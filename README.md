@@ -166,6 +166,19 @@ the profile's shell.
 - `editor_cmd` — command the sidebar `e` key runs on a session's folder
   (the folder path is appended), default `code`. `BAUDE_EDITOR_CMD` env var
   overrides the config file.
+- `daemon_url` — base URL of a remote bauded daemon (e.g.
+  `http://bauded:8642`); its sessions appear in the sidebar under a
+  `⇄ remote` section. `BAUDE_DAEMON_URL` env var overrides the config file.
+
+## Remote sessions in the TUI
+
+With `daemon_url` set, the daemon's sessions list in the sidebar below your
+local ones — same status dots, waiting timers, and metadata. `enter`
+attaches: the pane becomes a live raw terminal on the remote session (full
+keystroke passthrough over a websocket, resizes follow your pane), so a
+session running on your server is indistinguishable from a local one while
+attached. `x` kills and `r` restarts remote sessions through the API; shell
+panes, worktrees, and the editor key stay local-only.
 
 ## bauded (experimental)
 

@@ -5,11 +5,12 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use baude_core::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
-use baude_core::pty::{now_ms, Pty};
+use baude_core::pty::now_ms;
 use baude_core::session::{human_duration, Session, Status};
 use baude_core::vt100;
 
-use crate::app::{inner, pane_rects, App, Focus, Modal};
+use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
+use crate::remote::RemoteInfo;
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -138,72 +139,179 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     let width = list_area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let mut remote_header_drawn = false;
     for id in &ids {
-        let Some(s) = app.session(*id) else { continue };
-        let selected = app.selected_id == Some(*id);
-        let status = s.status();
-        let flash = flash_on();
-
-        let (icon, icon_style) = match status {
-            Status::Waiting => {
-                // pulse the dot to pull the eye to a session that needs you
-                let c = if flash {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                };
-                ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
+        match id {
+            SelId::Local(lid) => {
+                let Some(s) = app.session(*lid) else { continue };
+                let selected = app.selected_id == Some(*id);
+                session_row(
+                    &mut lines,
+                    selected,
+                    s.status(),
+                    &s.name,
+                    s.waiting_for_ms(),
+                    width,
+                );
+                lines.push(meta_line(s, selected));
             }
-            Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
-            Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
-        };
-
-        let name_style = if matches!(status, Status::Exited) {
-            Style::default().fg(Color::DarkGray)
-        } else if selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else if status == Status::Waiting {
-            // flash the name too, so a waiting session is unmissable
-            Style::default().fg(if flash { Color::Yellow } else { Color::Gray })
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        let suffix = if status == Status::Waiting {
-            human_duration(s.waiting_for_ms())
-        } else {
-            String::new()
-        };
-        let suffix_w = suffix.chars().count();
-        // gutter(2) + icon(1) + space(1) = 4; reserve a space before the timer.
-        let reserve = if suffix.is_empty() { 0 } else { suffix_w + 1 };
-        let name = truncate(&s.name, width.saturating_sub(4 + reserve).max(1));
-        let used = 4 + name.chars().count() + suffix_w;
-        let pad = width.saturating_sub(used);
-
-        let mut spans = vec![
-            gutter(selected),
-            Span::styled(icon.to_string(), icon_style),
-            Span::raw(" "),
-            Span::styled(name, name_style),
-        ];
-        if !suffix.is_empty() {
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(
-                suffix,
-                Style::default().fg(if flash {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                }),
-            ));
+            SelId::Remote(rid) => {
+                if !remote_header_drawn {
+                    remote_header_drawn = true;
+                    lines.push(remote_header(app, width));
+                }
+                let Some(r) = app.remote_info(*rid) else {
+                    continue;
+                };
+                let selected = app.selected_id == Some(*id);
+                let status = remote_status(r);
+                let waiting_ms = r
+                    .waiting_for_ms
+                    .map(|ms| ms + now_ms().saturating_sub(app.remote_snap.fetched_ms));
+                session_row(
+                    &mut lines,
+                    selected,
+                    status,
+                    &r.name,
+                    waiting_ms.unwrap_or(0),
+                    width,
+                );
+                lines.push(remote_meta_line(r, selected));
+            }
         }
-        lines.push(Line::from(spans));
-        lines.push(meta_line(s, selected));
+    }
+    // Remote configured but no sessions yet: still show the header.
+    if app.remote.is_some() && !remote_header_drawn {
+        lines.push(remote_header(app, width));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// Map a daemon status word onto the local status enum for shared styling.
+fn remote_status(r: &RemoteInfo) -> Status {
+    match r.status.as_str() {
+        "busy" => Status::Busy,
+        "exited" => Status::Exited,
+        _ => Status::Waiting,
+    }
+}
+
+fn remote_header(app: &App, width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let label = if app.remote_snap.ok {
+        "⇄ remote".to_string()
+    } else {
+        "⇄ remote (offline)".to_string()
+    };
+    let label = truncate(&label, width.saturating_sub(3).max(1));
+    Line::from(vec![Span::raw("  "), Span::styled(label, dim)])
+}
+
+fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span> = vec![gutter(selected)];
+    let push = |spans: &mut Vec<Span>, text: String, style: Style| {
+        if spans.len() > 1 {
+            spans.push(Span::styled(" ", dim));
+        }
+        spans.push(Span::styled(text, style));
+    };
+    if let Some(m) = &r.model {
+        push(&mut spans, short_model(m), dim);
+    }
+    if let Some(pct) = r.context_used_pct {
+        let style = if pct >= 80 {
+            Style::default().fg(Color::Red)
+        } else if pct >= 60 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            dim
+        };
+        push(&mut spans, format!("{pct}%"), style);
+    }
+    if let Some(mode) = &r.permission_mode {
+        let style = if mode == "bypassPermissions" {
+            Style::default().fg(Color::Red)
+        } else {
+            dim
+        };
+        push(&mut spans, short_mode(mode).to_string(), style);
+    }
+    if spans.len() == 1 {
+        spans.push(Span::styled("—", dim));
+    }
+    Line::from(spans)
+}
+
+/// One sidebar session row: status icon, name, and (when waiting) a
+/// right-aligned wait timer. Shared by local and remote sessions.
+fn session_row(
+    lines: &mut Vec<Line<'static>>,
+    selected: bool,
+    status: Status,
+    name: &str,
+    waiting_ms: u64,
+    width: usize,
+) {
+    let flash = flash_on();
+
+    let (icon, icon_style) = match status {
+        Status::Waiting => {
+            // pulse the dot to pull the eye to a session that needs you
+            let c = if flash {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
+        }
+        Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
+        Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
+    };
+
+    let name_style = if matches!(status, Status::Exited) {
+        Style::default().fg(Color::DarkGray)
+    } else if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if status == Status::Waiting {
+        // flash the name too, so a waiting session is unmissable
+        Style::default().fg(if flash { Color::Yellow } else { Color::Gray })
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let suffix = if status == Status::Waiting {
+        human_duration(waiting_ms)
+    } else {
+        String::new()
+    };
+    let suffix_w = suffix.chars().count();
+    // gutter(2) + icon(1) + space(1) = 4; reserve a space before the timer.
+    let reserve = if suffix.is_empty() { 0 } else { suffix_w + 1 };
+    let name = truncate(name, width.saturating_sub(4 + reserve).max(1));
+    let used = 4 + name.chars().count() + suffix_w;
+    let pad = width.saturating_sub(used);
+
+    let mut spans = vec![
+        gutter(selected),
+        Span::styled(icon.to_string(), icon_style),
+        Span::raw(" "),
+        Span::styled(name, name_style),
+    ];
+    if !suffix.is_empty() {
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            suffix,
+            Style::default().fg(if flash {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        ));
+    }
+    lines.push(Line::from(spans));
 }
 
 /// Color a usage percentage: green → yellow (60%) → red (85%).
@@ -313,6 +421,10 @@ fn meta_line(s: &Session, selected: bool) -> Line<'static> {
 }
 
 fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(r) = app.selected_remote() {
+        draw_remote_content(frame, app, area, r);
+        return;
+    }
     let Some(s) = app.selected() else {
         let welcome = Paragraph::new(vec![
             Line::raw(""),
@@ -357,7 +469,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
     draw_term(
         frame,
         inner(claude_rect),
-        &s.claude,
+        &s.claude.parser,
         app.focus == Focus::Claude,
     );
 
@@ -369,7 +481,38 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
             .title(format!(" shell @ {} ", s.cwd.display()));
         frame.render_widget(block, sr);
         if let Some(shell) = &s.shell {
-            draw_term(frame, inner(sr), shell, app.focus == Focus::Shell);
+            draw_term(frame, inner(sr), &shell.parser, app.focus == Focus::Shell);
+        }
+    }
+}
+
+fn draw_remote_content(frame: &mut Frame, app: &App, area: Rect, r: &RemoteInfo) {
+    let status_word = match r.status.as_str() {
+        "busy" => " working ",
+        "exited" => " exited — r to restart ",
+        _ => " waiting ",
+    };
+    let title = format!(" {} @ remote ·{status_word}", r.name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(app.focus == Focus::Claude))
+        .title(title);
+    frame.render_widget(block, area);
+
+    let attached = app
+        .attach
+        .as_ref()
+        .filter(|a| a.remote_id == r.id && !a.is_closed());
+    match attached {
+        Some(a) => draw_term(frame, inner(area), &a.parser, app.focus == Focus::Claude),
+        None => {
+            let dim = Style::default().fg(Color::DarkGray);
+            let hint = Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(Span::styled("  press enter to attach", dim)),
+            ]);
+            frame.render_widget(hint, inner(area));
         }
     }
 }
@@ -382,11 +525,16 @@ fn vt_color(c: vt100::Color) -> Color {
     }
 }
 
-fn draw_term(frame: &mut Frame, area: Rect, pty: &Pty, focused: bool) {
+fn draw_term(
+    frame: &mut Frame,
+    area: Rect,
+    parser: &std::sync::Mutex<vt100::Parser>,
+    focused: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Ok(parser) = pty.parser.lock() else {
+    let Ok(parser) = parser.lock() else {
         return;
     };
     let screen = parser.screen();
@@ -567,7 +715,13 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
         Modal::ConfirmKill { id } => {
-            let name = app.session(*id).map(|s| s.name.clone()).unwrap_or_default();
+            let name = match id {
+                SelId::Local(lid) => app.session(*lid).map(|s| s.name.clone()),
+                SelId::Remote(rid) => app
+                    .remote_info(*rid)
+                    .map(|r| format!("{} (remote)", r.name)),
+            }
+            .unwrap_or_default();
             let rect = centered(area, 50, 4);
             frame.render_widget(Clear, rect);
             let p = Paragraph::new(vec![
@@ -607,6 +761,60 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Info => {
+            if let Some(r) = app.selected_remote() {
+                let dim = Style::default().fg(Color::DarkGray);
+                let val = Style::default().fg(Color::White);
+                let row = |label: &str, value: String| {
+                    Line::from(vec![
+                        Span::styled(format!("  {label:<16}"), dim),
+                        Span::styled(value, val),
+                    ])
+                };
+                let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
+                let lines = vec![
+                    row("session", format!("{} (remote)", r.name)),
+                    row("title", opt(&r.title)),
+                    row("status", r.status.clone()),
+                    row(
+                        "model",
+                        r.model
+                            .as_deref()
+                            .map(short_model)
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    row(
+                        "permissions",
+                        r.permission_mode
+                            .as_deref()
+                            .map(|p| format!("{p} ({})", short_mode(p)))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    row(
+                        "context used",
+                        r.context_used_pct
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    row("branch", opt(&r.branch)),
+                    row(
+                        "session cost",
+                        r.session_cost_usd
+                            .map(|c| format!("${c:.2}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ];
+                let rect = centered(frame.area(), 64, lines.len() as u16 + 2);
+                frame.render_widget(Clear, rect);
+                let p = Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" remote session info "),
+                );
+                frame.render_widget(p, rect);
+                return;
+            }
             let Some(s) = app.selected() else { return };
             let dim = Style::default().fg(Color::DarkGray);
             let val = Style::default().fg(Color::White);

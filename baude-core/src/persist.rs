@@ -43,6 +43,9 @@ pub struct Config {
     /// The session cwd is appended as an argument. BAUDE_EDITOR_CMD overrides
     /// this. Defaults to "code".
     pub editor_cmd: Option<String>,
+    /// Base URL of a remote bauded daemon whose sessions appear in the
+    /// sidebar, e.g. "http://bauded:8642". BAUDE_DAEMON_URL overrides.
+    pub daemon_url: Option<String>,
 }
 
 pub fn load_config() -> Config {
