@@ -30,6 +30,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
         uses: docker/build-push-action@v6
+        env:
+          # The auto-uploaded .dockerbuild record artifacts have proven
+          # undownloadable (broke the v0.6.0 publish job); nothing needs them.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -102,6 +106,9 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          # Only the binary tarballs — not image digests or any other
+          # artifact a job happens to upload.
+          pattern: baude-*
           merge-multiple: true
       - name: checksums
         run: cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt
