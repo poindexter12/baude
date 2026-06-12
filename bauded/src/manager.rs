@@ -34,6 +34,8 @@ pub struct Manager {
     sessions: Vec<Session>,
     next_id: u64,
     claude_cmd: String,
+    /// false in tests — never touch the real daemon-state.json.
+    persist: bool,
 }
 
 /// One row of `GET /sessions`.
@@ -78,16 +80,22 @@ fn status_str(s: Status) -> &'static str {
     }
 }
 
+/// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
+/// `claude_cmd`, then plain `claude`.
+pub fn default_claude_cmd() -> String {
+    std::env::var("BAUDE_CLAUDE_CMD")
+        .ok()
+        .or_else(|| persist::load_config().claude_cmd)
+        .unwrap_or_else(|| "claude".to_string())
+}
+
 impl Manager {
-    pub fn new() -> Manager {
-        let claude_cmd = std::env::var("BAUDE_CLAUDE_CMD")
-            .ok()
-            .or_else(|| persist::load_config().claude_cmd)
-            .unwrap_or_else(|| "claude".to_string());
+    pub fn new(claude_cmd: String, persist: bool) -> Manager {
         Manager {
             sessions: Vec::new(),
             next_id: 1,
             claude_cmd,
+            persist,
         }
     }
 
@@ -117,6 +125,9 @@ impl Manager {
     }
 
     pub fn save(&self) {
+        if !self.persist {
+            return;
+        }
         let state = State {
             sessions: self
                 .sessions
@@ -435,5 +446,81 @@ fn session_info(s: &Session) -> SessionInfo {
         gsd_phase: s.meta.gsd.as_ref().and_then(|g| g.phase_line.clone()),
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn mgr() -> Manager {
+        Manager::new("sleep 30".into(), false)
+    }
+
+    #[test]
+    fn create_list_info_remove() {
+        let mut m = mgr();
+        let info = m.create("/tmp", None, Some("t1")).unwrap();
+        assert_eq!(info.name, "t1");
+        assert_eq!(m.list().len(), 1);
+        // macOS canonicalizes /tmp to /private/tmp
+        assert!(m.info(info.id).unwrap().cwd.ends_with("/tmp"));
+        assert!(m.info(99).is_none());
+        m.remove(info.id).unwrap();
+        assert!(m.list().is_empty());
+        assert!(m.remove(info.id).is_err());
+    }
+
+    #[test]
+    fn duplicate_names_get_suffixed() {
+        let mut m = mgr();
+        let a = m.create("/tmp", None, None).unwrap();
+        let b = m.create("/tmp", None, None).unwrap();
+        assert_eq!(a.name, "tmp");
+        assert_eq!(b.name, "tmp (2)");
+        m.kill_all();
+    }
+
+    #[test]
+    fn message_rejected_while_starting() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // The stub never writes a sessions/<pid>.json, so the daemon must
+        // refuse rather than write into a not-yet-listening PTY.
+        let err = m.post_message(id, "hello").unwrap_err().to_string();
+        assert!(err.contains("starting"), "got: {err}");
+        m.kill_all();
+    }
+
+    #[test]
+    fn keys_drive_a_shell_and_screen_reads_back() {
+        let mut m = Manager::new("bash --norc -i".into(), false);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // Let the shell come up, type a command, read it off the screen.
+        std::thread::sleep(Duration::from_millis(800));
+        m.send_keys(id, &["echo peek-ok".into(), "enter".into()])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let shot = m.screen(id).unwrap();
+            if shot.text.contains("peek-ok") {
+                assert_eq!((shot.rows, shot.cols), (40, 120));
+                break;
+            }
+            assert!(Instant::now() < deadline, "screen never showed output");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        m.kill_all();
+    }
+
+    #[test]
+    fn key_encoding() {
+        assert_eq!(key_bytes("up", false), b"\x1b[A");
+        assert_eq!(key_bytes("up", true), b"\x1bOA");
+        assert_eq!(key_bytes("enter", false), b"\r");
+        assert_eq!(key_bytes("shift+tab", false), b"\x1b[Z");
+        assert_eq!(key_bytes("ctrl+c", false), vec![3]);
+        assert_eq!(key_bytes("plain text", false), b"plain text");
     }
 }
