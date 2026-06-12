@@ -22,8 +22,9 @@ services:
     restart: unless-stopped
 
   bauded:
-    build: . # or use the published image instead of building:
-    # image: ghcr.io/poindexter12/bauded:latest
+    image: ghcr.io/poindexter12/bauded:latest
+    # hacking on bauded itself? build from source instead:
+    # build: .
     network_mode: service:tailscale # share the sidecar's network namespace
     depends_on:
       - tailscale

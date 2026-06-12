@@ -225,9 +225,8 @@ daemon is only reachable over your tailnet, nothing is published to the host:
 
 ```sh
 cp .env.example .env          # set TS_AUTHKEY
-docker compose up -d --build  # or set image: ghcr.io/poindexter12/bauded
+docker compose up -d          # pulls ghcr.io/poindexter12/bauded
 docker compose exec -it bauded claude   # log in once; persists in a volume
-docker compose exec bauded git clone <url> /repos/<name>
 open http://bauded:8642/                # the PWA, from any tailnet device
 ```
 

@@ -36,8 +36,8 @@ To use a tag, your ACL policy must declare an owner first:
 
 ```sh
 cp .env.example .env        # paste the tskey-auth-… key
-docker compose up -d        # builds from source; or uncomment the
-                            # ghcr.io/poindexter12/bauded image: line first
+docker compose up -d        # pulls the published multi-arch image; to hack
+                            # on bauded itself, switch to the build: line
 docker compose ps           # bauded healthcheck goes healthy in ~10s
 ```
 
@@ -98,9 +98,9 @@ install for Web Push; Safari-tab visits can't subscribe.)
 ## 6. Updating
 
 ```sh
-docker compose pull && docker compose up -d    # image: flavor
-# or
-git pull && docker compose up -d --build       # build: flavor
+docker compose pull && docker compose up -d    # grabs the latest release
+# building from source instead (build: flavor):
+# git pull && docker compose up -d --build
 ```
 
 Sessions die with the daemon, but state is saved on shutdown and every
