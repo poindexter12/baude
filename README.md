@@ -214,7 +214,9 @@ external assets.
 | `GET /sessions/{id}/queue` | messages typed while busy, not yet picked up |
 | `GET /sessions/{id}/screen` | plain-text terminal snapshot (menu escape hatch) |
 | `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |
+| `GET /sessions/{id}/pty` | websocket: raw terminal attach (snapshot, then live bytes) |
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
+| `GET /push/key` · `POST/DELETE /push/subscribe` | Web Push: VAPID key + subscriptions |
 
 ### Deploy (compose + Tailscale)
 

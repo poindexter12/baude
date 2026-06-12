@@ -1,6 +1,7 @@
 // Minimal service worker: cache the app shell for installability/offline
-// shell; never cache API calls (they're live session state).
-const CACHE = "baude-v1";
+// shell; never cache API calls (they're live session state). Also receives
+// Web Push notifications from the daemon.
+const CACHE = "baude-v2";
 const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
@@ -29,5 +30,34 @@ self.addEventListener("fetch", (e) => {
         return res;
       })
       .catch(() => caches.match(e.request))
+  );
+});
+
+self.addEventListener("push", (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { /* non-JSON push */ }
+  e.waitUntil(self.registration.showNotification(d.title || "baude", {
+    body: d.body || "",
+    tag: d.tag,
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    data: d,
+  }));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const sid = e.notification.data && e.notification.data.sid;
+  const url = sid ? `/#/s/${sid}` : "/";
+  e.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      for (const c of list) {
+        if ("focus" in c) {
+          c.navigate(url);
+          return c.focus();
+        }
+      }
+      return clients.openWindow(url);
+    })
   );
 });

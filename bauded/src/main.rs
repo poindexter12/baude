@@ -5,6 +5,8 @@
 
 mod api;
 mod manager;
+mod notify;
+mod push;
 mod transcript;
 mod web;
 
@@ -53,20 +55,51 @@ async fn main() -> Result<()> {
     let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();
     let state = Arc::new(Mutex::new(manager));
+    let push_state: push::SharedPush = Arc::new(Mutex::new(push::PushState::load(true)?));
 
     // Metadata poll loop — same cadence as the TUI tick. Plain thread: the
-    // work is blocking file IO under the manager lock.
+    // work is blocking file IO under the manager lock. The notifier rides
+    // along: decide under the lock, send (network) outside it.
     {
         let state = Arc::clone(&state);
-        std::thread::spawn(move || loop {
-            lock(&state).poll();
-            std::thread::sleep(Duration::from_millis(META_POLL_MS));
+        let push_state = Arc::clone(&push_state);
+        std::thread::spawn(move || {
+            let mut notifier = notify::Notifier::default();
+            loop {
+                let infos = {
+                    let mut m = lock(&state);
+                    m.poll();
+                    m.list()
+                };
+                let pending = notifier.tick(&infos);
+                if !pending.is_empty() {
+                    // Snapshot under the lock; the network sends run outside.
+                    let (subs, vapid) = {
+                        let p = push::lock(&push_state);
+                        (p.subs(), p.vapid.clone())
+                    };
+                    let mut dead = Vec::new();
+                    for n in &pending {
+                        let payload = n.to_json();
+                        for sub in &subs {
+                            match push::send(&vapid, sub, &payload) {
+                                Ok(true) => {}
+                                Ok(false) => dead.push(sub.endpoint.clone()),
+                                Err(e) => eprintln!("push: {e}"),
+                            }
+                        }
+                    }
+                    push::lock(&push_state).remove_dead(&dead);
+                }
+                std::thread::sleep(Duration::from_millis(META_POLL_MS));
+            }
         });
     }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("bauded listening on http://{bind} ({restored} session(s) restored)");
-    axum::serve(listener, api::router(Arc::clone(&state)))
+    let app = api::router(Arc::clone(&state)).merge(api::push_router(push_state));
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

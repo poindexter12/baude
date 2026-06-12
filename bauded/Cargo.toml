@@ -7,15 +7,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow.workspace = true
 async-stream = "0.3"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 baude-core.workspace = true
 dirs.workspace = true
 futures-core = "0.3"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 futures-util = "0.3"
