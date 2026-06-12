@@ -25,6 +25,8 @@ pub fn router(state: Shared) -> Router {
             get(get_messages).post(post_message),
         )
         .route("/sessions/{id}/interrupt", post(interrupt))
+        .route("/sessions/{id}/screen", get(get_screen))
+        .route("/sessions/{id}/keys", post(post_keys))
         .route("/sessions/{id}/stream", get(stream))
         .with_state(state)
 }
@@ -128,6 +130,32 @@ async fn interrupt(
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
     lock(&state).interrupt(id).map_err(not_found)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn get_screen(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+) -> Result<Json<crate::manager::Screenshot>, ApiError> {
+    lock(&state).screen(id).map(Json).map_err(not_found)
+}
+
+#[derive(Deserialize)]
+struct KeysBody {
+    /// Named keys (up/down/left/right/enter/esc/tab/shift+tab/space/
+    /// backspace/ctrl+x) or literal text to type.
+    keys: Vec<String>,
+}
+
+async fn post_keys(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    Json(body): Json<KeysBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.keys.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no keys".into()));
+    }
+    lock(&state).send_keys(id, &body.keys).map_err(not_found)?;
     Ok(StatusCode::ACCEPTED)
 }
 
