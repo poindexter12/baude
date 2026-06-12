@@ -1,6 +1,7 @@
 mod app;
 mod git;
 mod keys;
+mod meta;
 mod persist;
 mod pty;
 mod session;

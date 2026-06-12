@@ -6,17 +6,13 @@ use ratatui::layout::Rect;
 
 use crate::git;
 use crate::keys::encode_key;
-use crate::persist::{self, SavedSession, State};
+use crate::meta::{now_unix_ms, ClaudeMeta};
+use crate::persist::{self, Config, SavedSession, State};
 use crate::pty::{now_ms, Pty};
 use crate::session::{Session, Status};
 
 const MESSAGE_TTL_MS: u64 = 5000;
-
-/// The command run for each session. Override with e.g.
-/// BAUDE_CLAUDE_CMD="claude --dangerously-skip-permissions".
-fn claude_cmd() -> String {
-    std::env::var("BAUDE_CLAUDE_CMD").unwrap_or_else(|_| "claude".to_string())
-}
+const META_POLL_MS: u64 = 1000;
 
 /// ctrl+\ arrives as raw byte 0x1C, which crossterm reports as ctrl+4
 /// (the two are indistinguishable in legacy terminal encoding).
@@ -39,6 +35,10 @@ pub enum InputKind {
 pub enum Modal {
     None,
     Help,
+    /// Session details: model, tokens, context, permission mode.
+    Info,
+    /// GSD project state for the selected session's repo.
+    Gsd,
     Input {
         kind: InputKind,
         title: String,
@@ -60,8 +60,10 @@ pub struct App {
     pub message: Option<(String, u64)>,
     pub should_quit: bool,
     pub launch_dir: PathBuf,
+    config: Config,
     content_rect: Rect,
     next_id: u64,
+    last_meta_poll: u64,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -103,9 +105,20 @@ impl App {
             message: None,
             should_quit: false,
             launch_dir,
+            config: persist::load_config(),
             content_rect: Rect::new(0, 0, 80, 24),
             next_id: 1,
+            last_meta_poll: 0,
         }
+    }
+
+    /// The command run for each session: BAUDE_CLAUDE_CMD env, then
+    /// config.json `claude_cmd`, then plain `claude`.
+    fn claude_cmd(&self) -> String {
+        std::env::var("BAUDE_CLAUDE_CMD")
+            .ok()
+            .or_else(|| self.config.claude_cmd.clone())
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     // ---- startup / persistence ----
@@ -171,11 +184,9 @@ impl App {
                     Status::Busy => 1,
                     Status::Exited => 2,
                 };
-                let last = s
-                    .claude
-                    .last_output_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                (rank, last, s.id)
+                // Longest-waiting first within a rank.
+                let key = u64::MAX - s.waiting_for_ms();
+                (rank, key, s.id)
             })
             .collect();
         entries.sort();
@@ -245,7 +256,7 @@ impl App {
 
         // `claude --continue` resumes the most recent conversation in this
         // directory; falls back to a fresh session if there is none.
-        let base = claude_cmd();
+        let base = self.claude_cmd();
         let cmd = if resume {
             format!("{base} --continue 2>/dev/null || exec {base}")
         } else {
@@ -266,6 +277,8 @@ impl App {
             claude,
             shell: None,
             shell_open: false,
+            spawn_unix_ms: now_unix_ms(),
+            meta: ClaudeMeta::default(),
         };
         if shell_open {
             let (_, shell_rect) = pane_rects(self.content_rect, true);
@@ -299,6 +312,12 @@ impl App {
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
                 self.message = None;
+            }
+        }
+        if now_ms().saturating_sub(self.last_meta_poll) >= META_POLL_MS {
+            self.last_meta_poll = now_ms();
+            for s in &mut self.sessions {
+                s.poll_meta();
             }
         }
         // If the focused pane's process died, fall back to the sidebar.
@@ -508,6 +527,16 @@ impl App {
                     };
                 }
             }
+            KeyCode::Char('i') => {
+                if self.selected().is_some() {
+                    self.modal = Modal::Info;
+                }
+            }
+            KeyCode::Char('g') => {
+                if self.selected().is_some() {
+                    self.modal = Modal::Gsd;
+                }
+            }
             KeyCode::Char('?') => self.modal = Modal::Help,
             _ => {}
         }
@@ -515,7 +544,7 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
         match &mut self.modal {
-            Modal::Help => {
+            Modal::Help | Modal::Info | Modal::Gsd => {
                 self.modal = Modal::None;
             }
             Modal::Input { buf, .. } => match key.code {
@@ -675,11 +704,13 @@ impl App {
             self.claude_spawn_size(s.shell_open)
         };
         let cwd = self.session(id).map(|s| s.cwd.clone()).unwrap();
-        let cmd = format!("exec {}", claude_cmd());
+        let cmd = format!("exec {}", self.claude_cmd());
         match Pty::spawn(Some(&cmd), &cwd, rows, cols) {
             Ok(pty) => {
                 if let Some(s) = self.session_mut(id) {
                     s.claude = pty;
+                    s.spawn_unix_ms = now_unix_ms();
+                    s.meta = ClaudeMeta::default();
                 }
                 self.focus = Focus::Claude;
             }

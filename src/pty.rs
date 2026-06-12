@@ -133,6 +133,10 @@ impl Pty {
         let _ = self.writer.flush();
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().ok().and_then(|c| c.process_id())
+    }
+
     pub fn is_exited(&self) -> bool {
         if self.exited.load(Ordering::Relaxed) {
             return true;

@@ -18,13 +18,31 @@ pub struct SavedSession {
     pub shell_open: bool,
 }
 
-fn state_path() -> PathBuf {
+fn config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("baude")
-        .join("state.json")
+}
+
+fn state_path() -> PathBuf {
+    config_base().join("state.json")
+}
+
+/// User configuration, ~/.config/baude/config.json. All fields optional.
+#[derive(Deserialize, Default)]
+pub struct Config {
+    /// Command run for each session; BAUDE_CLAUDE_CMD overrides this.
+    /// Example: "claude --dangerously-skip-permissions"
+    pub claude_cmd: Option<String>,
+}
+
+pub fn load_config() -> Config {
+    std::fs::read_to_string(config_base().join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 pub fn load() -> State {

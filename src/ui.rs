@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal};
+use crate::meta::{human_tokens, short_mode, short_model};
 use crate::pty::Pty;
-use crate::session::{human_duration, Status};
+use crate::session::{human_duration, Session, Status};
 
 pub const SIDEBAR_WIDTH: u16 = 28;
 
@@ -105,6 +106,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(name, name_style),
             Span::styled(suffix, Style::default().fg(Color::Yellow)),
         ]));
+        lines.push(meta_line(s));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -117,6 +119,52 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// Compact second sidebar line: model · context% · permission mode · gsd phase.
+fn meta_line(s: &Session) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span> = vec![Span::styled("  ", dim)];
+    let push = |spans: &mut Vec<Span>, text: String, style: Style| {
+        if spans.len() > 1 {
+            spans.push(Span::styled(" ", dim));
+        }
+        spans.push(Span::styled(text, style));
+    };
+    if let Some(m) = &s.meta.model {
+        push(&mut spans, short_model(m), dim);
+    }
+    if let Some(pct) = s.meta.context_used_pct {
+        let style = if pct >= 80 {
+            Style::default().fg(Color::Red)
+        } else if pct >= 60 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            dim
+        };
+        push(&mut spans, format!("{pct}%"), style);
+    }
+    if let Some(mode) = &s.meta.permission_mode {
+        let style = if mode == "bypassPermissions" {
+            Style::default().fg(Color::Red)
+        } else {
+            dim
+        };
+        push(&mut spans, short_mode(mode).to_string(), style);
+    }
+    if let Some(gsd) = &s.meta.gsd {
+        if let Some(phase) = &gsd.active_phase {
+            push(
+                &mut spans,
+                format!("ph{phase}"),
+                Style::default().fg(Color::Green),
+            );
+        }
+    }
+    if spans.len() == 1 {
+        spans.push(Span::styled("—", dim));
+    }
+    Line::from(spans)
 }
 
 fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
@@ -148,7 +196,13 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         Status::Busy => " working ",
         Status::Exited => " exited — r to restart ",
     };
-    let title = format!(" {} ·{}", s.name, status_word);
+    let mode_word = s
+        .meta
+        .permission_mode
+        .as_deref()
+        .map(|m| format!("· {} ", short_mode(m)))
+        .unwrap_or_default();
+    let title = format!(" {} ·{}{}", s.name, status_word, mode_word);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -254,7 +308,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match app.focus {
             Focus::Sidebar => {
-                " enter attach · j/k select · t shell · n new · w worktree · r restart · x close · ? help · q quit"
+                " enter attach · j/k select · t shell · i info · g gsd · n new · w worktree · r restart · x close · ? help · q quit"
             }
             Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell",
             Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell",
@@ -334,6 +388,146 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(p, rect);
         }
+        Modal::Info => {
+            let Some(s) = app.selected() else { return };
+            let dim = Style::default().fg(Color::DarkGray);
+            let val = Style::default().fg(Color::White);
+            let row = |label: &str, value: String| {
+                Line::from(vec![
+                    Span::styled(format!("  {label:<16}"), dim),
+                    Span::styled(value, val),
+                ])
+            };
+            let m = &s.meta;
+            let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
+            let mut lines = vec![
+                row("session", s.name.clone()),
+                row("cwd", s.cwd.display().to_string()),
+                row(
+                    "model",
+                    m.model
+                        .as_deref()
+                        .map(short_model)
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                row(
+                    "permissions",
+                    m.permission_mode
+                        .as_deref()
+                        .map(|p| format!("{p} ({})", short_mode(p)))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                row(
+                    "context used",
+                    m.context_used_pct
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                row("claude session", opt(&m.session_id)),
+                Line::raw(""),
+            ];
+            if let Some(u) = &m.last_usage {
+                lines.push(row(
+                    "last turn",
+                    format!(
+                        "in {} · out {} · cache r {} / w {}",
+                        human_tokens(u.input),
+                        human_tokens(u.output),
+                        human_tokens(u.cache_read),
+                        human_tokens(u.cache_create)
+                    ),
+                ));
+            }
+            let t = &m.totals;
+            lines.push(row(
+                "session total",
+                format!(
+                    "in {} · out {} · cache r {} / w {}",
+                    human_tokens(t.input),
+                    human_tokens(t.output),
+                    human_tokens(t.cache_read),
+                    human_tokens(t.cache_create)
+                ),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("  press any key to close", dim)));
+            let rect = centered(area, 76, lines.len() as u16 + 2);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" session info "),
+                ),
+                rect,
+            );
+        }
+        Modal::Gsd => {
+            let Some(s) = app.selected() else { return };
+            let dim = Style::default().fg(Color::DarkGray);
+            let val = Style::default().fg(Color::White);
+            let row = |label: &str, value: String| {
+                Line::from(vec![
+                    Span::styled(format!("  {label:<16}"), dim),
+                    Span::styled(value, val),
+                ])
+            };
+            let lines = match &s.meta.gsd {
+                Some(g) => {
+                    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
+                    let mut lines = vec![
+                        row("milestone", opt(&g.milestone)),
+                        row("status", opt(&g.status)),
+                        row("active phase", opt(&g.active_phase)),
+                        row("next action", opt(&g.next_action)),
+                        row(
+                            "progress",
+                            g.percent
+                                .map(|p| {
+                                    let filled = (p as usize) / 10;
+                                    format!(
+                                        "[{}{}] {p}%",
+                                        "█".repeat(filled),
+                                        "░".repeat(10 - filled)
+                                    )
+                                })
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                    ];
+                    if let Some(pl) = &g.phase_line {
+                        lines.push(row("state", pl.clone()));
+                    }
+                    lines
+                }
+                None => vec![Line::from(Span::styled(
+                    "  no .planning/STATE.md in this repo",
+                    dim,
+                ))],
+            };
+            let mut lines = lines;
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("  press any key to close", dim)));
+            let rect = centered(area, 72, lines.len() as u16 + 2);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Green))
+                        .title(format!(
+                            " gsd — {} ",
+                            s.repo_root
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        )),
+                ),
+                rect,
+            );
+        }
         Modal::Help => {
             let rect = centered(area, 58, 20);
             frame.render_widget(Clear, rect);
@@ -346,6 +540,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  j/k ↑/↓     select session"),
                 Line::raw("  enter       attach to selected session"),
                 Line::raw("  t           toggle shell pane"),
+                Line::raw("  i           session info (model, tokens, context)"),
+                Line::raw("  g           gsd project state"),
                 Line::raw("  n           new session (repo path)"),
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
