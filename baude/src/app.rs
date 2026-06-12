@@ -12,6 +12,7 @@ use baude_core::pty::{now_ms, Pty};
 use baude_core::session::{Session, Status};
 
 use crate::keys::encode_key;
+use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
 use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
@@ -82,6 +83,13 @@ pub enum Focus {
     Shell,
 }
 
+/// Sidebar selection: a local session or one on the remote daemon.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SelId {
+    Local(u64),
+    Remote(u64),
+}
+
 pub enum InputKind {
     NewSessionPath,
     NewWorktreeBranch { repo_root: PathBuf },
@@ -102,7 +110,7 @@ pub enum Modal {
         candidates: Vec<String>,
     },
     ConfirmKill {
-        id: u64,
+        id: SelId,
     },
     ConfirmCloseWorktree {
         id: u64,
@@ -111,7 +119,7 @@ pub enum Modal {
 
 pub struct App {
     pub sessions: Vec<Session>,
-    pub selected_id: Option<u64>,
+    pub selected_id: Option<SelId>,
     pub focus: Focus,
     pub modal: Modal,
     pub message: Option<(String, u64)>,
@@ -122,6 +130,11 @@ pub struct App {
     next_id: u64,
     last_meta_poll: u64,
     usage: UsagePoller,
+    /// Remote daemon client (config `daemon_url` / BAUDE_DAEMON_URL).
+    pub remote: Option<RemotePoller>,
+    pub remote_snap: RemoteSnapshot,
+    /// At most one live raw attach to a remote session.
+    pub attach: Option<RemoteAttach>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -155,6 +168,12 @@ pub fn inner(r: Rect) -> Rect {
 
 impl App {
     pub fn new(launch_dir: PathBuf) -> App {
+        let config = persist::load_config();
+        let remote = std::env::var("BAUDE_DAEMON_URL")
+            .ok()
+            .or_else(|| config.daemon_url.clone())
+            .filter(|u| !u.trim().is_empty())
+            .map(RemotePoller::start);
         App {
             sessions: Vec::new(),
             selected_id: None,
@@ -163,11 +182,14 @@ impl App {
             message: None,
             should_quit: false,
             launch_dir,
-            config: persist::load_config(),
+            config,
             content_rect: Rect::new(0, 0, 80, 24),
             next_id: 1,
             last_meta_poll: 0,
             usage: UsagePoller::start(),
+            remote,
+            remote_snap: RemoteSnapshot::default(),
+            attach: None,
         }
     }
 
@@ -273,11 +295,31 @@ impl App {
 
     // ---- session bookkeeping ----
 
-    /// Session ids in a stable display order (creation order). The sidebar
-    /// never reorders — sessions that need your input flash in place instead,
-    /// so rows stay where your eye expects them.
-    pub fn ordered_ids(&self) -> Vec<u64> {
-        self.sessions.iter().map(|s| s.id).collect()
+    /// Selection order: local sessions (stable creation order — the sidebar
+    /// never reorders, sessions that need input flash in place instead),
+    /// followed by the remote daemon's sessions.
+    pub fn ordered_ids(&self) -> Vec<SelId> {
+        self.sessions
+            .iter()
+            .map(|s| SelId::Local(s.id))
+            .chain(
+                self.remote_snap
+                    .sessions
+                    .iter()
+                    .map(|r| SelId::Remote(r.id)),
+            )
+            .collect()
+    }
+
+    pub fn remote_info(&self, id: u64) -> Option<&RemoteInfo> {
+        self.remote_snap.sessions.iter().find(|r| r.id == id)
+    }
+
+    pub fn selected_remote(&self) -> Option<&RemoteInfo> {
+        match self.selected_id {
+            Some(SelId::Remote(id)) => self.remote_info(id),
+            _ => None,
+        }
     }
 
     pub fn session(&self, id: u64) -> Option<&Session> {
@@ -289,12 +331,17 @@ impl App {
     }
 
     pub fn selected(&self) -> Option<&Session> {
-        self.selected_id.and_then(|id| self.session(id))
+        match self.selected_id {
+            Some(SelId::Local(id)) => self.session(id),
+            _ => None,
+        }
     }
 
     fn selected_mut(&mut self) -> Option<&mut Session> {
-        self.selected_id
-            .and_then(|id| self.sessions.iter_mut().find(|s| s.id == id))
+        match self.selected_id {
+            Some(SelId::Local(id)) => self.sessions.iter_mut().find(|s| s.id == id),
+            _ => None,
+        }
     }
 
     fn unique_name(&self, base: &str) -> String {
@@ -375,7 +422,7 @@ impl App {
             }
         }
         self.sessions.push(session);
-        self.selected_id = Some(id);
+        self.selected_id = Some(SelId::Local(id));
         Ok(id)
     }
 
@@ -384,7 +431,7 @@ impl App {
             s.kill();
         }
         self.sessions.retain(|s| s.id != id);
-        if self.selected_id == Some(id) {
+        if self.selected_id == Some(SelId::Local(id)) {
             self.selected_id = self.ordered_ids().first().copied();
         }
         self.focus = Focus::Sidebar;
@@ -407,14 +454,46 @@ impl App {
                 s.poll_meta();
             }
         }
+        if let Some(r) = &self.remote {
+            self.remote_snap = r.snapshot();
+        }
+        // Remote rows can appear after startup (first poll): give an empty
+        // selection something to land on.
+        if self.selected_id.is_none() {
+            self.selected_id = self.ordered_ids().first().copied();
+        }
+        // Drop a dead attach; if the attached remote session vanished from a
+        // healthy listing, it was deleted elsewhere.
+        if let Some(a) = &self.attach {
+            let gone = self.remote_snap.ok && self.remote_info(a.remote_id).is_none();
+            if a.is_closed() || gone {
+                self.attach = None;
+                self.set_message("remote attach ended".into());
+            }
+        }
+        // A selected remote session that disappeared falls back to the top.
+        if let Some(SelId::Remote(id)) = self.selected_id {
+            if self.remote_snap.ok && self.remote_info(id).is_none() {
+                self.selected_id = self.ordered_ids().first().copied();
+                self.focus = Focus::Sidebar;
+            }
+        }
         // If the focused pane's process died, fall back to the sidebar.
         match self.focus {
             Focus::Claude => {
-                if self
-                    .selected()
-                    .map(|s| s.claude.is_exited())
-                    .unwrap_or(true)
-                {
+                let alive = match self.selected_id {
+                    Some(SelId::Local(_)) => self
+                        .selected()
+                        .map(|s| !s.claude.is_exited())
+                        .unwrap_or(false),
+                    Some(SelId::Remote(id)) => self
+                        .attach
+                        .as_ref()
+                        .map(|a| a.remote_id == id && !a.is_closed())
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if !alive {
                     self.focus = Focus::Sidebar;
                 }
             }
@@ -446,6 +525,11 @@ impl App {
                 let r = inner(sr);
                 shell.resize(r.height, r.width);
             }
+        }
+        if let Some(a) = &mut self.attach {
+            let (claude_rect, _) = pane_rects(content, false);
+            let r = inner(claude_rect);
+            a.resize(r.height, r.width);
         }
     }
 
@@ -503,6 +587,21 @@ impl App {
     }
 
     fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
+        if !to_shell {
+            if let Some(SelId::Remote(id)) = self.selected_id {
+                let Some(a) = &self.attach else { return };
+                if a.remote_id != id {
+                    return;
+                }
+                let app_cursor = a
+                    .parser
+                    .lock()
+                    .map(|p| p.screen().application_cursor())
+                    .unwrap_or(false);
+                a.write_input(&encode_key(&key, app_cursor));
+                return;
+            }
+        }
         let Some(s) = self.selected_mut() else { return };
         let pty = if to_shell {
             match s.shell.as_mut() {
@@ -533,6 +632,29 @@ impl App {
                 return;
             }
         };
+        if !to_shell {
+            if let Some(SelId::Remote(id)) = self.selected_id {
+                let Some(a) = &self.attach else { return };
+                if a.remote_id != id {
+                    return;
+                }
+                let bracketed = a
+                    .parser
+                    .lock()
+                    .map(|p| p.screen().bracketed_paste())
+                    .unwrap_or(false);
+                let mut bytes = Vec::with_capacity(text.len() + 12);
+                if bracketed {
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                } else {
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+                a.write_input(&bytes);
+                return;
+            }
+        }
         let Some(s) = self.selected_mut() else { return };
         let pty = if to_shell {
             match s.shell.as_mut() {
@@ -559,6 +681,7 @@ impl App {
     }
 
     fn handle_sidebar_key(&mut self, key: KeyEvent) {
+        let remote_selected = matches!(self.selected_id, Some(SelId::Remote(_)));
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -566,7 +689,9 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                if let Some(s) = self.selected() {
+                if remote_selected {
+                    self.attach_selected_remote();
+                } else if let Some(s) = self.selected() {
                     if s.claude.is_exited() {
                         self.set_message("claude exited — press r to restart".into());
                     } else {
@@ -574,7 +699,13 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('t') if remote_selected => {
+                self.set_message("no shell pane for remote sessions".into());
+            }
             KeyCode::Char('t') => self.toggle_shell(true),
+            KeyCode::Char('e') if remote_selected => {
+                self.set_message("remote session — folder lives on the daemon host".into());
+            }
             KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('n') => {
                 let buf = match &self.config.new_session_dir {
@@ -611,24 +742,35 @@ impl App {
                     self.set_message("no session selected — press n to add a repo first".into());
                 }
             }
-            KeyCode::Char('r') => {
-                if let Some(id) = self.selected_id {
-                    self.restart_session(id);
-                }
-            }
+            KeyCode::Char('r') => match self.selected_id {
+                Some(SelId::Local(id)) => self.restart_session(id),
+                Some(SelId::Remote(id)) => self.restart_remote(id),
+                None => {}
+            },
             KeyCode::Char('x') => {
-                if let Some(s) = self.selected() {
+                if remote_selected {
+                    if let Some(SelId::Remote(id)) = self.selected_id {
+                        self.modal = Modal::ConfirmKill {
+                            id: SelId::Remote(id),
+                        };
+                    }
+                } else if let Some(s) = self.selected() {
                     self.modal = if s.is_worktree {
                         Modal::ConfirmCloseWorktree { id: s.id }
                     } else {
-                        Modal::ConfirmKill { id: s.id }
+                        Modal::ConfirmKill {
+                            id: SelId::Local(s.id),
+                        }
                     };
                 }
             }
             KeyCode::Char('i') => {
-                if self.selected().is_some() {
+                if self.selected().is_some() || self.selected_remote().is_some() {
                     self.modal = Modal::Info;
                 }
+            }
+            KeyCode::Char('g') if remote_selected => {
+                self.set_message("GSD view is for local sessions".into());
             }
             KeyCode::Char('g') => {
                 if self.selected().is_some() {
@@ -682,7 +824,10 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
                         self.modal = Modal::None;
-                        self.remove_session(id);
+                        match id {
+                            SelId::Local(id) => self.remove_session(id),
+                            SelId::Remote(id) => self.remove_remote(id),
+                        }
                     }
                     KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
                     _ => {}
@@ -762,6 +907,66 @@ impl App {
                     Err(e) => self.set_message(format!("worktree: {e}")),
                 }
             }
+        }
+    }
+
+    // ---- remote session actions ----
+
+    /// Attach (or re-focus an existing attach) to the selected remote session.
+    fn attach_selected_remote(&mut self) {
+        let Some(SelId::Remote(id)) = self.selected_id else {
+            return;
+        };
+        if self.remote_info(id).map(|r| r.status == "exited") == Some(true) {
+            self.set_message("claude exited — press r to restart".into());
+            return;
+        }
+        if let Some(a) = &self.attach {
+            if a.remote_id == id && !a.is_closed() {
+                self.focus = Focus::Claude;
+                return;
+            }
+        }
+        let Some(r) = &self.remote else { return };
+        let (claude_rect, _) = pane_rects(self.content_rect, false);
+        let ir = inner(claude_rect);
+        match RemoteAttach::connect(&r.base, id, ir.height, ir.width) {
+            Ok(a) => {
+                self.attach = Some(a);
+                self.focus = Focus::Claude;
+            }
+            Err(e) => self.set_message(format!("attach: {e}")),
+        }
+    }
+
+    fn restart_remote(&mut self, id: u64) {
+        if self.remote_info(id).map(|r| r.status == "exited") != Some(true) {
+            self.set_message("claude is still running".into());
+            return;
+        }
+        let Some(r) = &self.remote else { return };
+        match r.restart(id) {
+            Ok(()) => self.set_message("restarting remote claude…".into()),
+            Err(e) => self.set_message(format!("restart: {e}")),
+        }
+    }
+
+    fn remove_remote(&mut self, id: u64) {
+        if let Some(a) = &self.attach {
+            if a.remote_id == id {
+                self.attach = None;
+            }
+        }
+        let Some(r) = &self.remote else { return };
+        match r.delete(id) {
+            Ok(()) => {
+                self.set_message("remote session killed".into());
+                if self.selected_id == Some(SelId::Remote(id)) {
+                    self.selected_id = self.ordered_ids().first().copied();
+                }
+                self.focus = Focus::Sidebar;
+            }
+            Err(e) => self.set_message(format!("kill: {e}")),
         }
     }
 
