@@ -22,7 +22,7 @@ jobs:
             os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
       - name: package
@@ -30,7 +30,7 @@ jobs:
           mkdir -p dist
           tar -C "target/${{ matrix.target }}/release" -czf \
             "dist/baude-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" baude
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: baude-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -39,7 +39,7 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
