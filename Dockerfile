@@ -16,6 +16,7 @@ RUN apt-get update \
     && mkdir -p /repos && chown node:node /repos
 
 COPY --from=build /src/target/release/bauded /src/target/release/baude /usr/local/bin/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Claude Code refuses bypassPermissions as root — run as the stock node user.
 USER node
@@ -24,8 +25,11 @@ RUN mkdir -p /home/node/.claude /home/node/.config/baude /home/node/.ssh
 
 # Sessions spawn under $SHELL -il (baude-core falls back to zsh, absent here).
 ENV SHELL=/bin/bash
+# Keep claude's .claude.json (onboarding/trust state) inside the volume —
+# without this it lands at ~/.claude.json and is lost on container recreate.
+ENV CLAUDE_CONFIG_DIR=/home/node/.claude
 # Inside the tailscale sidecar's netns; nothing is published to the host.
 ENV BAUDED_BIND=0.0.0.0:8642
 
 EXPOSE 8642
-ENTRYPOINT ["bauded"]
+ENTRYPOINT ["docker-entrypoint.sh"]

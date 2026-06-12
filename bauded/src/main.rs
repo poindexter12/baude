@@ -21,6 +21,27 @@ const META_POLL_MS: u64 = 1000;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("bauded {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "bauded {} — headless baude session daemon\n\n\
+                 usage: bauded [--bind <addr>]\n\n\
+                 options:\n  \
+                 --bind <addr>   listen address (default {DEFAULT_BIND}; env BAUDED_BIND)\n\n\
+                 env:\n  \
+                 BAUDE_CLAUDE_CMD   command run per session (default \"claude\")\n  \
+                 BAUDED_BIND        listen address\n\n\
+                 Serves the phone PWA at / and the REST+SSE API under /sessions.",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
     let bind = args
         .iter()
         .position(|a| a == "--bind")
