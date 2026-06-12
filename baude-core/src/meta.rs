@@ -163,6 +163,11 @@ impl ClaudeMeta {
             self.totals = Usage::default();
             self.last_usage = None;
             self.title = None;
+            // Transcript-derived values must not survive a transcript switch
+            // (e.g. the cwd fallback matched a foreign session before the
+            // pid-based session file appeared).
+            self.model = None;
+            self.permission_mode = None;
         }
     }
 

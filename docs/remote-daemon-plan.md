@@ -104,5 +104,8 @@ daemon restarts (already written).
   mitigated by bypass mode; revisit after Phase 4.
 - Push notifications (iOS Web Push from PWA vs native app) — revisit at Phase 4/5.
 - Whether the local TUI converts to a daemon client or stays standalone.
-- Statusline bridge (`/tmp/baude-usage-*.json`, `ccusage`) inside the
-  container — works in principle, verify in Phase 3.
+- ~~Statusline bridge (`/tmp/baude-usage-*.json`, `ccusage`) inside the
+  container~~ — VERIFIED live in Phase 3: with `settings.json` statusLine set
+  to `baude statusline`, the bridge file carries cost, context %, and both
+  rate-limit windows; `GET /sessions` surfaces them. (`ccusage` not installed
+  in the image — costs come from the bridge instead.)
