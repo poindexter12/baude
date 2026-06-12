@@ -19,6 +19,7 @@ const state = {
   screenOpen: false,
   screenText: "",
   screenTimer: null,
+  queue: [], // messages typed while busy, not yet picked up
 };
 
 // ---- helpers ----
@@ -88,6 +89,7 @@ function route() {
     state.seen = new Set();
     state.screenOpen = false;
     state.screenText = "";
+    state.queue = [];
     clearInterval(state.screenTimer);
     if (sid !== null) openChat(sid);
   }
@@ -102,6 +104,9 @@ async function refresh() {
   try {
     state.sessions = await api("/sessions");
     state.fetchedAt = Date.now();
+    if (state.sid !== null) {
+      state.queue = await api(`/sessions/${state.sid}/queue`).catch(() => []);
+    }
   } catch {
     state.online = false;
   }
@@ -377,7 +382,9 @@ function renderChat() {
       <button class="iconbtn danger" id="killbtn" title="kill session">✕</button>
     </header>
     ${conn}
-    <div id="chat">${state.msgs.map(msgHtml).join("")}</div>
+    <div id="chat">${state.msgs.map(msgHtml).join("")}${state.queue.map((q) => `
+      <div class="msg user queued"><div class="bubble">${esc(q)}</div>
+        <div class="meta">queued</div></div>`).join("")}</div>
     ${typing}
     ${screenDrawer}
     <form id="composer">
