@@ -61,7 +61,7 @@ Two chords total; everything else passes straight through to Claude.
 | `t` | sidebar | toggle shell pane |
 | `i` | sidebar | session info — model, tokens, context, permission mode |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
-| `n` | sidebar | new session (enter a repo path) |
+| `n` | sidebar | new session (enter a repo path; `tab` completes directories) |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
 | `x` | sidebar | close session (worktree sessions ask keep/remove) |
@@ -109,8 +109,13 @@ the profile's shell.
 `~/.config/baude/config.json`:
 
 ```json
-{ "claude_cmd": "claude --dangerously-skip-permissions" }
+{
+  "claude_cmd": "claude --dangerously-skip-permissions",
+  "new_session_dir": "~/Code/github.com"
+}
 ```
 
 - `claude_cmd` — command to run per session, default `claude`.
-- `BAUDE_CLAUDE_CMD` env var overrides the config file.
+  `BAUDE_CLAUDE_CMD` env var overrides the config file.
+- `new_session_dir` — prefill for the `n` new-session prompt (tab-complete
+  from there); defaults to the directory baude was launched from.

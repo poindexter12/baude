@@ -20,6 +20,58 @@ fn is_backslash(code: KeyCode) -> bool {
     matches!(code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(rest)
+    } else if s == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+/// Shell-style directory completion: complete the component after the last
+/// '/' against directories on disk. Returns the new buffer (if it advanced)
+/// and the candidate list when ambiguous. The typed prefix (incl. `~/`) is
+/// preserved — only the partial component is rewritten.
+fn complete_dir_path(input: &str) -> (Option<String>, Vec<String>) {
+    let (dir_part, partial) = match input.rfind('/') {
+        Some(i) => (&input[..=i], &input[i + 1..]),
+        None => ("", input),
+    };
+    let search = if dir_part.is_empty() {
+        PathBuf::from(".")
+    } else {
+        expand_tilde(dir_part)
+    };
+    let Ok(entries) = std::fs::read_dir(&search) else {
+        return (None, vec![]);
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(partial) && (partial.starts_with('.') || !n.starts_with('.')))
+        .collect();
+    names.sort();
+    match names.len() {
+        0 => (None, vec![]),
+        1 => (Some(format!("{dir_part}{}/", names[0])), vec![]),
+        _ => {
+            let mut lcp = names[0].clone();
+            for n in &names[1..] {
+                while !n.starts_with(&lcp) {
+                    lcp.pop();
+                }
+            }
+            let advanced = (lcp.len() > partial.len()).then(|| format!("{dir_part}{lcp}"));
+            (advanced, names)
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
@@ -43,6 +95,8 @@ pub enum Modal {
         kind: InputKind,
         title: String,
         buf: String,
+        /// Tab-completion candidates shown under the input.
+        candidates: Vec<String>,
     },
     ConfirmKill {
         id: u64,
@@ -488,10 +542,18 @@ impl App {
             }
             KeyCode::Char('t') => self.toggle_shell(false),
             KeyCode::Char('n') => {
+                let buf = match &self.config.new_session_dir {
+                    Some(d) => {
+                        let d = d.trim_end_matches('/');
+                        format!("{d}/")
+                    }
+                    None => format!("{}", self.launch_dir.display()),
+                };
                 self.modal = Modal::Input {
                     kind: InputKind::NewSessionPath,
-                    title: "new session — repo path".into(),
-                    buf: format!("{}", self.launch_dir.display()),
+                    title: "new session — repo path (tab completes)".into(),
+                    buf,
+                    candidates: Vec::new(),
                 };
             }
             KeyCode::Char('w') => {
@@ -508,6 +570,7 @@ impl App {
                                 .unwrap_or_default()
                         ),
                         buf: String::new(),
+                        candidates: Vec::new(),
                     };
                 } else {
                     self.set_message("no session selected — press n to add a repo first".into());
@@ -547,13 +610,29 @@ impl App {
             Modal::Help | Modal::Info | Modal::Gsd => {
                 self.modal = Modal::None;
             }
-            Modal::Input { buf, .. } => match key.code {
+            Modal::Input {
+                kind,
+                buf,
+                candidates,
+                ..
+            } => match key.code {
                 KeyCode::Esc => self.modal = Modal::None,
                 KeyCode::Backspace => {
                     buf.pop();
+                    candidates.clear();
+                }
+                KeyCode::Tab => {
+                    if matches!(kind, InputKind::NewSessionPath) {
+                        let (completed, names) = complete_dir_path(buf);
+                        if let Some(c) = completed {
+                            *buf = c;
+                        }
+                        *candidates = names;
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     buf.push(c);
+                    candidates.clear();
                 }
                 KeyCode::Enter => {
                     let modal = std::mem::replace(&mut self.modal, Modal::None);
@@ -615,13 +694,8 @@ impl App {
         }
         match kind {
             InputKind::NewSessionPath => {
-                let expanded = if let Some(rest) = value.strip_prefix("~/") {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| PathBuf::from("/"))
-                        .join(rest)
-                } else {
-                    PathBuf::from(&value)
-                };
+                let expanded = expand_tilde(&value);
+                let expanded = expanded.canonicalize().unwrap_or(expanded);
                 if !expanded.is_dir() {
                     self.set_message(format!("not a directory: {}", expanded.display()));
                     return;

@@ -333,20 +333,35 @@ fn draw_modal(frame: &mut Frame, app: &App) {
     let area = frame.area();
     match &app.modal {
         Modal::None => {}
-        Modal::Input { title, buf, .. } => {
-            let rect = centered(area, 64, 3);
+        Modal::Input {
+            title,
+            buf,
+            candidates,
+            ..
+        } => {
+            const MAX_SHOWN: usize = 6;
+            let dim = Style::default().fg(Color::DarkGray);
+            let mut lines = vec![Line::from(vec![
+                Span::raw(buf.clone()),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ])];
+            for c in candidates.iter().take(MAX_SHOWN) {
+                lines.push(Line::from(Span::styled(format!("  {c}/"), dim)));
+            }
+            if candidates.len() > MAX_SHOWN {
+                lines.push(Line::from(Span::styled(
+                    format!("  … {} more", candidates.len() - MAX_SHOWN),
+                    dim,
+                )));
+            }
+            let rect = centered(area, 64, lines.len() as u16 + 2);
             frame.render_widget(Clear, rect);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(format!(" {title} "));
-            let input = Paragraph::new(Line::from(vec![
-                Span::raw(buf.clone()),
-                Span::styled("█", Style::default().fg(Color::Cyan)),
-            ]))
-            .block(block);
-            frame.render_widget(input, rect);
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
         Modal::ConfirmKill { id } => {
             let name = app.session(*id).map(|s| s.name.clone()).unwrap_or_default();

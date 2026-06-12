@@ -36,6 +36,9 @@ pub struct Config {
     /// Command run for each session; BAUDE_CLAUDE_CMD overrides this.
     /// Example: "claude --dangerously-skip-permissions"
     pub claude_cmd: Option<String>,
+    /// Prefill for the new-session path prompt, e.g. "~/Code/github.com".
+    /// Defaults to the directory baude was launched from.
+    pub new_session_dir: Option<String>,
 }
 
 pub fn load_config() -> Config {
