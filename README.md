@@ -216,6 +216,9 @@ docker compose exec bauded git clone <url> /repos/<name>
 open http://bauded:8642/                # the PWA, from any tailnet device
 ```
 
+**Full guide — auth-key choices, key-expiry trap, HTTPS for installing the
+PWA, updates: [docs/deploy.md](docs/deploy.md).**
+
 The container seeds `statusLine: baude statusline` into the claude config
 volume on first run (never overwriting an existing settings.json), so session
 cost, context %, and account rate limits flow into the API out of the box.
