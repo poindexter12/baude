@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -9,7 +10,7 @@ use crate::keys::encode_key;
 use crate::meta::{now_unix_ms, ClaudeMeta};
 use crate::persist::{self, Config, SavedSession, State};
 use crate::pty::{now_ms, Pty};
-use crate::session::{Session, Status};
+use crate::session::Session;
 
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
@@ -175,6 +176,15 @@ impl App {
             .unwrap_or_else(|| "claude".to_string())
     }
 
+    /// The editor launched by the sidebar `e` key: BAUDE_EDITOR_CMD env,
+    /// then config.json `editor_cmd`, then `code`.
+    fn editor_cmd(&self) -> String {
+        std::env::var("BAUDE_EDITOR_CMD")
+            .ok()
+            .or_else(|| self.config.editor_cmd.clone())
+            .unwrap_or_else(|| "code".to_string())
+    }
+
     // ---- startup / persistence ----
 
     pub fn restore(&mut self) {
@@ -202,7 +212,7 @@ impl App {
                 self.set_message(format!("start session: {e}"));
             }
         }
-        self.selected_id = self.sorted_ids().first().copied();
+        self.selected_id = self.ordered_ids().first().copied();
         self.save();
     }
 
@@ -226,25 +236,11 @@ impl App {
 
     // ---- session bookkeeping ----
 
-    /// Session ids sorted for the sidebar: waiting-for-input first (longest
-    /// wait at the top), then busy, then exited. Stable tie-break by id.
-    pub fn sorted_ids(&self) -> Vec<u64> {
-        let mut entries: Vec<(u8, u64, u64)> = self
-            .sessions
-            .iter()
-            .map(|s| {
-                let rank = match s.status() {
-                    Status::Waiting => 0u8,
-                    Status::Busy => 1,
-                    Status::Exited => 2,
-                };
-                // Longest-waiting first within a rank.
-                let key = u64::MAX - s.waiting_for_ms();
-                (rank, key, s.id)
-            })
-            .collect();
-        entries.sort();
-        entries.into_iter().map(|(_, _, id)| id).collect()
+    /// Session ids in a stable display order (creation order). The sidebar
+    /// never reorders — sessions that need your input flash in place instead,
+    /// so rows stay where your eye expects them.
+    pub fn ordered_ids(&self) -> Vec<u64> {
+        self.sessions.iter().map(|s| s.id).collect()
     }
 
     pub fn session(&self, id: u64) -> Option<&Session> {
@@ -352,7 +348,7 @@ impl App {
         }
         self.sessions.retain(|s| s.id != id);
         if self.selected_id == Some(id) {
-            self.selected_id = self.sorted_ids().first().copied();
+            self.selected_id = self.ordered_ids().first().copied();
         }
         self.focus = Focus::Sidebar;
         self.save();
@@ -439,32 +435,33 @@ impl App {
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // ctrl+q: step out to the sidebar from anywhere.
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // Global chords — identical in every focus, so muscle memory carries
+        // across the sidebar and the panes.
         if ctrl && matches!(key.code, KeyCode::Char('q')) {
+            // step out to the sidebar from anywhere
             self.focus = Focus::Sidebar;
+            return;
+        }
+        if ctrl && is_backslash(key.code) {
+            // toggle the shell pane from anywhere; opening focuses it
+            self.toggle_shell(true);
+            return;
+        }
+        if alt && matches!(key.code, KeyCode::Left) {
+            self.cycle_session(-1);
+            return;
+        }
+        if alt && matches!(key.code, KeyCode::Right) {
+            self.cycle_session(1);
             return;
         }
 
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
-            Focus::Claude => {
-                if ctrl && is_backslash(key.code) {
-                    self.toggle_shell(true);
-                    return;
-                }
-                self.forward_key(key, false);
-            }
-            Focus::Shell => {
-                if ctrl && is_backslash(key.code) {
-                    if let Some(s) = self.selected_mut() {
-                        s.shell_open = false;
-                    }
-                    self.focus = Focus::Claude;
-                    self.save();
-                    return;
-                }
-                self.forward_key(key, true);
-            }
+            Focus::Claude => self.forward_key(key, false),
+            Focus::Shell => self.forward_key(key, true),
         }
     }
 
@@ -540,7 +537,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('t') => self.toggle_shell(false),
+            KeyCode::Char('t') => self.toggle_shell(true),
+            KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('n') => {
                 let buf = match &self.config.new_session_dir {
                     Some(d) => {
@@ -731,7 +729,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i64) {
-        let ids = self.sorted_ids();
+        let ids = self.ordered_ids();
         if ids.is_empty() {
             return;
         }
@@ -741,6 +739,59 @@ impl App {
             .unwrap_or(0) as i64;
         let next = (cur + delta).clamp(0, ids.len() as i64 - 1) as usize;
         self.selected_id = Some(ids[next]);
+    }
+
+    /// Cycle the selection to the next/prev session in sidebar order,
+    /// wrapping around. When attached, stays attached to the same kind of
+    /// pane — falling back to the claude pane if the new session has no shell.
+    fn cycle_session(&mut self, delta: i64) {
+        let ids = self.ordered_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let len = ids.len() as i64;
+        let cur = self
+            .selected_id
+            .and_then(|id| ids.iter().position(|&x| x == id))
+            .unwrap_or(0) as i64;
+        let next = (((cur + delta) % len) + len) % len;
+        self.selected_id = Some(ids[next as usize]);
+        if self.focus == Focus::Shell {
+            let has_shell = self
+                .selected()
+                .map(|s| s.shell_open && s.shell.is_some())
+                .unwrap_or(false);
+            if !has_shell {
+                self.focus = Focus::Claude;
+            }
+        }
+    }
+
+    /// Launch the configured editor on the selected session's folder.
+    /// Detached, with no inherited stdio, so a GUI editor (the `code` default)
+    /// doesn't disturb the TUI.
+    fn open_editor(&mut self) {
+        let Some(cwd) = self.selected().map(|s| s.cwd.clone()) else {
+            self.set_message("no session selected".into());
+            return;
+        };
+        let cmd = self.editor_cmd();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        // `sh -c '<cmd> "$1"' sh <cwd>` keeps args in editor_cmd intact and
+        // safely passes a path that may contain spaces.
+        match Command::new("sh")
+            .arg("-c")
+            .arg(format!("{cmd} \"$1\""))
+            .arg("sh")
+            .arg(&cwd_str)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.set_message(format!("opening {cmd}")),
+            Err(e) => self.set_message(format!("editor: {e}")),
+        }
     }
 
     fn toggle_shell(&mut self, focus_it: bool) {

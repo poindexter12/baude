@@ -4,9 +4,10 @@ A TUI for running multiple Claude Code sessions in one terminal.
 
 Start it from any git repo and it spawns a `claude` session there. Add more
 repos, or spin up isolated git-worktree sessions for parallel work in the same
-repo. A shell pane at the session's folder is one keystroke away. The sidebar
-sorts sessions by **who is waiting for your input** — longest-waiting on top,
-with a wait timer — so you always know which session needs you next.
+repo. A shell pane at the session's folder is one keystroke away. Sessions
+hold a stable order in the sidebar — when one is **waiting for your input** it
+flashes in place (with a wait timer) instead of jumping around, so the list
+stays where your eye expects it while still telling you who needs you next.
 
 Each session also surfaces live Claude Code metadata — model, context usage,
 permission mode, token counts, and GSD project state — read from the artifacts
@@ -50,15 +51,18 @@ recent conversation via `claude --continue`.
 
 ## Keys
 
-Two chords total; everything else passes straight through to Claude.
+A few global chords work the same everywhere; everything else passes straight
+through to Claude.
 
 | Key | Where | Action |
 |-----|-------|--------|
 | `ctrl+q` | anywhere | step out to the sidebar |
-| `ctrl+\` | attached | toggle shell pane (opening focuses it) |
+| `ctrl+\` | anywhere | toggle shell pane (opening focuses it) |
+| `alt+←/→` | anywhere | cycle to the prev/next session (wraps) |
 | `enter` | sidebar | attach to selected session |
 | `j/k` `↑/↓` | sidebar | select session |
-| `t` | sidebar | toggle shell pane |
+| `t` | sidebar | open shell pane (focuses it) |
+| `e` | sidebar | open the session folder in your editor (`editor_cmd`, default `code`) |
 | `i` | sidebar | session info — model, tokens, context, permission mode |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
 | `n` | sidebar | new session (enter a repo path; `tab` completes directories) |
@@ -68,10 +72,14 @@ Two chords total; everything else passes straight through to Claude.
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
 
-## Status icons (sidebar sort order)
+`alt+←/→` needs your terminal to send Option/Alt as a modifier — on macOS
+Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
+this chord shadows Claude's own alt+←/→ word navigation.
 
-- `●` waiting for your input — sorted to the top, longest wait first
-- `◐` working
+## Status icons
+
+- `●` waiting for your input — flashes in place, with a wait timer
+- `◐` working — animated spinner
 - `✗` exited (`r` to restart)
 
 Waiting is detected from PTY output silence: Claude streams spinner output
@@ -111,7 +119,8 @@ the profile's shell.
 ```json
 {
   "claude_cmd": "claude --dangerously-skip-permissions",
-  "new_session_dir": "~/Code/github.com"
+  "new_session_dir": "~/Code/github.com",
+  "editor_cmd": "code"
 }
 ```
 
@@ -119,3 +128,6 @@ the profile's shell.
   `BAUDE_CLAUDE_CMD` env var overrides the config file.
 - `new_session_dir` — prefill for the `n` new-session prompt (tab-complete
   from there); defaults to the directory baude was launched from.
+- `editor_cmd` — command the sidebar `e` key runs on a session's folder
+  (the folder path is appended), default `code`. `BAUDE_EDITOR_CMD` env var
+  overrides the config file.

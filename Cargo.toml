@@ -1,6 +1,6 @@
 [package]
 name = "baude"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A TUI for running multiple Claude Code sessions in one terminal"
 license = "MIT"

@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal};
 use crate::meta::{human_tokens, short_mode, short_model};
-use crate::pty::Pty;
+use crate::pty::{now_ms, Pty};
 use crate::session::{human_duration, Session, Status};
 
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -58,6 +58,38 @@ fn border_style(focused: bool) -> Style {
     }
 }
 
+/// A rotating quarter-circle spinner, advanced by the wall clock so "working"
+/// sessions visibly animate.
+fn spinner() -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    FRAMES[((now_ms() / 130) % 4) as usize]
+}
+
+/// ~1.4 Hz on/off phase used to flash sessions that want your input.
+fn flash_on() -> bool {
+    (now_ms() / 360).is_multiple_of(2)
+}
+
+/// 2-column left gutter: a cyan accent bar on the selected session, blank
+/// otherwise. Keeps every row aligned whether selected or not.
+fn gutter(selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled("▌ ", Style::default().fg(Color::Cyan))
+    } else {
+        Span::raw("  ")
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".into();
+    }
+    s.chars().take(max - 1).collect::<String>() + "…"
+}
+
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -67,64 +99,86 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let list_area = block.inner(area);
     frame.render_widget(block, area);
 
+    let ids = app.ordered_ids();
+    if ids.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(Span::styled("  no sessions yet", dim)),
+                Line::from(Span::styled("  press n to add one", dim)),
+            ]),
+            list_area,
+        );
+        return;
+    }
+
+    let width = list_area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for id in app.sorted_ids() {
-        let Some(s) = app.session(id) else { continue };
-        let selected = app.selected_id == Some(id);
-        let (icon, icon_style, suffix) = match s.status() {
-            Status::Waiting => (
-                "●",
-                Style::default().fg(Color::Yellow),
-                format!(" {}", human_duration(s.waiting_for_ms())),
-            ),
-            Status::Busy => ("◐", Style::default().fg(Color::Blue), String::new()),
-            Status::Exited => ("✗", Style::default().fg(Color::DarkGray), String::new()),
+    for id in &ids {
+        let Some(s) = app.session(*id) else { continue };
+        let selected = app.selected_id == Some(*id);
+        let status = s.status();
+        let flash = flash_on();
+
+        let (icon, icon_style) = match status {
+            Status::Waiting => {
+                // pulse the dot to pull the eye to a session that needs you
+                let c = if flash { Color::Yellow } else { Color::DarkGray };
+                ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
+            }
+            Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
+            Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
         };
-        let name_style = if selected {
+
+        let name_style = if matches!(status, Status::Exited) {
+            Style::default().fg(Color::DarkGray)
+        } else if selected {
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
-        } else if matches!(s.status(), Status::Exited) {
-            Style::default().fg(Color::DarkGray)
+        } else if status == Status::Waiting {
+            // flash the name too, so a waiting session is unmissable
+            Style::default().fg(if flash { Color::Yellow } else { Color::Gray })
         } else {
             Style::default().fg(Color::Gray)
         };
-        let marker = if selected { "▸ " } else { "  " };
-        let max_name = list_area.width.saturating_sub(6 + suffix.len() as u16) as usize;
-        let mut name = s.name.clone();
-        if name.chars().count() > max_name && max_name > 1 {
-            name = name
-                .chars()
-                .take(max_name.saturating_sub(1))
-                .collect::<String>()
-                + "…";
-        }
-        lines.push(Line::from(vec![
-            Span::styled(marker, name_style),
+
+        let suffix = if status == Status::Waiting {
+            human_duration(s.waiting_for_ms())
+        } else {
+            String::new()
+        };
+        let suffix_w = suffix.chars().count();
+        // gutter(2) + icon(1) + space(1) = 4; reserve a space before the timer.
+        let reserve = if suffix.is_empty() { 0 } else { suffix_w + 1 };
+        let name = truncate(&s.name, width.saturating_sub(4 + reserve).max(1));
+        let used = 4 + name.chars().count() + suffix_w;
+        let pad = width.saturating_sub(used);
+
+        let mut spans = vec![
+            gutter(selected),
             Span::styled(icon.to_string(), icon_style),
             Span::raw(" "),
             Span::styled(name, name_style),
-            Span::styled(suffix, Style::default().fg(Color::Yellow)),
-        ]));
-        lines.push(meta_line(s));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no sessions",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  press n to add",
-            Style::default().fg(Color::DarkGray),
-        )));
+        ];
+        if !suffix.is_empty() {
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(
+                suffix,
+                Style::default().fg(if flash { Color::Yellow } else { Color::DarkGray }),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(meta_line(s, selected));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
 /// Compact second sidebar line: model · context% · permission mode · gsd phase.
-fn meta_line(s: &Session) -> Line<'static> {
+fn meta_line(s: &Session, selected: bool) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
-    let mut spans: Vec<Span> = vec![Span::styled("  ", dim)];
+    let mut spans: Vec<Span> = vec![gutter(selected)];
     let push = |spans: &mut Vec<Span>, text: String, style: Style| {
         if spans.len() > 1 {
             spans.push(Span::styled(" ", dim));
@@ -308,10 +362,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let hints = match app.focus {
             Focus::Sidebar => {
-                " enter attach · j/k select · t shell · i info · g gsd · n new · w worktree · r restart · x close · ? help · q quit"
+                " enter attach · j/k select · alt+←/→ cycle · t shell · e edit · i info · g gsd · n new · w worktree · r restart · x close · ? help · q quit"
             }
-            Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell",
-            Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell",
+            Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
+            Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
         };
         Line::from(Span::styled(hints, Style::default().fg(Color::DarkGray)))
     };
@@ -544,7 +598,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 58, 20);
+            let rect = centered(area, 60, 25);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -554,7 +608,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 )),
                 Line::raw("  j/k ↑/↓     select session"),
                 Line::raw("  enter       attach to selected session"),
-                Line::raw("  t           toggle shell pane"),
+                Line::raw("  t           open shell pane (focuses it)"),
+                Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
                 Line::raw("  g           gsd project state"),
                 Line::raw("  n           new session (repo path)"),
@@ -564,11 +619,12 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "attached to a session",
+                    "global (any pane)",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::raw("  ctrl+q      back to sidebar"),
                 Line::raw("  ctrl+\\      toggle shell pane (focuses it)"),
+                Line::raw("  alt+←/→     cycle prev/next session"),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "status (sidebar sort order)",
