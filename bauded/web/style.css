@@ -128,6 +128,42 @@ header .iconbtn.danger { color: var(--red); }
 #typing { color: var(--dim); font-size: 13px; padding: 0 16px 8px; }
 #typing .dot.busy { color: var(--blue); }
 
+/* ---- terminal peek drawer ---- */
+header .iconbtn.active { background: var(--panel2); }
+#screen {
+  border-top: 1px solid var(--border);
+  background: #07090e;
+  max-height: 45vh;
+  display: flex;
+  flex-direction: column;
+}
+#screen pre {
+  flex: 1;
+  overflow: auto;
+  font: 10.5px/1.25 var(--mono);
+  color: #aab3c5;
+  padding: 8px 10px;
+  white-space: pre;
+}
+#screen .keys {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px;
+  overflow-x: auto;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+#screen .key {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font: 14px var(--mono);
+  padding: 7px 13px;
+  white-space: nowrap;
+}
+#screen .key:active { background: var(--border); }
+
 /* ---- composer ---- */
 #composer {
   display: flex;

@@ -294,6 +294,49 @@ impl Manager {
         Ok(s.meta.transcript_path().map(Path::to_path_buf))
     }
 
+    /// Plain-text snapshot of the session's terminal — the escape hatch for
+    /// the rare interactive menu that the chat surface can't represent.
+    pub fn screen(&self, id: u64) -> Result<Screenshot> {
+        let s = self.session(id)?;
+        let parser = s
+            .claude
+            .parser
+            .lock()
+            .map_err(|_| anyhow!("screen unavailable"))?;
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let (cur_row, cur_col) = screen.cursor_position();
+        Ok(Screenshot {
+            text: screen.contents(),
+            rows,
+            cols,
+            cursor: [cur_row, cur_col],
+        })
+    }
+
+    /// Send named keys (and literal text) straight into the PTY — pairs with
+    /// `screen` to drive menus. Small gaps between keys so Claude's input
+    /// coalescing treats each as a distinct keypress.
+    pub fn send_keys(&mut self, id: u64, keys: &[String]) -> Result<()> {
+        let s = self.session_mut(id)?;
+        if s.claude.is_exited() {
+            bail!("claude has exited");
+        }
+        let app_cursor = s
+            .claude
+            .parser
+            .lock()
+            .map(|p| p.screen().application_cursor())
+            .unwrap_or(false);
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            s.claude.write_input(&key_bytes(key, app_cursor));
+        }
+        Ok(())
+    }
+
     pub fn list(&self) -> Vec<SessionInfo> {
         self.sessions.iter().map(session_info).collect()
     }
@@ -326,6 +369,50 @@ impl Manager {
             .iter_mut()
             .find(|s| s.id == id)
             .ok_or_else(|| anyhow!("no session {id}"))
+    }
+}
+
+/// `GET /sessions/{id}/screen` payload.
+#[derive(Serialize)]
+pub struct Screenshot {
+    pub text: String,
+    pub rows: u16,
+    pub cols: u16,
+    /// (row, col), 0-based.
+    pub cursor: [u16; 2],
+}
+
+/// Map a key name to the bytes a terminal would send. Unrecognized names are
+/// sent literally, so `["y"]` types y and `["down","enter"]` drives a menu.
+fn key_bytes(key: &str, app_cursor: bool) -> Vec<u8> {
+    let arrow = |c: u8| {
+        if app_cursor {
+            vec![0x1b, b'O', c]
+        } else {
+            vec![0x1b, b'[', c]
+        }
+    };
+    match key {
+        "up" => arrow(b'A'),
+        "down" => arrow(b'B'),
+        "right" => arrow(b'C'),
+        "left" => arrow(b'D'),
+        "enter" => vec![b'\r'],
+        "esc" => vec![0x1b],
+        "tab" => vec![b'\t'],
+        "shift+tab" => b"\x1b[Z".to_vec(),
+        "space" => vec![b' '],
+        "backspace" => vec![0x7f],
+        k => match k.strip_prefix("ctrl+").and_then(|r| {
+            let mut chars = r.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_lowercase() => Some(c as u8 - b'a' + 1),
+                _ => None,
+            }
+        }) {
+            Some(b) => vec![b],
+            None => k.as_bytes().to_vec(),
+        },
     }
 }
 

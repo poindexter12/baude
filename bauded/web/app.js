@@ -16,6 +16,9 @@ const state = {
   online: true,
   pollTimer: null,
   tickTimer: null,
+  screenOpen: false,
+  screenText: "",
+  screenTimer: null,
 };
 
 // ---- helpers ----
@@ -83,6 +86,9 @@ function route() {
     state.sid = sid;
     state.msgs = [];
     state.seen = new Set();
+    state.screenOpen = false;
+    state.screenText = "";
+    clearInterval(state.screenTimer);
     if (sid !== null) openChat(sid);
   }
   render();
@@ -191,6 +197,40 @@ async function interrupt() {
     toast("sent esc");
   } catch (e) {
     toast(`interrupt failed: ${e.message}`);
+  }
+}
+
+// ---- terminal peek ----
+
+async function pollScreen() {
+  if (!state.screenOpen || state.sid === null) return;
+  try {
+    const shot = await api(`/sessions/${state.sid}/screen`);
+    if (shot.text !== state.screenText) {
+      state.screenText = shot.text;
+      const pre = document.getElementById("screentext");
+      if (pre) pre.textContent = shot.text;
+    }
+  } catch { /* session gone; list poll will redirect */ }
+}
+
+function toggleScreen() {
+  state.screenOpen = !state.screenOpen;
+  clearInterval(state.screenTimer);
+  if (state.screenOpen) {
+    pollScreen();
+    state.screenTimer = setInterval(pollScreen, 2000);
+  }
+  render();
+}
+
+async function sendKey(key) {
+  if (state.sid === null) return;
+  try {
+    await api(`/sessions/${state.sid}/keys`, { method: "POST", body: JSON.stringify({ keys: [key] }) });
+    setTimeout(pollScreen, 300);
+  } catch (e) {
+    toast(`key failed: ${e.message}`);
   }
 }
 
@@ -316,24 +356,42 @@ function renderChat() {
   const chatEl = document.getElementById("chat");
   const atBottom = chatEl ? chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 160 : true;
 
+  const KEYS = [
+    ["↑", "up"], ["↓", "down"], ["←", "left"], ["→", "right"],
+    ["⇥", "tab"], ["⇧⇥", "shift+tab"], ["↵", "enter"], ["esc", "esc"],
+  ];
+  const screenDrawer = !state.screenOpen ? "" : `
+    <div id="screen">
+      <pre id="screentext">${esc(state.screenText)}</pre>
+      <div class="keys">
+        ${KEYS.map(([label, k]) => `<button class="key" data-key="${k}">${label}</button>`).join("")}
+      </div>
+    </div>`;
+
   $app.innerHTML = `
     <header>
       <button class="iconbtn" id="backbtn" aria-label="back">‹</button>
       <h1>${esc(name)}<span class="sub">${esc(sub)}</span></h1>
+      <button class="iconbtn${state.screenOpen ? " active" : ""}" id="screenbtn" title="terminal peek">▦</button>
       <button class="iconbtn" id="escbtn" title="interrupt (esc)">⎋</button>
       <button class="iconbtn danger" id="killbtn" title="kill session">✕</button>
     </header>
     ${conn}
     <div id="chat">${state.msgs.map(msgHtml).join("")}</div>
     ${typing}
+    ${screenDrawer}
     <form id="composer">
       <textarea id="input" rows="1" placeholder="message claude…" enterkeyhint="send"></textarea>
       <button type="submit" class="send">send</button>
     </form>`;
 
   document.getElementById("backbtn").onclick = () => { location.hash = "#/"; };
+  document.getElementById("screenbtn").onclick = toggleScreen;
   document.getElementById("escbtn").onclick = interrupt;
   document.getElementById("killbtn").onclick = deleteSession;
+  for (const el of document.querySelectorAll("#screen .key")) {
+    el.onclick = () => sendKey(el.dataset.key);
+  }
   document.getElementById("composer").onsubmit = (e) => { e.preventDefault(); sendMessage(); };
   const ta = document.getElementById("input");
   ta.oninput = () => {
