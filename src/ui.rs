@@ -5,9 +5,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal};
-use crate::meta::{human_tokens, short_mode, short_model};
+use crate::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
 use crate::pty::{now_ms, Pty};
 use crate::session::{human_duration, Session, Status};
+use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 28;
 
@@ -99,6 +100,26 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let list_area = block.inner(area);
     frame.render_widget(block, area);
 
+    // Carve a usage footer off the bottom of the sidebar when there's room.
+    const FOOTER_H: u16 = 6;
+    let (list_area, footer_area) = if list_area.height >= FOOTER_H + 4 {
+        let footer = Rect {
+            y: list_area.y + list_area.height - FOOTER_H,
+            height: FOOTER_H,
+            ..list_area
+        };
+        let list = Rect {
+            height: list_area.height - FOOTER_H,
+            ..list_area
+        };
+        (list, Some(footer))
+    } else {
+        (list_area, None)
+    };
+    if let Some(fa) = footer_area {
+        draw_usage_footer(frame, app, fa);
+    }
+
     let ids = app.ordered_ids();
     if ids.is_empty() {
         let dim = Style::default().fg(Color::DarkGray);
@@ -181,6 +202,66 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(meta_line(s, selected));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// Color a usage percentage: green → yellow (60%) → red (85%).
+fn pct_style(pct: f64) -> Style {
+    if pct >= 85.0 {
+        Style::default().fg(Color::Red)
+    } else if pct >= 60.0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    }
+}
+
+/// `label ▓▓▓▓░░░░░░ 47%` gauge row for a rate-limit window.
+fn rate_line(label: &str, w: Option<RateWindow>, width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let Some(pct) = w.and_then(|w| w.used_pct) else {
+        return Line::from(vec![
+            Span::styled(format!(" {label} "), dim),
+            Span::styled("—", dim),
+        ]);
+    };
+    let bar_w = width.saturating_sub(label.len() + 7).clamp(4, 12);
+    let filled = ((pct / 100.0) * bar_w as f64).round() as usize;
+    Line::from(vec![
+        Span::styled(format!(" {label} "), dim),
+        Span::styled("▓".repeat(filled.min(bar_w)), pct_style(pct)),
+        Span::styled("░".repeat(bar_w - filled.min(bar_w)), dim),
+        Span::styled(format!(" {:>3.0}%", pct), pct_style(pct)),
+    ])
+}
+
+/// Sidebar footer: session/today/week cost + account rate-limit gauges.
+fn draw_usage_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    let width = area.width as usize;
+
+    let cost_row = |label: &str, cost: String| {
+        let pad = width.saturating_sub(2 + label.len() + cost.len());
+        Line::from(vec![
+            Span::styled(format!(" {label}"), dim),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(cost, val),
+        ])
+    };
+
+    let costs = app.usage_costs();
+    let session_cost = app.selected().and_then(|s| s.meta.session_cost_usd);
+    let (r5h, rweek) = app.rate_limits();
+
+    let lines = vec![
+        Line::from(Span::styled("─".repeat(width), dim)),
+        cost_row("sess", human_cost(session_cost)),
+        cost_row("today", human_cost(costs.today_usd)),
+        cost_row("week", human_cost(costs.week_usd)),
+        rate_line("5h", r5h, width),
+        rate_line("wk", rweek, width),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Compact second sidebar line: model · context% · permission mode · gsd phase.
@@ -361,23 +442,81 @@ fn draw_term(frame: &mut Frame, area: Rect, pty: &Pty, focused: bool) {
     }
 }
 
+/// Shorten a path for display: home → `~`.
+fn tilde_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    match dirs::home_dir() {
+        Some(h) => {
+            let h = h.display().to_string();
+            s.strip_prefix(&h)
+                .map(|rest| format!("~{rest}"))
+                .unwrap_or(s)
+        }
+        None => s,
+    }
+}
+
+/// Status bar: `hints │ ~/path ⎇ branch` with right-aligned session counts
+/// and rate-limit reset times. Transient messages take over the whole bar.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some((msg, _)) = &app.message {
-        Line::from(Span::styled(
+    if let Some((msg, _)) = &app.message {
+        let line = Line::from(Span::styled(
             format!(" {msg}"),
             Style::default().fg(Color::Black).bg(Color::Yellow),
-        ))
-    } else {
-        let hints = match app.focus {
-            Focus::Sidebar => {
-                " enter attach · j/k select · alt+←/→ cycle · t shell · e edit · i info · g gsd · n new · w worktree · r restart · x close · ? help · q quit"
-            }
-            Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
-            Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
-        };
-        Line::from(Span::styled(hints, Style::default().fg(Color::DarkGray)))
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    let width = area.width as usize;
+
+    let hints = match app.focus {
+        Focus::Sidebar => " enter attach · n new · t shell · e edit · ? help",
+        Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
+        Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
     };
-    frame.render_widget(Paragraph::new(line), area);
+
+    let mut spans: Vec<Span> = vec![Span::styled(hints.to_string(), dim)];
+    let mut used = hints.chars().count();
+
+    // Selected session's full path + branch — too wide for the sidebar.
+    if let Some(s) = app.selected() {
+        let mut loc = format!(" │ {}", tilde_path(&s.cwd));
+        if let Some(b) = s.branch.as_deref().or(s.meta.git_branch.as_deref()) {
+            loc.push_str(&format!(" ⎇ {b}"));
+        }
+        if used + loc.chars().count() <= width {
+            used += loc.chars().count();
+            spans.push(Span::styled(loc, val));
+        }
+    }
+
+    // Right side: who needs you, and when the limits refill.
+    let (waiting, busy) = app.status_counts();
+    let mut right: Vec<String> = Vec::new();
+    if waiting > 0 {
+        right.push(format!("● {waiting} waiting"));
+    }
+    if busy > 0 {
+        right.push(format!("◐ {busy} busy"));
+    }
+    let (r5h, rweek) = app.rate_limits();
+    if let Some(t) = r5h.and_then(|w| w.resets_at_unix_s) {
+        right.push(format!("5h resets {}", human_until(t)));
+    }
+    if let Some(t) = rweek.and_then(|w| w.resets_at_unix_s) {
+        right.push(format!("wk {}", human_until(t)));
+    }
+    let right = right.join(" · ");
+    if !right.is_empty() && used + right.chars().count() + 2 <= width {
+        let pad = width - used - right.chars().count() - 1;
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(right, dim));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

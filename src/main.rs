@@ -1,4 +1,5 @@
 mod app;
+mod bridge;
 mod git;
 mod keys;
 mod meta;
@@ -6,6 +7,7 @@ mod persist;
 mod pty;
 mod session;
 mod ui;
+mod usage;
 
 use std::io::stdout;
 use std::time::Duration;
@@ -25,6 +27,19 @@ fn restore_terminal() {
 }
 
 fn main() -> Result<()> {
+    // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
+    // Must be dispatched before anything touches the terminal: Claude Code
+    // invokes it headless on every statusline refresh.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("statusline") {
+        let wrap = args
+            .iter()
+            .position(|a| a == "--wrap")
+            .and_then(|i| args.get(i + 1))
+            .cloned();
+        std::process::exit(bridge::run(wrap));
+    }
+
     let launch_dir = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)

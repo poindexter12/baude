@@ -92,6 +92,41 @@ continuously while working, so ~2s of quiet means it's your turn.
 Closing a worktree session asks whether to keep or remove the worktree;
 worktrees with uncommitted changes are never removed.
 
+## Usage panel
+
+The bottom of the sidebar shows what you're consuming, and the status bar
+shows when the limits refill:
+
+```
+│ ──────────────────────│
+│ sess            $1.23 │   selected session cost (live)
+│ today          $63.58 │   all Claude usage today      (ccusage)
+│ week          $104.05 │   all Claude usage this week  (ccusage)
+│ 5h ▓▓▓▓▓░░░░░ 47%     │   5-hour block — real account rate limit
+│ wk ▓▓▓░░░░░░░ 32%     │   weekly window — real account rate limit
+╰───────────────────────╯
+ hints │ ~/code/api ⎇ main      ● 2 waiting · 5h resets in 46m · wk in 10d
+```
+
+- **today/week cost** — from [`ccusage`](https://ccusage.com), polled on a
+  background thread every minute. Shows `—` if ccusage isn't installed.
+- **session cost + rate-limit %** — Claude Code only exposes these in the
+  JSON it pipes to statusLine commands, so baude ships a bridge:
+  `baude statusline` captures the payload to `/tmp/baude-usage-<sid>.json`
+  and delegates to your real statusline unchanged. Wire it in
+  `$CLAUDE_CONFIG_DIR/settings.json`:
+
+  ```json
+  "statusLine": {
+    "type": "command",
+    "command": "baude statusline --wrap '<your existing statusline command>'"
+  }
+  ```
+
+  No `--wrap` works too (bridge only, no rendered line). Rate-limit data is
+  only sent for Pro/Max subscribers, and only after a session's first
+  response — rows show `—` until then.
+
 ## Session metadata
 
 The second sidebar line and the `i`/`g` overlays are populated from what

@@ -7,10 +7,11 @@ use ratatui::layout::Rect;
 
 use crate::git;
 use crate::keys::encode_key;
-use crate::meta::{now_unix_ms, ClaudeMeta};
+use crate::meta::{now_unix_ms, ClaudeMeta, RateWindow};
 use crate::persist::{self, Config, SavedSession, State};
 use crate::pty::{now_ms, Pty};
-use crate::session::Session;
+use crate::session::{Session, Status};
+use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
@@ -119,6 +120,7 @@ pub struct App {
     content_rect: Rect,
     next_id: u64,
     last_meta_poll: u64,
+    usage: UsagePoller,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -164,7 +166,41 @@ impl App {
             content_rect: Rect::new(0, 0, 80, 24),
             next_id: 1,
             last_meta_poll: 0,
+            usage: UsagePoller::start(),
         }
+    }
+
+    /// Cached today/week costs from the ccusage background poller.
+    pub fn usage_costs(&self) -> UsageCosts {
+        self.usage.costs()
+    }
+
+    /// Freshest account rate-limit windows across all sessions (they're
+    /// account-wide; whichever session's bridge file updated last wins).
+    pub fn rate_limits(&self) -> (Option<RateWindow>, Option<RateWindow>) {
+        let newest = self
+            .sessions
+            .iter()
+            .max_by_key(|s| s.meta.rate_updated_unix_ms)
+            .map(|s| &s.meta);
+        match newest {
+            Some(m) => (m.rate_5h, m.rate_week),
+            None => (None, None),
+        }
+    }
+
+    /// (waiting, busy) session counts for the status bar.
+    pub fn status_counts(&self) -> (usize, usize) {
+        let mut waiting = 0;
+        let mut busy = 0;
+        for s in &self.sessions {
+            match s.status() {
+                Status::Waiting => waiting += 1,
+                Status::Busy => busy += 1,
+                Status::Exited => {}
+            }
+        }
+        (waiting, busy)
     }
 
     /// The command run for each session: BAUDE_CLAUDE_CMD env, then

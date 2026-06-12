@@ -43,6 +43,14 @@ pub struct Usage {
     pub cache_create: u64,
 }
 
+/// One account rate-limit window (5-hour block or 7-day) as captured from
+/// the statusline payload by `baude statusline`.
+#[derive(Default, Clone, Copy)]
+pub struct RateWindow {
+    pub used_pct: Option<f64>,
+    pub resets_at_unix_s: Option<u64>,
+}
+
 #[derive(Default, Clone)]
 pub struct GsdState {
     pub milestone: Option<String>,
@@ -66,6 +74,15 @@ pub struct ClaudeMeta {
     /// (busy, status_updated_at unix ms) from Claude's own session file.
     pub claude_status: Option<(bool, u64)>,
     pub gsd: Option<GsdState>,
+    /// Live session cost from the `baude statusline` bridge file.
+    pub session_cost_usd: Option<f64>,
+    /// Account rate-limit windows from the bridge file, with the bridge's
+    /// write timestamp so the freshest session wins across the app.
+    pub rate_5h: Option<RateWindow>,
+    pub rate_week: Option<RateWindow>,
+    pub rate_updated_unix_ms: u64,
+    /// Current git branch of the session's cwd (read from .git/HEAD).
+    pub git_branch: Option<String>,
 }
 
 impl ClaudeMeta {
@@ -73,8 +90,12 @@ impl ClaudeMeta {
         self.poll_session_file(cwd, pid, spawn_unix_ms);
         self.resolve_transcript(cwd, spawn_unix_ms);
         self.read_transcript_tail();
+        // GSD ctx file first; the baude bridge file overrides when present
+        // (it carries Claude's exact used_percentage).
         self.read_context_file();
+        self.read_bridge_file();
         self.gsd = parse_gsd(repo_root);
+        self.git_branch = read_git_branch(cwd);
     }
 
     /// Find this session's `sessions/<pid>.json`. Exact pid match wins
@@ -198,6 +219,37 @@ impl ClaudeMeta {
         self.offset += consumed as u64;
     }
 
+    /// Usage bridge file written by `baude statusline`:
+    /// /tmp/baude-usage-<sessionId>.json — session cost, context %, and the
+    /// account rate-limit windows (the only local source for those).
+    fn read_bridge_file(&mut self) {
+        let Some(sid) = &self.session_id else {
+            return;
+        };
+        let Some(v) = read_json(&PathBuf::from(crate::bridge::bridge_path(sid))) else {
+            return;
+        };
+        if let Some(cost) = v["cost_usd"].as_f64() {
+            self.session_cost_usd = Some(cost);
+        }
+        if let Some(pct) = v["context_used_pct"].as_f64() {
+            self.context_used_pct = Some((pct.round() as u64).min(100) as u8);
+        }
+        self.rate_updated_unix_ms = v["updated_unix_ms"].as_u64().unwrap_or(0);
+        let window = |w: &Value| -> Option<RateWindow> {
+            w.is_object().then(|| RateWindow {
+                used_pct: w["used_pct"].as_f64(),
+                resets_at_unix_s: w["resets_at"].as_u64(),
+            })
+        };
+        if let Some(w) = window(&v["five_hour"]) {
+            self.rate_5h = Some(w);
+        }
+        if let Some(w) = window(&v["seven_day"]) {
+            self.rate_week = Some(w);
+        }
+    }
+
     /// Context usage bridge file written by statusline hooks (e.g. the GSD
     /// statusline): /tmp/claude-ctx-<sessionId>.json.
     fn read_context_file(&mut self) {
@@ -280,6 +332,49 @@ pub fn parse_gsd(repo_root: &Path) -> Option<GsdState> {
         }
     }
     Some(g)
+}
+
+/// Current branch from .git/HEAD without spawning git. Handles worktrees,
+/// where `.git` is a file pointing at the real gitdir.
+fn read_git_branch(cwd: &Path) -> Option<String> {
+    let mut dir = cwd.to_path_buf();
+    let head = loop {
+        let dotgit = dir.join(".git");
+        if dotgit.is_dir() {
+            break dotgit.join("HEAD");
+        }
+        if dotgit.is_file() {
+            // worktree: "gitdir: /path/to/main/.git/worktrees/<name>"
+            let text = fs::read_to_string(&dotgit).ok()?;
+            let gitdir = text.strip_prefix("gitdir:")?.trim();
+            break PathBuf::from(gitdir).join("HEAD");
+        }
+        if !dir.pop() {
+            return None;
+        }
+    };
+    let head = fs::read_to_string(head).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(|b| b.to_string())
+        .or(Some("detached".into()))
+}
+
+/// "in 46m" / "in 3d 4h" until a unix-seconds timestamp.
+pub fn human_until(unix_s: u64) -> String {
+    let now_s = now_unix_ms() / 1000;
+    let secs = unix_s.saturating_sub(now_s);
+    if secs == 0 {
+        return "now".into();
+    }
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("in {d}d {h}h")
+    } else if h > 0 {
+        format!("in {h}h {m}m")
+    } else {
+        format!("in {}m", m.max(1))
+    }
 }
 
 pub fn human_tokens(n: u64) -> String {
