@@ -200,3 +200,163 @@ async fn stream(
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::manager::Manager;
+
+    fn app() -> axum::Router {
+        super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))))
+    }
+
+    async fn body_json(res: axum::response::Response) -> serde_json::Value {
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::get(path).body(Body::empty()).unwrap()
+    }
+
+    fn post_json(path: &str, json: &str) -> Request<Body> {
+        Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_starts_empty() {
+        let res = app().oneshot(get("/sessions")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_404() {
+        let app = app();
+        for req in [
+            get("/sessions/9"),
+            get("/sessions/9/messages"),
+            get("/sessions/9/screen"),
+            Request::delete("/sessions/9").body(Body::empty()).unwrap(),
+            post_json("/sessions/9/interrupt", ""),
+            post_json("/sessions/9/keys", r#"{"keys":["enter"]}"#),
+        ] {
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{:?}", res);
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_requests_are_400() {
+        let app = app();
+        let res = app
+            .clone()
+            .oneshot(post_json("/sessions", r#"{"repo":"/nonexistent-xyz"}"#))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(post_json("/sessions/9/messages", r#"{"text":"  "}"#))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .oneshot(post_json("/sessions/9/keys", r#"{"keys":[]}"#))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serves_the_pwa() {
+        let res = app().oneshot(get("/")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(ct.starts_with("text/html"));
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("baude"));
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_over_http() {
+        let app = app();
+        // create
+        let res = app
+            .clone()
+            .oneshot(post_json("/sessions", r#"{"repo":"/tmp","name":"t"}"#))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created = body_json(res).await;
+        assert_eq!(created["name"], "t");
+        let id = created["id"].as_u64().unwrap();
+
+        // it lists, and the single-session endpoint agrees
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // message while the stub never registers → 409
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/messages"),
+                r#"{"text":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // keys + screen + interrupt work on a live PTY
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/keys"),
+                r#"{"keys":["enter"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/screen")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let shot = body_json(res).await;
+        assert_eq!(shot["rows"], 40);
+        let res = app
+            .clone()
+            .oneshot(post_json(&format!("/sessions/{id}/interrupt"), ""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+        // delete
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = app.oneshot(get("/sessions")).await.unwrap();
+        assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+}

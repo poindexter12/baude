@@ -139,9 +139,11 @@ dependencies = [
  "baude-core",
  "dirs",
  "futures-core",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

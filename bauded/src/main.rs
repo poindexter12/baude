@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("BAUDED_BIND").ok())
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
-    let mut manager = Manager::new();
+    let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();
     let state = Arc::new(Mutex::new(manager));
 
