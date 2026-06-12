@@ -303,6 +303,33 @@ impl Manager {
         Ok(())
     }
 
+    /// Attach for raw terminal streaming: a redraw snapshot plus a receiver
+    /// of every output chunk after it. See `Pty::subscribe`.
+    pub fn attach(&self, id: u64) -> Result<(Vec<u8>, std::sync::mpsc::Receiver<Vec<u8>>)> {
+        let s = self.session(id)?;
+        if s.claude.is_exited() {
+            bail!("claude has exited");
+        }
+        Ok(s.claude.subscribe())
+    }
+
+    /// Raw input bytes from an attached client.
+    pub fn write_raw(&mut self, id: u64, bytes: &[u8]) -> Result<()> {
+        let s = self.session_mut(id)?;
+        if s.claude.is_exited() {
+            bail!("claude has exited");
+        }
+        s.claude.write_input(bytes);
+        Ok(())
+    }
+
+    /// Resize from an attached client. Multiple clients: last write wins.
+    pub fn resize_pty(&mut self, id: u64, rows: u16, cols: u16) -> Result<()> {
+        let s = self.session_mut(id)?;
+        s.claude.resize(rows, cols);
+        Ok(())
+    }
+
     /// Send Esc — stops Claude's current work without killing the session.
     pub fn interrupt(&mut self, id: u64) -> Result<()> {
         let s = self.session_mut(id)?;
