@@ -100,9 +100,15 @@ async fn post_message(
     if body.text.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty message".into()));
     }
-    lock(&state)
-        .post_message(id, &body.text)
-        .map_err(not_found)?;
+    lock(&state).post_message(id, &body.text).map_err(|e| {
+        let msg = e.to_string();
+        if msg.starts_with("no session") {
+            (StatusCode::NOT_FOUND, msg)
+        } else {
+            // exists but can't take input right now (starting / exited)
+            (StatusCode::CONFLICT, msg)
+        }
+    })?;
     Ok(StatusCode::ACCEPTED)
 }
 

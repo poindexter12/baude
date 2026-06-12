@@ -239,13 +239,23 @@ impl Manager {
         Ok(())
     }
 
-    /// Inject a message into the session's PTY. Multiline-safe via bracketed
-    /// paste; the trailing CR submits. If Claude is busy it queues the message
-    /// natively (visible as `queue-operation` transcript records).
+    /// How long to wait between pasting the text and pressing Enter. Claude
+    /// Code coalesces input arriving in one burst into a single paste, which
+    /// swallows the CR — verified live; a same-write `text + \r` never
+    /// submits. The submit must arrive as a distinct later keypress.
+    const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Inject a message into the session's PTY: paste the text, then press
+    /// Enter. Multiline-safe via bracketed paste. If Claude is busy it queues
+    /// the message natively (visible as `queue-operation` transcript records).
     pub fn post_message(&mut self, id: u64, text: &str) -> Result<()> {
         let s = self.session_mut(id)?;
         if s.claude.is_exited() {
             bail!("claude has exited");
+        }
+        // Input written before Claude's TUI is up gets drained, not queued.
+        if s.meta.session_id.is_none() {
+            bail!("claude is still starting — retry shortly");
         }
         let bracketed = s
             .claude
@@ -253,7 +263,7 @@ impl Manager {
             .lock()
             .map(|p| p.screen().bracketed_paste())
             .unwrap_or(false);
-        let mut bytes = Vec::with_capacity(text.len() + 13);
+        let mut bytes = Vec::with_capacity(text.len() + 12);
         if bracketed {
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(text.as_bytes());
@@ -261,8 +271,9 @@ impl Manager {
         } else {
             bytes.extend_from_slice(text.as_bytes());
         }
-        bytes.extend_from_slice(b"\r");
         s.claude.write_input(&bytes);
+        std::thread::sleep(Self::SUBMIT_DELAY);
+        s.claude.write_input(b"\r");
         Ok(())
     }
 
