@@ -25,6 +25,7 @@ pub fn router(state: Shared) -> Router {
             get(get_messages).post(post_message),
         )
         .route("/sessions/{id}/interrupt", post(interrupt))
+        .route("/sessions/{id}/queue", get(get_queue))
         .route("/sessions/{id}/screen", get(get_screen))
         .route("/sessions/{id}/keys", post(post_keys))
         .route("/sessions/{id}/stream", get(stream))
@@ -131,6 +132,18 @@ async fn interrupt(
 ) -> Result<StatusCode, ApiError> {
     lock(&state).interrupt(id).map_err(not_found)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Messages typed while Claude was busy that it hasn't picked up yet.
+async fn get_queue(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let path = lock(&state).transcript_path(id).map_err(not_found)?;
+    Ok(Json(match path {
+        Some(p) => transcript::queued(&p),
+        None => vec![],
+    }))
 }
 
 async fn get_screen(

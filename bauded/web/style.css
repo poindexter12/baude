@@ -124,6 +124,7 @@ header .iconbtn.danger { color: var(--red); }
 }
 .msg .meta { color: var(--dim); font-size: 11px; margin-top: 2px; padding: 0 4px; }
 .msg.user .meta { text-align: right; }
+.msg.queued .bubble { opacity: 0.55; border-style: dashed; }
 
 #typing { color: var(--dim); font-size: 13px; padding: 0 16px 8px; }
 #typing .dot.busy { color: var(--blue); }

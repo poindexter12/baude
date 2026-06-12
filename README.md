@@ -178,10 +178,16 @@ auth layer. See `docs/remote-daemon-plan.md`.
 
 The daemon serves a phone-first PWA at `/`: a triage list of sessions (who's
 waiting and for how long, model, context %, cost, branch), a chat view with
-live updates over SSE, message posting, interrupt, and session create/kill.
-Open it from any tailnet device and add it to your home screen — it's
-installable (manifest + service worker), with no build step and no external
-assets.
+live updates over SSE, message posting, queued-message bubbles, a terminal
+peek drawer for the rare interactive menu, interrupt, and session
+create/kill. Open it from any tailnet device and add it to your home screen —
+it's installable (manifest + service worker), with no build step and no
+external assets.
+
+<p>
+  <img src="docs/img/pwa-list.png" width="320" alt="session triage list">
+  <img src="docs/img/pwa-chat.png" width="320" alt="chat view">
+</p>
 
 | Endpoint | What |
 |----------|------|

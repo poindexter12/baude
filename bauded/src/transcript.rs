@@ -162,6 +162,36 @@ pub fn after(mut messages: Vec<ChatMessage>, after: &str) -> Vec<ChatMessage> {
     }
 }
 
+/// Replay `queue-operation` records to the current queue: messages typed
+/// while Claude was busy that it hasn't picked up yet. Enqueue carries the
+/// prompt; dequeue pops FIFO.
+pub fn queued(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return vec![];
+    };
+    let mut queue: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"].as_str() != Some("queue-operation") {
+            continue;
+        }
+        match v["operation"].as_str() {
+            Some("enqueue") => {
+                if let Some(p) = v["prompt"].as_str() {
+                    queue.push(p.to_string());
+                }
+            }
+            Some("dequeue") if !queue.is_empty() => {
+                queue.remove(0);
+            }
+            _ => {}
+        }
+    }
+    queue
+}
+
 /// Incremental transcript tail for SSE: tracks a byte offset, consumes only
 /// complete lines (a partial trailing line is re-read next poll).
 #[derive(Default)]
@@ -265,6 +295,29 @@ mod tests {
         assert_eq!(rest[0].uuid, "u2");
         // unknown cursor → everything
         assert_eq!(after(msgs, "nope").len(), 2);
+    }
+
+    #[test]
+    fn queue_replay() {
+        let dir = std::env::temp_dir().join(format!("bauded-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("q.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"queue-operation","operation":"enqueue","prompt":"one"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","prompt":"two"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"dequeue"}"#,
+                "\n",
+                r#"{"type":"queue-operation","operation":"enqueue","prompt":"three"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(queued(&path), vec!["two", "three"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
