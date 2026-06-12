@@ -82,11 +82,16 @@ daemon restarts (already written).
    Sessions survive detach. Daemon state lives in its own
    `daemon-state.json` so it never clobbers the TUI's sessions. Default bind
    `127.0.0.1:8642` (`--bind` / `BAUDED_BIND` for the tailnet interface).
-3. **Containerize** — Dockerfile (claude CLI + git + bauded), compose stack
+3. **Containerize** ✅ — Dockerfile (claude CLI + git + bauded), compose stack
    with Tailscale sidecar (`network_mode: service:tailscale`, optional
    `tailscale serve` for tailnet HTTPS). Volumes: repos, `~/.claude`
    (login + transcripts persist), git automation SSH key. portable-pty is
-   fine in Linux containers.
+   fine in Linux containers. Notes: runs as the non-root `node` user
+   (bypassPermissions refuses root), `SHELL=/bin/bash` env is required
+   (baude-core's fallback shell is zsh, absent in the image), `init: true`
+   reaps orphaned session descendants. First run: set `TS_AUTHKEY` in
+   `.env`, `docker compose up -d --build`, then log in once with
+   `docker compose exec -it bauded claude`.
 4. **Phone frontend (PWA)** — triage-first: session list showing who's
    waiting and for how long, tap into chat view, post messages.
    Terminal rendering deliberately out of scope.

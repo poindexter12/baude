@@ -1,0 +1,50 @@
+# bauded behind a Tailscale sidecar: the daemon is reachable only over the
+# tailnet (no published ports, no auth layer — the VPN is the security
+# boundary). First run: `cp .env.example .env`, set TS_AUTHKEY, then
+# `docker compose up -d --build` and log claude in once with
+# `docker compose exec -it bauded claude` (credentials persist in the
+# claude-config volume).
+
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: bauded # device name on the tailnet
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?put TS_AUTHKEY in .env}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+    restart: unless-stopped
+
+  bauded:
+    build: .
+    network_mode: service:tailscale # share the sidecar's network namespace
+    depends_on:
+      - tailscale
+    init: true # reap orphaned descendants of killed sessions
+    environment:
+      # Remote sessions run bypass so TUI permission prompts never block them.
+      BAUDE_CLAUDE_CMD: claude --dangerously-skip-permissions
+    volumes:
+      - claude-config:/home/node/.claude # login + transcripts persist
+      - baude-state:/home/node/.config/baude # daemon-state.json survives recreate
+      - repos:/repos # clone work repos here
+      # Automation SSH key for unattended git pushes (optional):
+      # - ./ssh:/home/node/.ssh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8642/sessions"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+volumes:
+  tailscale-state:
+  claude-config:
+  baude-state:
+  repos:

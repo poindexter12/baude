@@ -185,3 +185,21 @@ disconnect; daemon restarts restore them via `claude --continue`. Binds
 | `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
 | `POST /sessions/{id}/interrupt` | Esc — stop current work |
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
+
+### Deploy (compose + Tailscale)
+
+The provided `compose.yaml` runs bauded behind a Tailscale sidecar — the
+daemon is only reachable over your tailnet, nothing is published to the host:
+
+```sh
+cp .env.example .env          # set TS_AUTHKEY
+docker compose up -d --build
+docker compose exec -it bauded claude   # log in once; persists in a volume
+docker compose exec bauded git clone <url> /repos/<name>
+curl http://bauded:8642/sessions        # from any tailnet device
+```
+
+Sessions run as `claude --dangerously-skip-permissions` (set per-deploy via
+`BAUDE_CLAUDE_CMD`) so permission prompts never block unattended work. For
+unattended git pushes, uncomment the ssh volume in `compose.yaml` and put an
+automation key + config in `./ssh/`.
