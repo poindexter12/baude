@@ -191,6 +191,8 @@ assets.
 | `GET /sessions/{id}/messages?after=<uuid>` | transcript as chat messages |
 | `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
 | `POST /sessions/{id}/interrupt` | Esc — stop current work |
+| `GET /sessions/{id}/screen` | plain-text terminal snapshot (menu escape hatch) |
+| `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
 
 ### Deploy (compose + Tailscale)
@@ -200,11 +202,15 @@ daemon is only reachable over your tailnet, nothing is published to the host:
 
 ```sh
 cp .env.example .env          # set TS_AUTHKEY
-docker compose up -d --build
+docker compose up -d --build  # or set image: ghcr.io/poindexter12/bauded
 docker compose exec -it bauded claude   # log in once; persists in a volume
 docker compose exec bauded git clone <url> /repos/<name>
-curl http://bauded:8642/sessions        # from any tailnet device
+open http://bauded:8642/                # the PWA, from any tailnet device
 ```
+
+The container seeds `statusLine: baude statusline` into the claude config
+volume on first run (never overwriting an existing settings.json), so session
+cost, context %, and account rate limits flow into the API out of the box.
 
 Sessions run as `claude --dangerously-skip-permissions` (set per-deploy via
 `BAUDE_CLAUDE_CMD`) so permission prompts never block unattended work. For

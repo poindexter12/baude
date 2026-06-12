@@ -100,7 +100,9 @@ daemon restarts (already written).
    with the SSE tail (stream connects first and buffers, so nothing falls
    in the gap), installable (manifest + service worker + icons).
 5. **Later / optional** — TUI as bauded client; push notifications on
-   waiting; raw terminal peek; interactive-menu handling.
+   waiting; ~~raw terminal peek; interactive-menu handling~~ (done: `GET
+   /sessions/{id}/screen` + `POST /sessions/{id}/keys`, surfaced as the ▦
+   drawer in the PWA chat view).
 
 ## Open questions (deferred by choice)
 
