@@ -75,11 +75,13 @@ daemon restarts (already written).
 
 ## Phases
 
-1. **Workspace split** — extract `baude-core` (pty, session, meta, persist,
+1. **Workspace split** ✅ — extract `baude-core` (pty, session, meta, persist,
    git). Pure refactor, TUI behavior unchanged, CI still green.
-2. **bauded** — axum + tokio daemon over baude-core. REST + SSE endpoints
+2. **bauded** ✅ — axum + tokio daemon over baude-core. REST + SSE endpoints
    above. Transcript→chat-message parser (the only genuinely new logic).
-   Sessions survive detach.
+   Sessions survive detach. Daemon state lives in its own
+   `daemon-state.json` so it never clobbers the TUI's sessions. Default bind
+   `127.0.0.1:8642` (`--bind` / `BAUDED_BIND` for the tailnet interface).
 3. **Containerize** — Dockerfile (claude CLI + git + bauded), compose stack
    with Tailscale sidecar (`network_mode: service:tailscale`, optional
    `tailscale serve` for tailnet HTTPS). Volumes: repos, `~/.claude`

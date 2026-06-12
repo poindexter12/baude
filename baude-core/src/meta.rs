@@ -83,6 +83,8 @@ pub struct ClaudeMeta {
     pub rate_updated_unix_ms: u64,
     /// Current git branch of the session's cwd (read from .git/HEAD).
     pub git_branch: Option<String>,
+    /// Claude's AI-generated session title (`ai-title` transcript records).
+    pub title: Option<String>,
 }
 
 impl ClaudeMeta {
@@ -160,7 +162,13 @@ impl ClaudeMeta {
             self.offset = 0;
             self.totals = Usage::default();
             self.last_usage = None;
+            self.title = None;
         }
+    }
+
+    /// Path of the resolved transcript JSONL, if one has been found.
+    pub fn transcript_path(&self) -> Option<&Path> {
+        self.transcript.as_deref()
     }
 
     /// Incrementally parse new transcript lines since the last poll.
@@ -194,6 +202,11 @@ impl ClaudeMeta {
             };
             if let Some(mode) = v["permissionMode"].as_str() {
                 self.permission_mode = Some(mode.to_string());
+            }
+            if v["type"].as_str() == Some("ai-title") {
+                if let Some(t) = v["aiTitle"].as_str() {
+                    self.title = Some(t.to_string());
+                }
             }
             if v["type"].as_str() == Some("assistant") {
                 let msg = &v["message"];

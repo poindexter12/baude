@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["baude-core", "baude"]
+members = ["baude-core", "baude", "bauded"]
 
 [workspace.package]
 version = "0.3.0"

@@ -26,8 +26,8 @@ fn config_base() -> PathBuf {
         .join("baude")
 }
 
-fn state_path() -> PathBuf {
-    config_base().join("state.json")
+fn state_path(file: &str) -> PathBuf {
+    config_base().join(file)
 }
 
 /// User configuration, ~/.config/baude/config.json. All fields optional.
@@ -53,15 +53,24 @@ pub fn load_config() -> Config {
 }
 
 pub fn load() -> State {
-    let path = state_path();
-    std::fs::read_to_string(&path)
+    load_named("state.json")
+}
+
+pub fn save(state: &State) -> Result<()> {
+    save_named("state.json", state)
+}
+
+/// Load session state from a specific file under the config dir. The TUI and
+/// the daemon keep separate files so they never clobber each other's sessions.
+pub fn load_named(file: &str) -> State {
+    std::fs::read_to_string(state_path(file))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-pub fn save(state: &State) -> Result<()> {
-    let path = state_path();
+pub fn save_named(file: &str, state: &State) -> Result<()> {
+    let path = state_path(file);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

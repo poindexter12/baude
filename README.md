@@ -166,3 +166,22 @@ the profile's shell.
 - `editor_cmd` — command the sidebar `e` key runs on a session's folder
   (the folder path is appended), default `code`. `BAUDE_EDITOR_CMD` env var
   overrides the config file.
+
+## bauded (experimental)
+
+A headless daemon (`cargo run -p bauded`) that owns sessions the same way the
+TUI does but exposes them over REST + SSE, so thin clients (a phone PWA,
+eventually) can triage and chat remotely. Sessions keep running when clients
+disconnect; daemon restarts restore them via `claude --continue`. Binds
+`127.0.0.1:8642` by default (`--bind` / `BAUDED_BIND`); security model is
+"bind the VPN interface" — no auth layer. See `docs/remote-daemon-plan.md`.
+
+| Endpoint | What |
+|----------|------|
+| `GET /sessions` | session list: status, waiting-for, model, context %, branch, cost |
+| `POST /sessions` | `{repo, worktree?, name?}` — spawn (worktree = branch name) |
+| `DELETE /sessions/{id}` | kill and remove |
+| `GET /sessions/{id}/messages?after=<uuid>` | transcript as chat messages |
+| `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
+| `POST /sessions/{id}/interrupt` | Esc — stop current work |
+| `GET /sessions/{id}/stream` | SSE live tail of new messages |
