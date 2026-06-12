@@ -31,9 +31,19 @@ name = "baude"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "baude-core",
+ "dirs",
+ "ratatui",
+ "serde_json",
+]
+
+[[package]]
+name = "baude-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
  "dirs",
  "portable-pty",
- "ratatui",
  "serde",
  "serde_json",
  "vt100",

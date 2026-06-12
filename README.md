@@ -35,7 +35,7 @@ mise use -g ubi:poindexter12/baude
 Or from source:
 
 ```sh
-cargo install --path .
+cargo install --path baude
 ```
 
 ## Usage

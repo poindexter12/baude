@@ -1,11 +1,5 @@
 mod app;
-mod bridge;
-mod git;
 mod keys;
-mod meta;
-mod persist;
-mod pty;
-mod session;
 mod ui;
 mod usage;
 
@@ -37,7 +31,7 @@ fn main() -> Result<()> {
             .position(|a| a == "--wrap")
             .and_then(|i| args.get(i + 1))
             .cloned();
-        std::process::exit(bridge::run(wrap));
+        std::process::exit(baude_core::bridge::run(wrap));
     }
 
     let launch_dir = std::env::args()

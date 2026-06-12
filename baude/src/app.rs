@@ -5,12 +5,13 @@ use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 
-use crate::git;
+use baude_core::git;
+use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
+use baude_core::persist::{self, Config, SavedSession, State};
+use baude_core::pty::{now_ms, Pty};
+use baude_core::session::{Session, Status};
+
 use crate::keys::encode_key;
-use crate::meta::{now_unix_ms, ClaudeMeta, RateWindow};
-use crate::persist::{self, Config, SavedSession, State};
-use crate::pty::{now_ms, Pty};
-use crate::session::{Session, Status};
 use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;

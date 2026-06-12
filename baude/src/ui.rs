@@ -4,10 +4,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use baude_core::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
+use baude_core::pty::{now_ms, Pty};
+use baude_core::session::{human_duration, Session, Status};
+use baude_core::vt100;
+
 use crate::app::{inner, pane_rects, App, Focus, Modal};
-use crate::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
-use crate::pty::{now_ms, Pty};
-use crate::session::{human_duration, Session, Status};
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 28;

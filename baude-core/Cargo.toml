@@ -1,0 +1,15 @@
+[package]
+name = "baude-core"
+description = "Session engine for baude: PTYs, Claude Code metadata, persistence, git worktrees"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+portable-pty = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+vt100 = "0.15"
