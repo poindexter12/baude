@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
@@ -17,8 +17,9 @@ use crate::transcript::{self, ChatMessage, Tail};
 
 pub fn router(state: Shared) -> Router {
     Router::new()
+        .merge(crate::web::router())
         .route("/sessions", get(list_sessions).post(create_session))
-        .route("/sessions/{id}", delete(delete_session))
+        .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route(
             "/sessions/{id}/messages",
             get(get_messages).post(post_message),
@@ -36,6 +37,16 @@ fn not_found(e: anyhow::Error) -> ApiError {
 
 async fn list_sessions(State(state): State<Shared>) -> Json<Vec<SessionInfo>> {
     Json(lock(&state).list())
+}
+
+async fn get_session(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+) -> Result<Json<SessionInfo>, ApiError> {
+    lock(&state)
+        .info(id)
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no session {id}")))
 }
 
 #[derive(Deserialize)]

@@ -92,9 +92,13 @@ daemon restarts (already written).
    reaps orphaned session descendants. First run: set `TS_AUTHKEY` in
    `.env`, `docker compose up -d --build`, then log in once with
    `docker compose exec -it bauded claude`.
-4. **Phone frontend (PWA)** — triage-first: session list showing who's
+4. **Phone frontend (PWA)** ✅ — triage-first: session list showing who's
    waiting and for how long, tap into chat view, post messages.
-   Terminal rendering deliberately out of scope.
+   Terminal rendering deliberately out of scope. Implementation: vanilla
+   HTML/CSS/JS embedded in the bauded binary (`bauded/web/`, served at `/`,
+   no build step), hash routing, list polls 3s, chat = history GET merged
+   with the SSE tail (stream connects first and buffers, so nothing falls
+   in the gap), installable (manifest + service worker + icons).
 5. **Later / optional** — TUI as bauded client; push notifications on
    waiting; raw terminal peek; interactive-menu handling.
 
