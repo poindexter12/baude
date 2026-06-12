@@ -288,6 +288,21 @@ impl Manager {
         Ok(())
     }
 
+    /// Respawn claude in an exited session's PTY (same cwd, fresh process,
+    /// `--continue` to pick the conversation back up).
+    pub fn restart(&mut self, id: u64) -> Result<()> {
+        let claude_cmd = self.claude_cmd.clone();
+        let s = self.session_mut(id)?;
+        if !s.claude.is_exited() {
+            bail!("claude is still running");
+        }
+        let cmd = format!("{claude_cmd} --continue 2>/dev/null || exec {claude_cmd}");
+        s.claude = Pty::spawn(Some(&cmd), &s.cwd, ROWS, COLS)?;
+        s.spawn_unix_ms = now_unix_ms();
+        s.meta = ClaudeMeta::default();
+        Ok(())
+    }
+
     /// Send Esc — stops Claude's current work without killing the session.
     pub fn interrupt(&mut self, id: u64) -> Result<()> {
         let s = self.session_mut(id)?;
@@ -511,6 +526,28 @@ mod tests {
             assert!(Instant::now() < deadline, "screen never showed output");
             std::thread::sleep(Duration::from_millis(300));
         }
+        m.kill_all();
+    }
+
+    #[test]
+    fn restart_requires_exited() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let err = m.restart(id).unwrap_err().to_string();
+        assert!(err.contains("still running"), "got: {err}");
+        m.kill_all();
+    }
+
+    #[test]
+    fn restart_respawns_an_exited_session() {
+        let mut m = Manager::new("true".into(), false);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.info(id).unwrap().status != "exited" {
+            assert!(Instant::now() < deadline, "stub never exited");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        m.restart(id).unwrap();
         m.kill_all();
     }
 
