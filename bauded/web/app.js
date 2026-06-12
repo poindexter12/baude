@@ -288,7 +288,7 @@ function openModal() {
     <form class="box" id="newform">
       <h2>New session</h2>
       <label for="f-repo">repo path (on the server)</label>
-      <input id="f-repo" placeholder="/repos/myproject" autocapitalize="off" autocorrect="off">
+      <input id="f-repo" placeholder="/code/myproject" autocapitalize="off" autocorrect="off">
       <label for="f-branch">worktree branch — optional</label>
       <input id="f-branch" placeholder="fix-thing" autocapitalize="off" autocorrect="off">
       <label for="f-name">name — optional</label>

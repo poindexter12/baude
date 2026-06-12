@@ -59,14 +59,19 @@ account rate limits flow into the API with no extra setup.
 
 ## 4. Put repos on the box
 
+Your host code directory is bind-mounted at `/code` — set it in `.env`
+(`CODE_DIR=~/Code` is the default). New sessions from the PWA point at
+`/code/<repo>`, with full read/write access.
+
+Alternatively, keep server-local clones in the `repos` named volume:
+
 ```sh
 docker compose exec bauded git clone <url> /repos/<name>
 ```
 
-The `repos` volume persists them. For unattended pushes, uncomment the ssh
-mount in `compose.yaml` and put an automation key + config under `./ssh/`.
-Set git identity once: `docker compose exec bauded git config --global
-user.name … && … user.email …`.
+For unattended pushes, uncomment the ssh mount in `compose.yaml` and put an
+automation key + config under `./ssh/`. Set git identity once:
+`docker compose exec bauded git config --global user.name … && … user.email …`.
 
 ## 5. HTTPS — make the PWA installable
 
