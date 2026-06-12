@@ -16,6 +16,10 @@ pub struct SavedSession {
     pub branch: Option<String>,
     pub is_worktree: bool,
     pub shell_open: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub archived_by_user: bool,
 }
 
 fn config_base() -> PathBuf {

@@ -27,6 +27,8 @@ pub fn router(state: Shared) -> Router {
         )
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/restart", post(restart))
+        .route("/sessions/{id}/archive", post(archive))
+        .route("/sessions/{id}/unarchive", post(unarchive))
         .route("/sessions/{id}/queue", get(get_queue))
         .route("/sessions/{id}/screen", get(get_screen))
         .route("/sessions/{id}/keys", post(post_keys))
@@ -201,6 +203,19 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
         }
     })?;
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn archive(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
+    lock(&state).set_archived(id, true).map_err(not_found)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unarchive(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, ApiError> {
+    lock(&state).set_archived(id, false).map_err(not_found)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Messages typed while Claude was busy that it hasn't picked up yet.

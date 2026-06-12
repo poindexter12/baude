@@ -68,6 +68,7 @@ through to Claude.
 | `n` | sidebar | new session (enter a repo path; `tab` completes directories) |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
+| `a` | sidebar | archive/unarchive — parked at the bottom, skipped by cycling |
 | `x` | sidebar | close session (worktree sessions ask keep/remove) |
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
@@ -84,6 +85,14 @@ this chord shadows Claude's own alt+←/→ word navigation.
 
 Waiting is detected from PTY output silence: Claude streams spinner output
 continuously while working, so ~2s of quiet means it's your turn.
+
+Sessions waiting unattended for 30 minutes auto-archive: they sink to a
+dimmed `▼ archived` section at the bottom, stop flashing and counting, and
+`alt+←/→` cycling skips them (`j/k` still reaches them). Archive manually
+with `a`; sending the session any input — or a new turn starting — lifts an
+auto-archive, while a manual one sticks until you unarchive or re-engage.
+The daemon applies the same rules (`BAUDED_AUTO_ARCHIVE_MIN`, 0 disables),
+and archived sessions never send push notifications.
 
 ## Worktrees
 
@@ -211,6 +220,7 @@ external assets.
 | `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
 | `POST /sessions/{id}/interrupt` | Esc — stop current work |
 | `POST /sessions/{id}/restart` | respawn claude in an exited session (`--continue`) |
+| `POST /sessions/{id}/archive` · `/unarchive` | park/unpark (auto after 30m waiting; input re-engages) |
 | `GET /sessions/{id}/queue` | messages typed while busy, not yet picked up |
 | `GET /sessions/{id}/screen` | plain-text terminal snapshot (menu escape hatch) |
 | `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |

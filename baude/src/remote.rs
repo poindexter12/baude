@@ -28,6 +28,8 @@ pub struct RemoteInfo {
     pub context_used_pct: Option<u8>,
     pub branch: Option<String>,
     pub session_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Clone, Default)]
@@ -88,6 +90,15 @@ impl RemotePoller {
 
     pub fn restart(&self, id: u64) -> Result<(), String> {
         ureq::post(&format!("{}/sessions/{id}/restart", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .call()
+            .map(|_| ())
+            .map_err(|e| short_err(&e))
+    }
+
+    pub fn set_archived(&self, id: u64, archived: bool) -> Result<(), String> {
+        let action = if archived { "archive" } else { "unarchive" };
+        ureq::post(&format!("{}/sessions/{id}/{action}", self.base))
             .timeout(REQUEST_TIMEOUT)
             .call()
             .map(|_| ())

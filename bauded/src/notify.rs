@@ -47,6 +47,13 @@ impl Notifier {
         self.last_status.retain(|id, _| live.contains(id));
 
         for s in sessions {
+            // Archived means "stop demanding my attention" — mute it, but
+            // keep last_status current so unarchiving doesn't false-fire.
+            if s.archived {
+                self.notified_waiting.remove(&s.id);
+                self.last_status.insert(s.id, s.status.to_string());
+                continue;
+            }
             match s.status {
                 "waiting" => {
                     let waited = s.waiting_for_ms.unwrap_or(0);
@@ -109,7 +116,16 @@ mod tests {
             gsd_phase: None,
             session_cost_usd: None,
             claude_session_id: None,
+            archived: false,
         }
+    }
+
+    #[test]
+    fn archived_sessions_are_muted() {
+        let mut n = Notifier::default();
+        let mut s = info(1, "waiting", Some(60_000));
+        s.archived = true;
+        assert!(n.tick(&[s]).is_empty());
     }
 
     #[test]
