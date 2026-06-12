@@ -6,6 +6,7 @@
 mod api;
 mod manager;
 mod transcript;
+mod web;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

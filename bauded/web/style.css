@@ -1,0 +1,209 @@
+/* baude PWA — dark, mobile-first, in the TUI's visual language:
+   cyan accents, yellow waiting pulses, blue busy spinners. */
+
+:root {
+  --bg: #0b0e14;
+  --panel: #11151f;
+  --panel2: #161b29;
+  --border: #232a3b;
+  --fg: #d6dbe7;
+  --dim: #6b7488;
+  --cyan: #22d3ee;
+  --yellow: #facc15;
+  --blue: #60a5fa;
+  --red: #f87171;
+  --green: #4ade80;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --pad-top: env(safe-area-inset-top, 0px);
+  --pad-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.45 -apple-system, system-ui, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app { height: 100%; display: flex; flex-direction: column; }
+
+/* ---- header ---- */
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(10px + var(--pad-top)) 14px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+header h1 {
+  font-size: 17px;
+  font-weight: 650;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+header h1 .sub { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }
+header .iconbtn {
+  font-size: 20px;
+  color: var(--cyan);
+  padding: 4px 10px;
+  border-radius: 8px;
+}
+header .iconbtn:active { background: var(--panel2); }
+header .iconbtn.danger { color: var(--red); }
+
+#conn {
+  background: var(--red);
+  color: #200;
+  font-size: 13px;
+  text-align: center;
+  padding: 3px;
+}
+
+/* ---- session list ---- */
+#list { flex: 1; overflow-y: auto; }
+.empty { color: var(--dim); text-align: center; padding: 48px 24px; }
+.row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.row:active { background: var(--panel2); }
+.row .line1 { display: flex; align-items: baseline; gap: 8px; }
+.row .name { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .wait { color: var(--yellow); font-variant-numeric: tabular-nums; font-size: 14px; }
+.row .line2 {
+  display: flex; gap: 10px; margin-top: 3px; margin-left: 22px;
+  color: var(--dim); font-size: 13px;
+  overflow: hidden; white-space: nowrap;
+}
+.row .title { color: var(--dim); font-size: 13px; margin-left: 22px; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.dot { display: inline-block; width: 14px; text-align: center; }
+.dot.waiting { color: var(--yellow); animation: pulse 1.4s infinite; }
+.dot.busy { color: var(--blue); display: inline-block; animation: spin 1s steps(4) infinite; }
+.dot.exited { color: var(--dim); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- chat ---- */
+#chat { flex: 1; overflow-y: auto; padding: 12px 12px 4px; }
+.msg { margin-bottom: 10px; max-width: 88%; }
+.msg .bubble {
+  padding: 8px 12px;
+  border-radius: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.user { margin-left: auto; }
+.msg.user .bubble { background: #0e3a47; border: 1px solid #14505f; border-bottom-right-radius: 4px; }
+.msg.assistant .bubble { background: var(--panel2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.msg.tool { max-width: 100%; }
+.msg.tool .bubble {
+  background: none; border: none; padding: 0 4px;
+  color: var(--dim); font-family: var(--mono); font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.msg .meta { color: var(--dim); font-size: 11px; margin-top: 2px; padding: 0 4px; }
+.msg.user .meta { text-align: right; }
+
+#typing { color: var(--dim); font-size: 13px; padding: 0 16px 8px; }
+#typing .dot.busy { color: var(--blue); }
+
+/* ---- composer ---- */
+#composer {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  padding: 8px 10px calc(8px + var(--pad-bottom));
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+#composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  color: var(--fg);
+  font: inherit;
+  padding: 9px 14px;
+  max-height: 140px;
+  outline: none;
+}
+#composer textarea:focus { border-color: var(--cyan); }
+#composer .send {
+  background: var(--cyan);
+  color: #06262e;
+  font-weight: 700;
+  border-radius: 18px;
+  padding: 9px 16px;
+}
+#composer .send:disabled { background: var(--border); color: var(--dim); }
+
+/* ---- modal ---- */
+#modal {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 10; padding: 24px;
+}
+#modal .box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px;
+  width: 100%;
+  max-width: 420px;
+}
+#modal h2 { font-size: 16px; margin-bottom: 14px; }
+#modal label { display: block; color: var(--dim); font-size: 13px; margin: 10px 0 4px; }
+#modal input {
+  width: 100%;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font: 15px var(--mono);
+  padding: 9px 10px;
+  outline: none;
+}
+#modal input:focus { border-color: var(--cyan); }
+#modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+#modal .actions button { padding: 8px 16px; border-radius: 8px; }
+#modal .actions .primary { background: var(--cyan); color: #06262e; font-weight: 700; }
+#modal .actions .ghost { color: var(--dim); }
+
+/* ---- toast ---- */
+#toast {
+  position: fixed;
+  left: 50%; bottom: calc(80px + var(--pad-bottom));
+  transform: translateX(-50%);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 14px;
+  z-index: 20;
+  max-width: 86vw;
+  text-align: center;
+}

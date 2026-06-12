@@ -170,11 +170,18 @@ the profile's shell.
 ## bauded (experimental)
 
 A headless daemon (`cargo run -p bauded`) that owns sessions the same way the
-TUI does but exposes them over REST + SSE, so thin clients (a phone PWA,
-eventually) can triage and chat remotely. Sessions keep running when clients
-disconnect; daemon restarts restore them via `claude --continue`. Binds
-`127.0.0.1:8642` by default (`--bind` / `BAUDED_BIND`); security model is
-"bind the VPN interface" — no auth layer. See `docs/remote-daemon-plan.md`.
+TUI does but exposes them over REST + SSE, so thin clients can triage and
+chat remotely. Sessions keep running when clients disconnect; daemon restarts
+restore them via `claude --continue`. Binds `127.0.0.1:8642` by default
+(`--bind` / `BAUDED_BIND`); security model is "bind the VPN interface" — no
+auth layer. See `docs/remote-daemon-plan.md`.
+
+The daemon serves a phone-first PWA at `/`: a triage list of sessions (who's
+waiting and for how long, model, context %, cost, branch), a chat view with
+live updates over SSE, message posting, interrupt, and session create/kill.
+Open it from any tailnet device and add it to your home screen — it's
+installable (manifest + service worker), with no build step and no external
+assets.
 
 | Endpoint | What |
 |----------|------|
