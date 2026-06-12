@@ -29,6 +29,7 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/queue", get(get_queue))
         .route("/sessions/{id}/screen", get(get_screen))
         .route("/sessions/{id}/keys", post(post_keys))
+        .route("/sessions/{id}/pty", get(pty_ws))
         .route("/sessions/{id}/stream", get(stream))
         .with_state(state)
 }
@@ -183,6 +184,84 @@ async fn post_keys(
     }
     lock(&state).send_keys(id, &body.keys).map_err(not_found)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Raw terminal attach over websocket: first frame out is a redraw snapshot,
+/// then live output bytes (binary). Inbound: binary frames are keystrokes,
+/// text frames carry control JSON (`{"resize":{"rows":40,"cols":120}}`).
+/// The stream ends when the session exits or is deleted.
+async fn pty_ws(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response, ApiError> {
+    // Validate before upgrading so a bad id is a clean 404, not a dead socket.
+    lock(&state).transcript_path(id).map_err(not_found)?;
+    Ok(ws.on_upgrade(move |socket| pty_session(socket, state, id)))
+}
+
+#[derive(Deserialize)]
+struct PtyControl {
+    resize: Option<[u16; 2]>, // [rows, cols]
+}
+
+async fn pty_session(mut socket: axum::extract::ws::WebSocket, state: Shared, id: u64) {
+    use axum::extract::ws::Message;
+
+    // Bind before matching: the guard must drop before any await.
+    let attached = lock(&state).attach(id);
+    let (snapshot, rx) = match attached {
+        Ok(x) => x,
+        Err(_) => {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    if socket.send(Message::Binary(snapshot.into())).await.is_err() {
+        return;
+    }
+
+    // Bridge the sync subscriber channel into async. The thread ends when
+    // the PTY drops the sender (exit/kill) or the websocket side hangs up.
+    let (tx, mut out) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        while let Ok(chunk) = rx.recv() {
+            if tx.blocking_send(chunk).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            chunk = out.recv() => match chunk {
+                Some(bytes) => {
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break, // PTY closed
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if lock(&state).write_raw(id, &bytes).is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ctl) = serde_json::from_str::<PtyControl>(&text) {
+                        if let Some([rows, cols]) = ctl.resize {
+                            let _ = lock(&state).resize_pty(id, rows, cols);
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {} // ping/pong are handled by axum
+                Some(Err(_)) => break,
+            },
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 const STREAM_POLL_MS: u64 = 750;
@@ -384,5 +463,76 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = app.oneshot(get("/sessions")).await.unwrap();
         assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod pty_ws_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    use crate::manager::{lock, Manager};
+
+    #[tokio::test]
+    async fn pty_websocket_round_trip() {
+        let state = Arc::new(Mutex::new(Manager::new("bash --norc -i".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        let app = super::router(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(800)).await; // shell prompt up
+
+        // unknown session: clean 404, no upgrade
+        let err = tokio_tungstenite::connect_async(format!("ws://{addr}/sessions/99/pty")).await;
+        assert!(err.is_err());
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/sessions/{id}/pty"))
+                .await
+                .unwrap();
+
+        // First frame is the redraw snapshot.
+        let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("no snapshot frame")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first, WsMessage::Binary(_)),
+            "snapshot must be binary"
+        );
+
+        // Type a command through the socket, expect its output back.
+        ws.send(WsMessage::Binary(b"echo ws-round-trip\r".to_vec().into()))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        while !seen.contains("ws-round-trip") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no echo back: {seen}"
+            );
+            if let Ok(Some(Ok(WsMessage::Binary(b)))) =
+                tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+            {
+                seen.push_str(&String::from_utf8_lossy(&b));
+            }
+        }
+
+        // Resize via control frame reaches the PTY.
+        ws.send(WsMessage::Text(r#"{"resize":[30,100]}"#.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let shot = lock(&state).screen(id).unwrap();
+        assert_eq!((shot.rows, shot.cols), (30, 100));
+
+        drop(ws);
+        lock(&state).kill_all();
     }
 }
