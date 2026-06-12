@@ -90,6 +90,11 @@ The serve config persists in the `tailscale-state` volume. The PWA is then
 at `https://bauded.<tailnet>.ts.net/` — open it on the phone, share →
 **Add to Home Screen**, and you get the standalone app with the icon.
 
+With HTTPS in place, tap the 🔕 bell in the installed app to turn on push
+notifications: the daemon pings your phone when a session has been waiting
+on you for 10+ seconds, or when one exits. (iOS requires the home-screen
+install for Web Push; Safari-tab visits can't subscribe.)
+
 ## 6. Updating
 
 ```sh

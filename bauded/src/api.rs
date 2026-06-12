@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -31,6 +32,60 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/keys", post(post_keys))
         .route("/sessions/{id}/pty", get(pty_ws))
         .route("/sessions/{id}/stream", get(stream))
+        .with_state(state)
+}
+
+/// Web Push subscription endpoints — separate state, merged by main.
+pub fn push_router(state: crate::push::SharedPush) -> Router {
+    use crate::push::{lock as plock, Subscription};
+
+    #[derive(Deserialize)]
+    struct SubKeys {
+        p256dh: String,
+        auth: String,
+    }
+    #[derive(Deserialize)]
+    struct SubscribeBody {
+        endpoint: String,
+        keys: SubKeys,
+    }
+    #[derive(Deserialize)]
+    struct UnsubscribeBody {
+        endpoint: String,
+    }
+
+    Router::new()
+        .route(
+            "/push/key",
+            get(|State(s): State<crate::push::SharedPush>| async move {
+                Json(serde_json::json!({ "key": plock(&s).vapid.public_b64 }))
+            }),
+        )
+        .route(
+            "/push/subscribe",
+            post(
+                |State(s): State<crate::push::SharedPush>, Json(b): Json<SubscribeBody>| async move {
+                    if !b.endpoint.starts_with("https://") {
+                        return (StatusCode::BAD_REQUEST, "endpoint must be https").into_response();
+                    }
+                    plock(&s).subscribe(Subscription {
+                        endpoint: b.endpoint,
+                        p256dh: b.keys.p256dh,
+                        auth: b.keys.auth,
+                    });
+                    StatusCode::CREATED.into_response()
+                },
+            )
+            .delete(
+                |State(s): State<crate::push::SharedPush>, Json(b): Json<UnsubscribeBody>| async move {
+                    if plock(&s).unsubscribe(&b.endpoint) {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                },
+            ),
+        )
         .with_state(state)
 }
 

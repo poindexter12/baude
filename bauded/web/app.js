@@ -20,6 +20,7 @@ const state = {
   screenText: "",
   screenTimer: null,
   queue: [], // messages typed while busy, not yet picked up
+  pushOn: false,
 };
 
 // ---- helpers ----
@@ -205,6 +206,72 @@ async function interrupt() {
   }
 }
 
+// ---- web push ----
+
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function urlB64ToUint8Array(s) {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const raw = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function refreshPushState() {
+  if (!pushSupported()) return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    const on = !!sub;
+    if (on !== state.pushOn) {
+      state.pushOn = on;
+      render();
+    }
+  } catch { /* no SW yet */ }
+}
+
+async function togglePush() {
+  if (!pushSupported()) {
+    toast("push not supported here");
+    return;
+  }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const existing = await reg.pushManager.getSubscription();
+    if (existing) {
+      await api("/push/subscribe", {
+        method: "DELETE",
+        body: JSON.stringify({ endpoint: existing.endpoint }),
+      }).catch(() => {});
+      await existing.unsubscribe();
+      state.pushOn = false;
+      toast("notifications off");
+    } else {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") {
+        toast("notifications blocked");
+        return;
+      }
+      const { key } = await api("/push/key");
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToUint8Array(key),
+      });
+      const json = sub.toJSON();
+      await api("/push/subscribe", {
+        method: "POST",
+        body: JSON.stringify({ endpoint: sub.endpoint, keys: json.keys }),
+      });
+      state.pushOn = true;
+      toast("notifications on — you'll hear when a session waits");
+    }
+  } catch (e) {
+    toast(`push: ${e.message}`);
+  }
+  render();
+}
+
 // ---- terminal peek ----
 
 async function pollScreen() {
@@ -335,13 +402,20 @@ function renderList() {
       </button>`;
   }).join("");
   const waiting = state.sessions.filter((s) => s.status === "waiting").length;
+  const bell = pushSupported()
+    ? `<button class="iconbtn${state.pushOn ? " active" : ""}" id="bellbtn"
+         title="notify when a session waits">${state.pushOn ? "🔔" : "🔕"}</button>`
+    : "";
   $app.innerHTML = `
     <header>
       <h1>baude${waiting ? `<span class="sub">● ${waiting} waiting</span>` : ""}</h1>
+      ${bell}
       <button class="iconbtn" id="newbtn" aria-label="new session">＋</button>
     </header>
     ${conn}
     <div id="list">${rows || '<div class="empty">no sessions — tap ＋ to start one</div>'}</div>`;
+  const bellBtn = document.getElementById("bellbtn");
+  if (bellBtn) bellBtn.onclick = togglePush;
   document.getElementById("newbtn").onclick = openModal;
   for (const el of document.querySelectorAll(".row")) {
     el.onclick = () => { location.hash = `#/s/${el.dataset.sid}`; };
@@ -479,7 +553,7 @@ document.addEventListener("visibilitychange", () => {
 // ---- boot ----
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js").catch(() => {});
+  navigator.serviceWorker.register("/sw.js").then(refreshPushState).catch(() => {});
 }
 startTimers();
 route();
