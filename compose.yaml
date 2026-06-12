@@ -33,12 +33,12 @@ services:
       # Remote sessions run bypass so TUI permission prompts never block them.
       BAUDE_CLAUDE_CMD: claude --dangerously-skip-permissions
     volumes:
-      - claude-config:/home/node/.claude # login + transcripts persist
-      - baude-state:/home/node/.config/baude # daemon-state.json survives recreate
+      - claude-config:/home/baude/.claude # login + transcripts persist
+      - baude-state:/home/baude/.config/baude # daemon-state.json survives recreate
       - ${CODE_DIR:-~/Code}:/code # your code dir on the host (set in .env)
       - repos:/repos # alternative: clone server-local repos here
       # Automation SSH key for unattended git pushes (optional):
-      # - ./ssh:/home/node/.ssh:ro
+      # - ./ssh:/home/baude/.ssh:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8642/sessions"]
