@@ -217,6 +217,9 @@ impl App {
         let mut waiting = 0;
         let mut busy = 0;
         for s in &self.sessions {
+            if s.archived {
+                continue;
+            }
             match s.status() {
                 Status::Waiting => waiting += 1,
                 Status::Busy => busy += 1,
@@ -252,7 +255,7 @@ impl App {
             if !saved.cwd.exists() {
                 continue;
             }
-            if let Err(e) = self.add_session(
+            match self.add_session(
                 saved.cwd.clone(),
                 Some(saved.repo_root.clone()),
                 saved.branch.clone(),
@@ -260,7 +263,15 @@ impl App {
                 true,
                 saved.shell_open,
             ) {
-                self.set_message(format!("restore {}: {e}", saved.name));
+                Ok(id) => {
+                    if saved.archived {
+                        if let Some(s) = self.session_mut(id) {
+                            s.archived = true;
+                            s.archived_by_user = saved.archived_by_user;
+                        }
+                    }
+                }
+                Err(e) => self.set_message(format!("restore {}: {e}", saved.name)),
             }
         }
         // Premise: baude is started from a repo folder. Auto-add it if new.
@@ -287,6 +298,8 @@ impl App {
                     branch: s.branch.clone(),
                     is_worktree: s.is_worktree,
                     shell_open: s.shell_open,
+                    archived: s.archived,
+                    archived_by_user: s.archived_by_user,
                 })
                 .collect(),
         };
@@ -299,16 +312,30 @@ impl App {
     /// never reorders, sessions that need input flash in place instead),
     /// followed by the remote daemon's sessions.
     pub fn ordered_ids(&self) -> Vec<SelId> {
-        self.sessions
-            .iter()
-            .map(|s| SelId::Local(s.id))
-            .chain(
-                self.remote_snap
-                    .sessions
-                    .iter()
-                    .map(|r| SelId::Remote(r.id)),
-            )
+        let all = || {
+            self.sessions
+                .iter()
+                .map(|s| (SelId::Local(s.id), s.archived))
+                .chain(
+                    self.remote_snap
+                        .sessions
+                        .iter()
+                        .map(|r| (SelId::Remote(r.id), r.archived)),
+                )
+        };
+        // Active sessions keep their stable order; archived sink to the end.
+        all()
+            .filter(|(_, a)| !a)
+            .chain(all().filter(|(_, a)| *a))
+            .map(|(id, _)| id)
             .collect()
+    }
+
+    pub fn is_archived(&self, id: SelId) -> bool {
+        match id {
+            SelId::Local(lid) => self.session(lid).map(|s| s.archived).unwrap_or(false),
+            SelId::Remote(rid) => self.remote_info(rid).map(|r| r.archived).unwrap_or(false),
+        }
     }
 
     pub fn remote_info(&self, id: u64) -> Option<&RemoteInfo> {
@@ -413,6 +440,9 @@ impl App {
             shell_open: false,
             spawn_unix_ms: now_unix_ms(),
             meta: ClaudeMeta::default(),
+            archived: false,
+            archived_by_user: false,
+            was_busy: false,
         };
         if shell_open {
             let (_, shell_rect) = pane_rects(self.content_rect, true);
@@ -450,8 +480,13 @@ impl App {
         }
         if now_ms().saturating_sub(self.last_meta_poll) >= META_POLL_MS {
             self.last_meta_poll = now_ms();
+            let mut changed = false;
             for s in &mut self.sessions {
                 s.poll_meta();
+                changed |= s.auto_archive_tick(baude_core::session::AUTO_ARCHIVE_IDLE_MS);
+            }
+            if changed {
+                self.save();
             }
         }
         if let Some(r) = &self.remote {
@@ -618,6 +653,9 @@ impl App {
             .unwrap_or(false);
         let bytes = encode_key(&key, app_cursor);
         pty.write_input(&bytes);
+        if !to_shell && s.unarchive_on_input() {
+            self.save();
+        }
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -742,6 +780,7 @@ impl App {
                     self.set_message("no session selected — press n to add a repo first".into());
                 }
             }
+            KeyCode::Char('a') => self.toggle_archive(),
             KeyCode::Char('r') => match self.selected_id {
                 Some(SelId::Local(id)) => self.restart_session(id),
                 Some(SelId::Remote(id)) => self.restart_remote(id),
@@ -970,6 +1009,35 @@ impl App {
         }
     }
 
+    /// `a` — park/unpark the selected session.
+    fn toggle_archive(&mut self) {
+        match self.selected_id {
+            Some(SelId::Local(id)) => {
+                let Some(s) = self.session_mut(id) else {
+                    return;
+                };
+                s.archived = !s.archived;
+                s.archived_by_user = s.archived;
+                let msg = if s.archived { "archived" } else { "unarchived" };
+                self.set_message(msg.into());
+                self.save();
+            }
+            Some(SelId::Remote(id)) => {
+                let archived = self.is_archived(SelId::Remote(id));
+                let Some(r) = &self.remote else { return };
+                match r.set_archived(id, !archived) {
+                    Ok(()) => self.set_message(if archived {
+                        "unarchived".into()
+                    } else {
+                        "archived".into()
+                    }),
+                    Err(e) => self.set_message(format!("archive: {e}")),
+                }
+            }
+            None => {}
+        }
+    }
+
     fn move_selection(&mut self, delta: i64) {
         let ids = self.ordered_ids();
         if ids.is_empty() {
@@ -987,7 +1055,12 @@ impl App {
     /// wrapping around. When attached, stays attached to the same kind of
     /// pane — falling back to the claude pane if the new session has no shell.
     fn cycle_session(&mut self, delta: i64) {
-        let ids = self.ordered_ids();
+        // Cycling skips the archive — j/k still reaches it.
+        let ids: Vec<SelId> = self
+            .ordered_ids()
+            .into_iter()
+            .filter(|&id| !self.is_archived(id))
+            .collect();
         if ids.is_empty() {
             return;
         }

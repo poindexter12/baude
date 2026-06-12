@@ -306,6 +306,18 @@ async function sendKey(key) {
   }
 }
 
+async function toggleArchive() {
+  const s = session(state.sid);
+  if (!s) return;
+  try {
+    await api(`/sessions/${state.sid}/${s.archived ? "unarchive" : "archive"}`, { method: "POST" });
+    toast(s.archived ? "unarchived" : "archived — parked at the bottom");
+    refresh();
+  } catch (e) {
+    toast(`archive failed: ${e.message}`);
+  }
+}
+
 async function restartSession() {
   if (state.sid === null) return;
   try {
@@ -385,7 +397,7 @@ function render() {
 
 function renderList() {
   const conn = state.online ? "" : '<div id="conn">disconnected — retrying…</div>';
-  const rows = state.sessions.map((s) => {
+  const rowHtml = (s) => {
     const meta = [
       shortModel(s.model),
       s.context_used_pct != null ? `${s.context_used_pct}%` : null,
@@ -394,14 +406,20 @@ function renderList() {
       s.session_cost_usd != null ? `$${s.session_cost_usd.toFixed(2)}` : null,
     ].filter(Boolean).join(" · ");
     return `
-      <button class="row" data-sid="${s.id}">
+      <button class="row${s.archived ? " archived" : ""}" data-sid="${s.id}">
         <div class="line1">${statusIcon(s)}<span class="name">${esc(s.name)}</span>
           <span class="wait">${waitingFor(s)}</span></div>
         ${s.title ? `<div class="title">${esc(s.title)}</div>` : ""}
         ${meta ? `<div class="line2">${meta}</div>` : ""}
       </button>`;
-  }).join("");
-  const waiting = state.sessions.filter((s) => s.status === "waiting").length;
+  };
+  const active = state.sessions.filter((s) => !s.archived);
+  const archived = state.sessions.filter((s) => s.archived);
+  const rows = active.map(rowHtml).join("")
+    + (archived.length
+      ? `<div class="secthead">archived</div>${archived.map(rowHtml).join("")}`
+      : "");
+  const waiting = active.filter((s) => s.status === "waiting").length;
   const bell = pushSupported()
     ? `<button class="iconbtn${state.pushOn ? " active" : ""}" id="bellbtn"
          title="notify when a session waits">${state.pushOn ? "🔔" : "🔕"}</button>`
@@ -463,6 +481,7 @@ function renderChat() {
       <button class="iconbtn" id="backbtn" aria-label="back">‹</button>
       <h1>${esc(name)}<span class="sub">${esc(sub)}</span></h1>
       <button class="iconbtn${state.screenOpen ? " active" : ""}" id="screenbtn" title="terminal peek">▦</button>
+      <button class="iconbtn" id="archbtn" title="${s && s.archived ? "unarchive" : "archive"}">${s && s.archived ? "⤒" : "⤓"}</button>
       <button class="iconbtn" id="escbtn" title="interrupt (esc)">⎋</button>
       <button class="iconbtn danger" id="killbtn" title="kill session">✕</button>
     </header>
@@ -483,6 +502,7 @@ function renderChat() {
 
   document.getElementById("backbtn").onclick = () => { location.hash = "#/"; };
   document.getElementById("screenbtn").onclick = toggleScreen;
+  document.getElementById("archbtn").onclick = toggleArchive;
   document.getElementById("escbtn").onclick = interrupt;
   document.getElementById("killbtn").onclick = deleteSession;
   for (const el of document.querySelectorAll("#screen .key")) {

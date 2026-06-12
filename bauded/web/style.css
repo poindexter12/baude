@@ -97,6 +97,16 @@ header .iconbtn.danger { color: var(--red); }
 .row .title { color: var(--dim); font-size: 13px; margin-left: 22px; margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.row.archived { opacity: 0.5; }
+.row.archived .dot.waiting { animation: none; }
+.secthead {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 12px 14px 4px;
+}
+
 .dot { display: inline-block; width: 14px; text-align: center; }
 .dot.waiting { color: var(--yellow); animation: pulse 1.4s infinite; }
 .dot.busy { color: var(--blue); display: inline-block; animation: spin 1s steps(4) infinite; }

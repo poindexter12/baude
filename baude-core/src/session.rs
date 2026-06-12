@@ -10,6 +10,10 @@ use crate::pty::{now_ms, Pty};
 /// While working, Claude Code streams spinner/progress output continuously.
 const BUSY_WINDOW_MS: u64 = 2000;
 
+/// Waiting this long unattended auto-archives a session: it sinks to the
+/// bottom of lists and stops demanding attention until it's active again.
+pub const AUTO_ARCHIVE_IDLE_MS: u64 = 30 * 60 * 1000;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Status {
     /// Idle and (presumably) waiting for user input.
@@ -32,6 +36,51 @@ pub struct Session {
     pub shell_open: bool,
     pub spawn_unix_ms: u64,
     pub meta: ClaudeMeta,
+    /// Parked: sorts last, excluded from cycling/counters/notifications.
+    /// Set manually or after `AUTO_ARCHIVE_IDLE_MS` of waiting.
+    pub archived: bool,
+    /// A manual archive sticks until unarchived or re-engaged (input sent);
+    /// an automatic one also lifts when a new turn starts.
+    pub archived_by_user: bool,
+    /// Busy state at the previous archive tick — auto-unarchiving triggers
+    /// on the *edge* into busy (fresh activity), not on busy level.
+    pub was_busy: bool,
+}
+
+impl Session {
+    /// Apply the auto-archive rules; returns true when the flag flipped.
+    pub fn auto_archive_tick(&mut self, idle_ms: u64) -> bool {
+        let status = self.status();
+        let busy_now = status == Status::Busy;
+        let was_busy = std::mem::replace(&mut self.was_busy, busy_now);
+        if idle_ms == 0 {
+            return false;
+        }
+        match status {
+            Status::Waiting if !self.archived && self.waiting_for_ms() >= idle_ms => {
+                self.archived = true;
+                self.archived_by_user = false;
+                true
+            }
+            Status::Busy if self.archived && !self.archived_by_user && !was_busy => {
+                self.archived = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Input headed into the session = re-engagement; lift any archive.
+    /// Returns true when the flag flipped.
+    pub fn unarchive_on_input(&mut self) -> bool {
+        if self.archived {
+            self.archived = false;
+            self.archived_by_user = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Session {

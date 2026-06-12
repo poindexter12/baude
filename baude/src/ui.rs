@@ -140,7 +140,17 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let width = list_area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut remote_header_drawn = false;
+    let mut archive_header_drawn = false;
     for id in &ids {
+        let archived = app.is_archived(*id);
+        if archived && !archive_header_drawn {
+            archive_header_drawn = true;
+            let dim = Style::default().fg(Color::DarkGray);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("▼ archived", dim),
+            ]));
+        }
         match id {
             SelId::Local(lid) => {
                 let Some(s) = app.session(*lid) else { continue };
@@ -152,11 +162,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     &s.name,
                     s.waiting_for_ms(),
                     width,
+                    archived,
                 );
                 lines.push(meta_line(s, selected));
             }
             SelId::Remote(rid) => {
-                if !remote_header_drawn {
+                if !remote_header_drawn && !archived {
                     remote_header_drawn = true;
                     lines.push(remote_header(app, width));
                 }
@@ -175,12 +186,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     &r.name,
                     waiting_ms.unwrap_or(0),
                     width,
+                    archived,
                 );
                 lines.push(remote_meta_line(r, selected));
             }
         }
     }
-    // Remote configured but no sessions yet: still show the header.
+    // Remote configured but no active sessions: still show the header.
     if app.remote.is_some() && !remote_header_drawn {
         lines.push(remote_header(app, width));
     }
@@ -245,6 +257,7 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
 
 /// One sidebar session row: status icon, name, and (when waiting) a
 /// right-aligned wait timer. Shared by local and remote sessions.
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     lines: &mut Vec<Line<'static>>,
     selected: bool,
@@ -252,10 +265,13 @@ fn session_row(
     name: &str,
     waiting_ms: u64,
     width: usize,
+    archived: bool,
 ) {
-    let flash = flash_on();
+    // Archived rows never flash or color — they've stopped asking for you.
+    let flash = !archived && flash_on();
 
     let (icon, icon_style) = match status {
+        _ if archived => ("·", Style::default().fg(Color::DarkGray)),
         Status::Waiting => {
             // pulse the dot to pull the eye to a session that needs you
             let c = if flash {
@@ -269,7 +285,7 @@ fn session_row(
         Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
     };
 
-    let name_style = if matches!(status, Status::Exited) {
+    let name_style = if archived || matches!(status, Status::Exited) {
         Style::default().fg(Color::DarkGray)
     } else if selected {
         Style::default()
@@ -972,6 +988,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  n           new session (repo path)"),
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
+                Line::raw("  a           archive/unarchive (auto after 30m idle)"),
                 Line::raw("  x           close session"),
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),

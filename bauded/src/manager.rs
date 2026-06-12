@@ -36,6 +36,8 @@ pub struct Manager {
     claude_cmd: String,
     /// false in tests — never touch the real daemon-state.json.
     persist: bool,
+    /// Waiting this long auto-archives a session; 0 disables.
+    pub auto_archive_ms: u64,
 }
 
 /// One row of `GET /sessions`.
@@ -58,6 +60,7 @@ pub struct SessionInfo {
     pub gsd_phase: Option<String>,
     pub session_cost_usd: Option<f64>,
     pub claude_session_id: Option<String>,
+    pub archived: bool,
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -82,6 +85,15 @@ fn status_str(s: Status) -> &'static str {
 
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
 /// `claude_cmd`, then plain `claude`.
+/// BAUDED_AUTO_ARCHIVE_MIN (minutes, 0 disables) — default 30.
+pub fn default_auto_archive_ms() -> u64 {
+    std::env::var("BAUDED_AUTO_ARCHIVE_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+        * 60_000
+}
+
 pub fn default_claude_cmd() -> String {
     std::env::var("BAUDE_CLAUDE_CMD")
         .ok()
@@ -96,6 +108,7 @@ impl Manager {
             next_id: 1,
             claude_cmd,
             persist,
+            auto_archive_ms: default_auto_archive_ms(),
         }
     }
 
@@ -116,7 +129,15 @@ impl Manager {
                 Some(&saved.name),
                 true,
             ) {
-                Ok(_) => restored += 1,
+                Ok(id) => {
+                    restored += 1;
+                    if saved.archived {
+                        if let Ok(s) = self.session_mut(id) {
+                            s.archived = true;
+                            s.archived_by_user = saved.archived_by_user;
+                        }
+                    }
+                }
                 Err(e) => eprintln!("restore {}: {e}", saved.name),
             }
         }
@@ -139,6 +160,8 @@ impl Manager {
                     branch: s.branch.clone(),
                     is_worktree: s.is_worktree,
                     shell_open: false,
+                    archived: s.archived,
+                    archived_by_user: s.archived_by_user,
                 })
                 .collect(),
         };
@@ -224,6 +247,9 @@ impl Manager {
             shell_open: false,
             spawn_unix_ms: now_unix_ms(),
             meta: ClaudeMeta::default(),
+            archived: false,
+            archived_by_user: false,
+            was_busy: false,
         });
         Ok(id)
     }
@@ -285,6 +311,9 @@ impl Manager {
         s.claude.write_input(&bytes);
         std::thread::sleep(Self::SUBMIT_DELAY);
         s.claude.write_input(b"\r");
+        if s.unarchive_on_input() {
+            self.save();
+        }
         Ok(())
     }
 
@@ -320,6 +349,9 @@ impl Manager {
             bail!("claude has exited");
         }
         s.claude.write_input(bytes);
+        if s.unarchive_on_input() {
+            self.save();
+        }
         Ok(())
     }
 
@@ -387,6 +419,9 @@ impl Manager {
             }
             s.claude.write_input(&key_bytes(key, app_cursor));
         }
+        if s.unarchive_on_input() {
+            self.save();
+        }
         Ok(())
     }
 
@@ -399,9 +434,26 @@ impl Manager {
     }
 
     pub fn poll(&mut self) {
+        let mut changed = false;
+        let idle = self.auto_archive_ms;
         for s in &mut self.sessions {
             s.poll_meta();
+            changed |= s.auto_archive_tick(idle);
         }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// Park or unpark a session. Archived sessions sort last in clients and
+    /// stop sending notifications. A manual archive sticks until unarchived
+    /// or re-engaged; an automatic one also lifts when a new turn starts.
+    pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
+        let s = self.session_mut(id)?;
+        s.archived = archived;
+        s.archived_by_user = archived;
+        self.save();
+        Ok(())
     }
 
     pub fn kill_all(&mut self) {
@@ -488,6 +540,7 @@ fn session_info(s: &Session) -> SessionInfo {
         gsd_phase: s.meta.gsd.as_ref().and_then(|g| g.phase_line.clone()),
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
+        archived: s.archived,
     }
 }
 
@@ -575,6 +628,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         m.restart(id).unwrap();
+        m.kill_all();
+    }
+
+    #[test]
+    fn archive_toggles() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        assert!(!m.info(id).unwrap().archived);
+        m.set_archived(id, true).unwrap();
+        assert!(m.info(id).unwrap().archived);
+        m.set_archived(id, false).unwrap();
+        assert!(!m.info(id).unwrap().archived);
+        assert!(m.set_archived(99, true).is_err());
         m.kill_all();
     }
 
