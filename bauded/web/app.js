@@ -239,6 +239,17 @@ async function sendKey(key) {
   }
 }
 
+async function restartSession() {
+  if (state.sid === null) return;
+  try {
+    await api(`/sessions/${state.sid}/restart`, { method: "POST" });
+    toast("restarting claude…");
+    refresh();
+  } catch (e) {
+    toast(`restart failed: ${e.message}`);
+  }
+}
+
 async function deleteSession() {
   const s = session(state.sid);
   if (!s || !confirm(`Kill session "${s.name}"?`)) return;
@@ -387,10 +398,14 @@ function renderChat() {
         <div class="meta">queued</div></div>`).join("")}</div>
     ${typing}
     ${screenDrawer}
+    ${s && s.status === "exited" ? `
+    <form id="composer">
+      <button type="button" class="send" id="restartbtn" style="flex:1">claude exited — restart</button>
+    </form>` : `
     <form id="composer">
       <textarea id="input" rows="1" placeholder="message claude…" enterkeyhint="send"></textarea>
       <button type="submit" class="send">send</button>
-    </form>`;
+    </form>`}`;
 
   document.getElementById("backbtn").onclick = () => { location.hash = "#/"; };
   document.getElementById("screenbtn").onclick = toggleScreen;
@@ -400,17 +415,21 @@ function renderChat() {
     el.onclick = () => sendKey(el.dataset.key);
   }
   document.getElementById("composer").onsubmit = (e) => { e.preventDefault(); sendMessage(); };
+  const restartBtn = document.getElementById("restartbtn");
+  if (restartBtn) restartBtn.onclick = restartSession;
   const ta = document.getElementById("input");
-  ta.oninput = () => {
-    ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
-  };
-  ta.onkeydown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !isTouch()) {
-      e.preventDefault();
-      sendMessage();
-    }
-  };
+  if (ta) {
+    ta.oninput = () => {
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+    };
+    ta.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !isTouch()) {
+        e.preventDefault();
+        sendMessage();
+      }
+    };
+  }
   if (atBottom) scrollChat(true);
 }
 
@@ -424,8 +443,8 @@ renderChat = function () {
   const ta = document.getElementById("input");
   const saved = ta ? { text: ta.value, focus: document.activeElement === ta } : null;
   _renderChat();
-  if (saved) {
-    const nta = document.getElementById("input");
+  const nta = document.getElementById("input");
+  if (saved && nta) {
     nta.value = saved.text;
     nta.dispatchEvent(new Event("input"));
     if (saved.focus) nta.focus();

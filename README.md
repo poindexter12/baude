@@ -197,6 +197,8 @@ external assets.
 | `GET /sessions/{id}/messages?after=<uuid>` | transcript as chat messages |
 | `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
 | `POST /sessions/{id}/interrupt` | Esc — stop current work |
+| `POST /sessions/{id}/restart` | respawn claude in an exited session (`--continue`) |
+| `GET /sessions/{id}/queue` | messages typed while busy, not yet picked up |
 | `GET /sessions/{id}/screen` | plain-text terminal snapshot (menu escape hatch) |
 | `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |

@@ -25,6 +25,7 @@ pub fn router(state: Shared) -> Router {
             get(get_messages).post(post_message),
         )
         .route("/sessions/{id}/interrupt", post(interrupt))
+        .route("/sessions/{id}/restart", post(restart))
         .route("/sessions/{id}/queue", get(get_queue))
         .route("/sessions/{id}/screen", get(get_screen))
         .route("/sessions/{id}/keys", post(post_keys))
@@ -131,6 +132,18 @@ async fn interrupt(
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
     lock(&state).interrupt(id).map_err(not_found)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
+    lock(&state).restart(id).map_err(|e| {
+        let msg = e.to_string();
+        if msg.starts_with("no session") {
+            (StatusCode::NOT_FOUND, msg)
+        } else {
+            (StatusCode::CONFLICT, msg) // still running
+        }
+    })?;
     Ok(StatusCode::ACCEPTED)
 }
 
