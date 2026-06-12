@@ -1,0 +1,689 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
+
+use crate::git;
+use crate::keys::encode_key;
+use crate::persist::{self, SavedSession, State};
+use crate::pty::{now_ms, Pty};
+use crate::session::{Session, Status};
+
+const MESSAGE_TTL_MS: u64 = 5000;
+
+/// The command run for each session. Override with e.g.
+/// BAUDE_CLAUDE_CMD="claude --dangerously-skip-permissions".
+fn claude_cmd() -> String {
+    std::env::var("BAUDE_CLAUDE_CMD").unwrap_or_else(|_| "claude".to_string())
+}
+
+/// ctrl+\ arrives as raw byte 0x1C, which crossterm reports as ctrl+4
+/// (the two are indistinguishable in legacy terminal encoding).
+fn is_backslash(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('\\') | KeyCode::Char('4'))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Claude,
+    Shell,
+}
+
+pub enum InputKind {
+    NewSessionPath,
+    NewWorktreeBranch { repo_root: PathBuf },
+}
+
+pub enum Modal {
+    None,
+    Help,
+    Input {
+        kind: InputKind,
+        title: String,
+        buf: String,
+    },
+    ConfirmKill {
+        id: u64,
+    },
+    ConfirmCloseWorktree {
+        id: u64,
+    },
+}
+
+pub struct App {
+    pub sessions: Vec<Session>,
+    pub selected_id: Option<u64>,
+    pub focus: Focus,
+    pub modal: Modal,
+    pub message: Option<(String, u64)>,
+    pub should_quit: bool,
+    pub launch_dir: PathBuf,
+    content_rect: Rect,
+    next_id: u64,
+}
+
+/// Outer (bordered) rects for the claude pane and optional shell pane.
+pub fn pane_rects(content: Rect, shell_open: bool) -> (Rect, Option<Rect>) {
+    if shell_open && content.height >= 14 {
+        let shell_h = (content.height * 30 / 100).clamp(8, content.height.saturating_sub(6));
+        let claude = Rect {
+            height: content.height - shell_h,
+            ..content
+        };
+        let shell = Rect {
+            y: content.y + claude.height,
+            height: shell_h,
+            ..content
+        };
+        (claude, Some(shell))
+    } else {
+        (content, None)
+    }
+}
+
+/// Shrink an outer pane rect to its terminal drawing area (inside the border).
+pub fn inner(r: Rect) -> Rect {
+    Rect {
+        x: r.x + 1,
+        y: r.y + 1,
+        width: r.width.saturating_sub(2),
+        height: r.height.saturating_sub(2),
+    }
+}
+
+impl App {
+    pub fn new(launch_dir: PathBuf) -> App {
+        App {
+            sessions: Vec::new(),
+            selected_id: None,
+            focus: Focus::Sidebar,
+            modal: Modal::None,
+            message: None,
+            should_quit: false,
+            launch_dir,
+            content_rect: Rect::new(0, 0, 80, 24),
+            next_id: 1,
+        }
+    }
+
+    // ---- startup / persistence ----
+
+    pub fn restore(&mut self) {
+        let state = persist::load();
+        for saved in &state.sessions {
+            if !saved.cwd.exists() {
+                continue;
+            }
+            if let Err(e) = self.add_session(
+                saved.cwd.clone(),
+                Some(saved.repo_root.clone()),
+                saved.branch.clone(),
+                saved.is_worktree,
+                true,
+                saved.shell_open,
+            ) {
+                self.set_message(format!("restore {}: {e}", saved.name));
+            }
+        }
+        // Premise: baude is started from a repo folder. Auto-add it if new.
+        let launch = self.launch_dir.clone();
+        let already = self.sessions.iter().any(|s| s.cwd == launch);
+        if !already && git::repo_root(&launch).is_some() {
+            if let Err(e) = self.add_session(launch, None, None, false, false, false) {
+                self.set_message(format!("start session: {e}"));
+            }
+        }
+        self.selected_id = self.sorted_ids().first().copied();
+        self.save();
+    }
+
+    pub fn save(&self) {
+        let state = State {
+            sessions: self
+                .sessions
+                .iter()
+                .map(|s| SavedSession {
+                    name: s.name.clone(),
+                    cwd: s.cwd.clone(),
+                    repo_root: s.repo_root.clone(),
+                    branch: s.branch.clone(),
+                    is_worktree: s.is_worktree,
+                    shell_open: s.shell_open,
+                })
+                .collect(),
+        };
+        let _ = persist::save(&state);
+    }
+
+    // ---- session bookkeeping ----
+
+    /// Session ids sorted for the sidebar: waiting-for-input first (longest
+    /// wait at the top), then busy, then exited. Stable tie-break by id.
+    pub fn sorted_ids(&self) -> Vec<u64> {
+        let mut entries: Vec<(u8, u64, u64)> = self
+            .sessions
+            .iter()
+            .map(|s| {
+                let rank = match s.status() {
+                    Status::Waiting => 0u8,
+                    Status::Busy => 1,
+                    Status::Exited => 2,
+                };
+                let last = s
+                    .claude
+                    .last_output_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                (rank, last, s.id)
+            })
+            .collect();
+        entries.sort();
+        entries.into_iter().map(|(_, _, id)| id).collect()
+    }
+
+    pub fn session(&self, id: u64) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
+    pub fn session_mut(&mut self, id: u64) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn selected(&self) -> Option<&Session> {
+        self.selected_id.and_then(|id| self.session(id))
+    }
+
+    fn selected_mut(&mut self) -> Option<&mut Session> {
+        self.selected_id
+            .and_then(|id| self.sessions.iter_mut().find(|s| s.id == id))
+    }
+
+    fn unique_name(&self, base: &str) -> String {
+        if !self.sessions.iter().any(|s| s.name == base) {
+            return base.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("{base} ({n})");
+            if !self.sessions.iter().any(|s| s.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    fn claude_spawn_size(&self, shell_open: bool) -> (u16, u16) {
+        let (claude, _) = pane_rects(self.content_rect, shell_open);
+        let r = inner(claude);
+        (r.height, r.width)
+    }
+
+    pub fn add_session(
+        &mut self,
+        cwd: PathBuf,
+        repo_root: Option<PathBuf>,
+        branch: Option<String>,
+        is_worktree: bool,
+        resume: bool,
+        shell_open: bool,
+    ) -> Result<u64> {
+        // For worktree sessions the caller passes the main repo root —
+        // `rev-parse --show-toplevel` inside a worktree returns the worktree.
+        let repo_root =
+            repo_root.unwrap_or_else(|| git::repo_root(&cwd).unwrap_or_else(|| cwd.clone()));
+        let dir_name = |p: &Path| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string_lossy().to_string())
+        };
+        let base = match &branch {
+            Some(b) => format!("{}:{}", dir_name(&repo_root), b),
+            None => dir_name(&cwd),
+        };
+        let name = self.unique_name(&base);
+
+        // `claude --continue` resumes the most recent conversation in this
+        // directory; falls back to a fresh session if there is none.
+        let base = claude_cmd();
+        let cmd = if resume {
+            format!("{base} --continue 2>/dev/null || exec {base}")
+        } else {
+            format!("exec {base}")
+        };
+        let (rows, cols) = self.claude_spawn_size(shell_open);
+        let claude = Pty::spawn(Some(&cmd), &cwd, rows, cols)?;
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut session = Session {
+            id,
+            name,
+            cwd,
+            repo_root,
+            branch,
+            is_worktree,
+            claude,
+            shell: None,
+            shell_open: false,
+        };
+        if shell_open {
+            let (_, shell_rect) = pane_rects(self.content_rect, true);
+            if let Some(sr) = shell_rect {
+                let r = inner(sr);
+                let _ = session.open_shell(r.height, r.width);
+            }
+        }
+        self.sessions.push(session);
+        self.selected_id = Some(id);
+        Ok(id)
+    }
+
+    fn remove_session(&mut self, id: u64) {
+        if let Some(s) = self.session_mut(id) {
+            s.kill();
+        }
+        self.sessions.retain(|s| s.id != id);
+        if self.selected_id == Some(id) {
+            self.selected_id = self.sorted_ids().first().copied();
+        }
+        self.focus = Focus::Sidebar;
+        self.save();
+    }
+
+    pub fn set_message(&mut self, msg: String) {
+        self.message = Some((msg, now_ms() + MESSAGE_TTL_MS));
+    }
+
+    pub fn tick(&mut self) {
+        if let Some((_, expiry)) = &self.message {
+            if now_ms() > *expiry {
+                self.message = None;
+            }
+        }
+        // If the focused pane's process died, fall back to the sidebar.
+        match self.focus {
+            Focus::Claude => {
+                if self
+                    .selected()
+                    .map(|s| s.claude.is_exited())
+                    .unwrap_or(true)
+                {
+                    self.focus = Focus::Sidebar;
+                }
+            }
+            Focus::Shell => {
+                let dead = self
+                    .selected()
+                    .and_then(|s| s.shell.as_ref())
+                    .map(|p| p.is_exited())
+                    .unwrap_or(true);
+                if dead {
+                    if let Some(s) = self.selected_mut() {
+                        s.shell_open = false;
+                    }
+                    self.focus = Focus::Claude;
+                }
+            }
+            Focus::Sidebar => {}
+        }
+    }
+
+    /// Resize every session's PTYs to match the geometry they would render at.
+    pub fn sync_sizes(&mut self, content: Rect) {
+        self.content_rect = content;
+        for s in &mut self.sessions {
+            let (claude_rect, shell_rect) = pane_rects(content, s.shell_open);
+            let c = inner(claude_rect);
+            s.claude.resize(c.height, c.width);
+            if let (Some(sr), Some(shell)) = (shell_rect, s.shell.as_mut()) {
+                let r = inner(sr);
+                shell.resize(r.height, r.width);
+            }
+        }
+    }
+
+    pub fn kill_all(&mut self) {
+        for s in &mut self.sessions {
+            s.kill();
+        }
+    }
+
+    // ---- input handling ----
+
+    pub fn handle_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
+            Event::Paste(text) => self.handle_paste(text),
+            _ => {}
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        if !matches!(self.modal, Modal::None) {
+            self.handle_modal_key(key);
+            return;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // ctrl+q: step out to the sidebar from anywhere.
+        if ctrl && matches!(key.code, KeyCode::Char('q')) {
+            self.focus = Focus::Sidebar;
+            return;
+        }
+
+        match self.focus {
+            Focus::Sidebar => self.handle_sidebar_key(key),
+            Focus::Claude => {
+                if ctrl && is_backslash(key.code) {
+                    self.toggle_shell(true);
+                    return;
+                }
+                self.forward_key(key, false);
+            }
+            Focus::Shell => {
+                if ctrl && is_backslash(key.code) {
+                    if let Some(s) = self.selected_mut() {
+                        s.shell_open = false;
+                    }
+                    self.focus = Focus::Claude;
+                    self.save();
+                    return;
+                }
+                self.forward_key(key, true);
+            }
+        }
+    }
+
+    fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
+        let Some(s) = self.selected_mut() else { return };
+        let pty = if to_shell {
+            match s.shell.as_mut() {
+                Some(p) => p,
+                None => return,
+            }
+        } else {
+            &mut s.claude
+        };
+        let app_cursor = pty
+            .parser
+            .lock()
+            .map(|p| p.screen().application_cursor())
+            .unwrap_or(false);
+        let bytes = encode_key(&key, app_cursor);
+        pty.write_input(&bytes);
+    }
+
+    fn handle_paste(&mut self, text: String) {
+        let to_shell = match self.focus {
+            Focus::Shell => true,
+            Focus::Claude => false,
+            Focus::Sidebar => {
+                // Paste into an open text input modal.
+                if let Modal::Input { buf, .. } = &mut self.modal {
+                    buf.push_str(text.trim_end_matches(['\r', '\n']));
+                }
+                return;
+            }
+        };
+        let Some(s) = self.selected_mut() else { return };
+        let pty = if to_shell {
+            match s.shell.as_mut() {
+                Some(p) => p,
+                None => return,
+            }
+        } else {
+            &mut s.claude
+        };
+        let bracketed = pty
+            .parser
+            .lock()
+            .map(|p| p.screen().bracketed_paste())
+            .unwrap_or(false);
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+        } else {
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        pty.write_input(&bytes);
+    }
+
+    fn handle_sidebar_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(s) = self.selected() {
+                    if s.claude.is_exited() {
+                        self.set_message("claude exited — press r to restart".into());
+                    } else {
+                        self.focus = Focus::Claude;
+                    }
+                }
+            }
+            KeyCode::Char('t') => self.toggle_shell(false),
+            KeyCode::Char('n') => {
+                self.modal = Modal::Input {
+                    kind: InputKind::NewSessionPath,
+                    title: "new session — repo path".into(),
+                    buf: format!("{}", self.launch_dir.display()),
+                };
+            }
+            KeyCode::Char('w') => {
+                if let Some(s) = self.selected() {
+                    self.modal = Modal::Input {
+                        kind: InputKind::NewWorktreeBranch {
+                            repo_root: s.repo_root.clone(),
+                        },
+                        title: format!(
+                            "new worktree in {} — branch name",
+                            s.repo_root
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        ),
+                        buf: String::new(),
+                    };
+                } else {
+                    self.set_message("no session selected — press n to add a repo first".into());
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(id) = self.selected_id {
+                    self.restart_session(id);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(s) = self.selected() {
+                    self.modal = if s.is_worktree {
+                        Modal::ConfirmCloseWorktree { id: s.id }
+                    } else {
+                        Modal::ConfirmKill { id: s.id }
+                    };
+                }
+            }
+            KeyCode::Char('?') => self.modal = Modal::Help,
+            _ => {}
+        }
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent) {
+        match &mut self.modal {
+            Modal::Help => {
+                self.modal = Modal::None;
+            }
+            Modal::Input { buf, .. } => match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buf.push(c);
+                }
+                KeyCode::Enter => {
+                    let modal = std::mem::replace(&mut self.modal, Modal::None);
+                    if let Modal::Input { kind, buf, .. } = modal {
+                        self.submit_input(kind, buf.trim().to_string());
+                    }
+                }
+                _ => {}
+            },
+            Modal::ConfirmKill { id } => {
+                let id = *id;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        self.modal = Modal::None;
+                        self.remove_session(id);
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                    _ => {}
+                }
+            }
+            Modal::ConfirmCloseWorktree { id } => {
+                let id = *id;
+                match key.code {
+                    KeyCode::Char('k') => {
+                        self.modal = Modal::None;
+                        self.remove_session(id);
+                        self.set_message("session closed — worktree kept".into());
+                    }
+                    KeyCode::Char('r') => {
+                        self.modal = Modal::None;
+                        let info = self
+                            .session(id)
+                            .map(|s| (s.repo_root.clone(), s.cwd.clone()));
+                        self.remove_session(id);
+                        if let Some((repo, wt)) = info {
+                            if git::is_dirty(&wt) {
+                                self.set_message(
+                                    "worktree has uncommitted changes — kept on disk".into(),
+                                );
+                            } else {
+                                match git::remove_worktree(&repo, &wt) {
+                                    Ok(()) => self.set_message("worktree removed".into()),
+                                    Err(e) => self.set_message(format!("worktree kept: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Esc => self.modal = Modal::None,
+                    _ => {}
+                }
+            }
+            Modal::None => {}
+        }
+    }
+
+    fn submit_input(&mut self, kind: InputKind, value: String) {
+        if value.is_empty() {
+            return;
+        }
+        match kind {
+            InputKind::NewSessionPath => {
+                let expanded = if let Some(rest) = value.strip_prefix("~/") {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/"))
+                        .join(rest)
+                } else {
+                    PathBuf::from(&value)
+                };
+                if !expanded.is_dir() {
+                    self.set_message(format!("not a directory: {}", expanded.display()));
+                    return;
+                }
+                match self.add_session(expanded, None, None, false, false, false) {
+                    Ok(_) => {
+                        self.focus = Focus::Claude;
+                        self.save();
+                    }
+                    Err(e) => self.set_message(format!("spawn failed: {e}")),
+                }
+            }
+            InputKind::NewWorktreeBranch { repo_root } => {
+                match git::create_worktree(&repo_root, &value) {
+                    Ok(dir) => match self.add_session(
+                        dir,
+                        Some(repo_root),
+                        Some(value),
+                        true,
+                        false,
+                        false,
+                    ) {
+                        Ok(_) => {
+                            self.focus = Focus::Claude;
+                            self.save();
+                        }
+                        Err(e) => self.set_message(format!("spawn failed: {e}")),
+                    },
+                    Err(e) => self.set_message(format!("worktree: {e}")),
+                }
+            }
+        }
+    }
+
+    fn move_selection(&mut self, delta: i64) {
+        let ids = self.sorted_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let cur = self
+            .selected_id
+            .and_then(|id| ids.iter().position(|&x| x == id))
+            .unwrap_or(0) as i64;
+        let next = (cur + delta).clamp(0, ids.len() as i64 - 1) as usize;
+        self.selected_id = Some(ids[next]);
+    }
+
+    fn toggle_shell(&mut self, focus_it: bool) {
+        let content = self.content_rect;
+        let Some(s) = self.selected_mut() else {
+            return;
+        };
+        if s.shell_open {
+            s.shell_open = false;
+            if self.focus == Focus::Shell {
+                self.focus = Focus::Claude;
+            }
+        } else {
+            let (_, shell_rect) = pane_rects(content, true);
+            let r = shell_rect.map(inner).unwrap_or(Rect::new(0, 0, 80, 10));
+            match s.open_shell(r.height, r.width) {
+                Ok(()) => {
+                    if focus_it {
+                        self.focus = Focus::Shell;
+                    }
+                }
+                Err(e) => self.set_message(format!("shell: {e}")),
+            }
+        }
+        self.save();
+    }
+
+    fn restart_session(&mut self, id: u64) {
+        let (rows, cols) = {
+            let Some(s) = self.session(id) else { return };
+            if !s.claude.is_exited() {
+                self.set_message("claude is still running".into());
+                return;
+            }
+            self.claude_spawn_size(s.shell_open)
+        };
+        let cwd = self.session(id).map(|s| s.cwd.clone()).unwrap();
+        let cmd = format!("exec {}", claude_cmd());
+        match Pty::spawn(Some(&cmd), &cwd, rows, cols) {
+            Ok(pty) => {
+                if let Some(s) = self.session_mut(id) {
+                    s.claude = pty;
+                }
+                self.focus = Focus::Claude;
+            }
+            Err(e) => self.set_message(format!("restart failed: {e}")),
+        }
+    }
+}
