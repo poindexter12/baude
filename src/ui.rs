@@ -124,7 +124,11 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         let (icon, icon_style) = match status {
             Status::Waiting => {
                 // pulse the dot to pull the eye to a session that needs you
-                let c = if flash { Color::Yellow } else { Color::DarkGray };
+                let c = if flash {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
                 ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
             }
             Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
@@ -166,7 +170,11 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(
                 suffix,
-                Style::default().fg(if flash { Color::Yellow } else { Color::DarkGray }),
+                Style::default().fg(if flash {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
             ));
         }
         lines.push(Line::from(spans));
