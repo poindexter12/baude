@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: package
+        run: |
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf \
+            "dist/baude-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" baude
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baude-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --generate-notes \
+            dist/*
