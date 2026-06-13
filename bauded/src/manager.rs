@@ -250,6 +250,7 @@ impl Manager {
             archived: false,
             archived_by_user: false,
             was_busy: false,
+            unarchived_at_ms: None,
         });
         Ok(id)
     }
@@ -450,8 +451,7 @@ impl Manager {
     /// or re-engaged; an automatic one also lifts when a new turn starts.
     pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
         let s = self.session_mut(id)?;
-        s.archived = archived;
-        s.archived_by_user = archived;
+        s.set_archived(archived);
         self.save();
         Ok(())
     }
@@ -641,6 +641,27 @@ mod tests {
         m.set_archived(id, false).unwrap();
         assert!(!m.info(id).unwrap().archived);
         assert!(m.set_archived(99, true).is_err());
+        m.kill_all();
+    }
+
+    #[test]
+    fn manual_unarchive_survives_the_auto_archive_tick() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // Fake a session that went idle well past the threshold.
+        let idle = 60_000;
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        s.meta.claude_status = Some((false, now_unix_ms() - 2 * idle));
+        assert!(
+            s.auto_archive_tick(idle),
+            "long-waiting session should park"
+        );
+        // Unarchiving must grant a fresh grace period — the waiting clock is
+        // still past the threshold, so without it the next tick re-parks.
+        m.set_archived(id, false).unwrap();
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        assert!(!s.auto_archive_tick(idle), "tick undid a manual unarchive");
+        assert!(!m.info(id).unwrap().archived);
         m.kill_all();
     }
 

@@ -443,6 +443,7 @@ impl App {
             archived: false,
             archived_by_user: false,
             was_busy: false,
+            unarchived_at_ms: None,
         };
         if shell_open {
             let (_, shell_rect) = pane_rects(self.content_rect, true);
@@ -1016,8 +1017,7 @@ impl App {
                 let Some(s) = self.session_mut(id) else {
                     return;
                 };
-                s.archived = !s.archived;
-                s.archived_by_user = s.archived;
+                s.set_archived(!s.archived);
                 let msg = if s.archived { "archived" } else { "unarchived" };
                 self.set_message(msg.into());
                 self.save();
