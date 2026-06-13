@@ -45,6 +45,10 @@ pub struct Session {
     /// Busy state at the previous archive tick — auto-unarchiving triggers
     /// on the *edge* into busy (fresh activity), not on busy level.
     pub was_busy: bool,
+    /// Monotonic ms of the last manual unarchive. The waiting clock keeps
+    /// running across an unarchive, so without a fresh grace period the very
+    /// next tick would re-park a still-long-waiting session.
+    pub unarchived_at_ms: Option<u64>,
 }
 
 impl Session {
@@ -57,7 +61,13 @@ impl Session {
             return false;
         }
         match status {
-            Status::Waiting if !self.archived && self.waiting_for_ms() >= idle_ms => {
+            Status::Waiting
+                if !self.archived
+                    && self.waiting_for_ms() >= idle_ms
+                    && self
+                        .unarchived_at_ms
+                        .is_none_or(|t| now_ms().saturating_sub(t) >= idle_ms) =>
+            {
                 self.archived = true;
                 self.archived_by_user = false;
                 true
@@ -70,12 +80,23 @@ impl Session {
         }
     }
 
+    /// Park or unpark by explicit user action. Unparking grants a fresh
+    /// idle grace period so `auto_archive_tick` can't immediately undo it.
+    pub fn set_archived(&mut self, archived: bool) {
+        self.archived = archived;
+        self.archived_by_user = archived;
+        if !archived {
+            self.unarchived_at_ms = Some(now_ms());
+        }
+    }
+
     /// Input headed into the session = re-engagement; lift any archive.
     /// Returns true when the flag flipped.
     pub fn unarchive_on_input(&mut self) -> bool {
         if self.archived {
             self.archived = false;
             self.archived_by_user = false;
+            self.unarchived_at_ms = Some(now_ms());
             true
         } else {
             false
