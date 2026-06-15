@@ -51,6 +51,22 @@ pub struct RateWindow {
     pub resets_at_unix_s: Option<u64>,
 }
 
+/// Pull-request info captured from the bridge file's `pr` object.
+#[derive(Default, Clone)]
+pub struct PrInfo {
+    pub number: Option<u64>,
+    pub url: Option<String>,
+    pub review_state: Option<String>,
+}
+
+/// Worktree info captured from the bridge file's `worktree` object.
+#[derive(Default, Clone)]
+pub struct WorktreeInfo {
+    pub name: Option<String>,
+    pub path: Option<String>,
+    pub branch: Option<String>,
+}
+
 #[derive(Default, Clone)]
 pub struct GsdState {
     pub milestone: Option<String>,
@@ -85,6 +101,16 @@ pub struct ClaudeMeta {
     pub git_branch: Option<String>,
     /// Claude's AI-generated session title (`ai-title` transcript records).
     pub title: Option<String>,
+    /// Reasoning-effort level from the bridge file (e.g. "high").
+    pub effort: Option<String>,
+    /// Whether extended thinking is enabled, from the bridge file.
+    pub thinking: Option<bool>,
+    /// Vim editing mode from the bridge file. Captured but not rendered.
+    pub vim_mode: Option<String>,
+    /// Pull-request info from the bridge file's `pr` object.
+    pub pr: Option<PrInfo>,
+    /// Worktree info from the bridge file's `worktree` object.
+    pub worktree: Option<WorktreeInfo>,
 }
 
 impl ClaudeMeta {
@@ -265,6 +291,39 @@ impl ClaudeMeta {
         }
         if let Some(w) = window(&v["seven_day"]) {
             self.rate_week = Some(w);
+        }
+        // STL-02 reader half: additive fields. Read every field optionally —
+        // never branch on `schema`. Type mismatches yield None (no panic).
+        if let Some(s) = v["effort"].as_str() {
+            self.effort = Some(s.to_string());
+        }
+        if let Some(b) = v["thinking"].as_bool() {
+            self.thinking = Some(b);
+        }
+        if let Some(s) = v["vim_mode"].as_str() {
+            self.vim_mode = Some(s.to_string());
+        }
+        // Model precedence: the bridge value wins when present; the guard
+        // preserves the transcript-derived model when the bridge omits it
+        // (poll() reads the transcript before the bridge — load-bearing).
+        if let Some(m) = v["model"].as_str() {
+            self.model = Some(m.to_string());
+        }
+        let p = &v["pr"];
+        if p.is_object() {
+            self.pr = Some(PrInfo {
+                number: p["number"].as_u64(),
+                url: p["url"].as_str().map(str::to_string),
+                review_state: p["review_state"].as_str().map(str::to_string),
+            });
+        }
+        let w = &v["worktree"];
+        if w.is_object() {
+            self.worktree = Some(WorktreeInfo {
+                name: w["name"].as_str().map(str::to_string),
+                path: w["path"].as_str().map(str::to_string),
+                branch: w["branch"].as_str().map(str::to_string),
+            });
         }
     }
 
