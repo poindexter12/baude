@@ -1,0 +1,102 @@
+# Roadmap: baude — v0.7 Native Claude integration
+
+## Overview
+
+v0.7 replaces baude's inferred session state with first-party Claude Code data
+and builds remote interactivity on top of it. The work flows along a hard
+dependency chain: first make the status-line bridge capture the full payload
+(cheap, independent, foundational), then make working/waiting/done state
+authoritative by driving it from Claude Code hooks (the keystone), then surface
+the hook stream as a live tool-activity feed in both clients, and finally let
+the phone approve or deny pending permission prompts — which reuses the hook
+layer's `Notification` event and the opt-in `prompt` mode. Source plan:
+`docs/plans/tier-1-native-claude-integration.md`.
+
+## Phases
+
+**Phase Numbering:**
+- Integer phases (1, 2, 3): Planned milestone work
+- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
+
+Decimal phases appear between their surrounding integers in numeric order.
+
+- [ ] **Phase 1: Full Status-Line Capture** - Bridge persists Claude's whole status-line payload; info overlay shows effort/thinking/PR
+- [ ] **Phase 2: Hook-Driven Status** - Working/waiting/done state comes from Claude Code hooks, with silence heuristic as labeled fallback
+- [ ] **Phase 3: Tool-Activity Timeline** - Live per-session tool feed renders in the PWA and the TUI
+- [ ] **Phase 4: Remote Permission Approval** - Approve/deny a session's pending permission prompt from the phone, with a distinct push
+
+## Phase Details
+
+### Phase 1: Full Status-Line Capture
+**Goal**: The `baude statusline` bridge becomes the authoritative source for the full useful Claude status-line payload, and the new fields surface in the info overlay.
+**Depends on**: Nothing (first phase)
+**Requirements**: STL-01, STL-02, STL-03
+**Success Criteria** (what must be TRUE):
+  1. After a managed session runs, `/tmp/baude-usage-<sessionId>.json` contains model, effort, thinking, pr, worktree, and vim.mode (each present only when Claude emitted it), in addition to today's cost/context/rate-limit fields.
+  2. The bridge JSON carries `schema: 2`, and a pre-existing reader (an older `meta.rs` build) still parses it without error — the new fields are optional and additive.
+  3. Mixed snake_case/camelCase payloads from different Claude Code versions are both parsed correctly (same tolerance as `bridge.rs::window()` today).
+  4. Selecting a session and pressing `i` shows that session's effort, thinking mode, and PR state in the info overlay.
+**Plans**: TBD
+
+Plans:
+- [ ] 01-01: TBD
+
+### Phase 2: Hook-Driven Status
+**Goal**: A managed session's working/waiting/done state is derived from Claude Code hook events rather than PTY-output silence, with the silence heuristic preserved only as a labeled fallback.
+**Depends on**: Phase 1
+**Requirements**: HOOK-01, HOOK-02, HOOK-03
+**Success Criteria** (what must be TRUE):
+  1. On spawn, baude seeds its hook set into the managed session's `settings.json` by merging into existing arrays — a session that already has user-defined hooks or a statusLine keeps them intact (verified by inspecting settings.json after spawn).
+  2. A session shows "working" the moment a prompt is submitted (`UserPromptSubmit`), flips to "waiting"/"done" on `Stop`, and reports the last tool it ran (`PostToolUse`) — all without the silence timer firing.
+  3. The same event model is consumed from a per-session file-tail (`/tmp/baude-events-<sid>.jsonl`) for TUI-local sessions and from `POST /sessions/{id}/event` in the daemon.
+  4. With hooks disabled or unavailable, the session still reaches correct waiting state via the dual-source silence fallback, and that fallback is labeled as such in the state source — no regression from v0.6.1 behavior.
+**Plans**: TBD
+**UI hint**: yes
+
+Plans:
+- [ ] 02-01: TBD
+
+### Phase 3: Tool-Activity Timeline
+**Goal**: The hook event stream is exposed as a live, capped per-session tool-activity feed that renders in both the PWA and the TUI.
+**Depends on**: Phase 2
+**Requirements**: ACT-01, ACT-02, ACT-03, ACT-04
+**Success Criteria** (what must be TRUE):
+  1. `manager.rs` retains a per-session ring buffer of recent tool events capped at ~200; older events are dropped, not unbounded.
+  2. `GET /sessions/{id}/activity` returns recent events, and new events arrive live over SSE (standalone channel or folded into `/stream`) without a page reload.
+  3. In the PWA chat view, a collapsible activity strip shows the recent tool sequence (e.g. "editing src/foo.rs → running cargo test → …") and updates live.
+  4. In the TUI, pressing `v` opens an activity overlay mirroring the same feed for the selected session.
+**Plans**: TBD
+**UI hint**: yes
+
+Plans:
+- [ ] 03-01: TBD
+
+### Phase 4: Remote Permission Approval
+**Goal**: From the phone, a pending tool-permission request can be approved or denied, gated behind an opt-in per-deploy mode, with its own distinct push.
+**Depends on**: Phase 2
+**Requirements**: PERM-01, PERM-02, PERM-03, PERM-04
+**Success Criteria** (what must be TRUE):
+  1. `BAUDE_PERMISSION_MODE` defaults to `skip` (sessions run `--dangerously-skip-permissions`, today's unattended behavior); setting it to `prompt` routes tool calls to baude via `--permission-prompt-tool`.
+  2. While a request is pending, `GET /sessions/{id}/permission` returns it, and `POST /sessions/{id}/permission {decision: allow|deny, scope?}` resolves it and unblocks (or denies) the session.
+  3. In the PWA chat view, an approve/deny card appears while a permission request is pending and disappears once resolved.
+  4. A pending permission (driven by the `Notification` hook and a `waiting_reason` of `permission` on `SessionInfo`) fires a distinct push describing the requested action, separate from the generic "waiting" push.
+**Plans**: TBD
+**UI hint**: yes
+
+Plans:
+- [ ] 04-01: TBD
+
+## Progress
+
+**Execution Order:**
+Phases execute in numeric order: 1 → 2 → 3 → 4
+
+(Phase 4 depends on Phase 2, not Phase 3; Phases 3 and 4 are independent of each
+other and may be planned/executed in either order once Phase 2 lands.)
+
+| Phase | Plans Complete | Status | Completed |
+|-------|----------------|--------|-----------|
+| 1. Full Status-Line Capture | 0/TBD | Not started | - |
+| 2. Hook-Driven Status | 0/TBD | Not started | - |
+| 3. Tool-Activity Timeline | 0/TBD | Not started | - |
+| 4. Remote Permission Approval | 0/TBD | Not started | - |
