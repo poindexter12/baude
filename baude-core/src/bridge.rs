@@ -47,6 +47,65 @@ fn window(v: &Value, snake: &str, camel: &str) -> Value {
     })
 }
 
+/// Build the bridge JSON from a parsed statusLine payload.
+///
+/// Reads every field via `serde_json::Value` accessors (never typed
+/// `Deserialize`) so unknown keys are ignored and absent/wrong-type keys yield
+/// `null` — that untyped tolerance is what keeps the on-disk format
+/// back-compatible (STL-02). `schema` is informational only; readers must NOT
+/// branch on it.
+///
+/// Field names verified against the Claude Code statusLine schema for CLI
+/// v2.1.177 (snake_case throughout; nested objects). camelCase `.or_else`
+/// fallbacks are defensive insurance against version drift.
+fn build_bridge(v: &Value) -> Value {
+    let pr = {
+        let p = &v["pr"];
+        if p.is_object() {
+            json!({
+                "number": p["number"].as_u64(),
+                "url": p["url"].as_str(),
+                "review_state": p["review_state"]
+                    .as_str()
+                    .or_else(|| p["reviewState"].as_str()),
+            })
+        } else {
+            Value::Null
+        }
+    };
+    let worktree = {
+        let w = &v["worktree"];
+        if w.is_object() {
+            json!({
+                "name": w["name"].as_str(),
+                "path": w["path"].as_str(),
+                "branch": w["branch"].as_str(),
+            })
+        } else {
+            Value::Null
+        }
+    };
+    json!({
+        "schema": 2,
+        "session_id": v["session_id"].as_str(),
+        "updated_unix_ms": now_unix_ms(),
+        "cost_usd": v["cost"]["total_cost_usd"].as_f64(),
+        "context_used_pct": v["context_window"]["used_percentage"].as_f64(),
+        "five_hour": window(v, "five_hour", "fiveHour"),
+        "seven_day": window(v, "seven_day", "sevenDay"),
+        // STL-01 — nested-object sources, Claude Code v2.1.177 schema:
+        "model": v["model"]["display_name"]
+            .as_str()
+            .or_else(|| v["model"]["id"].as_str()),
+        "effort": v["effort"]["level"].as_str(),
+        "thinking": v["thinking"]["enabled"].as_bool(),
+        "pr": pr,
+        "worktree": worktree,
+        // Captured but never rendered (locked scope: capture-but-don't-render).
+        "vim_mode": v["vim"]["mode"].as_str(),
+    })
+}
+
 pub fn run(wrap: Option<String>) -> i32 {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
@@ -56,15 +115,7 @@ pub fn run(wrap: Option<String>) -> i32 {
     // Best-effort capture — never break the user's statusline over it.
     if let Ok(v) = serde_json::from_str::<Value>(&input) {
         if let Some(sid) = v["session_id"].as_str() {
-            let bridge = json!({
-                "session_id": sid,
-                "updated_unix_ms": now_unix_ms(),
-                "cost_usd": v["cost"]["total_cost_usd"].as_f64(),
-                "context_used_pct": v["context_window"]["used_percentage"].as_f64(),
-                "five_hour": window(&v, "five_hour", "fiveHour"),
-                "seven_day": window(&v, "seven_day", "sevenDay"),
-            });
-            let _ = std::fs::write(bridge_path(sid), bridge.to_string());
+            let _ = std::fs::write(bridge_path(sid), build_bridge(&v).to_string());
         }
     }
 
@@ -180,7 +231,10 @@ mod tests {
         assert_eq!(out["five_hour"]["used_pct"].as_f64(), Some(33.0));
         assert_eq!(out["five_hour"]["resets_at"].as_u64(), Some(999));
         // pr.reviewState (camel) read by defensive fallback
-        assert_eq!(out["pr"]["review_state"].as_str(), Some("changes_requested"));
+        assert_eq!(
+            out["pr"]["review_state"].as_str(),
+            Some("changes_requested")
+        );
     }
 
     #[test]
