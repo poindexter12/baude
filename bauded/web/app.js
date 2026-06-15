@@ -258,8 +258,12 @@ function activityIcon(e) {
   return "•";
 }
 
+// Mirror the TUI's activity_label: the tool name for tool uses, the
+// notification type for notifications, else the event kind itself (IN-02).
 function activityLabel(e) {
-  return e.tool || e.notification_type || e.event || "event";
+  if (e.event === "PostToolUse") return e.tool || "tool";
+  if (e.event === "Notification") return e.notification_type || "notification";
+  return e.event || "event";
 }
 
 function activityRowHtml(e) {
