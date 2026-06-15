@@ -187,12 +187,72 @@ where
     }
 }
 
+/// Handle one `<binary> hook` invocation: parse the raw hook payload Claude
+/// piped to stdin, normalize it to one event line, and route it (POST to
+/// `$BAUDE_EVENT_URL` via `post`, else append to `/tmp/baude-events-<sid>.jsonl`).
+///
+/// This is the shared dispatch for BOTH the `baude` (TUI) and `bauded` (daemon)
+/// binaries — `seed_settings` seeds the hook command as `current_exe()`, which
+/// resolves to whichever binary spawned the session, so both MUST handle the
+/// `hook` subcommand identically or daemon-managed sessions silently lose hook
+/// events and regress to silence-only state.
+///
+/// Best-effort throughout: a malformed payload normalizes to an empty event
+/// rather than erroring, and the caller ALWAYS exits 0 so a hook failure never
+/// blocks Claude. The `post` closure (and any network client) stays in the
+/// binary so `baude-core` carries no HTTP dependency.
+pub fn dispatch_hook<F>(input: &str, url: Option<&str>, post: F)
+where
+    F: FnOnce(&str, &str) -> bool,
+{
+    let v = serde_json::from_str::<Value>(input).unwrap_or_else(|_| json!({}));
+    let line = build_event(&v).to_string();
+    let sid = v["session_id"].as_str().unwrap_or_default();
+    route_event(url, sid, &line, post);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).expect("fixture is valid JSON")
+    }
+
+    // ---- dispatch_hook --------------------------------------------------
+
+    #[test]
+    fn dispatch_hook_no_url_appends_to_file() {
+        let sid = format!("dispatch-file-{}", std::process::id());
+        let path = event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        let input = format!(r#"{{"session_id":"{sid}","hook_event_name":"Stop"}}"#);
+        // No URL -> file transport; post closure must never be called.
+        dispatch_hook(&input, None, |_, _| panic!("post called without a URL"));
+        let contents = std::fs::read_to_string(&path).expect("event file written");
+        assert!(contents.contains("\"event\":\"Stop\""), "got: {contents}");
+        assert!(contents.contains(&format!("\"session_id\":\"{sid}\"")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dispatch_hook_post_failure_falls_back_to_file() {
+        let sid = format!("dispatch-fallback-{}", std::process::id());
+        let path = event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        let input = format!(r#"{{"session_id":"{sid}","hook_event_name":"UserPromptSubmit"}}"#);
+        // URL present but POST "fails" -> route_event must append to the file.
+        dispatch_hook(&input, Some("http://127.0.0.1:9/x"), |_, _| false);
+        let contents = std::fs::read_to_string(&path).expect("fallback event file written");
+        assert!(contents.contains("UserPromptSubmit"), "got: {contents}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dispatch_hook_malformed_never_panics() {
+        // Empty session_id + garbage input: no panic, no file, no post.
+        dispatch_hook("not json", None, |_, _| panic!("post called"));
+        dispatch_hook("{}", None, |_, _| panic!("post called"));
     }
 
     // ---- build_event ----------------------------------------------------

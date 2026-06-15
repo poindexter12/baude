@@ -21,6 +21,37 @@ fn restore_terminal() {
     let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
 }
 
+/// `<binary> hook` — Claude Code lifecycle-event hook, no TUI. Claude invokes it
+/// headless per event, piping the hook JSON to stdin. Reads stdin, then defers
+/// to `baude_core::hook::dispatch_hook`, which normalizes the payload and routes
+/// it: POST to `$BAUDE_EVENT_URL` (daemon transport) or append to
+/// `/tmp/baude-events-<sid>.jsonl` (TUI-local). On a POST failure (wrong/dead
+/// port, transport error, OR timeout) it falls back to the file-append so the
+/// event is never silently lost — the daemon tails the same file (WR-02).
+///
+/// The POST uses a bounded agent (WR-04): the hook runs synchronously in Claude
+/// Code's critical path and the contract is "ALWAYS exit 0 so a hook failure
+/// never blocks Claude". A loopback peer that accepts then stalls would hang the
+/// POST; the connect/read timeouts cap that, then the file-append fallback runs.
+///
+/// NOTE: `bauded` carries a byte-identical `run_hook` because `seed_settings`
+/// seeds `current_exe()` and the daemon binary spawns its own sessions — keep
+/// the two in sync (the shared normalization lives in `dispatch_hook`).
+fn run_hook() -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let url = std::env::var("BAUDE_EVENT_URL").ok();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    baude_core::hook::dispatch_hook(&input, url.as_deref(), |url, line| {
+        agent.post(url).send_string(line).is_ok()
+    });
+    std::process::exit(0);
+}
+
 fn main() -> Result<()> {
     // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
     // Must be dispatched before anything touches the terminal: Claude Code
@@ -42,35 +73,7 @@ fn main() -> Result<()> {
     // Best-effort throughout — ALWAYS exit 0 so a hook failure never blocks
     // Claude (a non-zero exit is a blocking signal to the CLI).
     if args.get(1).map(String::as_str) == Some("hook") {
-        use std::io::Read;
-        let mut input = String::new();
-        let _ = std::io::stdin().read_to_string(&mut input);
-        let v = serde_json::from_str::<serde_json::Value>(&input)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let line = baude_core::hook::build_event(&v).to_string();
-        let sid = v["session_id"].as_str().unwrap_or_default();
-        // Route the event: POST to the daemon transport when $BAUDE_EVENT_URL
-        // is set, else append to the TUI-local /tmp file. On a POST failure
-        // (wrong/dead port, transport error, OR timeout) `route_event` falls
-        // back to the file-append so the event is never silently lost — the
-        // daemon tails the same /tmp file, so it converges either way (WR-02).
-        //
-        // The POST uses a bounded agent (WR-04): `baude hook` runs synchronously
-        // in Claude Code's critical path and the module's contract is "ALWAYS
-        // exit 0 so a hook failure never blocks Claude". A loopback peer that
-        // accepts the connection but stalls would otherwise hang the POST and
-        // block Claude indefinitely. The connect/read timeouts cap that; on
-        // timeout the call errors, route_event takes the file-append fallback,
-        // and we still exit 0.
-        let url = std::env::var("BAUDE_EVENT_URL").ok();
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_millis(500))
-            .timeout(std::time::Duration::from_secs(2))
-            .build();
-        baude_core::hook::route_event(url.as_deref(), sid, &line, |url, line| {
-            agent.post(url).send_string(line).is_ok()
-        });
-        std::process::exit(0);
+        run_hook();
     }
 
     let launch_dir = std::env::args()

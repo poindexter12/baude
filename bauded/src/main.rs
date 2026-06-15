@@ -20,6 +20,29 @@ use manager::{lock, Manager};
 const DEFAULT_BIND: &str = "127.0.0.1:8642";
 const META_POLL_MS: u64 = 1000;
 
+/// `bauded hook` — headless Claude Code lifecycle-event hook. Byte-identical to
+/// the `baude` (TUI) binary's `run_hook`: read the hook JSON from stdin, then
+/// defer to `baude_core::hook::dispatch_hook`, which normalizes it and routes
+/// it (POST to `$BAUDE_EVENT_URL`, else append to `/tmp/baude-events-<sid>.jsonl`,
+/// with the file-append fallback on POST failure — WR-02). The bounded ureq
+/// agent (WR-04) keeps a stalled loopback peer from blocking Claude. ALWAYS
+/// exits 0 so a hook failure never blocks the CLI. The shared normalization
+/// lives in `dispatch_hook` — keep this in sync with `baude`'s `run_hook`.
+fn run_hook() -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let url = std::env::var("BAUDE_EVENT_URL").ok();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_secs(2))
+        .build();
+    baude_core::hook::dispatch_hook(&input, url.as_deref(), |url, line| {
+        agent.post(url).send_string(line).is_ok()
+    });
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -42,6 +65,13 @@ async fn main() -> Result<()> {
             );
             return Ok(());
         }
+        // `bauded hook` — Claude Code lifecycle-event hook. The daemon seeds its
+        // own `current_exe()` (= `bauded`) as the hook command in each spawned
+        // session's settings.local.json, so the daemon binary MUST handle the
+        // `hook` subcommand. Without this arm, `bauded hook` falls through and
+        // boots a *second daemon* instead of emitting an event, silently
+        // breaking hook-driven status for every daemon-managed session.
+        Some("hook") => run_hook(),
         _ => {}
     }
     let bind = args
