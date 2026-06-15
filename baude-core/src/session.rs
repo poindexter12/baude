@@ -10,6 +10,26 @@ use crate::pty::{now_ms, Pty};
 /// While working, Claude Code streams spinner/progress output continuously.
 const BUSY_WINDOW_MS: u64 = 2000;
 
+/// A hook event older than this no longer wins precedence — state falls
+/// through to the session-file / silence sources. A few seconds is enough to
+/// keep a fresh UserPromptSubmit/Stop authoritative against the polled
+/// session file without pinning a long-dead event. Tunable; a wrong value
+/// only causes brief mislabel, never a crash (research A3 / Pitfall 5).
+const HOOK_FRESH_MS: u64 = 5000;
+
+/// Which source decided a session's [`Status`]. Lets the silence fallback be
+/// observably "fallback" so a regression to silence-only is visible, not
+/// silent. Precedence: `Hook` (fresh) > `SessionFile` > `Silence`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StateSource {
+    /// A fresh Claude Code hook event drove the state.
+    Hook,
+    /// Claude's own session file (`sessions/<pid>.json`) drove the state.
+    SessionFile,
+    /// The PTY-output-silence heuristic drove the state (the v0.6.1 fallback).
+    Silence,
+}
+
 /// Waiting this long unattended auto-archives a session: it sinks to the
 /// bottom of lists and stops demanding attention until it's active again.
 pub const AUTO_ARCHIVE_IDLE_MS: u64 = 30 * 60 * 1000;
@@ -104,22 +124,64 @@ impl Session {
     }
 }
 
+/// Pure precedence decision shared by [`Session::status`] /
+/// [`Session::status_with_source`]. Kept side-effect-free so the precedence
+/// tiers are unit-tested without constructing a live `Pty`/`Session`.
+///
+/// Precedence: exited > fresh hook > session file > silence. The
+/// `claude_status` and silence branches are byte-identical to the v0.6.1
+/// logic — only the fresh-hook branch is prepended (no-regression, Pitfall 3).
+fn decide_status(
+    exited: bool,
+    hook_status: Option<(bool, u64)>,
+    now_unix: u64,
+    claude_status: Option<(bool, u64)>,
+    last_output_ms: u64,
+    now_mono: u64,
+) -> (Status, StateSource) {
+    if exited {
+        return (Status::Exited, StateSource::Hook);
+    }
+    // Fresh hook event is authoritative — event-driven and the moment-accurate
+    // signal. Stale events fall through to the existing sources.
+    if let Some((busy, at)) = hook_status {
+        if now_unix.saturating_sub(at) < HOOK_FRESH_MS {
+            let s = if busy { Status::Busy } else { Status::Waiting };
+            return (s, StateSource::Hook);
+        }
+    }
+    // --- below: v0.6.1 logic, byte-identical (prepend-only edit) ---
+    // Claude's own session file is authoritative when we found it;
+    // otherwise fall back to the output-silence heuristic.
+    if let Some((busy, _)) = claude_status {
+        let s = if busy { Status::Busy } else { Status::Waiting };
+        return (s, StateSource::SessionFile);
+    }
+    let s = if now_mono.saturating_sub(last_output_ms) < BUSY_WINDOW_MS {
+        Status::Busy
+    } else {
+        Status::Waiting
+    };
+    (s, StateSource::Silence)
+}
+
 impl Session {
     pub fn status(&self) -> Status {
-        if self.claude.is_exited() {
-            return Status::Exited;
-        }
-        // Claude's own session file is authoritative when we found it;
-        // otherwise fall back to the output-silence heuristic.
-        if let Some((busy, _)) = self.meta.claude_status {
-            return if busy { Status::Busy } else { Status::Waiting };
-        }
-        let last = self.claude.last_output_ms.load(Ordering::Relaxed);
-        if now_ms().saturating_sub(last) < BUSY_WINDOW_MS {
-            Status::Busy
-        } else {
-            Status::Waiting
-        }
+        self.status_with_source().0
+    }
+
+    /// Like [`status`](Self::status) but also reports which [`StateSource`]
+    /// decided the result. `status()` delegates to `.0` so the public,
+    /// total `Status` API and all call sites stay unchanged.
+    pub fn status_with_source(&self) -> (Status, StateSource) {
+        decide_status(
+            self.claude.is_exited(),
+            self.meta.hook_status,
+            now_unix_ms(),
+            self.meta.claude_status,
+            self.claude.last_output_ms.load(Ordering::Relaxed),
+            now_ms(),
+        )
     }
 
     /// How long this session has been waiting for input, in ms.
@@ -187,5 +249,111 @@ mod tests {
         // precedence tests below start from a known empty baseline.
         let meta = ClaudeMeta::default();
         assert!(meta.claude_status.is_none());
+    }
+
+    // --- Precedence tests for decide_status (Hook > SessionFile > Silence) ---
+    //
+    // decide_status is the pure core of status_with_source: it takes the same
+    // raw inputs status_with_source reads off `self` (exited flag, hook_status,
+    // now_unix, claude_status, last_output_ms, now_mono) so each precedence
+    // tier is asserted without constructing a live Pty/Session.
+
+    const NOW_UNIX: u64 = 1_000_000;
+    const NOW_MONO: u64 = 500_000;
+
+    #[test]
+    fn fresh_hook_busy_wins() {
+        let (st, src) = decide_status(
+            false,
+            Some((true, NOW_UNIX)), // fresh
+            NOW_UNIX,
+            Some((false, NOW_UNIX)), // session file disagrees -> hook still wins
+            0,
+            NOW_MONO,
+        );
+        assert_eq!((st, src), (Status::Busy, StateSource::Hook));
+    }
+
+    #[test]
+    fn fresh_hook_waiting_wins() {
+        let (st, src) = decide_status(
+            false,
+            Some((false, NOW_UNIX - 1000)), // within HOOK_FRESH_MS (5000)
+            NOW_UNIX,
+            None,
+            NOW_MONO, // recent output -> silence would say Busy
+            NOW_MONO,
+        );
+        assert_eq!((st, src), (Status::Waiting, StateSource::Hook));
+    }
+
+    #[test]
+    fn stale_hook_falls_through_to_session_file() {
+        let (st, src) = decide_status(
+            false,
+            Some((true, NOW_UNIX - HOOK_FRESH_MS)), // exactly stale (>= threshold)
+            NOW_UNIX,
+            Some((false, 0)), // session file -> Waiting
+            NOW_MONO,
+            NOW_MONO,
+        );
+        assert_eq!((st, src), (Status::Waiting, StateSource::SessionFile));
+    }
+
+    #[test]
+    fn no_hook_uses_session_file() {
+        let (st, src) = decide_status(false, None, NOW_UNIX, Some((true, 0)), 0, NOW_MONO);
+        assert_eq!((st, src), (Status::Busy, StateSource::SessionFile));
+    }
+
+    #[test]
+    fn silence_recent_output_is_busy() {
+        // No hook, no session file, recent output -> Busy via Silence.
+        let (st, src) = decide_status(false, None, NOW_UNIX, None, NOW_MONO, NOW_MONO);
+        assert_eq!((st, src), (Status::Busy, StateSource::Silence));
+    }
+
+    #[test]
+    fn silence_old_output_is_waiting() {
+        // No hook, no session file, old output -> Waiting via Silence.
+        let last = NOW_MONO - BUSY_WINDOW_MS; // exactly at/over the window
+        let (st, src) = decide_status(false, None, NOW_UNIX, None, last, NOW_MONO);
+        assert_eq!((st, src), (Status::Waiting, StateSource::Silence));
+    }
+
+    #[test]
+    fn exited_overrides_everything() {
+        let (st, _src) = decide_status(
+            true,
+            Some((true, NOW_UNIX)),
+            NOW_UNIX,
+            Some((true, 0)),
+            NOW_MONO,
+            NOW_MONO,
+        );
+        assert_eq!(st, Status::Exited);
+    }
+
+    #[test]
+    fn no_hook_silence_is_byte_identical_to_v0_6_1() {
+        // HOOK-02 no-regression: with NO hook events, the (Status, StateSource)
+        // result must match the pre-hook dual-source logic exactly, labeled
+        // Silence. Recent output -> Busy; old output -> Waiting; and a present
+        // session file still wins over silence as before.
+        // Recent output, no session file.
+        assert_eq!(
+            decide_status(false, None, NOW_UNIX, None, NOW_MONO, NOW_MONO),
+            (Status::Busy, StateSource::Silence)
+        );
+        // Old output, no session file.
+        assert_eq!(
+            decide_status(false, None, NOW_UNIX, None, 0, NOW_MONO),
+            (Status::Waiting, StateSource::Silence)
+        );
+        // Session file present -> SessionFile (still authoritative over silence).
+        assert_eq!(
+            decide_status(false, None, NOW_UNIX, Some((false, 0)), NOW_MONO, NOW_MONO),
+            (Status::Waiting, StateSource::SessionFile)
+        );
     }
 }
