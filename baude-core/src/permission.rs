@@ -144,6 +144,169 @@ pub fn mcp_config_path(cwd: &Path) -> PathBuf {
     cwd.join(".mcp.json")
 }
 
+// ===== 04-02: hand-rolled JSON-RPC framing + MCP `approve`-tool transforms ==
+//
+// The pure, testable half of the `permission-mcp` stdio bridge (PERM-01
+// transport + PERM-02). Like [`crate::hook`], NO HTTP and NO stdin reads live
+// here — the binary owns the network/stdio (the `dispatch_hook` split). Every
+// value is read untyped via `serde_json::Value` and a malformed/partial/odd
+// payload yields `None`/empty and NEVER panics (Pitfall 5, T-04-06).
+//
+// SECURITY-ISOLATION: [`parse_frame`], [`parse_tool_call`], and
+// [`build_approve_result`] are deliberately the ONLY functions encoding the
+// ASSUMED Claude Code `--permission-prompt-tool` wire contract (RESEARCH §C/§D,
+// MEDIUM confidence — no complete official example, claude-code #1175). The §F
+// CONTRACT human-verify UAT confirms the live 2.1.178 shape; if it diverges,
+// only these three functions change (framing, request field names, response
+// envelope) — the binary loop and daemon round-trip are untouched.
+
+/// Parse a single JSON-RPC frame from the front of `buf`.
+///
+/// Supports BOTH framings Claude's MCP stdio transport may use (Assumption A4,
+/// confirmed by the §F UAT):
+///
+/// - **`Content-Length:` header + body** (LSP/MCP-stdio style): parse the byte
+///   count, skip the blank-line separator (`\r\n\r\n` or `\n\n`), and slice
+///   exactly that many body bytes.
+/// - **bare line-delimited JSON**: the buffer up to the next newline is one
+///   JSON body.
+///
+/// Returns `Some((body, consumed))` where `consumed` is the total bytes of the
+/// frame (header + separator + body, or the line incl. its newline) so the
+/// caller can advance its accumulating buffer and parse the next frame. Returns
+/// `None` on an INCOMPLETE frame (more bytes needed) OR an unparseable body —
+/// the binary loop reads more stdin and retries. Never panics (T-04-06).
+pub fn parse_frame(buf: &[u8]) -> Option<(Value, usize)> {
+    // Try Content-Length framing first if the buffer opens with the header.
+    // Case-insensitive, tolerant of either CRLF or LF separators.
+    if starts_with_ci(buf, b"content-length:") {
+        return parse_content_length_frame(buf);
+    }
+    // Otherwise: line-delimited. A frame is everything up to (and including)
+    // the next '\n'; without a newline the frame is incomplete -> None.
+    let nl = buf.iter().position(|&b| b == b'\n')?;
+    let line = &buf[..nl];
+    let body = serde_json::from_slice::<Value>(line).ok()?;
+    Some((body, nl + 1))
+}
+
+/// `true` iff `buf` begins with `prefix`, ASCII-case-insensitively.
+fn starts_with_ci(buf: &[u8], prefix: &[u8]) -> bool {
+    buf.len() >= prefix.len()
+        && buf[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Parse an LSP-style `Content-Length: N\r\n\r\n<N bytes>` frame. Tolerates a
+/// bare-LF (`\n\n`) separator. Returns `None` until the full body has arrived,
+/// on a non-numeric/overflowing length, or on an unparseable body. No panics.
+fn parse_content_length_frame(buf: &[u8]) -> Option<(Value, usize)> {
+    // Find the header/body separator: prefer the CRLF pair, fall back to LF.
+    let (sep_start, sep_len) = find_separator(buf)?;
+    let header = std::str::from_utf8(&buf[..sep_start]).ok()?;
+    let len: usize = header
+        .split(':')
+        .nth(1)?
+        .trim()
+        .parse() // a negative/overflowing value fails to parse -> None
+        .ok()?;
+    let body_start = sep_start + sep_len;
+    let body_end = body_start.checked_add(len)?;
+    if buf.len() < body_end {
+        return None; // body not fully arrived yet
+    }
+    let body = serde_json::from_slice::<Value>(&buf[body_start..body_end]).ok()?;
+    Some((body, body_end))
+}
+
+/// Locate the blank-line separator that ends the header block. Returns the
+/// byte offset where the separator starts and its length (`4` for `\r\n\r\n`,
+/// `2` for `\n\n`). `None` if no complete separator is present yet.
+fn find_separator(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    match (crlf, lf) {
+        (Some(c), Some(l)) if c <= l => Some((c, 4)),
+        (_, Some(l)) => Some((l, 2)),
+        (Some(c), None) => Some((c, 4)),
+        (None, None) => None,
+    }
+}
+
+/// Extract `(tool_name, input)` from a `tools/call` params object (§C).
+///
+/// Reads `tool_name` as the tool string. For the input, reads `input`, falling
+/// back to `parameters` then `tool_input` when `input` is absent (the field
+/// name varies across CLI versions — untyped reads make baude robust to which
+/// 2.1.178 emits). A missing `tool_use_id` is tolerated (not required here). A
+/// minimal/odd/`null` params yields `("", Value::Null)` and never panics.
+pub fn parse_tool_call(params: &Value) -> (String, Value) {
+    let tool = params["tool_name"].as_str().unwrap_or_default().to_string();
+    let input = if !params["input"].is_null() {
+        params["input"].clone()
+    } else if !params["parameters"].is_null() {
+        params["parameters"].clone()
+    } else {
+        // tool_input fallback (null when also absent — never panics).
+        params["tool_input"].clone()
+    };
+    (tool, input)
+}
+
+/// Build the MCP `tools/call` result the `approve` tool returns (§D).
+///
+/// On `behavior == "allow"`, the inner `PermissionResult` is
+/// `{"behavior":"allow","updatedInput":<updated_input or {}>}` — the input is
+/// echoed back verbatim (the safest rule: a CLI that requires `updatedInput`
+/// on allow is satisfied). On ANY other value (`"deny"`, an empty string, an
+/// unknown token) it coerces to `{"behavior":"deny","message":<message or
+/// "denied">}` — NEVER emit allow for a non-"allow" string (deny-default,
+/// SECURITY-CRITICAL T-04-04/V4). The inner object is `serde_json::to_string`'d
+/// and wrapped as `{"content":[{"type":"text","text":<that string>}]}`.
+///
+/// This is the ONE function encoding the response envelope so the §F UAT can
+/// correct it cheaply (e.g. to return the object directly) if 2.1.178 diverges.
+pub fn build_approve_result(
+    behavior: &str,
+    updated_input: Option<&Value>,
+    message: Option<&str>,
+) -> Value {
+    let inner = if behavior == "allow" {
+        json!({
+            "behavior": "allow",
+            "updatedInput": updated_input.cloned().unwrap_or_else(|| json!({})),
+        })
+    } else {
+        // Deny-default: coerce every non-"allow" value to deny, dropping any
+        // echoed input so an approval payload can never leak on a coercion.
+        json!({
+            "behavior": "deny",
+            "message": message.unwrap_or("denied"),
+        })
+    };
+    // Isolated text/JSON.stringify wrapping (§D). Serialization of a plain
+    // object never fails; fall back to "{}" defensively rather than panic.
+    let text = serde_json::to_string(&inner).unwrap_or_else(|_| "{}".to_string());
+    json!({
+        "content": [ { "type": "text", "text": text } ]
+    })
+}
+
+/// Build a JSON-RPC success envelope: `{"jsonrpc":"2.0","id":<id>,"result":..}`.
+/// `id` is echoed verbatim (numbers and strings both valid per JSON-RPC). A
+/// notification (no `id`) gets no response — the caller skips this entirely.
+pub fn rpc_response(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// Build a JSON-RPC error envelope:
+/// `{"jsonrpc":"2.0","id":<id>,"error":{"code":..,"message":..}}`.
+pub fn rpc_error(id: Value, code: i64, msg: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
