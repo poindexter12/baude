@@ -452,20 +452,16 @@ pub fn waiting_reason(last_notification: Option<&(String, u64)>, waiting: bool) 
 
 **If this table is empty:** it is not — A1/A2/A4 in particular MUST be confirmed by the §F human-verify UAT before `prompt` mode ships. The planner must insert a `checkpoint:human-verify` task BEFORE the spawn-wiring task is marked done.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Exact MCP request/response field names + framing for CLI 2.1.178**
+1. **Exact MCP request/response field names + framing for CLI 2.1.178** — **RESOLVED: gated by the §F CONTRACT human-verify UAT (plan 04-02 Task 4) — a raw-frame-logging `permission-mcp` returning hardcoded allow captures the live frames before prompt-mode spawn-wiring is finalized; parse/response-wrap functions isolated for cheap correction.**
    - What we know: flag value is an MCP tool name; registration via `--mcp-config`; `PermissionResult{behavior,updatedInput,message}`; secondary-sourced `{tool_name,input,tool_use_id}` request + text/JSON.stringify response.
    - What's unclear: whether 2.1.178 emits `input` vs `parameters`, includes `tool_use_id`, uses `Content-Length` vs line framing, and accepts text-wrapped vs object result.
-   - Recommendation: §F UAT with a raw-frame-logging `permission-mcp` returning hardcoded allow; finalize from the captured frames. Gate spawn-wiring behind it.
 
-2. **Timeout window default**
+2. **Timeout window default** — **RESOLVED: env knob `BAUDE_PERMISSION_TIMEOUT_S`, default ~120s; deny-on-expiry makes any value safe. Claude's discretion per CONTEXT.**
    - What we know: must deny on expiry; phone approval can be slow.
-   - What's unclear: the right default (30s? 2m? 5m?).
-   - Recommendation: env knob `BAUDE_PERMISSION_TIMEOUT_S` (default ~120s); deny-default makes any choice safe. Claude's discretion per CONTEXT.
 
-3. **Wakeup mechanism (Notify/watch vs poll)**
-   - Recommendation: `tokio::sync::Notify`/`watch` for instant wake; bounded `META_POLL_MS` poll is an acceptable simpler fallback. Claude's discretion.
+3. **Wakeup mechanism (Notify/watch vs poll)** — **RESOLVED: `tokio::sync::Notify`/`watch` for instant wake; bounded `META_POLL_MS` poll is the acceptable simpler fallback. Claude's discretion.**
 
 ## Environment Availability
 
