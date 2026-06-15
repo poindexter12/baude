@@ -267,3 +267,39 @@ impl Drop for RemoteAttach {
         self.closed.store(true, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An older daemon that omits `activity` must still deserialize — the
+    /// field defaults to an empty Vec (T-03-11 backward-compat). The rest of
+    /// the `#[serde(default)]` optionals are also exercised by their absence.
+    #[test]
+    fn remote_info_deserializes_without_activity() {
+        let json = r#"{"id":7,"name":"alpha","title":null,"status":"working",
+            "waiting_for_ms":null,"model":null,"permission_mode":null,
+            "context_used_pct":null,"branch":null,"session_cost_usd":null}"#;
+        let r: RemoteInfo = serde_json::from_str(json).expect("deserialize without activity");
+        assert_eq!(r.id, 7);
+        assert!(r.activity.is_empty(), "missing activity defaults to empty");
+    }
+
+    /// A daemon that bundles `activity` deserializes it into the overlay's
+    /// source Vec — the remote branch reads this directly, no round-trip.
+    #[test]
+    fn remote_info_deserializes_with_activity() {
+        let json = r#"{"id":7,"name":"alpha","status":"working","activity":[
+            {"event":"PostToolUse","tool":"Bash","ts":1000},
+            {"event":"Notification","notification_type":"permission","ts":2000}
+        ]}"#;
+        let r: RemoteInfo = serde_json::from_str(json).expect("deserialize with activity");
+        assert_eq!(r.activity.len(), 2);
+        assert_eq!(r.activity[0].event, "PostToolUse");
+        assert_eq!(r.activity[0].tool.as_deref(), Some("Bash"));
+        assert_eq!(
+            r.activity[1].notification_type.as_deref(),
+            Some("permission")
+        );
+    }
+}

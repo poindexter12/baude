@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use baude_core::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
+use baude_core::meta::{
+    human_tokens, human_until, now_unix_ms, short_mode, short_model, HookEvent, RateWindow,
+};
 use baude_core::pty::now_ms;
 use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
@@ -696,6 +698,84 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Pick an icon for a hook event by kind/tool so the activity overlay reads at
+/// a glance (mirrors the PWA strip's icon convention).
+fn activity_icon(ev: &HookEvent) -> &'static str {
+    match ev.event.as_str() {
+        "PostToolUse" => "⚙",
+        "UserPromptSubmit" => "›",
+        "Stop" => "■",
+        "Notification" => "🔔",
+        _ => "·",
+    }
+}
+
+/// Short human label for one activity event: the tool name for tool uses, the
+/// notification type for notifications, else the event kind itself.
+fn activity_label(ev: &HookEvent) -> String {
+    match ev.event.as_str() {
+        "PostToolUse" => ev.tool.clone().unwrap_or_else(|| "tool".into()),
+        "Notification" => ev
+            .notification_type
+            .clone()
+            .unwrap_or_else(|| "notification".into()),
+        other => other.to_string(),
+    }
+}
+
+/// Compact relative age (e.g. `now`, `12s`, `4m`, `2h`) for an event timestamp
+/// in unix ms, matching the at-a-glance tone of the overlay.
+fn activity_age(ts_ms: u64) -> String {
+    let secs = now_unix_ms().saturating_sub(ts_ms) / 1000;
+    if secs == 0 {
+        "now".into()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Build the activity overlay body for a slice of events, newest-at-bottom.
+/// Render-last-N-that-fit: clip to the most recent events that fit the box
+/// (RESEARCH Open Q1 first-cut). Paging the full ~200 is deferred to the GET
+/// `/sessions/{id}/activity` endpoint — no scroll-offset widget this phase.
+fn activity_lines<'a, I>(events: I, max_rows: usize) -> Vec<Line<'a>>
+where
+    I: ExactSizeIterator<Item = &'a HookEvent>,
+{
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+    let total = events.len();
+    if total == 0 {
+        return vec![Line::from(Span::styled("  no activity yet", dim))];
+    }
+    // Take the last `max_rows` events (newest), then render oldest→newest so the
+    // newest sits at the bottom (chronological, matches the chat view).
+    let skip = total.saturating_sub(max_rows);
+    let mut lines: Vec<Line> = events
+        .skip(skip)
+        .map(|ev| {
+            Line::from(vec![
+                Span::styled(format!("  {} ", activity_icon(ev)), val),
+                Span::styled(format!("{:<14}", activity_label(ev)), val),
+                Span::styled(format!("  {}", activity_age(ev.ts)), dim),
+            ])
+        })
+        .collect();
+    if skip > 0 {
+        lines.insert(
+            0,
+            Line::from(Span::styled(format!("  … {skip} earlier"), dim)),
+        );
+    }
+    lines
+}
+
 fn draw_modal(frame: &mut Frame, app: &App) {
     let area = frame.area();
     match &app.modal {
@@ -936,6 +1016,51 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 rect,
             );
         }
+        Modal::Activity => {
+            let dim = Style::default().fg(Color::DarkGray);
+            // Render-last-N-that-fit: cap rows to a fixed window; the box height
+            // follows the rendered line count. Paging the full retained set is
+            // deferred to the GET /sessions/{id}/activity endpoint (RESEARCH Q1).
+            const MAX_ROWS: usize = 24;
+            const WIDTH: u16 = 48;
+            // Remote first (mirrors Modal::Info): read the bounded RemoteInfo
+            // .activity bundled into the /sessions poll — no extra round-trip.
+            if let Some(r) = app.selected_remote() {
+                let mut lines = activity_lines(r.activity.iter(), MAX_ROWS);
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled("  press any key to close", dim)));
+                let rect = centered(frame.area(), WIDTH, lines.len() as u16 + 2);
+                frame.render_widget(Clear, rect);
+                frame.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(format!(" activity — {} (remote) ", r.name)),
+                    ),
+                    rect,
+                );
+                return;
+            }
+            // Local: read the ClaudeMeta ring directly.
+            let Some(s) = app.selected() else { return };
+            let mut lines = activity_lines(s.meta.activity().iter(), MAX_ROWS);
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("  press any key to close", dim)));
+            let rect = centered(area, WIDTH, lines.len() as u16 + 2);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(format!(" activity — {} ", s.name)),
+                ),
+                rect,
+            );
+        }
         Modal::Gsd => {
             let Some(s) = app.selected() else { return };
             let dim = Style::default().fg(Color::DarkGray);
@@ -1001,7 +1126,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 60, 25);
+            let rect = centered(area, 60, 26);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -1014,6 +1139,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  t           open shell pane (focuses it)"),
                 Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
+                Line::raw("  v           activity timeline (recent tools)"),
                 Line::raw("  g           gsd project state"),
                 Line::raw("  n           new session (repo path)"),
                 Line::raw("  w           new worktree session for selected repo"),
