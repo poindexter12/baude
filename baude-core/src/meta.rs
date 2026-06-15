@@ -294,37 +294,34 @@ impl ClaudeMeta {
         }
         // STL-02 reader half: additive fields. Read every field optionally —
         // never branch on `schema`. Type mismatches yield None (no panic).
-        if let Some(s) = v["effort"].as_str() {
-            self.effort = Some(s.to_string());
-        }
-        if let Some(b) = v["thinking"].as_bool() {
-            self.thinking = Some(b);
-        }
-        if let Some(s) = v["vim_mode"].as_str() {
-            self.vim_mode = Some(s.to_string());
-        }
-        // Model precedence: the bridge value wins when present; the guard
-        // preserves the transcript-derived model when the bridge omits it
-        // (poll() reads the transcript before the bridge — load-bearing).
+        //
+        // These bridge-derived fields are assigned UNCONDITIONALLY: the bridge
+        // is the source of truth for session state that comes and goes (a PR
+        // merges, effort/vim toggle off). An absent/null/wrong-type value
+        // yields None and clears the field, so the overlay never shows stale
+        // state after Claude stops emitting it (WR-01).
+        self.effort = v["effort"].as_str().map(str::to_string);
+        self.thinking = v["thinking"].as_bool();
+        self.vim_mode = v["vim_mode"].as_str().map(str::to_string);
+        // Model precedence is the deliberate exception: the bridge value wins
+        // when present, but the guard preserves the transcript-derived model
+        // when the bridge omits it (poll() reads the transcript before the
+        // bridge — load-bearing). Do NOT make this unconditional.
         if let Some(m) = v["model"].as_str() {
             self.model = Some(m.to_string());
         }
         let p = &v["pr"];
-        if p.is_object() {
-            self.pr = Some(PrInfo {
-                number: p["number"].as_u64(),
-                url: p["url"].as_str().map(str::to_string),
-                review_state: p["review_state"].as_str().map(str::to_string),
-            });
-        }
+        self.pr = p.is_object().then(|| PrInfo {
+            number: p["number"].as_u64(),
+            url: p["url"].as_str().map(str::to_string),
+            review_state: p["review_state"].as_str().map(str::to_string),
+        });
         let w = &v["worktree"];
-        if w.is_object() {
-            self.worktree = Some(WorktreeInfo {
-                name: w["name"].as_str().map(str::to_string),
-                path: w["path"].as_str().map(str::to_string),
-                branch: w["branch"].as_str().map(str::to_string),
-            });
-        }
+        self.worktree = w.is_object().then(|| WorktreeInfo {
+            name: w["name"].as_str().map(str::to_string),
+            path: w["path"].as_str().map(str::to_string),
+            branch: w["branch"].as_str().map(str::to_string),
+        });
     }
 
     /// Context usage bridge file written by statusline hooks (e.g. the GSD
