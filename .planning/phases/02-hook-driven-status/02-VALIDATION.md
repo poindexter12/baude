@@ -38,7 +38,7 @@ created: 2026-06-15
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 2-01-01 | 01 | 0 | — | — | `session.rs` test module exists (Wave-0 gap) | unit | `cargo test -p baude-core session` | ❌ W0 | ⬜ pending |
+| 2-02-00 | 02 | 0 | — | — | `session.rs` test module exists (Wave-0 gap — created by Plan 02 Task 0) | unit | `cargo test -p baude-core session` | ❌ W0 | ⬜ pending |
 | 2-01-02 | 01 | 1 | HOOK-01 | T-2-01 / V5 input-validation | Merge preserves existing user hooks + statusLine; idempotent on re-spawn | unit | `cargo test -p baude-core settings_seed` | ❌ W0 | ⬜ pending |
 | 2-02-01 | 02 | 1 | HOOK-03 | T-2-01 / V5 | `baude hook` parses minimal stdin Value without panic; emits schema-versioned line | unit | `cargo test -p baude-core hook_event` | ❌ W0 | ⬜ pending |
 | 2-02-02 | 02 | 2 | HOOK-02 | — | Event→state mapping (UserPromptSubmit→Busy, Stop→Waiting, Notification→Waiting, PostToolUse→tool) | unit | `cargo test -p baude-core event_state` | ❌ W0 | ⬜ pending |
@@ -51,7 +51,7 @@ created: 2026-06-15
 
 ## Wave 0 Requirements
 
-- [ ] `baude-core/src/session.rs` — add `#[cfg(test)] mod tests` (none exists today — researcher Wave-0 gap)
+- [ ] `baude-core/src/session.rs` — add `#[cfg(test)] mod tests` (none exists today — researcher Wave-0 gap; created by **Plan 02 Task 0**)
 - [ ] Reuse existing temp-file test helpers from `meta.rs` for event-file tail tests
 - [ ] No framework install needed — `cargo test` is built in
 
