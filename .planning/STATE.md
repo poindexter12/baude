@@ -4,14 +4,14 @@ milestone: v0.7
 milestone_name: milestone
 status: executing
 stopped_at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
-last_updated: "2026-06-15T20:12:00.000Z"
+last_updated: "2026-06-15T20:54:19.803Z"
 last_activity: 2026-06-15 -- 03-01 activity ring buffer complete
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 10
-  completed_plans: 7
-  percent: 70
+  completed_plans: 8
+  percent: 50
 ---
 
 # Project State
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-15)
 ## Current Position
 
 Phase: 03 (tool-activity-timeline) — EXECUTING
-Plan: 2 of 4
-Status: Executing Phase 03
+Plan: 3 of 4
+Status: Ready to execute
 Last activity: 2026-06-15 -- 03-01 activity ring buffer complete
 
 Progress: [████████░░] 70%
@@ -51,6 +51,7 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - [Phase ?]: 02-03: daemon POST /sessions/{id}/event converges with the TUI file-tail onto one /tmp consume path (HOOK-03)
 - 03-01: HookEvent is the only serde-Serialize type from ClaudeMeta; the struct itself stays non-serializable (anti-pattern)
 - 03-01: capped (200) drop-oldest VecDeque<HookEvent> ring on ClaudeMeta is the single source of truth — appended in read_event_tail's loop, cleared in the WR-03 rotation block (ACT-01)
+- [Phase ?]: 03-02: activity feed served two ways — GET /activity (ring snapshot) + GET /activity-stream (standalone SSE file-tail via dedicated EventTail, never the ChatMessage Tail)
 
 ### Pending Todos
 
@@ -63,7 +64,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-15T20:12:00.000Z
+Last session: 2026-06-15T20:54:16.605Z
 Stopped at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
 Resume file: 03-02-PLAN.md
 
@@ -74,3 +75,4 @@ Resume file: 03-02-PLAN.md
 | Phase 02 P01 | 18min | 3 tasks | 4 files |
 | Phase 02 P02 | 6min | 3 tasks | 2 files |
 | Phase 03 P01 | 12min | 2 tasks | 1 file |
+| Phase 03 P02 | 5min | 2 tasks | 4 files |

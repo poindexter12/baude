@@ -106,7 +106,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 03-02-PLAN.md — Daemon GET /activity + standalone /activity-stream SSE (HookEvent event-line tail) + SessionInfo.activity + notify.rs fix (ACT-02, TDD)
+- [x] 03-02-PLAN.md — Daemon GET /activity + standalone /activity-stream SSE (HookEvent event-line tail) + SessionInfo.activity + notify.rs fix (ACT-02, TDD)
 
 **Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
 
@@ -144,5 +144,5 @@ other and may be planned/executed in either order once Phase 2 lands.)
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
-| 3. Tool-Activity Timeline | 1/4 | In progress | - |
+| 3. Tool-Activity Timeline | 2/4 | In Progress|  |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |

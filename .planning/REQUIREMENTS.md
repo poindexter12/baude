@@ -26,7 +26,7 @@ Requirements for the v0.7 milestone. Each maps to roadmap phases.
 ### Tool-activity timeline (ACT)
 
 - [x] **ACT-01**: `baude-core/meta.rs` `ClaudeMeta` keeps a per-session capped ring buffer (`ACTIVITY_CAP` = 200) of recent tool events (the daemon serves it from the `ClaudeMeta` it holds)
-- [ ] **ACT-02**: `GET /sessions/{id}/activity` returns recent events and they stream live (SSE channel, standalone or folded into `/stream`)
+- [x] **ACT-02**: `GET /sessions/{id}/activity` returns recent events and they stream live (SSE channel, standalone or folded into `/stream`)
 - [ ] **ACT-03**: The PWA chat view shows a collapsible activity strip ("editing src/foo.rs → running cargo test → …")
 - [ ] **ACT-04**: The TUI has an activity overlay (key `v`) mirroring the feed
 
@@ -85,7 +85,7 @@ Mapped to roadmap phases (see `.planning/ROADMAP.md`).
 | HOOK-02 | Phase 2 | Complete |
 | HOOK-03 | Phase 2 | Complete |
 | ACT-01 | Phase 3 | Complete |
-| ACT-02 | Phase 3 | Pending |
+| ACT-02 | Phase 3 | Complete |
 | ACT-03 | Phase 3 | Pending |
 | ACT-04 | Phase 3 | Pending |
 | PERM-01 | Phase 4 | Pending |
