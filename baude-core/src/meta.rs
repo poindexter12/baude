@@ -420,3 +420,163 @@ pub fn short_mode(mode: &str) -> &'static str {
         _ => "?",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a bridge file at the path `read_bridge_file` will look for, build
+    /// a `ClaudeMeta` pointed at that session id, run the (private) reader, and
+    /// return the populated meta. The fixture path is pid+counter-keyed so
+    /// parallel tests never collide. Cleans up the temp file before returning.
+    fn read_fixture(suffix: &str, json: &str) -> ClaudeMeta {
+        let sid = format!("test-{}-{}", std::process::id(), suffix);
+        let path = crate::bridge::bridge_path(&sid);
+        fs::write(&path, json).unwrap();
+        let mut meta = ClaudeMeta {
+            session_id: Some(sid),
+            ..Default::default()
+        };
+        meta.read_bridge_file();
+        fs::remove_file(&path).ok();
+        meta
+    }
+
+    #[test]
+    fn reads_v2_bridge() {
+        let meta = read_fixture(
+            "v2",
+            r#"{
+                "schema": 2,
+                "cost_usd": 1.25,
+                "context_used_pct": 42.0,
+                "updated_unix_ms": 12345,
+                "five_hour": {"used_pct": 10.0, "resets_at": 111},
+                "seven_day": {"used_pct": 20.0, "resets_at": 222},
+                "model": "Claude Opus 4.8",
+                "effort": "high",
+                "thinking": true,
+                "vim_mode": "NORMAL",
+                "pr": {"number": 42, "url": "https://example.com/pr/42", "review_state": "approved"},
+                "worktree": {"name": "wt", "path": "/tmp/wt", "branch": "feature/x"}
+            }"#,
+        );
+
+        // new fields populated
+        assert_eq!(meta.effort.as_deref(), Some("high"));
+        assert_eq!(meta.thinking, Some(true));
+        assert_eq!(meta.vim_mode.as_deref(), Some("NORMAL"));
+        assert_eq!(meta.model.as_deref(), Some("Claude Opus 4.8"));
+
+        let pr = meta.pr.as_ref().expect("pr present");
+        assert_eq!(pr.number, Some(42));
+        assert_eq!(pr.url.as_deref(), Some("https://example.com/pr/42"));
+        assert_eq!(pr.review_state.as_deref(), Some("approved"));
+
+        let wt = meta.worktree.as_ref().expect("worktree present");
+        assert_eq!(wt.name.as_deref(), Some("wt"));
+        assert_eq!(wt.path.as_deref(), Some("/tmp/wt"));
+        assert_eq!(wt.branch.as_deref(), Some("feature/x"));
+
+        // legacy fields still read
+        assert_eq!(meta.session_cost_usd, Some(1.25));
+        assert_eq!(meta.context_used_pct, Some(42));
+        assert_eq!(meta.rate_updated_unix_ms, 12345);
+        assert_eq!(meta.rate_5h.unwrap().used_pct, Some(10.0));
+        assert_eq!(meta.rate_week.unwrap().resets_at_unix_s, Some(222));
+    }
+
+    #[test]
+    fn reads_legacy_bridge() {
+        // schema-absent file with ONLY the four legacy fields.
+        let meta = read_fixture(
+            "legacy",
+            r#"{
+                "cost_usd": 0.5,
+                "context_used_pct": 12.0,
+                "updated_unix_ms": 99,
+                "five_hour": {"used_pct": 5.0, "resets_at": 1}
+            }"#,
+        );
+
+        // legacy fields present
+        assert_eq!(meta.session_cost_usd, Some(0.5));
+        assert_eq!(meta.context_used_pct, Some(12));
+        assert_eq!(meta.rate_5h.unwrap().used_pct, Some(5.0));
+
+        // new fields all None (additive back-compat, new-reader-reads-old-file)
+        assert!(meta.effort.is_none());
+        assert!(meta.thinking.is_none());
+        assert!(meta.vim_mode.is_none());
+        assert!(meta.pr.is_none());
+        assert!(meta.worktree.is_none());
+    }
+
+    #[test]
+    fn does_not_branch_on_schema() {
+        // schema:99 with new fields present → still read (no `if schema == 2`).
+        let meta = read_fixture(
+            "schema99",
+            r#"{
+                "schema": 99,
+                "effort": "low",
+                "thinking": false,
+                "vim_mode": "INSERT",
+                "pr": {"number": 1}
+            }"#,
+        );
+        assert_eq!(meta.effort.as_deref(), Some("low"));
+        assert_eq!(meta.thinking, Some(false));
+        assert_eq!(meta.vim_mode.as_deref(), Some("INSERT"));
+        assert_eq!(meta.pr.as_ref().unwrap().number, Some(1));
+    }
+
+    #[test]
+    fn pr_absent_is_none() {
+        let meta = read_fixture("nopr", r#"{"schema": 2, "effort": "medium"}"#);
+        assert!(meta.pr.is_none());
+        assert!(meta.worktree.is_none());
+    }
+
+    #[test]
+    fn pr_present_review_state_absent() {
+        // pr exists but review_state absent → pr Some, review_state None.
+        let meta = read_fixture(
+            "pr-partial",
+            r#"{"schema": 2, "pr": {"number": 7, "url": "u"}}"#,
+        );
+        let pr = meta.pr.as_ref().expect("pr present");
+        assert_eq!(pr.number, Some(7));
+        assert_eq!(pr.url.as_deref(), Some("u"));
+        assert!(pr.review_state.is_none());
+    }
+
+    #[test]
+    fn model_bridge_wins_then_survives() {
+        // Bridge value wins over a transcript-derived model.
+        let sid = format!("test-{}-model-wins", std::process::id());
+        let path = crate::bridge::bridge_path(&sid);
+        fs::write(&path, r#"{"schema": 2, "model": "from-bridge"}"#).unwrap();
+        let mut meta = ClaudeMeta {
+            session_id: Some(sid),
+            model: Some("from-transcript".to_string()),
+            ..Default::default()
+        };
+        meta.read_bridge_file();
+        fs::remove_file(&path).ok();
+        assert_eq!(meta.model.as_deref(), Some("from-bridge"));
+
+        // Bridge omits model → transcript value survives (guard prevents None).
+        let sid2 = format!("test-{}-model-survives", std::process::id());
+        let path2 = crate::bridge::bridge_path(&sid2);
+        fs::write(&path2, r#"{"schema": 2, "effort": "high"}"#).unwrap();
+        let mut meta2 = ClaudeMeta {
+            session_id: Some(sid2),
+            model: Some("keep-me".to_string()),
+            ..Default::default()
+        };
+        meta2.read_bridge_file();
+        fs::remove_file(&path2).ok();
+        assert_eq!(meta2.model.as_deref(), Some("keep-me"));
+    }
+}
