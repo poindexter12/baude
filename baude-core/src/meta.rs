@@ -9,6 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub fn now_unix_ms() -> u64 {
@@ -75,6 +76,32 @@ pub struct GsdState {
     pub next_action: Option<String>,
     pub percent: Option<u8>,
     pub phase_line: Option<String>,
+}
+
+/// Drop-oldest cap for the per-session tool-activity ring buffer
+/// (`ClaudeMeta::activity`). Older events are evicted once the ring exceeds
+/// this size, keeping the buffer bounded regardless of event volume (T-03-01).
+pub const ACTIVITY_CAP: usize = 200;
+
+/// One Claude Code hook event retained in the per-session activity ring
+/// (`ClaudeMeta::activity`). Serialized to JSON for the daemon's activity
+/// endpoints and the TUI/PWA timeline views: `{event, tool?,
+/// notification_type?, ts}`. `tool` is present for `PostToolUse`,
+/// `notification_type` for `Notification`; both are omitted from JSON when
+/// `None`. This is the single serde-`Serialize` type produced by `ClaudeMeta`
+/// (the struct itself is intentionally NOT serializable).
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct HookEvent {
+    /// Event kind: `PostToolUse` | `UserPromptSubmit` | `Stop` | `Notification`.
+    pub event: String,
+    /// Tool name, present for `PostToolUse` events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Notification type, present for `Notification` events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_type: Option<String>,
+    /// Event timestamp, unix milliseconds.
+    pub ts: u64,
 }
 
 #[derive(Default)]
@@ -1019,5 +1046,62 @@ mod tests {
 
         fs::remove_file(&path_a).ok();
         fs::remove_file(&path_b).ok();
+    }
+
+    #[test]
+    fn hook_event_serializes_post_tool_use() {
+        // PostToolUse: tool present, notification_type omitted (skip_serializing_if).
+        let ev = HookEvent {
+            event: "PostToolUse".to_string(),
+            tool: Some("Bash".to_string()),
+            notification_type: None,
+            ts: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""event":"PostToolUse""#), "json: {json}");
+        assert!(json.contains(r#""tool":"Bash""#), "json: {json}");
+        assert!(json.contains(r#""ts":1700000000000"#), "json: {json}");
+        assert!(
+            !json.contains("notification_type"),
+            "None notification_type must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn hook_event_serializes_notification() {
+        // Notification: notification_type present, tool omitted.
+        let ev = HookEvent {
+            event: "Notification".to_string(),
+            tool: None,
+            notification_type: Some("permission".to_string()),
+            ts: 1_700_000_000_001,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""event":"Notification""#), "json: {json}");
+        assert!(
+            json.contains(r#""notification_type":"permission""#),
+            "json: {json}"
+        );
+        assert!(
+            !json.contains(r#""tool""#),
+            "None tool must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn hook_event_round_trips() {
+        // Serialize then deserialize; all four fields preserved.
+        let ev = HookEvent {
+            event: "PostToolUse".to_string(),
+            tool: Some("Edit".to_string()),
+            notification_type: None,
+            ts: 42,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: HookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.event, ev.event);
+        assert_eq!(back.tool, ev.tool);
+        assert_eq!(back.notification_type, ev.notification_type);
+        assert_eq!(back.ts, ev.ts);
     }
 }
