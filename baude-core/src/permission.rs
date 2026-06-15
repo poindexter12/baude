@@ -25,6 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::{json, Value};
+
 /// The flag appended to a base `claude` command in `skip` mode (and the
 /// default). Leading space lets the caller append directly to `base_cmd`.
 const SKIP_FLAG: &str = " --dangerously-skip-permissions";
@@ -345,5 +347,214 @@ mod tests {
     fn mcp_config_path_joins_dot_mcp_json() {
         let p = mcp_config_path(Path::new("/tmp/session"));
         assert_eq!(p, PathBuf::from("/tmp/session/.mcp.json"));
+    }
+
+    // ==== 04-02 Task 1: JSON-RPC framing + MCP transforms ================
+    // The §F-CONTRACT-isolated wire functions. Every bullet of the task
+    // <behavior> is pinned here, including the *_never_panics posture mirrored
+    // from hook.rs:222-296. The wire shape is the ASSUMED RESEARCH §C/§D
+    // contract; the §F UAT confirms/corrects it cheaply via these functions.
+
+    // ---- parse_frame ----------------------------------------------------
+
+    #[test]
+    fn parse_frame_line_delimited() {
+        let buf = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+        let (body, consumed) = parse_frame(buf).expect("line frame parses");
+        assert_eq!(body["method"].as_str(), Some("initialize"));
+        assert_eq!(body["id"].as_u64(), Some(1));
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn parse_frame_content_length() {
+        let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let (parsed, consumed) = parse_frame(frame.as_bytes()).expect("LSP frame parses");
+        assert_eq!(parsed["method"].as_str(), Some("tools/list"));
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_frame_content_length_lf_only_separator() {
+        // Some peers use bare \n line endings; tolerate both.
+        let body = r#"{"id":3,"method":"x"}"#;
+        let frame = format!("Content-Length: {}\n\n{}", body.len(), body);
+        let (parsed, consumed) = parse_frame(frame.as_bytes()).expect("LF-only LSP frame parses");
+        assert_eq!(parsed["method"].as_str(), Some("x"));
+        assert_eq!(consumed, frame.len());
+    }
+
+    #[test]
+    fn parse_frame_consumes_only_one_frame() {
+        // Two line-delimited frames back to back: parse_frame returns the first
+        // and reports exactly how many bytes it consumed so the caller can
+        // advance and parse the rest.
+        let first = "{\"id\":1}\n";
+        let buf = format!("{first}{{\"id\":2}}\n");
+        let (body, consumed) = parse_frame(buf.as_bytes()).expect("first frame parses");
+        assert_eq!(body["id"].as_u64(), Some(1));
+        assert_eq!(consumed, first.len());
+        let (body2, _) = parse_frame(&buf.as_bytes()[consumed..]).expect("second frame parses");
+        assert_eq!(body2["id"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn parse_frame_partial_yields_none() {
+        // Incomplete line (no newline yet) -> None (accumulate more bytes).
+        assert!(parse_frame(b"{\"id\":1").is_none());
+        // Content-Length header but body not fully arrived -> None.
+        let frame = b"Content-Length: 50\r\n\r\n{\"id\":1}";
+        assert!(parse_frame(frame).is_none());
+        // Header line started but not terminated -> None.
+        assert!(parse_frame(b"Content-Length: 10").is_none());
+    }
+
+    #[test]
+    fn parse_frame_never_panics_on_garbage() {
+        assert!(parse_frame(b"").is_none());
+        assert!(parse_frame(b"not json\n").is_none());
+        assert!(parse_frame(b"Content-Length: abc\r\n\r\n{}").is_none());
+        // Negative/overflowing length never panics.
+        assert!(parse_frame(b"Content-Length: -1\r\n\r\n{}").is_none());
+        assert!(parse_frame(b"\n").is_none());
+    }
+
+    // ---- parse_tool_call ------------------------------------------------
+
+    #[test]
+    fn parse_tool_call_reads_tool_name_and_input() {
+        let params = json!({
+            "tool_name": "Bash",
+            "input": {"command": "rm -rf build/"},
+            "tool_use_id": "toolu_01"
+        });
+        let (tool, input) = parse_tool_call(&params);
+        assert_eq!(tool, "Bash");
+        assert_eq!(input["command"].as_str(), Some("rm -rf build/"));
+    }
+
+    #[test]
+    fn parse_tool_call_parameters_fallback() {
+        // §C: when `input` is absent, fall back to `parameters` then `tool_input`.
+        let p1 = json!({"tool_name": "Edit", "parameters": {"path": "/x"}});
+        let (t, i) = parse_tool_call(&p1);
+        assert_eq!(t, "Edit");
+        assert_eq!(i["path"].as_str(), Some("/x"));
+
+        let p2 = json!({"tool_name": "Write", "tool_input": {"path": "/y"}});
+        let (t, i) = parse_tool_call(&p2);
+        assert_eq!(t, "Write");
+        assert_eq!(i["path"].as_str(), Some("/y"));
+    }
+
+    #[test]
+    fn parse_tool_call_tolerates_missing_tool_use_id() {
+        // tool_use_id is optional (§C) — absence must not break parsing.
+        let params = json!({"tool_name": "Read", "input": {}});
+        let (tool, _input) = parse_tool_call(&params);
+        assert_eq!(tool, "Read");
+    }
+
+    #[test]
+    fn parse_tool_call_empty_never_panics() {
+        let (tool, input) = parse_tool_call(&json!({}));
+        assert_eq!(tool, "");
+        assert!(input.is_null());
+        let (tool, input) = parse_tool_call(&Value::Null);
+        assert_eq!(tool, "");
+        assert!(input.is_null());
+        // Odd-typed fields never panic.
+        let (tool, input) = parse_tool_call(&json!({"tool_name": 5, "input": "str"}));
+        assert_eq!(tool, "");
+        assert_eq!(input.as_str(), Some("str"));
+    }
+
+    // ---- build_approve_result -------------------------------------------
+
+    fn inner_body(env: &Value) -> Value {
+        let text = env["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text is a string");
+        assert_eq!(env["content"][0]["type"].as_str(), Some("text"));
+        serde_json::from_str(text).expect("inner text is JSON")
+    }
+
+    #[test]
+    fn build_approve_result_allow_echoes_input() {
+        let input = json!({"command": "ls"});
+        let env = build_approve_result("allow", Some(&input), None);
+        let body = inner_body(&env);
+        assert_eq!(body["behavior"].as_str(), Some("allow"));
+        assert_eq!(body["updatedInput"]["command"].as_str(), Some("ls"));
+    }
+
+    #[test]
+    fn build_approve_result_allow_without_input_uses_empty_object() {
+        let env = build_approve_result("allow", None, None);
+        let body = inner_body(&env);
+        assert_eq!(body["behavior"].as_str(), Some("allow"));
+        assert!(body["updatedInput"].is_object());
+    }
+
+    #[test]
+    fn build_approve_result_deny() {
+        let env = build_approve_result("deny", None, None);
+        let body = inner_body(&env);
+        assert_eq!(body["behavior"].as_str(), Some("deny"));
+        assert_eq!(body["message"].as_str(), Some("denied"));
+    }
+
+    #[test]
+    fn build_approve_result_deny_custom_message() {
+        let env = build_approve_result("deny", None, Some("denied from phone"));
+        let body = inner_body(&env);
+        assert_eq!(body["behavior"].as_str(), Some("deny"));
+        assert_eq!(body["message"].as_str(), Some("denied from phone"));
+    }
+
+    #[test]
+    fn build_approve_result_unknown_behavior_coerces_to_deny() {
+        // SECURITY: any non-"allow" behavior is coerced to deny — never emit
+        // allow for an unrecognized value (deny-default, T-04-04/V4).
+        for bogus in ["", "ALLOW", "yes", "approve", "true", "Allow "] {
+            let env = build_approve_result(bogus, Some(&json!({"x":1})), None);
+            let body = inner_body(&env);
+            assert_eq!(
+                body["behavior"].as_str(),
+                Some("deny"),
+                "behavior {bogus:?} must coerce to deny, never allow"
+            );
+            // The echoed input must NOT leak as updatedInput on a deny coercion.
+            assert!(body["updatedInput"].is_null());
+        }
+    }
+
+    // ---- rpc_response / rpc_error ---------------------------------------
+
+    #[test]
+    fn rpc_response_well_formed() {
+        let r = rpc_response(json!(7), json!({"ok": true}));
+        assert_eq!(r["jsonrpc"].as_str(), Some("2.0"));
+        assert_eq!(r["id"].as_u64(), Some(7));
+        assert_eq!(r["result"]["ok"].as_bool(), Some(true));
+        assert!(r.get("error").is_none());
+    }
+
+    #[test]
+    fn rpc_error_well_formed() {
+        let r = rpc_error(json!(8), -32601, "method not found");
+        assert_eq!(r["jsonrpc"].as_str(), Some("2.0"));
+        assert_eq!(r["id"].as_u64(), Some(8));
+        assert_eq!(r["error"]["code"].as_i64(), Some(-32601));
+        assert_eq!(r["error"]["message"].as_str(), Some("method not found"));
+        assert!(r.get("result").is_none());
+    }
+
+    #[test]
+    fn rpc_response_string_id_preserved() {
+        // JSON-RPC ids may be strings; echo whatever the request used.
+        let r = rpc_response(json!("abc"), json!(null));
+        assert_eq!(r["id"].as_str(), Some("abc"));
     }
 }
