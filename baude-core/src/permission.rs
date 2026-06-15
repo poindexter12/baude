@@ -46,14 +46,31 @@ const PROMPT_FLAG: &str = " --permission-prompt-tool mcp__baude__approve";
 /// value) returns [`SKIP_FLAG`]. The two real flags are NEVER returned
 /// together — exactly one of `{skip, prompt, ""}`.
 pub fn permission_flag(base_cmd: &str) -> &'static str {
+    permission_flag_for(
+        std::env::var("BAUDE_PERMISSION_MODE").ok().as_deref(),
+        base_cmd,
+    )
+}
+
+/// Pure flag selection given an explicit mode — the env-free core of
+/// [`permission_flag`]. `mode` is the raw `BAUDE_PERMISSION_MODE` value (`None`
+/// when unset). Split out so callers (and tests) can exercise every branch
+/// WITHOUT mutating the process-global env var, which would race concurrent
+/// session spawns that read it (the same env-read/pure split as `hook`).
+///
+/// `Some("prompt")` returns [`PROMPT_FLAG`]; every other case (`None`,
+/// `Some("skip")`, and any unrecognized value) returns [`SKIP_FLAG`] — fail-safe
+/// (T-04-01). No-double-add (T-04-02) returns `""` when `base_cmd` already
+/// carries a permission flag. Exactly one of `{skip, prompt, ""}`.
+pub fn permission_flag_for(mode: Option<&str>, base_cmd: &str) -> &'static str {
     let already = base_cmd.contains("--dangerously-skip-permissions")
         || base_cmd.contains("--permission-prompt-tool")
         || base_cmd.contains("--permission-mode");
     if already {
         return "";
     }
-    match std::env::var("BAUDE_PERMISSION_MODE").as_deref() {
-        Ok("prompt") => PROMPT_FLAG,
+    match mode {
+        Some("prompt") => PROMPT_FLAG,
         // Default skip preserves today's unattended behavior. Unset, "skip",
         // and any unrecognized value all fall here (fail-safe — never prompt).
         _ => SKIP_FLAG,
@@ -86,6 +103,38 @@ pub fn mcp_server_config(exe: &str) -> serde_json::Value {
     })
 }
 
+/// Idempotently merge baude's `permission-mcp` server registration into an
+/// existing `.mcp.json` value (PERM-01 / T-04-03).
+///
+/// Pure `Value -> Value` transform mirroring [`crate::hook::merge_hook_settings`]:
+/// the binaries own the read/write (the env-read/`current_exe()`/filesystem
+/// half), this owns the non-clobbering merge. Only the `mcpServers.baude` key is
+/// set (to `exe` + `["permission-mcp"]`); a user's sibling servers and any other
+/// top-level keys survive byte-intact. Re-running on its own output is a no-op
+/// (idempotent). Never panics on a minimal / non-object / odd file.
+pub fn merge_mcp_config(existing: &serde_json::Value, exe: &str) -> serde_json::Value {
+    let mut root = existing.clone();
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().expect("root coerced to object");
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    let servers_obj = servers
+        .as_object_mut()
+        .expect("mcpServers coerced to object");
+    // Overwrite only our own `baude` entry; sibling servers are untouched.
+    servers_obj.insert(
+        "baude".to_string(),
+        mcp_server_config(exe)["mcpServers"]["baude"].clone(),
+    );
+    root
+}
+
 /// The seeded `.mcp.json` location for a session cwd. Both spawn sites agree on
 /// this so the daemon (which re-spawns on `restore`) and the TUI write the same
 /// file.
@@ -102,72 +151,69 @@ mod tests {
     /// tests so parallel cases never race the same var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    // ---- permission_flag: env-driven selection -------------------------
+    // ---- permission_flag_for: pure mode selection (no env mutation) -----
+    // Branch coverage uses the env-free seam so it never races concurrent
+    // session spawns (in any crate) that read the process-global env var.
 
     #[test]
-    fn permission_flag_env_selection() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // Unset -> default skip (security-critical default).
-        std::env::remove_var("BAUDE_PERMISSION_MODE");
-        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
-
-        // Explicit "skip" -> skip.
-        std::env::set_var("BAUDE_PERMISSION_MODE", "skip");
-        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
-
-        // "prompt" -> prompt flag (only on the exact literal).
-        std::env::set_var("BAUDE_PERMISSION_MODE", "prompt");
+    fn permission_flag_for_mode_selection() {
+        // None (unset) -> default skip (security-critical default, T-04-01).
         assert_eq!(
-            permission_flag("claude"),
+            permission_flag_for(None, "claude"),
+            " --dangerously-skip-permissions"
+        );
+        // Explicit "skip" -> skip.
+        assert_eq!(
+            permission_flag_for(Some("skip"), "claude"),
+            " --dangerously-skip-permissions"
+        );
+        // "prompt" -> prompt flag (only on the exact literal).
+        assert_eq!(
+            permission_flag_for(Some("prompt"), "claude"),
             " --permission-prompt-tool mcp__baude__approve"
         );
-
         // Unrecognized value -> fail-safe to skip (never reach prompt).
-        std::env::set_var("BAUDE_PERMISSION_MODE", "bogus");
-        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
-
+        assert_eq!(
+            permission_flag_for(Some("bogus"), "claude"),
+            " --dangerously-skip-permissions"
+        );
         // Case-mismatch is unrecognized -> skip (exact literal only).
-        std::env::set_var("BAUDE_PERMISSION_MODE", "Prompt");
-        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
-
-        std::env::remove_var("BAUDE_PERMISSION_MODE");
+        assert_eq!(
+            permission_flag_for(Some("Prompt"), "claude"),
+            " --dangerously-skip-permissions"
+        );
     }
 
-    // ---- permission_flag: no-double-add (independent of env) ------------
-
     #[test]
-    fn permission_flag_no_double_add() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // Even in prompt mode, an existing permission flag suppresses ours.
-        std::env::set_var("BAUDE_PERMISSION_MODE", "prompt");
-        assert_eq!(permission_flag("claude --dangerously-skip-permissions"), "");
+    fn permission_flag_for_no_double_add() {
+        // Even in prompt mode, an existing permission flag suppresses ours
+        // (T-04-02 — never duplicate/override an operator-set flag).
         assert_eq!(
-            permission_flag("claude --permission-prompt-tool mcp__other__x"),
+            permission_flag_for(Some("prompt"), "claude --dangerously-skip-permissions"),
             ""
         );
-        assert_eq!(permission_flag("claude --permission-mode acceptEdits"), "");
-
+        assert_eq!(
+            permission_flag_for(
+                Some("prompt"),
+                "claude --permission-prompt-tool mcp__other__x"
+            ),
+            ""
+        );
+        assert_eq!(
+            permission_flag_for(Some("prompt"), "claude --permission-mode acceptEdits"),
+            ""
+        );
         // And in skip mode too.
-        std::env::set_var("BAUDE_PERMISSION_MODE", "skip");
-        assert_eq!(permission_flag("claude --dangerously-skip-permissions"), "");
-
-        std::env::remove_var("BAUDE_PERMISSION_MODE");
+        assert_eq!(
+            permission_flag_for(Some("skip"), "claude --dangerously-skip-permissions"),
+            ""
+        );
     }
 
-    // ---- mutual exclusion ----------------------------------------------
-
     #[test]
-    fn permission_flag_returns_exactly_one_known_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        for mode in ["skip", "prompt", "bogus", ""] {
-            if mode.is_empty() {
-                std::env::remove_var("BAUDE_PERMISSION_MODE");
-            } else {
-                std::env::set_var("BAUDE_PERMISSION_MODE", mode);
-            }
-            let flag = permission_flag("claude");
+    fn permission_flag_for_returns_exactly_one_known_value() {
+        for mode in [None, Some("skip"), Some("prompt"), Some("bogus"), Some("")] {
+            let flag = permission_flag_for(mode, "claude");
             assert!(
                 flag == " --dangerously-skip-permissions"
                     || flag == " --permission-prompt-tool mcp__baude__approve"
@@ -181,6 +227,18 @@ mod tests {
                 "the two flags must never appear together"
             );
         }
+    }
+
+    // ---- permission_flag: the env-reading wrapper delegates correctly ---
+    // One guarded smoke test that the env wrapper reads BAUDE_PERMISSION_MODE
+    // and routes to permission_flag_for. Kept minimal and mutex-guarded;
+    // restores the var immediately to shrink the race window with spawns.
+
+    #[test]
+    fn permission_flag_reads_env_and_delegates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BAUDE_PERMISSION_MODE");
+        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
         std::env::remove_var("BAUDE_PERMISSION_MODE");
     }
 
@@ -193,16 +251,10 @@ mod tests {
         std::env::remove_var("BAUDE_PERMISSION_MODE");
         assert!(!is_prompt_mode());
 
-        std::env::set_var("BAUDE_PERMISSION_MODE", "skip");
-        assert!(!is_prompt_mode());
-
         std::env::set_var("BAUDE_PERMISSION_MODE", "prompt");
         assert!(is_prompt_mode());
 
         std::env::set_var("BAUDE_PERMISSION_MODE", "Prompt");
-        assert!(!is_prompt_mode());
-
-        std::env::set_var("BAUDE_PERMISSION_MODE", "bogus");
         assert!(!is_prompt_mode());
 
         std::env::remove_var("BAUDE_PERMISSION_MODE");
@@ -237,6 +289,54 @@ mod tests {
             v["mcpServers"]["baude"]["command"].as_str(),
             Some("with spaces/baude binary")
         );
+    }
+
+    // ---- merge_mcp_config ----------------------------------------------
+
+    #[test]
+    fn merge_mcp_config_preserves_siblings_and_is_idempotent() {
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers":{"other":{"command":"other-srv"}},"extra":true}"#,
+        )
+        .unwrap();
+
+        let once = merge_mcp_config(&existing, "/abs/baude");
+        // Sibling server + unrelated top-level key survive.
+        assert_eq!(
+            once["mcpServers"]["other"]["command"].as_str(),
+            Some("other-srv")
+        );
+        assert_eq!(once["extra"].as_bool(), Some(true));
+        // Our server registered with the permission-mcp arg.
+        assert_eq!(
+            once["mcpServers"]["baude"]["args"][0].as_str(),
+            Some("permission-mcp")
+        );
+        assert_eq!(
+            once["mcpServers"]["baude"]["command"].as_str(),
+            Some("/abs/baude")
+        );
+
+        // Idempotent: re-merging its own output is a no-op.
+        let twice = merge_mcp_config(&once, "/abs/baude");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn merge_mcp_config_never_panics_on_odd_inputs() {
+        // Empty object.
+        let v = merge_mcp_config(&serde_json::json!({}), "/x");
+        assert_eq!(
+            v["mcpServers"]["baude"]["args"][0].as_str(),
+            Some("permission-mcp")
+        );
+        // Non-object root.
+        let v = merge_mcp_config(&serde_json::json!(42), "/x");
+        assert!(v.is_object());
+        assert_eq!(v["mcpServers"]["baude"]["command"].as_str(), Some("/x"));
+        // mcpServers is a non-object scalar — coerced, no panic.
+        let v = merge_mcp_config(&serde_json::json!({"mcpServers": 5}), "/x");
+        assert_eq!(v["mcpServers"]["baude"]["command"].as_str(), Some("/x"));
     }
 
     // ---- mcp_config_path ------------------------------------------------

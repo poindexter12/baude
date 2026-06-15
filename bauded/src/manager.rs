@@ -132,6 +132,30 @@ fn spawn_command(base_cmd: &str, event_url: &str, resume: bool) -> String {
     format!("export BAUDE_EVENT_URL={event_url}; {inner}")
 }
 
+/// Best-effort, non-clobbering seed of a session cwd's `.mcp.json` registering
+/// baude's `permission-mcp` stdio server (PERM-01, `prompt` mode only).
+///
+/// The MCP command is `current_exe()` + ` permission-mcp` — the same
+/// `current_exe()` resolution as `baude_core::hook::baude_hook_command`, so a
+/// daemon-spawned session seeds `bauded permission-mcp` (the Pitfall-2 reason
+/// BOTH binaries must grow the arm in 04-02). Mirrors `seed_settings`: never
+/// aborts a spawn on failure, and re-seeding merges `mcpServers.baude` into an
+/// existing file without discarding sibling MCP servers (idempotent — the
+/// command is the sentinel). Re-runs on every `restore()` re-spawn.
+fn seed_mcp_config(cwd: &Path) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(_) => return, // can't resolve the bridge command — best-effort skip.
+    };
+    let path = baude_core::permission::mcp_config_path(cwd);
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let merged = baude_core::permission::merge_mcp_config(&existing, &exe);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
 /// `claude_cmd`, then plain `claude`.
 /// BAUDED_AUTO_ARCHIVE_MIN (minutes, 0 disables) — default 30.
@@ -282,7 +306,29 @@ impl Manager {
         // adds exactly one baude entry per event no matter how often it runs.
         baude_core::hook::seed_settings(&cwd);
 
-        let cmd = spawn_command(&self.claude_cmd, &event_url(id), resume);
+        // PERM-01: select exactly one permission flag (default skip preserves
+        // today's unattended `--dangerously-skip-permissions`; `prompt` is
+        // opt-in via BAUDE_PERMISSION_MODE). Append to the base cmd BEFORE the
+        // `export …; {inner}` wrap so the flag survives the `--continue || exec`
+        // resume fallback (WR-01). No-op when the operator already set a
+        // permission flag (no-double-add).
+        let base_cmd = format!(
+            "{}{}",
+            self.claude_cmd,
+            baude_core::permission::permission_flag(&self.claude_cmd)
+        );
+
+        // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
+        // registering the `permission-mcp` stdio server (command =
+        // current_exe() + " permission-mcp"). Best-effort, idempotent, and
+        // re-seeded on every `restore()`-driven re-spawn — exactly the hook
+        // seed posture. The daemon's current_exe() is `bauded`, so 04-02 adds
+        // the `permission-mcp` arm to BOTH binaries (Pitfall 2).
+        if baude_core::permission::is_prompt_mode() {
+            seed_mcp_config(&cwd);
+        }
+
+        let cmd = spawn_command(&base_cmd, &event_url(id), resume);
         let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
 
         self.next_id += 1;
@@ -771,7 +817,11 @@ mod tests {
 
     #[test]
     fn keys_drive_a_shell_and_screen_reads_back() {
-        let mut m = Manager::new("bash --norc -i".into(), false);
+        // Wrap the shell so the spawn-site permission flag (appended to the
+        // base cmd by `spawn`, default `--dangerously-skip-permissions`) lands
+        // as the harmless `$0` of `sh -c` instead of breaking bash's arg
+        // parsing. Production uses `claude`, which accepts the flag.
+        let mut m = Manager::new("sh -c 'exec bash --norc -i'".into(), false);
         let id = m.create("/tmp", None, None).unwrap().id;
         // Let the shell come up, type a command, read it off the screen.
         std::thread::sleep(Duration::from_millis(800));
@@ -880,6 +930,107 @@ mod tests {
             !resumed.contains("|| BAUDE_EVENT_URL="),
             "fallback must not re-prefix; export already covers it"
         );
+    }
+
+    #[test]
+    fn permission_mode_default_skip_and_prompt_at_spawn_command() {
+        // PERM-01 (security-critical): the daemon spawn command must carry
+        // `--dangerously-skip-permissions` by default (BAUDE_PERMISSION_MODE
+        // unset/skip) and `--permission-prompt-tool` ONLY in `prompt` mode.
+        // Pins the exact composition the daemon `spawn` uses: base_cmd =
+        // claude_cmd + permission_flag(claude_cmd), then spawn_command wraps it.
+        //
+        // Exercises the env-free `permission_flag_for` seam so the test never
+        // mutates the process-global BAUDE_PERMISSION_MODE — which would race
+        // the concurrent real-PTY spawn tests in this crate that read it.
+        let url = "http://127.0.0.1:8642/sessions/1/event";
+        let flagged = |claude: &str, mode: Option<&str>| {
+            format!(
+                "{claude}{}",
+                baude_core::permission::permission_flag_for(mode, claude)
+            )
+        };
+
+        // Default (unset) and explicit skip and unrecognized -> skip flag,
+        // never the prompt flag (fail-safe default).
+        for mode in [None, Some("skip"), Some("bogus")] {
+            let cmd = spawn_command(&flagged("claude", mode), url, false);
+            assert!(
+                cmd.contains("--dangerously-skip-permissions"),
+                "mode {mode:?} must skip permissions, got: {cmd}"
+            );
+            assert!(
+                !cmd.contains("--permission-prompt-tool"),
+                "mode {mode:?} must NOT prompt, got: {cmd}"
+            );
+        }
+
+        // prompt -> prompt flag present, skip flag absent; survives the resume
+        // `--continue || exec` fallback (appended to the inner base cmd).
+        let cmd = spawn_command(&flagged("claude", Some("prompt")), url, true);
+        assert!(
+            cmd.contains("--permission-prompt-tool mcp__baude__approve"),
+            "prompt mode must wire the prompt tool, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--dangerously-skip-permissions"),
+            "prompt mode must NOT also skip, got: {cmd}"
+        );
+        // The flag is on the base cmd so both `--continue` and the `exec`
+        // fallback carry it.
+        assert_eq!(
+            cmd.matches("--permission-prompt-tool").count(),
+            2,
+            "resume path repeats the flagged base cmd on both sides of `||`: {cmd}"
+        );
+    }
+
+    #[test]
+    fn seed_mcp_config_is_non_clobbering() {
+        // PERM-01 / T-04-03: seeding `.mcp.json` in prompt mode must merge our
+        // `baude` server without discarding a user's sibling MCP servers, and
+        // must be idempotent across re-spawns (restore()).
+        let cwd = std::env::temp_dir().join(format!("baude-mcp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let path = baude_core::permission::mcp_config_path(&cwd);
+
+        // Pre-existing user config with a sibling server.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"command":"other-srv"}},"extra":true}"#,
+        )
+        .unwrap();
+
+        seed_mcp_config(&cwd);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Sibling server + unrelated key preserved.
+        assert_eq!(
+            v["mcpServers"]["other"]["command"].as_str(),
+            Some("other-srv")
+        );
+        assert_eq!(v["extra"].as_bool(), Some(true));
+        // Our server registered with the permission-mcp arg.
+        assert_eq!(
+            v["mcpServers"]["baude"]["args"][0].as_str(),
+            Some("permission-mcp")
+        );
+
+        // Idempotent: re-seeding leaves exactly one `baude` server, sibling intact.
+        seed_mcp_config(&cwd);
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v2["mcpServers"]["other"]["command"].as_str(),
+            Some("other-srv")
+        );
+        assert_eq!(
+            v2["mcpServers"]["baude"]["args"][0].as_str(),
+            Some("permission-mcp")
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]

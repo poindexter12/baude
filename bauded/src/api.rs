@@ -787,7 +787,14 @@ mod pty_ws_tests {
 
     #[tokio::test]
     async fn pty_websocket_round_trip() {
-        let state = Arc::new(Mutex::new(Manager::new("bash --norc -i".into(), false)));
+        // Wrap the shell so the spawn-site permission flag (appended to the
+        // base cmd, default `--dangerously-skip-permissions`) lands as the
+        // harmless `$0` of `sh -c` instead of breaking bash's arg parsing.
+        // Production uses `claude`, which accepts the flag.
+        let state = Arc::new(Mutex::new(Manager::new(
+            "sh -c 'exec bash --norc -i'".into(),
+            false,
+        )));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -168,6 +168,28 @@ pub fn inner(r: Rect) -> Rect {
     }
 }
 
+/// Best-effort, non-clobbering seed of a session cwd's `.mcp.json` registering
+/// baude's `permission-mcp` stdio server (PERM-01, `prompt` mode only).
+///
+/// The MCP command is `current_exe()` + ` permission-mcp` (same resolution as
+/// `baude_core::hook::baude_hook_command`). Mirrors `seed_settings`: never
+/// aborts a spawn on failure, and re-seeding merges `mcpServers.baude` into an
+/// existing file via the pure `merge_mcp_config` without discarding a user's
+/// sibling MCP servers (idempotent).
+fn seed_mcp_config(cwd: &Path) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(_) => return, // can't resolve the bridge command — best-effort skip.
+    };
+    let path = baude_core::permission::mcp_config_path(cwd);
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let merged = baude_core::permission::merge_mcp_config(&existing, &exe);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 impl App {
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
@@ -419,7 +441,16 @@ impl App {
 
         // `claude --continue` resumes the most recent conversation in this
         // directory; falls back to a fresh session if there is none.
-        let base = self.claude_cmd();
+        // PERM-01: append exactly one permission flag to the base cmd (default
+        // skip preserves today's `--dangerously-skip-permissions`; `prompt` is
+        // opt-in via BAUDE_PERMISSION_MODE). The flag rides on the base cmd so
+        // it survives the `--continue || exec` resume fallback. No-double-add
+        // when the operator already set a permission flag.
+        let base = format!(
+            "{0}{1}",
+            self.claude_cmd(),
+            baude_core::permission::permission_flag(&self.claude_cmd())
+        );
         let cmd = if resume {
             format!("{base} --continue 2>/dev/null || exec {base}")
         } else {
@@ -432,6 +463,14 @@ impl App {
         // get NO $BAUDE_EVENT_URL, which routes the hook to the /tmp append
         // path (only the daemon injects that var).
         baude_core::hook::seed_settings(&cwd);
+
+        // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
+        // registering the `permission-mcp` stdio server (command =
+        // current_exe() + " permission-mcp"). Best-effort, mirrors the hook
+        // seed; 04-02 adds the `permission-mcp` arm to both binaries.
+        if baude_core::permission::is_prompt_mode() {
+            seed_mcp_config(&cwd);
+        }
 
         let (rows, cols) = self.claude_spawn_size(shell_open);
         let claude = Pty::spawn(Some(&cmd), &cwd, rows, cols)?;
