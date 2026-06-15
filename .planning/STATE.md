@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.7
 milestone_name: milestone
 status: executing
-stopped_at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
-last_updated: "2026-06-15T20:59:08.938Z"
-last_activity: 2026-06-15 -- 03-01 activity ring buffer complete
+stopped_at: 04-01 complete (BAUDE_PERMISSION_MODE spawn-flag selection, PERM-01); ready for 04-02
+last_updated: "2026-06-15T23:51:48Z"
+last_activity: 2026-06-15 -- 04-01 complete (permission_flag selector + .mcp.json seed)
 progress:
   total_phases: 4
-  completed_phases: 2
-  total_plans: 10
-  completed_plans: 9
-  percent: 50
+  completed_phases: 3
+  total_plans: 14
+  completed_plans: 11
+  percent: 79
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-15)
 
 **Core value:** You can see at a glance which of your many Claude Code sessions needs you next — and act on it — whether at the terminal or on your phone.
-**Current focus:** Phase 03 — tool-activity-timeline
+**Current focus:** Phase 04 — remote-permission-approval
 
 ## Current Position
 
-Phase: 03 (tool-activity-timeline) — EXECUTING
-Plan: 3 of 4
-Status: Ready to execute
-Last activity: 2026-06-15 -- 03-01 activity ring buffer complete
+Phase: 04 (remote-permission-approval) — EXECUTING
+Plan: 2 of 4
+Status: Executing Phase 04 (04-01 complete)
+Last activity: 2026-06-15 -- 04-01 complete (permission_flag selector + .mcp.json seed)
 
-Progress: [████████░░] 70%
+Progress: [████████░░] 79%
 
 ## Accumulated Context
 
@@ -54,6 +54,9 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - [Phase ?]: 03-02: activity feed served two ways — GET /activity (ring snapshot) + GET /activity-stream (standalone SSE file-tail via dedicated EventTail, never the ChatMessage Tail)
 - [Phase ?]: PWA HookEvent.ts is unix-ms; activity strip relative time = humanMs(Date.now() - e.ts)
 - [Phase ?]: Activity strip is a second standalone EventSource, closed in closeStream alongside the chat ES (no leak)
+- 04-01: permission_flag defaults to skip (--dangerously-skip-permissions); prompt reachable ONLY by exact "prompt" (unset/unrecognized/case-mismatch fail safe to skip) — PERM-01/T-04-01 security-critical
+- 04-01: env-free permission_flag_for(mode, base_cmd) seam so branch tests never mutate process-global BAUDE_PERMISSION_MODE (races concurrent PTY spawns that read it)
+- 04-01: permission flag appended to base cmd unconditionally (mode-driven, not command-sniffing); merge_mcp_config pure non-clobbering seed (only mcpServers.baude set) shared by both spawn sites
 
 ### Pending Todos
 
@@ -66,9 +69,9 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-15T20:58:54.759Z
-Stopped at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
-Resume file: 03-02-PLAN.md
+Last session: 2026-06-15T23:51:48Z
+Stopped at: 04-01 complete (BAUDE_PERMISSION_MODE spawn-flag selection, PERM-01); ready for 04-02
+Resume file: 04-02-PLAN.md
 
 ## Performance Metrics
 
@@ -79,3 +82,4 @@ Resume file: 03-02-PLAN.md
 | Phase 03 P01 | 12min | 2 tasks | 1 file |
 | Phase 03 P02 | 5min | 2 tasks | 4 files |
 | Phase 03 P03 | 8min | 1 tasks | 3 files |
+| Phase 04 P01 | 10min | 2 tasks | 5 files |

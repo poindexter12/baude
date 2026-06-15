@@ -132,7 +132,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 04-01-PLAN.md — BAUDE_PERMISSION_MODE spawn-flag selection (default skip) + .mcp.json seeding (PERM-01)
+- [x] 04-01-PLAN.md — BAUDE_PERMISSION_MODE spawn-flag selection (default skip) + .mcp.json seeding (PERM-01)
 
 **Wave 2** *(blocked on Wave 1)*
 

@@ -88,7 +88,7 @@ Mapped to roadmap phases (see `.planning/ROADMAP.md`).
 | ACT-02 | Phase 3 | Complete |
 | ACT-03 | Phase 3 | Pending |
 | ACT-04 | Phase 3 | Pending |
-| PERM-01 | Phase 4 | Pending |
+| PERM-01 | Phase 4 | In Progress (04-01: spawn-flag selection + .mcp.json seed done; prompt-routing bridge in 04-02) |
 | PERM-02 | Phase 4 | Pending |
 | PERM-03 | Phase 4 | Pending |
 | PERM-04 | Phase 4 | Pending |
