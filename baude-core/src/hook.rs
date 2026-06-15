@@ -133,6 +133,36 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
+/// Route one normalized event line to its transport, never losing the event.
+///
+/// When `url` is `Some`, attempt the daemon POST via `post` (which returns
+/// `true` on success). On a POST failure — connection refused on a wrong/dead
+/// port (e.g. a custom daemon `--bind` the injected URL doesn't know about) or
+/// any transport error — fall back to the TUI-local `/tmp` file-append so the
+/// event is never silently dropped; the daemon tails that same file, so the
+/// event converges either way (WR-02). When `url` is `None`, append directly.
+///
+/// `post` is injected so the routing/fallback decision is unit-testable without
+/// a live network peer. The transport call itself stays in the binary.
+pub fn route_event<F>(url: Option<&str>, sid: &str, line: &str, post: F)
+where
+    F: FnOnce(&str, &str) -> bool,
+{
+    match url {
+        Some(url) => {
+            let posted = post(url, line);
+            if !posted && !sid.is_empty() {
+                let _ = append_event(sid, line);
+            }
+        }
+        None => {
+            if !sid.is_empty() {
+                let _ = append_event(sid, line);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +342,72 @@ mod tests {
         assert!(lines[0].contains("UserPromptSubmit"));
         assert!(lines[1].contains("Stop"));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- route_event ---------------------------------------------------
+
+    #[test]
+    fn route_event_failed_post_falls_back_to_file() {
+        // WR-02: a POST that fails (here: a wrong/dead port simulated by the
+        // closure returning false) must NOT drop the event — it appends to the
+        // per-session /tmp file so the daemon's file-tail still catches it.
+        let sid = format!("test-route-fail-{}", std::process::id());
+        let path = event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+
+        route_event(
+            Some("http://127.0.0.1:1/bad"),
+            &sid,
+            r#"{"event":"Stop"}"#,
+            |_url, _line| false, // simulate connection refused / dead port
+        );
+
+        let contents = std::fs::read_to_string(&path).expect("fallback wrote the event file");
+        assert!(
+            contents.contains("Stop"),
+            "failed POST must append to the file, not drop the event"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn route_event_successful_post_does_not_write_file() {
+        // A successful POST consumes the event via the daemon transport; no
+        // file is written (the daemon ingests and appends on its side).
+        let sid = format!("test-route-ok-{}", std::process::id());
+        let path = event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+
+        route_event(
+            Some("http://127.0.0.1:8642/ok"),
+            &sid,
+            r#"{"event":"Stop"}"#,
+            |_url, _line| true, // POST succeeded
+        );
+
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a successful POST must not also write the local file"
+        );
+    }
+
+    #[test]
+    fn route_event_no_url_appends_to_file() {
+        // The TUI-local path (no $BAUDE_EVENT_URL) appends directly.
+        let sid = format!("test-route-nourl-{}", std::process::id());
+        let path = event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+
+        let mut post_called = false;
+        route_event(None, &sid, r#"{"event":"Stop"}"#, |_url, _line| {
+            post_called = true;
+            true
+        });
+        assert!(!post_called, "no URL means no POST attempt");
+
+        let contents = std::fs::read_to_string(&path).expect("local append wrote the file");
+        assert!(contents.contains("Stop"));
         let _ = std::fs::remove_file(&path);
     }
 }
