@@ -77,7 +77,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 02-02-PLAN.md — read_event_tail + hook_status/last_tool capture + StateSource precedence (Hook>SessionFile>Silence), silence fallback unchanged (HOOK-02)
+- [x] 02-02-PLAN.md — read_event_tail + hook_status/last_tool capture + StateSource precedence (Hook>SessionFile>Silence), silence fallback unchanged (HOOK-02)
 
 **Wave 3** *(blocked on Wave 2)*
 
@@ -132,6 +132,6 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
-| 2. Hook-Driven Status | 1/3 | In Progress|  |
+| 2. Hook-Driven Status | 2/3 | In Progress|  |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
