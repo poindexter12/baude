@@ -42,6 +42,14 @@ function humanMs(ms) {
   return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
 }
 
+// Compact relative age for an event ts (unix ms), mirroring the TUI's
+// activity_age: "now" for <1s, else humanMs (IN-01).
+function activityAge(ts) {
+  if (!ts) return "";
+  const ms = Math.max(0, Date.now() - ts);
+  return ms < 1000 ? "now" : humanMs(ms);
+}
+
 function shortModel(m) {
   return m && !m.startsWith("<") ? m.replace(/^claude-/, "") : null;
 }
@@ -255,7 +263,7 @@ function activityLabel(e) {
 }
 
 function activityRowHtml(e) {
-  const rel = e.ts ? humanMs(Math.max(0, Date.now() - e.ts)) : "";
+  const rel = activityAge(e.ts);
   return `<div class="act-row">
     <span class="act-icon">${esc(activityIcon(e))}</span>
     <span class="act-label">${esc(activityLabel(e))}</span>
