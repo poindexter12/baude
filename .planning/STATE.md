@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.7
 milestone_name: milestone
 status: executing
-stopped_at: ROADMAP.md created and REQUIREMENTS.md traceability populated
-last_updated: "2026-06-15T19:28:51.189Z"
+stopped_at: 02-03 autonomous tasks complete; Task 4 live-hook UAT pending human verification
+last_updated: "2026-06-15T19:37:11.438Z"
 last_activity: 2026-06-15 -- Phase 02 execution started
 progress:
   total_phases: 4
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 6
-  completed_plans: 5
-  percent: 25
+  completed_plans: 6
+  percent: 50
 ---
 
 # Project State
@@ -47,6 +47,8 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - 01-01: `vim_mode` is captured/persisted but never rendered (capture-but-don't-render)
 - [Phase ?]: 02-01: command string is the hook-merge idempotency sentinel; seed current_exe() absolute path so the hook resolves regardless of session PATH
 - [Phase ?]: Plan 02-02: hook events drive session state; precedence Hook(fresh,5s)>SessionFile>Silence via StateSource, silence fallback byte-identical (HOOK-02)
+- [Phase ?]: 02-03: BAUDE_EVENT_URL uses loopback DEFAULT_BIND; custom --bind port not honored this phase (deferred)
+- [Phase ?]: 02-03: daemon POST /sessions/{id}/event converges with the TUI file-tail onto one /tmp consume path (HOOK-03)
 
 ### Pending Todos
 
@@ -59,9 +61,9 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-15T19:28:43.413Z
-Stopped at: ROADMAP.md created and REQUIREMENTS.md traceability populated
-Resume file: None
+Last session: 2026-06-15T19:37:11.434Z
+Stopped at: 02-03 autonomous tasks complete; Task 4 live-hook UAT pending human verification
+Resume file: 02-03-PLAN.md (Task 4 human-verify UAT)
 
 ## Performance Metrics
 

@@ -22,7 +22,7 @@ layer's `Notification` event and the opt-in `prompt` mode. Source plan:
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Full Status-Line Capture** - Bridge persists Claude's whole status-line payload; info overlay shows effort/thinking/PR (completed 2026-06-15)
-- [ ] **Phase 2: Hook-Driven Status** - Working/waiting/done state comes from Claude Code hooks, with silence heuristic as labeled fallback
+- [x] **Phase 2: Hook-Driven Status** - Working/waiting/done state comes from Claude Code hooks, with silence heuristic as labeled fallback (completed 2026-06-15)
 - [ ] **Phase 3: Tool-Activity Timeline** - Live per-session tool feed renders in the PWA and the TUI
 - [ ] **Phase 4: Remote Permission Approval** - Approve/deny a session's pending permission prompt from the phone, with a distinct push
 
@@ -81,7 +81,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 02-03-PLAN.md — daemon POST /sessions/{id}/event + $BAUDE_EVENT_URL injection + daemon seeding + overlay surfacing + end-to-end UAT (HOOK-01, HOOK-03)
+- [x] 02-03-PLAN.md — daemon POST /sessions/{id}/event + $BAUDE_EVENT_URL injection + daemon seeding + overlay surfacing + end-to-end UAT (HOOK-01, HOOK-03)
 
 ### Phase 3: Tool-Activity Timeline
 
@@ -132,6 +132,6 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
-| 2. Hook-Driven Status | 2/3 | In Progress|  |
+| 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
