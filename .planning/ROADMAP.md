@@ -44,7 +44,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Capture full status-line payload (model/effort/thinking/pr/worktree/vim) + schema:2 in bridge.rs (TDD)
+- [x] 01-01-PLAN.md — Capture full status-line payload (model/effort/thinking/pr/worktree/vim) + schema:2 in bridge.rs (TDD)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -121,7 +121,7 @@ other and may be planned/executed in either order once Phase 2 lands.)
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Full Status-Line Capture | 0/3 | Planned | - |
+| 1. Full Status-Line Capture | 1/3 | In Progress|  |
 | 2. Hook-Driven Status | 0/TBD | Not started | - |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
