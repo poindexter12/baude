@@ -868,6 +868,20 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 row("claude session", opt(&m.session_id)),
                 Line::raw(""),
             ];
+            if let Some(e) = &m.effort {
+                lines.push(row("effort", e.clone()));
+            }
+            if let Some(t) = m.thinking {
+                lines.push(row("thinking", if t { "on".into() } else { "off".into() }));
+            }
+            if let Some(pr) = &m.pr {
+                let n = pr
+                    .number
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "?".into());
+                let st = pr.review_state.clone().unwrap_or_else(|| "—".into());
+                lines.push(row("pr", format!("{n} ({st})")));
+            }
             if let Some(u) = &m.last_usage {
                 lines.push(row(
                     "last turn",
