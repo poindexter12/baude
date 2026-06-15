@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use baude_core::meta::{human_tokens, human_until, short_mode, short_model, RateWindow};
 use baude_core::pty::now_ms;
-use baude_core::session::{human_duration, Session, Status};
+use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
@@ -787,10 +787,11 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     ])
                 };
                 let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
-                let lines = vec![
+                let mut lines = vec![
                     row("session", format!("{} (remote)", r.name)),
                     row("title", opt(&r.title)),
                     row("status", r.status.clone()),
+                    row("state", opt(&r.state_source)),
                     row(
                         "model",
                         r.model
@@ -819,6 +820,9 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                             .unwrap_or_else(|| "—".into()),
                     ),
                 ];
+                if let Some(tool) = &r.last_tool {
+                    lines.push(row("tool", tool.clone()));
+                }
                 let rect = centered(frame.area(), 64, lines.len() as u16 + 2);
                 frame.render_widget(Clear, rect);
                 let p = Paragraph::new(lines).block(
@@ -868,6 +872,18 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 row("claude session", opt(&m.session_id)),
                 Line::raw(""),
             ];
+            // Capture-but-render-lightly: surface which source decided the
+            // state so a regression to the silence fallback is observable, and
+            // the last tool Claude ran when the hook stream reported one.
+            let source_label = match s.status_with_source().1 {
+                StateSource::Hook => "hook",
+                StateSource::SessionFile => "session-file",
+                StateSource::Silence => "silence",
+            };
+            lines.push(row("state", source_label.into()));
+            if let Some((tool, _)) = &m.last_tool {
+                lines.push(row("tool", tool.clone()));
+            }
             if let Some(e) = &m.effort {
                 lines.push(row("effort", e.clone()));
             }

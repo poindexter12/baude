@@ -28,6 +28,13 @@ pub struct RemoteInfo {
     pub context_used_pct: Option<u8>,
     pub branch: Option<String>,
     pub session_cost_usd: Option<f64>,
+    /// Which source decided `status` ("hook"/"session-file"/"silence"); shown
+    /// in the remote info overlay so a regression to silence is observable.
+    #[serde(default)]
+    pub state_source: Option<String>,
+    /// The last tool the daemon-managed session ran, if any.
+    #[serde(default)]
+    pub last_tool: Option<String>,
     #[serde(default)]
     pub archived: bool,
 }
