@@ -263,11 +263,6 @@ pub struct EventTail {
     offset: u64,
 }
 
-// The accessors are wired into `api::activity_stream` in Task 2 of this plan;
-// they are exercised by the tail unit tests now. The allow is removed once the
-// SSE handler consumes them (mirrors the 03-01 deferred-import precedent for
-// keeping a per-task commit clippy-clean under -D warnings).
-#[allow(dead_code)]
 impl EventTail {
     /// Start at the current end of `path` — recent history is served by the
     /// non-streaming `/activity` endpoint; the stream only carries new events.

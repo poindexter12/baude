@@ -13,8 +13,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use baude_core::meta::{HookEvent, ACTIVITY_CAP};
+
 use crate::manager::{lock, SessionInfo, Shared};
-use crate::transcript::{self, ChatMessage, Tail};
+use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
 pub fn router(state: Shared) -> Router {
     Router::new()
@@ -35,6 +37,8 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/pty", get(pty_ws))
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/event", post(post_event))
+        .route("/sessions/{id}/activity", get(get_activity))
+        .route("/sessions/{id}/activity-stream", get(activity_stream))
         .with_state(state)
 }
 
@@ -159,6 +163,26 @@ async fn get_messages(
         Some(uuid) => transcript::after(messages, uuid),
         None => messages,
     }))
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    /// Max number of recent events to return. Clamped to `ACTIVITY_CAP`
+    /// (Security V5 — never honor an oversized/unbounded limit; T-03-06).
+    limit: Option<usize>,
+}
+
+/// Recent hook events for a session as a JSON array (newest at back). The
+/// `?limit` is defaulted to and clamped at `ACTIVITY_CAP` so a hostile/oversized
+/// value never allocates more than the ring holds. Unknown id → 404, never 500.
+async fn get_activity(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    Query(q): Query<ActivityQuery>,
+) -> Result<Json<Vec<HookEvent>>, ApiError> {
+    let limit = q.limit.unwrap_or(ACTIVITY_CAP).min(ACTIVITY_CAP);
+    let act = lock(&state).activity(id, limit).map_err(not_found)?;
+    Ok(Json(act))
 }
 
 #[derive(Deserialize)]
@@ -396,6 +420,50 @@ async fn stream(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+/// SSE live tail of the session's hook-event file — a standalone channel,
+/// independent of the chat `/stream`. Offset-tails `/tmp/baude-events-<sid>.jsonl`
+/// via the dedicated `EventTail` (Pitfall 1: NOT the ChatMessage `Tail`, which
+/// would yield zero events). Recent history is served by `GET /activity`; this
+/// stream carries only events appended after connect. Unknown id → 404 via the
+/// up-front guard. Hook events have no uuid, so no `Event::id` is set (Pitfall 2);
+/// ordering is append-only and the PWA does GET-then-buffer.
+async fn activity_stream(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    lock(&state).event_path(id).map_err(not_found)?;
+
+    let stream = async_stream::stream! {
+        let mut current: Option<PathBuf> = None;
+        let mut tail = EventTail::default();
+        loop {
+            let path = match lock(&state).event_path(id) {
+                Ok(p) => p,
+                Err(_) => break, // session deleted
+            };
+            if let Some(path) = path {
+                if current.as_ref() != Some(&path) {
+                    // First sighting of an existing event file: skip its
+                    // history. A rotated path (resumed/rotated Claude session)
+                    // is all new — read it from the top.
+                    tail = if current.is_none() {
+                        EventTail::end_of(&path)
+                    } else {
+                        EventTail::default()
+                    };
+                    current = Some(path.clone());
+                }
+                for ev in tail.read_new(&path) {
+                    let data = serde_json::to_string(&ev).unwrap_or_default();
+                    yield Ok(Event::default().event("message").data(data));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(STREAM_POLL_MS)).await;
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -514,6 +582,112 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_file(&path);
+        lock(&state).kill_all();
+    }
+
+    #[tokio::test]
+    async fn activity_returns_events_clamps_limit_and_404s_unknown() {
+        use crate::manager::lock;
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        let sid = format!("api-activity-test-{}", std::process::id());
+        let path = baude_core::hook::event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        // Seed a few events onto the on-disk file, then drive the ring.
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"event":"UserPromptSubmit","ts":1}"#,
+                "\n",
+                r#"{"event":"PostToolUse","tool":"Read","ts":2}"#,
+                "\n",
+                r#"{"event":"Stop","ts":3}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        {
+            let mut m = lock(&state);
+            m.session_id_for_test(id, &sid);
+            m.poll();
+        }
+        let app = super::router(Arc::clone(&state));
+
+        // Default: full recent set as a JSON array, newest at back.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/activity")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.last().unwrap()["event"], "Stop");
+        // PostToolUse carries `tool`; events without it omit the field.
+        assert_eq!(arr[1]["tool"], "Read");
+
+        // ?limit=1 returns exactly the newest event.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/activity?limit=1")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let arr = body_json(res).await;
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["event"], "Stop");
+
+        // An oversized ?limit is clamped (no 500, no oversized response).
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/activity?limit=100000")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await.as_array().unwrap().len(), 3);
+
+        // Unknown id → 404, never 500.
+        let res = app
+            .clone()
+            .oneshot(get("/sessions/9999/activity"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&path);
+        lock(&state).kill_all();
+    }
+
+    #[tokio::test]
+    async fn activity_stream_guards_known_and_unknown() {
+        use crate::manager::lock;
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        let app = super::router(Arc::clone(&state));
+
+        // Known id: the route exists and returns an SSE stream (200 +
+        // text/event-stream). A full live-tail assertion is covered by the
+        // EventTail unit test; here we assert the route + content-type.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/activity-stream")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(ct.starts_with("text/event-stream"), "got: {ct}");
+
+        // Unknown id → 404 via the up-front event_path guard.
+        let res = app
+            .oneshot(get("/sessions/9999/activity-stream"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
         lock(&state).kill_all();
     }
 

@@ -463,10 +463,6 @@ impl Manager {
     /// Claude session_id hasn't been resolved yet (so no event file exists).
     /// The sid is sanitized by `baude_core::hook::event_path` (T-03-05).
     /// Analog of `transcript_path` — the SSE existence guard maps Err → 404.
-    // Wired into `api::activity_stream`/`get_activity` in Task 2; the allow is
-    // removed there (mirrors the 03-01 deferred-import precedent for keeping a
-    // per-task commit clippy-clean under -D warnings).
-    #[allow(dead_code)]
     pub fn event_path(&self, id: u64) -> Result<Option<PathBuf>> {
         let s = self.session(id)?;
         Ok(s.meta
@@ -478,7 +474,6 @@ impl Manager {
     /// The session's recent hook events, newest-at-back, bounded to `limit`.
     /// Reads the in-memory `ClaudeMeta` ring (the single source of truth).
     /// Err = no such session (→ 404 upstream).
-    #[allow(dead_code)]
     pub fn activity(&self, id: u64, limit: usize) -> Result<Vec<HookEvent>> {
         let s = self.session(id)?;
         let act = s.meta.activity();
