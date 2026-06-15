@@ -1,1 +1,4 @@
 /target
+
+# GSD intel — regeneratable API-surface tooling output
+.planning/intel/
