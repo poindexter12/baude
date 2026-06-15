@@ -89,6 +89,21 @@ pub struct ClaudeMeta {
     pub context_used_pct: Option<u8>,
     /// (busy, status_updated_at unix ms) from Claude's own session file.
     pub claude_status: Option<(bool, u64)>,
+    /// (busy, event_ts unix ms) derived from the Claude Code hook event
+    /// stream (`/tmp/baude-events-<sid>.jsonl`). Higher precedence than
+    /// `claude_status` while fresh (see `session.rs::status_with_source`).
+    /// Event-driven: only ever set on a new event, never cleared by absence.
+    pub hook_status: Option<(bool, u64)>,
+    /// (tool_name, event_ts unix ms) of the most recent PostToolUse event.
+    pub last_tool: Option<(String, u64)>,
+    /// (notification_type, event_ts unix ms) of the most recent Notification
+    /// event. Captured for a future Phase 4 `waiting_reason`; intentionally
+    /// NOT exposed as a structured SessionInfo field this phase.
+    pub last_notification: Option<(String, u64)>,
+    /// Byte offset of the last fully-consumed line in the event stream.
+    /// Separate from `offset` (the transcript tail) so the two tails never
+    /// interfere.
+    offset_events: u64,
     pub gsd: Option<GsdState>,
     /// Live session cost from the `baude statusline` bridge file.
     pub session_cost_usd: Option<f64>,
@@ -122,6 +137,7 @@ impl ClaudeMeta {
         // (it carries Claude's exact used_percentage).
         self.read_context_file();
         self.read_bridge_file();
+        self.read_event_tail();
         self.gsd = parse_gsd(repo_root);
         self.git_branch = read_git_branch(cwd);
     }
@@ -322,6 +338,63 @@ impl ClaudeMeta {
             path: w["path"].as_str().map(str::to_string),
             branch: w["branch"].as_str().map(str::to_string),
         });
+    }
+
+    /// Incrementally parse new hook-event lines since the last poll. Mirrors
+    /// `read_transcript_tail`'s offset-tracked, complete-lines-only machinery
+    /// but tracks a separate `offset_events` so the transcript tail is never
+    /// disturbed. Events drive `hook_status`/`last_tool`/`last_notification`.
+    /// Untyped `Value` accessors throughout — a malformed line is skipped and
+    /// never panics (T-02-05).
+    fn read_event_tail(&mut self) {
+        let Some(sid) = &self.session_id else {
+            return;
+        };
+        let path = PathBuf::from(crate::hook::event_path(sid));
+        let Ok(mut f) = fs::File::open(&path) else {
+            return;
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len <= self.offset_events {
+            return;
+        }
+        if f.seek(SeekFrom::Start(self.offset_events)).is_err() {
+            return;
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return;
+        }
+        // Only consume complete lines; a partial trailing line is re-read on
+        // the next poll.
+        let consumed = match buf.rfind('\n') {
+            Some(i) => i + 1,
+            None => return,
+        };
+        for line in buf[..consumed].lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let ts = v["ts"].as_u64().unwrap_or(0);
+            match v["event"].as_str() {
+                Some("UserPromptSubmit") => self.hook_status = Some((true, ts)),
+                Some("Stop") => self.hook_status = Some((false, ts)),
+                Some("Notification") => {
+                    self.hook_status = Some((false, ts));
+                    if let Some(nt) = v["notification_type"].as_str() {
+                        self.last_notification = Some((nt.to_string(), ts));
+                    }
+                }
+                Some("PostToolUse") => {
+                    self.hook_status = Some((true, ts));
+                    if let Some(t) = v["tool"].as_str() {
+                        self.last_tool = Some((t.to_string(), ts));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.offset_events += consumed as u64;
     }
 
     /// Context usage bridge file written by statusline hooks (e.g. the GSD
@@ -718,5 +791,158 @@ mod tests {
         fs::remove_file(&bpath2).ok();
         fs::remove_file(&tpath2).ok();
         assert_eq!(meta2.model.as_deref(), Some("keep-me"));
+    }
+
+    /// Write event lines to the path `read_event_tail` will look for (keyed by
+    /// `meta.session_id`), then drive the REAL incremental reader the way
+    /// `poll()` does — mirroring the `model_bridge_wins_then_survives`
+    /// real-seam rigor. Appends (does not truncate) so multi-tick offset tests
+    /// accumulate. Returns the event-file path for cleanup.
+    fn feed_events(meta: &mut ClaudeMeta, suffix: &str, lines: &[&str]) -> PathBuf {
+        let sid = format!("test-{}-{}", std::process::id(), suffix);
+        let path = PathBuf::from(crate::hook::event_path(&sid));
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        // First feed (meta has no session yet) truncates any stale file from
+        // a prior run; subsequent feeds append to extend the same file so the
+        // offset semantics are exercised.
+        if meta.session_id.is_none() {
+            fs::write(&path, &body).unwrap();
+        } else {
+            let existing = fs::read_to_string(&path).unwrap_or_default();
+            fs::write(&path, format!("{existing}{body}")).unwrap();
+        }
+        meta.session_id = Some(sid);
+        meta.read_event_tail();
+        path
+    }
+
+    #[test]
+    fn event_tail_drives_state() {
+        // UserPromptSubmit -> Busy; Stop -> Waiting; through the real seam.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "drives-state",
+            &[r#"{"schema":1,"event":"UserPromptSubmit","ts":100}"#],
+        );
+        assert_eq!(meta.hook_status, Some((true, 100)));
+
+        // Same session id (deterministic from suffix) — feed appends.
+        feed_events(
+            &mut meta,
+            "drives-state",
+            &[r#"{"schema":1,"event":"Stop","ts":200}"#],
+        );
+        assert_eq!(meta.hook_status, Some((false, 200)));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn notification_permission_captured() {
+        // Notification -> Waiting AND notification_type captured in meta
+        // (last_notification), not exposed as a structured field.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "notif",
+            &[
+                r#"{"schema":1,"event":"Notification","ts":250,"notification_type":"permission_prompt"}"#,
+            ],
+        );
+        assert_eq!(meta.hook_status, Some((false, 250)));
+        assert_eq!(
+            meta.last_notification,
+            Some(("permission_prompt".to_string(), 250))
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn post_tool_use_records_last_tool() {
+        // PostToolUse -> stays Busy AND records the tool name + ts.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "posttool",
+            &[r#"{"schema":1,"event":"PostToolUse","ts":300,"tool":"Bash"}"#],
+        );
+        assert_eq!(meta.hook_status, Some((true, 300)));
+        assert_eq!(meta.last_tool, Some(("Bash".to_string(), 300)));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn event_tail_offset_does_not_reprocess() {
+        // A second read over an UNCHANGED file does not re-process lines: the
+        // Stop at ts=200 must not be clobbered back to the earlier prompt.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "offset",
+            &[
+                r#"{"schema":1,"event":"UserPromptSubmit","ts":100}"#,
+                r#"{"schema":1,"event":"Stop","ts":200}"#,
+            ],
+        );
+        assert_eq!(meta.hook_status, Some((false, 200)));
+        let off_after_first = meta.offset_events;
+        // Re-read the same file (no new lines) — no change.
+        meta.read_event_tail();
+        assert_eq!(meta.hook_status, Some((false, 200)));
+        assert_eq!(meta.offset_events, off_after_first);
+        // The transcript offset is untouched by the event tail.
+        assert_eq!(meta.offset, 0);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn event_tail_defers_partial_line() {
+        // A trailing line without a newline is NOT consumed until completed.
+        let mut meta = ClaudeMeta::default();
+        let sid = format!("test-{}-partial", std::process::id());
+        let path = PathBuf::from(crate::hook::event_path(&sid));
+        meta.session_id = Some(sid);
+
+        // One complete line + a partial (no newline) trailing line.
+        fs::write(
+            &path,
+            "{\"schema\":1,\"event\":\"Stop\",\"ts\":10}\n{\"schema\":1,\"event\":\"UserPromptSubmit\",\"ts\":20",
+        )
+        .unwrap();
+        meta.read_event_tail();
+        // Only the complete Stop line consumed.
+        assert_eq!(meta.hook_status, Some((false, 10)));
+
+        // Complete the partial line.
+        fs::write(
+            &path,
+            "{\"schema\":1,\"event\":\"Stop\",\"ts\":10}\n{\"schema\":1,\"event\":\"UserPromptSubmit\",\"ts\":20}\n",
+        )
+        .unwrap();
+        meta.read_event_tail();
+        assert_eq!(meta.hook_status, Some((true, 20)));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn event_tail_skips_malformed_line() {
+        // A malformed JSON line is skipped without panicking; the surrounding
+        // valid lines still drive state.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "malformed",
+            &[
+                r#"{"schema":1,"event":"UserPromptSubmit","ts":100}"#,
+                "{ this is not json",
+                r#"{"schema":1,"event":"Stop","ts":300}"#,
+            ],
+        );
+        assert_eq!(meta.hook_status, Some((false, 300)));
+        fs::remove_file(&path).ok();
     }
 }
