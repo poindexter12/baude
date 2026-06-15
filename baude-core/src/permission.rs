@@ -45,9 +45,19 @@ const PROMPT_FLAG: &str = " --permission-prompt-tool mcp__baude__approve";
 /// [`PROMPT_FLAG`]; every other case (unset, `"skip"`, and any unrecognized
 /// value) returns [`SKIP_FLAG`]. The two real flags are NEVER returned
 /// together — exactly one of `{skip, prompt, ""}`.
-pub fn permission_flag(_base_cmd: &str) -> &'static str {
-    // RED stub — implemented in the GREEN step.
-    ""
+pub fn permission_flag(base_cmd: &str) -> &'static str {
+    let already = base_cmd.contains("--dangerously-skip-permissions")
+        || base_cmd.contains("--permission-prompt-tool")
+        || base_cmd.contains("--permission-mode");
+    if already {
+        return "";
+    }
+    match std::env::var("BAUDE_PERMISSION_MODE").as_deref() {
+        Ok("prompt") => PROMPT_FLAG,
+        // Default skip preserves today's unattended behavior. Unset, "skip",
+        // and any unrecognized value all fall here (fail-safe — never prompt).
+        _ => SKIP_FLAG,
+    }
 }
 
 /// `true` iff `prompt` mode is active (the exact literal `"prompt"`).
@@ -56,8 +66,7 @@ pub fn permission_flag(_base_cmd: &str) -> &'static str {
 /// Mirrors the fail-safe of [`permission_flag`]: only the exact `"prompt"`
 /// literal is `prompt` mode; everything else is `skip`.
 pub fn is_prompt_mode() -> bool {
-    // RED stub — implemented in the GREEN step.
-    false
+    std::env::var("BAUDE_PERMISSION_MODE").as_deref() == Ok("prompt")
 }
 
 /// Build the `.mcp.json` body registering the `baude` permission MCP server.
@@ -66,9 +75,15 @@ pub fn is_prompt_mode() -> bool {
 /// `exe` is the absolute `current_exe()` path the CALLER resolves (mirroring
 /// [`crate::hook::baude_hook_command`]) — core stays pure and never calls
 /// `current_exe()`. Building the Value never panics.
-pub fn mcp_server_config(_exe: &str) -> serde_json::Value {
-    // RED stub — implemented in the GREEN step.
-    serde_json::json!({})
+pub fn mcp_server_config(exe: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mcpServers": {
+            "baude": {
+                "command": exe,
+                "args": ["permission-mcp"],
+            }
+        }
+    })
 }
 
 /// The seeded `.mcp.json` location for a session cwd. Both spawn sites agree on
@@ -127,10 +142,7 @@ mod tests {
 
         // Even in prompt mode, an existing permission flag suppresses ours.
         std::env::set_var("BAUDE_PERMISSION_MODE", "prompt");
-        assert_eq!(
-            permission_flag("claude --dangerously-skip-permissions"),
-            ""
-        );
+        assert_eq!(permission_flag("claude --dangerously-skip-permissions"), "");
         assert_eq!(
             permission_flag("claude --permission-prompt-tool mcp__other__x"),
             ""
@@ -139,10 +151,7 @@ mod tests {
 
         // And in skip mode too.
         std::env::set_var("BAUDE_PERMISSION_MODE", "skip");
-        assert_eq!(
-            permission_flag("claude --dangerously-skip-permissions"),
-            ""
-        );
+        assert_eq!(permission_flag("claude --dangerously-skip-permissions"), "");
 
         std::env::remove_var("BAUDE_PERMISSION_MODE");
     }
@@ -213,9 +222,7 @@ mod tests {
             Some("permission-mcp")
         );
         assert_eq!(
-            v["mcpServers"]["baude"]["args"]
-                .as_array()
-                .map(|a| a.len()),
+            v["mcpServers"]["baude"]["args"].as_array().map(|a| a.len()),
             Some(1)
         );
     }
