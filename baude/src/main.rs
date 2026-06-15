@@ -35,6 +35,28 @@ fn main() -> Result<()> {
         std::process::exit(baude_core::bridge::run(wrap));
     }
 
+    // `baude hook` — Claude Code lifecycle-event hook, no TUI. Claude invokes
+    // it headless per event, piping the hook JSON to stdin. We normalize it to
+    // one event line and route it: POST to `$BAUDE_EVENT_URL` (daemon
+    // transport) or append to `/tmp/baude-events-<sid>.jsonl` (TUI-local).
+    // Best-effort throughout — ALWAYS exit 0 so a hook failure never blocks
+    // Claude (a non-zero exit is a blocking signal to the CLI).
+    if args.get(1).map(String::as_str) == Some("hook") {
+        use std::io::Read;
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let v = serde_json::from_str::<serde_json::Value>(&input)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let line = baude_core::hook::build_event(&v).to_string();
+        let sid = v["session_id"].as_str().unwrap_or_default();
+        if let Ok(url) = std::env::var("BAUDE_EVENT_URL") {
+            let _ = ureq::post(&url).send_string(&line);
+        } else if !sid.is_empty() {
+            let _ = baude_core::hook::append_event(sid, &line);
+        }
+        std::process::exit(0);
+    }
+
     let launch_dir = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)
