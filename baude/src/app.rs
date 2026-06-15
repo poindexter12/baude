@@ -36,6 +36,25 @@ fn expand_tilde(s: &str) -> PathBuf {
     }
 }
 
+/// Best-effort: merge baude's hook set into `cwd/.claude/settings.local.json`
+/// before a managed session starts. Every step is best-effort — a failure here
+/// must never abort the spawn (the session falls back to the silence path, no
+/// regression). The seeded command is the `current_exe()` absolute path + ` hook`
+/// (so it resolves regardless of the session PATH), and the merge is idempotent
+/// so re-spawn/restart never duplicates entries. User statusLine/hooks survive.
+fn seed_session_hooks(cwd: &Path) {
+    let dir = cwd.join(".claude");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("settings.local.json");
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let command = baude_core::hook::baude_hook_command();
+    let merged = baude_core::hook::merge_hook_settings(&existing, &command);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 /// Shell-style directory completion: complete the component after the last
 /// '/' against directories on disk. Returns the new buffer (if it advanced)
 /// and the candidate list when ambiguous. The typed prefix (incl. `~/`) is
@@ -423,6 +442,14 @@ impl App {
         } else {
             format!("exec {base}")
         };
+        // Seed baude's hooks into the session cwd's .claude/settings.local.json
+        // before claude starts, so Claude Code actually invokes `baude hook`.
+        // Best-effort: a seeding failure must NOT abort the spawn — the session
+        // simply falls back to the silence path (no regression). TUI sessions
+        // get NO $BAUDE_EVENT_URL, which routes the hook to the /tmp append
+        // path (only the daemon injects that var).
+        seed_session_hooks(&cwd);
+
         let (rows, cols) = self.claude_spawn_size(shell_open);
         let claude = Pty::spawn(Some(&cmd), &cwd, rows, cols)?;
 
