@@ -36,10 +36,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. The bridge JSON carries `schema: 2`, and a pre-existing reader (an older `meta.rs` build) still parses it without error — the new fields are optional and additive.
   3. Mixed snake_case/camelCase payloads from different Claude Code versions are both parsed correctly (same tolerance as `bridge.rs::window()` today).
   4. Selecting a session and pressing `i` shows that session's effort, thinking mode, and PR state in the info overlay.
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: TBD
+- [ ] 01-01-PLAN.md — Capture full status-line payload (model/effort/thinking/pr/worktree/vim) + schema:2 in bridge.rs (TDD)
+- [ ] 01-02-PLAN.md — Grow ClaudeMeta + read_bridge_file with the new optional fields, back-compat both directions (TDD)
+- [ ] 01-03-PLAN.md — Surface effort/thinking/pr rows in the local `i` info overlay (ui.rs)
 
 ### Phase 2: Hook-Driven Status
 **Goal**: A managed session's working/waiting/done state is derived from Claude Code hook events rather than PTY-output silence, with the silence heuristic preserved only as a labeled fallback.
@@ -96,7 +98,7 @@ other and may be planned/executed in either order once Phase 2 lands.)
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Full Status-Line Capture | 0/TBD | Not started | - |
+| 1. Full Status-Line Capture | 0/3 | Planned | - |
 | 2. Hook-Driven Status | 0/TBD | Not started | - |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
