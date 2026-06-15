@@ -73,7 +73,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 02-01-PLAN.md — hook.rs (build_event/merge_hook_settings/append_event) + `baude hook` dispatch + TUI settings.local.json seeding (HOOK-01, HOOK-03)
+- [x] 02-01-PLAN.md — hook.rs (build_event/merge_hook_settings/append_event) + `baude hook` dispatch + TUI settings.local.json seeding (HOOK-01, HOOK-03)
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -132,6 +132,6 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
-| 2. Hook-Driven Status | 0/TBD | Not started | - |
+| 2. Hook-Driven Status | 1/3 | In Progress|  |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |

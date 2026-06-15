@@ -19,9 +19,9 @@ Requirements for the v0.7 milestone. Each maps to roadmap phases.
 
 ### Hook-driven status (HOOK)
 
-- [ ] **HOOK-01**: On spawn, a hook set is seeded into the managed session's `settings.json` by merging into existing arrays — never clobbering a user's existing hooks or statusline (reuse the container's statusLine-seeding path)
+- [x] **HOOK-01**: On spawn, a hook set is seeded into the managed session's `settings.json` by merging into existing arrays — never clobbering a user's existing hooks or statusline (reuse the container's statusLine-seeding path)
 - [ ] **HOOK-02**: A session's working/waiting/done state derives from Claude Code hooks (`UserPromptSubmit` → turn started, `Stop` → turn done/waiting, `Notification` → waiting for permission/input, `PostToolUse` → ran tool X); the PTY-silence heuristic remains only as a labeled fallback
-- [ ] **HOOK-03**: Hook events transport via a per-session file-tail (`/tmp/baude-events-<sid>.jsonl`) for TUI-local sessions and `POST /sessions/{id}/event` in the daemon; one event model serves both
+- [x] **HOOK-03**: Hook events transport via a per-session file-tail (`/tmp/baude-events-<sid>.jsonl`) for TUI-local sessions and `POST /sessions/{id}/event` in the daemon; one event model serves both
 
 ### Tool-activity timeline (ACT)
 
@@ -81,9 +81,9 @@ Mapped to roadmap phases (see `.planning/ROADMAP.md`).
 | STL-01 | Phase 1 | Complete |
 | STL-02 | Phase 1 | Complete |
 | STL-03 | Phase 1 | Complete |
-| HOOK-01 | Phase 2 | Pending |
+| HOOK-01 | Phase 2 | Complete |
 | HOOK-02 | Phase 2 | Pending |
-| HOOK-03 | Phase 2 | Pending |
+| HOOK-03 | Phase 2 | Complete |
 | ACT-01 | Phase 3 | Pending |
 | ACT-02 | Phase 3 | Pending |
 | ACT-03 | Phase 3 | Pending |
