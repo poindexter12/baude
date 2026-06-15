@@ -209,7 +209,14 @@ async function openActivity(sid) {
     const recent = await api(`/sessions/${sid}/activity?limit=30`);
     if (state.sid !== sid) return;
     state.activity = recent;
-    for (const e of state.aesBuffer || []) state.activity.push(e);
+    // De-dup at the seam: the snapshot reads the in-memory ring while the SSE
+    // seeds from on-disk EOF, so an event appended around T0 can appear in both.
+    // Events are append-only with monotonic ts, so drop any buffered SSE event
+    // that is not strictly newer than the last snapshot event (WR-01).
+    const lastTs = recent.length ? recent[recent.length - 1].ts || 0 : 0;
+    for (const e of state.aesBuffer || []) {
+      if ((e.ts || 0) > lastTs) state.activity.push(e);
+    }
     state.aesBuffer = null;
     render();
     scrollActivity();
