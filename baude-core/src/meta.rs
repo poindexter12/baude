@@ -4,6 +4,7 @@
 //! `/tmp/claude-ctx-<sessionId>.json` (context %, written by statusline
 //! hooks), and `.planning/STATE.md` (GSD project state).
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -138,6 +139,12 @@ pub struct ClaudeMeta {
     /// events (WR-03), mirroring the transcript tail's reset in
     /// `resolve_transcript`.
     event_path: Option<PathBuf>,
+    /// Capped (drop-oldest) ring of recent hook events for the activity
+    /// timeline (ACT-01). Appended to by `read_event_tail` as it tails the
+    /// event stream, bounded at `ACTIVITY_CAP`, and cleared on event-path
+    /// rotation (WR-03) so it never carries stale cross-session events. Private
+    /// like `offset_events`/`event_path`; read via the `activity()` accessor.
+    activity: VecDeque<HookEvent>,
     pub gsd: Option<GsdState>,
     /// Live session cost from the `baude statusline` bridge file.
     pub session_cost_usd: Option<f64>,
@@ -250,6 +257,14 @@ impl ClaudeMeta {
     /// Path of the resolved transcript JSONL, if one has been found.
     pub fn transcript_path(&self) -> Option<&Path> {
         self.transcript.as_deref()
+    }
+
+    /// The per-session tool-activity ring (oldest at front, newest at back),
+    /// bounded at `ACTIVITY_CAP`. The single source of truth for the activity
+    /// timeline; the TUI reads it directly and the daemon serves it from the
+    /// `ClaudeMeta` it already holds.
+    pub fn activity(&self) -> &VecDeque<HookEvent> {
+        &self.activity
     }
 
     /// Incrementally parse new transcript lines since the last poll.
@@ -396,6 +411,7 @@ impl ClaudeMeta {
             self.hook_status = None;
             self.last_tool = None;
             self.last_notification = None;
+            self.activity.clear();
         }
         let Ok(mut f) = fs::File::open(&path) else {
             return;
@@ -438,6 +454,20 @@ impl ClaudeMeta {
                     }
                 }
                 _ => {}
+            }
+            // Append to the activity ring from the SAME parsed line. An
+            // event-less line is skipped (same guard the match keys on); the
+            // ring is bounded drop-oldest at `ACTIVITY_CAP` (T-03-01).
+            if let Some(ev) = v["event"].as_str() {
+                self.activity.push_back(HookEvent {
+                    event: ev.to_string(),
+                    tool: v["tool"].as_str().map(str::to_string),
+                    notification_type: v["notification_type"].as_str().map(str::to_string),
+                    ts,
+                });
+                if self.activity.len() > ACTIVITY_CAP {
+                    self.activity.pop_front();
+                }
             }
         }
         self.offset_events += consumed as u64;
