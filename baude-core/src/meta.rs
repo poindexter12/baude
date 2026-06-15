@@ -608,31 +608,115 @@ mod tests {
     }
 
     #[test]
-    fn model_bridge_wins_then_survives() {
-        // Bridge value wins over a transcript-derived model.
-        let sid = format!("test-{}-model-wins", std::process::id());
+    fn present_then_absent_bridge_fields_clear() {
+        // A bridge that emits pr/effort/thinking/vim_mode, then a later write
+        // that drops them, must CLEAR the captured state (WR-01). The classic
+        // case: a PR merges, the bridge writes `"pr": null`, and the overlay
+        // must stop showing the now-closed PR.
+        let sid = format!("test-{}-clear", std::process::id());
         let path = crate::bridge::bridge_path(&sid);
-        fs::write(&path, r#"{"schema": 2, "model": "from-bridge"}"#).unwrap();
         let mut meta = ClaudeMeta {
             session_id: Some(sid),
-            model: Some("from-transcript".to_string()),
             ..Default::default()
         };
+
+        // First tick: everything present.
+        fs::write(
+            &path,
+            r#"{
+                "schema": 2,
+                "effort": "high",
+                "thinking": true,
+                "vim_mode": "NORMAL",
+                "pr": {"number": 42},
+                "worktree": {"name": "wt"}
+            }"#,
+        )
+        .unwrap();
+        meta.read_bridge_file();
+        assert_eq!(meta.effort.as_deref(), Some("high"));
+        assert_eq!(meta.thinking, Some(true));
+        assert_eq!(meta.vim_mode.as_deref(), Some("NORMAL"));
+        assert_eq!(meta.pr.as_ref().unwrap().number, Some(42));
+        assert_eq!(meta.worktree.as_ref().unwrap().name.as_deref(), Some("wt"));
+
+        // Second tick: fields gone (pr explicitly null, others absent).
+        fs::write(&path, r#"{"schema": 2, "pr": null}"#).unwrap();
         meta.read_bridge_file();
         fs::remove_file(&path).ok();
+
+        assert!(meta.effort.is_none(), "stale effort lingered");
+        assert!(meta.thinking.is_none(), "stale thinking lingered");
+        assert!(meta.vim_mode.is_none(), "stale vim_mode lingered");
+        assert!(meta.pr.is_none(), "stale pr lingered after null");
+        assert!(meta.worktree.is_none(), "stale worktree lingered");
+    }
+
+    /// Append JSONL records to a transcript fixture and point `meta` at it,
+    /// then drive the real incremental reader. Mirrors how `poll()` feeds
+    /// `read_transcript_tail` (offset-tracked tail reads), so tests exercise
+    /// the same seam production does. Returns the temp path for cleanup.
+    fn feed_transcript(meta: &mut ClaudeMeta, suffix: &str, lines: &[&str]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "baude-test-transcript-{}-{}.jsonl",
+            std::process::id(),
+            suffix
+        ));
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        fs::write(&path, body).unwrap();
+        meta.transcript = Some(path.clone());
+        meta.read_transcript_tail();
+        path
+    }
+
+    #[test]
+    fn model_bridge_wins_then_survives() {
+        // Drive the model through the REAL transcript path (read_transcript_tail),
+        // the way poll() does, so this guards the load-bearing ordering claim —
+        // not just the read_bridge_file accessor (WR-02).
+
+        // Case A: transcript sets the model, then the bridge emits its own —
+        // bridge wins (poll order: transcript, then bridge).
+        let mut meta = ClaudeMeta::default();
+        let tpath = feed_transcript(
+            &mut meta,
+            "model-wins",
+            &[r#"{"type":"assistant","message":{"model":"from-transcript"}}"#],
+        );
+        assert_eq!(
+            meta.model.as_deref(),
+            Some("from-transcript"),
+            "transcript model not read through the real seam"
+        );
+        let sid = format!("test-{}-model-wins", std::process::id());
+        let bpath = crate::bridge::bridge_path(&sid);
+        fs::write(&bpath, r#"{"schema": 2, "model": "from-bridge"}"#).unwrap();
+        meta.session_id = Some(sid);
+        meta.read_bridge_file();
+        fs::remove_file(&bpath).ok();
+        fs::remove_file(&tpath).ok();
         assert_eq!(meta.model.as_deref(), Some("from-bridge"));
 
-        // Bridge omits model → transcript value survives (guard prevents None).
+        // Case B: transcript sets the model, the bridge omits it —
+        // the transcript value survives (the model guard prevents clobber).
+        let mut meta2 = ClaudeMeta::default();
+        let tpath2 = feed_transcript(
+            &mut meta2,
+            "model-survives",
+            &[r#"{"type":"assistant","message":{"model":"keep-me"}}"#],
+        );
+        assert_eq!(meta2.model.as_deref(), Some("keep-me"));
         let sid2 = format!("test-{}-model-survives", std::process::id());
-        let path2 = crate::bridge::bridge_path(&sid2);
-        fs::write(&path2, r#"{"schema": 2, "effort": "high"}"#).unwrap();
-        let mut meta2 = ClaudeMeta {
-            session_id: Some(sid2),
-            model: Some("keep-me".to_string()),
-            ..Default::default()
-        };
+        let bpath2 = crate::bridge::bridge_path(&sid2);
+        fs::write(&bpath2, r#"{"schema": 2, "effort": "high"}"#).unwrap();
+        meta2.session_id = Some(sid2);
         meta2.read_bridge_file();
-        fs::remove_file(&path2).ok();
+        fs::remove_file(&bpath2).ok();
+        fs::remove_file(&tpath2).ok();
         assert_eq!(meta2.model.as_deref(), Some("keep-me"));
     }
 }
