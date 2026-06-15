@@ -692,6 +692,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_get_post_round_trip_and_validation() {
+        use crate::manager::{lock, PendingPermission};
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        let app = super::router(Arc::clone(&state));
+
+        // No pending yet -> GET returns null (200).
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/permission")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::Value::Null);
+
+        // Set a pending request directly on the manager (the bridge POSTs it).
+        {
+            let mut m = lock(&state);
+            m.set_pending(
+                id,
+                PendingPermission {
+                    request_id: "r1".into(),
+                    tool: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                    ts: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        // GET now returns the pending request as JSON.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/permission")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["request_id"], "r1");
+        assert_eq!(body["tool"], "Bash");
+        assert!(body["decision"].is_null(), "no decision while pending");
+
+        // Unknown decision -> 400, NEVER treated as allow.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/permission"),
+                r#"{"decision":"maybe"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // The pending request is untouched by the rejected decision.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/permission")))
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["request_id"], "r1");
+
+        // Valid allow -> 202 and resolves.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/permission"),
+                r#"{"decision":"allow","scope":"session"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+        // GET now exposes the decision for the bridge poll; pending is cleared.
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/permission")))
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["decision"], "allow");
+
+        // Unknown id -> 404 for both GET and POST, never 500.
+        let res = app
+            .clone()
+            .oneshot(get("/sessions/9999/permission"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = app
+            .oneshot(post_json("/sessions/9999/permission", r#"{"decision":"deny"}"#))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        lock(&state).kill_all();
+    }
+
+    #[tokio::test]
+    async fn permission_post_deny_resolves_deny() {
+        use crate::manager::{lock, PendingPermission};
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        {
+            let mut m = lock(&state);
+            m.set_pending(
+                id,
+                PendingPermission {
+                    request_id: "r9".into(),
+                    tool: "Write".into(),
+                    input: serde_json::json!({}),
+                    ts: 1,
+                },
+            )
+            .unwrap();
+        }
+        let app = super::router(Arc::clone(&state));
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/permission"),
+                r#"{"decision":"deny"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let res = app
+            .oneshot(get(&format!("/sessions/{id}/permission")))
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["decision"], "deny");
+        lock(&state).kill_all();
+    }
+
+    #[tokio::test]
     async fn serves_the_pwa() {
         let res = app().oneshot(get("/")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);

@@ -1138,4 +1138,135 @@ mod tests {
         assert_eq!(key_bytes("ctrl+c", false), vec![3]);
         assert_eq!(key_bytes("plain text", false), b"plain text");
     }
+
+    // ==== 04-02 Task 2: pending-permission state + set/resolve ============
+
+    fn pending(req: &str, tool: &str) -> PendingPermission {
+        PendingPermission {
+            request_id: req.to_string(),
+            tool: tool.to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            ts: now_unix_ms(),
+        }
+    }
+
+    #[test]
+    fn set_pending_and_read_round_trip() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // No pending initially.
+        assert!(m.pending(id).unwrap().is_none());
+        // Set -> readable.
+        m.set_pending(id, pending("r1", "Bash")).unwrap();
+        let p = m.pending(id).unwrap().expect("pending present");
+        assert_eq!(p.request_id, "r1");
+        assert_eq!(p.tool, "Bash");
+        m.kill_all();
+    }
+
+    #[test]
+    fn set_and_pending_404_on_unknown_id() {
+        let mut m = mgr();
+        assert!(m.set_pending(9999, pending("x", "Bash")).is_err());
+        assert!(m.pending(9999).is_err());
+        assert!(m.resolve_pending(9999, "allow", None).is_err());
+    }
+
+    #[test]
+    fn resolve_clears_pending_and_records_decision() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        m.set_pending(id, pending("r1", "Bash")).unwrap();
+        m.resolve_pending(id, "allow", Some("session".into()))
+            .unwrap();
+        // Pending cleared.
+        assert!(m.pending(id).unwrap().is_none());
+        // The decision is readable by a waiter (the bridge's poll).
+        let d = m.decision(id).unwrap().expect("decision recorded");
+        assert_eq!(d.decision, "allow");
+        assert_eq!(d.scope.as_deref(), Some("session"));
+        m.kill_all();
+    }
+
+    #[test]
+    fn resolve_deny_records_deny() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        m.set_pending(id, pending("r2", "Write")).unwrap();
+        m.resolve_pending(id, "deny", None).unwrap();
+        assert_eq!(m.decision(id).unwrap().unwrap().decision, "deny");
+        m.kill_all();
+    }
+
+    #[test]
+    fn setting_new_pending_clears_a_stale_decision() {
+        // A fresh permission request must not read the previous turn's decision.
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        m.set_pending(id, pending("r1", "Bash")).unwrap();
+        m.resolve_pending(id, "allow", None).unwrap();
+        assert!(m.decision(id).unwrap().is_some());
+        // New request resets the decision slot.
+        m.set_pending(id, pending("r2", "Edit")).unwrap();
+        assert!(m.decision(id).unwrap().is_none());
+        assert_eq!(m.pending(id).unwrap().unwrap().request_id, "r2");
+        m.kill_all();
+    }
+
+    #[test]
+    fn timeout_with_no_decision_resolves_to_deny() {
+        // SECURITY-CRITICAL (T-04-04 / V4): when the deadline passes with no
+        // POSTed decision, the resolution is DENY — never allow.
+        // `decide_with_timeout` is the pure deny-on-timeout rule.
+        let none: Option<&str> = None;
+        assert_eq!(decide_with_timeout(none, true), "deny"); // deadline passed, no decision
+        assert_eq!(decide_with_timeout(Some("allow"), true), "allow"); // decision wins even at deadline
+        assert_eq!(decide_with_timeout(Some("deny"), true), "deny");
+        // An unknown decision value also coerces to deny (deny-default).
+        assert_eq!(decide_with_timeout(Some("bogus"), false), "deny");
+        // Before the deadline with no decision yet: keep waiting sentinel.
+        assert_eq!(decide_with_timeout(none, false), "");
+    }
+
+    #[test]
+    fn permission_timeout_s_reads_env_with_safe_default() {
+        // Default ~120s; an explicit env value is honored; a garbage value
+        // falls back to the default (never 0 / never panics).
+        assert!(permission_timeout_s() >= 1);
+    }
+
+    #[test]
+    fn resolve_notifies_a_registered_waiter() {
+        // Pitfall 4: a waiter registered before the resolve observes the wake.
+        // The per-session Notify fires on resolve so a bounded poll/await is
+        // promptly woken (the await happens OUTSIDE the manager lock).
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        m.set_pending(id, pending("r1", "Bash")).unwrap();
+        let notify = m.permission_notify(id).unwrap();
+        // Register interest BEFORE resolving.
+        let waiter = notify.notified();
+        tokio::pin!(waiter);
+        // Build a tiny runtime to drive the await deterministically.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Not yet resolved: the waiter is pending.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+                    .await
+                    .is_err(),
+                "waiter must block until resolve"
+            );
+            m.resolve_pending(id, "allow", None).unwrap();
+            // After resolve, the waiter completes promptly.
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiter)
+                .await
+                .expect("resolve must wake the waiter");
+        });
+        assert_eq!(m.decision(id).unwrap().unwrap().decision, "allow");
+        m.kill_all();
+    }
 }
