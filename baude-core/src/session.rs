@@ -139,9 +139,35 @@ fn decide_status(
     last_output_ms: u64,
     now_mono: u64,
 ) -> (Status, StateSource) {
+    // Decide the live (status, source) from the precedence tiers first, then
+    // let an exited process override only the Status — never the source. An
+    // exited session that never saw a hook must NOT be mislabeled `Hook`; the
+    // honest underlying source (SessionFile/Silence) is what the observability
+    // field wants to surface (WR-05).
+    let (mut st, src) = decide_live(
+        hook_status,
+        now_unix,
+        claude_status,
+        last_output_ms,
+        now_mono,
+    );
     if exited {
-        return (Status::Exited, StateSource::Hook);
+        st = Status::Exited;
     }
+    (st, src)
+}
+
+/// The live (not-exited) precedence decision. Split out of [`decide_status`]
+/// so the exited path can override only the `Status` while preserving the
+/// honest source label (WR-05): an exited session reports the source that
+/// actually decided it, not a fabricated `Hook`.
+fn decide_live(
+    hook_status: Option<(bool, u64)>,
+    now_unix: u64,
+    claude_status: Option<(bool, u64)>,
+    last_output_ms: u64,
+    now_mono: u64,
+) -> (Status, StateSource) {
     // Fresh hook event is authoritative — event-driven and the moment-accurate
     // signal. Stale events fall through to the existing sources.
     if let Some((busy, at)) = hook_status {
@@ -323,7 +349,9 @@ mod tests {
 
     #[test]
     fn exited_overrides_everything() {
-        let (st, _src) = decide_status(
+        // Exited overrides the Status, but reports the HONEST underlying source
+        // (here a fresh hook drove it) rather than fabricating one (WR-05).
+        let (st, src) = decide_status(
             true,
             Some((true, NOW_UNIX)),
             NOW_UNIX,
@@ -332,6 +360,27 @@ mod tests {
             NOW_MONO,
         );
         assert_eq!(st, Status::Exited);
+        assert_eq!(src, StateSource::Hook);
+    }
+
+    #[test]
+    fn exited_without_hook_is_not_labeled_hook() {
+        // An Exited session that never saw a hook event must NOT report
+        // StateSource::Hook — that mislabels the very observability field the
+        // source is meant to provide. With no hook and no session file, the
+        // honest source is Silence (WR-05).
+        let (st, src) = decide_status(true, None, NOW_UNIX, None, 0, NOW_MONO);
+        assert_eq!(st, Status::Exited);
+        assert_eq!(
+            src,
+            StateSource::Silence,
+            "exited-with-no-hook must carry an honest source, not Hook"
+        );
+
+        // And when the session file decided it, exited carries SessionFile.
+        let (st, src) = decide_status(true, None, NOW_UNIX, Some((false, 0)), 0, NOW_MONO);
+        assert_eq!(st, Status::Exited);
+        assert_eq!(src, StateSource::SessionFile);
     }
 
     #[test]
