@@ -6,6 +6,7 @@ pub use vt100;
 
 pub mod bridge;
 pub mod git;
+pub mod hook;
 pub mod meta;
 pub mod persist;
 pub mod pty;
