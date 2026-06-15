@@ -21,6 +21,10 @@ const state = {
   screenTimer: null,
   queue: [], // messages typed while busy, not yet picked up
   pushOn: false,
+  activity: [], // ordered tool-activity events (oldest→newest)
+  activityOpen: false, // collapsible strip state (collapsed by default)
+  aes: null, // activity EventSource
+  aesBuffer: null, // activity events received before backfill loaded
 };
 
 // ---- helpers ----
@@ -91,8 +95,10 @@ function route() {
     state.screenOpen = false;
     state.screenText = "";
     state.queue = [];
+    state.activity = [];
+    state.activityOpen = false;
     clearInterval(state.screenTimer);
-    if (sid !== null) openChat(sid);
+    if (sid !== null) { openChat(sid); openActivity(sid); }
   }
   render();
   refresh();
@@ -131,6 +137,11 @@ function closeStream() {
   if (state.es) state.es.close();
   state.es = null;
   state.esBuffer = null;
+  // Tear the activity SSE down too, so the second EventSource never leaks
+  // across views (Pitfall 5).
+  if (state.aes) state.aes.close();
+  state.aes = null;
+  state.aesBuffer = null;
 }
 
 function addMsg(m) {
@@ -173,6 +184,76 @@ function scrollChat(force) {
   if (!el) return;
   const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
   if (force || nearBottom) el.scrollTop = el.scrollHeight;
+}
+
+// ---- activity strip ----
+
+// GET-then-SSE-with-buffer, mirroring openChat: connect the live tail first and
+// buffer, then load the recent snapshot, then drain — nothing can fall between
+// the snapshot and the live tail. The strip channel is standalone (Pitfall 1),
+// keyless (Pitfall 2: append-only, no Event::id), and closed on view exit.
+async function openActivity(sid) {
+  state.aesBuffer = [];
+  const es = new EventSource(`/sessions/${sid}/activity-stream`);
+  state.aes = es;
+  es.onmessage = (ev) => {
+    if (state.sid !== sid) return;
+    const e = JSON.parse(ev.data);
+    if (state.aesBuffer) state.aesBuffer.push(e);
+    else { state.activity.push(e); render(); scrollActivity(); }
+  };
+  es.onerror = () => {
+    // EventSource auto-reconnects; a closed session ends the stream silently.
+  };
+  try {
+    const recent = await api(`/sessions/${sid}/activity?limit=30`);
+    if (state.sid !== sid) return;
+    state.activity = recent;
+    for (const e of state.aesBuffer || []) state.activity.push(e);
+    state.aesBuffer = null;
+    render();
+    scrollActivity();
+  } catch {
+    // 404 / offline — the chat view's own poll handles redirect; leave the
+    // strip empty rather than throwing.
+    state.aesBuffer = null;
+  }
+}
+
+function scrollActivity() {
+  const el = document.getElementById("activity-feed");
+  if (!el) return;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
+// One line per event: icon + tool/notification_type/event + relative time.
+// Every event-origin field is esc()-escaped before innerHTML (XSS — T-03-09).
+function activityIcon(e) {
+  if (e.event === "PostToolUse") return "⚙";
+  if (e.event === "Notification") return "🔔";
+  if (e.event === "UserPromptSubmit") return "✎";
+  if (e.event === "Stop") return "■";
+  return "•";
+}
+
+function activityLabel(e) {
+  return e.tool || e.notification_type || e.event || "event";
+}
+
+function activityRowHtml(e) {
+  const rel = e.ts ? humanMs(Math.max(0, Date.now() - e.ts)) : "";
+  return `<div class="act-row">
+    <span class="act-icon">${esc(activityIcon(e))}</span>
+    <span class="act-label">${esc(activityLabel(e))}</span>
+    <span class="act-time">${esc(rel)}</span>
+  </div>`;
+}
+
+function toggleActivity() {
+  state.activityOpen = !state.activityOpen;
+  render();
+  if (state.activityOpen) scrollActivity();
 }
 
 // ---- actions ----
@@ -476,6 +557,26 @@ function renderChat() {
       </div>
     </div>`;
 
+  // Collapsible activity strip: collapsed by default; expanded shows the
+  // recent ~30 events (newest at bottom, scrollable). The recent-30 clamp is
+  // applied at render time too, in case live appends grow state.activity past
+  // the snapshot window.
+  const actCount = state.activity.length;
+  const actRows = state.activity.slice(-30).map(activityRowHtml).join("");
+  const activityStrip = `
+    <div class="activity-strip${state.activityOpen ? " open" : ""}">
+      <button type="button" class="act-toggle" id="actbtn"
+        aria-expanded="${state.activityOpen ? "true" : "false"}">
+        <span class="act-caret">${state.activityOpen ? "▾" : "▸"}</span>
+        <span class="act-title">activity</span>
+        <span class="act-count">${actCount}</span>
+      </button>
+      ${state.activityOpen
+      ? `<div id="activity-feed" class="act-feed">${actRows
+        || '<div class="act-empty">no tool activity yet</div>'}</div>`
+      : ""}
+    </div>`;
+
   $app.innerHTML = `
     <header>
       <button class="iconbtn" id="backbtn" aria-label="back">‹</button>
@@ -491,6 +592,7 @@ function renderChat() {
         <div class="meta">queued</div></div>`).join("")}</div>
     ${typing}
     ${screenDrawer}
+    ${activityStrip}
     ${s && s.status === "exited" ? `
     <form id="composer">
       <button type="button" class="send" id="restartbtn" style="flex:1">claude exited — restart</button>
@@ -503,6 +605,7 @@ function renderChat() {
   document.getElementById("backbtn").onclick = () => { location.hash = "#/"; };
   document.getElementById("screenbtn").onclick = toggleScreen;
   document.getElementById("archbtn").onclick = toggleArchive;
+  document.getElementById("actbtn").onclick = toggleActivity;
   document.getElementById("escbtn").onclick = interrupt;
   document.getElementById("killbtn").onclick = deleteSession;
   for (const el of document.querySelectorAll("#screen .key")) {
@@ -567,6 +670,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     refresh();
     if (state.sid !== null && !state.es) openChat(state.sid);
+    if (state.sid !== null && !state.aes) openActivity(state.sid);
   }
 });
 
