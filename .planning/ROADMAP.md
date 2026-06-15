@@ -110,7 +110,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
 
-- [ ] 03-03-PLAN.md — PWA collapsible activity strip (openActivity GET-then-SSE, sw.js cache bump) — manual UAT (ACT-03)
+- [x] 03-03-PLAN.md — PWA collapsible activity strip (openActivity GET-then-SSE, sw.js cache bump) — manual UAT (ACT-03)
 - [ ] 03-04-PLAN.md — TUI `v` Modal::Activity overlay (local meta + remote RemoteInfo.activity) — manual UAT (ACT-04)
 
 ### Phase 4: Remote Permission Approval
@@ -144,5 +144,5 @@ other and may be planned/executed in either order once Phase 2 lands.)
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
-| 3. Tool-Activity Timeline | 2/4 | In Progress|  |
+| 3. Tool-Activity Timeline | 3/4 | In Progress|  |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |

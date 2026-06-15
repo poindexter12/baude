@@ -4,13 +4,13 @@ milestone: v0.7
 milestone_name: milestone
 status: executing
 stopped_at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
-last_updated: "2026-06-15T20:54:19.803Z"
+last_updated: "2026-06-15T20:59:08.938Z"
 last_activity: 2026-06-15 -- 03-01 activity ring buffer complete
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 10
-  completed_plans: 8
+  completed_plans: 9
   percent: 50
 ---
 
@@ -52,6 +52,8 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - 03-01: HookEvent is the only serde-Serialize type from ClaudeMeta; the struct itself stays non-serializable (anti-pattern)
 - 03-01: capped (200) drop-oldest VecDeque<HookEvent> ring on ClaudeMeta is the single source of truth — appended in read_event_tail's loop, cleared in the WR-03 rotation block (ACT-01)
 - [Phase ?]: 03-02: activity feed served two ways — GET /activity (ring snapshot) + GET /activity-stream (standalone SSE file-tail via dedicated EventTail, never the ChatMessage Tail)
+- [Phase ?]: PWA HookEvent.ts is unix-ms; activity strip relative time = humanMs(Date.now() - e.ts)
+- [Phase ?]: Activity strip is a second standalone EventSource, closed in closeStream alongside the chat ES (no leak)
 
 ### Pending Todos
 
@@ -64,7 +66,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-15T20:54:16.605Z
+Last session: 2026-06-15T20:58:54.759Z
 Stopped at: 03-01 complete (HookEvent ring buffer on ClaudeMeta); ready for 03-02
 Resume file: 03-02-PLAN.md
 
@@ -76,3 +78,4 @@ Resume file: 03-02-PLAN.md
 | Phase 02 P02 | 6min | 3 tasks | 2 files |
 | Phase 03 P01 | 12min | 2 tasks | 1 file |
 | Phase 03 P02 | 5min | 2 tasks | 4 files |
+| Phase 03 P03 | 8min | 1 tasks | 3 files |
