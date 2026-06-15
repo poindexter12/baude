@@ -203,7 +203,13 @@ async function openActivity(sid) {
     else { state.activity.push(e); render(); scrollActivity(); }
   };
   es.onerror = () => {
-    // EventSource auto-reconnects; a closed session ends the stream silently.
+    // EventSource auto-reconnects; for a deleted session the reconnect 404s and
+    // would churn forever. When the browser has given up (CLOSED), tear it down
+    // instead of letting it retry against a session that will never return (WR-02).
+    if (es.readyState === EventSource.CLOSED) {
+      es.close();
+      if (state.aes === es) state.aes = null;
+    }
   };
   try {
     const recent = await api(`/sessions/${sid}/activity?limit=30`);
