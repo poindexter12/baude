@@ -104,6 +104,13 @@ pub struct ClaudeMeta {
     /// Separate from `offset` (the transcript tail) so the two tails never
     /// interfere.
     offset_events: u64,
+    /// Resolved event-file path the `offset_events` cursor belongs to. When the
+    /// `session_id` rotates mid-session the event-file path flips; tracking it
+    /// here lets `read_event_tail` reset the offset on a path change so a stale
+    /// (possibly larger) offset can't permanently short-circuit the new file's
+    /// events (WR-03), mirroring the transcript tail's reset in
+    /// `resolve_transcript`.
+    event_path: Option<PathBuf>,
     pub gsd: Option<GsdState>,
     /// Live session cost from the `baude statusline` bridge file.
     pub session_cost_usd: Option<f64>,
@@ -351,6 +358,18 @@ impl ClaudeMeta {
             return;
         };
         let path = PathBuf::from(crate::hook::event_path(sid));
+        // The session_id can rotate mid-session (a resumed/rotated Claude
+        // session), flipping the resolved event-file path. Reset the offset and
+        // the event-derived state when that happens so a stale (possibly larger)
+        // offset cannot permanently short-circuit the new file's events (WR-03).
+        // Mirrors the transcript tail's reset in `resolve_transcript`.
+        if self.event_path.as_ref() != Some(&path) {
+            self.event_path = Some(path.clone());
+            self.offset_events = 0;
+            self.hook_status = None;
+            self.last_tool = None;
+            self.last_notification = None;
+        }
         let Ok(mut f) = fs::File::open(&path) else {
             return;
         };
@@ -944,5 +963,61 @@ mod tests {
         );
         assert_eq!(meta.hook_status, Some((false, 300)));
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn event_tail_resets_offset_on_session_id_change() {
+        // WR-03: when the session_id rotates mid-session the event-file path
+        // flips. A stale (here larger) offset must NOT short-circuit the new,
+        // shorter file forever — read_event_tail resets the offset and clears
+        // event-derived state when the path changes.
+
+        // First session: a longer file that advances the offset well past the
+        // length of the second session's file.
+        let sid_a = format!("test-{}-reset-a", std::process::id());
+        let path_a = PathBuf::from(crate::hook::event_path(&sid_a));
+        let mut meta = ClaudeMeta {
+            session_id: Some(sid_a),
+            ..Default::default()
+        };
+        let mut body_a = String::new();
+        for ts in 0..50 {
+            body_a.push_str(&format!(
+                r#"{{"schema":1,"event":"PostToolUse","ts":{ts},"tool":"Bash"}}"#
+            ));
+            body_a.push('\n');
+        }
+        fs::write(&path_a, &body_a).unwrap();
+        meta.read_event_tail();
+        assert!(meta.offset_events > 0, "first session advanced the offset");
+        assert!(meta.last_tool.is_some());
+        let off_a = meta.offset_events;
+
+        // Rotate to a NEW (deterministically distinct, shorter) session id. Its
+        // file is far smaller than off_a — without the reset, `len <= offset`
+        // would skip it forever.
+        let sid_b = format!("test-{}-reset-b", std::process::id());
+        let path_b = PathBuf::from(crate::hook::event_path(&sid_b));
+        fs::write(
+            &path_b,
+            "{\"schema\":1,\"event\":\"UserPromptSubmit\",\"ts\":900}\n",
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&path_b).unwrap().len() < off_a,
+            "second file must be shorter than the stale offset to prove the bug"
+        );
+        meta.session_id = Some(sid_b);
+        meta.read_event_tail();
+
+        // The new session's event was processed (offset was reset), not dropped.
+        assert_eq!(
+            meta.hook_status,
+            Some((true, 900)),
+            "rotated session's events must be read after the offset reset"
+        );
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
     }
 }
