@@ -169,3 +169,23 @@ pub fn human_duration(ms: u64) -> String {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_duration_buckets() {
+        assert_eq!(human_duration(5_000), "5s");
+        assert_eq!(human_duration(120_000), "2m");
+        assert_eq!(human_duration(3_660_000), "1h1m");
+    }
+
+    #[test]
+    fn fresh_meta_has_no_status() {
+        // Smoke: a default ClaudeMeta carries no Claude-side status, so the
+        // precedence tests below start from a known empty baseline.
+        let meta = ClaudeMeta::default();
+        assert!(meta.claude_status.is_none());
+    }
+}
