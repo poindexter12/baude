@@ -125,12 +125,23 @@ Plans:
   3. In the PWA chat view, an approve/deny card appears while a permission request is pending and disappears once resolved.
   4. A pending permission (driven by the `Notification` hook and a `waiting_reason` of `permission` on `SessionInfo`) fires a distinct push describing the requested action, separate from the generic "waiting" push.
 
-**Plans**: TBD
+**Plans**: 4 plans
 **UI hint**: yes
 
 Plans:
 
-- [ ] 04-01: TBD
+**Wave 1**
+
+- [ ] 04-01-PLAN.md — BAUDE_PERMISSION_MODE spawn-flag selection (default skip) + .mcp.json seeding (PERM-01)
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 04-02-PLAN.md — permission-mcp JSON-RPC bridge (both binaries) + daemon pending-state + GET/POST /permission + CONTRACT human-verify gate (PERM-01, PERM-02)
+
+**Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
+
+- [ ] 04-03-PLAN.md — waiting_reason enum on SessionInfo/RemoteInfo + distinct notified_permission push (PERM-04)
+- [ ] 04-04-PLAN.md — PWA approve/deny card above the composer — manual UAT (PERM-03)
 
 ## Progress
 
@@ -145,4 +156,4 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
 | 3. Tool-Activity Timeline | 4/4 | Complete   | 2026-06-15 |
-| 4. Remote Permission Approval | 0/TBD | Not started | - |
+| 4. Remote Permission Approval | 0/4 | Not started | - |
