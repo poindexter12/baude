@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use baude_core::meta::HookEvent;
 use baude_core::pty::now_ms;
 use baude_core::vt100;
 
@@ -37,6 +38,12 @@ pub struct RemoteInfo {
     pub last_tool: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// Recent (~30) tool-activity events bundled into the `/sessions` poll so
+    /// the remote activity overlay needs no extra round-trip. Defaults to an
+    /// empty Vec against an older daemon that omits the field (backward-compat,
+    /// mirroring the `#[serde(default)]` fields above).
+    #[serde(default)]
+    pub activity: Vec<HookEvent>,
 }
 
 #[derive(Clone, Default)]

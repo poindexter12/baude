@@ -102,6 +102,8 @@ pub enum Modal {
     Info,
     /// GSD project state for the selected session's repo.
     Gsd,
+    /// Recent tool-activity timeline for the selected session (local or remote).
+    Activity,
     Input {
         kind: InputKind,
         title: String,
@@ -817,6 +819,11 @@ impl App {
                     self.modal = Modal::Info;
                 }
             }
+            KeyCode::Char('v') => {
+                if self.selected().is_some() || self.selected_remote().is_some() {
+                    self.modal = Modal::Activity;
+                }
+            }
             KeyCode::Char('g') if remote_selected => {
                 self.set_message("GSD view is for local sessions".into());
             }
@@ -832,7 +839,7 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
         match &mut self.modal {
-            Modal::Help | Modal::Info | Modal::Gsd => {
+            Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
             }
             Modal::Input {
