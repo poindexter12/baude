@@ -102,7 +102,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 03-01-PLAN.md — Capped activity ring + HookEvent serde struct in baude-core (ClaudeMeta.activity, ACTIVITY_CAP) (ACT-01, TDD)
+- [x] 03-01-PLAN.md — Capped activity ring + HookEvent serde struct in baude-core (ClaudeMeta.activity, ACTIVITY_CAP) (ACT-01, TDD)
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -144,5 +144,5 @@ other and may be planned/executed in either order once Phase 2 lands.)
 |-------|----------------|--------|-----------|
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
-| 3. Tool-Activity Timeline | 0/4 | Not started | - |
+| 3. Tool-Activity Timeline | 1/4 | In progress | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
