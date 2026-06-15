@@ -15,7 +15,7 @@ Requirements for the v0.7 milestone. Each maps to roadmap phases.
 
 - [x] **STL-01**: The `baude statusline` bridge persists the full useful payload (model, effort, thinking, pr, worktree, vim.mode), each optional, tolerating snake/camel key drift like `bridge.rs::window()` does today
 - [x] **STL-02**: Bridge JSON is versioned (`schema: 2`); `meta.rs` reader and `ClaudeMeta` gain the new optional fields without breaking existing readers
-- [ ] **STL-03**: The `i` info overlay surfaces effort, thinking mode, and PR state for the selected session
+- [x] **STL-03**: The `i` info overlay surfaces effort, thinking mode, and PR state for the selected session
 
 ### Hook-driven status (HOOK)
 
@@ -80,7 +80,7 @@ Mapped to roadmap phases (see `.planning/ROADMAP.md`).
 |-------------|-------|--------|
 | STL-01 | Phase 1 | Complete |
 | STL-02 | Phase 1 | Complete |
-| STL-03 | Phase 1 | Pending |
+| STL-03 | Phase 1 | Complete |
 | HOOK-01 | Phase 2 | Pending |
 | HOOK-02 | Phase 2 | Pending |
 | HOOK-03 | Phase 2 | Pending |
