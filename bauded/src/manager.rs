@@ -13,7 +13,7 @@ use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta};
 use baude_core::persist::{self, SavedSession, State};
 use baude_core::pty::Pty;
-use baude_core::session::{Session, Status};
+use baude_core::session::{Session, StateSource, Status};
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
 /// that Claude Code's TUI lays out sanely in the transcript-driving sense.
@@ -47,6 +47,11 @@ pub struct SessionInfo {
     pub name: String,
     pub title: Option<String>,
     pub status: &'static str,
+    /// Which source decided `status`: "hook" / "session-file" / "silence".
+    /// Surfaces a regression to the silence fallback (capture-but-render-lightly).
+    pub state_source: &'static str,
+    /// The last tool name Claude ran (from the hook event stream), if any.
+    pub last_tool: Option<String>,
     /// Only present while waiting — how long Claude has been blocked on us.
     pub waiting_for_ms: Option<u64>,
     pub model: Option<String>,
@@ -81,6 +86,24 @@ fn status_str(s: Status) -> &'static str {
         Status::Busy => "busy",
         Status::Exited => "exited",
     }
+}
+
+fn source_str(s: StateSource) -> &'static str {
+    match s {
+        StateSource::Hook => "hook",
+        StateSource::SessionFile => "session-file",
+        StateSource::Silence => "silence",
+    }
+}
+
+/// The daemon's own loopback event endpoint for a session. `Manager` does not
+/// store the daemon's bind addr (manager.rs has no bind field), and the hook
+/// only needs same-host reachability, so we use the loopback default bind
+/// (`DEFAULT_BIND = "127.0.0.1:8642"` in bauded/src/main.rs). Known limitation
+/// (out of scope for Phase 2): a custom `--bind` port is NOT honored here —
+/// honoring it would require threading the bind addr into `Manager`.
+fn event_url(id: u64) -> String {
+    format!("http://127.0.0.1:8642/sessions/{id}/event")
 }
 
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
@@ -223,17 +246,30 @@ impl Manager {
         };
         let name = self.unique_name(&base);
 
+        let id = self.next_id;
+
+        // Seed `.claude/settings.local.json` in the session's actual cwd
+        // (worktree dir for worktree sessions) so daemon-spawned Claude fires
+        // baude's hooks — the same best-effort, idempotent, non-clobbering
+        // merge as the TUI path. Idempotency matters because `restore()`
+        // re-spawns every persisted session on each daemon startup; the merge
+        // adds exactly one baude entry per event no matter how often it runs.
+        seed_session_hooks(&cwd);
+
         // `claude --continue` resumes the most recent conversation in this
         // directory; falls back to a fresh session if there is none.
+        // Inject `$BAUDE_EVENT_URL` by prefixing the command string (Pty::spawn
+        // has no env-map param) so claude and its hook child both inherit it
+        // and POST events back to this daemon's loopback ingest route.
         let base_cmd = &self.claude_cmd;
-        let cmd = if resume {
+        let inner = if resume {
             format!("{base_cmd} --continue 2>/dev/null || exec {base_cmd}")
         } else {
             format!("exec {base_cmd}")
         };
+        let cmd = format!("BAUDE_EVENT_URL={} {inner}", event_url(id));
         let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
 
-        let id = self.next_id;
         self.next_id += 1;
         self.sessions.push(Session {
             id,
@@ -316,6 +352,23 @@ impl Manager {
             self.save();
         }
         Ok(())
+    }
+
+    /// Ingest one hook event line POSTed to `POST /sessions/{id}/event` onto
+    /// the same `/tmp/baude-events-<sid>.jsonl` consume path the poll loop
+    /// tails — converging the daemon (POST) transport with the TUI-local
+    /// (file-tail) transport onto one event model. Resolves the baude `id` to
+    /// the Claude `session_id` via `Session.meta.session_id`. Errors (never
+    /// panics) on an unknown id or a not-yet-known session_id.
+    pub fn ingest_event(&mut self, id: u64, body: &str) -> Result<()> {
+        let s = self.session(id)?;
+        let sid = s
+            .meta
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow!("session {id} has no claude session_id yet"))?;
+        baude_core::hook::append_event(&sid, body.trim_end())
+            .map_err(|e| anyhow!("append event for session {id}: {e}"))
     }
 
     /// Respawn claude in an exited session's PTY (same cwd, fresh process,
@@ -521,13 +574,31 @@ fn key_bytes(key: &str, app_cursor: bool) -> Vec<u8> {
     }
 }
 
+/// Best-effort, idempotent, non-clobbering seed of the session cwd's
+/// `.claude/settings.local.json` — the same merge as the TUI path
+/// (`baude/src/app.rs::seed_session_hooks`). A failure never aborts the spawn.
+fn seed_session_hooks(cwd: &Path) {
+    let dir = cwd.join(".claude");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("settings.local.json");
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let command = baude_core::hook::baude_hook_command();
+    let merged = baude_core::hook::merge_hook_settings(&existing, &command);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 fn session_info(s: &Session) -> SessionInfo {
-    let status = s.status();
+    let (status, source) = s.status_with_source();
     SessionInfo {
         id: s.id,
         name: s.name.clone(),
         title: s.meta.title.clone(),
         status: status_str(status),
+        state_source: source_str(source),
+        last_tool: s.meta.last_tool.as_ref().map(|(t, _)| t.clone()),
         waiting_for_ms: (status == Status::Waiting).then(|| s.waiting_for_ms()),
         model: s.meta.model.clone(),
         permission_mode: s.meta.permission_mode.clone(),
@@ -662,6 +733,79 @@ mod tests {
         let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
         assert!(!s.auto_archive_tick(idle), "tick undid a manual unarchive");
         assert!(!m.info(id).unwrap().archived);
+        m.kill_all();
+    }
+
+    #[test]
+    fn event_url_is_loopback_default_bind() {
+        // The injected $BAUDE_EVENT_URL points at the daemon's own loopback
+        // event route for the session (DEFAULT_BIND = 127.0.0.1:8642).
+        assert_eq!(
+            event_url(7),
+            "http://127.0.0.1:8642/sessions/7/event",
+            "spawn command must carry BAUDE_EVENT_URL= for the loopback route"
+        );
+    }
+
+    #[test]
+    fn ingest_event_appends_to_resolved_tmp_file() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // Pin a deterministic claude session_id so the /tmp path is isolated.
+        let sid = format!("ingest-test-{}", std::process::id());
+        let path = baude_core::hook::event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        m.sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .meta
+            .session_id = Some(sid.clone());
+
+        m.ingest_event(id, r#"{"schema":1,"event":"UserPromptSubmit"}"#)
+            .unwrap();
+        m.ingest_event(id, r#"{"schema":1,"event":"Stop"}"#)
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "two posts -> two appended lines");
+        assert!(lines[0].contains("UserPromptSubmit"));
+        assert!(lines[1].contains("Stop"));
+
+        let _ = std::fs::remove_file(&path);
+        m.kill_all();
+    }
+
+    #[test]
+    fn ingest_event_errors_on_unknown_id_and_missing_session_id() {
+        let mut m = mgr();
+        // Unknown id -> Err (not panic).
+        let err = m.ingest_event(999, "{}").unwrap_err().to_string();
+        assert!(err.contains("no session"), "got: {err}");
+        // Known id but session_id not resolved yet -> Err (not panic).
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let err = m.ingest_event(id, "{}").unwrap_err().to_string();
+        assert!(err.contains("session_id"), "got: {err}");
+        m.kill_all();
+    }
+
+    #[test]
+    fn session_info_carries_state_source_and_last_tool() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let info = m.info(id).unwrap();
+        // A freshly spawned stub has no hook/session-file state -> silence.
+        assert_eq!(info.state_source, "silence");
+        assert!(info.last_tool.is_none());
+        // Populate last_tool from the hook event stream and re-read.
+        m.sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .meta
+            .last_tool = Some(("Bash".to_string(), 1));
+        assert_eq!(m.info(id).unwrap().last_tool.as_deref(), Some("Bash"));
         m.kill_all();
     }
 

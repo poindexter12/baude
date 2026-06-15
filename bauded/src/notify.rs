@@ -104,6 +104,8 @@ mod tests {
             name: format!("s{id}"),
             title: None,
             status,
+            state_source: "silence",
+            last_tool: None,
             waiting_for_ms: waiting_ms,
             model: None,
             permission_mode: None,
