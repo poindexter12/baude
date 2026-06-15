@@ -10,6 +10,8 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+use baude_core::meta::HookEvent;
+
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -234,6 +236,76 @@ impl Tail {
     }
 }
 
+/// Parse one hook-event JSONL line into a [`HookEvent`]. Untyped `Value`
+/// accessors throughout (mirrors `meta::read_event_tail`): a malformed or
+/// event-less line yields `None` and never panics. An absent `ts` falls back
+/// to 0. This is the parse target that distinguishes [`EventTail`] from the
+/// `ChatMessage` [`Tail`] — Pitfall 1: the transcript `Tail` runs lines
+/// through `parse_line` (transcript schema) and would yield zero hook events.
+fn parse_event_line(line: &str) -> Option<HookEvent> {
+    let v = serde_json::from_str::<Value>(line).ok()?;
+    let event = v["event"].as_str()?.to_string();
+    Some(HookEvent {
+        event,
+        tool: v["tool"].as_str().map(str::to_string),
+        notification_type: v["notification_type"].as_str().map(str::to_string),
+        ts: v["ts"].as_u64().unwrap_or(0),
+    })
+}
+
+/// Incremental hook-event tail for the activity SSE channel. Copies the
+/// offset/truncation-reset/complete-lines-only machinery from [`Tail`] but
+/// yields [`HookEvent`] per well-formed line instead of `ChatMessage`. A
+/// distinct type so the event channel can never be wired to the transcript
+/// `Tail` by accident (Pitfall 1).
+#[derive(Default)]
+pub struct EventTail {
+    offset: u64,
+}
+
+// The accessors are wired into `api::activity_stream` in Task 2 of this plan;
+// they are exercised by the tail unit tests now. The allow is removed once the
+// SSE handler consumes them (mirrors the 03-01 deferred-import precedent for
+// keeping a per-task commit clippy-clean under -D warnings).
+#[allow(dead_code)]
+impl EventTail {
+    /// Start at the current end of `path` — recent history is served by the
+    /// non-streaming `/activity` endpoint; the stream only carries new events.
+    pub fn end_of(path: &Path) -> EventTail {
+        EventTail {
+            offset: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    pub fn read_new(&mut self, path: &Path) -> Vec<HookEvent> {
+        let Ok(mut f) = fs::File::open(path) else {
+            return vec![];
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.offset {
+            // Truncated/replaced file — start over.
+            self.offset = 0;
+        }
+        if len == self.offset || f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return vec![];
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            return vec![];
+        }
+        let consumed = match buf.rfind('\n') {
+            Some(i) => i + 1,
+            None => return vec![],
+        };
+        let events = buf[..consumed]
+            .lines()
+            .filter_map(parse_event_line)
+            .collect();
+        self.offset += consumed as u64;
+        events
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +417,76 @@ mod tests {
         let second = tail.read_new(&path);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].uuid, "u2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_tail_yields_hook_events_skips_malformed_and_advances() {
+        let dir = std::env::temp_dir().join(format!("bauded-evtail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("activity.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Mixed well-formed events + one malformed line + one event-less line.
+        writeln!(f, r#"{{"event":"UserPromptSubmit","ts":1}}"#).unwrap();
+        writeln!(f, r#"{{"event":"PostToolUse","tool":"Read","ts":2}}"#).unwrap();
+        writeln!(f, r#"not json at all"#).unwrap();
+        writeln!(f, r#"{{"ts":3}}"#).unwrap(); // event-less → skipped
+        writeln!(
+            f,
+            r#"{{"event":"Notification","notification_type":"idle","ts":4}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let mut tail = EventTail::default();
+        let first = tail.read_new(&path);
+        // Yields one HookEvent per WELL-FORMED, event-bearing line, in order.
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].event, "UserPromptSubmit");
+        assert_eq!(first[1].event, "PostToolUse");
+        assert_eq!(first[1].tool.as_deref(), Some("Read"));
+        assert_eq!(first[2].event, "Notification");
+        assert_eq!(first[2].notification_type.as_deref(), Some("idle"));
+
+        // A second read after appending yields only the new lines (offset advanced).
+        writeln!(f, r#"{{"event":"Stop","ts":5}}"#).unwrap();
+        f.flush().unwrap();
+        let second = tail.read_new(&path);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].event, "Stop");
+        assert_eq!(second[0].ts, 5);
+
+        // Truncating the file resets the offset to 0 and re-reads from the top.
+        let mut f2 = std::fs::File::create(&path).unwrap();
+        writeln!(f2, r#"{{"event":"UserPromptSubmit","ts":9}}"#).unwrap();
+        f2.flush().unwrap();
+        let third = tail.read_new(&path);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].ts, 9);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_tail_end_of_skips_history() {
+        let dir =
+            std::env::temp_dir().join(format!("bauded-evtail-endof-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("activity.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"event":"UserPromptSubmit","ts":1}}"#).unwrap();
+        f.flush().unwrap();
+
+        // end_of starts at the current end — pre-existing history is not replayed.
+        let mut tail = EventTail::end_of(&path);
+        assert!(tail.read_new(&path).is_empty());
+
+        writeln!(f, r#"{{"event":"Stop","ts":2}}"#).unwrap();
+        f.flush().unwrap();
+        let new = tail.read_new(&path);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].event, "Stop");
 
         std::fs::remove_dir_all(&dir).ok();
     }

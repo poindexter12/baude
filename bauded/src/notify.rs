@@ -119,6 +119,7 @@ mod tests {
             session_cost_usd: None,
             claude_session_id: None,
             archived: false,
+            activity: vec![],
         }
     }
 

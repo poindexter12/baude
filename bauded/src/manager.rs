@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
 use baude_core::git;
-use baude_core::meta::{now_unix_ms, ClaudeMeta};
+use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, SavedSession, State};
 use baude_core::pty::Pty;
 use baude_core::session::{Session, StateSource, Status};
@@ -66,6 +66,10 @@ pub struct SessionInfo {
     pub session_cost_usd: Option<f64>,
     pub claude_session_id: Option<String>,
     pub archived: bool,
+    /// A bounded (~30) tail of the session's recent hook events so the remote
+    /// TUI overlay rides the existing `/sessions` poll without an extra round
+    /// trip. The full ring is served by `GET /sessions/{id}/activity`.
+    pub activity: Vec<HookEvent>,
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -455,6 +459,33 @@ impl Manager {
         Ok(s.meta.transcript_path().map(Path::to_path_buf))
     }
 
+    /// Per-session hook-event file path: Err = no such session, Ok(None) = the
+    /// Claude session_id hasn't been resolved yet (so no event file exists).
+    /// The sid is sanitized by `baude_core::hook::event_path` (T-03-05).
+    /// Analog of `transcript_path` — the SSE existence guard maps Err → 404.
+    // Wired into `api::activity_stream`/`get_activity` in Task 2; the allow is
+    // removed there (mirrors the 03-01 deferred-import precedent for keeping a
+    // per-task commit clippy-clean under -D warnings).
+    #[allow(dead_code)]
+    pub fn event_path(&self, id: u64) -> Result<Option<PathBuf>> {
+        let s = self.session(id)?;
+        Ok(s.meta
+            .session_id
+            .as_ref()
+            .map(|sid| PathBuf::from(baude_core::hook::event_path(sid))))
+    }
+
+    /// The session's recent hook events, newest-at-back, bounded to `limit`.
+    /// Reads the in-memory `ClaudeMeta` ring (the single source of truth).
+    /// Err = no such session (→ 404 upstream).
+    #[allow(dead_code)]
+    pub fn activity(&self, id: u64, limit: usize) -> Result<Vec<HookEvent>> {
+        let s = self.session(id)?;
+        let act = s.meta.activity();
+        let start = act.len().saturating_sub(limit);
+        Ok(act.iter().skip(start).cloned().collect())
+    }
+
     /// Plain-text snapshot of the session's terminal — the escape hatch for
     /// the rare interactive menu that the chat surface can't represent.
     pub fn screen(&self, id: u64) -> Result<Screenshot> {
@@ -628,6 +659,13 @@ fn session_info(s: &Session) -> SessionInfo {
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
         archived: s.archived,
+        activity: {
+            // Bounded recent set (~30) for the remote TUI overlay; the full
+            // ring is served by GET /sessions/{id}/activity.
+            let act = s.meta.activity();
+            let start = act.len().saturating_sub(30);
+            act.iter().skip(start).cloned().collect()
+        },
     }
 }
 
@@ -652,6 +690,67 @@ mod tests {
         m.remove(info.id).unwrap();
         assert!(m.list().is_empty());
         assert!(m.remove(info.id).is_err());
+    }
+
+    #[test]
+    fn event_path_resolves_per_sid_and_404s_unknown() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // No sid resolved yet → Ok(None).
+        assert!(matches!(m.event_path(id), Ok(None)));
+        // Pin a sid → Ok(Some(the /tmp event path)).
+        let sid = format!("mgr-evpath-{}", std::process::id());
+        m.session_id_for_test(id, &sid);
+        let p = m.event_path(id).unwrap().unwrap();
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(baude_core::hook::event_path(&sid))
+        );
+        // Unknown id → Err (→ 404 upstream).
+        assert!(m.event_path(9999).is_err());
+        m.kill_all();
+    }
+
+    #[test]
+    fn activity_returns_recent_slice_and_404s_unknown() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let sid = format!("mgr-activity-{}", std::process::id());
+        let path = baude_core::hook::event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"event":"UserPromptSubmit","ts":1}"#,
+                "\n",
+                r#"{"event":"PostToolUse","tool":"Read","ts":2}"#,
+                "\n",
+                r#"{"event":"Stop","ts":3}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        m.session_id_for_test(id, &sid);
+        // Drive read_event_tail so the ring fills from the on-disk file.
+        m.poll();
+
+        // The last 2 events, newest at back.
+        let recent = m.activity(id, 2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].event, "PostToolUse");
+        assert_eq!(recent[1].event, "Stop");
+        assert_eq!(recent[1].ts, 3);
+
+        // SessionInfo carries a bounded recent set too.
+        let info = m.info(id).unwrap();
+        assert_eq!(info.activity.len(), 3);
+        assert_eq!(info.activity.last().unwrap().event, "Stop");
+
+        // Unknown id → Err (→ 404 upstream).
+        assert!(m.activity(9999, 10).is_err());
+
+        let _ = std::fs::remove_file(&path);
+        m.kill_all();
     }
 
     #[test]
