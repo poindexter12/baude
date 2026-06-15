@@ -106,6 +106,28 @@ fn event_url(id: u64) -> String {
     format!("http://127.0.0.1:8642/sessions/{id}/event")
 }
 
+/// Build the shell command string for a daemon-spawned session, injecting
+/// `$BAUDE_EVENT_URL` so claude and its hook child POST events to the daemon's
+/// loopback ingest route (`Pty::spawn` has no env-map param).
+///
+/// `claude --continue` resumes the most recent conversation; on a fresh
+/// directory it exits non-zero and the `|| exec claude` fallback starts a new
+/// session. The env var is set with `export VAR=...; <inner>` rather than a
+/// `VAR=... cmd` assignment prefix: an assignment prefix applies only to the
+/// single command it prefixes, so on the resume path the `exec claude`
+/// fallback (the common fresh-directory case) would otherwise run WITHOUT the
+/// var and its hooks would silently miss the daemon transport. `export` sets
+/// it for the whole command group, surviving the `||` fallback and sub-exec
+/// (WR-01).
+fn spawn_command(base_cmd: &str, event_url: &str, resume: bool) -> String {
+    let inner = if resume {
+        format!("{base_cmd} --continue 2>/dev/null || exec {base_cmd}")
+    } else {
+        format!("exec {base_cmd}")
+    };
+    format!("export BAUDE_EVENT_URL={event_url}; {inner}")
+}
+
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
 /// `claude_cmd`, then plain `claude`.
 /// BAUDED_AUTO_ARCHIVE_MIN (minutes, 0 disables) — default 30.
@@ -256,18 +278,7 @@ impl Manager {
         // adds exactly one baude entry per event no matter how often it runs.
         seed_session_hooks(&cwd);
 
-        // `claude --continue` resumes the most recent conversation in this
-        // directory; falls back to a fresh session if there is none.
-        // Inject `$BAUDE_EVENT_URL` by prefixing the command string (Pty::spawn
-        // has no env-map param) so claude and its hook child both inherit it
-        // and POST events back to this daemon's loopback ingest route.
-        let base_cmd = &self.claude_cmd;
-        let inner = if resume {
-            format!("{base_cmd} --continue 2>/dev/null || exec {base_cmd}")
-        } else {
-            format!("exec {base_cmd}")
-        };
-        let cmd = format!("BAUDE_EVENT_URL={} {inner}", event_url(id));
+        let cmd = spawn_command(&self.claude_cmd, &event_url(id), resume);
         let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
 
         self.next_id += 1;
@@ -754,6 +765,31 @@ mod tests {
             event_url(7),
             "http://127.0.0.1:8642/sessions/7/event",
             "spawn command must carry BAUDE_EVENT_URL= for the loopback route"
+        );
+    }
+
+    #[test]
+    fn spawn_command_exports_event_url_on_both_paths() {
+        // WR-01: the event URL must be exported (not assignment-prefixed) so it
+        // survives the resume path's `|| exec claude` fallback. Both the resume
+        // and fresh commands must start with `export BAUDE_EVENT_URL=<url>;`.
+        let url = "http://127.0.0.1:8642/sessions/3/event";
+
+        let fresh = spawn_command("claude", url, false);
+        assert_eq!(fresh, format!("export BAUDE_EVENT_URL={url}; exec claude"));
+
+        let resumed = spawn_command("claude", url, true);
+        let prefix = format!("export BAUDE_EVENT_URL={url}; ");
+        assert!(
+            resumed.starts_with(&prefix),
+            "resume command must export the var for the whole group, got: {resumed}"
+        );
+        // The fallback after `||` is inside the exported scope (no second
+        // assignment prefix on `exec claude`), so it inherits the var too.
+        assert!(resumed.contains("--continue 2>/dev/null || exec claude"));
+        assert!(
+            !resumed.contains("|| BAUDE_EVENT_URL="),
+            "fallback must not re-prefix; export already covers it"
         );
     }
 
