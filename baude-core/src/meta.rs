@@ -1049,6 +1049,121 @@ mod tests {
     }
 
     #[test]
+    fn activity_ring_caps_drop_oldest() {
+        // Feed N = ACTIVITY_CAP + 5 PostToolUse lines; the ring caps at
+        // ACTIVITY_CAP, oldest dropped, newest at back.
+        let n = ACTIVITY_CAP + 5;
+        let mut lines = Vec::with_capacity(n);
+        for i in 0..n {
+            lines.push(format!(
+                r#"{{"schema":1,"event":"PostToolUse","ts":{i},"tool":"Bash"}}"#
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(&mut meta, "ring-cap", &refs);
+
+        assert_eq!(meta.activity().len(), ACTIVITY_CAP);
+        // The oldest 5 (ts 0..5) were dropped; front is ts == 5.
+        assert_eq!(meta.activity().front().unwrap().ts, 5);
+        // Newest is at the back.
+        assert_eq!(meta.activity().back().unwrap().ts, (n - 1) as u64);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn activity_ring_records_each_event_in_order() {
+        // A mix of event kinds lands one HookEvent per line in arrival order,
+        // with tool/notification_type populated only on the relevant kinds.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "ring-mix",
+            &[
+                r#"{"schema":1,"event":"UserPromptSubmit","ts":10}"#,
+                r#"{"schema":1,"event":"PostToolUse","ts":20,"tool":"Bash"}"#,
+                r#"{"schema":1,"event":"Stop","ts":30}"#,
+                r#"{"schema":1,"event":"Notification","ts":40,"notification_type":"permission"}"#,
+            ],
+        );
+
+        let act = meta.activity();
+        assert_eq!(act.len(), 4);
+
+        assert_eq!(act[0].event, "UserPromptSubmit");
+        assert_eq!(act[0].tool, None);
+        assert_eq!(act[0].notification_type, None);
+
+        assert_eq!(act[1].event, "PostToolUse");
+        assert_eq!(act[1].tool.as_deref(), Some("Bash"));
+        assert_eq!(act[1].notification_type, None);
+
+        assert_eq!(act[2].event, "Stop");
+        assert_eq!(act[2].tool, None);
+
+        assert_eq!(act[3].event, "Notification");
+        assert_eq!(act[3].tool, None);
+        assert_eq!(act[3].notification_type.as_deref(), Some("permission"));
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn activity_ring_clears_on_path_rotation() {
+        // Feed session A, then rotate the event path to session B; the ring is
+        // cleared at rotation and reflects only B's events (mirrors WR-03).
+        let mut meta = ClaudeMeta::default();
+        let path_a = feed_events(
+            &mut meta,
+            "ring-rot-a",
+            &[
+                r#"{"schema":1,"event":"PostToolUse","ts":100,"tool":"Bash"}"#,
+                r#"{"schema":1,"event":"PostToolUse","ts":200,"tool":"Edit"}"#,
+            ],
+        );
+        assert_eq!(meta.activity().len(), 2);
+
+        // Rotate to a NEW, deterministically distinct session id.
+        let path_b = feed_events(
+            &mut meta,
+            "ring-rot-b",
+            &[r#"{"schema":1,"event":"UserPromptSubmit","ts":900}"#],
+        );
+
+        let act = meta.activity();
+        assert_eq!(act.len(), 1, "ring must be cleared on rotation");
+        assert_eq!(act[0].event, "UserPromptSubmit");
+        assert_eq!(act[0].ts, 900);
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
+    }
+
+    #[test]
+    fn activity_ring_skips_malformed_lines() {
+        // A non-JSON line and a line missing `event` are both skipped — they do
+        // not push into the ring and do not panic.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "ring-malformed",
+            &[
+                r#"{"schema":1,"event":"PostToolUse","ts":10,"tool":"Bash"}"#,
+                r#"not json at all"#,
+                r#"{"schema":1,"ts":20}"#, // missing `event`
+                r#"{"schema":1,"event":"Stop","ts":30}"#,
+            ],
+        );
+
+        let act = meta.activity();
+        assert_eq!(act.len(), 2, "only the two well-formed events are retained");
+        assert_eq!(act[0].event, "PostToolUse");
+        assert_eq!(act[1].event, "Stop");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn hook_event_serializes_post_tool_use() {
         // PostToolUse: tool present, notification_type omitted (skip_serializing_if).
         let ev = HookEvent {
