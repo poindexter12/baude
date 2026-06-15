@@ -48,7 +48,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 01-02-PLAN.md — Grow ClaudeMeta + read_bridge_file with the new optional fields, back-compat both directions (TDD)
+- [x] 01-02-PLAN.md — Grow ClaudeMeta + read_bridge_file with the new optional fields, back-compat both directions (TDD)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -121,7 +121,7 @@ other and may be planned/executed in either order once Phase 2 lands.)
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Full Status-Line Capture | 1/3 | In Progress|  |
+| 1. Full Status-Line Capture | 2/3 | In Progress|  |
 | 2. Hook-Driven Status | 0/TBD | Not started | - |
 | 3. Tool-Activity Timeline | 0/TBD | Not started | - |
 | 4. Remote Permission Approval | 0/TBD | Not started | - |
