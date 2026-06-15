@@ -408,9 +408,9 @@ Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => { self.modal = Modal
 **Note:** A1/A2 are minor and explicitly within Claude's-discretion or
 no-regression-safe territory; neither blocks planning.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **TUI overlay scroll mechanics**
+1. **TUI overlay scroll mechanics** — **RESOLVED: render-last-N-that-fit anchored to the bottom (option a); `scroll_offset` paging deferred unless a UAT demands it. Threaded into 03-04 Task 2.**
    - What we know: No scrollbar/scroll-offset widget exists in `ui.rs` today;
      `Modal::Info` renders a static variable-height `Paragraph`. CONTEXT says
      "scrollable, newest at bottom" but grants scroll-mechanics discretion.
@@ -423,7 +423,7 @@ no-regression-safe territory; neither blocks planning.
      demands paging through the full ~200 in the TUI (the GET endpoint already
      covers full retrieval). Flag as a one-line plan note.
 
-2. **Event id for the activity SSE**
+2. **Event id for the activity SSE** — **RESOLVED: omit `Event::id` (hook events have no uuid); rely on the `openChat`-style GET+buffer seam — Pitfall 2. Threaded into 03-02 Task 2.**
    - What we know: events have `ts` (not unique) and no `uuid`.
    - What's unclear: whether to set `Event::id` at all.
    - Recommendation: Use the running byte offset as the id (stable, monotonic) or

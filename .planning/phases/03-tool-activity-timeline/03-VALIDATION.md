@@ -1,9 +1,9 @@
 ---
 phase: 3
 slug: tool-activity-timeline
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: approved
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-06-15
 ---
 
@@ -42,7 +42,7 @@ created: 2026-06-15
 | 3-02-01 | 02 | 2 | ACT-02 | V5 input-validation | `GET /sessions/{id}/activity` returns recent events JSON (+?limit); 404 unknown id, never 500 | integration | `cargo test -p bauded activity` | ❌ W0 | ⬜ pending |
 | 3-02-02 | 02 | 2 | ACT-02 | — | `GET /sessions/{id}/activity-stream` SSE tails event file (dedicated HookEvent tail, NOT the ChatMessage Tail) | integration | `cargo test -p bauded activity_stream` | ❌ W0 | ⬜ pending |
 | 3-03-01 | 03 | 3 | ACT-03 | — | PWA collapsible activity strip: GET-then-SSE backfill, live append | manual-UAT | (no JS runner — UAT) | n/a | ⬜ pending |
-| 3-04-01 | 04 | 3 | ACT-04 | — | TUI `v` opens Modal::Activity (local meta buffer + remote RemoteInfo.activity); dismiss | unit-if-seam-else-UAT | `cargo test -p baude activity_modal` | ❌ W0 | ⬜ pending |
+| 3-04-01 | 04 | 3 | ACT-04 | — | TUI `v` opens Modal::Activity (local meta buffer + remote RemoteInfo.activity); dismiss | manual-UAT (Wave-0 confirmed: no app.rs key-dispatch test seam → no `activity_modal` unit test) | (manual — see Manual-Only table) | n/a | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -69,11 +69,11 @@ created: 2026-06-15
 
 ## Validation Sign-Off
 
-- [ ] ACT-01/ACT-02 have automated verify (ring buffer + endpoints); ACT-03 is UAT; ACT-04 unit-if-seam-else-UAT
-- [ ] Sampling continuity: no 3 consecutive automatable tasks without automated verify
-- [ ] Wave 0 covers the activity ring + endpoint test scaffolds and the ACT-04 seam check
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 60s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] ACT-01/ACT-02 have automated verify (ring buffer + endpoints); ACT-03 is UAT; ACT-04 manual-UAT (no app.rs test seam)
+- [x] Sampling continuity: no 3 consecutive automatable tasks without automated verify
+- [x] Wave 0 covers the activity ring + endpoint test scaffolds and the ACT-04 seam check (resolved: no seam → UAT)
+- [x] No watch-mode flags
+- [x] Feedback latency < 60s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-06-15
