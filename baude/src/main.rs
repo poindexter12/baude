@@ -51,12 +51,24 @@ fn main() -> Result<()> {
         let sid = v["session_id"].as_str().unwrap_or_default();
         // Route the event: POST to the daemon transport when $BAUDE_EVENT_URL
         // is set, else append to the TUI-local /tmp file. On a POST failure
-        // (wrong/dead port, transport error) `route_event` falls back to the
-        // file-append so the event is never silently lost — the daemon tails
-        // the same /tmp file, so it converges either way (WR-02).
+        // (wrong/dead port, transport error, OR timeout) `route_event` falls
+        // back to the file-append so the event is never silently lost — the
+        // daemon tails the same /tmp file, so it converges either way (WR-02).
+        //
+        // The POST uses a bounded agent (WR-04): `baude hook` runs synchronously
+        // in Claude Code's critical path and the module's contract is "ALWAYS
+        // exit 0 so a hook failure never blocks Claude". A loopback peer that
+        // accepts the connection but stalls would otherwise hang the POST and
+        // block Claude indefinitely. The connect/read timeouts cap that; on
+        // timeout the call errors, route_event takes the file-append fallback,
+        // and we still exit 0.
         let url = std::env::var("BAUDE_EVENT_URL").ok();
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_millis(500))
+            .timeout(std::time::Duration::from_secs(2))
+            .build();
         baude_core::hook::route_event(url.as_deref(), sid, &line, |url, line| {
-            ureq::post(url).send_string(line).is_ok()
+            agent.post(url).send_string(line).is_ok()
         });
         std::process::exit(0);
     }
