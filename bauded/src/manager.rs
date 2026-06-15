@@ -509,6 +509,16 @@ impl Manager {
         Ok(())
     }
 
+    /// Test-only: pin a session's resolved Claude `session_id` so handlers
+    /// that resolve baude id -> sid (e.g. `ingest_event`) can be exercised
+    /// without a live Claude writing `sessions/<pid>.json`.
+    #[cfg(test)]
+    pub fn session_id_for_test(&mut self, id: u64, sid: &str) {
+        if let Ok(s) = self.session_mut(id) {
+            s.meta.session_id = Some(sid.to_string());
+        }
+    }
+
     pub fn kill_all(&mut self) {
         for s in &mut self.sessions {
             s.kill();

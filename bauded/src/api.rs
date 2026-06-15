@@ -34,6 +34,7 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/keys", post(post_keys))
         .route("/sessions/{id}/pty", get(pty_ws))
         .route("/sessions/{id}/stream", get(stream))
+        .route("/sessions/{id}/event", post(post_event))
         .with_state(state)
 }
 
@@ -215,6 +216,25 @@ async fn unarchive(
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
     lock(&state).set_archived(id, false).map_err(not_found)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ingest one hook event line from a managed session's `baude hook` child
+/// (POSTed via the daemon-injected `$BAUDE_EVENT_URL`). The raw body is the
+/// already-built event line; it is appended to the same `/tmp` file the poll
+/// loop tails, converging the POST and file-tail transports (HOOK-03).
+///
+/// Security (T-02-08/09): the `Path<u64>` extractor rejects a non-numeric id
+/// at the framework layer; an unknown / unresolvable session is a 404 via
+/// `not_found`; a malformed body is appended best-effort. There is no 500
+/// path. No auth layer — the route inherits the tailnet/loopback-bound,
+/// single-user security model.
+async fn post_event(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    lock(&state).ingest_event(id, &body).map_err(not_found)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -450,6 +470,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_event_appends_and_404s_unknown() {
+        use crate::manager::lock;
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        // Pin a deterministic claude session_id so the /tmp path is isolated.
+        let sid = format!("api-event-test-{}", std::process::id());
+        let path = baude_core::hook::event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut m = lock(&state);
+            m.session_id_for_test(id, &sid);
+        }
+        let app = super::router(Arc::clone(&state));
+
+        // Known session: 204 and the line lands in the /tmp event file.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/sessions/{id}/event"))
+                    .body(Body::from(r#"{"schema":1,"event":"UserPromptSubmit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("UserPromptSubmit"), "got: {contents}");
+
+        // Bogus id: 404, never 500.
+        let res = app
+            .oneshot(
+                Request::post("/sessions/9999/event")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(&path);
+        lock(&state).kill_all();
     }
 
     #[tokio::test]
