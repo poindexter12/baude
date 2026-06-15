@@ -368,15 +368,26 @@ impl Manager {
     /// Ingest one hook event line POSTed to `POST /sessions/{id}/event` onto
     /// the same `/tmp/baude-events-<sid>.jsonl` consume path the poll loop
     /// tails — converging the daemon (POST) transport with the TUI-local
-    /// (file-tail) transport onto one event model. Resolves the baude `id` to
-    /// the Claude `session_id` via `Session.meta.session_id`. Errors (never
-    /// panics) on an unknown id or a not-yet-known session_id.
+    /// (file-tail) transport onto one event model.
+    ///
+    /// Resolves the target Claude `session_id` by preferring the one embedded in
+    /// the POSTed event line itself (`baude hook` builds the line with the
+    /// authoritative `session_id` from the hook payload, and the file is keyed by
+    /// that same id), falling back to the session's poll-resolved
+    /// `meta.session_id`. Preferring the body id means a real session's earliest
+    /// hook events land in the correct file immediately, instead of being
+    /// rejected until the first poll cycle resolves `meta.session_id` (~1s race).
+    /// Errors (never panics) only on an unknown baude id or when neither source
+    /// yields a session_id. `event_path` sanitizes the id, so a body-supplied id
+    /// cannot traverse paths (single-user loopback model).
     pub fn ingest_event(&mut self, id: u64, body: &str) -> Result<()> {
         let s = self.session(id)?;
-        let sid = s
-            .meta
-            .session_id
-            .clone()
+        let body_sid = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["session_id"].as_str().map(str::to_string))
+            .filter(|s| !s.is_empty());
+        let sid = body_sid
+            .or_else(|| s.meta.session_id.clone())
             .ok_or_else(|| anyhow!("session {id} has no claude session_id yet"))?;
         baude_core::hook::append_event(&sid, body.trim_end())
             .map_err(|e| anyhow!("append event for session {id}: {e}"))
@@ -813,10 +824,44 @@ mod tests {
         // Unknown id -> Err (not panic).
         let err = m.ingest_event(999, "{}").unwrap_err().to_string();
         assert!(err.contains("no session"), "got: {err}");
-        // Known id but session_id not resolved yet -> Err (not panic).
+        // Known id but session_id not resolved yet AND no session_id in the
+        // body -> Err (not panic).
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.ingest_event(id, "{}").unwrap_err().to_string();
         assert!(err.contains("session_id"), "got: {err}");
+        m.kill_all();
+    }
+
+    #[test]
+    fn ingest_event_uses_body_session_id_before_meta_resolves() {
+        // A real session's earliest hook events arrive before the poll loop has
+        // resolved meta.session_id. The POSTed line carries the authoritative
+        // session_id, so ingest must use it and land the event in the correct
+        // /tmp file immediately (no 404 / no loss).
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        assert!(
+            m.sessions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .meta
+                .session_id
+                .is_none(),
+            "precondition: meta.session_id not resolved for a sleep session"
+        );
+        let sid = format!("ingest-body-sid-{}", std::process::id());
+        let path = baude_core::hook::event_path(&sid);
+        let _ = std::fs::remove_file(&path);
+
+        let line = format!(r#"{{"schema":1,"event":"UserPromptSubmit","session_id":"{sid}"}}"#);
+        m.ingest_event(id, &line).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("UserPromptSubmit"), "got: {contents}");
+        assert!(contents.contains(&sid));
+
+        let _ = std::fs::remove_file(&path);
         m.kill_all();
     }
 
