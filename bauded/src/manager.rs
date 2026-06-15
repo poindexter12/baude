@@ -276,7 +276,7 @@ impl Manager {
         // merge as the TUI path. Idempotency matters because `restore()`
         // re-spawns every persisted session on each daemon startup; the merge
         // adds exactly one baude entry per event no matter how often it runs.
-        seed_session_hooks(&cwd);
+        baude_core::hook::seed_settings(&cwd);
 
         let cmd = spawn_command(&self.claude_cmd, &event_url(id), resume);
         let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
@@ -593,22 +593,6 @@ fn key_bytes(key: &str, app_cursor: bool) -> Vec<u8> {
             None => k.as_bytes().to_vec(),
         },
     }
-}
-
-/// Best-effort, idempotent, non-clobbering seed of the session cwd's
-/// `.claude/settings.local.json` — the same merge as the TUI path
-/// (`baude/src/app.rs::seed_session_hooks`). A failure never aborts the spawn.
-fn seed_session_hooks(cwd: &Path) {
-    let dir = cwd.join(".claude");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("settings.local.json");
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let command = baude_core::hook::baude_hook_command();
-    let merged = baude_core::hook::merge_hook_settings(&existing, &command);
-    let _ = std::fs::write(&path, merged.to_string());
 }
 
 fn session_info(s: &Session) -> SessionInfo {

@@ -133,6 +133,30 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
+/// Best-effort, idempotent, non-clobbering seed of a session cwd's
+/// `.claude/settings.local.json` so a managed Claude session fires baude's
+/// hooks. Single source of truth for both the TUI (`baude`) and the daemon
+/// (`bauded`) spawn paths (WR-06).
+///
+/// Every step is best-effort — a failure here must NEVER abort a spawn: the
+/// session simply falls back to the silence path (no regression). The seeded
+/// command is the `current_exe()` absolute path + ` hook` (so it resolves
+/// regardless of the session PATH), and [`merge_hook_settings`] is idempotent
+/// and non-clobbering so re-spawn/restart never duplicates entries and a
+/// user's `statusLine`/own hooks survive.
+pub fn seed_settings(cwd: &std::path::Path) {
+    let dir = cwd.join(".claude");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("settings.local.json");
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let command = baude_hook_command();
+    let merged = merge_hook_settings(&existing, &command);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 /// Route one normalized event line to its transport, never losing the event.
 ///
 /// When `url` is `Some`, attempt the daemon POST via `post` (which returns
@@ -409,5 +433,36 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("local append wrote the file");
         assert!(contents.contains("Stop"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- seed_settings -------------------------------------------------
+
+    #[test]
+    fn seed_settings_writes_idempotent_merge() {
+        // WR-06: the shared seed wrapper creates .claude/settings.local.json,
+        // merges baude's hook entries, and is idempotent across re-runs (the
+        // daemon re-seeds every persisted session on each restart).
+        let cwd = std::env::temp_dir().join(format!("baude-seed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        seed_settings(&cwd);
+        let path = cwd.join(".claude").join("settings.local.json");
+        let first = std::fs::read_to_string(&path).expect("seed wrote settings file");
+        let v: Value = serde_json::from_str(&first).expect("seed wrote valid JSON");
+        // All four lifecycle events seeded.
+        for ev in EVENTS {
+            assert!(
+                v["hooks"][ev].is_array(),
+                "missing seeded hook array for {ev}"
+            );
+        }
+
+        // Re-seeding is a no-op on the merged content (idempotent).
+        seed_settings(&cwd);
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second, "re-seed must be idempotent");
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 }
