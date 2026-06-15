@@ -66,12 +66,22 @@ Plans:
   3. The same event model is consumed from a per-session file-tail (`/tmp/baude-events-<sid>.jsonl`) for TUI-local sessions and from `POST /sessions/{id}/event` in the daemon.
   4. With hooks disabled or unavailable, the session still reaches correct waiting state via the dual-source silence fallback, and that fallback is labeled as such in the state source — no regression from v0.6.1 behavior.
 
-**Plans**: TBD
+**Plans**: 3 plans
 **UI hint**: yes
 
 Plans:
 
-- [ ] 02-01: TBD
+**Wave 1**
+
+- [ ] 02-01-PLAN.md — hook.rs (build_event/merge_hook_settings/append_event) + `baude hook` dispatch + TUI settings.local.json seeding (HOOK-01, HOOK-03)
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 02-02-PLAN.md — read_event_tail + hook_status/last_tool capture + StateSource precedence (Hook>SessionFile>Silence), silence fallback unchanged (HOOK-02)
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 02-03-PLAN.md — daemon POST /sessions/{id}/event + $BAUDE_EVENT_URL injection + daemon seeding + overlay surfacing + end-to-end UAT (HOOK-01, HOOK-03)
 
 ### Phase 3: Tool-Activity Timeline
 
