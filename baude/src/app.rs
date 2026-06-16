@@ -470,6 +470,15 @@ impl App {
         // seed; 04-02 adds the `permission-mcp` arm to both binaries.
         if baude_core::permission::is_prompt_mode() {
             seed_mcp_config(&cwd);
+            // WR-01: permission approval is inherently daemon+PWA-mediated. A
+            // TUI-local session gets NO $BAUDE_EVENT_URL (only the daemon injects
+            // it), so the `permission-mcp` bridge fails CLOSED and DENIES every
+            // tool with no operator-visible reason. Make that non-silent: warn
+            // clearly (once per process to stderr, plus a visible TUI message)
+            // that prompt mode requires the daemon and the bare TUI will deny all
+            // tools. This is fail-safe (deny, never allow) but no longer a silent
+            // footgun. `skip` (the default) is unaffected.
+            self.warn_prompt_mode_without_daemon();
         }
 
         let (rows, cols) = self.claude_spawn_size(shell_open);
@@ -522,6 +531,22 @@ impl App {
 
     pub fn set_message(&mut self, msg: String) {
         self.message = Some((msg, now_ms() + MESSAGE_TTL_MS));
+    }
+
+    /// WR-01: warn — once per process to stderr, and visibly in the TUI — that
+    /// `BAUDE_PERMISSION_MODE=prompt` cannot work under the bare TUI. Permission
+    /// approval is daemon+PWA-mediated; a TUI-local session has no
+    /// `$BAUDE_EVENT_URL`, so the `permission-mcp` bridge fails closed and denies
+    /// every tool. This makes the deny-all behaviour discoverable instead of a
+    /// silent hang. Fail-safe (deny, never allow); `skip` (default) is untouched.
+    fn warn_prompt_mode_without_daemon(&mut self) {
+        const MSG: &str = "BAUDE_PERMISSION_MODE=prompt has no approval UI under the bare TUI \
+             (no daemon) — every tool will be DENIED. Run via bauded + the PWA to approve.";
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("baude: {MSG}");
+        }
+        self.set_message(MSG.into());
     }
 
     pub fn tick(&mut self) {
