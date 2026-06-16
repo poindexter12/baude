@@ -358,7 +358,10 @@ function permSummary(input) {
     try { s = JSON.stringify(input); } catch { s = String(input); }
   }
   s = s.replace(/\s+/g, " ").trim();
-  return s.length > 140 ? `${s.slice(0, 139)}…` : s;
+  // IN-03: slice on code points (not UTF-16 code units) so truncation never
+  // splits a surrogate pair / multi-byte grapheme into a replacement char.
+  const cp = [...s];
+  return cp.length > 140 ? `${cp.slice(0, 139).join("")}…` : s;
 }
 
 // Resolve the pending permission. Approve runs the tool; Deny denies ONLY this
