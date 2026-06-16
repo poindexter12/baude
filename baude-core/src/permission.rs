@@ -379,7 +379,11 @@ fn approve_tool_descriptor() -> Value {
 ///   Any unknown decision string is coerced to deny inside the builder.
 ///
 /// A JSON-RPC notification (no `id`) returns `None` (no reply — the loop skips
-/// it). An unknown method returns a `-32601` error. `resolve` is injected so the
+/// it). Two distinct error codes (IN-01): an unknown *method* returns `-32601`
+/// (Method not found), while a `tools/call` for an unknown *tool name* returns
+/// `-32602` (Invalid params) — the tool name is a param of the one registered
+/// `tools/call` method, so `-32602` is the intended code (pinned by the unknown-
+/// tool test). `resolve` is injected so the
 /// network round-trip (POST request + long-poll, deny-on-timeout) stays in the
 /// binary; this dispatch is fully unit-testable. Never panics on odd input.
 pub fn dispatch_rpc<F>(req: &Value, resolve: F) -> Option<Value>
