@@ -334,7 +334,6 @@ async fn get_permission(
             input: Some(p.input),
             ts: Some(p.ts),
             decision: None,
-            scope: None,
         }),
         // No pending request, but a resolved decision the bridge can read.
         (None, Some(d)) => Some(PermissionView {
@@ -343,7 +342,6 @@ async fn get_permission(
             input: None,
             ts: Some(d.ts),
             decision: Some(d.decision),
-            scope: d.scope,
         }),
         // Nothing in flight and nothing resolved → null.
         (None, None) => None,
@@ -361,10 +359,21 @@ async fn get_permission(
 /// The presence of `decision` selects the path. A `decision` value other than
 /// `allow`/`deny` is a 400, NEVER treated as allow (V5 + deny-default, T-04-05).
 /// A request POST missing both `decision` and `tool` is a 400.
+///
+/// WR-03: `scope` is accepted for forward-compatibility but is NOT enforced in
+/// v0.7. Each `tools/call` mints a fresh `request_id`/pending request, so an
+/// `{decision:"allow", scope:"session"}` only ever resolves the single in-flight
+/// call — there is no session-scoped allow. Rich scope enforcement is deferred;
+/// the field is parsed and discarded so a future client may send it, but nothing
+/// reads it. It is deliberately NOT stored or echoed back (that would imply a
+/// contract that does not exist).
 #[derive(Deserialize)]
 struct PermissionBody {
     // Decision path (PWA → resolve).
     decision: Option<String>,
+    /// Accepted-but-ignored in v0.7 (WR-03): see the struct doc above. Parsed so
+    /// a forward-compat client may send it; enforcement is deferred.
+    #[allow(dead_code)]
     scope: Option<String>,
     // Request path (bridge → set pending).
     request_id: Option<String>,
@@ -389,8 +398,10 @@ async fn post_permission(
                 format!("decision must be \"allow\" or \"deny\", got {decision:?}"),
             ));
         }
+        // WR-03: `body.scope` is intentionally dropped — scope is accepted for
+        // forward-compat but not enforced/stored in v0.7 (see PermissionBody).
         lock(&state)
-            .resolve_pending(id, &decision, body.scope)
+            .resolve_pending(id, &decision)
             .map_err(not_found)?;
         return Ok(StatusCode::ACCEPTED);
     }

@@ -100,11 +100,16 @@ pub struct PendingPermission {
 
 /// PERM-02: the human decision recorded for the most recent request. The
 /// bridge's GET poll reads `decision` (`allow`|`deny`) to unblock.
+///
+/// WR-03: there is deliberately NO `scope` field — scope is not enforced in
+/// v0.7. Carrying it here would imply a session-scoped-allow contract that does
+/// not exist (every `tools/call` mints a fresh request). Enforcement is
+/// deferred; the POST handler still accepts `scope` for forward-compat but
+/// discards it.
 #[derive(Serialize, Clone, Debug)]
 pub struct PermissionDecision {
     pub request_id: String,
     pub decision: String,
-    pub scope: Option<String>,
     pub ts: u64,
 }
 
@@ -121,7 +126,6 @@ pub struct PermissionView {
     pub ts: Option<u64>,
     /// `allow` | `deny` once resolved; absent while pending or idle.
     pub decision: Option<String>,
-    pub scope: Option<String>,
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -538,7 +542,6 @@ impl Manager {
         Ok(s.permission_decision.as_ref().map(|v| PermissionDecision {
             request_id: v["request_id"].as_str().unwrap_or_default().to_string(),
             decision: v["decision"].as_str().unwrap_or("deny").to_string(),
-            scope: v["scope"].as_str().map(str::to_string),
             ts: v["ts"].as_u64().unwrap_or_default(),
         }))
     }
@@ -549,12 +552,11 @@ impl Manager {
     /// the lock). Err → 404 on an unknown id. The caller (`post_permission`)
     /// validates `decision ∈ {allow,deny}` BEFORE calling — but as defense in
     /// depth any non-`allow` value is stored as `deny` (deny-default).
-    pub fn resolve_pending(
-        &mut self,
-        id: u64,
-        decision: &str,
-        scope: Option<String>,
-    ) -> Result<()> {
+    /// WR-03: `scope` is intentionally NOT a parameter — scope is accepted by the
+    /// POST handler for forward-compat but is not enforced or stored in v0.7
+    /// (every `tools/call` mints a fresh request, so a "session" scope would have
+    /// nothing to attach to). Enforcement is deferred to a later milestone.
+    pub fn resolve_pending(&mut self, id: u64, decision: &str) -> Result<()> {
         let request_id = {
             let s = self.session_mut(id)?;
             let request_id = s
@@ -566,7 +568,6 @@ impl Manager {
             s.permission_decision = Some(serde_json::json!({
                 "request_id": request_id,
                 "decision": verdict,
-                "scope": scope,
                 "ts": now_unix_ms(),
             }));
             s.pending_permission = None;
@@ -1351,7 +1352,7 @@ mod tests {
         let mut m = mgr();
         assert!(m.set_pending(9999, pending("x", "Bash")).is_err());
         assert!(m.pending(9999).is_err());
-        assert!(m.resolve_pending(9999, "allow", None).is_err());
+        assert!(m.resolve_pending(9999, "allow").is_err());
     }
 
     #[test]
@@ -1359,14 +1360,14 @@ mod tests {
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         m.set_pending(id, pending("r1", "Bash")).unwrap();
-        m.resolve_pending(id, "allow", Some("session".into()))
-            .unwrap();
+        // WR-03: scope is no longer a parameter; an "allow" simply resolves the
+        // single in-flight request (scope enforcement is deferred).
+        m.resolve_pending(id, "allow").unwrap();
         // Pending cleared.
         assert!(m.pending(id).unwrap().is_none());
         // The decision is readable by a waiter (the bridge's poll).
         let d = m.decision(id).unwrap().expect("decision recorded");
         assert_eq!(d.decision, "allow");
-        assert_eq!(d.scope.as_deref(), Some("session"));
         m.kill_all();
     }
 
@@ -1375,7 +1376,7 @@ mod tests {
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         m.set_pending(id, pending("r2", "Write")).unwrap();
-        m.resolve_pending(id, "deny", None).unwrap();
+        m.resolve_pending(id, "deny").unwrap();
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "deny");
         m.kill_all();
     }
@@ -1386,7 +1387,7 @@ mod tests {
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         m.set_pending(id, pending("r1", "Bash")).unwrap();
-        m.resolve_pending(id, "allow", None).unwrap();
+        m.resolve_pending(id, "allow").unwrap();
         assert!(m.decision(id).unwrap().is_some());
         // New request resets the decision slot.
         m.set_pending(id, pending("r2", "Edit")).unwrap();
@@ -1443,7 +1444,7 @@ mod tests {
                     .is_err(),
                 "waiter must block until resolve"
             );
-            m.resolve_pending(id, "allow", None).unwrap();
+            m.resolve_pending(id, "allow").unwrap();
             // After resolve, the waiter completes promptly.
             tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiter)
                 .await
