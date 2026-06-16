@@ -229,6 +229,46 @@ header .iconbtn.active { background: var(--panel2); }
 .act-time { margin-left: auto; color: var(--dim); flex: none; }
 .act-empty { color: var(--dim); font: 12px var(--mono); padding: 8px 12px; }
 
+/* ---- permission card ---- */
+.perm-card {
+  margin: 0;
+  padding: 12px 14px calc(12px + var(--pad-bottom));
+  background: var(--panel2);
+  border-top: 1px solid var(--yellow);
+}
+.perm-head {
+  color: var(--yellow);
+  font: 11px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.perm-tool {
+  font: 600 15px var(--mono);
+  color: var(--fg);
+  margin-top: 4px;
+  word-break: break-all;
+}
+.perm-input {
+  font: 12px/1.4 var(--mono);
+  color: var(--dim);
+  margin-top: 3px;
+  word-break: break-word;
+}
+.perm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.perm-btn {
+  flex: 1;
+  padding: 10px 16px;
+  border-radius: 18px;
+  font-weight: 700;
+}
+.perm-btn.allow { background: var(--green); color: #06281a; }
+.perm-btn.deny { background: var(--panel); color: var(--red); border: 1px solid var(--red); }
+.perm-btn:active { opacity: 0.85; }
+
 /* ---- composer ---- */
 #composer {
   display: flex;

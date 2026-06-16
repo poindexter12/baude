@@ -25,6 +25,7 @@ const state = {
   activityOpen: false, // collapsible strip state (collapsed by default)
   aes: null, // activity EventSource
   aesBuffer: null, // activity events received before backfill loaded
+  pendingPermission: null, // GET /permission view while waiting_reason === "permission" (else null)
 };
 
 // ---- helpers ----
@@ -105,6 +106,7 @@ function route() {
     state.queue = [];
     state.activity = [];
     state.activityOpen = false;
+    state.pendingPermission = null;
     clearInterval(state.screenTimer);
     if (sid !== null) { openChat(sid); openActivity(sid); }
   }
@@ -124,6 +126,20 @@ async function refresh() {
     }
   } catch {
     state.online = false;
+  }
+  // Drive the permission card off the open session's waiting_reason. This is the
+  // signal a permission push/SSE update surfaces (waiting_reason === "permission"
+  // arrives in /sessions), and it also covers chat open (route() → refresh()).
+  // Fetch the detail from GET /permission when waiting; clear it otherwise.
+  if (state.sid !== null) {
+    const s = session(state.sid);
+    if (s && s.waiting_reason === "permission") {
+      fetchPermission(state.sid); // async; renders when it lands
+    } else if (state.pendingPermission) {
+      state.pendingPermission = null;
+    }
+  } else if (state.pendingPermission) {
+    state.pendingPermission = null;
   }
   render();
 }
@@ -311,6 +327,62 @@ async function interrupt() {
     toast(`interrupt failed: ${e.message}`);
   }
 }
+
+// ---- permission approval ----
+
+// Fetch the pending tool-permission request for a session. The GET /permission
+// view carries `{request_id, tool, input, decision}`: a *pending* request has a
+// `tool` and no `decision` yet — store it so renderChat() can surface the card.
+// Anything else (null, or a resolved decision with no live request) clears it.
+// Use the existing api() GET shape (mirrors the activity fetch).
+async function fetchPermission(sid) {
+  try {
+    const view = await api(`/sessions/${sid}/permission`);
+    if (state.sid !== sid) return; // view changed mid-flight
+    state.pendingPermission = view && view.tool && !view.decision ? view : null;
+  } catch {
+    // 404 / offline — leave the card hidden rather than throwing.
+    state.pendingPermission = null;
+  }
+  render();
+}
+
+// Collapse the (attacker-influenced) tool input object into a short readable
+// line for the card. The caller esc()'s the result before innerHTML — this only
+// shapes/clips, it does not escape.
+function permSummary(input) {
+  if (input == null) return "";
+  let s;
+  if (typeof input === "string") s = input;
+  else {
+    try { s = JSON.stringify(input); } catch { s = String(input); }
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > 140 ? `${s.slice(0, 139)}…` : s;
+}
+
+// Resolve the pending permission. Approve runs the tool; Deny denies ONLY this
+// single tool call — Claude continues with the tool denied (it does NOT kill or
+// interrupt the session). Optimistically remove the card, then refetch to
+// confirm it cleared (SC3: the card disappears once resolved).
+async function resolvePermission(decision) {
+  const sid = state.sid;
+  if (sid === null) return;
+  try {
+    await api(`/sessions/${sid}/permission`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
+    state.pendingPermission = null; // optimistic removal
+    render();
+    fetchPermission(sid); // confirm it cleared
+  } catch (e) {
+    toast(`${decision === "allow" ? "approve" : "deny"} failed: ${e.message}`);
+  }
+}
+
+function approve() { resolvePermission("allow"); }
+function deny() { resolvePermission("deny"); }
 
 // ---- web push ----
 
@@ -602,6 +674,24 @@ function renderChat() {
       : ""}
     </div>`;
 
+  // Approve/deny card: shown above the composer while a permission is pending
+  // (waiting_reason === "permission" AND a fetched pending request). The tool
+  // name and the input summary are attacker-influenced (Claude's tool args) —
+  // esc() EVERY dynamic string before innerHTML (XSS, T-04-13). Deny denies the
+  // single tool call only; it does NOT kill/interrupt the session (T-04-14).
+  const pp = state.pendingPermission;
+  const permCard = s && s.waiting_reason === "permission" && pp
+    ? `<div class="perm-card">
+        <div class="perm-head">permission</div>
+        <div class="perm-tool">${esc(pp.tool || "tool")}</div>
+        <div class="perm-input">${esc(permSummary(pp.input))}</div>
+        <div class="perm-actions">
+          <button type="button" class="perm-btn deny" id="permdeny">deny</button>
+          <button type="button" class="perm-btn allow" id="permallow">approve</button>
+        </div>
+      </div>`
+    : "";
+
   $app.innerHTML = `
     <header>
       <button class="iconbtn" id="backbtn" aria-label="back">‹</button>
@@ -618,6 +708,7 @@ function renderChat() {
     ${typing}
     ${screenDrawer}
     ${activityStrip}
+    ${permCard}
     ${s && s.status === "exited" ? `
     <form id="composer">
       <button type="button" class="send" id="restartbtn" style="flex:1">claude exited — restart</button>
@@ -633,6 +724,10 @@ function renderChat() {
   document.getElementById("actbtn").onclick = toggleActivity;
   document.getElementById("escbtn").onclick = interrupt;
   document.getElementById("killbtn").onclick = deleteSession;
+  const permAllow = document.getElementById("permallow");
+  if (permAllow) permAllow.onclick = approve;
+  const permDeny = document.getElementById("permdeny");
+  if (permDeny) permDeny.onclick = deny;
   for (const el of document.querySelectorAll("#screen .key")) {
     el.onclick = () => sendKey(el.dataset.key);
   }
