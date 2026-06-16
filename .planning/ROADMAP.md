@@ -24,7 +24,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Full Status-Line Capture** - Bridge persists Claude's whole status-line payload; info overlay shows effort/thinking/PR (completed 2026-06-15)
 - [x] **Phase 2: Hook-Driven Status** - Working/waiting/done state comes from Claude Code hooks, with silence heuristic as labeled fallback (completed 2026-06-15)
 - [x] **Phase 3: Tool-Activity Timeline** - Live per-session tool feed renders in the PWA and the TUI (completed 2026-06-15)
-- [ ] **Phase 4: Remote Permission Approval** - Approve/deny a session's pending permission prompt from the phone, with a distinct push
+- [x] **Phase 4: Remote Permission Approval** - Approve/deny a session's pending permission prompt from the phone, with a distinct push (completed 2026-06-16)
 
 ## Phase Details
 
@@ -141,7 +141,7 @@ Plans:
 **Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
 
 - [x] 04-03-PLAN.md — waiting_reason enum on SessionInfo/RemoteInfo + distinct notified_permission push (PERM-04)
-- [ ] 04-04-PLAN.md — PWA approve/deny card above the composer — manual UAT (PERM-03)
+- [x] 04-04-PLAN.md — PWA approve/deny card above the composer — manual UAT (PERM-03)
 
 ## Progress
 
@@ -156,4 +156,4 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
 | 3. Tool-Activity Timeline | 4/4 | Complete   | 2026-06-15 |
-| 4. Remote Permission Approval | 3/4 | In Progress|  |
+| 4. Remote Permission Approval | 4/4 | Complete   | 2026-06-16 |

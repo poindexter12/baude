@@ -4,14 +4,14 @@ milestone: v0.7
 milestone_name: milestone
 status: executing
 stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-06-16T00:22:53.870Z"
+last_updated: "2026-06-16T00:28:16.273Z"
 last_activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 14
-  completed_plans: 13
-  percent: 75
+  completed_plans: 14
+  percent: 100
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-06-15)
 ## Current Position
 
 Phase: 04 (remote-permission-approval) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
 
@@ -60,6 +60,8 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - [Phase 04]: 04-02: permission wire-contract functions (parse_frame/parse_tool_call/build_approve_result) isolated in baude-core so the §F CONTRACT UAT corrects them cheaply
 - [Phase 04]: 04-02: deny-on-timeout (decide_with_timeout) + permission_timeout_s live in baude-core, single-sourced by both binaries' bridges (security-critical V4)
 - [Phase ?]: Permission push stays lean (no tool name); detail via GET /permission (T-04-10)
+- [Phase ?]: 04-04: PWA permission card driven off SessionInfo.waiting_reason in the existing refresh() poll (no new SSE handler); state.pendingPermission holds only a live pending GET /permission view, never a resolved decision
+- [Phase ?]: 04-04: Deny POSTs {decision:deny} to /permission (denies the single tool call, session survives) — NOT interrupt/kill (T-04-14); every dynamic card string esc()'d (T-04-13)
 
 ### Pending Todos
 
@@ -70,10 +72,11 @@ None yet.
 - Phase 2 (hooks) must tolerate Claude Code hook schema drift and never clobber user settings.json — same care as `bridge.rs::window()` and the statusLine seeding path.
 - Web Push (v0.5) is not yet phone-verified; Phase 4's distinct permission push depends on a working push path.
 - 04-02 §F CONTRACT gate: live claude 2.1.178 --permission-prompt-tool wire shape must be confirmed before prompt mode ships (see 04-02-SUMMARY.md CONTRACT GATE)
+- 04-04 PWA approve/deny card: PERM-03 human-verify UAT pending (browser + live prompt-mode session + real permission). Also gated by 04-02 §F CONTRACT UAT. Code complete + committed (f60bb3f); not marked done until verified.
 
 ## Session Continuity
 
-Last session: 2026-06-16T00:22:44.814Z
+Last session: 2026-06-16T00:27:46.974Z
 Stopped at: Completed 04-03-PLAN.md
 Resume file: None
 
@@ -88,3 +91,4 @@ Resume file: None
 | Phase 03 P03 | 8min | 1 tasks | 3 files |
 | Phase 04 P01 | 10min | 2 tasks | 5 files |
 | Phase 04 P03 | 4min | 2 tasks | 5 files |
+| Phase 04 P04 | 12min | 1 tasks | 3 files |
