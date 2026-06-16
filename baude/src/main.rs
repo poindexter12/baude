@@ -103,8 +103,14 @@ fn run_permission_mcp() -> ! {
         let request_id = format!("{}-{}", std::process::id(), req_counter);
         let req = serde_json::json!({ "request_id": request_id, "tool": tool, "input": input });
         // Register the pending request (best-effort POST). A failure still falls
-        // into the poll loop, which denies on the deadline.
-        let _ = agent.post(perm_url).send_string(&req.to_string());
+        // into the poll loop, which denies on the deadline. The body IS JSON, so
+        // declare `application/json` — the daemon's `Json<PermissionBody>`
+        // extractor 415s a `text/plain` body (ureq's `send_string` default), which
+        // would silently drop the registration and deny every tool (PERM-BUG).
+        let _ = agent
+            .post(perm_url)
+            .set("Content-Type", "application/json")
+            .send_string(&req.to_string());
 
         // Long-poll GET until a decision for THIS request appears or the
         // deadline passes -> deny (deny-on-timeout, security-critical, V4).
