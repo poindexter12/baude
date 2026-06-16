@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.7
 milestone_name: milestone
 status: executing
-stopped_at: 04-01 complete (BAUDE_PERMISSION_MODE spawn-flag selection, PERM-01); ready for 04-02
-last_updated: "2026-06-15T23:51:48Z"
-last_activity: 2026-06-15 -- 04-01 complete (permission_flag selector + .mcp.json seed)
+stopped_at: 04-02 code tasks complete (permission-mcp bridge + daemon pending state + /permission routes, CI triad green); PAUSED at §F CONTRACT human-verify gate (Task 4 — needs live claude 2.1.178)
+last_updated: "2026-06-16T00:13:19.359Z"
+last_activity: 2026-06-15 -- 04-02 code complete, paused at §F CONTRACT gate
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 14
-  completed_plans: 11
-  percent: 79
+  completed_plans: 12
+  percent: 75
 ---
 
 # Project State
@@ -27,8 +27,8 @@ See: .planning/PROJECT.md (updated 2026-06-15)
 
 Phase: 04 (remote-permission-approval) — EXECUTING
 Plan: 2 of 4
-Status: Executing Phase 04 (04-01 complete)
-Last activity: 2026-06-15 -- 04-01 complete (permission_flag selector + .mcp.json seed)
+Status: Executing Phase 04 (04-02 code complete; PAUSED at §F CONTRACT human-verify gate)
+Last activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
 
 Progress: [████████░░] 79%
 
@@ -57,6 +57,8 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - 04-01: permission_flag defaults to skip (--dangerously-skip-permissions); prompt reachable ONLY by exact "prompt" (unset/unrecognized/case-mismatch fail safe to skip) — PERM-01/T-04-01 security-critical
 - 04-01: env-free permission_flag_for(mode, base_cmd) seam so branch tests never mutate process-global BAUDE_PERMISSION_MODE (races concurrent PTY spawns that read it)
 - 04-01: permission flag appended to base cmd unconditionally (mode-driven, not command-sniffing); merge_mcp_config pure non-clobbering seed (only mcpServers.baude set) shared by both spawn sites
+- [Phase 04]: 04-02: permission wire-contract functions (parse_frame/parse_tool_call/build_approve_result) isolated in baude-core so the §F CONTRACT UAT corrects them cheaply
+- [Phase 04]: 04-02: deny-on-timeout (decide_with_timeout) + permission_timeout_s live in baude-core, single-sourced by both binaries' bridges (security-critical V4)
 
 ### Pending Todos
 
@@ -66,10 +68,11 @@ None yet.
 
 - Phase 2 (hooks) must tolerate Claude Code hook schema drift and never clobber user settings.json — same care as `bridge.rs::window()` and the statusLine seeding path.
 - Web Push (v0.5) is not yet phone-verified; Phase 4's distinct permission push depends on a working push path.
+- 04-02 §F CONTRACT gate: live claude 2.1.178 --permission-prompt-tool wire shape must be confirmed before prompt mode ships (see 04-02-SUMMARY.md CONTRACT GATE)
 
 ## Session Continuity
 
-Last session: 2026-06-15T23:51:48Z
+Last session: 2026-06-16T00:11:57.341Z
 Stopped at: 04-01 complete (BAUDE_PERMISSION_MODE spawn-flag selection, PERM-01); ready for 04-02
 Resume file: 04-02-PLAN.md
 

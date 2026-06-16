@@ -136,7 +136,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 04-02-PLAN.md — permission-mcp JSON-RPC bridge (both binaries) + daemon pending-state + GET/POST /permission + CONTRACT human-verify gate (PERM-01, PERM-02)
+- [x] 04-02-PLAN.md — permission-mcp JSON-RPC bridge (both binaries) + daemon pending-state + GET/POST /permission + CONTRACT human-verify gate (PERM-01, PERM-02)
 
 **Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
 
@@ -156,4 +156,4 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
 | 3. Tool-Activity Timeline | 4/4 | Complete   | 2026-06-15 |
-| 4. Remote Permission Approval | 0/4 | Not started | - |
+| 4. Remote Permission Approval | 2/4 | In Progress|  |
