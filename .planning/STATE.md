@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v0.7
 milestone_name: milestone
-status: executing
+status: Awaiting next milestone
 stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-06-16T00:28:16.273Z"
-last_activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
+last_updated: "2026-06-16T01:51:34.353Z"
+last_activity: 2026-06-16 — Milestone v0.7 completed and archived
 progress:
   total_phases: 4
   completed_phases: 4
@@ -25,12 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-15)
 
 ## Current Position
 
-Phase: 04 (remote-permission-approval) — EXECUTING
-Plan: 4 of 4
-Status: Ready to execute
-Last activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
-
-Progress: [████████░░] 79%
+Phase: Milestone v0.7 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-16 — Milestone v0.7 completed and archived
 
 ## Accumulated Context
 
@@ -92,3 +90,23 @@ Resume file: None
 | Phase 04 P01 | 10min | 2 tasks | 5 files |
 | Phase 04 P03 | 4min | 2 tasks | 5 files |
 | Phase 04 P04 | 12min | 1 tasks | 3 files |
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
+
+## Deferred Items
+
+Items acknowledged and deferred at v0.7 milestone close on 2026-06-16 (code-complete; human-only verification):
+
+| Category | Item | Status |
+|----------|------|--------|
+| UAT | Phase 1 — info overlay render (effort/thinking/PR rows) | pending |
+| UAT | Phase 3 — PWA activity strip visual render | pending |
+| UAT | Phase 3 — TUI `v` activity overlay visual render | pending |
+| UAT | Phase 4 — live `claude` 2.1.178 `--permission-prompt-tool` MCP wire contract (§F gate) | pending |
+| UAT | Phase 4 — PWA approve/deny card + distinct push (browser/device) | pending |
+| verification | Phase 1 / 3 / 4 VERIFICATION.md = human_needed (code-complete; data paths Claude-validated live) | pending |
+| deferred | First-real-phone Web Push verification (carried from v0.5) | pending |
+
+All data paths were drive-validated live by Claude; 4 real integration bugs were found and fixed. The above are visual/live-claude observation gaps, not code gaps. Per-phase detail in each `NN-UAT.md`.
