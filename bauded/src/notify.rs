@@ -170,4 +170,51 @@ mod tests {
         n.tick(&[]);
         assert_eq!(n.tick(&[info(1, "waiting", Some(20_000))]).len(), 1);
     }
+
+    /// A waiting session with a pending tool-permission request.
+    fn perm(id: u64) -> SessionInfo {
+        let mut s = info(id, "waiting", Some(60_000));
+        s.waiting_reason = Some("permission".to_string());
+        s
+    }
+
+    #[test]
+    fn permission_fires_distinct_push_once_and_not_generic() {
+        let mut n = Notifier::default();
+        // First tick: exactly one DISTINCT permission push, and NOT the
+        // generic "is waiting for you" push (mutually exclusive).
+        let fired = n.tick(&[perm(1)]);
+        assert_eq!(fired.len(), 1, "exactly one push");
+        assert!(
+            fired[0].title.contains("permission"),
+            "distinct permission title, got: {}",
+            fired[0].title
+        );
+        assert!(
+            !fired[0].title.contains("waiting"),
+            "must not be the generic waiting push"
+        );
+        // Second tick, still pending: no duplicate (debounced).
+        assert!(n.tick(&[perm(1)]).is_empty(), "no duplicate while pending");
+    }
+
+    #[test]
+    fn permission_re_arms_after_resolve() {
+        let mut n = Notifier::default();
+        assert_eq!(n.tick(&[perm(1)]).len(), 1);
+        // Permission resolves: waiting_reason flips away (still waiting on a
+        // generic prompt). The generic waiting push may now fire, and the
+        // permission notifier re-arms.
+        let mut waiting = info(1, "waiting", Some(60_000));
+        waiting.waiting_reason = Some("input".to_string());
+        let fired = n.tick(&[waiting]);
+        assert!(
+            fired.iter().all(|f| !f.title.contains("permission")),
+            "no permission push once resolved"
+        );
+        // A NEW permission can fire again after the re-arm.
+        let fired = n.tick(&[perm(1)]);
+        assert_eq!(fired.len(), 1, "permission re-armed and fires again");
+        assert!(fired[0].title.contains("permission"));
+    }
 }
