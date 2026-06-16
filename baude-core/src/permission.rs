@@ -1047,4 +1047,49 @@ mod tests {
         assert!(permission_url_from_event_url("").is_none());
         assert!(permission_url_from_event_url("http://x/sessions/7").is_none());
     }
+
+    // ---- waiting_reason mapper (PERM-04) --------------------------------
+
+    #[test]
+    fn waiting_reason_maps_permission_input_none() {
+        // A recent permission_prompt notification -> permission (regardless of
+        // the waiting flag; a pending permission IS a kind of waiting).
+        assert_eq!(
+            waiting_reason(Some(&("permission_prompt".to_string(), 1)), true),
+            "permission"
+        );
+        assert_eq!(
+            waiting_reason(Some(&("permission_prompt".to_string(), 1)), false),
+            "permission"
+        );
+        // Waiting with a non-permission notification -> input.
+        assert_eq!(
+            waiting_reason(Some(&("idle".to_string(), 1)), true),
+            "input"
+        );
+        // Waiting with no notification at all -> input.
+        assert_eq!(waiting_reason(None, true), "input");
+        // Not waiting, no notification -> none.
+        assert_eq!(waiting_reason(None, false), "none");
+        // Not waiting, a stale non-permission notification -> none.
+        assert_eq!(
+            waiting_reason(Some(&("idle".to_string(), 1)), false),
+            "none"
+        );
+    }
+
+    #[test]
+    fn waiting_reason_tolerant_permission_substring() {
+        // Any notification type CONTAINING "permission" maps to permission,
+        // so an odd/variant hook label still routes the distinct push.
+        assert_eq!(
+            waiting_reason(Some(&("needs_permission".to_string(), 1)), false),
+            "permission"
+        );
+        assert_eq!(
+            waiting_reason(Some(&("PERMISSION".to_string(), 1)), true),
+            "input",
+            "matching is case-sensitive substring; upper-case is not 'permission'"
+        );
+    }
 }
