@@ -69,6 +69,17 @@ pub struct Session {
     /// running across an unarchive, so without a fresh grace period the very
     /// next tick would re-park a still-long-waiting session.
     pub unarchived_at_ms: Option<u64>,
+    /// PERM-02: the in-flight tool-permission request the `permission-mcp`
+    /// bridge POSTed, awaiting a human `allow`/`deny`. `None` when nothing is
+    /// pending. The bridge long-polls until [`Self::permission_decision`] is
+    /// recorded (or its own deadline denies). Daemon-mediated state — the
+    /// `Manager` owns set/resolve. Held as an opaque JSON `Value` so baude-core
+    /// carries no permission-request type (the shape lives in the daemon).
+    pub pending_permission: Option<serde_json::Value>,
+    /// PERM-02: the decision the human POSTed for the most recent request
+    /// (`{request_id, decision, scope?, ts}` as JSON). The bridge's GET poll
+    /// reads this to unblock; cleared when a new request supersedes it.
+    pub permission_decision: Option<serde_json::Value>,
 }
 
 impl Session {

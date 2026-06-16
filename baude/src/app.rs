@@ -493,6 +493,8 @@ impl App {
             archived_by_user: false,
             was_busy: false,
             unarchived_at_ms: None,
+            pending_permission: None,
+            permission_decision: None,
         };
         if shell_open {
             let (_, shell_rect) = pane_rects(self.content_rect, true);

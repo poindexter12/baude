@@ -3,11 +3,13 @@
 //! shutdown. State persists to its own file (`daemon-state.json`) so a daemon
 //! restart restores every session via `claude --continue`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
+use tokio::sync::Notify;
 
 use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
@@ -38,6 +40,12 @@ pub struct Manager {
     persist: bool,
     /// Waiting this long auto-archives a session; 0 disables.
     pub auto_archive_ms: u64,
+    /// PERM-02: per-session wake handle for the permission long-poll. Set/clear
+    /// pending state happens UNDER the manager lock; the bridge/handler then
+    /// `notified().await`s on this Arc OUTSIDE the lock so one pending
+    /// permission never stalls other sessions (Pitfall 4 — "decide under the
+    /// lock, act outside it"). `resolve_pending` fires `notify_waiters()`.
+    permission_notify: HashMap<u64, Arc<Notify>>,
 }
 
 /// One row of `GET /sessions`.
@@ -70,6 +78,79 @@ pub struct SessionInfo {
     /// TUI overlay rides the existing `/sessions` poll without an extra round
     /// trip. The full ring is served by `GET /sessions/{id}/activity`.
     pub activity: Vec<HookEvent>,
+}
+
+/// PERM-02: an in-flight tool-permission request the `permission-mcp` bridge
+/// POSTed, awaiting a human decision. `request_id` is bridge-generated; `ts` is
+/// unix-ms (the bridge owns its own deadline). Serializable so `GET
+/// /sessions/{id}/permission` returns it directly.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+pub struct PendingPermission {
+    pub request_id: String,
+    pub tool: String,
+    pub input: serde_json::Value,
+    pub ts: u64,
+}
+
+/// PERM-02: the human decision recorded for the most recent request. The
+/// bridge's GET poll reads `decision` (`allow`|`deny`) to unblock.
+#[derive(Serialize, Clone, Debug)]
+pub struct PermissionDecision {
+    pub request_id: String,
+    pub decision: String,
+    pub scope: Option<String>,
+    pub ts: u64,
+}
+
+/// `GET /sessions/{id}/permission` payload — the pending request (if any) plus
+/// the resolved decision (if any). While pending, `decision` is `None`; after a
+/// POST resolves it, `request_id`/`tool`/`input` describe the just-decided call
+/// and `decision` carries the verdict for the bridge poll. `None`-everywhere
+/// (no request ever) serializes to JSON `null` at the handler.
+#[derive(Serialize)]
+pub struct PermissionView {
+    pub request_id: Option<String>,
+    pub tool: Option<String>,
+    pub input: Option<serde_json::Value>,
+    pub ts: Option<u64>,
+    /// `allow` | `deny` once resolved; absent while pending or idle.
+    pub decision: Option<String>,
+    pub scope: Option<String>,
+}
+
+/// Read the deny-on-timeout window (`BAUDE_PERMISSION_TIMEOUT_S`, default 120s).
+/// A missing/garbage/zero value falls back to the default — never 0 (which would
+/// deny instantly) and never panics. The deny-default makes any value safe.
+// Consumed by the `run_permission_mcp` bridge (04-02 Task 3, same plan); tested
+// here now. The allow is removed once the bridge wires it in.
+#[allow(dead_code)]
+pub fn permission_timeout_s() -> u64 {
+    const DEFAULT: u64 = 120;
+    std::env::var("BAUDE_PERMISSION_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// The pure deny-on-timeout resolution rule (SECURITY-CRITICAL, T-04-04 / V4).
+///
+/// Given the decision read so far (`None` = none yet) and whether the deadline
+/// has passed, return the final verdict the bridge emits:
+/// - a recorded `"allow"` wins (the human approved);
+/// - a recorded non-`"allow"` value coerces to `"deny"` (deny-default — an
+///   unknown value is NEVER allow);
+/// - no decision AND deadline passed -> `"deny"` (never auto-allow);
+/// - no decision AND still within the window -> `""` (keep polling).
+// Consumed by the `run_permission_mcp` bridge (04-02 Task 3, same plan).
+#[allow(dead_code)]
+pub fn decide_with_timeout(decision: Option<&str>, deadline_passed: bool) -> &'static str {
+    match decision {
+        Some("allow") => "allow",
+        Some(_) => "deny",
+        None if deadline_passed => "deny",
+        None => "",
+    }
 }
 
 fn expand_tilde(s: &str) -> PathBuf {
@@ -182,6 +263,7 @@ impl Manager {
             claude_cmd,
             persist,
             auto_archive_ms: default_auto_archive_ms(),
+            permission_notify: HashMap::new(),
         }
     }
 
@@ -348,6 +430,8 @@ impl Manager {
             archived_by_user: false,
             was_busy: false,
             unarchived_at_ms: None,
+            pending_permission: None,
+            permission_decision: None,
         });
         Ok(id)
     }
@@ -370,6 +454,11 @@ impl Manager {
         let s = self.session_mut(id)?;
         s.kill();
         self.sessions.retain(|s| s.id != id);
+        // Wake any lingering permission waiter (it will re-check, find the
+        // session gone, and bail) and drop its handle so the map doesn't leak.
+        if let Some(n) = self.permission_notify.remove(&id) {
+            n.notify_waiters();
+        }
         self.save();
         Ok(())
     }
@@ -441,6 +530,93 @@ impl Manager {
             .ok_or_else(|| anyhow!("session {id} has no claude session_id yet"))?;
         baude_core::hook::append_event(&sid, body.trim_end())
             .map_err(|e| anyhow!("append event for session {id}: {e}"))
+    }
+
+    // ===== PERM-02: pending-permission set/resolve =======================
+    //
+    // The bridge POSTs a pending request (set_pending), the PWA/phone POSTs the
+    // decision (resolve_pending), and the bridge's GET poll reads it (decision).
+    // All route `Err -> 404` via `self.session(id)?`/`session_mut(id)?` exactly
+    // like `ingest_event`. Pitfall 4: these only touch state UNDER the lock; the
+    // actual wait happens OUTSIDE via the Arc<Notify> from `permission_notify`.
+
+    /// Store a fresh pending permission request on a known session, clearing any
+    /// stale decision from a previous turn so the bridge can't read it. Err →
+    /// 404 on an unknown id.
+    pub fn set_pending(&mut self, id: u64, p: PendingPermission) -> Result<()> {
+        let s = self.session_mut(id)?;
+        s.pending_permission = Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null));
+        s.permission_decision = None; // a new request supersedes any prior decision
+        Ok(())
+    }
+
+    /// The pending permission request, if one is awaiting a decision. `Ok(None)`
+    /// when nothing is pending; Err → 404 on an unknown id.
+    pub fn pending(&self, id: u64) -> Result<Option<PendingPermission>> {
+        let s = self.session(id)?;
+        Ok(s.pending_permission
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()))
+    }
+
+    /// The recorded decision for the most recent request, if resolved. `Ok(None)`
+    /// while pending/idle; Err → 404 on an unknown id. The bridge's GET poll
+    /// reads this to unblock.
+    pub fn decision(&self, id: u64) -> Result<Option<PermissionDecision>> {
+        let s = self.session(id)?;
+        Ok(s.permission_decision.as_ref().map(|v| PermissionDecision {
+            request_id: v["request_id"].as_str().unwrap_or_default().to_string(),
+            decision: v["decision"].as_str().unwrap_or("deny").to_string(),
+            scope: v["scope"].as_str().map(str::to_string),
+            ts: v["ts"].as_u64().unwrap_or_default(),
+        }))
+    }
+
+    /// Resolve the pending permission with a `allow`/`deny` decision: clear the
+    /// pending request, record the decision for the bridge poll, and wake any
+    /// registered waiter (Pitfall 4 — the wake fires here, the await is outside
+    /// the lock). Err → 404 on an unknown id. The caller (`post_permission`)
+    /// validates `decision ∈ {allow,deny}` BEFORE calling — but as defense in
+    /// depth any non-`allow` value is stored as `deny` (deny-default).
+    pub fn resolve_pending(
+        &mut self,
+        id: u64,
+        decision: &str,
+        scope: Option<String>,
+    ) -> Result<()> {
+        let request_id = {
+            let s = self.session_mut(id)?;
+            let request_id = s
+                .pending_permission
+                .as_ref()
+                .and_then(|v| v["request_id"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let verdict = if decision == "allow" { "allow" } else { "deny" };
+            s.permission_decision = Some(serde_json::json!({
+                "request_id": request_id,
+                "decision": verdict,
+                "scope": scope,
+                "ts": now_unix_ms(),
+            }));
+            s.pending_permission = None;
+            request_id
+        };
+        let _ = request_id;
+        // Wake the bridge/handler waiting outside the lock.
+        if let Some(n) = self.permission_notify.get(&id) {
+            n.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// The per-session wake handle for the permission long-poll. A waiter clones
+    /// this Arc, registers `notified()` BEFORE re-checking `decision`, then
+    /// `await`s OUTSIDE the manager lock (Pitfall 4). `resolve_pending` fires it.
+    /// Err → 404 on an unknown id.
+    pub fn permission_notify(&mut self, id: u64) -> Result<Arc<Notify>> {
+        // Validate the id first so an unknown session is a clean 404.
+        self.session(id)?;
+        Ok(Arc::clone(self.permission_notify.entry(id).or_default()))
     }
 
     /// Respawn claude in an exited session's PTY (same cwd, fresh process,

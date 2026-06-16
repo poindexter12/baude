@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 
-use crate::manager::{lock, SessionInfo, Shared};
+use crate::manager::{lock, PermissionView, SessionInfo, Shared};
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
 pub fn router(state: Shared) -> Router {
@@ -37,6 +37,10 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/pty", get(pty_ws))
         .route("/sessions/{id}/stream", get(stream))
         .route("/sessions/{id}/event", post(post_event))
+        .route(
+            "/sessions/{id}/permission",
+            get(get_permission).post(post_permission),
+        )
         .route("/sessions/{id}/activity", get(get_activity))
         .route("/sessions/{id}/activity-stream", get(activity_stream))
         .with_state(state)
@@ -260,6 +264,139 @@ async fn post_event(
 ) -> Result<StatusCode, ApiError> {
     lock(&state).ingest_event(id, &body).map_err(not_found)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /sessions/{id}/permission` (PERM-02) — the in-flight permission request
+/// the `permission-mcp` bridge POSTed, or the resolved decision once a human
+/// answered (the bridge long-polls this until `decision` appears). Returns JSON
+/// `null` when nothing is pending and nothing resolved. Unknown id → 404 via
+/// `not_found`; `Path<u64>` rejects a non-numeric id at the framework layer
+/// (T-04-09). No auth — inherits the tailnet/loopback single-user model (T-04-08).
+#[derive(Deserialize)]
+struct PermissionQuery {
+    /// Long-poll seconds: when > 0 the bridge blocks (bounded, clamped to 30s)
+    /// until the pending request resolves or the window elapses. `0`/absent (the
+    /// PWA) returns the current state immediately.
+    wait: Option<u64>,
+}
+
+async fn get_permission(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    Query(q): Query<PermissionQuery>,
+) -> Result<Json<Option<PermissionView>>, ApiError> {
+    // Long-poll (Pitfall 4): when the bridge asks to wait and a request is
+    // pending with no decision yet, register the per-session Notify and await it
+    // OUTSIDE the manager lock so one pending permission never stalls other
+    // sessions. A bounded timeout caps the hang; the bridge re-polls. `?wait=0`
+    // (the PWA) returns the current state immediately.
+    if q.wait.unwrap_or(0) > 0 {
+        let (notify, pending, decision) = {
+            let mut m = lock(&state);
+            let notify = m.permission_notify(id).map_err(not_found)?;
+            let pending = m.pending(id).map_err(not_found)?;
+            let decision = m.decision(id).map_err(not_found)?;
+            (notify, pending, decision)
+        };
+        // Only block when there is something pending and nothing resolved yet.
+        if pending.is_some() && decision.is_none() {
+            let wait = Duration::from_secs(q.wait.unwrap_or(0).min(30));
+            // `notified()` is registered before we dropped the lock above? No —
+            // re-register here and accept the small race: a resolve between the
+            // unlock and this await leaves a recorded decision the post-await
+            // re-read picks up immediately (the timeout also bounds it).
+            let _ = tokio::time::timeout(wait, notify.notified()).await;
+        }
+    }
+
+    let m = lock(&state);
+    let pending = m.pending(id).map_err(not_found)?;
+    let decision = m.decision(id).map_err(not_found)?;
+    drop(m);
+    let view = match (pending, decision) {
+        // A pending request awaiting a human decision.
+        (Some(p), _) => Some(PermissionView {
+            request_id: Some(p.request_id),
+            tool: Some(p.tool),
+            input: Some(p.input),
+            ts: Some(p.ts),
+            decision: None,
+            scope: None,
+        }),
+        // No pending request, but a resolved decision the bridge can read.
+        (None, Some(d)) => Some(PermissionView {
+            request_id: Some(d.request_id),
+            tool: None,
+            input: None,
+            ts: Some(d.ts),
+            decision: Some(d.decision),
+            scope: d.scope,
+        }),
+        // Nothing in flight and nothing resolved → null.
+        (None, None) => None,
+    };
+    Ok(Json(view))
+}
+
+/// `POST /sessions/{id}/permission` body — dual-purpose (PERM-02):
+///
+/// - The **`permission-mcp` bridge** POSTs a request to register pending state:
+///   `{request_id, tool, input, ts?}` (no `decision`). This sets the pending
+///   permission the PWA then sees via GET.
+/// - The **PWA/phone** POSTs a `{decision: allow|deny, scope?}` to resolve it.
+///
+/// The presence of `decision` selects the path. A `decision` value other than
+/// `allow`/`deny` is a 400, NEVER treated as allow (V5 + deny-default, T-04-05).
+/// A request POST missing both `decision` and `tool` is a 400.
+#[derive(Deserialize)]
+struct PermissionBody {
+    // Decision path (PWA → resolve).
+    decision: Option<String>,
+    scope: Option<String>,
+    // Request path (bridge → set pending).
+    request_id: Option<String>,
+    tool: Option<String>,
+    input: Option<serde_json::Value>,
+    ts: Option<u64>,
+}
+
+async fn post_permission(
+    State(state): State<Shared>,
+    Path(id): Path<u64>,
+    Json(body): Json<PermissionBody>,
+) -> Result<StatusCode, ApiError> {
+    use crate::manager::PendingPermission;
+    use baude_core::meta::now_unix_ms;
+
+    if let Some(decision) = body.decision {
+        // ---- Decision path: resolve the pending request --------------------
+        if decision != "allow" && decision != "deny" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("decision must be \"allow\" or \"deny\", got {decision:?}"),
+            ));
+        }
+        lock(&state)
+            .resolve_pending(id, &decision, body.scope)
+            .map_err(not_found)?;
+        return Ok(StatusCode::ACCEPTED);
+    }
+
+    // ---- Request path: the bridge registers pending state ------------------
+    let Some(tool) = body.tool else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "permission POST needs either a decision or a tool request".into(),
+        ));
+    };
+    let pending = PendingPermission {
+        request_id: body.request_id.unwrap_or_default(),
+        tool,
+        input: body.input.unwrap_or(serde_json::Value::Null),
+        ts: body.ts.unwrap_or_else(now_unix_ms),
+    };
+    lock(&state).set_pending(id, pending).map_err(not_found)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Messages typed while Claude was busy that it hasn't picked up yet.
@@ -781,7 +918,10 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let res = app
-            .oneshot(post_json("/sessions/9999/permission", r#"{"decision":"deny"}"#))
+            .oneshot(post_json(
+                "/sessions/9999/permission",
+                r#"{"decision":"deny"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
