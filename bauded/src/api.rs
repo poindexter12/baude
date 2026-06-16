@@ -291,21 +291,34 @@ async fn get_permission(
     // sessions. A bounded timeout caps the hang; the bridge re-polls. `?wait=0`
     // (the PWA) returns the current state immediately.
     if q.wait.unwrap_or(0) > 0 {
-        let (notify, pending, decision) = {
+        // WR-04: close the missed-wakeup window. Acquire the per-session Notify,
+        // register the `Notified` future (pin it) BEFORE re-reading pending/
+        // decision under the lock, then re-check state and await. Because the
+        // waiter is registered before the state re-read, a `resolve_pending`
+        // that fires `notify_waiters()` in the (now-eliminated) window between
+        // the read and the await is delivered to this registered waiter instead
+        // of being dropped — so a resolved permission can no longer appear to
+        // hang for the full wait window on an unlucky interleaving.
+        let notify = {
             let mut m = lock(&state);
-            let notify = m.permission_notify(id).map_err(not_found)?;
+            m.permission_notify(id).map_err(not_found)?
+        };
+        // Register the waiter first. `Notify::notified()` only stores a permit
+        // for an already-registered waiter, so this MUST precede the state read.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        let (pending, decision) = {
+            let m = lock(&state);
             let pending = m.pending(id).map_err(not_found)?;
             let decision = m.decision(id).map_err(not_found)?;
-            (notify, pending, decision)
+            (pending, decision)
         };
         // Only block when there is something pending and nothing resolved yet.
+        // If a decision already landed (possibly during/after registration) we
+        // skip the await entirely and fall through to the re-read below.
         if pending.is_some() && decision.is_none() {
             let wait = Duration::from_secs(q.wait.unwrap_or(0).min(30));
-            // `notified()` is registered before we dropped the lock above? No —
-            // re-register here and accept the small race: a resolve between the
-            // unlock and this await leaves a recorded decision the post-await
-            // re-read picks up immediately (the timeout also bounds it).
-            let _ = tokio::time::timeout(wait, notify.notified()).await;
+            let _ = tokio::time::timeout(wait, notified).await;
         }
     }
 
@@ -963,6 +976,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(res).await["decision"], "deny");
+        lock(&state).kill_all();
+    }
+
+    /// WR-04: a decision that lands while a long-poll GET is in flight must wake
+    /// the registered waiter promptly — the response returns with the decision
+    /// well before the (generous) `wait` window would otherwise elapse. Because
+    /// the `Notified` future is registered before the in-handler state re-read,
+    /// the `notify_waiters()` fired by `resolve_pending` is delivered rather than
+    /// dropped, so there is no missed-wakeup hang.
+    #[tokio::test]
+    async fn permission_long_poll_wakes_on_decision() {
+        use std::time::{Duration, Instant};
+
+        use crate::manager::{lock, PendingPermission};
+
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let id = lock(&state).create("/tmp", None, None).unwrap().id;
+        {
+            let mut m = lock(&state);
+            m.set_pending(
+                id,
+                PendingPermission {
+                    request_id: "rw".into(),
+                    tool: "Bash".into(),
+                    input: serde_json::json!({}),
+                    ts: 1,
+                },
+            )
+            .unwrap();
+        }
+        let app = super::router(Arc::clone(&state));
+
+        // Start the long-poll with a generous wait window (clamped to 30s in the
+        // handler). If the wakeup were lost, this GET would block for ~the full
+        // window; the assertion below proves it returns near-immediately.
+        let poll = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let started = Instant::now();
+                let res = app
+                    .oneshot(get(&format!("/sessions/{id}/permission?wait=30")))
+                    .await
+                    .unwrap();
+                (res, started.elapsed())
+            }
+        });
+
+        // Give the handler a beat to register the waiter and reach the await,
+        // then resolve the decision (the PWA → resolve path).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        app.clone()
+            .oneshot(post_json(
+                &format!("/sessions/{id}/permission"),
+                r#"{"decision":"allow"}"#,
+            ))
+            .await
+            .unwrap();
+
+        let (res, elapsed) = poll.await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["decision"], "allow");
+        // The long-poll must have woken promptly (well under the 30s window),
+        // not blocked on a missed wakeup.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "long-poll did not wake promptly on decision: took {elapsed:?}"
+        );
+
         lock(&state).kill_all();
     }
 
