@@ -484,6 +484,25 @@ pub fn permission_url_from_event_url(event_url: &str) -> Option<String> {
     Some(format!("{trimmed}/permission"))
 }
 
+/// PERM-04: classify *why* a session is waiting, for `SessionInfo.waiting_reason`
+/// (and the distinct permission push). Pure, total, panic-free over the
+/// event-derived `last_notification` (`meta.rs:447`, `Option<(type, ts)>`):
+///
+/// - a notification type CONTAINING `"permission"` → `"permission"` (the phone
+///   shows the approve/deny card and gets a distinct push);
+/// - otherwise, if the session is `waiting` → `"input"` (generic prompt);
+/// - otherwise → `"none"` (active / not waiting).
+///
+/// The `"permission"` arm fires even when `waiting` is false: a pending
+/// permission is itself a waiting state, and the notification is the authority.
+pub fn waiting_reason(last_notification: Option<&(String, u64)>, waiting: bool) -> &'static str {
+    match last_notification {
+        Some((nt, _)) if nt.contains("permission") => "permission",
+        _ if waiting => "input",
+        _ => "none",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

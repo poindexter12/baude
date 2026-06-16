@@ -107,6 +107,7 @@ mod tests {
             state_source: "silence",
             last_tool: None,
             waiting_for_ms: waiting_ms,
+            waiting_reason: None,
             model: None,
             permission_mode: None,
             context_used_pct: None,

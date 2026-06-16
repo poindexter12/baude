@@ -36,6 +36,12 @@ pub struct RemoteInfo {
     /// The last tool the daemon-managed session ran, if any.
     #[serde(default)]
     pub last_tool: Option<String>,
+    /// PERM-04: why the session is waiting — `"permission"` / `"input"` /
+    /// absent. `#[serde(default)]` keeps an older daemon (which omits the
+    /// field) deserializing to `None` (backward-compat, mirroring the fields
+    /// above).
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
     #[serde(default)]
     pub archived: bool,
     /// Recent (~30) tool-activity events bundled into the `/sessions` poll so

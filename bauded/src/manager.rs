@@ -62,6 +62,12 @@ pub struct SessionInfo {
     pub last_tool: Option<String>,
     /// Only present while waiting — how long Claude has been blocked on us.
     pub waiting_for_ms: Option<u64>,
+    /// PERM-04: why the session is waiting — `"permission"` (a pending
+    /// tool-permission request, drives the distinct push + PWA card),
+    /// `"input"` (a generic waiting prompt), or `None` when active. Derived
+    /// from `meta.last_notification` + the waiting status via
+    /// `baude_core::permission::waiting_reason`.
+    pub waiting_reason: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_used_pct: Option<u8>,
@@ -829,6 +835,15 @@ fn session_info(s: &Session) -> SessionInfo {
         state_source: source_str(source),
         last_tool: s.meta.last_tool.as_ref().map(|(t, _)| t.clone()),
         waiting_for_ms: (status == Status::Waiting).then(|| s.waiting_for_ms()),
+        waiting_reason: match baude_core::permission::waiting_reason(
+            s.meta.last_notification.as_ref(),
+            status == Status::Waiting,
+        ) {
+            // "none" carries no signal — omit it so the JSON stays lean and the
+            // PWA/push key off the presence of "permission"/"input".
+            "none" => None,
+            reason => Some(reason.to_string()),
+        },
         model: s.meta.model.clone(),
         permission_mode: s.meta.permission_mode.clone(),
         context_used_pct: s.meta.context_used_pct,
@@ -1267,6 +1282,32 @@ mod tests {
             .meta
             .last_tool = Some(("Bash".to_string(), 1));
         assert_eq!(m.info(id).unwrap().last_tool.as_deref(), Some("Bash"));
+        m.kill_all();
+    }
+
+    #[test]
+    fn session_info_sets_waiting_reason_permission() {
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        // No notification yet -> no permission signal (a fresh stub is not
+        // in a permission wait).
+        assert_ne!(
+            m.info(id).unwrap().waiting_reason.as_deref(),
+            Some("permission")
+        );
+        // A permission_prompt notification -> waiting_reason == "permission"
+        // (the distinct push + PWA card key off this), regardless of the
+        // silence-derived status.
+        m.sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .meta
+            .last_notification = Some(("permission_prompt".to_string(), 1));
+        assert_eq!(
+            m.info(id).unwrap().waiting_reason.as_deref(),
+            Some("permission")
+        );
         m.kill_all();
     }
 

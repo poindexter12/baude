@@ -903,6 +903,11 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 if let Some(tool) = &r.last_tool {
                     lines.push(row("tool", tool.clone()));
                 }
+                // PERM-04: surface *why* the session is waiting ("permission"
+                // flags a pending approve/deny request handled from the phone).
+                if let Some(reason) = &r.waiting_reason {
+                    lines.push(row("waiting", reason.clone()));
+                }
                 let rect = centered(frame.area(), 64, lines.len() as u16 + 2);
                 frame.render_widget(Clear, rect);
                 let p = Paragraph::new(lines).block(
