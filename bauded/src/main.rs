@@ -67,9 +67,15 @@ fn run_permission_mcp() -> ! {
     let perm_url = std::env::var("BAUDE_EVENT_URL")
         .ok()
         .and_then(|u| permission_url_from_event_url(&u));
+    // WR-02: the client read timeout MUST be strictly greater than the server
+    // long-poll window (`wait=5` below). When they are equal the GET frequently
+    // times out at the exact boundary the daemon is still holding the poll open,
+    // converting every long-poll into a spurious timeout-then-retry. 8s > 5s
+    // leaves headroom while staying well under the deny-on-deadline window
+    // (BAUDE_PERMISSION_TIMEOUT_S, default 120s, unchanged).
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_millis(500))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
         .build();
     let mut req_counter: u64 = 0;
 
