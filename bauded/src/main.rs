@@ -43,6 +43,72 @@ fn run_hook() -> ! {
     std::process::exit(0);
 }
 
+/// `bauded permission-mcp` — the blocking stdio JSON-RPC permission bridge.
+/// Byte-identical to the `baude` (TUI) binary's `run_permission_mcp`: the daemon
+/// seeds `current_exe()` (= `bauded`) as the `.mcp.json` command, so the daemon
+/// binary MUST handle `permission-mcp`. Without this arm, `bauded permission-mcp`
+/// falls through and boots a *second daemon* instead of speaking MCP — exactly
+/// the Phase-2 `bauded hook` trap (Pitfall 2).
+///
+/// The BLOCKING inverse of `run_hook`: it sits on Claude's critical path and
+/// each `tools/call` blocks until a human `allow`/`deny` arrives OR the deadline
+/// denies (deny-on-timeout, never auto-allow — V4). Framing/protocol live in
+/// `baude_core::permission::run_permission_mcp`; this binary owns only the env
+/// read + `ureq` daemon round-trip. Absent `$BAUDE_EVENT_URL` (no daemon) fails
+/// CLOSED to `deny`. Keep in sync with `baude`'s `run_permission_mcp`.
+fn run_permission_mcp() -> ! {
+    use std::time::Instant;
+
+    use baude_core::permission::{
+        decide_with_timeout, permission_timeout_s, permission_url_from_event_url,
+    };
+
+    let timeout_s = permission_timeout_s();
+    let perm_url = std::env::var("BAUDE_EVENT_URL")
+        .ok()
+        .and_then(|u| permission_url_from_event_url(&u));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_secs(5))
+        .build();
+    let mut req_counter: u64 = 0;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    baude_core::permission::run_permission_mcp(stdin.lock(), stdout.lock(), |tool, input| {
+        // Fail closed: no daemon URL -> deny (never allow) — the no-daemon path.
+        let Some(perm_url) = perm_url.as_deref() else {
+            return "deny".to_string();
+        };
+        req_counter += 1;
+        let request_id = format!("{}-{}", std::process::id(), req_counter);
+        let req = serde_json::json!({ "request_id": request_id, "tool": tool, "input": input });
+        // Register the pending request (best-effort POST). A failure still falls
+        // into the poll loop, which denies on the deadline.
+        let _ = agent.post(perm_url).send_string(&req.to_string());
+
+        // Long-poll GET until a decision for THIS request appears or the
+        // deadline passes -> deny (deny-on-timeout, security-critical, V4).
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
+        loop {
+            let mut decision: Option<String> = None;
+            if let Ok(resp) = agent.get(perm_url).query("wait", "5").call() {
+                if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    if v["request_id"].as_str() == Some(request_id.as_str()) {
+                        decision = v["decision"].as_str().map(str::to_string);
+                    }
+                }
+            }
+            let passed = Instant::now() >= deadline;
+            match decide_with_timeout(decision.as_deref(), passed) {
+                "" => std::thread::sleep(Duration::from_millis(500)), // keep polling
+                verdict => break verdict.to_string(),
+            }
+        }
+    });
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -72,6 +138,12 @@ async fn main() -> Result<()> {
         // boots a *second daemon* instead of emitting an event, silently
         // breaking hook-driven status for every daemon-managed session.
         Some("hook") => run_hook(),
+        // `bauded permission-mcp` — the blocking stdio JSON-RPC permission
+        // bridge. The daemon seeds its own `current_exe()` (= `bauded`) as the
+        // `.mcp.json` command, so the daemon binary MUST handle `permission-mcp`.
+        // Without this arm it falls through and boots a *second daemon* instead
+        // of speaking MCP (Pitfall 2, the same trap as `bauded hook`).
+        Some("permission-mcp") => run_permission_mcp(),
         _ => {}
     }
     let bind = args

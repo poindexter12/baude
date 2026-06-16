@@ -307,6 +307,183 @@ pub fn rpc_error(id: Value, code: i64, msg: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
 }
 
+/// Read the deny-on-timeout window (`BAUDE_PERMISSION_TIMEOUT_S`, default 120s).
+/// A missing/garbage/zero value falls back to the default — never 0 (which would
+/// deny instantly) and never panics. The deny-default makes any value safe (A5).
+/// Shared by both binaries' `permission-mcp` bridge so the window is one rule.
+pub fn permission_timeout_s() -> u64 {
+    const DEFAULT: u64 = 120;
+    std::env::var("BAUDE_PERMISSION_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// The pure deny-on-timeout resolution rule (SECURITY-CRITICAL, T-04-04 / V4).
+///
+/// Given the decision read so far (`None` = none yet) and whether the deadline
+/// has passed, return the final verdict the bridge emits:
+/// - a recorded `"allow"` wins (the human approved);
+/// - a recorded non-`"allow"` value coerces to `"deny"` (deny-default — an
+///   unknown value is NEVER allow);
+/// - no decision AND deadline passed -> `"deny"` (never auto-allow);
+/// - no decision AND still within the window -> `""` (keep polling).
+///
+/// Shared by both binaries' bridge loop so the security-critical rule is tested
+/// once and never diverges between `baude` and `bauded`.
+pub fn decide_with_timeout(decision: Option<&str>, deadline_passed: bool) -> &'static str {
+    match decision {
+        Some("allow") => "allow",
+        Some(_) => "deny",
+        None if deadline_passed => "deny",
+        None => "",
+    }
+}
+
+/// The MCP protocol version baude advertises in `initialize`. Claude's stdio
+/// transport echoes/negotiates this; a recent stable value is safe (the §F UAT
+/// confirms the handshake is accepted for 2.1.178).
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// The single tool baude exposes — `mcp__baude__approve`, the value passed to
+/// `--permission-prompt-tool`.
+const APPROVE_TOOL: &str = "approve";
+
+/// The `tools/list` descriptor for the one `approve` tool (§G). The input
+/// schema names the request fields baude reads (`tool_name`/`input`/
+/// `tool_use_id`) so the CLI knows the tool's shape.
+fn approve_tool_descriptor() -> Value {
+    json!({
+        "name": APPROVE_TOOL,
+        "description": "Route a tool-permission decision through baude (phone approval).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": { "type": "string" },
+                "input": { "type": "object" },
+                "tool_use_id": { "type": "string" }
+            }
+        }
+    })
+}
+
+/// Dispatch ONE parsed JSON-RPC request to its MCP reply (pure — no IO).
+///
+/// Handles the three methods baude's stdio server answers (§G):
+/// - `initialize` → `protocolVersion` + `capabilities.tools` + `serverInfo`.
+/// - `tools/list` → the single [`approve_tool_descriptor`].
+/// - `tools/call` (name == `approve`) → `parse_tool_call` the params, invoke
+///   `resolve(tool, &input)` for the decision string, then
+///   `build_approve_result(decision, Some(&input), …)` (echo input on allow).
+///   Any unknown decision string is coerced to deny inside the builder.
+///
+/// A JSON-RPC notification (no `id`) returns `None` (no reply — the loop skips
+/// it). An unknown method returns a `-32601` error. `resolve` is injected so the
+/// network round-trip (POST request + long-poll, deny-on-timeout) stays in the
+/// binary; this dispatch is fully unit-testable. Never panics on odd input.
+pub fn dispatch_rpc<F>(req: &Value, resolve: F) -> Option<Value>
+where
+    F: FnOnce(&str, &Value) -> String,
+{
+    // A notification (no id) is fire-and-forget — no response.
+    let id = req.get("id")?.clone();
+    let method = req["method"].as_str().unwrap_or_default();
+    match method {
+        "initialize" => Some(rpc_response(
+            id,
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "baude", "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )),
+        "tools/list" => Some(rpc_response(
+            id,
+            json!({ "tools": [ approve_tool_descriptor() ] }),
+        )),
+        "tools/call" => {
+            let params = &req["params"];
+            let name = params["name"].as_str().unwrap_or_default();
+            if name != APPROVE_TOOL {
+                return Some(rpc_error(id, -32602, "unknown tool"));
+            }
+            let (tool, input) = parse_tool_call(&params["arguments"]);
+            // The injected resolver does the daemon round-trip; deny-on-timeout
+            // and fail-closed-on-no-daemon live there. Any non-"allow" string
+            // is coerced to deny by build_approve_result (deny-default).
+            let decision = resolve(&tool, &input);
+            Some(rpc_response(
+                id,
+                build_approve_result(&decision, Some(&input), None),
+            ))
+        }
+        _ => Some(rpc_error(id, -32601, "method not found")),
+    }
+}
+
+/// Run the blocking stdio JSON-RPC `permission-mcp` server until stdin closes.
+///
+/// The BLOCKING inverse of [`crate::hook::dispatch_hook`]: the hook is
+/// fire-and-forget exit-0; this server sits on Claude's critical path and each
+/// `tools/call` blocks (via the injected `resolve`) until a human decision
+/// arrives or the deadline denies. Accumulates stdin bytes, extracts each frame
+/// with [`parse_frame`] (Content-Length AND line framing), dispatches via
+/// [`dispatch_rpc`], and writes each reply as a `Content-Length`-framed frame to
+/// stdout.
+///
+/// `resolve(tool, &input) -> decision` is the ONLY injected seam: the binary
+/// owns the env read (`$BAUDE_EVENT_URL`-derived permission URL +
+/// `$BAUDE_PERMISSION_TIMEOUT_S`) and the `ureq` POST-then-long-poll, returning
+/// `"allow"`/`"deny"`. Keeping it a closure means the framing/protocol is
+/// unit-tested here while no HTTP dependency enters baude-core. Best-effort
+/// throughout: a malformed frame is skipped, never panicked on (Pitfall 5).
+pub fn run_permission_mcp<R, W, F>(mut input: R, mut output: W, mut resolve: F)
+where
+    R: std::io::Read,
+    W: std::io::Write,
+    F: FnMut(&str, &Value) -> String,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        // Drain any complete frames already buffered.
+        while let Some((req, consumed)) = parse_frame(&buf) {
+            buf.drain(..consumed);
+            if let Some(reply) = dispatch_rpc(&req, |tool, inp| resolve(tool, inp)) {
+                if write_frame(&mut output, &reply).is_err() {
+                    return; // stdout closed — Claude went away.
+                }
+            }
+        }
+        // Need more bytes.
+        match input.read(&mut chunk) {
+            Ok(0) => return, // stdin EOF — Claude closed the server.
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Write one JSON-RPC reply as a `Content-Length`-framed (LSP-style) frame —
+/// the framing baude advertises and the §F UAT confirms 2.1.178 accepts.
+fn write_frame<W: std::io::Write>(out: &mut W, v: &Value) -> std::io::Result<()> {
+    let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+    write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
+    out.write_all(&body)?;
+    out.flush()
+}
+
+/// Derive the daemon `/permission` URL for THIS session from the spawn-injected
+/// `$BAUDE_EVENT_URL` (`…/sessions/{id}/event`). The MCP server inherits the
+/// session shell's exported env (it is a grandchild of the spawn). Returns
+/// `None` when the var is absent (no daemon) — the bridge then fails CLOSED to
+/// deny (never allow), the security-critical no-daemon path.
+pub fn permission_url_from_event_url(event_url: &str) -> Option<String> {
+    let trimmed = event_url.strip_suffix("/event")?;
+    Some(format!("{trimmed}/permission"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +896,155 @@ mod tests {
         // JSON-RPC ids may be strings; echo whatever the request used.
         let r = rpc_response(json!("abc"), json!(null));
         assert_eq!(r["id"].as_str(), Some("abc"));
+    }
+
+    // ---- dispatch_rpc ---------------------------------------------------
+
+    fn never_resolve(_t: &str, _i: &Value) -> String {
+        panic!("resolve must not be called for non tools/call methods");
+    }
+
+    #[test]
+    fn dispatch_initialize() {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize"});
+        let r = dispatch_rpc(&req, never_resolve).unwrap();
+        assert_eq!(r["id"].as_u64(), Some(1));
+        assert_eq!(r["result"]["protocolVersion"].as_str(), Some("2024-11-05"));
+        assert!(r["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(r["result"]["serverInfo"]["name"].as_str(), Some("baude"));
+    }
+
+    #[test]
+    fn dispatch_tools_list_has_one_approve_tool() {
+        let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+        let r = dispatch_rpc(&req, never_resolve).unwrap();
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"].as_str(), Some("approve"));
+        assert!(tools[0]["inputSchema"]["properties"]["tool_name"].is_object());
+    }
+
+    #[test]
+    fn dispatch_tools_call_allow_echoes_input() {
+        let req = json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params": {
+                "name": "approve",
+                "arguments": {"tool_name":"Bash","input":{"command":"ls"}}
+            }
+        });
+        let r = dispatch_rpc(&req, |tool, input| {
+            assert_eq!(tool, "Bash");
+            assert_eq!(input["command"].as_str(), Some("ls"));
+            "allow".to_string()
+        })
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let inner: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inner["behavior"].as_str(), Some("allow"));
+        assert_eq!(inner["updatedInput"]["command"].as_str(), Some("ls"));
+    }
+
+    #[test]
+    fn dispatch_tools_call_deny() {
+        let req = json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params": {"name":"approve","arguments":{"tool_name":"Write","input":{}}}
+        });
+        let r = dispatch_rpc(&req, |_, _| "deny".to_string()).unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let inner: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inner["behavior"].as_str(), Some("deny"));
+    }
+
+    #[test]
+    fn dispatch_tools_call_unknown_decision_coerces_to_deny() {
+        // SECURITY: a resolver returning anything but "allow" denies.
+        let req = json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params": {"name":"approve","arguments":{"tool_name":"Bash","input":{"x":1}}}
+        });
+        let r = dispatch_rpc(&req, |_, _| "weird".to_string()).unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let inner: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inner["behavior"].as_str(), Some("deny"));
+    }
+
+    #[test]
+    fn dispatch_unknown_tool_is_error() {
+        let req = json!({
+            "jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params": {"name":"other","arguments":{}}
+        });
+        let r = dispatch_rpc(&req, |_, _| "allow".to_string()).unwrap();
+        assert_eq!(r["error"]["code"].as_i64(), Some(-32602));
+    }
+
+    #[test]
+    fn dispatch_unknown_method_is_error() {
+        let req = json!({"jsonrpc":"2.0","id":7,"method":"frobnicate"});
+        let r = dispatch_rpc(&req, never_resolve).unwrap();
+        assert_eq!(r["error"]["code"].as_i64(), Some(-32601));
+    }
+
+    #[test]
+    fn dispatch_notification_gets_no_reply() {
+        // No id -> notification -> no response (and resolve never runs).
+        let req = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        assert!(dispatch_rpc(&req, never_resolve).is_none());
+    }
+
+    // ---- run_permission_mcp (the stdio loop, with mock IO) --------------
+
+    #[test]
+    fn run_permission_mcp_full_session_over_mock_io() {
+        // Two line-delimited requests on stdin: initialize then a tools/call.
+        // The resolver approves; assert both replies are Content-Length framed
+        // and that the approve result echoes the input.
+        let stdin = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"approve\",\"arguments\":{\"tool_name\":\"Bash\",\"input\":{\"command\":\"ls\"}}}}\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+        run_permission_mcp(stdin.as_bytes(), &mut out, |_t, _i| "allow".to_string());
+        let s = String::from_utf8(out).unwrap();
+        // Two Content-Length frames written.
+        assert_eq!(s.matches("Content-Length:").count(), 2, "got: {s}");
+        assert!(s.contains("\"protocolVersion\""));
+        assert!(s.contains("\\\"behavior\\\":\\\"allow\\\""), "got: {s}");
+    }
+
+    #[test]
+    fn run_permission_mcp_skips_notifications_and_eofs_clean() {
+        // A notification (no id) yields no frame; EOF ends the loop cleanly.
+        let stdin = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        let mut out: Vec<u8> = Vec::new();
+        run_permission_mcp(stdin.as_bytes(), &mut out, |_, _| {
+            panic!("no tools/call -> resolve unused")
+        });
+        assert!(out.is_empty(), "a notification must produce no reply");
+    }
+
+    #[test]
+    fn run_permission_mcp_content_length_framed_input() {
+        let body = r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#;
+        let stdin = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut out: Vec<u8> = Vec::new();
+        run_permission_mcp(stdin.as_bytes(), &mut out, never_resolve);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\"approve\""), "got: {s}");
+    }
+
+    // ---- permission_url_from_event_url ----------------------------------
+
+    #[test]
+    fn permission_url_derives_from_event_url() {
+        assert_eq!(
+            permission_url_from_event_url("http://127.0.0.1:8642/sessions/7/event").as_deref(),
+            Some("http://127.0.0.1:8642/sessions/7/permission")
+        );
+        // Absent/odd value -> None (the bridge then fails closed to deny).
+        assert!(permission_url_from_event_url("").is_none());
+        assert!(permission_url_from_event_url("http://x/sessions/7").is_none());
     }
 }

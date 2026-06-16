@@ -52,6 +52,76 @@ fn run_hook() -> ! {
     std::process::exit(0);
 }
 
+/// `<binary> permission-mcp` — the blocking stdio JSON-RPC MCP server Claude
+/// invokes (via `--permission-prompt-tool mcp__baude__approve`) for each
+/// unresolved tool-permission decision in `prompt` mode. The BLOCKING inverse of
+/// `run_hook`: where the hook is fire-and-forget exit-0, this sits on Claude's
+/// critical path and each `tools/call` blocks until a human `allow`/`deny`
+/// arrives OR the deadline denies (deny-on-timeout, never auto-allow — V4).
+///
+/// All framing/protocol lives in `baude_core::permission::run_permission_mcp`;
+/// this binary owns only the env read + the `ureq` daemon round-trip (the
+/// `dispatch_hook` split). The resolver POSTs the pending request to
+/// `…/sessions/{id}/permission` then long-polls GET until a decision appears or
+/// `$BAUDE_PERMISSION_TIMEOUT_S` (default 120s) elapses. If `$BAUDE_EVENT_URL`
+/// is absent (no daemon), it fails CLOSED to `deny` (never allow).
+///
+/// NOTE: `bauded` carries a byte-identical `run_permission_mcp` because the
+/// daemon seeds `current_exe()` (= `bauded`) as the `.mcp.json` command — WITHOUT
+/// the arm, `bauded permission-mcp` would fall through and boot a *second
+/// daemon* (the Phase-2 `bauded hook` trap; Pitfall 2). Keep the two in sync.
+fn run_permission_mcp() -> ! {
+    use baude_core::permission::{
+        decide_with_timeout, permission_timeout_s, permission_url_from_event_url,
+    };
+    use std::time::{Duration, Instant};
+
+    let timeout_s = permission_timeout_s();
+    let perm_url = std::env::var("BAUDE_EVENT_URL")
+        .ok()
+        .and_then(|u| permission_url_from_event_url(&u));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_secs(5))
+        .build();
+    let mut req_counter: u64 = 0;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    baude_core::permission::run_permission_mcp(stdin.lock(), stdout.lock(), |tool, input| {
+        // Fail closed: no daemon URL -> deny (never allow) — the no-daemon path.
+        let Some(perm_url) = perm_url.as_deref() else {
+            return "deny".to_string();
+        };
+        req_counter += 1;
+        let request_id = format!("{}-{}", std::process::id(), req_counter);
+        let req = serde_json::json!({ "request_id": request_id, "tool": tool, "input": input });
+        // Register the pending request (best-effort POST). A failure still falls
+        // into the poll loop, which denies on the deadline.
+        let _ = agent.post(perm_url).send_string(&req.to_string());
+
+        // Long-poll GET until a decision for THIS request appears or the
+        // deadline passes -> deny (deny-on-timeout, security-critical, V4).
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
+        loop {
+            let mut decision: Option<String> = None;
+            if let Ok(resp) = agent.get(perm_url).query("wait", "5").call() {
+                if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    if v["request_id"].as_str() == Some(request_id.as_str()) {
+                        decision = v["decision"].as_str().map(str::to_string);
+                    }
+                }
+            }
+            let passed = Instant::now() >= deadline;
+            match decide_with_timeout(decision.as_deref(), passed) {
+                "" => std::thread::sleep(Duration::from_millis(500)), // keep polling
+                verdict => break verdict.to_string(),
+            }
+        }
+    });
+    std::process::exit(0);
+}
+
 fn main() -> Result<()> {
     // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
     // Must be dispatched before anything touches the terminal: Claude Code
@@ -74,6 +144,15 @@ fn main() -> Result<()> {
     // Claude (a non-zero exit is a blocking signal to the CLI).
     if args.get(1).map(String::as_str) == Some("hook") {
         run_hook();
+    }
+
+    // `baude permission-mcp` — the blocking stdio JSON-RPC permission bridge
+    // Claude invokes in `prompt` mode. MUST be dispatched before the TUI
+    // touches the terminal (it speaks MCP on stdio, no UI). Byte-identical to
+    // the `bauded` arm (Pitfall 2). Blocks on Claude's critical path with
+    // deny-on-timeout — contrast `hook`'s always-exit-0.
+    if args.get(1).map(String::as_str) == Some("permission-mcp") {
+        run_permission_mcp();
     }
 
     let launch_dir = std::env::args()

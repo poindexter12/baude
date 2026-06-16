@@ -118,41 +118,6 @@ pub struct PermissionView {
     pub scope: Option<String>,
 }
 
-/// Read the deny-on-timeout window (`BAUDE_PERMISSION_TIMEOUT_S`, default 120s).
-/// A missing/garbage/zero value falls back to the default — never 0 (which would
-/// deny instantly) and never panics. The deny-default makes any value safe.
-// Consumed by the `run_permission_mcp` bridge (04-02 Task 3, same plan); tested
-// here now. The allow is removed once the bridge wires it in.
-#[allow(dead_code)]
-pub fn permission_timeout_s() -> u64 {
-    const DEFAULT: u64 = 120;
-    std::env::var("BAUDE_PERMISSION_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
-}
-
-/// The pure deny-on-timeout resolution rule (SECURITY-CRITICAL, T-04-04 / V4).
-///
-/// Given the decision read so far (`None` = none yet) and whether the deadline
-/// has passed, return the final verdict the bridge emits:
-/// - a recorded `"allow"` wins (the human approved);
-/// - a recorded non-`"allow"` value coerces to `"deny"` (deny-default — an
-///   unknown value is NEVER allow);
-/// - no decision AND deadline passed -> `"deny"` (never auto-allow);
-/// - no decision AND still within the window -> `""` (keep polling).
-// Consumed by the `run_permission_mcp` bridge (04-02 Task 3, same plan).
-#[allow(dead_code)]
-pub fn decide_with_timeout(decision: Option<&str>, deadline_passed: bool) -> &'static str {
-    match decision {
-        Some("allow") => "allow",
-        Some(_) => "deny",
-        None if deadline_passed => "deny",
-        None => "",
-    }
-}
-
 fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         dirs::home_dir()
@@ -1392,8 +1357,9 @@ mod tests {
     #[test]
     fn timeout_with_no_decision_resolves_to_deny() {
         // SECURITY-CRITICAL (T-04-04 / V4): when the deadline passes with no
-        // POSTed decision, the resolution is DENY — never allow.
-        // `decide_with_timeout` is the pure deny-on-timeout rule.
+        // POSTed decision, the resolution is DENY — never allow. The pure rule
+        // lives in baude-core so both binaries' bridges share it.
+        use baude_core::permission::decide_with_timeout;
         let none: Option<&str> = None;
         assert_eq!(decide_with_timeout(none, true), "deny"); // deadline passed, no decision
         assert_eq!(decide_with_timeout(Some("allow"), true), "allow"); // decision wins even at deadline
@@ -1408,7 +1374,7 @@ mod tests {
     fn permission_timeout_s_reads_env_with_safe_default() {
         // Default ~120s; an explicit env value is honored; a garbage value
         // falls back to the default (never 0 / never panics).
-        assert!(permission_timeout_s() >= 1);
+        assert!(baude_core::permission::permission_timeout_s() >= 1);
     }
 
     #[test]
