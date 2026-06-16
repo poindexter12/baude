@@ -140,7 +140,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2; 03 and 04 run in parallel — no file overlap)*
 
-- [ ] 04-03-PLAN.md — waiting_reason enum on SessionInfo/RemoteInfo + distinct notified_permission push (PERM-04)
+- [x] 04-03-PLAN.md — waiting_reason enum on SessionInfo/RemoteInfo + distinct notified_permission push (PERM-04)
 - [ ] 04-04-PLAN.md — PWA approve/deny card above the composer — manual UAT (PERM-03)
 
 ## Progress
@@ -156,4 +156,4 @@ other and may be planned/executed in either order once Phase 2 lands.)
 | 1. Full Status-Line Capture | 3/3 | Complete   | 2026-06-15 |
 | 2. Hook-Driven Status | 3/3 | Complete   | 2026-06-15 |
 | 3. Tool-Activity Timeline | 4/4 | Complete   | 2026-06-15 |
-| 4. Remote Permission Approval | 2/4 | In Progress|  |
+| 4. Remote Permission Approval | 3/4 | In Progress|  |

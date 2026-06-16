@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.7
 milestone_name: milestone
 status: executing
-stopped_at: 04-02 code tasks complete (permission-mcp bridge + daemon pending state + /permission routes, CI triad green); PAUSED at §F CONTRACT human-verify gate (Task 4 — needs live claude 2.1.178)
-last_updated: "2026-06-16T00:13:19.359Z"
-last_activity: 2026-06-15 -- 04-02 code complete, paused at §F CONTRACT gate
+stopped_at: Completed 04-03-PLAN.md
+last_updated: "2026-06-16T00:22:53.870Z"
+last_activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 75
 ---
 
@@ -26,8 +26,8 @@ See: .planning/PROJECT.md (updated 2026-06-15)
 ## Current Position
 
 Phase: 04 (remote-permission-approval) — EXECUTING
-Plan: 2 of 4
-Status: Executing Phase 04 (04-02 code complete; PAUSED at §F CONTRACT human-verify gate)
+Plan: 3 of 4
+Status: Ready to execute
 Last activity: 2026-06-15 -- 04-02 code complete (permission-mcp bridge + /permission routes); §F CONTRACT gate pending
 
 Progress: [████████░░] 79%
@@ -59,6 +59,7 @@ Recent decisions affecting current work (full log in PROJECT.md Key Decisions):
 - 04-01: permission flag appended to base cmd unconditionally (mode-driven, not command-sniffing); merge_mcp_config pure non-clobbering seed (only mcpServers.baude set) shared by both spawn sites
 - [Phase 04]: 04-02: permission wire-contract functions (parse_frame/parse_tool_call/build_approve_result) isolated in baude-core so the §F CONTRACT UAT corrects them cheaply
 - [Phase 04]: 04-02: deny-on-timeout (decide_with_timeout) + permission_timeout_s live in baude-core, single-sourced by both binaries' bridges (security-critical V4)
+- [Phase ?]: Permission push stays lean (no tool name); detail via GET /permission (T-04-10)
 
 ### Pending Todos
 
@@ -72,9 +73,9 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-16T00:11:57.341Z
-Stopped at: 04-01 complete (BAUDE_PERMISSION_MODE spawn-flag selection, PERM-01); ready for 04-02
-Resume file: 04-02-PLAN.md
+Last session: 2026-06-16T00:22:44.814Z
+Stopped at: Completed 04-03-PLAN.md
+Resume file: None
 
 ## Performance Metrics
 
@@ -86,3 +87,4 @@ Resume file: 04-02-PLAN.md
 | Phase 03 P02 | 5min | 2 tasks | 4 files |
 | Phase 03 P03 | 8min | 1 tasks | 3 files |
 | Phase 04 P01 | 10min | 2 tasks | 5 files |
+| Phase 04 P03 | 4min | 2 tasks | 5 files |

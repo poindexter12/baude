@@ -35,7 +35,7 @@ Requirements for the v0.7 milestone. Each maps to roadmap phases.
 - [ ] **PERM-01**: A per-deploy `BAUDE_PERMISSION_MODE = skip | prompt` (default `skip`) controls whether managed sessions run `--dangerously-skip-permissions` or route tool calls to baude via `--permission-prompt-tool`; `skip` preserves today's unattended behaviour
 - [ ] **PERM-02**: `GET /sessions/{id}/permission` returns the pending request (if any); `POST /sessions/{id}/permission {decision: allow|deny, scope?}` resolves it
 - [ ] **PERM-03**: The PWA chat view shows an approve/deny card while a permission request is pending
-- [ ] **PERM-04**: A pending permission fires a distinct push (e.g. "wants to run `rm -rf build/` — approve?") separate from the generic "waiting" push, driven by the `Notification` hook and a `waiting_reason` (`permission` | `input` | none) on `SessionInfo`
+- [x] **PERM-04**: A pending permission fires a distinct push (e.g. "wants to run `rm -rf build/` — approve?") separate from the generic "waiting" push, driven by the `Notification` hook and a `waiting_reason` (`permission` | `input` | none) on `SessionInfo`
 
 ## v2 Requirements
 
@@ -91,7 +91,7 @@ Mapped to roadmap phases (see `.planning/ROADMAP.md`).
 | PERM-01 | Phase 4 | In Progress (04-01: spawn-flag selection + .mcp.json seed done; prompt-routing bridge in 04-02) |
 | PERM-02 | Phase 4 | Pending |
 | PERM-03 | Phase 4 | Pending |
-| PERM-04 | Phase 4 | Pending |
+| PERM-04 | Phase 4 | Complete |
 
 **Coverage:**
 
