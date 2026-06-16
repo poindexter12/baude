@@ -16,6 +16,10 @@ pub struct Notifier {
     notified_waiting: HashSet<u64>,
     /// Sessions already notified as exited.
     notified_exited: HashSet<u64>,
+    /// PERM-04: sessions already notified for their current pending
+    /// tool-permission request. Distinct from `notified_waiting` so a pending
+    /// permission gets its own push; re-armed when `waiting_reason` flips away.
+    notified_permission: HashSet<u64>,
     last_status: HashMap<u64, String>,
 }
 
@@ -44,6 +48,7 @@ impl Notifier {
         let live: HashSet<u64> = sessions.iter().map(|s| s.id).collect();
         self.notified_waiting.retain(|id| live.contains(id));
         self.notified_exited.retain(|id| live.contains(id));
+        self.notified_permission.retain(|id| live.contains(id));
         self.last_status.retain(|id, _| live.contains(id));
 
         for s in sessions {
@@ -51,10 +56,31 @@ impl Notifier {
             // keep last_status current so unarchiving doesn't false-fire.
             if s.archived {
                 self.notified_waiting.remove(&s.id);
+                self.notified_permission.remove(&s.id);
                 self.last_status.insert(s.id, s.status.to_string());
                 continue;
             }
+            // PERM-04: a pending tool-permission request gets its OWN distinct
+            // push and must NOT also fire the generic waiting push (mutually
+            // exclusive). Re-arm the permission notifier whenever the reason is
+            // no longer "permission" (resolve / a new turn).
+            let is_permission = s.waiting_reason.as_deref() == Some("permission");
+            if !is_permission {
+                self.notified_permission.remove(&s.id);
+            }
             match s.status {
+                "waiting" if is_permission => {
+                    if self.notified_permission.insert(s.id) {
+                        out.push(Notification {
+                            // Lean body (CONTEXT "push stays lean"): the phone
+                            // fetches the tool/input detail from GET /permission
+                            // when it opens the card — no tool name in the push.
+                            title: format!("{} needs permission", s.name),
+                            body: "wants to run a tool — approve?".into(),
+                            sid: s.id,
+                        });
+                    }
+                }
                 "waiting" => {
                     let waited = s.waiting_for_ms.unwrap_or(0);
                     if waited >= WAITING_DEBOUNCE_MS && self.notified_waiting.insert(s.id) {
