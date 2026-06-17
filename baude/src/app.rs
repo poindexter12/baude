@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use baude_core::git;
@@ -119,6 +121,49 @@ pub enum Modal {
     },
 }
 
+/// Active text selection within a content pane (claude or shell).
+/// Coordinates are relative to the pane's inner rect (0-indexed).
+pub struct Selection {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    /// The terminal-absolute inner rect of the pane the selection lives in,
+    /// captured at mouse-down so drags map correctly even if layout shifts.
+    pub pane_area: Rect,
+    pub is_shell: bool,
+}
+
+impl Selection {
+    /// Normalize so start <= end (for rendering and extraction).
+    pub fn normalized(&self) -> (u16, u16, u16, u16) {
+        if self.start_row < self.end_row
+            || (self.start_row == self.end_row && self.start_col <= self.end_col)
+        {
+            (self.start_row, self.start_col, self.end_row, self.end_col)
+        } else {
+            (self.end_row, self.end_col, self.start_row, self.start_col)
+        }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let (sr, sc, er, ec) = self.normalized();
+        if row < sr || row > er {
+            return false;
+        }
+        if sr == er {
+            return col >= sc && col <= ec;
+        }
+        if row == sr {
+            return col >= sc;
+        }
+        if row == er {
+            return col <= ec;
+        }
+        true
+    }
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected_id: Option<SelId>,
@@ -137,6 +182,12 @@ pub struct App {
     pub remote_snap: RemoteSnapshot,
     /// At most one live raw attach to a remote session.
     pub attach: Option<RemoteAttach>,
+    /// Scrollback offset for the selected session's claude pane.
+    pub claude_scroll: usize,
+    /// Scrollback offset for the selected session's shell pane.
+    pub shell_scroll: usize,
+    /// Active text selection (if any).
+    pub selection: Option<Selection>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -214,6 +265,9 @@ impl App {
             remote,
             remote_snap: RemoteSnapshot::default(),
             attach: None,
+            claude_scroll: 0,
+            shell_scroll: 0,
+            selection: None,
         }
     }
 
@@ -627,7 +681,9 @@ impl App {
     }
 
     /// Resize every session's PTYs to match the geometry they would render at.
-    pub fn sync_sizes(&mut self, content: Rect) {
+    pub fn sync_sizes(&mut self, area: Rect) {
+        let rects = crate::ui::layout(area);
+        let content = rects.content;
         self.content_rect = content;
         for s in &mut self.sessions {
             let (claude_rect, shell_rect) = pane_rects(content, s.shell_open);
@@ -657,11 +713,13 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Paste(text) => self.handle_paste(text),
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
             _ => {}
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        self.selection = None;
         if !matches!(self.modal, Modal::None) {
             self.handle_modal_key(key);
             return;
@@ -699,6 +757,11 @@ impl App {
     }
 
     fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
+        if to_shell {
+            self.shell_scroll = 0;
+        } else {
+            self.claude_scroll = 0;
+        }
         if !to_shell {
             if let Some(SelId::Remote(id)) = self.selected_id {
                 let Some(a) = &self.attach else { return };
@@ -1129,6 +1192,11 @@ impl App {
             .and_then(|id| ids.iter().position(|&x| x == id))
             .unwrap_or(0) as i64;
         let next = (cur + delta).clamp(0, ids.len() as i64 - 1) as usize;
+        if self.selected_id != Some(ids[next]) {
+            self.claude_scroll = 0;
+            self.shell_scroll = 0;
+            self.selection = None;
+        }
         self.selected_id = Some(ids[next]);
     }
 
@@ -1151,6 +1219,9 @@ impl App {
             .and_then(|id| ids.iter().position(|&x| x == id))
             .unwrap_or(0) as i64;
         let next = (((cur + delta) % len) + len) % len;
+        self.claude_scroll = 0;
+        self.shell_scroll = 0;
+        self.selection = None;
         self.selected_id = Some(ids[next as usize]);
         if self.focus == Focus::Shell {
             let has_shell = self
@@ -1236,6 +1307,125 @@ impl App {
                 self.focus = Focus::Claude;
             }
             Err(e) => self.set_message(format!("restart failed: {e}")),
+        }
+    }
+
+    // ---- mouse handling ----
+
+    fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    fn content_pane_rects(&self) -> (Rect, Option<Rect>) {
+        let shell_open = self.selected().map(|s| s.shell_open).unwrap_or(false);
+        let (claude_rect, shell_rect) = pane_rects(self.content_rect, shell_open);
+        (inner(claude_rect), shell_rect.map(inner))
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        let col = mouse.column;
+        let row = mouse.row;
+        let (claude_inner, shell_inner) = self.content_pane_rects();
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.selection = None;
+                if Self::rect_contains(claude_inner, col, row) {
+                    self.claude_scroll = self.claude_scroll.saturating_add(3);
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    self.shell_scroll = self.shell_scroll.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.selection = None;
+                if Self::rect_contains(claude_inner, col, row) {
+                    self.claude_scroll = self.claude_scroll.saturating_sub(3);
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    self.shell_scroll = self.shell_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (pane_area, is_shell) =
+                    if Self::rect_contains(claude_inner, col, row) {
+                        (claude_inner, false)
+                    } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                        (shell_inner.unwrap(), true)
+                    } else {
+                        self.selection = None;
+                        return;
+                    };
+                let r = row.saturating_sub(pane_area.y);
+                let c = col.saturating_sub(pane_area.x);
+                self.selection = Some(Selection {
+                    start_row: r,
+                    start_col: c,
+                    end_row: r,
+                    end_col: c,
+                    pane_area,
+                    is_shell,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection {
+                    let r = row.saturating_sub(sel.pane_area.y).min(sel.pane_area.height.saturating_sub(1));
+                    let c = col.saturating_sub(sel.pane_area.x).min(sel.pane_area.width.saturating_sub(1));
+                    sel.end_row = r;
+                    sel.end_col = c;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(sel) = self.selection.take() {
+                    let (sr, sc, er, ec) = sel.normalized();
+                    if sr == er && sc == ec {
+                        return;
+                    }
+                    let scroll = if sel.is_shell {
+                        self.shell_scroll
+                    } else {
+                        self.claude_scroll
+                    };
+                    let parser = if sel.is_shell {
+                        self.selected()
+                            .and_then(|s| s.shell.as_ref())
+                            .map(|p| &p.parser)
+                    } else {
+                        match self.selected_id {
+                            Some(SelId::Remote(_)) => {
+                                self.attach.as_ref().map(|a| &a.parser)
+                            }
+                            _ => self.selected().map(|s| &s.claude.parser),
+                        }
+                    };
+                    if let Some(parser) = parser {
+                        if let Ok(mut p) = parser.lock() {
+                            p.set_scrollback(scroll);
+                            let text = p.screen().contents_between(sr, sc, er, ec + 1);
+                            p.set_scrollback(0);
+                            if !text.is_empty() {
+                                Self::copy_to_clipboard(&text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_to_clipboard(text: &str) {
+        use std::io::Write;
+        if let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
 use crate::remote::RemoteInfo;
 use crate::usage::human_cost;
 
-pub const SIDEBAR_WIDTH: u16 = 28;
+pub const SIDEBAR_WIDTH: u16 = 42;
 
 pub struct LayoutRects {
     pub sidebar: Rect,
@@ -466,6 +466,11 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
 
     let (claude_rect, shell_rect) = pane_rects(area, s.shell_open);
 
+    let scroll_hint = if app.claude_scroll > 0 {
+        format!(" ↑{} ", app.claude_scroll)
+    } else {
+        String::new()
+    };
     let status_word = match s.status() {
         Status::Waiting => " waiting ",
         Status::Busy => " working ",
@@ -477,29 +482,52 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         .as_deref()
         .map(|m| format!("· {} ", short_mode(m)))
         .unwrap_or_default();
-    let title = format!(" {} ·{}{}", s.name, status_word, mode_word);
+    let title = format!(" {} ·{}{}{}", s.name, status_word, mode_word, scroll_hint);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style(app.focus == Focus::Claude))
         .title(title);
     frame.render_widget(block, claude_rect);
+
+    let claude_sel = app
+        .selection
+        .as_ref()
+        .filter(|s| !s.is_shell);
     draw_term(
         frame,
         inner(claude_rect),
         &s.claude.parser,
         app.focus == Focus::Claude,
+        app.claude_scroll,
+        claude_sel,
     );
 
     if let Some(sr) = shell_rect {
+        let shell_scroll_hint = if app.shell_scroll > 0 {
+            format!(" ↑{} ", app.shell_scroll)
+        } else {
+            String::new()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style(app.focus == Focus::Shell))
-            .title(format!(" shell @ {} ", s.cwd.display()));
+            .title(format!(" shell @ {} {}", s.cwd.display(), shell_scroll_hint));
         frame.render_widget(block, sr);
         if let Some(shell) = &s.shell {
-            draw_term(frame, inner(sr), &shell.parser, app.focus == Focus::Shell);
+            let shell_sel = app
+                .selection
+                .as_ref()
+                .filter(|s| s.is_shell);
+            draw_term(
+                frame,
+                inner(sr),
+                &shell.parser,
+                app.focus == Focus::Shell,
+                app.shell_scroll,
+                shell_sel,
+            );
         }
     }
 }
@@ -523,7 +551,17 @@ fn draw_remote_content(frame: &mut Frame, app: &App, area: Rect, r: &RemoteInfo)
         .as_ref()
         .filter(|a| a.remote_id == r.id && !a.is_closed());
     match attached {
-        Some(a) => draw_term(frame, inner(area), &a.parser, app.focus == Focus::Claude),
+        Some(a) => {
+            let sel = app.selection.as_ref().filter(|s| !s.is_shell);
+            draw_term(
+                frame,
+                inner(area),
+                &a.parser,
+                app.focus == Focus::Claude,
+                app.claude_scroll,
+                sel,
+            );
+        }
         None => {
             let dim = Style::default().fg(Color::DarkGray);
             let hint = Paragraph::new(vec![
@@ -548,66 +586,75 @@ fn draw_term(
     area: Rect,
     parser: &std::sync::Mutex<vt100::Parser>,
     focused: bool,
+    scroll_offset: usize,
+    selection: Option<&crate::app::Selection>,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Ok(parser) = parser.lock() else {
+    let Ok(mut parser) = parser.lock() else {
         return;
     };
-    let screen = parser.screen();
-    let (srows, scols) = screen.size();
-    let rows = area.height.min(srows);
-    let cols = area.width.min(scols);
-    let buf = frame.buffer_mut();
+    parser.set_scrollback(scroll_offset);
+    {
+        let screen = parser.screen();
+        let (srows, scols) = screen.size();
+        let rows = area.height.min(srows);
+        let cols = area.width.min(scols);
+        let buf = frame.buffer_mut();
 
-    for row in 0..rows {
-        let mut col = 0u16;
-        while col < cols {
-            let x = area.x + col;
-            let y = area.y + row;
-            let Some(cell) = screen.cell(row, col) else {
-                col += 1;
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                col += 1;
-                continue;
+        for row in 0..rows {
+            let mut col = 0u16;
+            while col < cols {
+                let x = area.x + col;
+                let y = area.y + row;
+                let Some(cell) = screen.cell(row, col) else {
+                    col += 1;
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    col += 1;
+                    continue;
+                }
+                let target = &mut buf[(x, y)];
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    target.set_symbol(" ");
+                } else {
+                    target.set_symbol(&contents);
+                }
+                target.set_fg(vt_color(cell.fgcolor()));
+                target.set_bg(vt_color(cell.bgcolor()));
+                let mut mods = Modifier::empty();
+                if cell.bold() {
+                    mods |= Modifier::BOLD;
+                }
+                if cell.italic() {
+                    mods |= Modifier::ITALIC;
+                }
+                if cell.underline() {
+                    mods |= Modifier::UNDERLINED;
+                }
+                if cell.inverse() {
+                    mods |= Modifier::REVERSED;
+                }
+                if selection.map(|s| s.contains(row, col)) == Some(true) {
+                    mods ^= Modifier::REVERSED;
+                }
+                target.modifier = mods;
+                col += if cell.is_wide() { 2 } else { 1 };
             }
-            let target = &mut buf[(x, y)];
-            let contents = cell.contents();
-            if contents.is_empty() {
-                target.set_symbol(" ");
-            } else {
-                target.set_symbol(&contents);
+        }
+
+        if scroll_offset == 0 && focused && !screen.hide_cursor() {
+            let (crow, ccol) = screen.cursor_position();
+            if crow < rows && ccol < cols {
+                let cell = &mut buf[(area.x + ccol, area.y + crow)];
+                cell.modifier ^= Modifier::REVERSED;
             }
-            target.set_fg(vt_color(cell.fgcolor()));
-            target.set_bg(vt_color(cell.bgcolor()));
-            let mut mods = Modifier::empty();
-            if cell.bold() {
-                mods |= Modifier::BOLD;
-            }
-            if cell.italic() {
-                mods |= Modifier::ITALIC;
-            }
-            if cell.underline() {
-                mods |= Modifier::UNDERLINED;
-            }
-            if cell.inverse() {
-                mods |= Modifier::REVERSED;
-            }
-            target.modifier = mods;
-            col += if cell.is_wide() { 2 } else { 1 };
         }
     }
-
-    if focused && !screen.hide_cursor() {
-        let (crow, ccol) = screen.cursor_position();
-        if crow < rows && ccol < cols {
-            let cell = &mut buf[(area.x + ccol, area.y + crow)];
-            cell.modifier ^= Modifier::REVERSED;
-        }
-    }
+    parser.set_scrollback(0);
 }
 
 /// Shorten a path for display: home → `~`.

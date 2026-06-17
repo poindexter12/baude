@@ -8,7 +8,9 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -18,7 +20,12 @@ use app::App;
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
 }
 
 /// `<binary> hook` — Claude Code lifecycle-event hook, no TUI. Claude invokes it
@@ -180,7 +187,12 @@ fn main() -> Result<()> {
     }));
 
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(launch_dir);
@@ -202,8 +214,7 @@ fn run(
         app.tick();
 
         let area = terminal.get_frame().area();
-        let rects = ui::layout(area);
-        app.sync_sizes(rects.content);
+        app.sync_sizes(area);
 
         terminal.draw(|frame| ui::draw(frame, app))?;
 
