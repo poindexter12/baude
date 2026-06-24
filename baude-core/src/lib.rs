@@ -6,7 +6,9 @@ pub use vt100;
 
 pub mod bridge;
 pub mod git;
+pub mod hook;
 pub mod meta;
+pub mod permission;
 pub mod persist;
 pub mod pty;
 pub mod session;

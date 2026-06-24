@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use baude_core::meta::HookEvent;
 use baude_core::pty::now_ms;
 use baude_core::vt100;
 
@@ -26,10 +27,41 @@ pub struct RemoteInfo {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_used_pct: Option<u8>,
+    /// The session's active 5h rate-limit window (used % + reset), mirrored
+    /// from `SessionInfo`. `#[serde(default)]` so an older daemon that omits
+    /// these deserializes to `None` (back-compat, like the fields below).
+    #[serde(default)]
+    pub rate_5h_used_pct: Option<u8>,
+    #[serde(default)]
+    pub rate_5h_resets_at_unix_s: Option<u64>,
     pub branch: Option<String>,
     pub session_cost_usd: Option<f64>,
+    /// Which source decided `status` ("hook"/"session-file"/"silence"); shown
+    /// in the remote info overlay so a regression to silence is observable.
+    #[serde(default)]
+    pub state_source: Option<String>,
+    /// The last tool the daemon-managed session ran, if any.
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    /// PERM-04: why the session is waiting — `"permission"` / `"input"` /
+    /// absent. `#[serde(default)]` keeps an older daemon (which omits the
+    /// field) deserializing to `None` (backward-compat, mirroring the fields
+    /// above).
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// Recent (~30) tool-activity events bundled into the `/sessions` poll so
+    /// the remote activity overlay needs no extra round-trip. Defaults to an
+    /// empty Vec against an older daemon that omits the field (backward-compat,
+    /// mirroring the `#[serde(default)]` fields above).
+    #[serde(default)]
+    pub activity: Vec<HookEvent>,
+    /// BL-03: compact GSD active phase (e.g. `4`), surfaced in the remote line
+    /// so daemon sessions show GSD state like local ones. `#[serde(default)]`
+    /// for back-compat with a daemon that omits it.
+    #[serde(default)]
+    pub gsd_active_phase: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -251,5 +283,41 @@ impl RemoteAttach {
 impl Drop for RemoteAttach {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An older daemon that omits `activity` must still deserialize — the
+    /// field defaults to an empty Vec (T-03-11 backward-compat). The rest of
+    /// the `#[serde(default)]` optionals are also exercised by their absence.
+    #[test]
+    fn remote_info_deserializes_without_activity() {
+        let json = r#"{"id":7,"name":"alpha","title":null,"status":"working",
+            "waiting_for_ms":null,"model":null,"permission_mode":null,
+            "context_used_pct":null,"branch":null,"session_cost_usd":null}"#;
+        let r: RemoteInfo = serde_json::from_str(json).expect("deserialize without activity");
+        assert_eq!(r.id, 7);
+        assert!(r.activity.is_empty(), "missing activity defaults to empty");
+    }
+
+    /// A daemon that bundles `activity` deserializes it into the overlay's
+    /// source Vec — the remote branch reads this directly, no round-trip.
+    #[test]
+    fn remote_info_deserializes_with_activity() {
+        let json = r#"{"id":7,"name":"alpha","status":"working","activity":[
+            {"event":"PostToolUse","tool":"Bash","ts":1000},
+            {"event":"Notification","notification_type":"permission","ts":2000}
+        ]}"#;
+        let r: RemoteInfo = serde_json::from_str(json).expect("deserialize with activity");
+        assert_eq!(r.activity.len(), 2);
+        assert_eq!(r.activity[0].event, "PostToolUse");
+        assert_eq!(r.activity[0].tool.as_deref(), Some("Bash"));
+        assert_eq!(
+            r.activity[1].notification_type.as_deref(),
+            Some("permission")
+        );
     }
 }

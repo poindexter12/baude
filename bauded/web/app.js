@@ -21,6 +21,11 @@ const state = {
   screenTimer: null,
   queue: [], // messages typed while busy, not yet picked up
   pushOn: false,
+  activity: [], // ordered tool-activity events (oldest→newest)
+  activityOpen: false, // collapsible strip state (collapsed by default)
+  aes: null, // activity EventSource
+  aesBuffer: null, // activity events received before backfill loaded
+  pendingPermission: null, // GET /permission view while waiting_reason === "permission" (else null)
 };
 
 // ---- helpers ----
@@ -36,6 +41,31 @@ function humanMs(ms) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+}
+
+// "in 2h12m" until a unix-seconds timestamp (the 5h rate-limit reset), "now"
+// once elapsed. Mirrors the TUI's human_until for the per-session 5h chip.
+function untilShort(unixS) {
+  const ms = unixS * 1000 - Date.now();
+  return ms <= 0 ? "now" : "in " + humanMs(ms);
+}
+
+// BL-03: compact GSD chip "⬡ <milestone> ph<phase>" (both optional), so the PWA
+// surfaces GSD state like the TUI. Every dynamic field esc()'d. Null when no
+// GSD state is present (the session isn't GSD-tracked).
+function gsdChip(s) {
+  const ms = s.gsd_milestone ? esc(s.gsd_milestone) : null;
+  const ph = s.gsd_active_phase ? `ph${esc(s.gsd_active_phase)}` : null;
+  const body = [ms, ph].filter(Boolean).join(" ");
+  return body ? `⬡ ${body}` : null;
+}
+
+// Compact relative age for an event ts (unix ms), mirroring the TUI's
+// activity_age: "now" for <1s, else humanMs (IN-01).
+function activityAge(ts) {
+  if (!ts) return "";
+  const ms = Math.max(0, Date.now() - ts);
+  return ms < 1000 ? "now" : humanMs(ms);
 }
 
 function shortModel(m) {
@@ -91,8 +121,11 @@ function route() {
     state.screenOpen = false;
     state.screenText = "";
     state.queue = [];
+    state.activity = [];
+    state.activityOpen = false;
+    state.pendingPermission = null;
     clearInterval(state.screenTimer);
-    if (sid !== null) openChat(sid);
+    if (sid !== null) { openChat(sid); openActivity(sid); }
   }
   render();
   refresh();
@@ -110,6 +143,20 @@ async function refresh() {
     }
   } catch {
     state.online = false;
+  }
+  // Drive the permission card off the open session's waiting_reason. This is the
+  // signal a permission push/SSE update surfaces (waiting_reason === "permission"
+  // arrives in /sessions), and it also covers chat open (route() → refresh()).
+  // Fetch the detail from GET /permission when waiting; clear it otherwise.
+  if (state.sid !== null) {
+    const s = session(state.sid);
+    if (s && s.waiting_reason === "permission") {
+      fetchPermission(state.sid); // async; renders when it lands
+    } else if (state.pendingPermission) {
+      state.pendingPermission = null;
+    }
+  } else if (state.pendingPermission) {
+    state.pendingPermission = null;
   }
   render();
 }
@@ -131,6 +178,11 @@ function closeStream() {
   if (state.es) state.es.close();
   state.es = null;
   state.esBuffer = null;
+  // Tear the activity SSE down too, so the second EventSource never leaks
+  // across views (Pitfall 5).
+  if (state.aes) state.aes.close();
+  state.aes = null;
+  state.aesBuffer = null;
 }
 
 function addMsg(m) {
@@ -175,6 +227,93 @@ function scrollChat(force) {
   if (force || nearBottom) el.scrollTop = el.scrollHeight;
 }
 
+// ---- activity strip ----
+
+// GET-then-SSE-with-buffer, mirroring openChat: connect the live tail first and
+// buffer, then load the recent snapshot, then drain — nothing can fall between
+// the snapshot and the live tail. The strip channel is standalone (Pitfall 1),
+// keyless (Pitfall 2: append-only, no Event::id), and closed on view exit.
+async function openActivity(sid) {
+  state.aesBuffer = [];
+  const es = new EventSource(`/sessions/${sid}/activity-stream`);
+  state.aes = es;
+  es.onmessage = (ev) => {
+    if (state.sid !== sid) return;
+    const e = JSON.parse(ev.data);
+    if (state.aesBuffer) state.aesBuffer.push(e);
+    else { state.activity.push(e); render(); scrollActivity(); }
+  };
+  es.onerror = () => {
+    // EventSource auto-reconnects; for a deleted session the reconnect 404s and
+    // would churn forever. When the browser has given up (CLOSED), tear it down
+    // instead of letting it retry against a session that will never return (WR-02).
+    if (es.readyState === EventSource.CLOSED) {
+      es.close();
+      if (state.aes === es) state.aes = null;
+    }
+  };
+  try {
+    const recent = await api(`/sessions/${sid}/activity?limit=30`);
+    if (state.sid !== sid) return;
+    state.activity = recent;
+    // De-dup at the seam: the snapshot reads the in-memory ring while the SSE
+    // seeds from on-disk EOF, so an event appended around T0 can appear in both.
+    // Events are append-only with monotonic ts, so drop any buffered SSE event
+    // that is not strictly newer than the last snapshot event (WR-01).
+    const lastTs = recent.length ? recent[recent.length - 1].ts || 0 : 0;
+    for (const e of state.aesBuffer || []) {
+      if ((e.ts || 0) > lastTs) state.activity.push(e);
+    }
+    state.aesBuffer = null;
+    render();
+    scrollActivity();
+  } catch {
+    // 404 / offline — the chat view's own poll handles redirect; leave the
+    // strip empty rather than throwing.
+    state.aesBuffer = null;
+  }
+}
+
+function scrollActivity() {
+  const el = document.getElementById("activity-feed");
+  if (!el) return;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
+// One line per event: icon + tool/notification_type/event + relative time.
+// Every event-origin field is esc()-escaped before innerHTML (XSS — T-03-09).
+function activityIcon(e) {
+  if (e.event === "PostToolUse") return "⚙";
+  if (e.event === "Notification") return "🔔";
+  if (e.event === "UserPromptSubmit") return "✎";
+  if (e.event === "Stop") return "■";
+  return "•";
+}
+
+// Mirror the TUI's activity_label: the tool name for tool uses, the
+// notification type for notifications, else the event kind itself (IN-02).
+function activityLabel(e) {
+  if (e.event === "PostToolUse") return e.tool || "tool";
+  if (e.event === "Notification") return e.notification_type || "notification";
+  return e.event || "event";
+}
+
+function activityRowHtml(e) {
+  const rel = activityAge(e.ts);
+  return `<div class="act-row">
+    <span class="act-icon">${esc(activityIcon(e))}</span>
+    <span class="act-label">${esc(activityLabel(e))}</span>
+    <span class="act-time">${esc(rel)}</span>
+  </div>`;
+}
+
+function toggleActivity() {
+  state.activityOpen = !state.activityOpen;
+  render();
+  if (state.activityOpen) scrollActivity();
+}
+
 // ---- actions ----
 
 async function sendMessage() {
@@ -205,6 +344,65 @@ async function interrupt() {
     toast(`interrupt failed: ${e.message}`);
   }
 }
+
+// ---- permission approval ----
+
+// Fetch the pending tool-permission request for a session. The GET /permission
+// view carries `{request_id, tool, input, decision}`: a *pending* request has a
+// `tool` and no `decision` yet — store it so renderChat() can surface the card.
+// Anything else (null, or a resolved decision with no live request) clears it.
+// Use the existing api() GET shape (mirrors the activity fetch).
+async function fetchPermission(sid) {
+  try {
+    const view = await api(`/sessions/${sid}/permission`);
+    if (state.sid !== sid) return; // view changed mid-flight
+    state.pendingPermission = view && view.tool && !view.decision ? view : null;
+  } catch {
+    // 404 / offline — leave the card hidden rather than throwing.
+    state.pendingPermission = null;
+  }
+  render();
+}
+
+// Collapse the (attacker-influenced) tool input object into a short readable
+// line for the card. The caller esc()'s the result before innerHTML — this only
+// shapes/clips, it does not escape.
+function permSummary(input) {
+  if (input == null) return "";
+  let s;
+  if (typeof input === "string") s = input;
+  else {
+    try { s = JSON.stringify(input); } catch { s = String(input); }
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  // IN-03: slice on code points (not UTF-16 code units) so truncation never
+  // splits a surrogate pair / multi-byte grapheme into a replacement char.
+  const cp = [...s];
+  return cp.length > 140 ? `${cp.slice(0, 139).join("")}…` : s;
+}
+
+// Resolve the pending permission. Approve runs the tool; Deny denies ONLY this
+// single tool call — Claude continues with the tool denied (it does NOT kill or
+// interrupt the session). Optimistically remove the card, then refetch to
+// confirm it cleared (SC3: the card disappears once resolved).
+async function resolvePermission(decision) {
+  const sid = state.sid;
+  if (sid === null) return;
+  try {
+    await api(`/sessions/${sid}/permission`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
+    state.pendingPermission = null; // optimistic removal
+    render();
+    fetchPermission(sid); // confirm it cleared
+  } catch (e) {
+    toast(`${decision === "allow" ? "approve" : "deny"} failed: ${e.message}`);
+  }
+}
+
+function approve() { resolvePermission("allow"); }
+function deny() { resolvePermission("deny"); }
 
 // ---- web push ----
 
@@ -401,7 +599,12 @@ function renderList() {
     const meta = [
       shortModel(s.model),
       s.context_used_pct != null ? `${s.context_used_pct}%` : null,
+      s.rate_5h_used_pct != null
+        ? `5h ${s.rate_5h_used_pct}%` +
+          (s.rate_5h_resets_at_unix_s ? ` ${untilShort(s.rate_5h_resets_at_unix_s)}` : "")
+        : null,
       shortMode(s.permission_mode),
+      gsdChip(s),
       s.branch ? `⎇ ${esc(s.branch)}` : null,
       s.session_cost_usd != null ? `$${s.session_cost_usd.toFixed(2)}` : null,
     ].filter(Boolean).join(" · ");
@@ -476,6 +679,44 @@ function renderChat() {
       </div>
     </div>`;
 
+  // Collapsible activity strip: collapsed by default; expanded shows the
+  // recent ~30 events (newest at bottom, scrollable). The recent-30 clamp is
+  // applied at render time too, in case live appends grow state.activity past
+  // the snapshot window.
+  const actCount = state.activity.length;
+  const actRows = state.activity.slice(-30).map(activityRowHtml).join("");
+  const activityStrip = `
+    <div class="activity-strip${state.activityOpen ? " open" : ""}">
+      <button type="button" class="act-toggle" id="actbtn"
+        aria-expanded="${state.activityOpen ? "true" : "false"}">
+        <span class="act-caret">${state.activityOpen ? "▾" : "▸"}</span>
+        <span class="act-title">activity</span>
+        <span class="act-count">${actCount}</span>
+      </button>
+      ${state.activityOpen
+      ? `<div id="activity-feed" class="act-feed">${actRows
+        || '<div class="act-empty">no tool activity yet</div>'}</div>`
+      : ""}
+    </div>`;
+
+  // Approve/deny card: shown above the composer while a permission is pending
+  // (waiting_reason === "permission" AND a fetched pending request). The tool
+  // name and the input summary are attacker-influenced (Claude's tool args) —
+  // esc() EVERY dynamic string before innerHTML (XSS, T-04-13). Deny denies the
+  // single tool call only; it does NOT kill/interrupt the session (T-04-14).
+  const pp = state.pendingPermission;
+  const permCard = s && s.waiting_reason === "permission" && pp
+    ? `<div class="perm-card">
+        <div class="perm-head">permission</div>
+        <div class="perm-tool">${esc(pp.tool || "tool")}</div>
+        <div class="perm-input">${esc(permSummary(pp.input))}</div>
+        <div class="perm-actions">
+          <button type="button" class="perm-btn deny" id="permdeny">deny</button>
+          <button type="button" class="perm-btn allow" id="permallow">approve</button>
+        </div>
+      </div>`
+    : "";
+
   $app.innerHTML = `
     <header>
       <button class="iconbtn" id="backbtn" aria-label="back">‹</button>
@@ -491,6 +732,8 @@ function renderChat() {
         <div class="meta">queued</div></div>`).join("")}</div>
     ${typing}
     ${screenDrawer}
+    ${activityStrip}
+    ${permCard}
     ${s && s.status === "exited" ? `
     <form id="composer">
       <button type="button" class="send" id="restartbtn" style="flex:1">claude exited — restart</button>
@@ -503,8 +746,13 @@ function renderChat() {
   document.getElementById("backbtn").onclick = () => { location.hash = "#/"; };
   document.getElementById("screenbtn").onclick = toggleScreen;
   document.getElementById("archbtn").onclick = toggleArchive;
+  document.getElementById("actbtn").onclick = toggleActivity;
   document.getElementById("escbtn").onclick = interrupt;
   document.getElementById("killbtn").onclick = deleteSession;
+  const permAllow = document.getElementById("permallow");
+  if (permAllow) permAllow.onclick = approve;
+  const permDeny = document.getElementById("permdeny");
+  if (permDeny) permDeny.onclick = deny;
   for (const el of document.querySelectorAll("#screen .key")) {
     el.onclick = () => sendKey(el.dataset.key);
   }
@@ -567,6 +815,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     refresh();
     if (state.sid !== null && !state.es) openChat(state.sid);
+    if (state.sid !== null && !state.aes) openActivity(state.sid);
   }
 });
 

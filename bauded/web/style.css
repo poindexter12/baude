@@ -175,6 +175,100 @@ header .iconbtn.active { background: var(--panel2); }
 }
 #screen .key:active { background: var(--border); }
 
+/* ---- activity strip ---- */
+.activity-strip {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+}
+.act-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--dim);
+  font: 12px var(--mono);
+  text-align: left;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.act-toggle:active { background: var(--panel2); }
+.act-caret { width: 10px; }
+.act-title { letter-spacing: 0.04em; }
+.act-count {
+  margin-left: auto;
+  color: var(--dim);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+.activity-strip.open .act-feed {
+  max-height: 30vh;
+  overflow-y: auto;
+  padding: 4px 0 6px;
+  background: #07090e;
+  border-top: 1px solid var(--border);
+}
+.act-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 12px;
+  font: 12px/1.5 var(--mono);
+  color: #aab3c5;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.act-icon { width: 16px; text-align: center; flex: none; }
+.act-label { overflow: hidden; text-overflow: ellipsis; }
+.act-time { margin-left: auto; color: var(--dim); flex: none; }
+.act-empty { color: var(--dim); font: 12px var(--mono); padding: 8px 12px; }
+
+/* ---- permission card ---- */
+.perm-card {
+  margin: 0;
+  padding: 12px 14px calc(12px + var(--pad-bottom));
+  background: var(--panel2);
+  border-top: 1px solid var(--yellow);
+}
+.perm-head {
+  color: var(--yellow);
+  font: 11px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.perm-tool {
+  font: 600 15px var(--mono);
+  color: var(--fg);
+  margin-top: 4px;
+  word-break: break-all;
+}
+.perm-input {
+  font: 12px/1.4 var(--mono);
+  color: var(--dim);
+  margin-top: 3px;
+  word-break: break-word;
+}
+.perm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.perm-btn {
+  flex: 1;
+  padding: 10px 16px;
+  border-radius: 18px;
+  font-weight: 700;
+}
+.perm-btn.allow { background: var(--green); color: #06281a; }
+.perm-btn.deny { background: var(--panel); color: var(--red); border: 1px solid var(--red); }
+.perm-btn:active { opacity: 0.85; }
+
 /* ---- composer ---- */
 #composer {
   display: flex;

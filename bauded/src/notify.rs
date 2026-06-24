@@ -16,6 +16,10 @@ pub struct Notifier {
     notified_waiting: HashSet<u64>,
     /// Sessions already notified as exited.
     notified_exited: HashSet<u64>,
+    /// PERM-04: sessions already notified for their current pending
+    /// tool-permission request. Distinct from `notified_waiting` so a pending
+    /// permission gets its own push; re-armed when `waiting_reason` flips away.
+    notified_permission: HashSet<u64>,
     last_status: HashMap<u64, String>,
 }
 
@@ -44,6 +48,7 @@ impl Notifier {
         let live: HashSet<u64> = sessions.iter().map(|s| s.id).collect();
         self.notified_waiting.retain(|id| live.contains(id));
         self.notified_exited.retain(|id| live.contains(id));
+        self.notified_permission.retain(|id| live.contains(id));
         self.last_status.retain(|id, _| live.contains(id));
 
         for s in sessions {
@@ -51,10 +56,31 @@ impl Notifier {
             // keep last_status current so unarchiving doesn't false-fire.
             if s.archived {
                 self.notified_waiting.remove(&s.id);
+                self.notified_permission.remove(&s.id);
                 self.last_status.insert(s.id, s.status.to_string());
                 continue;
             }
+            // PERM-04: a pending tool-permission request gets its OWN distinct
+            // push and must NOT also fire the generic waiting push (mutually
+            // exclusive). Re-arm the permission notifier whenever the reason is
+            // no longer "permission" (resolve / a new turn).
+            let is_permission = s.waiting_reason.as_deref() == Some("permission");
+            if !is_permission {
+                self.notified_permission.remove(&s.id);
+            }
             match s.status {
+                "waiting" if is_permission => {
+                    if self.notified_permission.insert(s.id) {
+                        out.push(Notification {
+                            // Lean body (CONTEXT "push stays lean"): the phone
+                            // fetches the tool/input detail from GET /permission
+                            // when it opens the card — no tool name in the push.
+                            title: format!("{} needs permission", s.name),
+                            body: "wants to run a tool — approve?".into(),
+                            sid: s.id,
+                        });
+                    }
+                }
                 "waiting" => {
                     let waited = s.waiting_for_ms.unwrap_or(0);
                     if waited >= WAITING_DEBOUNCE_MS && self.notified_waiting.insert(s.id) {
@@ -104,19 +130,26 @@ mod tests {
             name: format!("s{id}"),
             title: None,
             status,
+            state_source: "silence",
+            last_tool: None,
             waiting_for_ms: waiting_ms,
+            waiting_reason: None,
             model: None,
             permission_mode: None,
             context_used_pct: None,
+            rate_5h_used_pct: None,
+            rate_5h_resets_at_unix_s: None,
             branch: None,
             cwd: String::new(),
             repo_root: String::new(),
             is_worktree: false,
             gsd_milestone: None,
             gsd_phase: None,
+            gsd_active_phase: None,
             session_cost_usd: None,
             claude_session_id: None,
             archived: false,
+            activity: vec![],
         }
     }
 
@@ -165,5 +198,52 @@ mod tests {
         // session disappears, then a new one reuses the id
         n.tick(&[]);
         assert_eq!(n.tick(&[info(1, "waiting", Some(20_000))]).len(), 1);
+    }
+
+    /// A waiting session with a pending tool-permission request.
+    fn perm(id: u64) -> SessionInfo {
+        let mut s = info(id, "waiting", Some(60_000));
+        s.waiting_reason = Some("permission".to_string());
+        s
+    }
+
+    #[test]
+    fn permission_fires_distinct_push_once_and_not_generic() {
+        let mut n = Notifier::default();
+        // First tick: exactly one DISTINCT permission push, and NOT the
+        // generic "is waiting for you" push (mutually exclusive).
+        let fired = n.tick(&[perm(1)]);
+        assert_eq!(fired.len(), 1, "exactly one push");
+        assert!(
+            fired[0].title.contains("permission"),
+            "distinct permission title, got: {}",
+            fired[0].title
+        );
+        assert!(
+            !fired[0].title.contains("waiting"),
+            "must not be the generic waiting push"
+        );
+        // Second tick, still pending: no duplicate (debounced).
+        assert!(n.tick(&[perm(1)]).is_empty(), "no duplicate while pending");
+    }
+
+    #[test]
+    fn permission_re_arms_after_resolve() {
+        let mut n = Notifier::default();
+        assert_eq!(n.tick(&[perm(1)]).len(), 1);
+        // Permission resolves: waiting_reason flips away (still waiting on a
+        // generic prompt). The generic waiting push may now fire, and the
+        // permission notifier re-arms.
+        let mut waiting = info(1, "waiting", Some(60_000));
+        waiting.waiting_reason = Some("input".to_string());
+        let fired = n.tick(&[waiting]);
+        assert!(
+            fired.iter().all(|f| !f.title.contains("permission")),
+            "no permission push once resolved"
+        );
+        // A NEW permission can fire again after the re-arm.
+        let fired = n.tick(&[perm(1)]);
+        assert_eq!(fired.len(), 1, "permission re-armed and fires again");
+        assert!(fired[0].title.contains("permission"));
     }
 }

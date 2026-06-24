@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use baude_core::git;
@@ -102,6 +104,8 @@ pub enum Modal {
     Info,
     /// GSD project state for the selected session's repo.
     Gsd,
+    /// Recent tool-activity timeline for the selected session (local or remote).
+    Activity,
     Input {
         kind: InputKind,
         title: String,
@@ -115,6 +119,49 @@ pub enum Modal {
     ConfirmCloseWorktree {
         id: u64,
     },
+}
+
+/// Active text selection within a content pane (claude or shell).
+/// Coordinates are relative to the pane's inner rect (0-indexed).
+pub struct Selection {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    /// The terminal-absolute inner rect of the pane the selection lives in,
+    /// captured at mouse-down so drags map correctly even if layout shifts.
+    pub pane_area: Rect,
+    pub is_shell: bool,
+}
+
+impl Selection {
+    /// Normalize so start <= end (for rendering and extraction).
+    pub fn normalized(&self) -> (u16, u16, u16, u16) {
+        if self.start_row < self.end_row
+            || (self.start_row == self.end_row && self.start_col <= self.end_col)
+        {
+            (self.start_row, self.start_col, self.end_row, self.end_col)
+        } else {
+            (self.end_row, self.end_col, self.start_row, self.start_col)
+        }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let (sr, sc, er, ec) = self.normalized();
+        if row < sr || row > er {
+            return false;
+        }
+        if sr == er {
+            return col >= sc && col <= ec;
+        }
+        if row == sr {
+            return col >= sc;
+        }
+        if row == er {
+            return col <= ec;
+        }
+        true
+    }
 }
 
 pub struct App {
@@ -135,6 +182,12 @@ pub struct App {
     pub remote_snap: RemoteSnapshot,
     /// At most one live raw attach to a remote session.
     pub attach: Option<RemoteAttach>,
+    /// Scrollback offset for the selected session's claude pane.
+    pub claude_scroll: usize,
+    /// Scrollback offset for the selected session's shell pane.
+    pub shell_scroll: usize,
+    /// Active text selection (if any).
+    pub selection: Option<Selection>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -166,6 +219,28 @@ pub fn inner(r: Rect) -> Rect {
     }
 }
 
+/// Best-effort, non-clobbering seed of a session cwd's `.mcp.json` registering
+/// baude's `permission-mcp` stdio server (PERM-01, `prompt` mode only).
+///
+/// The MCP command is `current_exe()` + ` permission-mcp` (same resolution as
+/// `baude_core::hook::baude_hook_command`). Mirrors `seed_settings`: never
+/// aborts a spawn on failure, and re-seeding merges `mcpServers.baude` into an
+/// existing file via the pure `merge_mcp_config` without discarding a user's
+/// sibling MCP servers (idempotent).
+fn seed_mcp_config(cwd: &Path) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.display().to_string(),
+        Err(_) => return, // can't resolve the bridge command — best-effort skip.
+    };
+    let path = baude_core::permission::mcp_config_path(cwd);
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let merged = baude_core::permission::merge_mcp_config(&existing, &exe);
+    let _ = std::fs::write(&path, merged.to_string());
+}
+
 impl App {
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
@@ -190,6 +265,9 @@ impl App {
             remote,
             remote_snap: RemoteSnapshot::default(),
             attach: None,
+            claude_scroll: 0,
+            shell_scroll: 0,
+            selection: None,
         }
     }
 
@@ -417,12 +495,44 @@ impl App {
 
         // `claude --continue` resumes the most recent conversation in this
         // directory; falls back to a fresh session if there is none.
-        let base = self.claude_cmd();
+        // PERM-01: append exactly one permission flag to the base cmd (default
+        // skip preserves today's `--dangerously-skip-permissions`; `prompt` is
+        // opt-in via BAUDE_PERMISSION_MODE). The flag rides on the base cmd so
+        // it survives the `--continue || exec` resume fallback. BL-04: prompt
+        // mode strips a conflicting skip flag from claude_cmd so it can't be
+        // silently suppressed. The TUI is a ratatui screen, so the `stripped_skip`
+        // warning channel (eprintln) the daemon uses is intentionally dropped here.
+        let base = baude_core::permission::resolve_claude_cmd_env(&self.claude_cmd()).cmd;
         let cmd = if resume {
             format!("{base} --continue 2>/dev/null || exec {base}")
         } else {
             format!("exec {base}")
         };
+        // Seed baude's hooks into the session cwd's .claude/settings.local.json
+        // before claude starts, so Claude Code actually invokes `baude hook`.
+        // Best-effort: a seeding failure must NOT abort the spawn — the session
+        // simply falls back to the silence path (no regression). TUI sessions
+        // get NO $BAUDE_EVENT_URL, which routes the hook to the /tmp append
+        // path (only the daemon injects that var).
+        baude_core::hook::seed_settings(&cwd);
+
+        // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
+        // registering the `permission-mcp` stdio server (command =
+        // current_exe() + " permission-mcp"). Best-effort, mirrors the hook
+        // seed; 04-02 adds the `permission-mcp` arm to both binaries.
+        if baude_core::permission::is_prompt_mode() {
+            seed_mcp_config(&cwd);
+            // WR-01: permission approval is inherently daemon+PWA-mediated. A
+            // TUI-local session gets NO $BAUDE_EVENT_URL (only the daemon injects
+            // it), so the `permission-mcp` bridge fails CLOSED and DENIES every
+            // tool with no operator-visible reason. Make that non-silent: warn
+            // clearly (once per process to stderr, plus a visible TUI message)
+            // that prompt mode requires the daemon and the bare TUI will deny all
+            // tools. This is fail-safe (deny, never allow) but no longer a silent
+            // footgun. `skip` (the default) is unaffected.
+            self.warn_prompt_mode_without_daemon();
+        }
+
         let (rows, cols) = self.claude_spawn_size(shell_open);
         let claude = Pty::spawn(Some(&cmd), &cwd, rows, cols)?;
 
@@ -444,6 +554,8 @@ impl App {
             archived_by_user: false,
             was_busy: false,
             unarchived_at_ms: None,
+            pending_permission: None,
+            permission_decision: None,
         };
         if shell_open {
             let (_, shell_rect) = pane_rects(self.content_rect, true);
@@ -471,6 +583,22 @@ impl App {
 
     pub fn set_message(&mut self, msg: String) {
         self.message = Some((msg, now_ms() + MESSAGE_TTL_MS));
+    }
+
+    /// WR-01: warn — once per process to stderr, and visibly in the TUI — that
+    /// `BAUDE_PERMISSION_MODE=prompt` cannot work under the bare TUI. Permission
+    /// approval is daemon+PWA-mediated; a TUI-local session has no
+    /// `$BAUDE_EVENT_URL`, so the `permission-mcp` bridge fails closed and denies
+    /// every tool. This makes the deny-all behaviour discoverable instead of a
+    /// silent hang. Fail-safe (deny, never allow); `skip` (default) is untouched.
+    fn warn_prompt_mode_without_daemon(&mut self) {
+        const MSG: &str = "BAUDE_PERMISSION_MODE=prompt has no approval UI under the bare TUI \
+             (no daemon) — every tool will be DENIED. Run via bauded + the PWA to approve.";
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("baude: {MSG}");
+        }
+        self.set_message(MSG.into());
     }
 
     pub fn tick(&mut self) {
@@ -551,7 +679,9 @@ impl App {
     }
 
     /// Resize every session's PTYs to match the geometry they would render at.
-    pub fn sync_sizes(&mut self, content: Rect) {
+    pub fn sync_sizes(&mut self, area: Rect) {
+        let rects = crate::ui::layout(area);
+        let content = rects.content;
         self.content_rect = content;
         for s in &mut self.sessions {
             let (claude_rect, shell_rect) = pane_rects(content, s.shell_open);
@@ -581,11 +711,13 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Paste(text) => self.handle_paste(text),
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
             _ => {}
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        self.selection = None;
         if !matches!(self.modal, Modal::None) {
             self.handle_modal_key(key);
             return;
@@ -623,6 +755,11 @@ impl App {
     }
 
     fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
+        if to_shell {
+            self.shell_scroll = 0;
+        } else {
+            self.claude_scroll = 0;
+        }
         if !to_shell {
             if let Some(SelId::Remote(id)) = self.selected_id {
                 let Some(a) = &self.attach else { return };
@@ -809,6 +946,11 @@ impl App {
                     self.modal = Modal::Info;
                 }
             }
+            KeyCode::Char('v') => {
+                if self.selected().is_some() || self.selected_remote().is_some() {
+                    self.modal = Modal::Activity;
+                }
+            }
             KeyCode::Char('g') if remote_selected => {
                 self.set_message("GSD view is for local sessions".into());
             }
@@ -824,7 +966,7 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
         match &mut self.modal {
-            Modal::Help | Modal::Info | Modal::Gsd => {
+            Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
             }
             Modal::Input {
@@ -1048,6 +1190,11 @@ impl App {
             .and_then(|id| ids.iter().position(|&x| x == id))
             .unwrap_or(0) as i64;
         let next = (cur + delta).clamp(0, ids.len() as i64 - 1) as usize;
+        if self.selected_id != Some(ids[next]) {
+            self.claude_scroll = 0;
+            self.shell_scroll = 0;
+            self.selection = None;
+        }
         self.selected_id = Some(ids[next]);
     }
 
@@ -1070,6 +1217,9 @@ impl App {
             .and_then(|id| ids.iter().position(|&x| x == id))
             .unwrap_or(0) as i64;
         let next = (((cur + delta) % len) + len) % len;
+        self.claude_scroll = 0;
+        self.shell_scroll = 0;
+        self.selection = None;
         self.selected_id = Some(ids[next as usize]);
         if self.focus == Focus::Shell {
             let has_shell = self
@@ -1155,6 +1305,126 @@ impl App {
                 self.focus = Focus::Claude;
             }
             Err(e) => self.set_message(format!("restart failed: {e}")),
+        }
+    }
+
+    // ---- mouse handling ----
+
+    fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    fn content_pane_rects(&self) -> (Rect, Option<Rect>) {
+        let shell_open = self.selected().map(|s| s.shell_open).unwrap_or(false);
+        let (claude_rect, shell_rect) = pane_rects(self.content_rect, shell_open);
+        (inner(claude_rect), shell_rect.map(inner))
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        let col = mouse.column;
+        let row = mouse.row;
+        let (claude_inner, shell_inner) = self.content_pane_rects();
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.selection = None;
+                if Self::rect_contains(claude_inner, col, row) {
+                    self.claude_scroll = self.claude_scroll.saturating_add(3);
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    self.shell_scroll = self.shell_scroll.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.selection = None;
+                if Self::rect_contains(claude_inner, col, row) {
+                    self.claude_scroll = self.claude_scroll.saturating_sub(3);
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    self.shell_scroll = self.shell_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (pane_area, is_shell) = if Self::rect_contains(claude_inner, col, row) {
+                    (claude_inner, false)
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    (shell_inner.unwrap(), true)
+                } else {
+                    self.selection = None;
+                    return;
+                };
+                let r = row.saturating_sub(pane_area.y);
+                let c = col.saturating_sub(pane_area.x);
+                self.selection = Some(Selection {
+                    start_row: r,
+                    start_col: c,
+                    end_row: r,
+                    end_col: c,
+                    pane_area,
+                    is_shell,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection {
+                    let r = row
+                        .saturating_sub(sel.pane_area.y)
+                        .min(sel.pane_area.height.saturating_sub(1));
+                    let c = col
+                        .saturating_sub(sel.pane_area.x)
+                        .min(sel.pane_area.width.saturating_sub(1));
+                    sel.end_row = r;
+                    sel.end_col = c;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(sel) = self.selection.take() {
+                    let (sr, sc, er, ec) = sel.normalized();
+                    if sr == er && sc == ec {
+                        return;
+                    }
+                    let scroll = if sel.is_shell {
+                        self.shell_scroll
+                    } else {
+                        self.claude_scroll
+                    };
+                    let parser = if sel.is_shell {
+                        self.selected()
+                            .and_then(|s| s.shell.as_ref())
+                            .map(|p| &p.parser)
+                    } else {
+                        match self.selected_id {
+                            Some(SelId::Remote(_)) => self.attach.as_ref().map(|a| &a.parser),
+                            _ => self.selected().map(|s| &s.claude.parser),
+                        }
+                    };
+                    if let Some(parser) = parser {
+                        if let Ok(mut p) = parser.lock() {
+                            p.set_scrollback(scroll);
+                            let text = p.screen().contents_between(sr, sc, er, ec + 1);
+                            p.set_scrollback(0);
+                            if !text.is_empty() {
+                                Self::copy_to_clipboard(&text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_to_clipboard(text: &str) {
+        use std::io::Write;
+        if let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
         }
     }
 }
