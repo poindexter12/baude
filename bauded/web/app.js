@@ -50,6 +50,16 @@ function untilShort(unixS) {
   return ms <= 0 ? "now" : "in " + humanMs(ms);
 }
 
+// BL-03: compact GSD chip "⬡ <milestone> ph<phase>" (both optional), so the PWA
+// surfaces GSD state like the TUI. Every dynamic field esc()'d. Null when no
+// GSD state is present (the session isn't GSD-tracked).
+function gsdChip(s) {
+  const ms = s.gsd_milestone ? esc(s.gsd_milestone) : null;
+  const ph = s.gsd_active_phase ? `ph${esc(s.gsd_active_phase)}` : null;
+  const body = [ms, ph].filter(Boolean).join(" ");
+  return body ? `⬡ ${body}` : null;
+}
+
 // Compact relative age for an event ts (unix ms), mirroring the TUI's
 // activity_age: "now" for <1s, else humanMs (IN-01).
 function activityAge(ts) {
@@ -594,6 +604,7 @@ function renderList() {
           (s.rate_5h_resets_at_unix_s ? ` ${untilShort(s.rate_5h_resets_at_unix_s)}` : "")
         : null,
       shortMode(s.permission_mode),
+      gsdChip(s),
       s.branch ? `⎇ ${esc(s.branch)}` : null,
       s.session_cost_usd != null ? `$${s.session_cost_usd.toFixed(2)}` : null,
     ].filter(Boolean).join(" · ");

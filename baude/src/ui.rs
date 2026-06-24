@@ -255,6 +255,13 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
         };
         push(&mut spans, short_mode(mode).to_string(), style);
     }
+    if let Some(phase) = &r.gsd_active_phase {
+        push(
+            &mut spans,
+            format!("ph{phase}"),
+            Style::default().fg(Color::Green),
+        );
+    }
     if spans.len() == 1 {
         spans.push(Span::styled("—", dim));
     }

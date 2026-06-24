@@ -83,6 +83,10 @@ pub struct SessionInfo {
     pub is_worktree: bool,
     pub gsd_milestone: Option<String>,
     pub gsd_phase: Option<String>,
+    /// BL-03: the compact active phase (e.g. `4` → rendered `ph4`), mirroring
+    /// what the TUI local line shows, so remote sessions + the PWA surface GSD
+    /// state consistently with local sessions.
+    pub gsd_active_phase: Option<String>,
     pub session_cost_usd: Option<f64>,
     pub claude_session_id: Option<String>,
     pub archived: bool,
@@ -877,6 +881,7 @@ fn session_info(s: &Session) -> SessionInfo {
         is_worktree: s.is_worktree,
         gsd_milestone: s.meta.gsd.as_ref().and_then(|g| g.milestone.clone()),
         gsd_phase: s.meta.gsd.as_ref().and_then(|g| g.phase_line.clone()),
+        gsd_active_phase: s.meta.gsd.as_ref().and_then(|g| g.active_phase.clone()),
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
         archived: s.archived,

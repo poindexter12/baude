@@ -145,6 +145,7 @@ mod tests {
             is_worktree: false,
             gsd_milestone: None,
             gsd_phase: None,
+            gsd_active_phase: None,
             session_cost_usd: None,
             claude_session_id: None,
             archived: false,

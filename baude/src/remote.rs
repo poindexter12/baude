@@ -57,6 +57,11 @@ pub struct RemoteInfo {
     /// mirroring the `#[serde(default)]` fields above).
     #[serde(default)]
     pub activity: Vec<HookEvent>,
+    /// BL-03: compact GSD active phase (e.g. `4`), surfaced in the remote line
+    /// so daemon sessions show GSD state like local ones. `#[serde(default)]`
+    /// for back-compat with a daemon that omits it.
+    #[serde(default)]
+    pub gsd_active_phase: Option<String>,
 }
 
 #[derive(Clone, Default)]
