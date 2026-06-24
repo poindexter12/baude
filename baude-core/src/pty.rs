@@ -266,14 +266,31 @@ mod tests {
 
     #[test]
     fn output_timestamp_goes_idle() {
-        let pty = Pty::spawn(Some("echo hi; sleep 5"), Path::new("/tmp"), 5, 40).unwrap();
-        std::thread::sleep(Duration::from_millis(3500));
-        let last = pty.last_output_ms.load(Ordering::Relaxed);
-        let idle = now_ms().saturating_sub(last);
+        // The child speaks once (`echo hi`) then goes quiet for a long time.
+        let pty = Pty::spawn(Some("echo hi; sleep 30"), Path::new("/tmp"), 5, 40).unwrap();
+        // Poll until the silence since the last output crosses the ~2s idle
+        // threshold, rather than asserting a fixed sleep lines up with when the
+        // reader thread happens to record the echo — that coupling made this
+        // flaky on loaded CI (the echo could be timestamped late, squeezing the
+        // measured idle below 2000ms). The 5s budget bounds a genuine hang while
+        // staying well under the 30s child lifetime.
+        let mut idle = 0;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            idle = now_ms().saturating_sub(pty.last_output_ms.load(Ordering::Relaxed));
+            if idle >= 2000 {
+                break;
+            }
+        }
         assert!(
             idle >= 2000,
-            "expected >=2000ms idle, got {idle}ms (output kept arriving)"
+            "expected idle to reach >=2000ms, got {idle}ms"
         );
-        assert!(!pty.is_exited(), "child should still be sleeping");
+        // It went idle because the child is silently sleeping, not because it
+        // exited.
+        assert!(
+            !pty.is_exited(),
+            "child should still be sleeping, not exited"
+        );
     }
 }
