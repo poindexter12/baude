@@ -28,7 +28,31 @@ follow-up to relabel.
 
 ---
 
-### BL-02 — Model / permission-mode (bypass) / planning mode not shown for every session
+### BL-02 — Model / permission-mode (bypass) / planning mode not shown for every session — ⚠️ PARTIALLY RESOLVED 2026-06-24
+
+**Triage (2026-06-24):** It's a CAPTURE gap, not a render gap — the sidebar/overlay
+already show each field when present (`Some`→show, `None`→omit). Root cause:
+- `model`: dual-sourced (transcript `assistant` messages + statusline bridge
+  `schema:2`), but both are gated on the session's `sessionId` resolving (the
+  `sessions/<pid>.json` pid-match or the cwd-fallback transcript) — the session
+  file itself carries NO model/mode, only `sessionId` + status. No assistant turn
+  yet AND no bridge → no model.
+- `permission_mode`: transcript-ONLY (the `permissionMode` field on transcript
+  records). The statusline payload does NOT carry it (confirmed against a live
+  bridge file), so there's no second source.
+
+**Fix shipped (commit on `gsd/phase-04`):** `permission_mode` now falls back to
+baude's spawn intent via `spawn_permission_mode()` (skip/default→`bypassPermissions`,
+prompt→none) in both the daemon `SessionInfo` and the TUI local line, so the mode
+shows for every session immediately; a transcript-reported mode still wins.
+
+**Still open:** `model` remains data-gated — absent until the transcript/bridge
+resolves and yields a model. The deeper sub-cause (sessions whose `sessionId`
+never resolves: cwd-encoding mismatch, the "ignore session files >20s older than
+spawn" filter, or daemon sessions without the bridge) needs a REAL-session repro
+to confirm and fix; could not be reproduced headlessly (scratch sessions don't
+resolve `claude_session_id`). Carry as a focused follow-up if model is still
+missing on real sessions after this.
 
 **Observation (user):** The model isn't shown for everything, and neither is the
 permission mode (e.g. bypass), planning mode, etc. — they're missing for some
