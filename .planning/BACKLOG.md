@@ -64,7 +64,15 @@ with user before planning.
 
 ## Captured 2026-06-23
 
-### BL-04 — `BAUDE_PERMISSION_MODE=prompt` silently suppressed when `claude_cmd` already contains `--dangerously-skip-permissions`
+### BL-04 — `BAUDE_PERMISSION_MODE=prompt` silently suppressed when `claude_cmd` already contains `--dangerously-skip-permissions` — ✅ RESOLVED 2026-06-24
+
+**Resolution:** Fixed via `resolve_claude_cmd` (replaces the append-only
+`permission_flag`): in prompt mode the conflicting `--dangerously-skip-permissions`
+is stripped from `claude_cmd` and the prompt flag wins (explicit opt-in), with a
+daemon `eprintln` warning (`stripped_skip`). Chose candidate (b) from below. Both
+spawn sites migrated; BL-04 unit tests added. Commit on `gsd/phase-04`.
+
+
 
 **Observation (found during v0.7 §F UAT setup):** With `~/.config/baude/config.json`
 `"claude_cmd": "claude --dangerously-skip-permissions"`, setting
