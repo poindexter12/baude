@@ -433,8 +433,8 @@ where
 /// `tools/call` blocks (via the injected `resolve`) until a human decision
 /// arrives or the deadline denies. Accumulates stdin bytes, extracts each frame
 /// with [`parse_frame`] (Content-Length AND line framing), dispatches via
-/// [`dispatch_rpc`], and writes each reply as a `Content-Length`-framed frame to
-/// stdout.
+/// [`dispatch_rpc`], and writes each reply as a newline-delimited JSON line to
+/// stdout (the framing live claude's MCP stdio client requires — §F UAT).
 ///
 /// `resolve(tool, &input) -> decision` is the ONLY injected seam: the binary
 /// owns the env read (`$BAUDE_EVENT_URL`-derived permission URL +
@@ -469,12 +469,21 @@ where
     }
 }
 
-/// Write one JSON-RPC reply as a `Content-Length`-framed (LSP-style) frame —
-/// the framing baude advertises and the §F UAT confirms 2.1.178 accepts.
+/// Write one JSON-RPC reply as a single newline-delimited JSON line — the MCP
+/// stdio transport framing.
+///
+/// CONTRACT (§F UAT, live claude 2.1.187): Claude Code's MCP stdio *client*
+/// accepts ONLY newline-delimited JSON on the server's stdout; an LSP-style
+/// `Content-Length:`-framed reply is silently dropped, the `initialize`
+/// handshake never completes, and the `approve` tool is reported "not found"
+/// (prompt mode fully broken). `serde_json::to_vec` is compact (no embedded
+/// newlines), so a trailing `\n` is a valid single frame. Input framing is
+/// unaffected — [`parse_frame`] still accepts both line- and Content-Length-
+/// framing for robustness; live claude only ever sends line-delimited.
 fn write_frame<W: std::io::Write>(out: &mut W, v: &Value) -> std::io::Result<()> {
     let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
-    write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
     out.write_all(&body)?;
+    out.write_all(b"\n")?;
     out.flush()
 }
 
@@ -1022,8 +1031,9 @@ mod tests {
     #[test]
     fn run_permission_mcp_full_session_over_mock_io() {
         // Two line-delimited requests on stdin: initialize then a tools/call.
-        // The resolver approves; assert both replies are Content-Length framed
-        // and that the approve result echoes the input.
+        // The resolver approves; assert both replies are newline-delimited
+        // (the MCP stdio framing live claude requires — §F UAT) and that the
+        // approve result echoes the input.
         let stdin = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"approve\",\"arguments\":{\"tool_name\":\"Bash\",\"input\":{\"command\":\"ls\"}}}}\n",
@@ -1031,8 +1041,12 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         run_permission_mcp(stdin.as_bytes(), &mut out, |_t, _i| "allow".to_string());
         let s = String::from_utf8(out).unwrap();
-        // Two Content-Length frames written.
-        assert_eq!(s.matches("Content-Length:").count(), 2, "got: {s}");
+        // No LSP-style Content-Length framing on output (claude drops it).
+        assert!(!s.contains("Content-Length:"), "got: {s}");
+        // Exactly two newline-delimited reply frames, no embedded newlines in
+        // either body.
+        assert_eq!(s.trim_end().matches('\n').count(), 1, "two lines: {s}");
+        assert!(s.ends_with('\n'), "trailing newline: {s}");
         assert!(s.contains("\"protocolVersion\""));
         assert!(s.contains("\\\"behavior\\\":\\\"allow\\\""), "got: {s}");
     }
