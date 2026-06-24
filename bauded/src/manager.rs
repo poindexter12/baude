@@ -369,17 +369,21 @@ impl Manager {
         // adds exactly one baude entry per event no matter how often it runs.
         baude_core::hook::seed_settings(&cwd);
 
-        // PERM-01: select exactly one permission flag (default skip preserves
-        // today's unattended `--dangerously-skip-permissions`; `prompt` is
-        // opt-in via BAUDE_PERMISSION_MODE). Append to the base cmd BEFORE the
-        // `export …; {inner}` wrap so the flag survives the `--continue || exec`
-        // resume fallback (WR-01). No-op when the operator already set a
-        // permission flag (no-double-add).
-        let base_cmd = format!(
-            "{}{}",
-            self.claude_cmd,
-            baude_core::permission::permission_flag(&self.claude_cmd)
-        );
+        // PERM-01: resolve the permission flag (default skip preserves today's
+        // unattended `--dangerously-skip-permissions`; `prompt` is opt-in via
+        // BAUDE_PERMISSION_MODE). Applied to the base cmd BEFORE the `export …;
+        // {inner}` wrap so the flag survives the `--continue || exec` resume
+        // fallback (WR-01). BL-04: prompt mode strips a conflicting skip flag
+        // from `claude_cmd` and warns, so an operator's skip default no longer
+        // silently suppresses prompt mode.
+        let resolved = baude_core::permission::resolve_claude_cmd_env(&self.claude_cmd);
+        if resolved.stripped_skip {
+            eprintln!(
+                "baude: prompt mode active — stripped --dangerously-skip-permissions \
+                 from claude_cmd so the permission prompt can fire (BL-04)"
+            );
+        }
+        let base_cmd = resolved.cmd;
 
         // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
         // registering the `permission-mcp` stdio server (command =
@@ -1109,15 +1113,12 @@ mod tests {
         // Pins the exact composition the daemon `spawn` uses: base_cmd =
         // claude_cmd + permission_flag(claude_cmd), then spawn_command wraps it.
         //
-        // Exercises the env-free `permission_flag_for` seam so the test never
+        // Exercises the env-free `resolve_claude_cmd` seam so the test never
         // mutates the process-global BAUDE_PERMISSION_MODE — which would race
         // the concurrent real-PTY spawn tests in this crate that read it.
         let url = "http://127.0.0.1:8642/sessions/1/event";
         let flagged = |claude: &str, mode: Option<&str>| {
-            format!(
-                "{claude}{}",
-                baude_core::permission::permission_flag_for(mode, claude)
-            )
+            baude_core::permission::resolve_claude_cmd(mode, claude).cmd
         };
 
         // Default (unset) and explicit skip and unrecognized -> skip flag,
@@ -1151,6 +1152,23 @@ mod tests {
             cmd.matches("--permission-prompt-tool").count(),
             2,
             "resume path repeats the flagged base cmd on both sides of `||`: {cmd}"
+        );
+
+        // BL-04: a claude_cmd that already bakes in --dangerously-skip-permissions
+        // must NOT suppress prompt mode — the skip is stripped and the prompt
+        // flag wins (explicit opt-in), with no skip flag left in the spawn cmd.
+        let cmd = spawn_command(
+            &flagged("claude --dangerously-skip-permissions", Some("prompt")),
+            url,
+            false,
+        );
+        assert!(
+            cmd.contains("--permission-prompt-tool mcp__baude__approve"),
+            "BL-04: prompt must win over a baked-in skip flag, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--dangerously-skip-permissions"),
+            "BL-04: the conflicting skip flag must be stripped, got: {cmd}"
         );
     }
 

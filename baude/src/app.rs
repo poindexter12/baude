@@ -498,13 +498,11 @@ impl App {
         // PERM-01: append exactly one permission flag to the base cmd (default
         // skip preserves today's `--dangerously-skip-permissions`; `prompt` is
         // opt-in via BAUDE_PERMISSION_MODE). The flag rides on the base cmd so
-        // it survives the `--continue || exec` resume fallback. No-double-add
-        // when the operator already set a permission flag.
-        let base = format!(
-            "{0}{1}",
-            self.claude_cmd(),
-            baude_core::permission::permission_flag(&self.claude_cmd())
-        );
+        // it survives the `--continue || exec` resume fallback. BL-04: prompt
+        // mode strips a conflicting skip flag from claude_cmd so it can't be
+        // silently suppressed. The TUI is a ratatui screen, so the `stripped_skip`
+        // warning channel (eprintln) the daemon uses is intentionally dropped here.
+        let base = baude_core::permission::resolve_claude_cmd_env(&self.claude_cmd()).cmd;
         let cmd = if resume {
             format!("{base} --continue 2>/dev/null || exec {base}")
         } else {

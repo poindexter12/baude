@@ -36,53 +36,94 @@ const SKIP_FLAG: &str = " --dangerously-skip-permissions";
 /// `approve` tool is registered via the seeded `.mcp.json`.
 const PROMPT_FLAG: &str = " --permission-prompt-tool mcp__baude__approve";
 
-/// Select the single permission flag to append to `base_cmd`.
-///
-/// No-double-add (locked decision / T-04-02): if `base_cmd` already carries any
-/// permission flag (`--dangerously-skip-permissions`, `--permission-prompt-tool`,
-/// or `--permission-mode`), return `""` so an operator-set flag is never
-/// duplicated or overridden.
-///
-/// Otherwise read `BAUDE_PERMISSION_MODE`: the exact literal `"prompt"` returns
-/// [`PROMPT_FLAG`]; every other case (unset, `"skip"`, and any unrecognized
-/// value) returns [`SKIP_FLAG`]. The two real flags are NEVER returned
-/// together — exactly one of `{skip, prompt, ""}`.
-pub fn permission_flag(base_cmd: &str) -> &'static str {
-    permission_flag_for(
+/// Build the `claude` command to spawn for the current `BAUDE_PERMISSION_MODE`,
+/// applied to `base_cmd`. Reads the env; the env-free core is
+/// [`resolve_claude_cmd`] (split so tests never mutate the process-global var,
+/// which would race concurrent spawns — same pattern as `hook`).
+pub fn resolve_claude_cmd_env(base_cmd: &str) -> ResolvedCmd {
+    resolve_claude_cmd(
         std::env::var("BAUDE_PERMISSION_MODE").ok().as_deref(),
         base_cmd,
     )
 }
 
-/// Pure flag selection given an explicit mode — the env-free core of
-/// [`permission_flag`]. `mode` is the raw `BAUDE_PERMISSION_MODE` value (`None`
-/// when unset). Split out so callers (and tests) can exercise every branch
-/// WITHOUT mutating the process-global env var, which would race concurrent
-/// session spawns that read it (the same env-read/pure split as `hook`).
+/// The spawn command plus whether a conflicting skip flag was stripped (so the
+/// caller can warn). `stripped_skip` is only ever `true` in `prompt` mode.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedCmd {
+    pub cmd: String,
+    pub stripped_skip: bool,
+}
+
+/// Pure: resolve the spawn command for an explicit `mode` (`None` = unset).
 ///
-/// `Some("prompt")` returns [`PROMPT_FLAG`]; every other case (`None`,
-/// `Some("skip")`, and any unrecognized value) returns [`SKIP_FLAG`] — fail-safe
-/// (T-04-01). No-double-add (T-04-02) returns `""` when `base_cmd` already
-/// carries a permission flag. Exactly one of `{skip, prompt, ""}`.
-pub fn permission_flag_for(mode: Option<&str>, base_cmd: &str) -> &'static str {
-    let already = base_cmd.contains("--dangerously-skip-permissions")
-        || base_cmd.contains("--permission-prompt-tool")
-        || base_cmd.contains("--permission-mode");
-    if already {
-        return "";
-    }
+/// `prompt` is an EXPLICIT opt-in and WINS over a `--dangerously-skip-permissions`
+/// baked into the operator's `claude_cmd` (BL-04 — that combination previously
+/// suppressed prompt mode silently via the old no-double-add short-circuit,
+/// leaving sessions in skip while baude still seeded `.mcp.json`). In `prompt`
+/// mode a conflicting skip flag is STRIPPED from `base_cmd` before [`PROMPT_FLAG`]
+/// is appended, and `stripped_skip` is set so the caller can warn. An
+/// operator-set `--permission-prompt-tool`/`--permission-mode` is still respected
+/// (no double-add) — they explicitly chose a prompt-style flag.
+///
+/// `skip`/default (unset, `"skip"`, any unrecognized value — fail-safe, T-04-01)
+/// keeps the original no-double-add: append [`SKIP_FLAG`] only when `base_cmd`
+/// carries no permission flag at all.
+pub fn resolve_claude_cmd(mode: Option<&str>, base_cmd: &str) -> ResolvedCmd {
+    let has_prompt = base_cmd.contains("--permission-prompt-tool");
+    let has_mode = base_cmd.contains("--permission-mode");
+    let has_skip = base_cmd.contains("--dangerously-skip-permissions");
     match mode {
-        Some("prompt") => PROMPT_FLAG,
-        // Default skip preserves today's unattended behavior. Unset, "skip",
-        // and any unrecognized value all fall here (fail-safe — never prompt).
-        _ => SKIP_FLAG,
+        Some("prompt") => {
+            if has_prompt || has_mode {
+                // Operator explicitly set a prompt-style flag — respect it.
+                ResolvedCmd {
+                    cmd: base_cmd.to_string(),
+                    stripped_skip: false,
+                }
+            } else if has_skip {
+                // Explicit opt-in wins: drop the conflicting skip, add prompt.
+                let stripped = strip_token(base_cmd, "--dangerously-skip-permissions");
+                ResolvedCmd {
+                    cmd: format!("{stripped}{PROMPT_FLAG}"),
+                    stripped_skip: true,
+                }
+            } else {
+                ResolvedCmd {
+                    cmd: format!("{base_cmd}{PROMPT_FLAG}"),
+                    stripped_skip: false,
+                }
+            }
+        }
+        _ => {
+            let cmd = if has_prompt || has_mode || has_skip {
+                base_cmd.to_string()
+            } else {
+                format!("{base_cmd}{SKIP_FLAG}")
+            };
+            ResolvedCmd {
+                cmd,
+                stripped_skip: false,
+            }
+        }
     }
+}
+
+/// Remove every whitespace-delimited occurrence of `token` from `cmd`,
+/// collapsing surrounding whitespace to single spaces. The realistic
+/// `claude_cmd` is simple flag tokens (no quoted spaces), so a split/rejoin is
+/// safe and total.
+fn strip_token(cmd: &str, token: &str) -> String {
+    cmd.split_whitespace()
+        .filter(|t| *t != token)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `true` iff `prompt` mode is active (the exact literal `"prompt"`).
 ///
 /// The spawn sites use this to decide whether to additionally seed `.mcp.json`.
-/// Mirrors the fail-safe of [`permission_flag`]: only the exact `"prompt"`
+/// Mirrors the fail-safe of [`resolve_claude_cmd`]: only the exact `"prompt"`
 /// literal is `prompt` mode; everything else is `skip`.
 pub fn is_prompt_mode() -> bool {
     std::env::var("BAUDE_PERMISSION_MODE").as_deref() == Ok("prompt")
@@ -525,94 +566,111 @@ mod tests {
     /// tests so parallel cases never race the same var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    // ---- permission_flag_for: pure mode selection (no env mutation) -----
+    // ---- resolve_claude_cmd: pure mode resolution (no env mutation) -----
     // Branch coverage uses the env-free seam so it never races concurrent
     // session spawns (in any crate) that read the process-global env var.
 
     #[test]
-    fn permission_flag_for_mode_selection() {
+    fn resolve_claude_cmd_mode_selection() {
         // None (unset) -> default skip (security-critical default, T-04-01).
         assert_eq!(
-            permission_flag_for(None, "claude"),
-            " --dangerously-skip-permissions"
+            resolve_claude_cmd(None, "claude").cmd,
+            "claude --dangerously-skip-permissions"
         );
         // Explicit "skip" -> skip.
         assert_eq!(
-            permission_flag_for(Some("skip"), "claude"),
-            " --dangerously-skip-permissions"
+            resolve_claude_cmd(Some("skip"), "claude").cmd,
+            "claude --dangerously-skip-permissions"
         );
         // "prompt" -> prompt flag (only on the exact literal).
         assert_eq!(
-            permission_flag_for(Some("prompt"), "claude"),
-            " --permission-prompt-tool mcp__baude__approve"
+            resolve_claude_cmd(Some("prompt"), "claude").cmd,
+            "claude --permission-prompt-tool mcp__baude__approve"
         );
         // Unrecognized value -> fail-safe to skip (never reach prompt).
         assert_eq!(
-            permission_flag_for(Some("bogus"), "claude"),
-            " --dangerously-skip-permissions"
+            resolve_claude_cmd(Some("bogus"), "claude").cmd,
+            "claude --dangerously-skip-permissions"
         );
         // Case-mismatch is unrecognized -> skip (exact literal only).
         assert_eq!(
-            permission_flag_for(Some("Prompt"), "claude"),
-            " --dangerously-skip-permissions"
+            resolve_claude_cmd(Some("Prompt"), "claude").cmd,
+            "claude --dangerously-skip-permissions"
+        );
+        // None of these strip anything (no conflicting skip to remove).
+        assert!(!resolve_claude_cmd(Some("prompt"), "claude").stripped_skip);
+    }
+
+    #[test]
+    fn resolve_claude_cmd_no_double_add() {
+        // Operator-set prompt-style flags are respected, never doubled (T-04-02).
+        let r = resolve_claude_cmd(
+            Some("prompt"),
+            "claude --permission-prompt-tool mcp__other__x",
+        );
+        assert_eq!(r.cmd, "claude --permission-prompt-tool mcp__other__x");
+        assert!(!r.stripped_skip);
+        let r = resolve_claude_cmd(Some("prompt"), "claude --permission-mode acceptEdits");
+        assert_eq!(r.cmd, "claude --permission-mode acceptEdits");
+        // Skip mode never double-adds its own flag.
+        assert_eq!(
+            resolve_claude_cmd(Some("skip"), "claude --dangerously-skip-permissions").cmd,
+            "claude --dangerously-skip-permissions"
         );
     }
 
     #[test]
-    fn permission_flag_for_no_double_add() {
-        // Even in prompt mode, an existing permission flag suppresses ours
-        // (T-04-02 — never duplicate/override an operator-set flag).
-        assert_eq!(
-            permission_flag_for(Some("prompt"), "claude --dangerously-skip-permissions"),
-            ""
+    fn resolve_claude_cmd_bl04_prompt_strips_conflicting_skip() {
+        // BL-04: prompt mode is an explicit opt-in and WINS over a skip flag
+        // baked into claude_cmd — the skip is stripped, prompt is added, and
+        // stripped_skip flags it so the caller can warn.
+        let r = resolve_claude_cmd(Some("prompt"), "claude --dangerously-skip-permissions");
+        assert_eq!(r.cmd, "claude --permission-prompt-tool mcp__baude__approve");
+        assert!(r.stripped_skip, "must report it stripped the skip flag");
+        // Strip works mid-command too, and only in prompt mode.
+        let r = resolve_claude_cmd(
+            Some("prompt"),
+            "claude --dangerously-skip-permissions --foo x",
         );
         assert_eq!(
-            permission_flag_for(
-                Some("prompt"),
-                "claude --permission-prompt-tool mcp__other__x"
-            ),
-            ""
+            r.cmd,
+            "claude --foo x --permission-prompt-tool mcp__baude__approve"
         );
-        assert_eq!(
-            permission_flag_for(Some("prompt"), "claude --permission-mode acceptEdits"),
-            ""
-        );
-        // And in skip mode too.
-        assert_eq!(
-            permission_flag_for(Some("skip"), "claude --dangerously-skip-permissions"),
-            ""
-        );
+        // Skip/default mode never strips (preserves the operator's skip).
+        assert!(!resolve_claude_cmd(None, "claude --dangerously-skip-permissions").stripped_skip);
     }
 
     #[test]
-    fn permission_flag_for_returns_exactly_one_known_value() {
+    fn resolve_claude_cmd_never_both_flags() {
         for mode in [None, Some("skip"), Some("prompt"), Some("bogus"), Some("")] {
-            let flag = permission_flag_for(mode, "claude");
-            assert!(
-                flag == " --dangerously-skip-permissions"
-                    || flag == " --permission-prompt-tool mcp__baude__approve"
-                    || flag.is_empty(),
-                "flag must be exactly one known value, got {flag:?} for mode {mode:?}"
-            );
-            // Never both flags at once.
-            assert!(
-                !(flag.contains("--dangerously-skip-permissions")
-                    && flag.contains("--permission-prompt-tool")),
-                "the two flags must never appear together"
-            );
+            for base in [
+                "claude",
+                "claude --dangerously-skip-permissions",
+                "claude --permission-mode acceptEdits",
+            ] {
+                let cmd = resolve_claude_cmd(mode, base).cmd;
+                assert!(
+                    !(cmd.contains("--dangerously-skip-permissions")
+                        && cmd.contains("--permission-prompt-tool")),
+                    "the two flags must never appear together: mode {mode:?} base {base:?} -> {cmd}"
+                );
+            }
         }
     }
 
-    // ---- permission_flag: the env-reading wrapper delegates correctly ---
+    // ---- resolve_claude_cmd_env: the env-reading wrapper delegates ------
     // One guarded smoke test that the env wrapper reads BAUDE_PERMISSION_MODE
-    // and routes to permission_flag_for. Kept minimal and mutex-guarded;
+    // and routes to resolve_claude_cmd. Kept minimal and mutex-guarded;
     // restores the var immediately to shrink the race window with spawns.
 
     #[test]
-    fn permission_flag_reads_env_and_delegates() {
+    fn resolve_claude_cmd_env_reads_env_and_delegates() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BAUDE_PERMISSION_MODE");
-        assert_eq!(permission_flag("claude"), " --dangerously-skip-permissions");
+        assert_eq!(
+            resolve_claude_cmd_env("claude").cmd,
+            "claude --dangerously-skip-permissions"
+        );
         std::env::remove_var("BAUDE_PERMISSION_MODE");
     }
 
