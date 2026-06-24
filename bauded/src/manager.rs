@@ -856,7 +856,14 @@ fn session_info(s: &Session) -> SessionInfo {
             reason => Some(reason.to_string()),
         },
         model: s.meta.model.clone(),
-        permission_mode: s.meta.permission_mode.clone(),
+        // BL-02: fall back to baude's spawn-intended mode (skip→bypassPermissions)
+        // when the transcript hasn't reported one yet, so the mode is shown for
+        // every session — not just those past their first permissionMode record.
+        permission_mode: s
+            .meta
+            .permission_mode
+            .clone()
+            .or_else(|| baude_core::permission::spawn_permission_mode().map(str::to_string)),
         context_used_pct: s.meta.context_used_pct,
         rate_5h_used_pct: s
             .meta

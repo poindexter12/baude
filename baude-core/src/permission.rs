@@ -129,6 +129,23 @@ pub fn is_prompt_mode() -> bool {
     std::env::var("BAUDE_PERMISSION_MODE").as_deref() == Ok("prompt")
 }
 
+/// BL-02: the claude `permissionMode` baude's spawn flag IMPLIES, for display
+/// when the transcript hasn't reported one yet (a freshly spawned session shows
+/// no model/mode until its transcript resolves and carries `permissionMode`).
+///
+/// `skip`/default → `Some("bypassPermissions")` (the `--dangerously-skip-permissions`
+/// baude spawns with). `prompt` → `None`: claude runs in its normal default mode
+/// and the `approve` tool intercepts, so there is no distinct mode label to imply.
+/// Callers use this only as a FALLBACK — a transcript-reported mode always wins
+/// (the user may switch modes mid-session, and claude is authoritative).
+pub fn spawn_permission_mode() -> Option<&'static str> {
+    if is_prompt_mode() {
+        None
+    } else {
+        Some("bypassPermissions")
+    }
+}
+
 /// Build the `.mcp.json` body registering the `baude` permission MCP server.
 ///
 /// Returns `{"mcpServers":{"baude":{"command":<exe>,"args":["permission-mcp"]}}}`.
@@ -689,6 +706,20 @@ mod tests {
         std::env::set_var("BAUDE_PERMISSION_MODE", "Prompt");
         assert!(!is_prompt_mode());
 
+        std::env::remove_var("BAUDE_PERMISSION_MODE");
+    }
+
+    #[test]
+    fn spawn_permission_mode_maps_skip_to_bypass_prompt_to_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // BL-02: skip/default implies bypassPermissions (the flag baude spawns);
+        // prompt implies no distinct mode label (claude runs default + tool).
+        std::env::remove_var("BAUDE_PERMISSION_MODE");
+        assert_eq!(spawn_permission_mode(), Some("bypassPermissions"));
+        std::env::set_var("BAUDE_PERMISSION_MODE", "skip");
+        assert_eq!(spawn_permission_mode(), Some("bypassPermissions"));
+        std::env::set_var("BAUDE_PERMISSION_MODE", "prompt");
+        assert_eq!(spawn_permission_mode(), None);
         std::env::remove_var("BAUDE_PERMISSION_MODE");
     }
 

@@ -445,13 +445,21 @@ fn meta_line(s: &Session, selected: bool) -> Line<'static> {
             push(&mut spans, text, style);
         }
     }
-    if let Some(mode) = &s.meta.permission_mode {
+    // BL-02: fall back to baude's spawn-intended mode (skip→bypassPermissions)
+    // when the transcript hasn't reported one yet, so every local session shows
+    // its mode. A transcript-reported mode always wins.
+    let mode = s
+        .meta
+        .permission_mode
+        .clone()
+        .or_else(|| baude_core::permission::spawn_permission_mode().map(str::to_string));
+    if let Some(mode) = mode {
         let style = if mode == "bypassPermissions" {
             Style::default().fg(Color::Red)
         } else {
             dim
         };
-        push(&mut spans, short_mode(mode).to_string(), style);
+        push(&mut spans, short_mode(&mode).to_string(), style);
     }
     if let Some(gsd) = &s.meta.gsd {
         if let Some(phase) = &gsd.active_phase {
