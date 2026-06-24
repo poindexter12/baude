@@ -490,10 +490,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         .title(title);
     frame.render_widget(block, claude_rect);
 
-    let claude_sel = app
-        .selection
-        .as_ref()
-        .filter(|s| !s.is_shell);
+    let claude_sel = app.selection.as_ref().filter(|s| !s.is_shell);
     draw_term(
         frame,
         inner(claude_rect),
@@ -513,13 +510,14 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style(app.focus == Focus::Shell))
-            .title(format!(" shell @ {} {}", s.cwd.display(), shell_scroll_hint));
+            .title(format!(
+                " shell @ {} {}",
+                s.cwd.display(),
+                shell_scroll_hint
+            ));
         frame.render_widget(block, sr);
         if let Some(shell) = &s.shell {
-            let shell_sel = app
-                .selection
-                .as_ref()
-                .filter(|s| s.is_shell);
+            let shell_sel = app.selection.as_ref().filter(|s| s.is_shell);
             draw_term(
                 frame,
                 inner(sr),

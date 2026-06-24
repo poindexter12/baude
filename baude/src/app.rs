@@ -1348,15 +1348,14 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let (pane_area, is_shell) =
-                    if Self::rect_contains(claude_inner, col, row) {
-                        (claude_inner, false)
-                    } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
-                        (shell_inner.unwrap(), true)
-                    } else {
-                        self.selection = None;
-                        return;
-                    };
+                let (pane_area, is_shell) = if Self::rect_contains(claude_inner, col, row) {
+                    (claude_inner, false)
+                } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
+                    (shell_inner.unwrap(), true)
+                } else {
+                    self.selection = None;
+                    return;
+                };
                 let r = row.saturating_sub(pane_area.y);
                 let c = col.saturating_sub(pane_area.x);
                 self.selection = Some(Selection {
@@ -1370,8 +1369,12 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(sel) = &mut self.selection {
-                    let r = row.saturating_sub(sel.pane_area.y).min(sel.pane_area.height.saturating_sub(1));
-                    let c = col.saturating_sub(sel.pane_area.x).min(sel.pane_area.width.saturating_sub(1));
+                    let r = row
+                        .saturating_sub(sel.pane_area.y)
+                        .min(sel.pane_area.height.saturating_sub(1));
+                    let c = col
+                        .saturating_sub(sel.pane_area.x)
+                        .min(sel.pane_area.width.saturating_sub(1));
                     sel.end_row = r;
                     sel.end_col = c;
                 }
@@ -1393,9 +1396,7 @@ impl App {
                             .map(|p| &p.parser)
                     } else {
                         match self.selected_id {
-                            Some(SelId::Remote(_)) => {
-                                self.attach.as_ref().map(|a| &a.parser)
-                            }
+                            Some(SelId::Remote(_)) => self.attach.as_ref().map(|a| &a.parser),
                             _ => self.selected().map(|s| &s.claude.parser),
                         }
                     };
