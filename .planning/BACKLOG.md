@@ -70,7 +70,17 @@ audit item.
 
 ---
 
-### BL-03 — Wire GSD phase/state into the sidebar
+### BL-03 — Wire GSD phase/state into the sidebar — ✅ RESOLVED 2026-06-24
+
+**Resolution:** GSD already showed on local TUI sessions (`ph<active_phase>`) but
+nowhere else. Made placement CONSISTENT across surfaces (kept the existing
+sidebar-line placement rather than redesign): added `gsd_active_phase` to
+`SessionInfo` + `RemoteInfo`, rendered `ph<phase>` on the remote TUI line, and
+added a `⬡ <milestone> ph<phase>` chip to the PWA session rows (sw.js v5→v6).
+GSD state is now visible at a glance on local TUI, remote TUI, and the PWA.
+Commit on `gsd/phase-04`.
+
+
 
 **Observation (user):** Since GSD is used heavily, surfacing GSD phase/state in the
 sidebar would be valuable "if it makes sense."
