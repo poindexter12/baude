@@ -27,6 +27,13 @@ pub struct RemoteInfo {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_used_pct: Option<u8>,
+    /// The session's active 5h rate-limit window (used % + reset), mirrored
+    /// from `SessionInfo`. `#[serde(default)]` so an older daemon that omits
+    /// these deserializes to `None` (back-compat, like the fields below).
+    #[serde(default)]
+    pub rate_5h_used_pct: Option<u8>,
+    #[serde(default)]
+    pub rate_5h_resets_at_unix_s: Option<u64>,
     pub branch: Option<String>,
     pub session_cost_usd: Option<f64>,
     /// Which source decided `status` ("hook"/"session-file"/"silence"); shown

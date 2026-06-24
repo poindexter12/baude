@@ -243,6 +243,10 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
         };
         push(&mut spans, format!("{pct}%"), style);
     }
+    if let Some(pct) = r.rate_5h_used_pct {
+        let (text, style) = rate_5h_chip(pct, r.rate_5h_resets_at_unix_s, dim);
+        push(&mut spans, text, style);
+    }
     if let Some(mode) = &r.permission_mode {
         let style = if mode == "bypassPermissions" {
             Style::default().fg(Color::Red)
@@ -392,7 +396,26 @@ fn draw_usage_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Compact second sidebar line: model · context% · permission mode · gsd phase.
+/// Per-session 5h rate-limit chip: `5h 47% in 2h12m` (reset countdown dropped
+/// when unknown). Colors the chip like context% — red ≥80, yellow ≥60, else
+/// dim — so a near-exhausted window stands out in the sidebar. Shared by the
+/// local and remote second-line builders so both render the window identically.
+fn rate_5h_chip(pct: u8, resets_at: Option<u64>, dim: Style) -> (String, Style) {
+    let text = match resets_at {
+        Some(t) => format!("5h {pct}% {}", human_until(t)),
+        None => format!("5h {pct}%"),
+    };
+    let style = if pct >= 80 {
+        Style::default().fg(Color::Red)
+    } else if pct >= 60 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        dim
+    };
+    (text, style)
+}
+
+/// Compact second sidebar line: model · context% · 5h · permission mode · gsd phase.
 fn meta_line(s: &Session, selected: bool) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut spans: Vec<Span> = vec![gutter(selected)];
@@ -414,6 +437,13 @@ fn meta_line(s: &Session, selected: bool) -> Line<'static> {
             dim
         };
         push(&mut spans, format!("{pct}%"), style);
+    }
+    if let Some(w) = s.meta.rate_5h {
+        if let Some(p) = w.used_pct {
+            let pct = (p.round() as u64).min(100) as u8;
+            let (text, style) = rate_5h_chip(pct, w.resets_at_unix_s, dim);
+            push(&mut spans, text, style);
+        }
     }
     if let Some(mode) = &s.meta.permission_mode {
         let style = if mode == "bypassPermissions" {
@@ -1224,5 +1254,32 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(p, rect);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rate_5h_chip;
+    use ratatui::style::{Color, Style};
+
+    #[test]
+    fn rate_5h_chip_formats_and_colors() {
+        let dim = Style::default().fg(Color::DarkGray);
+        // No reset known -> bare "5h N%" with the dim color below 60%.
+        let (text, style) = rate_5h_chip(47, None, dim);
+        assert_eq!(text, "5h 47%");
+        assert_eq!(style, dim);
+        // >=60% is yellow, >=80% is red (mirrors context% thresholds).
+        assert_eq!(
+            rate_5h_chip(60, None, dim).1,
+            Style::default().fg(Color::Yellow)
+        );
+        assert_eq!(
+            rate_5h_chip(80, None, dim).1,
+            Style::default().fg(Color::Red)
+        );
+        // A known reset appends the countdown ("in …" / "now").
+        let (text, _) = rate_5h_chip(10, Some(0), dim);
+        assert!(text.starts_with("5h 10% "), "got: {text}");
     }
 }

@@ -137,6 +137,8 @@ mod tests {
             model: None,
             permission_mode: None,
             context_used_pct: None,
+            rate_5h_used_pct: None,
+            rate_5h_resets_at_unix_s: None,
             branch: None,
             cwd: String::new(),
             repo_root: String::new(),

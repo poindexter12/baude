@@ -71,6 +71,12 @@ pub struct SessionInfo {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub context_used_pct: Option<u8>,
+    /// The session's active 5-hour rate-limit window (used % + reset time),
+    /// captured per-session from its statusline bridge file (`meta.rate_5h`).
+    /// Flat optionals (not a nested object) so an older PWA/TUI client just
+    /// ignores them and `#[serde(default)]` back-compat on `RemoteInfo` is free.
+    pub rate_5h_used_pct: Option<u8>,
+    pub rate_5h_resets_at_unix_s: Option<u64>,
     pub branch: Option<String>,
     pub cwd: String,
     pub repo_root: String,
@@ -848,6 +854,12 @@ fn session_info(s: &Session) -> SessionInfo {
         model: s.meta.model.clone(),
         permission_mode: s.meta.permission_mode.clone(),
         context_used_pct: s.meta.context_used_pct,
+        rate_5h_used_pct: s
+            .meta
+            .rate_5h
+            .and_then(|w| w.used_pct)
+            .map(|p| (p.round() as u64).min(100) as u8),
+        rate_5h_resets_at_unix_s: s.meta.rate_5h.and_then(|w| w.resets_at_unix_s),
         branch: s.meta.git_branch.clone().or_else(|| s.branch.clone()),
         cwd: s.cwd.display().to_string(),
         repo_root: s.repo_root.display().to_string(),

@@ -43,6 +43,13 @@ function humanMs(ms) {
   return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
 }
 
+// "in 2h12m" until a unix-seconds timestamp (the 5h rate-limit reset), "now"
+// once elapsed. Mirrors the TUI's human_until for the per-session 5h chip.
+function untilShort(unixS) {
+  const ms = unixS * 1000 - Date.now();
+  return ms <= 0 ? "now" : "in " + humanMs(ms);
+}
+
 // Compact relative age for an event ts (unix ms), mirroring the TUI's
 // activity_age: "now" for <1s, else humanMs (IN-01).
 function activityAge(ts) {
@@ -582,6 +589,10 @@ function renderList() {
     const meta = [
       shortModel(s.model),
       s.context_used_pct != null ? `${s.context_used_pct}%` : null,
+      s.rate_5h_used_pct != null
+        ? `5h ${s.rate_5h_used_pct}%` +
+          (s.rate_5h_resets_at_unix_s ? ` ${untilShort(s.rate_5h_resets_at_unix_s)}` : "")
+        : null,
       shortMode(s.permission_mode),
       s.branch ? `⎇ ${esc(s.branch)}` : null,
       s.session_cost_usd != null ? `$${s.session_cost_usd.toFixed(2)}` : null,
