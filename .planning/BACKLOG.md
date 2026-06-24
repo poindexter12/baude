@@ -59,3 +59,33 @@ visible at a glance.
 **Action:** New feature idea — scope a future phase (likely a later v0.7 ergonomics
 item or a Tier-2+ milestone). Confirm desired placement (sidebar line vs overlay)
 with user before planning.
+
+---
+
+## Captured 2026-06-23
+
+### BL-04 — `BAUDE_PERMISSION_MODE=prompt` silently suppressed when `claude_cmd` already contains `--dangerously-skip-permissions`
+
+**Observation (found during v0.7 §F UAT setup):** With `~/.config/baude/config.json`
+`"claude_cmd": "claude --dangerously-skip-permissions"`, setting
+`BAUDE_PERMISSION_MODE=prompt` does NOT enable prompt mode. The locked
+no-double-add rule (`permission_flag_for`, T-04-02) sees the existing
+`--dangerously-skip-permissions` in the base cmd and returns `""`, so skip wins.
+Meanwhile `is_prompt_mode()` (which does NOT inspect the base cmd) still returns
+true and seeds `.mcp.json` — a half-configured state (mcp server seeded, but
+claude runs in skip mode) with NO warning. The `approve` tool is never invoked.
+
+**Impact:** Any user who bakes `--dangerously-skip-permissions` into `claude_cmd`
+(a very common, natural setting for unattended use) cannot turn on prompt mode via
+the env var alone, and gets no signal explaining why. This is the inverse of WR-01
+(which warns on TUI-prompt-with-no-daemon).
+
+**Candidate fixes:** (a) when `is_prompt_mode()` but the resolved base cmd carries
+`--dangerously-skip-permissions`, log/surface a warning at spawn (and skip the
+.mcp.json seed for consistency); (b) in prompt mode, strip a conflicting
+`--dangerously-skip-permissions` from the base cmd before appending the prompt
+flag (prompt is the explicit opt-in, so it should win over a config default);
+(c) document the interaction. (b) is probably the least-surprising behavior.
+
+**Workaround (UAT):** override with `BAUDE_CLAUDE_CMD=claude` so the base cmd has
+no permission flag and prompt mode engages.
