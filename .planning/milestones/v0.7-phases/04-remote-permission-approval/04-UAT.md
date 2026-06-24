@@ -77,7 +77,7 @@ result: [passed — 2026-06-23, Claude-driven against live claude 2.1.187; 1 shi
 ### 2. PWA approve/deny card + distinct push, live prompt-mode session (04-04 UAT)
 expected: prompt-mode session → (a) distinct push fires ("<name> needs permission"), separate from the generic waiting push; (b) approve/deny card above the composer with the tool + esc()'d input; (c) Approve runs the tool, card clears; (d) Deny denies only that tool call (session survives), card clears; (e) timeout past BAUDE_PERMISSION_TIMEOUT_S denies (never auto-allows). Web Push phone-verification noted (separate deferred milestone).
 why_human: Vanilla-JS PWA (no test runner) + real Web Push needs a device.
-result: [partial — 2026-06-23, on-device (iPhone 16 Pro, prompt-mode daemon over a tailnet raw-TCP serve at http://100.76.8.47:8642). CONFIRMED live: (b) the approve/deny card renders above the composer for a real pending permission, and (c) Approve runs the tool — the full bridge→daemon→PWA→approve round-trip works end-to-end against live claude 2.1.187 (this is the path the §F framing fix unblocked; before the fix the permission-mcp server never connected so no card could ever appear). PENDING: (d) Deny-survives-session, (a) distinct permission push, and (e) timeout-denies — (a) needs the HTTPS/secure-context path (Web Push requires it; the raw-IP HTTP path used here can't subscribe). Carry the first-real-phone Web Push verification with (a).]
+result: [partial — 2026-06-23, on-device (iPhone 16 Pro, prompt-mode daemon over a tailnet raw-TCP serve at http://100.76.8.47:8642). CONFIRMED live: (b) the approve/deny card renders above the composer for a real pending permission, (c) Approve runs the tool, and (d) Deny denies only that tool call — the session SURVIVED (server-verified: status stayed `waiting`, not `exited`) and the file was NOT created (server-verified: `deny-test.txt` absent). The full bridge→daemon→PWA→approve/deny round-trip works end-to-end against live claude 2.1.187 (this is the path the §F framing fix unblocked; before the fix the permission-mcp server never connected so no card could ever appear). PENDING: (a) distinct permission push, and (e) timeout-denies — (a) needs the HTTPS/secure-context path (Web Push requires it; the raw-IP HTTP path used here can't subscribe). Carry the first-real-phone Web Push verification with (a).]
 
 ## Data-path validation (Claude-driven, 2026-06-15)
 
@@ -117,7 +117,8 @@ bugs_found_and_fixed: 2
 
 - Test 1 (§F wire contract) PASSED against live claude 2.1.187 — found + fixed a
   ship-blocking output-framing bug (`write_frame` Content-Length → newline).
-- Test 2 PARTIAL — on-device confirmed the approve/deny card renders + Approve
-  runs the tool end-to-end (the core §F-unblocked path). Still to verify on the
-  HTTPS path: Deny-survives-session, the distinct permission push, timeout-denies,
-  and first-real-phone Web Push (all gated on the secure-context HTTPS leg).
+- Test 2 PARTIAL — on-device confirmed card render + Approve-runs-tool +
+  Deny-denies-tool-and-session-survives (Deny outcome server-verified). Still to
+  verify: the distinct permission push + timeout-denies + first-real-phone Web
+  Push — all gated on the secure-context HTTPS leg (enable iOS "Use Tailscale
+  DNS", then the https://…ts.net PWA).

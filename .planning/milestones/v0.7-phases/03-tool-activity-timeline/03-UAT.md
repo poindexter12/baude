@@ -29,7 +29,7 @@ steps: |
   5. Drive tool calls — rows append live, no reload, no gap/dup at snapshot↔live seam.
   6. A tool/notification string with HTML chars renders as literal text.
   7. Navigate away and back — no duplicate/stale EventSource.
-result: [pending]
+result: [passed — 2026-06-24, on-device (iPhone 16 Pro, prompt-mode daemon over tailnet raw-TCP serve). User confirmed the activity strip renders below the chat and shows the session's tool events as they occur (verified live while driving a permission-gated Write through the session). sw.js served baude-v5 over the wire (cache bumped past v3 by the later 5h-window change). NOTE: the daemon's in-memory ring `GET /activity` read 0 in THIS scratch run only because the managed session's `claude_session_id` never resolved headlessly (same limitation that blocked the 5h-data injection) — the on-device strip render is the evidence; the ring+SSE+GET feed itself was already validated end-to-end with a resolved session_id (see "Data-feed validation" above).]
 
 ### 2. TUI `v` activity overlay live-render (ACT-04 / SC4)
 expected: `v` on a selected session (local OR remote) opens Modal::Activity mirroring the `i` overlay, recent tool sequence newest-at-bottom; any key dismisses; refreshes live on the draw tick (local ~1s, remote ~3s); local reads s.meta.activity(), remote reads RemoteInfo.activity.
@@ -59,13 +59,15 @@ renders of this validated feed remain for human verification.
 ## Summary
 
 total: 2
-passed: 0
+passed: 1
 issues: 0
-pending: 2
+pending: 1
 skipped: 0
 blocked: 0
 data_feed_validated: true
 
 ## Gaps
 
-- Both pending items are visual-render confirmations of an already-live-validated data feed.
+- Test 1 (PWA activity strip) PASSED on-device 2026-06-24.
+- Test 2 (TUI `v` activity overlay) still pending — terminal-only visual render,
+  no phone needed; verify with `cargo run -p baude` + `v` on a session.
