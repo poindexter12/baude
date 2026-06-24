@@ -34,8 +34,14 @@ jobs:
           cache-to: type=gha,mode=max
       - name: smoke test image
         run: |
+          # The daemon appends a permission flag (PERM-01, default
+          # --dangerously-skip-permissions) to BAUDE_CLAUDE_CMD; the real
+          # `claude` accepts it but a bare `sleep` would choke and exit.
+          # Wrap the stand-in in `sh -c` so the appended flags land as ignored
+          # positionals and the process stays alive + silent → settles to
+          # "waiting" (what this smoke asserts).
           docker run -d --rm --name smoke --init -p 8642:8642 \
-            -e BAUDE_CLAUDE_CMD="sleep 60" bauded:ci
+            -e BAUDE_CLAUDE_CMD='sh -c "sleep 60"' bauded:ci
           for i in $(seq 1 20); do
             curl -fsS http://127.0.0.1:8642/sessions && break || sleep 1
           done
