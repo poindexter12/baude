@@ -174,6 +174,27 @@ fn main() -> Result<()> {
         run_permission_mcp();
     }
 
+    // `baude --version` / `--help` — print and exit BEFORE the launch-dir logic
+    // below (which would otherwise treat the flag as a repo path and boot the
+    // TUI without a TTY). Mirrors the `bauded` arms.
+    match args.get(1).map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("baude {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "baude {} — multiple Claude Code sessions in one terminal\n\n\
+                 usage: baude [<repo-dir>]\n\n\
+                 subcommands: statusline, hook, permission-mcp\n\
+                 options:     --version/-V, --help/-h",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let launch_dir = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)
