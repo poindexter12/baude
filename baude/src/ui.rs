@@ -101,7 +101,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style(app.focus == Focus::Sidebar))
-        .title(" baude ");
+        .title(concat!(" baude v", env!("CARGO_PKG_VERSION"), " "));
     let list_area = block.inner(area);
     frame.render_widget(block, area);
 
