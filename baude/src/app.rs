@@ -20,6 +20,26 @@ use crate::usage::{UsageCosts, UsagePoller};
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
 
+/// Encode a mouse scroll event for delivery to a PTY.
+/// `up` true → scroll up (button 64), false → scroll down (button 65).
+/// `col`/`row` are 1-indexed coordinates within the PTY viewport.
+/// `sgr` selects SGR encoding (`\x1b[<N;C;RM`) vs X10 (`\x1b[MBxy`).
+fn encode_mouse_scroll(up: bool, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let button = if up { 64u8 } else { 65u8 };
+    if sgr {
+        format!("\x1b[<{button};{col};{row}M").into_bytes()
+    } else {
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            button + 32,
+            (col as u8).saturating_add(32),
+            (row as u8).saturating_add(32),
+        ]
+    }
+}
+
 /// ctrl+\ arrives as raw byte 0x1C, which crossterm reports as ctrl+4
 /// (the two are indistinguishable in legacy terminal encoding).
 fn is_backslash(code: KeyCode) -> bool {
@@ -1062,6 +1082,14 @@ impl App {
                     self.set_message(format!("not a directory: {}", expanded.display()));
                     return;
                 }
+                // Daemon mode: delegate so sessions survive TUI restarts.
+                if let Some(remote) = &self.remote {
+                    match remote.create(expanded.to_str().unwrap_or(&value), None, None) {
+                        Ok(()) => self.set_message("session queued on daemon".into()),
+                        Err(e) => self.set_message(format!("daemon: {e}")),
+                    }
+                    return;
+                }
                 match self.add_session(expanded, None, None, false, false, false) {
                     Ok(_) => {
                         self.focus = Focus::Claude;
@@ -1071,6 +1099,14 @@ impl App {
                 }
             }
             InputKind::NewWorktreeBranch { repo_root } => {
+                // Daemon mode: daemon creates the worktree and spawns the session.
+                if let Some(remote) = &self.remote {
+                    match remote.create(repo_root.to_str().unwrap_or(""), Some(&value), None) {
+                        Ok(()) => self.set_message("worktree session queued on daemon".into()),
+                        Err(e) => self.set_message(format!("daemon: {e}")),
+                    }
+                    return;
+                }
                 match git::create_worktree(&repo_root, &value) {
                     Ok(dir) => match self.add_session(
                         dir,
@@ -1332,7 +1368,21 @@ impl App {
             MouseEventKind::ScrollUp => {
                 self.selection = None;
                 if Self::rect_contains(claude_inner, col, row) {
-                    self.claude_scroll = self.claude_scroll.saturating_add(3);
+                    let scroll_state = self.selected().map(|s| s.claude.scroll_info());
+                    match scroll_state {
+                        Some((true, true, sgr)) => {
+                            let px = col.saturating_sub(claude_inner.x) as usize + 1;
+                            let py = row.saturating_sub(claude_inner.y) as usize + 1;
+                            let bytes = encode_mouse_scroll(true, px, py, sgr);
+                            if let Some(s) = self.selected_mut() {
+                                s.claude.write_input(&bytes);
+                            }
+                        }
+                        Some((false, _, _)) | None => {
+                            self.claude_scroll = self.claude_scroll.saturating_add(3);
+                        }
+                        _ => {}
+                    }
                 } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
                     self.shell_scroll = self.shell_scroll.saturating_add(3);
                 }
@@ -1340,7 +1390,21 @@ impl App {
             MouseEventKind::ScrollDown => {
                 self.selection = None;
                 if Self::rect_contains(claude_inner, col, row) {
-                    self.claude_scroll = self.claude_scroll.saturating_sub(3);
+                    let scroll_state = self.selected().map(|s| s.claude.scroll_info());
+                    match scroll_state {
+                        Some((true, true, sgr)) => {
+                            let px = col.saturating_sub(claude_inner.x) as usize + 1;
+                            let py = row.saturating_sub(claude_inner.y) as usize + 1;
+                            let bytes = encode_mouse_scroll(false, px, py, sgr);
+                            if let Some(s) = self.selected_mut() {
+                                s.claude.write_input(&bytes);
+                            }
+                        }
+                        Some((false, _, _)) | None => {
+                            self.claude_scroll = self.claude_scroll.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
                 } else if shell_inner.map(|r| Self::rect_contains(r, col, row)) == Some(true) {
                     self.shell_scroll = self.shell_scroll.saturating_sub(3);
                 }

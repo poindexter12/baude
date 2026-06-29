@@ -41,10 +41,14 @@ pub fn encode_key(key: &KeyEvent, app_cursor: bool) -> Vec<u8> {
             }
         }
         KeyCode::Enter => {
-            if alt {
-                out.push(0x1b);
+            if shift && !alt && !ctrl {
+                out.extend_from_slice(b"\x1b[13;2u");
+            } else {
+                if alt {
+                    out.push(0x1b);
+                }
+                out.push(b'\r');
             }
-            out.push(b'\r');
         }
         KeyCode::Backspace => {
             if alt {
@@ -83,7 +87,6 @@ pub fn encode_key(key: &KeyEvent, app_cursor: bool) -> Vec<u8> {
         _ => {}
     }
 
-    let _ = shift; // shift is folded into modifier_code below
     out
 }
 

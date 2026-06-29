@@ -187,6 +187,24 @@ impl Pty {
         let _ = self.writer.flush();
     }
 
+    /// Returns `(alternate_screen, mouse_enabled, mouse_sgr)` — enough for
+    /// the TUI to decide whether to use vt100 scrollback or forward scroll
+    /// events as PTY input to the inner application.
+    pub fn scroll_info(&self) -> (bool, bool, bool) {
+        self.parser
+            .lock()
+            .ok()
+            .map(|p| {
+                let screen = p.screen();
+                let alt = screen.alternate_screen();
+                let mouse_enabled = screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+                let mouse_sgr =
+                    screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
+                (alt, mouse_enabled, mouse_sgr)
+            })
+            .unwrap_or((false, false, false))
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.lock().ok().and_then(|c| c.process_id())
     }

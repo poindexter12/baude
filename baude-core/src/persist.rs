@@ -50,6 +50,11 @@ pub struct Config {
     /// Base URL of a remote bauded daemon whose sessions appear in the
     /// sidebar, e.g. "http://bauded:8642". BAUDE_DAEMON_URL overrides.
     pub daemon_url: Option<String>,
+    /// When true, baude auto-starts a local bauded on startup if one is not
+    /// already running, and routes new-session creation through it so sessions
+    /// survive TUI restarts. BAUDE_AUTO_DAEMON=1 overrides.
+    #[serde(default)]
+    pub auto_daemon: bool,
 }
 
 pub fn load_config() -> Config {
