@@ -5,6 +5,27 @@ network namespace, and bauded shares it. Nothing is published to the host —
 **the tailnet is the security boundary**, there is no auth layer in the
 daemon itself.
 
+```mermaid
+flowchart LR
+    phone["tailnet device<br/>(phone / laptop)"]
+
+    subgraph host["Docker host — nothing published to it"]
+        subgraph netns["shared network namespace"]
+            ts["tailscale sidecar<br/>owns netns · MagicDNS 'bauded'"]
+            bd["bauded :8642<br/>REST · SSE · PWA"]
+        end
+        vols[("volumes<br/>claude-config · repos<br/>baude-state · tailscale-state")]
+        code[("/code — host bind mount")]
+        sessions["claude sessions<br/>--dangerously-skip-permissions"]
+    end
+
+    phone -->|"tailnet only<br/>(:8642, or HTTPS via tailscale serve)"| ts
+    ts --- bd
+    bd --- vols
+    bd --- code
+    bd --> sessions
+```
+
 ## 1. Create a Tailscale auth key
 
 https://login.tailscale.com/admin/settings/keys → **Generate auth key**:

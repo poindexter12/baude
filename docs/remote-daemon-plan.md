@@ -49,12 +49,26 @@ If the session is busy, Claude Code queues it natively (visible as
 
 ## Target architecture
 
+The shipped workspace layout (this plan is fully realized as of v0.7):
+
+```mermaid
+flowchart TB
+    core["<b>baude-core</b> — UI-free session engine<br/>pty · session · meta · persist · git<br/>+ hook · bridge · permission (v0.7)"]
+    tui["<b>baude</b> — ratatui TUI<br/>app · ui · keys · usage · remote"]
+    daemon["<b>bauded</b> — axum daemon<br/>api · manager · transcript · notify · push · web/PWA"]
+
+    tui -->|owns sessions directly| core
+    daemon -->|owns sessions, REST + SSE| core
+    tui -. "daemon_url: lists & attaches remote sessions" .-> daemon
+
+    classDef lib fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
+    class core lib;
 ```
-baude/  (cargo workspace)
-├── baude-core/    pty.rs, session.rs, meta.rs, persist.rs, git.rs (today's code, no UI deps)
-├── bauded/        axum daemon: REST + SSE over baude-core; owns sessions; systemd/compose
-└── baude/         existing ratatui TUI (unchanged at first; later optionally a bauded client)
-```
+
+baude-core carries no HTTP dependency — every network seam (hook POST,
+permission resolve) is injected from the binaries. Both binaries also share
+byte-identical `hook` and `permission-mcp` subcommands, because each seeds
+`current_exe()` as the command Claude invokes.
 
 ### bauded API sketch
 
