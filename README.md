@@ -49,6 +49,41 @@ Sessions, worktrees, and shell-pane state persist across restarts
 (`~/.config/baude/state.json`). On relaunch each session resumes its most
 recent conversation via `claude --continue`.
 
+## How it works
+
+baude never asks Claude Code for anything — it **reads what Claude writes to
+disk**. Every session is a real `claude` process in a PTY that baude owns.
+baude auto-seeds four lifecycle hooks into each session's `.claude/settings.local.json`;
+the `statusLine` bridge is configured once (in your Claude settings, or seeded
+by the container). baude then polls the resulting artifacts about once a second
+to render the sidebar.
+
+```mermaid
+flowchart LR
+    subgraph cc["a claude session — PTY owned by baude"]
+        claude["claude process"]
+    end
+
+    claude -->|"lifecycle events"| hook["baude hook"]
+    claude -->|"statusLine JSON"| bridge["baude statusline --wrap"]
+    bridge -->|"delegates unchanged"| real["your real statusline"]
+
+    claude -.->|writes| sess["sessions/&lt;pid&gt;.json<br/>busy · model · mode · tokens"]
+    claude -.->|writes| tx["projects/…/&lt;sid&gt;.jsonl<br/>transcript"]
+    hook --> ev["/tmp/baude-events-&lt;sid&gt;.jsonl<br/>working / waiting signal"]
+    bridge --> usage["/tmp/baude-usage-&lt;sid&gt;.json<br/>cost · rate-limit %"]
+    sh["statusline hook (e.g. GSD)"] --> ctx["/tmp/claude-ctx-&lt;sid&gt;.json<br/>context %"]
+    repo[".planning/STATE.md<br/>GSD state"]
+    ccusage["ccusage — bg thread, 1m<br/>today / week cost"]
+
+    sess & tx & ev & usage & ctx & repo & ccusage --> tui["baude TUI<br/>polls ~1s → sidebar"]
+```
+
+The [Session metadata](#session-metadata) and [Usage panel](#usage-panel)
+sections below detail each source. When Claude's own session file or hook
+events are present they drive the precise working/waiting signal; absent those,
+baude falls back to a PTY output-silence heuristic.
+
 ## Keys
 
 A few global chords work the same everywhere; everything else passes straight
@@ -84,7 +119,20 @@ this chord shadows Claude's own alt+←/→ word navigation.
 - `✗` exited (`r` to restart)
 
 Waiting is detected from PTY output silence: Claude streams spinner output
-continuously while working, so ~2s of quiet means it's your turn.
+continuously while working, so ~2s of quiet means it's your turn. When Claude's
+own session file or hook events are present they take precedence over this
+heuristic (`exited > hook event > session file > output silence`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> working
+    working --> waiting: Stop hook / ~2s output silence
+    waiting --> working: you reply, or a new turn starts
+    working --> exited: claude exits
+    exited --> working: r — restart (claude --continue)
+    waiting --> archived: 30m unattended (auto), or a (manual)
+    archived --> waiting: input re-engages auto-archive; a unarchives a manual one
+```
 
 Sessions waiting unattended for 30 minutes auto-archive: they sink to a
 dimmed `▼ archived` section at the bottom, stop flashing and counting, and
