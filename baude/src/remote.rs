@@ -128,6 +128,21 @@ impl RemotePoller {
             .map_err(|e| short_err(&e))
     }
 
+    pub fn create(
+        &self,
+        repo: &str,
+        worktree: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<(), String> {
+        let body = serde_json::json!({ "repo": repo, "worktree": worktree, "name": name });
+        ureq::post(&format!("{}/sessions", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .map(|_| ())
+            .map_err(|e| short_err(&e))
+    }
+
     pub fn set_archived(&self, id: u64, archived: bool) -> Result<(), String> {
         let action = if archived { "archive" } else { "unarchive" };
         ureq::post(&format!("{}/sessions/{id}/{action}", self.base))

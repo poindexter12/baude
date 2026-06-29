@@ -8,6 +8,62 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::Result;
+
+const AUTO_DAEMON_URL: &str = "http://127.0.0.1:8642";
+
+fn daemon_is_up() -> bool {
+    ureq::get(&format!("{AUTO_DAEMON_URL}/sessions"))
+        .timeout(Duration::from_millis(300))
+        .call()
+        .is_ok()
+}
+
+/// If `auto_daemon` is enabled (config or env) and no explicit daemon URL is
+/// configured, ensure a local `bauded` is running and return its URL.
+/// Returns `None` when auto-daemon is disabled or already handled by config.
+fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
+    // Explicit URL already configured — nothing to do.
+    if std::env::var("BAUDE_DAEMON_URL").is_ok() || config.daemon_url.is_some() {
+        return None;
+    }
+    let auto = config.auto_daemon
+        || std::env::var("BAUDE_AUTO_DAEMON")
+            .map(|v| matches!(v.as_str(), "1" | "true"))
+            .unwrap_or(false);
+    if !auto {
+        return None;
+    }
+    if daemon_is_up() {
+        return Some(AUTO_DAEMON_URL.to_string());
+    }
+    // Locate bauded: same directory as this binary, then PATH.
+    let bauded = std::env::current_exe()
+        .ok()
+        .map(|p| p.with_file_name("bauded"))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join("bauded"))
+                    .find(|p| p.exists())
+            })
+        })?;
+    // Spawn detached; drop the handle — bauded outlives the TUI.
+    std::process::Command::new(&bauded)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    // Wait up to 2 s for bauded to bind.
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(200));
+        if daemon_is_up() {
+            return Some(AUTO_DAEMON_URL.to_string());
+        }
+    }
+    None
+}
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -200,6 +256,14 @@ fn main() -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let launch_dir = launch_dir.canonicalize().unwrap_or(launch_dir);
+
+    // Auto-start local bauded when auto_daemon is configured. Must run before
+    // App::new() reads the env, and before any threads start (set_var is not
+    // thread-safe, but we're still single-threaded here).
+    let config = baude_core::persist::load_config();
+    if let Some(url) = ensure_daemon(&config) {
+        std::env::set_var("BAUDE_DAEMON_URL", url);
+    }
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
