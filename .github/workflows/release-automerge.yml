@@ -1,0 +1,60 @@
+name: release-automerge
+
+# The soak gate for minor releases. release-please.yml labels a minor release PR
+# `release:minor` but does NOT auto-merge it; this cron merges it once it has
+# soaked >= SOAK_HOURS AND all required checks are green. Patch PRs land via
+# native auto-merge (see release-please.yml); major PRs are never touched here.
+#
+# Escape hatches: label a PR `release:hold` to veto auto-merge; a maintainer can
+# always merge manually to fast-track past the soak.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  SOAK_HOURS: "2"
+
+jobs:
+  soak:
+    runs-on: ubuntu-22.04
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      - name: merge soaked minor release PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Open minor release PRs not held.
+          prs=$(gh pr list --repo "$REPO" --state open --label 'release:minor' \
+                  --json number,labels \
+                  --jq '.[] | select([.labels[].name] | index("release:hold") | not) | .number')
+          [ -n "$prs" ] || { echo "no minor release PRs pending"; exit 0; }
+          now=$(date -u +%s)
+          for num in $prs; do
+            created=$(gh pr view "$num" --repo "$REPO" --json createdAt --jq .createdAt)
+            then=$(date -u -d "$created" +%s)
+            age_h=$(( (now - then) / 3600 ))
+            if [ "$age_h" -lt "${SOAK_HOURS}" ]; then
+              echo "PR #$num soaking: ${age_h}h < ${SOAK_HOURS}h"
+              continue
+            fi
+            # `gh pr checks --required` exits non-zero unless every required check passed.
+            if gh pr checks "$num" --repo "$REPO" --required >/dev/null 2>&1; then
+              echo "PR #$num soaked ${age_h}h and green — merging"
+              gh pr merge "$num" --repo "$REPO" --merge
+            else
+              echo "PR #$num past soak but required checks not green — skipping"
+            fi
+          done
