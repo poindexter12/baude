@@ -60,13 +60,15 @@ pub struct SessionInfo {
     pub state_source: &'static str,
     /// The last tool name Claude ran (from the hook event stream), if any.
     pub last_tool: Option<String>,
-    /// Only present while waiting — how long Claude has been blocked on us.
+    /// Present while `Waiting` (blocked on us) or `Completed` (idle since a
+    /// clean turn end) — how long Claude has been in that idle state.
     pub waiting_for_ms: Option<u64>,
-    /// PERM-04: why the session is waiting — `"permission"` (a pending
-    /// tool-permission request, drives the distinct push + PWA card),
-    /// `"input"` (a generic waiting prompt), or `None` when active. Derived
-    /// from `meta.last_notification` + the waiting status via
-    /// `baude_core::permission::waiting_reason`.
+    /// PERM-04 + three-state status: why the session is idle —
+    /// `"permission"` (a pending tool-permission request, drives the
+    /// distinct push + PWA card), `"input"` (a generic waiting prompt),
+    /// `"completed"` (a clean `Stop`, calm — no push urgency), or `None` when
+    /// active/busy. Derived from `meta.last_notification` + the resolved
+    /// `Status` via `baude_core::permission::waiting_reason`.
     pub waiting_reason: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
@@ -153,6 +155,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 fn status_str(s: Status) -> &'static str {
     match s {
         Status::Waiting => "waiting",
+        Status::Completed => "completed",
         Status::Busy => "busy",
         Status::Exited => "exited",
     }
@@ -849,13 +852,17 @@ fn session_info(s: &Session) -> SessionInfo {
         status: status_str(status),
         state_source: source_str(source),
         last_tool: s.meta.last_tool.as_ref().map(|(t, _)| t.clone()),
-        waiting_for_ms: (status == Status::Waiting).then(|| s.waiting_for_ms()),
+        // Populated for both idle flavors: Waiting's yellow "waiting Xm" timer
+        // and Completed's dim "done Xm ago" both read this same duration.
+        waiting_for_ms: matches!(status, Status::Waiting | Status::Completed)
+            .then(|| s.waiting_for_ms()),
         waiting_reason: match baude_core::permission::waiting_reason(
             s.meta.last_notification.as_ref(),
             status == Status::Waiting,
+            status == Status::Completed,
         ) {
             // "none" carries no signal — omit it so the JSON stays lean and the
-            // PWA/push key off the presence of "permission"/"input".
+            // PWA/push key off the presence of "permission"/"input"/"completed".
             "none" => None,
             reason => Some(reason.to_string()),
         },

@@ -36,8 +36,13 @@ pub const AUTO_ARCHIVE_IDLE_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Status {
-    /// Idle and (presumably) waiting for user input.
+    /// Idle, blocked on the user — Claude asked a question or needs a
+    /// permission decision. The urgent idle state: flashes, has a wait timer.
     Waiting,
+    /// Idle, turn ended cleanly (a `Stop` event, no pending `Notification`) —
+    /// your move, but not urgent. Calm sibling of `Waiting`; recolors the same
+    /// sidebar row in place rather than reordering it. See [`idle_kind`].
+    Completed,
     /// Producing output — Claude is thinking/working.
     Busy,
     /// The claude process has exited.
@@ -92,7 +97,10 @@ impl Session {
             return false;
         }
         match status {
-            Status::Waiting
+            // Both idle flavors still park after AUTO_ARCHIVE_IDLE_MS — a
+            // Completed session left unattended is just as "done being
+            // watched" as a Waiting one, it just didn't shout on the way in.
+            Status::Waiting | Status::Completed
                 if !self.archived
                     && self.waiting_for_ms() >= idle_ms
                     && self
@@ -168,6 +176,51 @@ fn decide_status(
     (st, src)
 }
 
+/// Which flavor of "idle" a [`Status::Waiting`] session is really in. Output
+/// of [`idle_kind`] — see there for the derivation rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdleKind {
+    /// Claude asked a question / needs a permission decision — urgent.
+    NeedsInput,
+    /// Claude finished its turn cleanly — calm, your move.
+    Completed,
+}
+
+/// Refine the *idle* bucket `decide_status` already produced into
+/// [`IdleKind::Completed`] vs [`IdleKind::NeedsInput`]. Deliberately NOT part
+/// of `decide_status`/`decide_live` — those own busy-vs-idle precedence and
+/// stay untouched; this is a separate, pure classifier layered on top, fed the
+/// two terminal hook-event timestamps `ClaudeMeta` already tracks
+/// (`last_stop`, `last_notification`).
+///
+/// Rules, in order:
+/// - a `last_notification` whose type CONTAINS `"permission"` is
+///   `NeedsInput` regardless of recency — a pending permission is itself a
+///   kind of waiting (mirrors [`crate::permission::waiting_reason`]'s own
+///   rule, and guarantees a session can never read `Completed` while a
+///   permission is outstanding).
+/// - otherwise, whichever of `last_stop`/`last_notification` is the more
+///   recent terminal event wins: a `Stop` at or after the last `Notification`
+///   is `Completed`; a `Notification` strictly after the last `Stop` is
+///   `NeedsInput`.
+/// - fail-safe: idle with NEITHER known (a session that never fired hooks —
+///   pure silence/session-file fallback) is `NeedsInput`, never `Completed`.
+///   A false "completed" could hide a session actually blocked on you; a
+///   false "needs input" only costs one harmless extra flash. Never trade
+///   away the attention guarantee.
+pub fn idle_kind(last_stop: Option<u64>, last_notification: Option<&(String, u64)>) -> IdleKind {
+    if let Some((notification_type, _)) = last_notification {
+        if notification_type.contains("permission") {
+            return IdleKind::NeedsInput;
+        }
+    }
+    match (last_stop, last_notification.map(|(_, ts)| *ts)) {
+        (Some(stop), Some(notif)) if notif > stop => IdleKind::NeedsInput,
+        (Some(_), _) => IdleKind::Completed,
+        (None, _) => IdleKind::NeedsInput, // fail-safe: no Stop ever seen
+    }
+}
+
 /// The live (not-exited) precedence decision. Split out of [`decide_status`]
 /// so the exited path can override only the `Status` while preserving the
 /// honest source label (WR-05): an exited session reports the source that
@@ -211,14 +264,27 @@ impl Session {
     /// decided the result. `status()` delegates to `.0` so the public,
     /// total `Status` API and all call sites stay unchanged.
     pub fn status_with_source(&self) -> (Status, StateSource) {
-        decide_status(
+        let (status, source) = decide_status(
             self.claude.is_exited(),
             self.meta.hook_status,
             now_unix_ms(),
             self.meta.claude_status,
             self.claude.last_output_ms.load(Ordering::Relaxed),
             now_ms(),
-        )
+        );
+        // decide_status/decide_live are untouched (they own busy-vs-idle
+        // precedence); the idle bucket they hand back as Waiting is refined
+        // here into Completed vs NeedsInput(=Waiting) via the new pure
+        // classifier. Busy and Exited pass through unchanged.
+        if status == Status::Waiting {
+            let refined = match idle_kind(self.meta.last_stop, self.meta.last_notification.as_ref())
+            {
+                IdleKind::Completed => Status::Completed,
+                IdleKind::NeedsInput => Status::Waiting,
+            };
+            return (refined, source);
+        }
+        (status, source)
     }
 
     /// How long this session has been waiting for input, in ms.
@@ -414,6 +480,59 @@ mod tests {
         assert_eq!(
             decide_status(false, None, NOW_UNIX, Some((false, 0)), NOW_MONO, NOW_MONO),
             (Status::Waiting, StateSource::SessionFile)
+        );
+    }
+
+    // --- idle_kind: the new Completed/NeedsInput classifier ---
+    //
+    // Pure over the two terminal-event timestamps ClaudeMeta already tracks;
+    // does not touch decide_status/decide_live (asserted unchanged above).
+
+    #[test]
+    fn idle_kind_stop_newer_is_completed() {
+        assert_eq!(
+            idle_kind(Some(200), Some(&("idle".to_string(), 100))),
+            IdleKind::Completed
+        );
+        // Stop with no notification at all is also Completed.
+        assert_eq!(idle_kind(Some(200), None), IdleKind::Completed);
+        // Tied timestamps: Stop counts as "the most recent" -> Completed.
+        assert_eq!(
+            idle_kind(Some(100), Some(&("idle".to_string(), 100))),
+            IdleKind::Completed
+        );
+    }
+
+    #[test]
+    fn idle_kind_notification_newer_is_needs_input() {
+        assert_eq!(
+            idle_kind(Some(100), Some(&("idle".to_string(), 200))),
+            IdleKind::NeedsInput
+        );
+    }
+
+    #[test]
+    fn idle_kind_permission_type_wins_regardless_of_recency() {
+        // A permission-type notification is NeedsInput even when it is OLDER
+        // than the last Stop — mirrors permission::waiting_reason's own rule
+        // and guarantees Completed never coexists with a pending permission.
+        assert_eq!(
+            idle_kind(Some(500), Some(&("permission_prompt".to_string(), 100))),
+            IdleKind::NeedsInput
+        );
+    }
+
+    #[test]
+    fn idle_kind_neither_known_fails_safe_to_needs_input() {
+        // No hook history at all (pure silence/session-file fallback) must
+        // NOT read as Completed — a false "completed" could hide a session
+        // genuinely blocked on the user.
+        assert_eq!(idle_kind(None, None), IdleKind::NeedsInput);
+        // No Stop but SOME notification: still NeedsInput (the notification
+        // itself is the reason to wait, and there's no Stop to out-rank it).
+        assert_eq!(
+            idle_kind(None, Some(&("idle".to_string(), 100))),
+            IdleKind::NeedsInput
         );
     }
 }

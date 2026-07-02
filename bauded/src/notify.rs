@@ -1,6 +1,8 @@
 //! Decides *when* to push: a session that has been waiting on the user for
-//! a debounce window (cutting spinner-flicker noise), or one that exited.
-//! Pure state machine over `SessionInfo` snapshots — the sending happens
+//! a debounce window (cutting spinner-flicker noise), one that exited, or one
+//! that just finished a turn cleanly (three-state status: a distinct, gentle
+//! push on the Working→Completed edge — never the urgent waiting push). Pure
+//! state machine over `SessionInfo` snapshots — the sending happens
 //! elsewhere, outside any locks.
 
 use std::collections::{HashMap, HashSet};
@@ -20,6 +22,11 @@ pub struct Notifier {
     /// tool-permission request. Distinct from `notified_waiting` so a pending
     /// permission gets its own push; re-armed when `waiting_reason` flips away.
     notified_permission: HashSet<u64>,
+    /// Three-state status: sessions already notified for their current
+    /// Completed stretch (the gentle "X finished" push). Distinct from
+    /// `notified_waiting` — Completed never fires the urgent "is waiting for
+    /// you" push, only this one, and only once per Working→Completed edge.
+    notified_completed: HashSet<u64>,
     last_status: HashMap<u64, String>,
 }
 
@@ -49,6 +56,7 @@ impl Notifier {
         self.notified_waiting.retain(|id| live.contains(id));
         self.notified_exited.retain(|id| live.contains(id));
         self.notified_permission.retain(|id| live.contains(id));
+        self.notified_completed.retain(|id| live.contains(id));
         self.last_status.retain(|id, _| live.contains(id));
 
         for s in sessions {
@@ -57,6 +65,7 @@ impl Notifier {
             if s.archived {
                 self.notified_waiting.remove(&s.id);
                 self.notified_permission.remove(&s.id);
+                self.notified_completed.remove(&s.id);
                 self.last_status.insert(s.id, s.status.to_string());
                 continue;
             }
@@ -91,6 +100,31 @@ impl Notifier {
                         });
                     }
                 }
+                "completed" => {
+                    // Three-state status: Completed is the CALM idle bucket —
+                    // never the urgent "is waiting for you" push, only a
+                    // gentle "finished" push, and only ONCE on the edge from
+                    // a genuinely working turn (not on first sighting already
+                    // completed, e.g. a daemon restart — mirrors the exited
+                    // "was_alive" guard just above).
+                    let was_busy = self
+                        .last_status
+                        .get(&s.id)
+                        .map(|p| p == "busy")
+                        .unwrap_or(false);
+                    if was_busy && self.notified_completed.insert(s.id) {
+                        out.push(Notification {
+                            title: format!("{} finished", s.name),
+                            body: s.title.clone().unwrap_or_default(),
+                            sid: s.id,
+                        });
+                    }
+                    // Re-arm the waiting/exited notifiers, same as the busy
+                    // catch-all below — a completed turn is as much "fresh
+                    // ground" as a busy one for those two.
+                    self.notified_waiting.remove(&s.id);
+                    self.notified_exited.remove(&s.id);
+                }
                 "exited" => {
                     self.notified_waiting.remove(&s.id);
                     // Only sessions seen alive before count — don't fire for
@@ -112,6 +146,7 @@ impl Notifier {
                     // busy: a new turn started; re-arm the waiting notifier
                     self.notified_waiting.remove(&s.id);
                     self.notified_exited.remove(&s.id);
+                    self.notified_completed.remove(&s.id);
                 }
             }
             self.last_status.insert(s.id, s.status.to_string());
@@ -245,5 +280,41 @@ mod tests {
         let fired = n.tick(&[perm(1)]);
         assert_eq!(fired.len(), 1, "permission re-armed and fires again");
         assert!(fired[0].title.contains("permission"));
+    }
+
+    #[test]
+    fn completed_fires_gentle_finished_once_on_edge_from_busy() {
+        let mut n = Notifier::default();
+        // A working turn is seen first (records last_status = busy).
+        assert!(n.tick(&[info(1, "busy", None)]).is_empty());
+        // Edge into completed: exactly one gentle "finished" push, and NOT the
+        // urgent "is waiting for you" push.
+        let fired = n.tick(&[info(1, "completed", None)]);
+        assert_eq!(fired.len(), 1, "exactly one finished push on the edge");
+        assert!(
+            fired[0].title.contains("finished"),
+            "gentle finished title, got: {}",
+            fired[0].title
+        );
+        assert!(
+            !fired[0].title.contains("waiting"),
+            "completed must never be the urgent waiting push"
+        );
+        // Still completed on the next tick: no duplicate.
+        assert!(
+            n.tick(&[info(1, "completed", None)]).is_empty(),
+            "no duplicate finished push while still completed"
+        );
+    }
+
+    #[test]
+    fn completed_on_first_sighting_does_not_fire() {
+        // Daemon restart sees a session already completed with no prior busy —
+        // must NOT fire (mirrors the exited "was_alive" guard).
+        let mut n = Notifier::default();
+        assert!(
+            n.tick(&[info(1, "completed", None)]).is_empty(),
+            "no finished push for a session first seen already completed"
+        );
     }
 }

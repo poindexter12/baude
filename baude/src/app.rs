@@ -310,10 +310,11 @@ impl App {
         }
     }
 
-    /// (waiting, busy) session counts for the status bar.
-    pub fn status_counts(&self) -> (usize, usize) {
+    /// (waiting, busy, completed) session counts for the status bar.
+    pub fn status_counts(&self) -> (usize, usize, usize) {
         let mut waiting = 0;
         let mut busy = 0;
+        let mut completed = 0;
         for s in &self.sessions {
             if s.archived {
                 continue;
@@ -321,10 +322,11 @@ impl App {
             match s.status() {
                 Status::Waiting => waiting += 1,
                 Status::Busy => busy += 1,
+                Status::Completed => completed += 1,
                 Status::Exited => {}
             }
         }
-        (waiting, busy)
+        (waiting, busy, completed)
     }
 
     /// The command run for each session: BAUDE_CLAUDE_CMD env, then
