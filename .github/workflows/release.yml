@@ -1,8 +1,14 @@
 name: release
 
+# release-please owns the tag + GitHub Release (with changelog notes); this
+# workflow attaches the built assets to that Release. Triggering on
+# `release: published` (not tag push) avoids a double-release collision — the
+# tag is created by release-please when its release PR merges, which publishes
+# the Release, which fires this build. `github.ref_name` is the tag for a
+# release event, so the image jobs below are unaffected.
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -112,11 +118,11 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: cd dist && shasum -a 256 *.tar.gz > SHA256SUMS.txt
-      - name: create release
+      - name: attach assets to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
+          gh release upload "${{ github.event.release.tag_name }}" \
             --repo "${{ github.repository }}" \
-            --generate-notes \
+            --clobber \
             dist/*

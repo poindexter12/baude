@@ -1,0 +1,87 @@
+name: release-please
+
+# Maintains a single open "release PR" from Conventional Commits on main
+# (version bump + Cargo.lock + CHANGELOG.md). Merging that PR creates the
+# vX.Y.Z tag + GitHub Release, which triggers release.yml to build/attach assets.
+#
+# Auth: the default GITHUB_TOKEN cannot trigger the release PR's required CI, so
+# release-please authenticates as a GitHub App. Create the App (Contents: RW,
+# Pull requests: RW), install it on this repo, and add secrets
+# RELEASE_PLEASE_APP_ID + RELEASE_PLEASE_APP_PRIVATE_KEY.
+
+on:
+  push:
+    branches: [main]
+
+# The App token performs all writes; the workflow's own token stays read-only.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-22.04
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
+      - id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # We need the CURRENT (pre-bump) version to classify the bump size.
+      - if: ${{ steps.rp.outputs.pr }}
+        uses: actions/checkout@v6
+
+      # Classify the pending release PR and gate it per the tiered policy:
+      #   patch -> native auto-merge (lands the instant required checks pass)
+      #   minor -> label only; release-automerge.yml merges it after the soak
+      #   major -> label manual + comment; a human merges to release
+      - name: gate release pr
+        if: ${{ steps.rp.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.rp.outputs.pr }}
+        run: |
+          set -euo pipefail
+          num=$(jq -r '.number' <<<"$PR")
+          # release-please PR titles end with the proposed version.
+          new=$(jq -r '.title' <<<"$PR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n1)
+          old=$(jq -r '."."' .release-please-manifest.json)
+          echo "release PR #$num: $old -> $new"
+          IFS=. read -r oM om _ <<<"$old"
+          IFS=. read -r nM nm _ <<<"$new"
+          if   [ "$nM" -gt "$oM" ]; then tier="major"
+          elif [ "$nm" -gt "$om" ]; then tier="minor"
+          else tier="patch"
+          fi
+          echo "bump tier: $tier"
+
+          # Idempotent labels; clear the other two tiers so a re-run re-classifies.
+          gh label create "release:$tier" -c FBCA04 -d "release-please bump tier" -f
+          for l in release:patch release:minor release:major; do
+            [ "$l" = "release:$tier" ] || gh pr edit "$num" --remove-label "$l" 2>/dev/null || true
+          done
+          gh pr edit "$num" --add-label "release:$tier"
+
+          case "$tier" in
+            patch)
+              gh pr merge "$num" --auto --merge
+              ;;
+            minor)
+              # Left to soak; make sure no stale auto-merge shortcuts it.
+              gh pr merge "$num" --disable-auto 2>/dev/null || true
+              ;;
+            major)
+              gh label create release:manual -c B60205 -d "manual release — no auto-merge" -f
+              gh pr edit "$num" --add-label release:manual
+              gh pr merge "$num" --disable-auto 2>/dev/null || true
+              gh pr comment "$num" --body "Major version bump — auto-release is disabled. Review and merge manually to cut the release." || true
+              ;;
+          esac
