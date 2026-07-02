@@ -128,6 +128,13 @@ pub struct ClaudeMeta {
     /// event. Captured for a future Phase 4 `waiting_reason`; intentionally
     /// NOT exposed as a structured SessionInfo field this phase.
     pub last_notification: Option<(String, u64)>,
+    /// event_ts unix ms of the most recent Stop event — Claude ended a turn
+    /// cleanly. Symmetric to `last_notification`; the two together feed
+    /// `session::idle_kind`, which decides whether an idle session reads as
+    /// `Status::Completed` (this is the newer terminal event) or
+    /// `Status::Waiting`/needs-input (`last_notification` is newer, or is a
+    /// permission-type notification).
+    pub last_stop: Option<u64>,
     /// Byte offset of the last fully-consumed line in the event stream.
     /// Separate from `offset` (the transcript tail) so the two tails never
     /// interfere.
@@ -411,6 +418,7 @@ impl ClaudeMeta {
             self.hook_status = None;
             self.last_tool = None;
             self.last_notification = None;
+            self.last_stop = None;
             self.activity.clear();
         }
         let Ok(mut f) = fs::File::open(&path) else {
@@ -440,7 +448,10 @@ impl ClaudeMeta {
             let ts = v["ts"].as_u64().unwrap_or(0);
             match v["event"].as_str() {
                 Some("UserPromptSubmit") => self.hook_status = Some((true, ts)),
-                Some("Stop") => self.hook_status = Some((false, ts)),
+                Some("Stop") => {
+                    self.hook_status = Some((false, ts));
+                    self.last_stop = Some(ts);
+                }
                 Some("Notification") => {
                     self.hook_status = Some((false, ts));
                     if let Some(nt) = v["notification_type"].as_str() {
@@ -915,6 +926,52 @@ mod tests {
         );
         assert_eq!(meta.hook_status, Some((false, 200)));
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stop_event_captures_last_stop() {
+        // Stop -> hook_status Waiting AND last_stop records the event ts,
+        // symmetric to how Notification records last_notification.
+        let mut meta = ClaudeMeta::default();
+        let path = feed_events(
+            &mut meta,
+            "last-stop",
+            &[r#"{"schema":1,"event":"Stop","ts":150}"#],
+        );
+        assert_eq!(meta.hook_status, Some((false, 150)));
+        assert_eq!(meta.last_stop, Some(150));
+
+        // A LATER Stop event updates last_stop (not just the first one).
+        feed_events(
+            &mut meta,
+            "last-stop",
+            &[r#"{"schema":1,"event":"Stop","ts":400}"#],
+        );
+        assert_eq!(meta.last_stop, Some(400));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn last_stop_resets_on_session_id_change() {
+        // Mirrors event_tail_resets_offset_on_session_id_change (WR-03): a
+        // rotated session_id must not carry a stale last_stop forward.
+        let mut meta = ClaudeMeta::default();
+        let path_a = feed_events(
+            &mut meta,
+            "last-stop-rot-a",
+            &[r#"{"schema":1,"event":"Stop","ts":100}"#],
+        );
+        assert_eq!(meta.last_stop, Some(100));
+
+        let path_b = feed_events(
+            &mut meta,
+            "last-stop-rot-b",
+            &[r#"{"schema":1,"event":"UserPromptSubmit","ts":900}"#],
+        );
+        assert_eq!(meta.last_stop, None, "rotation must clear last_stop");
+
+        fs::remove_file(&path_a).ok();
+        fs::remove_file(&path_b).ok();
     }
 
     #[test]

@@ -202,9 +202,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Map a daemon status word onto the local status enum for shared styling.
+/// The `_ => Waiting` fallback is deliberate back-compat: an unknown word from
+/// a newer daemon degrades to the urgent-idle state (never silently "calm").
 fn remote_status(r: &RemoteInfo) -> Status {
     match r.status.as_str() {
         "busy" => Status::Busy,
+        "completed" => Status::Completed,
         "exited" => Status::Exited,
         _ => Status::Waiting,
     }
@@ -295,6 +298,15 @@ fn session_row(
             ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
         }
         Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
+        // A finished turn is calm — a steady green check, never flashing. It's
+        // your move, but nothing is blocked, so it must not pull the eye the
+        // way a `Waiting` (needs-input) session does.
+        Status::Completed => (
+            "✓",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM),
+        ),
         Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
     };
 
@@ -311,7 +323,10 @@ fn session_row(
         Style::default().fg(Color::Gray)
     };
 
-    let suffix = if status == Status::Waiting {
+    // Both a needs-input (`Waiting`) and a finished (`Completed`) session show
+    // how long they've been idle; the color below tells them apart (urgent
+    // yellow vs. calm gray "done Xm ago").
+    let suffix = if status == Status::Waiting || status == Status::Completed {
         human_duration(waiting_ms)
     } else {
         String::new()
@@ -331,9 +346,11 @@ fn session_row(
     ];
     if !suffix.is_empty() {
         spans.push(Span::raw(" ".repeat(pad)));
+        // Only a needs-input session flashes its timer yellow; a completed
+        // session's "done Xm ago" stays calm gray.
         spans.push(Span::styled(
             suffix,
-            Style::default().fg(if flash {
+            Style::default().fg(if flash && status == Status::Waiting {
                 Color::Yellow
             } else {
                 Color::DarkGray
@@ -519,6 +536,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
     let status_word = match s.status() {
         Status::Waiting => " waiting ",
         Status::Busy => " working ",
+        Status::Completed => " completed ",
         Status::Exited => " exited — r to restart ",
     };
     let mode_word = s
@@ -578,6 +596,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_remote_content(frame: &mut Frame, app: &App, area: Rect, r: &RemoteInfo) {
     let status_word = match r.status.as_str() {
         "busy" => " working ",
+        "completed" => " completed ",
         "exited" => " exited — r to restart ",
         _ => " waiting ",
     };
@@ -752,13 +771,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Right side: who needs you, and when the limits refill.
-    let (waiting, busy) = app.status_counts();
+    let (waiting, busy, completed) = app.status_counts();
     let mut right: Vec<String> = Vec::new();
     if waiting > 0 {
         right.push(format!("● {waiting} waiting"));
     }
     if busy > 0 {
         right.push(format!("◐ {busy} busy"));
+    }
+    if completed > 0 {
+        right.push(format!("✓ {completed} done"));
     }
     let (r5h, rweek) = app.rate_limits();
     if let Some(t) = r5h.and_then(|w| w.resets_at_unix_s) {
@@ -1257,6 +1279,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 )),
                 Line::raw("  ● waiting for your input — longest wait on top"),
                 Line::raw("  ◐ working"),
+                Line::raw("  ✓ completed — turn finished, your move"),
                 Line::raw("  ✗ exited"),
                 Line::from(Span::styled("press any key to close", dim)),
             ])

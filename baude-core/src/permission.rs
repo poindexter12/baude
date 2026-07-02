@@ -562,14 +562,25 @@ pub fn permission_url_from_event_url(event_url: &str) -> Option<String> {
 /// - a notification type CONTAINING `"permission"` → `"permission"` (the phone
 ///   shows the approve/deny card and gets a distinct push);
 /// - otherwise, if the session is `waiting` → `"input"` (generic prompt);
+/// - otherwise, if the session is `completed` (three-state status:
+///   `Status::Completed`, decided by `session::idle_kind`) → `"completed"`;
 /// - otherwise → `"none"` (active / not waiting).
 ///
 /// The `"permission"` arm fires even when `waiting` is false: a pending
-/// permission is itself a waiting state, and the notification is the authority.
-pub fn waiting_reason(last_notification: Option<&(String, u64)>, waiting: bool) -> &'static str {
+/// permission is itself a waiting state, and the notification is the
+/// authority. `waiting` and `completed` are mutually exclusive by
+/// construction (both are derived from the same `Status`), so their relative
+/// order below is immaterial — kept as `waiting` first to match the
+/// pre-existing precedence.
+pub fn waiting_reason(
+    last_notification: Option<&(String, u64)>,
+    waiting: bool,
+    completed: bool,
+) -> &'static str {
     match last_notification {
         Some((nt, _)) if nt.contains("permission") => "permission",
         _ if waiting => "input",
+        _ if completed => "completed",
         _ => "none",
     }
 }
@@ -1181,25 +1192,25 @@ mod tests {
         // A recent permission_prompt notification -> permission (regardless of
         // the waiting flag; a pending permission IS a kind of waiting).
         assert_eq!(
-            waiting_reason(Some(&("permission_prompt".to_string(), 1)), true),
+            waiting_reason(Some(&("permission_prompt".to_string(), 1)), true, false),
             "permission"
         );
         assert_eq!(
-            waiting_reason(Some(&("permission_prompt".to_string(), 1)), false),
+            waiting_reason(Some(&("permission_prompt".to_string(), 1)), false, false),
             "permission"
         );
         // Waiting with a non-permission notification -> input.
         assert_eq!(
-            waiting_reason(Some(&("idle".to_string(), 1)), true),
+            waiting_reason(Some(&("idle".to_string(), 1)), true, false),
             "input"
         );
         // Waiting with no notification at all -> input.
-        assert_eq!(waiting_reason(None, true), "input");
+        assert_eq!(waiting_reason(None, true, false), "input");
         // Not waiting, no notification -> none.
-        assert_eq!(waiting_reason(None, false), "none");
+        assert_eq!(waiting_reason(None, false, false), "none");
         // Not waiting, a stale non-permission notification -> none.
         assert_eq!(
-            waiting_reason(Some(&("idle".to_string(), 1)), false),
+            waiting_reason(Some(&("idle".to_string(), 1)), false, false),
             "none"
         );
     }
@@ -1209,13 +1220,35 @@ mod tests {
         // Any notification type CONTAINING "permission" maps to permission,
         // so an odd/variant hook label still routes the distinct push.
         assert_eq!(
-            waiting_reason(Some(&("needs_permission".to_string(), 1)), false),
+            waiting_reason(Some(&("needs_permission".to_string(), 1)), false, false),
             "permission"
         );
         assert_eq!(
-            waiting_reason(Some(&("PERMISSION".to_string(), 1)), true),
+            waiting_reason(Some(&("PERMISSION".to_string(), 1)), true, false),
             "input",
             "matching is case-sensitive substring; upper-case is not 'permission'"
         );
+    }
+
+    #[test]
+    fn waiting_reason_completed_arm() {
+        // three-state status: a Completed session (not waiting, not a pending
+        // permission) reports "completed".
+        assert_eq!(waiting_reason(None, false, true), "completed");
+        // A stale non-permission notification doesn't block the completed
+        // reason (mirrors idle_kind: only a permission-typed notification
+        // can coexist with the idle bucket being anything other than input).
+        assert_eq!(
+            waiting_reason(Some(&("idle".to_string(), 1)), false, true),
+            "completed"
+        );
+        // permission still wins over completed, defense-in-depth (idle_kind
+        // guarantees this combination can't actually occur upstream).
+        assert_eq!(
+            waiting_reason(Some(&("permission_prompt".to_string(), 1)), false, true),
+            "permission"
+        );
+        // waiting wins over completed too (shouldn't co-occur upstream either).
+        assert_eq!(waiting_reason(None, true, true), "input");
     }
 }
