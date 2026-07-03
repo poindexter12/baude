@@ -2,12 +2,17 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false,
       "bump-minor-pre-major": false,
       "draft": false,
-      "prerelease": false
+      "prerelease": false,
+      "extra-files": [
+        { "type": "toml", "path": "baude-core/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "baude/Cargo.toml", "jsonpath": "$.package.version" },
+        { "type": "toml", "path": "bauded/Cargo.toml", "jsonpath": "$.package.version" }
+      ]
     }
   }
 }

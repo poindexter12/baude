@@ -39,6 +39,28 @@ jobs:
       - if: ${{ steps.rp.outputs.pr }}
         uses: actions/checkout@v6
 
+      # The generic toml updaters bump the member Cargo.toml versions but
+      # cannot target Cargo.lock's [[package]] entries, so refresh the lock
+      # on the release branch. Idempotent: skips the commit when in sync.
+      - name: sync Cargo.lock on release branch
+        if: ${{ steps.rp.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          branch="release-please--branches--${{ github.ref_name }}"
+          git clone --depth=1 --branch "$branch" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" /tmp/rp-branch
+          cd /tmp/rp-branch
+          cargo update --workspace
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: sync Cargo.lock with release version"
+            git push origin "$branch"
+          fi
+
       # Classify the pending release PR and gate it per the tiered policy:
       #   patch -> native auto-merge (lands the instant required checks pass)
       #   minor -> label only; release-automerge.yml merges it after the soak
