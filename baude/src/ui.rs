@@ -82,7 +82,11 @@ fn flash_on() -> bool {
 /// moved to the content pane (inactive-selection convention).
 fn gutter(selected: bool, focused: bool) -> Span<'static> {
     if selected {
-        let c = if focused { Color::Cyan } else { Color::DarkGray };
+        let c = if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
         Span::styled("▌ ", Style::default().fg(c))
     } else {
         Span::raw("  ")
@@ -270,7 +274,11 @@ fn chips_line(
 /// Baseline chip style: a whisper. Slightly brighter on the selected row so
 /// it stays readable on the selection band.
 fn chip_base(selected: bool) -> Style {
-    Style::default().fg(if selected { Color::Gray } else { Color::DarkGray })
+    Style::default().fg(if selected {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    })
 }
 
 fn remote_meta_line(r: &RemoteInfo, selected: bool, focused: bool, width: usize) -> Line<'static> {
