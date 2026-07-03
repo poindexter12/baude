@@ -76,14 +76,24 @@ fn flash_on() -> bool {
     (now_ms() / 360).is_multiple_of(2)
 }
 
-/// 2-column left gutter: a cyan accent bar on the selected session, blank
-/// otherwise. Keeps every row aligned whether selected or not.
-fn gutter(selected: bool) -> Span<'static> {
+/// 2-column left gutter: an accent bar on the selected session, blank
+/// otherwise. Keeps every row aligned whether selected or not. The bar is
+/// cyan while the sidebar has focus and dims to gray when attention has
+/// moved to the content pane (inactive-selection convention).
+fn gutter(selected: bool, focused: bool) -> Span<'static> {
     if selected {
-        Span::styled("▌ ", Style::default().fg(Color::Cyan))
+        let c = if focused { Color::Cyan } else { Color::DarkGray };
+        Span::styled("▌ ", Style::default().fg(c))
     } else {
         Span::raw("  ")
     }
+}
+
+/// Background band painted across both lines of the selected session. A
+/// shared background is the strongest grouping cue a terminal offers: it
+/// marks the selection *and* binds the name line to its meta line.
+fn selection_bg() -> Style {
+    Style::default().bg(Color::Indexed(237))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -140,6 +150,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let width = list_area.width as usize;
+    let focused = app.focus == Focus::Sidebar;
     let mut lines: Vec<Line> = Vec::new();
     let mut remote_header_drawn = false;
     let mut archive_header_drawn = false;
@@ -160,13 +171,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 session_row(
                     &mut lines,
                     selected,
+                    focused,
                     s.status(),
                     &s.name,
                     s.waiting_for_ms(),
                     width,
                     archived,
                 );
-                lines.push(meta_line(s, selected));
+                lines.push(meta_line(s, selected, focused, width));
             }
             SelId::Remote(rid) => {
                 if !remote_header_drawn && !archived {
@@ -184,13 +196,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 session_row(
                     &mut lines,
                     selected,
+                    focused,
                     status,
                     &r.name,
                     waiting_ms.unwrap_or(0),
                     width,
                     archived,
                 );
-                lines.push(remote_meta_line(r, selected));
+                lines.push(remote_meta_line(r, selected, focused, width));
             }
         }
     }
@@ -224,17 +237,47 @@ fn remote_header(app: &App, width: usize) -> Line<'static> {
     Line::from(vec![Span::raw("  "), Span::styled(label, dim)])
 }
 
-fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let mut spans: Vec<Span> = vec![gutter(selected)];
-    let push = |spans: &mut Vec<Span>, text: String, style: Style| {
-        if spans.len() > 1 {
-            spans.push(Span::styled(" ", dim));
+/// Assemble a meta line from chips: a dim `↳` connector sits under the
+/// status icon so every meta line visibly hangs off the session name above
+/// it (an unadorned second line reads as ambiguous between neighbors),
+/// `·` separators bind the chips into one annotation, and the selected row
+/// gets the selection band + padding.
+fn chips_line(
+    chips: Vec<(String, Style)>,
+    selected: bool,
+    focused: bool,
+    width: usize,
+) -> Line<'static> {
+    let sep = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span> = vec![gutter(selected, focused), Span::styled("↳ ", sep)];
+    let mut used = 4usize;
+    for (i, (text, style)) in chips.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", sep));
+            used += 3;
         }
+        used += text.chars().count();
         spans.push(Span::styled(text, style));
-    };
+    }
+    if selected {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        Line::from(spans).style(selection_bg())
+    } else {
+        Line::from(spans)
+    }
+}
+
+/// Baseline chip style: a whisper. Slightly brighter on the selected row so
+/// it stays readable on the selection band.
+fn chip_base(selected: bool) -> Style {
+    Style::default().fg(if selected { Color::Gray } else { Color::DarkGray })
+}
+
+fn remote_meta_line(r: &RemoteInfo, selected: bool, focused: bool, width: usize) -> Line<'static> {
+    let base = chip_base(selected);
+    let mut chips: Vec<(String, Style)> = Vec::new();
     if let Some(m) = &r.model {
-        push(&mut spans, short_model(m), dim);
+        chips.push((short_model(m), base));
     }
     if let Some(pct) = r.context_used_pct {
         let style = if pct >= 80 {
@@ -242,33 +285,35 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
         } else if pct >= 60 {
             Style::default().fg(Color::Yellow)
         } else {
-            dim
+            base
         };
-        push(&mut spans, format!("{pct}%"), style);
+        chips.push((format!("{pct}%"), style));
     }
+    // The 5h window is account-global (the footer gauge owns it); surface it
+    // per-row only once it's hot enough to warrant attention.
     if let Some(pct) = r.rate_5h_used_pct {
-        let (text, style) = rate_5h_chip(pct, r.rate_5h_resets_at_unix_s, dim);
-        push(&mut spans, text, style);
+        if pct >= 60 {
+            let (text, style) = rate_5h_chip(pct, r.rate_5h_resets_at_unix_s, base);
+            chips.push((text, style));
+        }
     }
     if let Some(mode) = &r.permission_mode {
         let style = if mode == "bypassPermissions" {
             Style::default().fg(Color::Red)
         } else {
-            dim
+            base
         };
-        push(&mut spans, short_mode(mode).to_string(), style);
+        chips.push((short_mode(mode).to_string(), style));
     }
     if let Some(phase) = &r.gsd_active_phase {
-        push(
-            &mut spans,
-            format!("ph{phase}"),
-            Style::default().fg(Color::Green),
-        );
+        // Identity metadata, not status — styled like the model name so
+        // saturated color on this line always means "alarm".
+        chips.push((format!("ph{phase}"), base));
     }
-    if spans.len() == 1 {
-        spans.push(Span::styled("—", dim));
+    if chips.is_empty() {
+        chips.push(("—".into(), base));
     }
-    Line::from(spans)
+    chips_line(chips, selected, focused, width)
 }
 
 /// One sidebar session row: status icon, name, and (when waiting) a
@@ -277,6 +322,7 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool) -> Line<'static> {
 fn session_row(
     lines: &mut Vec<Line<'static>>,
     selected: bool,
+    focused: bool,
     status: Status,
     name: &str,
     waiting_ms: u64,
@@ -310,15 +356,22 @@ fn session_row(
         Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
     };
 
+    // The name never flashes: the pulsing icon and timer already carry the
+    // needs-input signal, and a whole flashing word drowns out the selection
+    // cue once a few sessions are waiting. A selected dead session caps at
+    // Gray — findable, but never as alive-looking as a running one.
     let name_style = if archived || matches!(status, Status::Exited) {
-        Style::default().fg(Color::DarkGray)
+        if selected {
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     } else if selected {
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
-    } else if status == Status::Waiting {
-        // flash the name too, so a waiting session is unmissable
-        Style::default().fg(if flash { Color::Yellow } else { Color::Gray })
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -339,7 +392,7 @@ fn session_row(
     let pad = width.saturating_sub(used);
 
     let mut spans = vec![
-        gutter(selected),
+        gutter(selected, focused),
         Span::styled(icon.to_string(), icon_style),
         Span::raw(" "),
         Span::styled(name, name_style),
@@ -356,8 +409,16 @@ fn session_row(
                 Color::DarkGray
             }),
         ));
+    } else if selected {
+        // Pad so the selection band spans the full sidebar width.
+        spans.push(Span::raw(" ".repeat(pad)));
     }
-    lines.push(Line::from(spans));
+    let line = Line::from(spans);
+    lines.push(if selected {
+        line.style(selection_bg())
+    } else {
+        line
+    });
 }
 
 /// Color a usage percentage: green → yellow (60%) → red (85%).
@@ -439,18 +500,15 @@ fn rate_5h_chip(pct: u8, resets_at: Option<u64>, dim: Style) -> (String, Style) 
     (text, style)
 }
 
-/// Compact second sidebar line: model · context% · 5h · permission mode · gsd phase.
-fn meta_line(s: &Session, selected: bool) -> Line<'static> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let mut spans: Vec<Span> = vec![gutter(selected)];
-    let push = |spans: &mut Vec<Span>, text: String, style: Style| {
-        if spans.len() > 1 {
-            spans.push(Span::styled(" ", dim));
-        }
-        spans.push(Span::styled(text, style));
-    };
+/// Compact second sidebar line: model · context% · permission mode · gsd phase.
+/// Deliberately a whisper: the baseline is dim and saturated color is reserved
+/// for alarms (red bypass, hot context/rate windows), so color here always
+/// means "look at me".
+fn meta_line(s: &Session, selected: bool, focused: bool, width: usize) -> Line<'static> {
+    let base = chip_base(selected);
+    let mut chips: Vec<(String, Style)> = Vec::new();
     if let Some(m) = &s.meta.model {
-        push(&mut spans, short_model(m), dim);
+        chips.push((short_model(m), base));
     }
     if let Some(pct) = s.meta.context_used_pct {
         let style = if pct >= 80 {
@@ -458,15 +516,19 @@ fn meta_line(s: &Session, selected: bool) -> Line<'static> {
         } else if pct >= 60 {
             Style::default().fg(Color::Yellow)
         } else {
-            dim
+            base
         };
-        push(&mut spans, format!("{pct}%"), style);
+        chips.push((format!("{pct}%"), style));
     }
+    // The 5h window is account-global (the footer gauge owns it); surface it
+    // per-row only once it's hot enough to warrant attention.
     if let Some(w) = s.meta.rate_5h {
         if let Some(p) = w.used_pct {
             let pct = (p.round() as u64).min(100) as u8;
-            let (text, style) = rate_5h_chip(pct, w.resets_at_unix_s, dim);
-            push(&mut spans, text, style);
+            if pct >= 60 {
+                let (text, style) = rate_5h_chip(pct, w.resets_at_unix_s, base);
+                chips.push((text, style));
+            }
         }
     }
     // BL-02: fall back to baude's spawn-intended mode (skip→bypassPermissions)
@@ -481,23 +543,21 @@ fn meta_line(s: &Session, selected: bool) -> Line<'static> {
         let style = if mode == "bypassPermissions" {
             Style::default().fg(Color::Red)
         } else {
-            dim
+            base
         };
-        push(&mut spans, short_mode(&mode).to_string(), style);
+        chips.push((short_mode(&mode).to_string(), style));
     }
     if let Some(gsd) = &s.meta.gsd {
         if let Some(phase) = &gsd.active_phase {
-            push(
-                &mut spans,
-                format!("ph{phase}"),
-                Style::default().fg(Color::Green),
-            );
+            // Identity metadata, not status — styled like the model name so
+            // saturated color on this line always means "alarm".
+            chips.push((format!("ph{phase}"), base));
         }
     }
-    if spans.len() == 1 {
-        spans.push(Span::styled("—", dim));
+    if chips.is_empty() {
+        chips.push(("—".into(), base));
     }
-    Line::from(spans)
+    chips_line(chips, selected, focused, width)
 }
 
 fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
