@@ -582,6 +582,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
             )),
             Line::raw(""),
             Line::raw("  n  start a session in a repo folder"),
+            Line::raw("  c  clone a github repo and start there"),
             Line::raw("  ?  help"),
         ])
         .block(
@@ -1327,6 +1328,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  v           activity timeline (recent tools)"),
                 Line::raw("  g           gsd project state"),
                 Line::raw("  n           new session (repo path)"),
+                Line::raw("  c           clone a repo (github url) into a new session"),
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
                 Line::raw("  a           archive/unarchive (auto after 30m idle)"),

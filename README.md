@@ -101,6 +101,7 @@ through to Claude.
 | `i` | sidebar | session info — model, tokens, context, permission mode |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
 | `n` | sidebar | new session (enter a repo path; `tab` completes directories) |
+| `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
 | `a` | sidebar | archive/unarchive — parked at the bottom, skipped by cycling |
@@ -141,6 +142,17 @@ with `a`; sending the session any input — or a new turn starting — lifts an
 auto-archive, while a manual one sticks until you unarchive or re-engage.
 The daemon applies the same rules (`BAUDED_AUTO_ARCHIVE_MIN`, 0 disables),
 and archived sessions never send push notifications.
+
+## Cloning
+
+`c` starts a session in a repo you haven't cloned yet. Paste anything that
+names a GitHub repo — an ssh or https clone URL, a browser URL (trailing
+`/tree/...` is fine), or just `owner/repo` — then confirm the destination,
+which defaults to `<clone_base_dir>/<host>/<owner>/<repo>` (tab completes).
+The clone runs in the background so the TUI stays responsive, and the
+session opens when it finishes. Shorthand and ssh inputs clone over ssh
+(`git@host:owner/repo.git`); pasted `https://` URLs keep https. If the
+destination already holds a clone, baude just opens a session there.
 
 ## Worktrees
 
@@ -220,6 +232,8 @@ the profile's shell.
   `BAUDE_CLAUDE_CMD` env var overrides the config file.
 - `new_session_dir` — prefill for the `n` new-session prompt (tab-complete
   from there); defaults to the directory baude was launched from.
+- `clone_base_dir` — base for the `c` clone prompt's default destination,
+  laid out ghq-style as `<base>/<host>/<owner>/<repo>`; default `~/Code`.
 - `editor_cmd` — command the sidebar `e` key runs on a session's folder
   (the folder path is appended), default `code`. `BAUDE_EDITOR_CMD` env var
   overrides the config file.

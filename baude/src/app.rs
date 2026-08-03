@@ -114,7 +114,24 @@ pub enum SelId {
 
 pub enum InputKind {
     NewSessionPath,
-    NewWorktreeBranch { repo_root: PathBuf },
+    NewWorktreeBranch {
+        repo_root: PathBuf,
+    },
+    /// Step 1 of `c`: a github url (or `owner/repo` shorthand) to clone.
+    CloneUrl,
+    /// Step 2 of `c`: where to clone it, prefilled from `clone_base_dir`.
+    CloneDest {
+        url: String,
+        /// `owner/repo`, for messages.
+        name: String,
+    },
+}
+
+/// A `git clone` running on a background thread; polled from `tick`.
+struct PendingClone {
+    name: String,
+    dest: PathBuf,
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
 pub enum Modal {
@@ -208,6 +225,8 @@ pub struct App {
     pub shell_scroll: usize,
     /// Active text selection (if any).
     pub selection: Option<Selection>,
+    /// Clones in flight (`c` key); sessions open as each one lands.
+    pending_clones: Vec<PendingClone>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -288,6 +307,7 @@ impl App {
             claude_scroll: 0,
             shell_scroll: 0,
             selection: None,
+            pending_clones: Vec::new(),
         }
     }
 
@@ -629,6 +649,7 @@ impl App {
                 self.message = None;
             }
         }
+        self.poll_pending_clones();
         if now_ms().saturating_sub(self.last_meta_poll) >= META_POLL_MS {
             self.last_meta_poll = now_ms();
             let mut changed = false;
@@ -920,6 +941,14 @@ impl App {
                     candidates: Vec::new(),
                 };
             }
+            KeyCode::Char('c') => {
+                self.modal = Modal::Input {
+                    kind: InputKind::CloneUrl,
+                    title: "clone repo — github url or owner/repo".into(),
+                    buf: String::new(),
+                    candidates: Vec::new(),
+                };
+            }
             KeyCode::Char('w') => {
                 if let Some(s) = self.selected() {
                     self.modal = Modal::Input {
@@ -1003,7 +1032,10 @@ impl App {
                     candidates.clear();
                 }
                 KeyCode::Tab => {
-                    if matches!(kind, InputKind::NewSessionPath) {
+                    if matches!(
+                        kind,
+                        InputKind::NewSessionPath | InputKind::CloneDest { .. }
+                    ) {
                         let (completed, names) = complete_dir_path(buf);
                         if let Some(c) = completed {
                             *buf = c;
@@ -1084,21 +1116,51 @@ impl App {
                     self.set_message(format!("not a directory: {}", expanded.display()));
                     return;
                 }
-                // Daemon mode: delegate so sessions survive TUI restarts.
-                if let Some(remote) = &self.remote {
-                    match remote.create(expanded.to_str().unwrap_or(&value), None, None) {
-                        Ok(()) => self.set_message("session queued on daemon".into()),
-                        Err(e) => self.set_message(format!("daemon: {e}")),
-                    }
+                self.open_repo_session(expanded);
+            }
+            InputKind::CloneUrl => {
+                let Some(t) = git::parse_clone_target(&value) else {
+                    self.set_message(format!("can't parse repo: {value}"));
+                    return;
+                };
+                let base = self
+                    .config
+                    .clone_base_dir
+                    .clone()
+                    .unwrap_or_else(|| "~/Code".into());
+                let base = base.trim_end_matches('/').to_string();
+                let name = format!("{}/{}", t.owner, t.repo);
+                self.modal = Modal::Input {
+                    kind: InputKind::CloneDest { url: t.url, name },
+                    title: format!("clone {}/{} — destination", t.owner, t.repo),
+                    buf: format!("{base}/{}/{}/{}", t.host, t.owner, t.repo),
+                    candidates: Vec::new(),
+                };
+            }
+            InputKind::CloneDest { url, name } => {
+                let dest = expand_tilde(&value);
+                // Already cloned there? Just open a session on it.
+                if dest.join(".git").exists() {
+                    self.set_message(format!("{name} already cloned — opening session"));
+                    self.open_repo_session(dest);
                     return;
                 }
-                match self.add_session(expanded, None, None, false, false, false) {
-                    Ok(_) => {
-                        self.focus = Focus::Claude;
-                        self.save();
-                    }
-                    Err(e) => self.set_message(format!("spawn failed: {e}")),
+                let occupied = dest.exists()
+                    && std::fs::read_dir(&dest)
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(true);
+                if occupied {
+                    self.set_message(format!("destination not empty: {}", dest.display()));
+                    return;
                 }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let thread_dest = dest.clone();
+                std::thread::spawn(move || {
+                    let res = git::clone_repo(&url, &thread_dest).map_err(|e| e.to_string());
+                    let _ = tx.send(res);
+                });
+                self.set_message(format!("cloning {name}…"));
+                self.pending_clones.push(PendingClone { name, dest, rx });
             }
             InputKind::NewWorktreeBranch { repo_root } => {
                 // Daemon mode: daemon creates the worktree and spawns the session.
@@ -1127,6 +1189,66 @@ impl App {
                     Err(e) => self.set_message(format!("worktree: {e}")),
                 }
             }
+        }
+    }
+
+    /// Open a session on an existing repo path — via the daemon when one is
+    /// configured (so it survives TUI restarts), locally otherwise. Shared by
+    /// the `n` new-session flow and clone completion.
+    fn open_repo_session(&mut self, path: PathBuf) {
+        if let Some(remote) = &self.remote {
+            match remote.create(&path.to_string_lossy(), None, None) {
+                Ok(()) => self.set_message("session queued on daemon".into()),
+                Err(e) => self.set_message(format!("daemon: {e}")),
+            }
+            return;
+        }
+        match self.add_session(path, None, None, false, false, false) {
+            Ok(_) => {
+                self.focus = Focus::Claude;
+                self.save();
+            }
+            Err(e) => self.set_message(format!("spawn failed: {e}")),
+        }
+    }
+
+    /// Poll background clones; open a session for each one that finished.
+    /// A completion never steals focus from a pane the user is typing in —
+    /// it only auto-selects the new session when the sidebar has focus.
+    fn poll_pending_clones(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let mut i = 0;
+        while i < self.pending_clones.len() {
+            let res = match self.pending_clones[i].rx.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(res) => res,
+                Err(TryRecvError::Disconnected) => Err("clone worker died".into()),
+            };
+            let pc = self.pending_clones.remove(i);
+            match res {
+                Ok(()) => {
+                    let (prev_sel, prev_focus) = (self.selected_id, self.focus);
+                    self.set_message(format!("cloned {}", pc.name));
+                    self.open_repo_session(pc.dest);
+                    if prev_focus != Focus::Sidebar {
+                        self.selected_id = prev_sel;
+                        self.focus = prev_focus;
+                    }
+                }
+                Err(e) => self.set_message(format!("clone {}: {e}", pc.name)),
+            }
+        }
+        // Keep a visible heartbeat while clones run (messages expire after 5s).
+        if !self.pending_clones.is_empty() && self.message.is_none() {
+            let names: Vec<&str> = self
+                .pending_clones
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            self.set_message(format!("cloning {}…", names.join(", ")));
         }
     }
 
