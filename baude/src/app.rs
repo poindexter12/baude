@@ -936,7 +936,7 @@ impl App {
                 };
                 self.modal = Modal::Input {
                     kind: InputKind::NewSessionPath,
-                    title: "new session — repo path (tab completes)".into(),
+                    title: "new session — repo path or github url (tab completes)".into(),
                     buf,
                     candidates: Vec::new(),
                 };
@@ -1112,29 +1112,37 @@ impl App {
             InputKind::NewSessionPath => {
                 let expanded = expand_tilde(&value);
                 let expanded = expanded.canonicalize().unwrap_or(expanded);
-                if !expanded.is_dir() {
-                    self.set_message(format!("not a directory: {}", expanded.display()));
+                if expanded.is_dir() {
+                    self.open_repo_session(expanded);
                     return;
                 }
-                self.open_repo_session(expanded);
+                // Not on disk — fall through to the clone flow if the input
+                // names a repo: a url / owner-repo shorthand, or a
+                // not-yet-cloned path whose tail is <host>/<owner>/<repo>
+                // (the ghq-style layout), which clones right where typed.
+                if let Some(t) = git::parse_clone_target(&value) {
+                    self.prompt_clone_dest(t, None);
+                    return;
+                }
+                let tail: Vec<&str> = value
+                    .trim_end_matches('/')
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let tail_target = tail
+                    .len()
+                    .checked_sub(3)
+                    .and_then(|i| git::parse_clone_target(&tail[i..].join("/")));
+                if let Some(t) = tail_target {
+                    self.prompt_clone_dest(t, Some(value));
+                    return;
+                }
+                self.set_message(format!("not a directory: {}", expanded.display()));
             }
             InputKind::CloneUrl => {
-                let Some(t) = git::parse_clone_target(&value) else {
-                    self.set_message(format!("can't parse repo: {value}"));
-                    return;
-                };
-                let base = self
-                    .config
-                    .clone_base_dir
-                    .clone()
-                    .unwrap_or_else(|| "~/Code".into());
-                let base = base.trim_end_matches('/').to_string();
-                let name = format!("{}/{}", t.owner, t.repo);
-                self.modal = Modal::Input {
-                    kind: InputKind::CloneDest { url: t.url, name },
-                    title: format!("clone {}/{} — destination", t.owner, t.repo),
-                    buf: format!("{base}/{}/{}/{}", t.host, t.owner, t.repo),
-                    candidates: Vec::new(),
+                match git::parse_clone_target(&value) {
+                    Some(t) => self.prompt_clone_dest(t, None),
+                    None => self.set_message(format!("can't parse repo: {value}")),
                 };
             }
             InputKind::CloneDest { url, name } => {
@@ -1190,6 +1198,28 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Open the clone-destination prompt for a parsed clone target. The
+    /// buffer prefills with `dest` when the user already typed a path (the
+    /// `n` fallthrough), else the ghq-style `clone_base_dir` layout.
+    fn prompt_clone_dest(&mut self, t: git::CloneTarget, dest: Option<String>) {
+        let buf = dest.unwrap_or_else(|| {
+            let base = self
+                .config
+                .clone_base_dir
+                .clone()
+                .unwrap_or_else(|| "~/Code".into());
+            let base = base.trim_end_matches('/');
+            format!("{base}/{}/{}/{}", t.host, t.owner, t.repo)
+        });
+        let name = format!("{}/{}", t.owner, t.repo);
+        self.modal = Modal::Input {
+            kind: InputKind::CloneDest { url: t.url, name },
+            title: format!("clone {}/{} — destination", t.owner, t.repo),
+            buf,
+            candidates: Vec::new(),
+        };
     }
 
     /// Open a session on an existing repo path — via the daemon when one is

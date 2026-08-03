@@ -100,7 +100,7 @@ through to Claude.
 | `e` | sidebar | open the session folder in your editor (`editor_cmd`, default `code`) |
 | `i` | sidebar | session info — model, tokens, context, permission mode |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
-| `n` | sidebar | new session (enter a repo path; `tab` completes directories) |
+| `n` | sidebar | new session (enter a repo path; `tab` completes; not-yet-cloned repos fall through to `c`) |
 | `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
@@ -153,6 +153,13 @@ The clone runs in the background so the TUI stays responsive, and the
 session opens when it finishes. Shorthand and ssh inputs clone over ssh
 (`git@host:owner/repo.git`); pasted `https://` URLs keep https. If the
 destination already holds a clone, baude just opens a session there.
+
+The `n` prompt falls through to the same flow: if what you enter isn't a
+directory on disk but names a repo — a URL, `owner/repo`, or a path whose
+tail looks like `<host>/<owner>/<repo>` (e.g. a not-yet-cloned
+`~/Code/github.com/owner/repo`) — baude offers to clone it, prefilling the
+destination with the path you typed. No need to back out and re-enter via
+`c`.
 
 ## Worktrees
 
