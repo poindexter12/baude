@@ -868,6 +868,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Left-truncate an input buffer so its tail — where the cursor sits — stays
+/// visible within `width` cells (one reserved for the cursor block), with a
+/// leading `…` marking the cut.
+fn input_tail(buf: &str, width: usize) -> String {
+    let avail = width.saturating_sub(1);
+    let n = buf.chars().count();
+    if n <= avail {
+        return buf.to_string();
+    }
+    let keep = avail.saturating_sub(1);
+    let tail: String = buf.chars().skip(n - keep).collect();
+    format!("…{tail}")
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -969,8 +983,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         } => {
             const MAX_SHOWN: usize = 6;
             let dim = Style::default().fg(Color::DarkGray);
+            // Keep the tail (where the cursor sits) visible for long buffers.
+            let inner_w = 64u16.min(area.width).saturating_sub(2) as usize;
             let mut lines = vec![Line::from(vec![
-                Span::raw(buf.clone()),
+                Span::raw(input_tail(buf, inner_w)),
                 Span::styled("█", Style::default().fg(Color::Cyan)),
             ])];
             for c in candidates.iter().take(MAX_SHOWN) {
@@ -1389,5 +1405,19 @@ mod tests {
         // A known reset appends the countdown ("in …" / "now").
         let (text, _) = rate_5h_chip(10, Some(0), dim);
         assert!(text.starts_with("5h 10% "), "got: {text}");
+    }
+
+    #[test]
+    fn input_tail_shows_cursor_end() {
+        use super::input_tail;
+        // Fits (with room for the cursor cell): unchanged.
+        assert_eq!(input_tail("short", 10), "short");
+        assert_eq!(input_tail("123456789", 10), "123456789");
+        // Too long: keep the tail, mark the cut, total = width - 1 cells.
+        assert_eq!(input_tail("0123456789", 10), "…23456789");
+        assert_eq!(input_tail("/very/long/path/to/repo", 10), "…/to/repo");
+        // Degenerate widths never panic.
+        assert_eq!(input_tail("abc", 0), "…");
+        assert_eq!(input_tail("abc", 1), "…");
     }
 }

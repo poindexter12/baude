@@ -1031,6 +1031,11 @@ impl App {
                     buf.pop();
                     candidates.clear();
                 }
+                // Shell-style clear-line, for replacing a long prefill.
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buf.clear();
+                    candidates.clear();
+                }
                 KeyCode::Tab => {
                     if matches!(
                         kind,
