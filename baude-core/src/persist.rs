@@ -43,6 +43,9 @@ pub struct Config {
     /// Prefill for the new-session path prompt, e.g. "~/Code/github.com".
     /// Defaults to the directory baude was launched from.
     pub new_session_dir: Option<String>,
+    /// Base directory for the `c` clone prompt's default destination,
+    /// laid out as `<base>/<host>/<owner>/<repo>`. Defaults to "~/Code".
+    pub clone_base_dir: Option<String>,
     /// Command used by the sidebar `e` key to open a session's folder.
     /// The session cwd is appended as an argument. BAUDE_EDITOR_CMD overrides
     /// this. Defaults to "code".
