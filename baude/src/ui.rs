@@ -1312,7 +1312,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 60, 26);
+            let rect = centered(area, 60, 32);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -1341,6 +1341,9 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 )),
                 Line::raw("  ctrl+q      back to sidebar"),
                 Line::raw("  ctrl+\\      toggle shell pane (focuses it)"),
+                Line::raw("  ctrl+e      open folder in editor"),
+                Line::raw("  ctrl+n      new session"),
+                Line::raw("  ctrl+x      close session"),
                 Line::raw("  alt+←/→     cycle prev/next session"),
                 Line::raw(""),
                 Line::from(Span::styled(

@@ -789,6 +789,21 @@ impl App {
             self.cycle_session(1);
             return;
         }
+        if ctrl && matches!(key.code, KeyCode::Char('e')) {
+            self.open_editor_for_selection();
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('n')) {
+            // Step out to the sidebar so modal paste routing works.
+            self.focus = Focus::Sidebar;
+            self.open_new_session_modal();
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('x')) {
+            self.focus = Focus::Sidebar;
+            self.confirm_close_selected();
+            return;
+        }
 
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
@@ -899,6 +914,52 @@ impl App {
         pty.write_input(&bytes);
     }
 
+    fn open_editor_for_selection(&mut self) {
+        if matches!(self.selected_id, Some(SelId::Remote(_))) {
+            self.set_message("remote session — folder lives on the daemon host".into());
+        } else {
+            self.open_editor();
+        }
+    }
+
+    fn open_new_session_modal(&mut self) {
+        let buf = match &self.config.new_session_dir {
+            Some(d) => {
+                let d = d.trim_end_matches('/');
+                format!("{d}/")
+            }
+            None => format!("{}", self.launch_dir.display()),
+        };
+        self.modal = Modal::Input {
+            kind: InputKind::NewSessionPath,
+            title: "new session — repo path or github url (tab completes)".into(),
+            buf,
+            candidates: Vec::new(),
+        };
+    }
+
+    fn confirm_close_selected(&mut self) {
+        match self.selected_id {
+            Some(SelId::Remote(id)) => {
+                self.modal = Modal::ConfirmKill {
+                    id: SelId::Remote(id),
+                };
+            }
+            Some(SelId::Local(_)) => {
+                if let Some(s) = self.selected() {
+                    self.modal = if s.is_worktree {
+                        Modal::ConfirmCloseWorktree { id: s.id }
+                    } else {
+                        Modal::ConfirmKill {
+                            id: SelId::Local(s.id),
+                        }
+                    };
+                }
+            }
+            None => {}
+        }
+    }
+
     fn handle_sidebar_key(&mut self, key: KeyEvent) {
         let remote_selected = matches!(self.selected_id, Some(SelId::Remote(_)));
         match key.code {
@@ -922,25 +983,8 @@ impl App {
                 self.set_message("no shell pane for remote sessions".into());
             }
             KeyCode::Char('t') => self.toggle_shell(true),
-            KeyCode::Char('e') if remote_selected => {
-                self.set_message("remote session — folder lives on the daemon host".into());
-            }
-            KeyCode::Char('e') => self.open_editor(),
-            KeyCode::Char('n') => {
-                let buf = match &self.config.new_session_dir {
-                    Some(d) => {
-                        let d = d.trim_end_matches('/');
-                        format!("{d}/")
-                    }
-                    None => format!("{}", self.launch_dir.display()),
-                };
-                self.modal = Modal::Input {
-                    kind: InputKind::NewSessionPath,
-                    title: "new session — repo path or github url (tab completes)".into(),
-                    buf,
-                    candidates: Vec::new(),
-                };
-            }
+            KeyCode::Char('e') => self.open_editor_for_selection(),
+            KeyCode::Char('n') => self.open_new_session_modal(),
             KeyCode::Char('c') => {
                 self.modal = Modal::Input {
                     kind: InputKind::CloneUrl,
@@ -975,23 +1019,7 @@ impl App {
                 Some(SelId::Remote(id)) => self.restart_remote(id),
                 None => {}
             },
-            KeyCode::Char('x') => {
-                if remote_selected {
-                    if let Some(SelId::Remote(id)) = self.selected_id {
-                        self.modal = Modal::ConfirmKill {
-                            id: SelId::Remote(id),
-                        };
-                    }
-                } else if let Some(s) = self.selected() {
-                    self.modal = if s.is_worktree {
-                        Modal::ConfirmCloseWorktree { id: s.id }
-                    } else {
-                        Modal::ConfirmKill {
-                            id: SelId::Local(s.id),
-                        }
-                    };
-                }
-            }
+            KeyCode::Char('x') => self.confirm_close_selected(),
             KeyCode::Char('i') => {
                 if self.selected().is_some() || self.selected_remote().is_some() {
                     self.modal = Modal::Info;
