@@ -103,7 +103,7 @@ through to Claude.
 | `e` | sidebar | open the session folder in your editor (`editor_cmd`, default `code`) |
 | `i` | sidebar | session info — model, tokens, context, permission mode |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
-| `n` | sidebar | new session (enter a repo path; `tab` completes; not-yet-cloned repos fall through to `c`) |
+| `n` | sidebar | new session (enter a repo path; `tab` completes, `ctrl+u` clears; not-yet-cloned repos fall through to `c`) |
 | `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
