@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.0](https://github.com/poindexter12/baude/compare/v0.9.0...v0.10.0) (2026-08-12)
+
+
+### Features
+
+* make ctrl+e/n/x global chords for editor, new session, close ([c44f224](https://github.com/poindexter12/baude/commit/c44f224c79149df4136306f802c540963f23e587))
+* make ctrl+e/n/x global chords for editor, new session, close ([9705e35](https://github.com/poindexter12/baude/commit/9705e35844c66f38248603496df02b54cecc2cae))
+
+
+### Bug Fixes
+
+* keep input tail visible and support ctrl+u clear in prompts ([9686492](https://github.com/poindexter12/baude/commit/9686492769e3d0f5b954580ea316e017a36422e9))
+* keep input tail visible and support ctrl+u clear in prompts ([477a2d2](https://github.com/poindexter12/baude/commit/477a2d24dcba38e76431daeaf6307503c47fc8d9))
+
 ## [0.9.0](https://github.com/poindexter12/baude/compare/v0.8.0...v0.9.0) (2026-08-04)
 
 
