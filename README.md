@@ -4,9 +4,9 @@ A TUI for running multiple Claude Code sessions in one terminal.
 
 Start it from any git repo and it spawns a `claude` session there. Add more
 repos, or spin up isolated git-worktree sessions for parallel work in the same
-repo. A shell pane at the session's folder is one keystroke away. Sessions
-hold a stable order in the sidebar — when one is **waiting for your input** it
-flashes in place (with a wait timer) instead of jumping around, so the list
+repo. A shell pane at the session's folder is one keystroke away. The sidebar
+sorts sessions alphabetically by name — when one is **waiting for your input**
+it flashes in place (with a wait timer) instead of jumping around, so the list
 stays where your eye expects it while still telling you who needs you next.
 
 Each session also surfaces live Claude Code metadata — model, context usage,
@@ -107,7 +107,7 @@ through to Claude.
 | `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
 | `w` | sidebar | new worktree session for selected repo |
 | `r` | sidebar | restart an exited claude |
-| `a` | sidebar | archive/unarchive — parked at the bottom, skipped by cycling |
+| `a` | sidebar | archive/unarchive — parked at the bottom, quiet until re-engaged |
 | `x` | sidebar | close session (worktree sessions ask keep/remove) |
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
@@ -136,17 +136,18 @@ stateDiagram-v2
     waiting --> working: you reply, or a new turn starts
     working --> exited: claude exits
     exited --> working: r — restart (claude --continue)
-    waiting --> archived: 30m unattended (auto), or a (manual)
+    waiting --> archived: idle timeout (auto, default 30m), or a (manual)
     archived --> waiting: input re-engages auto-archive; a unarchives a manual one
 ```
 
-Sessions waiting unattended for 30 minutes auto-archive: they sink to a
-dimmed `▼ archived` section at the bottom, stop flashing and counting, and
-`alt+←/→` cycling skips them (`j/k` still reaches them). Archive manually
-with `a`; sending the session any input — or a new turn starting — lifts an
-auto-archive, while a manual one sticks until you unarchive or re-engage.
-The daemon applies the same rules (`BAUDED_AUTO_ARCHIVE_MIN`, 0 disables),
-and archived sessions never send push notifications.
+Sessions waiting unattended past the idle timeout auto-archive (default 30
+minutes; `auto_archive_minutes` in config or `BAUDED_AUTO_ARCHIVE_MIN`, 0
+disables): they sink to a dimmed `▼ archived` section at the bottom and stop
+flashing and counting. `alt+←/→` cycling and `j/k` both still reach them —
+sending an archived session any input lifts an auto-archive, so cycling in
+and typing resurfaces it. A manual archive (`a`) sticks until you unarchive
+or re-engage. The daemon applies the same rules, and archived sessions never
+send push notifications.
 
 ## Cloning
 
@@ -249,6 +250,10 @@ the profile's shell.
 - `editor_cmd` — command the sidebar `e` key runs on a session's folder
   (the folder path is appended), default `code`. `BAUDE_EDITOR_CMD` env var
   overrides the config file.
+- `auto_archive_minutes` — idle minutes before a waiting session
+  auto-archives; `0` disables auto-archiving, default `30`.
+  `BAUDED_AUTO_ARCHIVE_MIN` env var overrides the config file (both the TUI
+  and the daemon honor it).
 - `daemon_url` — base URL of a remote bauded daemon (e.g.
   `http://bauded:8642`); its sessions appear in the sidebar under a
   `⇄ remote` section. `BAUDE_DAEMON_URL` env var overrides the config file.
@@ -294,7 +299,7 @@ external assets.
 | `POST /sessions/{id}/messages` | `{text}` — send a message (queues if busy) |
 | `POST /sessions/{id}/interrupt` | Esc — stop current work |
 | `POST /sessions/{id}/restart` | respawn claude in an exited session (`--continue`) |
-| `POST /sessions/{id}/archive` · `/unarchive` | park/unpark (auto after 30m waiting; input re-engages) |
+| `POST /sessions/{id}/archive` · `/unarchive` | park/unpark (auto after idle timeout; input re-engages) |
 | `GET /sessions/{id}/queue` | messages typed while busy, not yet picked up |
 | `GET /sessions/{id}/screen` | plain-text terminal snapshot (menu escape hatch) |
 | `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |

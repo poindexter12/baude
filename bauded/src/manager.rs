@@ -225,17 +225,14 @@ fn seed_mcp_config(cwd: &Path) {
     let _ = std::fs::write(&path, merged.to_string());
 }
 
-/// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
-/// `claude_cmd`, then plain `claude`.
-/// BAUDED_AUTO_ARCHIVE_MIN (minutes, 0 disables) — default 30.
+/// BAUDED_AUTO_ARCHIVE_MIN env (minutes, 0 disables), then config.json
+/// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
-    std::env::var("BAUDED_AUTO_ARCHIVE_MIN")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30)
-        * 60_000
+    persist::load_config().auto_archive_ms()
 }
 
+/// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
+/// `claude_cmd`, then plain `claude`.
 pub fn default_claude_cmd() -> String {
     std::env::var("BAUDE_CLAUDE_CMD")
         .ok()

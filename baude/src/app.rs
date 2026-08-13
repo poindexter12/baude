@@ -210,6 +210,8 @@ pub struct App {
     pub should_quit: bool,
     pub launch_dir: PathBuf,
     config: Config,
+    /// Resolved once at startup (env / config / 30m default); 0 disables.
+    auto_archive_ms: u64,
     content_rect: Rect,
     next_id: u64,
     last_meta_poll: u64,
@@ -296,6 +298,7 @@ impl App {
             message: None,
             should_quit: false,
             launch_dir,
+            auto_archive_ms: config.auto_archive_ms(),
             config,
             content_rect: Rect::new(0, 0, 80, 24),
             next_id: 1,
@@ -428,26 +431,39 @@ impl App {
 
     // ---- session bookkeeping ----
 
-    /// Selection order: local sessions (stable creation order — the sidebar
-    /// never reorders, sessions that need input flash in place instead),
-    /// followed by the remote daemon's sessions.
+    /// Selection order: active local sessions, then the remote daemon's
+    /// active sessions, then archived sessions at the end — each group
+    /// alphabetical by name (case-insensitive) so the sidebar is predictable.
+    /// Sessions that need input flash in place instead of reordering.
     pub fn ordered_ids(&self) -> Vec<SelId> {
-        let all = || {
-            self.sessions
-                .iter()
-                .map(|s| (SelId::Local(s.id), s.archived))
-                .chain(
-                    self.remote_snap
-                        .sessions
-                        .iter()
-                        .map(|r| (SelId::Remote(r.id), r.archived)),
-                )
-        };
-        // Active sessions keep their stable order; archived sink to the end.
-        all()
-            .filter(|(_, a)| !a)
-            .chain(all().filter(|(_, a)| *a))
-            .map(|(id, _)| id)
+        let mut active_local: Vec<(String, SelId)> = Vec::new();
+        let mut active_remote: Vec<(String, SelId)> = Vec::new();
+        let mut archived: Vec<(String, SelId)> = Vec::new();
+        for s in &self.sessions {
+            let entry = (s.name.to_lowercase(), SelId::Local(s.id));
+            if s.archived {
+                archived.push(entry);
+            } else {
+                active_local.push(entry);
+            }
+        }
+        for r in &self.remote_snap.sessions {
+            let entry = (r.name.to_lowercase(), SelId::Remote(r.id));
+            if r.archived {
+                archived.push(entry);
+            } else {
+                active_remote.push(entry);
+            }
+        }
+        // Stable sort: equal names keep creation order.
+        for group in [&mut active_local, &mut active_remote, &mut archived] {
+            group.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        active_local
+            .into_iter()
+            .chain(active_remote)
+            .chain(archived)
+            .map(|(_, id)| id)
             .collect()
     }
 
@@ -655,7 +671,7 @@ impl App {
             let mut changed = false;
             for s in &mut self.sessions {
                 s.poll_meta();
-                changed |= s.auto_archive_tick(baude_core::session::AUTO_ARCHIVE_IDLE_MS);
+                changed |= s.auto_archive_tick(self.auto_archive_ms);
             }
             if changed {
                 self.save();
@@ -1425,12 +1441,10 @@ impl App {
     /// wrapping around. When attached, stays attached to the same kind of
     /// pane — falling back to the claude pane if the new session has no shell.
     fn cycle_session(&mut self, delta: i64) {
-        // Cycling skips the archive — j/k still reaches it.
-        let ids: Vec<SelId> = self
-            .ordered_ids()
-            .into_iter()
-            .filter(|&id| !self.is_archived(id))
-            .collect();
+        // Cycling reaches the archive too — sending input into an archived
+        // session auto-unarchives it, so landing there and typing resurfaces
+        // it without an explicit `a`.
+        let ids = self.ordered_ids();
         if ids.is_empty() {
             return;
         }

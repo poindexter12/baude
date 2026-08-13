@@ -30,8 +30,9 @@ pub enum StateSource {
     Silence,
 }
 
-/// Waiting this long unattended auto-archives a session: it sinks to the
+/// Default idle window before a session auto-archives: it sinks to the
 /// bottom of lists and stops demanding attention until it's active again.
+/// Overridable via config `auto_archive_minutes` / BAUDED_AUTO_ARCHIVE_MIN.
 pub const AUTO_ARCHIVE_IDLE_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -61,8 +62,10 @@ pub struct Session {
     pub shell_open: bool,
     pub spawn_unix_ms: u64,
     pub meta: ClaudeMeta,
-    /// Parked: sorts last, excluded from cycling/counters/notifications.
-    /// Set manually or after `AUTO_ARCHIVE_IDLE_MS` of waiting.
+    /// Parked: sorts last, excluded from counters/notifications.
+    /// Set manually or after the auto-archive idle window (config
+    /// `auto_archive_minutes` / BAUDED_AUTO_ARCHIVE_MIN, default
+    /// `AUTO_ARCHIVE_IDLE_MS`) of waiting.
     pub archived: bool,
     /// A manual archive sticks until unarchived or re-engaged (input sent);
     /// an automatic one also lifts when a new turn starts.
