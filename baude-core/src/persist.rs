@@ -53,11 +53,27 @@ pub struct Config {
     /// Base URL of a remote bauded daemon whose sessions appear in the
     /// sidebar, e.g. "http://bauded:8642". BAUDE_DAEMON_URL overrides.
     pub daemon_url: Option<String>,
+    /// Minutes of idle waiting before a session auto-archives; 0 disables
+    /// auto-archiving. BAUDED_AUTO_ARCHIVE_MIN overrides. Defaults to 30.
+    pub auto_archive_minutes: Option<u64>,
     /// When true, baude auto-starts a local bauded on startup if one is not
     /// already running, and routes new-session creation through it so sessions
     /// survive TUI restarts. BAUDE_AUTO_DAEMON=1 overrides.
     #[serde(default)]
     pub auto_daemon: bool,
+}
+
+impl Config {
+    /// Resolved auto-archive idle window in ms: BAUDED_AUTO_ARCHIVE_MIN env
+    /// (minutes, 0 disables), then `auto_archive_minutes`, then 30 minutes.
+    pub fn auto_archive_ms(&self) -> u64 {
+        std::env::var("BAUDED_AUTO_ARCHIVE_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .or(self.auto_archive_minutes)
+            .map(|min| min * 60_000)
+            .unwrap_or(crate::session::AUTO_ARCHIVE_IDLE_MS)
+    }
 }
 
 pub fn load_config() -> Config {
@@ -91,4 +107,23 @@ pub fn save_named(file: &str, state: &State) -> Result<()> {
     }
     std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_archive_ms_resolves_env_then_config_then_default() {
+        std::env::remove_var("BAUDED_AUTO_ARCHIVE_MIN");
+        let mut c = Config::default();
+        assert_eq!(c.auto_archive_ms(), crate::session::AUTO_ARCHIVE_IDLE_MS);
+        c.auto_archive_minutes = Some(5);
+        assert_eq!(c.auto_archive_ms(), 5 * 60_000);
+        c.auto_archive_minutes = Some(0);
+        assert_eq!(c.auto_archive_ms(), 0, "0 disables auto-archiving");
+        std::env::set_var("BAUDED_AUTO_ARCHIVE_MIN", "1");
+        assert_eq!(c.auto_archive_ms(), 60_000, "env overrides config");
+        std::env::remove_var("BAUDED_AUTO_ARCHIVE_MIN");
+    }
 }
