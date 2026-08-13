@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0](https://github.com/poindexter12/baude/compare/v0.10.0...v0.11.0) (2026-08-13)
+
+
+### Features
+
+* alphabetical sidebar order, cycle into archive, configurable idle timeout ([c5a8196](https://github.com/poindexter12/baude/commit/c5a819677c08fd620872f6f5b0b8ea5a636ba401))
+* alphabetical sidebar order, cycle into archive, configurable idle timeout ([64ba3e4](https://github.com/poindexter12/baude/commit/64ba3e4f7c50502207a974dad8e93222b0fb9dfe))
+
 ## [0.10.0](https://github.com/poindexter12/baude/compare/v0.9.0...v0.10.0) (2026-08-12)
 
 
