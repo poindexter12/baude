@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 
+use baude_core::backend;
 use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
 use baude_core::persist::{self, Config, SavedSession, State};
@@ -260,28 +261,6 @@ pub fn inner(r: Rect) -> Rect {
     }
 }
 
-/// Best-effort, non-clobbering seed of a session cwd's `.mcp.json` registering
-/// baude's `permission-mcp` stdio server (PERM-01, `prompt` mode only).
-///
-/// The MCP command is `current_exe()` + ` permission-mcp` (same resolution as
-/// `baude_core::hook::baude_hook_command`). Mirrors `seed_settings`: never
-/// aborts a spawn on failure, and re-seeding merges `mcpServers.baude` into an
-/// existing file via the pure `merge_mcp_config` without discarding a user's
-/// sibling MCP servers (idempotent).
-fn seed_mcp_config(cwd: &Path) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p.display().to_string(),
-        Err(_) => return, // can't resolve the bridge command — best-effort skip.
-    };
-    let path = baude_core::permission::mcp_config_path(cwd);
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let merged = baude_core::permission::merge_mcp_config(&existing, &exe);
-    let _ = std::fs::write(&path, merged.to_string());
-}
-
 impl App {
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
@@ -358,7 +337,7 @@ impl App {
         std::env::var("BAUDE_CLAUDE_CMD")
             .ok()
             .or_else(|| self.config.claude_cmd.clone())
-            .unwrap_or_else(|| "claude".to_string())
+            .unwrap_or_else(|| backend::active().default_cmd().to_string())
     }
 
     /// The editor launched by the sidebar `e` key: BAUDE_EDITOR_CMD env,
@@ -551,8 +530,8 @@ impl App {
         };
         let name = self.unique_name(&base);
 
-        // `claude --continue` resumes the most recent conversation in this
-        // directory; falls back to a fresh session if there is none.
+        let be = backend::active();
+
         // PERM-01: append exactly one permission flag to the base cmd (default
         // skip preserves today's `--dangerously-skip-permissions`; `prompt` is
         // opt-in via BAUDE_PERMISSION_MODE). The flag rides on the base cmd so
@@ -560,26 +539,19 @@ impl App {
         // mode strips a conflicting skip flag from claude_cmd so it can't be
         // silently suppressed. The TUI is a ratatui screen, so the `stripped_skip`
         // warning channel (eprintln) the daemon uses is intentionally dropped here.
-        let base = baude_core::permission::resolve_claude_cmd_env(&self.claude_cmd()).cmd;
-        let cmd = if resume {
-            format!("{base} --continue 2>/dev/null || exec {base}")
-        } else {
-            format!("exec {base}")
-        };
-        // Seed baude's hooks into the session cwd's .claude/settings.local.json
-        // before claude starts, so Claude Code actually invokes `baude hook`.
-        // Best-effort: a seeding failure must NOT abort the spawn — the session
-        // simply falls back to the silence path (no regression). TUI sessions
-        // get NO $BAUDE_EVENT_URL, which routes the hook to the /tmp append
-        // path (only the daemon injects that var).
-        baude_core::hook::seed_settings(&cwd);
+        // TUI sessions pass NO event URL: the spawned command gets no
+        // $BAUDE_EVENT_URL, which routes hook events to the /tmp append path
+        // (only the daemon injects that var).
+        let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let cmd = be.shell_command(&base, None, resume);
 
-        // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
-        // registering the `permission-mcp` stdio server (command =
-        // current_exe() + " permission-mcp"). Best-effort, mirrors the hook
-        // seed; 04-02 adds the `permission-mcp` arm to both binaries.
+        // Wire the session cwd before the CLI starts (for Claude: the
+        // settings.local.json hook seed, plus the prompt-mode .mcp.json).
+        // Best-effort: a seeding failure must NOT abort the spawn — the session
+        // simply falls back to the silence path (no regression).
+        be.prepare_cwd(&cwd);
+
         if baude_core::permission::is_prompt_mode() {
-            seed_mcp_config(&cwd);
             // WR-01: permission approval is inherently daemon+PWA-mediated. A
             // TUI-local session gets NO $BAUDE_EVENT_URL (only the daemon injects
             // it), so the `permission-mcp` bridge fails CLOSED and DENIES every

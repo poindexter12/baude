@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use tokio::sync::Notify;
 
+use baude_core::backend;
 use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, SavedSession, State};
@@ -179,52 +180,6 @@ fn event_url(id: u64) -> String {
     format!("http://127.0.0.1:8642/sessions/{id}/event")
 }
 
-/// Build the shell command string for a daemon-spawned session, injecting
-/// `$BAUDE_EVENT_URL` so claude and its hook child POST events to the daemon's
-/// loopback ingest route (`Pty::spawn` has no env-map param).
-///
-/// `claude --continue` resumes the most recent conversation; on a fresh
-/// directory it exits non-zero and the `|| exec claude` fallback starts a new
-/// session. The env var is set with `export VAR=...; <inner>` rather than a
-/// `VAR=... cmd` assignment prefix: an assignment prefix applies only to the
-/// single command it prefixes, so on the resume path the `exec claude`
-/// fallback (the common fresh-directory case) would otherwise run WITHOUT the
-/// var and its hooks would silently miss the daemon transport. `export` sets
-/// it for the whole command group, surviving the `||` fallback and sub-exec
-/// (WR-01).
-fn spawn_command(base_cmd: &str, event_url: &str, resume: bool) -> String {
-    let inner = if resume {
-        format!("{base_cmd} --continue 2>/dev/null || exec {base_cmd}")
-    } else {
-        format!("exec {base_cmd}")
-    };
-    format!("export BAUDE_EVENT_URL={event_url}; {inner}")
-}
-
-/// Best-effort, non-clobbering seed of a session cwd's `.mcp.json` registering
-/// baude's `permission-mcp` stdio server (PERM-01, `prompt` mode only).
-///
-/// The MCP command is `current_exe()` + ` permission-mcp` — the same
-/// `current_exe()` resolution as `baude_core::hook::baude_hook_command`, so a
-/// daemon-spawned session seeds `bauded permission-mcp` (the Pitfall-2 reason
-/// BOTH binaries must grow the arm in 04-02). Mirrors `seed_settings`: never
-/// aborts a spawn on failure, and re-seeding merges `mcpServers.baude` into an
-/// existing file without discarding sibling MCP servers (idempotent — the
-/// command is the sentinel). Re-runs on every `restore()` re-spawn.
-fn seed_mcp_config(cwd: &Path) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p.display().to_string(),
-        Err(_) => return, // can't resolve the bridge command — best-effort skip.
-    };
-    let path = baude_core::permission::mcp_config_path(cwd);
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let merged = baude_core::permission::merge_mcp_config(&existing, &exe);
-    let _ = std::fs::write(&path, merged.to_string());
-}
-
 /// BAUDED_AUTO_ARCHIVE_MIN env (minutes, 0 disables), then config.json
 /// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
@@ -237,7 +192,7 @@ pub fn default_claude_cmd() -> String {
     std::env::var("BAUDE_CLAUDE_CMD")
         .ok()
         .or_else(|| persist::load_config().claude_cmd)
-        .unwrap_or_else(|| "claude".to_string())
+        .unwrap_or_else(|| backend::active().default_cmd().to_string())
 }
 
 impl Manager {
@@ -365,13 +320,15 @@ impl Manager {
 
         let id = self.next_id;
 
-        // Seed `.claude/settings.local.json` in the session's actual cwd
-        // (worktree dir for worktree sessions) so daemon-spawned Claude fires
-        // baude's hooks — the same best-effort, idempotent, non-clobbering
-        // merge as the TUI path. Idempotency matters because `restore()`
-        // re-spawns every persisted session on each daemon startup; the merge
-        // adds exactly one baude entry per event no matter how often it runs.
-        baude_core::hook::seed_settings(&cwd);
+        let be = backend::active();
+
+        // Wire the session's actual cwd (worktree dir for worktree sessions)
+        // so the daemon-spawned CLI reports back to baude: for Claude that's
+        // the `.claude/settings.local.json` hook seed plus the prompt-mode
+        // `.mcp.json` — best-effort, idempotent, non-clobbering. Idempotency
+        // matters because `restore()` re-spawns every persisted session on
+        // each daemon startup.
+        be.prepare_cwd(&cwd);
 
         // PERM-01: resolve the permission flag (default skip preserves today's
         // unattended `--dangerously-skip-permissions`; `prompt` is opt-in via
@@ -380,26 +337,15 @@ impl Manager {
         // fallback (WR-01). BL-04: prompt mode strips a conflicting skip flag
         // from `claude_cmd` and warns, so an operator's skip default no longer
         // silently suppresses prompt mode.
-        let resolved = baude_core::permission::resolve_claude_cmd_env(&self.claude_cmd);
+        let resolved = be.resolve_cmd(&self.claude_cmd);
         if resolved.stripped_skip {
             eprintln!(
                 "baude: prompt mode active — stripped --dangerously-skip-permissions \
                  from claude_cmd so the permission prompt can fire (BL-04)"
             );
         }
-        let base_cmd = resolved.cmd;
 
-        // In `prompt` mode only, additionally seed a non-clobbering `.mcp.json`
-        // registering the `permission-mcp` stdio server (command =
-        // current_exe() + " permission-mcp"). Best-effort, idempotent, and
-        // re-seeded on every `restore()`-driven re-spawn — exactly the hook
-        // seed posture. The daemon's current_exe() is `bauded`, so 04-02 adds
-        // the `permission-mcp` arm to BOTH binaries (Pitfall 2).
-        if baude_core::permission::is_prompt_mode() {
-            seed_mcp_config(&cwd);
-        }
-
-        let cmd = spawn_command(&base_cmd, &event_url(id), resume);
+        let cmd = be.shell_command(&resolved.cmd, Some(&event_url(id)), resume);
         let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
 
         self.next_id += 1;
@@ -1094,146 +1040,6 @@ mod tests {
             "http://127.0.0.1:8642/sessions/7/event",
             "spawn command must carry BAUDE_EVENT_URL= for the loopback route"
         );
-    }
-
-    #[test]
-    fn spawn_command_exports_event_url_on_both_paths() {
-        // WR-01: the event URL must be exported (not assignment-prefixed) so it
-        // survives the resume path's `|| exec claude` fallback. Both the resume
-        // and fresh commands must start with `export BAUDE_EVENT_URL=<url>;`.
-        let url = "http://127.0.0.1:8642/sessions/3/event";
-
-        let fresh = spawn_command("claude", url, false);
-        assert_eq!(fresh, format!("export BAUDE_EVENT_URL={url}; exec claude"));
-
-        let resumed = spawn_command("claude", url, true);
-        let prefix = format!("export BAUDE_EVENT_URL={url}; ");
-        assert!(
-            resumed.starts_with(&prefix),
-            "resume command must export the var for the whole group, got: {resumed}"
-        );
-        // The fallback after `||` is inside the exported scope (no second
-        // assignment prefix on `exec claude`), so it inherits the var too.
-        assert!(resumed.contains("--continue 2>/dev/null || exec claude"));
-        assert!(
-            !resumed.contains("|| BAUDE_EVENT_URL="),
-            "fallback must not re-prefix; export already covers it"
-        );
-    }
-
-    #[test]
-    fn permission_mode_default_skip_and_prompt_at_spawn_command() {
-        // PERM-01 (security-critical): the daemon spawn command must carry
-        // `--dangerously-skip-permissions` by default (BAUDE_PERMISSION_MODE
-        // unset/skip) and `--permission-prompt-tool` ONLY in `prompt` mode.
-        // Pins the exact composition the daemon `spawn` uses: base_cmd =
-        // claude_cmd + permission_flag(claude_cmd), then spawn_command wraps it.
-        //
-        // Exercises the env-free `resolve_claude_cmd` seam so the test never
-        // mutates the process-global BAUDE_PERMISSION_MODE — which would race
-        // the concurrent real-PTY spawn tests in this crate that read it.
-        let url = "http://127.0.0.1:8642/sessions/1/event";
-        let flagged = |claude: &str, mode: Option<&str>| {
-            baude_core::permission::resolve_claude_cmd(mode, claude).cmd
-        };
-
-        // Default (unset) and explicit skip and unrecognized -> skip flag,
-        // never the prompt flag (fail-safe default).
-        for mode in [None, Some("skip"), Some("bogus")] {
-            let cmd = spawn_command(&flagged("claude", mode), url, false);
-            assert!(
-                cmd.contains("--dangerously-skip-permissions"),
-                "mode {mode:?} must skip permissions, got: {cmd}"
-            );
-            assert!(
-                !cmd.contains("--permission-prompt-tool"),
-                "mode {mode:?} must NOT prompt, got: {cmd}"
-            );
-        }
-
-        // prompt -> prompt flag present, skip flag absent; survives the resume
-        // `--continue || exec` fallback (appended to the inner base cmd).
-        let cmd = spawn_command(&flagged("claude", Some("prompt")), url, true);
-        assert!(
-            cmd.contains("--permission-prompt-tool mcp__baude__approve"),
-            "prompt mode must wire the prompt tool, got: {cmd}"
-        );
-        assert!(
-            !cmd.contains("--dangerously-skip-permissions"),
-            "prompt mode must NOT also skip, got: {cmd}"
-        );
-        // The flag is on the base cmd so both `--continue` and the `exec`
-        // fallback carry it.
-        assert_eq!(
-            cmd.matches("--permission-prompt-tool").count(),
-            2,
-            "resume path repeats the flagged base cmd on both sides of `||`: {cmd}"
-        );
-
-        // BL-04: a claude_cmd that already bakes in --dangerously-skip-permissions
-        // must NOT suppress prompt mode — the skip is stripped and the prompt
-        // flag wins (explicit opt-in), with no skip flag left in the spawn cmd.
-        let cmd = spawn_command(
-            &flagged("claude --dangerously-skip-permissions", Some("prompt")),
-            url,
-            false,
-        );
-        assert!(
-            cmd.contains("--permission-prompt-tool mcp__baude__approve"),
-            "BL-04: prompt must win over a baked-in skip flag, got: {cmd}"
-        );
-        assert!(
-            !cmd.contains("--dangerously-skip-permissions"),
-            "BL-04: the conflicting skip flag must be stripped, got: {cmd}"
-        );
-    }
-
-    #[test]
-    fn seed_mcp_config_is_non_clobbering() {
-        // PERM-01 / T-04-03: seeding `.mcp.json` in prompt mode must merge our
-        // `baude` server without discarding a user's sibling MCP servers, and
-        // must be idempotent across re-spawns (restore()).
-        let cwd = std::env::temp_dir().join(format!("baude-mcp-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        std::fs::create_dir_all(&cwd).unwrap();
-        let path = baude_core::permission::mcp_config_path(&cwd);
-
-        // Pre-existing user config with a sibling server.
-        std::fs::write(
-            &path,
-            r#"{"mcpServers":{"other":{"command":"other-srv"}},"extra":true}"#,
-        )
-        .unwrap();
-
-        seed_mcp_config(&cwd);
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // Sibling server + unrelated key preserved.
-        assert_eq!(
-            v["mcpServers"]["other"]["command"].as_str(),
-            Some("other-srv")
-        );
-        assert_eq!(v["extra"].as_bool(), Some(true));
-        // Our server registered with the permission-mcp arg.
-        assert_eq!(
-            v["mcpServers"]["baude"]["args"][0].as_str(),
-            Some("permission-mcp")
-        );
-
-        // Idempotent: re-seeding leaves exactly one `baude` server, sibling intact.
-        seed_mcp_config(&cwd);
-        let v2: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            v2["mcpServers"]["other"]["command"].as_str(),
-            Some("other-srv")
-        );
-        assert_eq!(
-            v2["mcpServers"]["baude"]["args"][0].as_str(),
-            Some("permission-mcp")
-        );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
