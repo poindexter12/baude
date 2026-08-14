@@ -543,7 +543,7 @@ impl App {
         // $BAUDE_EVENT_URL, which routes hook events to the /tmp append path
         // (only the daemon injects that var).
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
-        let cmd = be.shell_command(&base, None, resume);
+        let plan = be.spawn_plan(&base, None, resume);
 
         // Wire the session cwd before the CLI starts (for Claude: the
         // settings.local.json hook seed, plus the prompt-mode .mcp.json).
@@ -551,20 +551,23 @@ impl App {
         // simply falls back to the silence path (no regression).
         be.prepare_cwd(&cwd);
 
-        if baude_core::permission::is_prompt_mode() {
-            // WR-01: permission approval is inherently daemon+PWA-mediated. A
-            // TUI-local session gets NO $BAUDE_EVENT_URL (only the daemon injects
-            // it), so the `permission-mcp` bridge fails CLOSED and DENIES every
-            // tool with no operator-visible reason. Make that non-silent: warn
-            // clearly (once per process to stderr, plus a visible TUI message)
-            // that prompt mode requires the daemon and the bare TUI will deny all
-            // tools. This is fail-safe (deny, never allow) but no longer a silent
-            // footgun. `skip` (the default) is unaffected.
+        if baude_core::permission::is_prompt_mode() && be.prompt_mode_needs_daemon() {
+            // WR-01: claude's permission approval is inherently daemon+PWA-
+            // mediated. A TUI-local session gets NO $BAUDE_EVENT_URL (only the
+            // daemon injects it), so the `permission-mcp` bridge fails CLOSED
+            // and DENIES every tool with no operator-visible reason. Make that
+            // non-silent: warn clearly (once per process to stderr, plus a
+            // visible TUI message) that prompt mode requires the daemon and the
+            // bare TUI will deny all tools. This is fail-safe (deny, never
+            // allow) but no longer a silent footgun. `skip` (the default) is
+            // unaffected — and so is opencode, whose own TUI prompts locally.
             self.warn_prompt_mode_without_daemon();
         }
 
         let (rows, cols) = self.claude_spawn_size(shell_open);
-        let claude = Pty::spawn(Some(&cmd), &cwd, rows, cols)?;
+        let claude = Pty::spawn(Some(&plan.cmd), &cwd, rows, cols)?;
+        let mut meta = ClaudeMeta::default();
+        meta.backend_port = plan.server_port;
 
         let id = self.next_id;
         self.next_id += 1;
@@ -579,7 +582,7 @@ impl App {
             shell: None,
             shell_open: false,
             spawn_unix_ms: now_unix_ms(),
-            meta: ClaudeMeta::default(),
+            meta,
             archived: false,
             archived_by_user: false,
             was_busy: false,
@@ -1503,13 +1506,22 @@ impl App {
             self.claude_spawn_size(s.shell_open)
         };
         let cwd = self.session(id).map(|s| s.cwd.clone()).unwrap();
-        let cmd = format!("exec {}", self.claude_cmd());
-        match Pty::spawn(Some(&cmd), &cwd, rows, cols) {
+        // Route through the backend like add_session — previously this
+        // hand-rolled `exec {claude_cmd}`, so a restarted session silently
+        // lost its permission flag (and, for opencode, needs a fresh pinned
+        // server port). TUI restarts stay fresh-start (no resume), matching
+        // the prior behavior.
+        let be = backend::active();
+        let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let plan = be.spawn_plan(&base, None, false);
+        be.prepare_cwd(&cwd);
+        match Pty::spawn(Some(&plan.cmd), &cwd, rows, cols) {
             Ok(pty) => {
                 if let Some(s) = self.session_mut(id) {
                     s.claude = pty;
                     s.spawn_unix_ms = now_unix_ms();
                     s.meta = ClaudeMeta::default();
+                    s.meta.backend_port = plan.server_port;
                 }
                 self.focus = Focus::Claude;
             }

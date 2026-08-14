@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::Backend;
+use super::{Backend, SpawnPlan};
 use crate::meta::ClaudeMeta;
 use crate::permission::ResolvedCmd;
 
@@ -35,15 +35,19 @@ impl Backend for ClaudeBackend {
     /// otherwise run WITHOUT the var and its hooks would silently miss the
     /// daemon transport. `export` sets it for the whole command group,
     /// surviving the `||` fallback and sub-exec (WR-01).
-    fn shell_command(&self, resolved_cmd: &str, event_url: Option<&str>, resume: bool) -> String {
+    fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, resume: bool) -> SpawnPlan {
         let inner = if resume {
             format!("{resolved_cmd} --continue 2>/dev/null || exec {resolved_cmd}")
         } else {
             format!("exec {resolved_cmd}")
         };
-        match event_url {
+        let cmd = match event_url {
             Some(url) => format!("export BAUDE_EVENT_URL={url}; {inner}"),
             None => inner,
+        };
+        SpawnPlan {
+            cmd,
+            server_port: None,
         }
     }
 
@@ -69,6 +73,13 @@ impl Backend for ClaudeBackend {
         repo_root: &Path,
     ) {
         meta.poll(cwd, pid, spawn_unix_ms, repo_root);
+    }
+
+    /// The `permission-mcp` bridge fails CLOSED (denies every tool) when no
+    /// daemon injects `$BAUDE_EVENT_URL` — a bare-TUI prompt-mode session
+    /// would silently deny everything, so the TUI must warn (WR-01).
+    fn prompt_mode_needs_daemon(&self) -> bool {
+        true
     }
 }
 
@@ -100,23 +111,23 @@ fn seed_mcp_config(cwd: &Path) {
 mod tests {
     use super::*;
 
-    // ---- shell_command --------------------------------------------------
+    // ---- spawn_plan -----------------------------------------------------
     //
     // These pin the exact spawn strings both binaries relied on before the
     // seam (moved from bauded/src/manager.rs's spawn_command tests): the
     // daemon path (event_url = Some) and the TUI path (event_url = None).
 
     #[test]
-    fn shell_command_exports_event_url_on_both_paths() {
+    fn spawn_plan_exports_event_url_on_both_paths() {
         // WR-01: the event URL must be exported (not assignment-prefixed) so it
         // survives the resume path's `|| exec claude` fallback. Both the resume
         // and fresh commands must start with `export BAUDE_EVENT_URL=<url>;`.
         let url = "http://127.0.0.1:8642/sessions/3/event";
 
-        let fresh = ClaudeBackend.shell_command("claude", Some(url), false);
+        let fresh = ClaudeBackend.spawn_plan("claude", Some(url), false).cmd;
         assert_eq!(fresh, format!("export BAUDE_EVENT_URL={url}; exec claude"));
 
-        let resumed = ClaudeBackend.shell_command("claude", Some(url), true);
+        let resumed = ClaudeBackend.spawn_plan("claude", Some(url), true).cmd;
         let prefix = format!("export BAUDE_EVENT_URL={url}; ");
         assert!(
             resumed.starts_with(&prefix),
@@ -132,27 +143,27 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_tui_path_has_no_export() {
+    fn spawn_plan_tui_path_has_no_export() {
         // TUI sessions get NO $BAUDE_EVENT_URL (only the daemon injects it),
         // which routes hook events to the /tmp append path. Exact strings the
         // TUI spawn used before the seam.
         assert_eq!(
-            ClaudeBackend.shell_command("claude", None, false),
+            ClaudeBackend.spawn_plan("claude", None, false).cmd,
             "exec claude"
         );
         assert_eq!(
-            ClaudeBackend.shell_command("claude", None, true),
+            ClaudeBackend.spawn_plan("claude", None, true).cmd,
             "claude --continue 2>/dev/null || exec claude"
         );
     }
 
     #[test]
-    fn permission_mode_default_skip_and_prompt_at_shell_command() {
+    fn permission_mode_default_skip_and_prompt_at_spawn_plan() {
         // PERM-01 (security-critical): the spawn command must carry
         // `--dangerously-skip-permissions` by default (BAUDE_PERMISSION_MODE
         // unset/skip) and `--permission-prompt-tool` ONLY in `prompt` mode.
         // Pins the exact composition both spawn paths use: base_cmd =
-        // claude_cmd + permission_flag(claude_cmd), then shell_command wraps it.
+        // claude_cmd + permission_flag(claude_cmd), then spawn_plan wraps it.
         //
         // Exercises the env-free `resolve_claude_cmd` seam so the test never
         // mutates the process-global BAUDE_PERMISSION_MODE — which would race
@@ -165,7 +176,9 @@ mod tests {
         // Default (unset) and explicit skip and unrecognized -> skip flag,
         // never the prompt flag (fail-safe default).
         for mode in [None, Some("skip"), Some("bogus")] {
-            let cmd = ClaudeBackend.shell_command(&flagged("claude", mode), Some(url), false);
+            let cmd = ClaudeBackend
+                .spawn_plan(&flagged("claude", mode), Some(url), false)
+                .cmd;
             assert!(
                 cmd.contains("--dangerously-skip-permissions"),
                 "mode {mode:?} must skip permissions, got: {cmd}"
@@ -178,7 +191,9 @@ mod tests {
 
         // prompt -> prompt flag present, skip flag absent; survives the resume
         // `--continue || exec` fallback (appended to the inner base cmd).
-        let cmd = ClaudeBackend.shell_command(&flagged("claude", Some("prompt")), Some(url), true);
+        let cmd = ClaudeBackend
+            .spawn_plan(&flagged("claude", Some("prompt")), Some(url), true)
+            .cmd;
         assert!(
             cmd.contains("--permission-prompt-tool mcp__baude__approve"),
             "prompt mode must wire the prompt tool, got: {cmd}"
@@ -198,11 +213,13 @@ mod tests {
         // BL-04: a claude_cmd that already bakes in --dangerously-skip-permissions
         // must NOT suppress prompt mode — the skip is stripped and the prompt
         // flag wins (explicit opt-in), with no skip flag left in the spawn cmd.
-        let cmd = ClaudeBackend.shell_command(
-            &flagged("claude --dangerously-skip-permissions", Some("prompt")),
-            Some(url),
-            false,
-        );
+        let cmd = ClaudeBackend
+            .spawn_plan(
+                &flagged("claude --dangerously-skip-permissions", Some("prompt")),
+                Some(url),
+                false,
+            )
+            .cmd;
         assert!(
             cmd.contains("--permission-prompt-tool mcp__baude__approve"),
             "BL-04: prompt must win over a baked-in skip flag, got: {cmd}"

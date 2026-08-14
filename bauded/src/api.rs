@@ -135,6 +135,7 @@ async fn create_session(
     let info = lock(&state)
         .create(&body.repo, body.worktree.as_deref(), body.name.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    crate::permission_bridge::watch_if_needed(&state, info.id);
     Ok((StatusCode::CREATED, Json(info)))
 }
 
@@ -231,6 +232,8 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
             (StatusCode::CONFLICT, msg) // still running
         }
     })?;
+    // A restart re-rolls the opencode server port — wire a fresh watcher.
+    crate::permission_bridge::watch_if_needed(&state, id);
     Ok(StatusCode::ACCEPTED)
 }
 

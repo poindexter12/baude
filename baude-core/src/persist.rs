@@ -61,6 +61,10 @@ pub struct Config {
     /// survive TUI restarts. BAUDE_AUTO_DAEMON=1 overrides.
     #[serde(default)]
     pub auto_daemon: bool,
+    /// Which AI-CLI backend to manage: "claude" (default) or "opencode".
+    /// Global — every session in this baude/bauded process uses the same
+    /// backend. BAUDE_BACKEND overrides. Unknown values fall back to claude.
+    pub backend: Option<String>,
 }
 
 impl Config {

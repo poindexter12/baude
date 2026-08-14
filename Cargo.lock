@@ -218,6 +218,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "ureq",
  "vt100",
 ]
 
