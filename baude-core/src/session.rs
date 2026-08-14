@@ -304,7 +304,7 @@ impl Session {
         }
         let pid = self.claude.pid();
         let (cwd, spawn, root) = (self.cwd.clone(), self.spawn_unix_ms, self.repo_root.clone());
-        self.meta.poll(&cwd, pid, spawn, &root);
+        crate::backend::active().poll_meta(&mut self.meta, &cwd, pid, spawn, &root);
     }
 
     pub fn open_shell(&mut self, rows: u16, cols: u16) -> Result<()> {

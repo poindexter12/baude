@@ -1,0 +1,83 @@
+{
+  "verdict": "VALIDATED",
+  "approve": {
+    "name": "approve",
+    "response": "once",
+    "replyAccepted": true,
+    "heldWithoutExecuting": true,
+    "repliedEvent": {
+      "sessionID": "ses_ffe014b8bffeK1JTGcEYcQ7ll2",
+      "requestID": "per_001feca34001uc7gFZVvSn8XLn",
+      "reply": "once"
+    },
+    "proofExists": true,
+    "proofContent": "approve-proof",
+    "permission": {
+      "id": "per_001feca34001uc7gFZVvSn8XLn",
+      "permission": "bash",
+      "patterns": [
+        "echo approve-proof > proof-approve.txt"
+      ],
+      "always": [
+        "echo *"
+      ],
+      "metadata": {
+        "command": "echo approve-proof > proof-approve.txt"
+      },
+      "tool": {
+        "messageID": "msg_001feb70a0015bp0YGFkWnSCPE",
+        "callID": "call_Stb5JU4QIRYJnqf8apEhRCPf"
+      }
+    }
+  },
+  "reject": {
+    "name": "reject",
+    "response": "reject",
+    "replyAccepted": true,
+    "heldWithoutExecuting": true,
+    "repliedEvent": {
+      "sessionID": "ses_ffe012267ffeQDWLXcimG8cmKS",
+      "requestID": "per_001fee96f001P3DNqQJx4p3aNR",
+      "reply": "reject"
+    },
+    "proofExists": false,
+    "proofContent": null,
+    "permission": {
+      "id": "per_001fee96f001P3DNqQJx4p3aNR",
+      "permission": "bash",
+      "patterns": [
+        "echo reject-proof > proof-reject.txt"
+      ],
+      "always": [
+        "echo *"
+      ],
+      "metadata": {
+        "command": "echo reject-proof > proof-reject.txt"
+      },
+      "tool": {
+        "messageID": "msg_001fedda2001qSYznpE3Ig5WEY",
+        "callID": "call_853DiLd1UdsXJ3p19VMW7IGS"
+      }
+    }
+  },
+  "eventCounts": {
+    "test:-": 6,
+    "sse:server.connected": 1,
+    "api:-": 6,
+    "sse:session.created": 2,
+    "sse:session.updated": 8,
+    "sse:message.updated": 15,
+    "sse:message.part.updated": 22,
+    "sse:session.status": 9,
+    "sse:session.diff": 4,
+    "sse:plugin.added": 45,
+    "sse:catalog.updated": 2,
+    "sse:reference.updated": 1,
+    "sse:integration.updated": 1,
+    "sse:permission.asked": 2,
+    "sse:permission.replied": 2,
+    "sse:server.heartbeat": 1,
+    "sse:message.part.delta": 1,
+    "sse:session.idle": 2
+  }
+}

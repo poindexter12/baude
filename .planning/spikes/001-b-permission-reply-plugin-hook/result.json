@@ -1,0 +1,26 @@
+{
+  "verdict": "INVALIDATED",
+  "allow": {
+    "name": "allow",
+    "status": "allow",
+    "askHookFired": false,
+    "eventHookFired": true,
+    "resolvedVia": "http-reply-endpoint-fallback",
+    "heldWithoutExecuting": true,
+    "decisionApplied": null,
+    "proofExists": true,
+    "proofContent": "allow-proof"
+  },
+  "deny": {
+    "name": "deny",
+    "status": "deny",
+    "askHookFired": false,
+    "eventHookFired": true,
+    "resolvedVia": "http-reply-endpoint-fallback",
+    "heldWithoutExecuting": true,
+    "decisionApplied": null,
+    "proofExists": false,
+    "proofContent": null
+  },
+  "note": "askHookFired = documented permission.ask plugin hook; eventHookFired = generic event hook receiving permission.asked"
+}
