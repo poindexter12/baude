@@ -6,6 +6,7 @@
 mod api;
 mod manager;
 mod notify;
+mod permission_bridge;
 mod push;
 mod transcript;
 mod web;
@@ -169,6 +170,11 @@ async fn main() -> Result<()> {
     let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();
     let state = Arc::new(Mutex::new(manager));
+    // opencode prompt mode: every restored session needs its permission
+    // watcher back (create/restart wire theirs in the API handlers).
+    for info in lock(&state).list() {
+        permission_bridge::watch_if_needed(&state, info.id);
+    }
     let push_state: push::SharedPush = Arc::new(Mutex::new(push::PushState::load(true)?));
 
     // Metadata poll loop — same cadence as the TUI tick. Plain thread: the

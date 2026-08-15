@@ -257,6 +257,31 @@ the profile's shell.
 - `daemon_url` — base URL of a remote bauded daemon (e.g.
   `http://bauded:8642`); its sessions appear in the sidebar under a
   `⇄ remote` section. `BAUDE_DAEMON_URL` env var overrides the config file.
+- `backend` — which AI CLI to manage: `claude` (default) or `opencode`.
+  Global per process — every session uses the same backend. `BAUDE_BACKEND`
+  env var overrides the config file. See "opencode backend" below.
+
+## opencode backend
+
+Setting `backend` to `opencode` (or `BAUDE_BACKEND=opencode`) runs
+[opencode](https://opencode.ai) sessions instead of Claude Code. Each session
+pins its opencode server to a local port, and baude reads status, model,
+title, tokens, and cost over that server's HTTP API — no hooks or statusline
+wiring needed. `claude_cmd`/`BAUDE_CLAUDE_CMD` still name the command
+(default `opencode`).
+
+Permission modes map as follows: the default `skip` spawns with `--auto`
+(auto-approve anything not explicitly denied — the
+`--dangerously-skip-permissions` analog), and `BAUDE_PERMISSION_MODE=prompt`
+injects ask-rules for `bash`/`edit`/`webfetch` via `OPENCODE_CONFIG_CONTENT`.
+In prompt mode under the daemon, pending permissions surface on the PWA's
+approve/deny card exactly like Claude's (a per-session bridge subscribes to
+opencode's event stream and relays your decision); in the bare TUI, opencode's
+own in-terminal prompt keeps working.
+
+Known gaps vs the Claude backend: no context-% gauge, no account rate-limit
+windows, and the PWA chat/activity views stay empty (they read Claude's
+transcript and hook streams).
 
 ## Remote sessions in the TUI
 

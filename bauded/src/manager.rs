@@ -345,8 +345,10 @@ impl Manager {
             );
         }
 
-        let cmd = be.shell_command(&resolved.cmd, Some(&event_url(id)), resume);
-        let claude = Pty::spawn(Some(&cmd), &cwd, ROWS, COLS)?;
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), resume);
+        let claude = Pty::spawn(Some(&plan.cmd), &cwd, ROWS, COLS)?;
+        let mut meta = ClaudeMeta::default();
+        meta.backend_port = plan.server_port;
 
         self.next_id += 1;
         self.sessions.push(Session {
@@ -360,7 +362,7 @@ impl Manager {
             shell: None,
             shell_open: false,
             spawn_unix_ms: now_unix_ms(),
-            meta: ClaudeMeta::default(),
+            meta,
             archived: false,
             archived_by_user: false,
             was_busy: false,
@@ -412,8 +414,12 @@ impl Manager {
         if s.claude.is_exited() {
             bail!("claude has exited");
         }
-        // Input written before Claude's TUI is up gets drained, not queued.
-        if s.meta.session_id.is_none() {
+        // Input written before the CLI's TUI is up gets drained, not queued.
+        // Claude readiness = its session file resolved a session_id; opencode
+        // readiness = its server answered a poll (`backend_ready` — its
+        // session_id only exists AFTER the first prompt, so gating on it
+        // would deadlock the first message).
+        if s.meta.session_id.is_none() && !s.meta.backend_ready {
             bail!("claude is still starting — retry shortly");
         }
         let bracketed = s
@@ -551,19 +557,35 @@ impl Manager {
         Ok(Arc::clone(self.permission_notify.entry(id).or_default()))
     }
 
-    /// Respawn claude in an exited session's PTY (same cwd, fresh process,
-    /// `--continue` to pick the conversation back up).
+    /// Respawn the CLI in an exited session's PTY (same cwd, fresh process,
+    /// the backend's resume form to pick the conversation back up).
+    ///
+    /// Routes through the SAME backend composition as `spawn` — previously
+    /// this hand-rolled `{claude_cmd} --continue || exec {claude_cmd}`, so a
+    /// restarted session silently lost its permission flag AND the
+    /// `$BAUDE_EVENT_URL` export (hook events regressed to the /tmp file
+    /// path with no daemon POST). Now a restart is spawn-equivalent, and for
+    /// opencode it re-rolls the pinned server port.
     pub fn restart(&mut self, id: u64) -> Result<()> {
-        let claude_cmd = self.claude_cmd.clone();
+        let be = backend::active();
+        let resolved = be.resolve_cmd(&self.claude_cmd);
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), true);
         let s = self.session_mut(id)?;
         if !s.claude.is_exited() {
             bail!("claude is still running");
         }
-        let cmd = format!("{claude_cmd} --continue 2>/dev/null || exec {claude_cmd}");
-        s.claude = Pty::spawn(Some(&cmd), &s.cwd, ROWS, COLS)?;
+        be.prepare_cwd(&s.cwd);
+        s.claude = Pty::spawn(Some(&plan.cmd), &s.cwd, ROWS, COLS)?;
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
+        s.meta.backend_port = plan.server_port;
         Ok(())
+    }
+
+    /// Local port of the session's backend server (opencode), if it runs one.
+    /// Err → 404 on an unknown id. Read by the daemon's permission bridge.
+    pub fn backend_port(&self, id: u64) -> Result<Option<u16>> {
+        Ok(self.session(id)?.meta.backend_port)
     }
 
     /// Attach for raw terminal streaming: a redraw snapshot plus a receiver
@@ -799,15 +821,24 @@ fn session_info(s: &Session) -> SessionInfo {
         // and Completed's dim "done Xm ago" both read this same duration.
         waiting_for_ms: matches!(status, Status::Waiting | Status::Completed)
             .then(|| s.waiting_for_ms()),
-        waiting_reason: match baude_core::permission::waiting_reason(
-            s.meta.last_notification.as_ref(),
-            status == Status::Waiting,
-            status == Status::Completed,
-        ) {
-            // "none" carries no signal — omit it so the JSON stays lean and the
-            // PWA/push key off the presence of "permission"/"input"/"completed".
-            "none" => None,
-            reason => Some(reason.to_string()),
+        // A live pending_permission IS a permission wait regardless of what the
+        // hook stream said — claude's Notification hook usually agrees, but
+        // opencode has no hooks, so the daemon-set pending (via the SSE
+        // permission bridge) is the only signal there. This is what routes the
+        // distinct `notified_permission` push and the PWA approve/deny card.
+        waiting_reason: if s.pending_permission.is_some() {
+            Some("permission".to_string())
+        } else {
+            match baude_core::permission::waiting_reason(
+                s.meta.last_notification.as_ref(),
+                status == Status::Waiting,
+                status == Status::Completed,
+            ) {
+                // "none" carries no signal — omit it so the JSON stays lean and
+                // the PWA/push key off "permission"/"input"/"completed".
+                "none" => None,
+                reason => Some(reason.to_string()),
+            }
         },
         model: s.meta.model.clone(),
         // BL-02: fall back to baude's spawn-intended mode (skip→bypassPermissions)

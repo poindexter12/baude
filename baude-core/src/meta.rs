@@ -174,6 +174,19 @@ pub struct ClaudeMeta {
     pub pr: Option<PrInfo>,
     /// Worktree info from the bridge file's `worktree` object.
     pub worktree: Option<WorktreeInfo>,
+    /// Local port of the per-session backend server, when the backend runs
+    /// one (opencode: the TUI's embedded HTTP server, pinned via `--port` at
+    /// spawn). `None` for backends without one (claude). Set by the spawn
+    /// sites from [`crate::backend::SpawnPlan::server_port`]; read by the
+    /// opencode backend's `poll_meta`.
+    pub backend_port: Option<u16>,
+    /// True once the backend's server has answered a poll — the opencode
+    /// equivalent of "the TUI is up, input won't be drained". opencode creates
+    /// its session LAZILY on the first prompt, so `session_id` stays `None`
+    /// until a message goes in; the daemon's post_message readiness gate
+    /// accepts EITHER a resolved session_id (claude) or this flag (opencode),
+    /// or the first message could never be delivered. Never set by claude.
+    pub backend_ready: bool,
 }
 
 impl ClaudeMeta {
@@ -186,6 +199,13 @@ impl ClaudeMeta {
         self.read_context_file();
         self.read_bridge_file();
         self.read_event_tail();
+        self.poll_neutral(cwd, repo_root);
+    }
+
+    /// The backend-neutral slice of a poll — GSD project state and the git
+    /// branch, read from the repo itself rather than any backend artifact.
+    /// Called by every backend's `poll_meta` (claude via [`Self::poll`]).
+    pub fn poll_neutral(&mut self, cwd: &Path, repo_root: &Path) {
         self.gsd = parse_gsd(repo_root);
         self.git_branch = read_git_branch(cwd);
     }
