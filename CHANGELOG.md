@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/poindexter12/baude/compare/v0.11.0...v0.12.0) (2026-08-15)
+
+
+### Features
+
+* opencode backend — spawn, live metadata, and remote permission approval ([1b0479d](https://github.com/poindexter12/baude/commit/1b0479d4bbf7c9145034006f578a3d1448dcaf0b))
+* opencode backend — spawn, live metadata, and remote permission approval ([36ae74d](https://github.com/poindexter12/baude/commit/36ae74d997b9ec59f5aea3ed56894d582bec0222))
+
 ## [0.11.0](https://github.com/poindexter12/baude/compare/v0.10.0...v0.11.0) (2026-08-13)
 
 
