@@ -73,6 +73,10 @@ pub struct Config {
     /// Named workspace declarations. Absent entries still resolve — a
     /// workspace is its state namespace first, config second.
     pub workspaces: Option<std::collections::HashMap<String, WorkspaceConfig>>,
+    /// macOS desktop banners when a session needs attention (waiting /
+    /// permission / finished / exited). Default true (macOS only);
+    /// BAUDE_NOTIFY=0 overrides.
+    pub desktop_notifications: Option<bool>,
 }
 
 /// One `workspaces.<name>` config entry. All fields optional.

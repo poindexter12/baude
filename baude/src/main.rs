@@ -1,5 +1,6 @@
 mod app;
 mod keys;
+mod notify_desktop;
 mod remote;
 mod ui;
 mod usage;
