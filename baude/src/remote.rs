@@ -128,12 +128,40 @@ impl RemotePoller {
             .map_err(|e| short_err(&e))
     }
 
+    /// The workspace the daemon reports serving (`GET /info`). `None` when
+    /// the daemon predates workspaces (404) or is unreachable.
+    fn daemon_workspace(&self) -> Option<String> {
+        ureq::get(&format!("{}/info", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok())
+            .and_then(|v| v["workspace"].as_str().map(str::to_string))
+    }
+
     pub fn create(
         &self,
         repo: &str,
         worktree: Option<&str>,
         name: Option<&str>,
     ) -> Result<(), String> {
+        // Cross-workspace guard: a daemon serves exactly one workspace (and
+        // thus one backend), so creating a session through a daemon bound to
+        // a DIFFERENT workspace would silently spawn it under the wrong
+        // backend and pollute the wrong session pool. Refuse loudly instead.
+        // A pre-workspace daemon (no /info) is claude-era: allowed only from
+        // the claude workspace.
+        let local = &baude_core::workspace::active().name;
+        match self.daemon_workspace() {
+            Some(ws) if ws == *local => {}
+            Some(ws) => return Err(format!(
+                "daemon serves workspace {ws:?}, not {local:?} — refusing cross-workspace session"
+            )),
+            None if local == "claude" => {}
+            None => return Err(format!(
+                "daemon reports no workspace (pre-workspace version) — refusing {local:?} session"
+            )),
+        }
         let body = serde_json::json!({ "repo": repo, "worktree": worktree, "name": name });
         ureq::post(&format!("{}/sessions", self.base))
             .timeout(REQUEST_TIMEOUT)

@@ -266,6 +266,7 @@ impl App {
         let config = persist::load_config();
         let remote = std::env::var("BAUDE_DAEMON_URL")
             .ok()
+            .or_else(|| baude_core::workspace::active().daemon_url.clone())
             .or_else(|| config.daemon_url.clone())
             .filter(|u| !u.trim().is_empty())
             .map(RemotePoller::start);

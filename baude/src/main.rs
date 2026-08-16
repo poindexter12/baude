@@ -9,21 +9,26 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-const AUTO_DAEMON_URL: &str = "http://127.0.0.1:8642";
-
-fn daemon_is_up() -> bool {
-    ureq::get(&format!("{AUTO_DAEMON_URL}/sessions"))
+fn daemon_is_up(url: &str) -> bool {
+    ureq::get(&format!("{url}/sessions"))
         .timeout(Duration::from_millis(300))
         .call()
         .is_ok()
 }
 
 /// If `auto_daemon` is enabled (config or env) and no explicit daemon URL is
-/// configured, ensure a local `bauded` is running and return its URL.
+/// configured, ensure a local `bauded` is running FOR THIS WORKSPACE and
+/// return its URL. Each workspace gets its own daemon on its own port
+/// (claude 8642, opencode 8643, custom via `workspaces.<n>.daemon_port`) so
+/// two workspaces running side-by-side never share a session pool.
 /// Returns `None` when auto-daemon is disabled or already handled by config.
 fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
+    let ws = baude_core::workspace::active();
     // Explicit URL already configured — nothing to do.
-    if std::env::var("BAUDE_DAEMON_URL").is_ok() || config.daemon_url.is_some() {
+    if std::env::var("BAUDE_DAEMON_URL").is_ok()
+        || ws.daemon_url.is_some()
+        || config.daemon_url.is_some()
+    {
         return None;
     }
     let auto = config.auto_daemon
@@ -33,8 +38,16 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
     if !auto {
         return None;
     }
-    if daemon_is_up() {
-        return Some(AUTO_DAEMON_URL.to_string());
+    let Some(port) = ws.auto_daemon_port() else {
+        eprintln!(
+            "baude: auto_daemon needs workspaces.{}.daemon_port in config — skipping",
+            ws.name
+        );
+        return None;
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    if daemon_is_up(&url) {
+        return Some(url);
     }
     // Locate bauded: same directory as this binary, then PATH.
     let bauded = std::env::current_exe()
@@ -48,8 +61,13 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
                     .find(|p| p.exists())
             })
         })?;
-    // Spawn detached; drop the handle — bauded outlives the TUI.
+    // Spawn detached; drop the handle — bauded outlives the TUI. Workspace
+    // and bind are passed EXPLICITLY: env inheritance alone would miss a
+    // workspace selected via config, and the per-workspace port must win
+    // over any BAUDED_BIND in the environment.
     std::process::Command::new(&bauded)
+        .env("BAUDE_WORKSPACE", &ws.name)
+        .env("BAUDED_BIND", format!("127.0.0.1:{port}"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -58,8 +76,8 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
     // Wait up to 2 s for bauded to bind.
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(200));
-        if daemon_is_up() {
-            return Some(AUTO_DAEMON_URL.to_string());
+        if daemon_is_up(&url) {
+            return Some(url);
         }
     }
     None
