@@ -262,6 +262,11 @@ the profile's shell.
   below.
 - `workspace` / `workspaces` — named, hard-separated session pools, each
   bound to one backend. See "Workspaces" below.
+- `desktop_notifications` — macOS banners when a session needs attention:
+  a pending permission (immediate, with sound), waiting on input for 10s+
+  (with sound, once per turn), a finished turn, or an exit (both silent).
+  Covers local and remote sidebar sessions; archived sessions are muted.
+  Default `true` (no-op off macOS); `BAUDE_NOTIFY=0` env overrides.
 
 ## Workspaces
 
