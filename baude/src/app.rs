@@ -15,6 +15,7 @@ use baude_core::pty::{now_ms, Pty};
 use baude_core::session::{Session, Status};
 
 use crate::keys::encode_key;
+use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
 use crate::usage::{UsageCosts, UsagePoller};
 
@@ -230,6 +231,11 @@ pub struct App {
     pub selection: Option<Selection>,
     /// Clones in flight (`c` key); sessions open as each one lands.
     pending_clones: Vec<PendingClone>,
+    /// macOS banner state machine (waiting/permission/finished/exited).
+    desktop_notifier: DesktopNotifier,
+    /// Resolved once at startup: BAUDE_NOTIFY env, then config
+    /// `desktop_notifications`, then on.
+    desktop_notify_enabled: bool,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -264,6 +270,7 @@ pub fn inner(r: Rect) -> Rect {
 impl App {
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
+        let config_notify = config.desktop_notifications;
         let remote = std::env::var("BAUDE_DAEMON_URL")
             .ok()
             .or_else(|| baude_core::workspace::active().daemon_url.clone())
@@ -291,6 +298,12 @@ impl App {
             shell_scroll: 0,
             selection: None,
             pending_clones: Vec::new(),
+            desktop_notifier: DesktopNotifier::default(),
+            desktop_notify_enabled: std::env::var("BAUDE_NOTIFY")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false"))
+                .or(config_notify)
+                .unwrap_or(true),
         }
     }
 
@@ -635,6 +648,60 @@ impl App {
         self.set_message(MSG.into());
     }
 
+    /// Feed the desktop-banner state machine one snapshot of every sidebar
+    /// row — local sessions and the remote daemon's — and post whatever it
+    /// decides. Cheap per frame; osascript runs off-thread on actual events.
+    fn tick_desktop_notify(&mut self) {
+        if !self.desktop_notify_enabled {
+            return;
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(self.sessions.len());
+        for s in &self.sessions {
+            let status = match s.status() {
+                Status::Waiting => "waiting",
+                Status::Completed => "completed",
+                Status::Busy => "busy",
+                Status::Exited => "exited",
+            };
+            rows.push(Row {
+                key: format!("l{}", s.id),
+                name: s.name.clone(),
+                status,
+                waiting_for_ms: Some(s.waiting_for_ms()),
+                waiting_reason: match baude_core::permission::waiting_reason(
+                    s.meta.last_notification.as_ref(),
+                    status == "waiting",
+                    status == "completed",
+                ) {
+                    "none" => None,
+                    r => Some(r.to_string()),
+                },
+                archived: s.archived,
+            });
+        }
+        // Remote timers are snapshots — age them by time-since-fetch, exactly
+        // like the sidebar rendering does, so the 10s debounce is honest.
+        let age = now_ms().saturating_sub(self.remote_snap.fetched_ms);
+        for r in &self.remote_snap.sessions {
+            rows.push(Row {
+                key: format!("r{}", r.id),
+                name: r.name.clone(),
+                status: match r.status.as_str() {
+                    "waiting" => "waiting",
+                    "completed" => "completed",
+                    "exited" => "exited",
+                    _ => "busy",
+                },
+                waiting_for_ms: r.waiting_for_ms.map(|w| w + age),
+                waiting_reason: r.waiting_reason.clone(),
+                archived: r.archived,
+            });
+        }
+        for banner in self.desktop_notifier.tick(&rows) {
+            notify_desktop::post(banner);
+        }
+    }
+
     pub fn tick(&mut self) {
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
@@ -656,6 +723,7 @@ impl App {
         if let Some(r) = &self.remote {
             self.remote_snap = r.snapshot();
         }
+        self.tick_desktop_notify();
         // Remote rows can appear after startup (first poll): give an empty
         // selection something to land on.
         if self.selected_id.is_none() {
