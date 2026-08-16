@@ -839,9 +839,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Right side: who needs you, and when the limits refill.
+    // Right side: which workspace this is, who needs you, and when the
+    // limits refill. The workspace chip is the always-visible answer to
+    // "which session pool am I in?" — load-bearing when a claude and an
+    // opencode baude run side by side.
     let (waiting, busy, completed) = app.status_counts();
     let mut right: Vec<String> = Vec::new();
+    right.push(format!("⬢ {}", baude_core::workspace::active().name));
     if waiting > 0 {
         right.push(format!("● {waiting} waiting"));
     }

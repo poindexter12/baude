@@ -64,7 +64,29 @@ pub struct Config {
     /// Which AI-CLI backend to manage: "claude" (default) or "opencode".
     /// Global — every session in this baude/bauded process uses the same
     /// backend. BAUDE_BACKEND overrides. Unknown values fall back to claude.
+    /// With workspaces, this is the fallback for workspaces that carry no
+    /// explicit `backend` binding (see [`crate::workspace`]).
     pub backend: Option<String>,
+    /// Default workspace to open; BAUDE_WORKSPACE overrides. Defaults to the
+    /// backend name, so `claude`/`opencode` separate automatically.
+    pub workspace: Option<String>,
+    /// Named workspace declarations. Absent entries still resolve — a
+    /// workspace is its state namespace first, config second.
+    pub workspaces: Option<std::collections::HashMap<String, WorkspaceConfig>>,
+}
+
+/// One `workspaces.<name>` config entry. All fields optional.
+#[derive(Deserialize, Clone, Default)]
+pub struct WorkspaceConfig {
+    /// Backend this workspace is BOUND to ("claude" | "opencode"). A binding
+    /// beats BAUDE_BACKEND — the anti-cross-wiring guarantee.
+    pub backend: Option<String>,
+    /// Remote daemon for this workspace; beats the global `daemon_url`.
+    pub daemon_url: Option<String>,
+    /// Loopback port auto_daemon uses for this workspace. Implicit
+    /// workspaces default (claude 8642, opencode 8643); custom ones need
+    /// this set for auto_daemon to work.
+    pub daemon_port: Option<u16>,
 }
 
 impl Config {
@@ -88,11 +110,33 @@ pub fn load_config() -> Config {
 }
 
 pub fn load() -> State {
-    load_named("state.json")
+    load_for_workspace("state", crate::workspace::active())
 }
 
 pub fn save(state: &State) -> Result<()> {
-    save_named("state.json", state)
+    save_for_workspace("state", crate::workspace::active(), state)
+}
+
+/// Load a workspace's session state (`<base>-<ws>.json`), falling back to
+/// the legacy un-suffixed file for the default workspace so pre-workspace
+/// session lists survive the upgrade. Saves never target the legacy name.
+pub fn load_for_workspace(base: &str, ws: &crate::workspace::Workspace) -> State {
+    let primary = ws.state_file(base);
+    if state_path(&primary).exists() {
+        return load_named(&primary);
+    }
+    match ws.legacy_state_file(base) {
+        Some(legacy) => load_named(&legacy),
+        None => State::default(),
+    }
+}
+
+pub fn save_for_workspace(
+    base: &str,
+    ws: &crate::workspace::Workspace,
+    state: &State,
+) -> Result<()> {
+    save_named(&ws.state_file(base), state)
 }
 
 /// Load session state from a specific file under the config dir. The TUI and

@@ -217,7 +217,12 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    println!("bauded listening on http://{bind} ({restored} session(s) restored)");
+    let ws = baude_core::workspace::active();
+    println!(
+        "bauded listening on http://{bind} — workspace {} / backend {} ({restored} session(s) restored)",
+        ws.name,
+        ws.backend.name()
+    );
     let app = api::router(Arc::clone(&state)).merge(api::push_router(push_state));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

@@ -21,6 +21,7 @@ use crate::transcript::{self, ChatMessage, EventTail, Tail};
 pub fn router(state: Shared) -> Router {
     Router::new()
         .merge(crate::web::router())
+        .route("/info", get(info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route(
@@ -104,6 +105,19 @@ type ApiError = (StatusCode, String);
 
 fn not_found(e: anyhow::Error) -> ApiError {
     (StatusCode::NOT_FOUND, e.to_string())
+}
+
+/// `GET /info` — daemon identity: which workspace (and thus backend) this
+/// daemon serves, so clients can refuse to route sessions into the wrong
+/// pool (the TUI's cross-workspace guard). Daemons predating workspaces
+/// 404 here; clients treat that as "claude workspace, old version".
+async fn info() -> Json<serde_json::Value> {
+    let ws = baude_core::workspace::active();
+    Json(serde_json::json!({
+        "workspace": ws.name,
+        "backend": ws.backend.name(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn list_sessions(State(state): State<Shared>) -> Json<Vec<SessionInfo>> {

@@ -39,7 +39,6 @@ pub mod claude;
 pub mod opencode;
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use crate::meta::ClaudeMeta;
 use crate::permission::ResolvedCmd;
@@ -112,26 +111,12 @@ pub fn backend_for(name: Option<&str>) -> &'static dyn Backend {
     }
 }
 
-/// The active backend for this process: `BAUDE_BACKEND` env, then config.json
-/// `backend`, then claude. Resolved once and cached — the poll loop calls
-/// this every tick.
+/// The active backend for this process: whatever backend the active
+/// WORKSPACE is bound to ([`crate::workspace::active`] — `BAUDE_WORKSPACE` /
+/// `BAUDE_BACKEND` / config, workspace binding wins). Cached — the poll loop
+/// calls this every tick.
 pub fn active() -> &'static dyn Backend {
-    static ACTIVE: OnceLock<&'static dyn Backend> = OnceLock::new();
-    *ACTIVE.get_or_init(|| {
-        let name = std::env::var("BAUDE_BACKEND")
-            .ok()
-            .or_else(|| crate::persist::load_config().backend);
-        let be = backend_for(name.as_deref());
-        if let Some(n) = name.as_deref() {
-            if n != be.name() {
-                eprintln!(
-                    "baude: unknown backend {n:?} — falling back to {}",
-                    be.name()
-                );
-            }
-        }
-        be
-    })
+    crate::workspace::active().backend
 }
 
 #[cfg(test)]

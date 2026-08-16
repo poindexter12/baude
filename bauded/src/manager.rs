@@ -23,7 +23,11 @@ use baude_core::session::{Session, StateSource, Status};
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
-const STATE_FILE: &str = "daemon-state.json";
+/// Base name of the daemon's state file; workspace-suffixed by persist
+/// (`daemon-state-<ws>.json`, legacy `daemon-state.json` read-fallback for
+/// the claude workspace) so two daemons serving different workspaces never
+/// share a session list.
+const STATE_BASE: &str = "daemon-state";
 
 pub type Shared = Arc<Mutex<Manager>>;
 
@@ -210,7 +214,7 @@ impl Manager {
     /// Respawn every saved session with `claude --continue`. Returns how many
     /// came back.
     pub fn restore(&mut self) -> usize {
-        let state = persist::load_named(STATE_FILE);
+        let state = persist::load_for_workspace(STATE_BASE, baude_core::workspace::active());
         let mut restored = 0;
         for saved in &state.sessions {
             if !saved.cwd.exists() {
@@ -260,7 +264,9 @@ impl Manager {
                 })
                 .collect(),
         };
-        if let Err(e) = persist::save_named(STATE_FILE, &state) {
+        if let Err(e) =
+            persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state)
+        {
             eprintln!("save state: {e}");
         }
     }

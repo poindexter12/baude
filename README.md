@@ -258,8 +258,43 @@ the profile's shell.
   `http://bauded:8642`); its sessions appear in the sidebar under a
   `⇄ remote` section. `BAUDE_DAEMON_URL` env var overrides the config file.
 - `backend` — which AI CLI to manage: `claude` (default) or `opencode`.
-  Global per process — every session uses the same backend. `BAUDE_BACKEND`
-  env var overrides the config file. See "opencode backend" below.
+  `BAUDE_BACKEND` env var overrides the config file. See "opencode backend"
+  below.
+- `workspace` / `workspaces` — named, hard-separated session pools, each
+  bound to one backend. See "Workspaces" below.
+
+## Workspaces
+
+A workspace is a named session pool with its own persisted state
+(`state-<name>.json` / `daemon-state-<name>.json`) and a pinned backend, so
+claude and opencode sessions can never mix — not on restore, not through a
+shared daemon. Two implicit workspaces exist with zero config: `claude` and
+`opencode`, each bound to the backend of the same name — so
+`BAUDE_BACKEND=opencode baude` and plain `baude` already keep fully separate
+histories. Custom workspaces are declared in config:
+
+```json
+{
+  "workspace": "oss",
+  "workspaces": {
+    "oss":  { "backend": "opencode", "daemon_port": 8650 },
+    "work": { "backend": "claude", "daemon_url": "http://bauded:8642" }
+  }
+}
+```
+
+`BAUDE_WORKSPACE` selects the workspace (then config `workspace`, then the
+backend name). A workspace's backend binding **wins over `BAUDE_BACKEND`** —
+the env var can't cross-wire a workspace onto the wrong backend (a conflict
+warns and is ignored). The status bar shows the active workspace (`⬢ name`).
+
+Daemons serve exactly one workspace: `bauded` reads `BAUDE_WORKSPACE` at
+startup, namespaces its state, and reports its identity at `GET /info`; the
+TUI refuses to create sessions through a daemon serving a different
+workspace. `auto_daemon` runs one daemon per workspace on its own port
+(claude `8642`, opencode `8643`, custom via `daemon_port`). The `claude`
+workspace reads the legacy un-suffixed state files on first run, so existing
+session lists survive the upgrade.
 
 ## opencode backend
 
