@@ -1,7 +1,7 @@
 [package]
 name = "baude-core"
 description = "Session engine for baude: PTYs, Claude Code metadata, persistence, git worktrees"
-version = "0.12.0"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
