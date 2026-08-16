@@ -154,13 +154,17 @@ impl RemotePoller {
         let local = &baude_core::workspace::active().name;
         match self.daemon_workspace() {
             Some(ws) if ws == *local => {}
-            Some(ws) => return Err(format!(
+            Some(ws) => {
+                return Err(format!(
                 "daemon serves workspace {ws:?}, not {local:?} — refusing cross-workspace session"
-            )),
+            ))
+            }
             None if local == "claude" => {}
-            None => return Err(format!(
+            None => {
+                return Err(format!(
                 "daemon reports no workspace (pre-workspace version) — refusing {local:?} session"
-            )),
+            ))
+            }
         }
         let body = serde_json::json!({ "repo": repo, "worktree": worktree, "name": name });
         ureq::post(&format!("{}/sessions", self.base))
