@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.13.0](https://github.com/poindexter12/baude/compare/v0.12.0...v0.13.0) (2026-08-16)
+
+
+### Features
+
+* macOS desktop notifications when sessions need attention ([900c7d0](https://github.com/poindexter12/baude/commit/900c7d0abe794c3ca78aaa42c3313b71a2e85e45))
+* macOS desktop notifications when sessions need attention ([790d6ce](https://github.com/poindexter12/baude/commit/790d6cedf50dc9208b2df0156b04a8d9934c83cf))
+* workspaces — named session pools hard-bound to a backend ([30f9d53](https://github.com/poindexter12/baude/commit/30f9d5377cff09b4264cca7f64b247d3c9903ad5))
+* workspaces — named session pools hard-bound to a backend ([a028bf2](https://github.com/poindexter12/baude/commit/a028bf2cbae6dad4a86d24cbc52ad5fad8306a18))
+
 ## [0.12.0](https://github.com/poindexter12/baude/compare/v0.11.0...v0.12.0) (2026-08-15)
 
 
