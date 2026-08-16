@@ -18,6 +18,10 @@ impl Backend for ClaudeBackend {
         "claude"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
     fn default_cmd(&self) -> &'static str {
         "claude"
     }

@@ -116,6 +116,11 @@ impl Backend for OpencodeBackend {
         "opencode"
     }
 
+    // opencode brands itself lowercase.
+    fn display_name(&self) -> &'static str {
+        "opencode"
+    }
+
     fn default_cmd(&self) -> &'static str {
         "opencode"
     }

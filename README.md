@@ -291,7 +291,9 @@ histories. Custom workspaces are declared in config:
 `BAUDE_WORKSPACE` selects the workspace (then config `workspace`, then the
 backend name). A workspace's backend binding **wins over `BAUDE_BACKEND`** —
 the env var can't cross-wire a workspace onto the wrong backend (a conflict
-warns and is ignored). The status bar shows the active workspace (`⬢ name`).
+warns and is ignored). The status bar shows the active workspace and its
+platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces,
+`⬢ work · Claude Code` / `⬢ oss · opencode` for named ones.
 
 Daemons serve exactly one workspace: `bauded` reads `BAUDE_WORKSPACE` at
 startup, namespaces its state, and reports its identity at `GET /info`; the
