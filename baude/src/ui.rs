@@ -845,7 +845,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // opencode baude run side by side.
     let (waiting, busy, completed) = app.status_counts();
     let mut right: Vec<String> = Vec::new();
-    right.push(format!("⬢ {}", baude_core::workspace::active().name));
+    right.push(format!(
+        "⬢ {}",
+        baude_core::workspace::active().display_label()
+    ));
     if waiting > 0 {
         right.push(format!("● {waiting} waiting"));
     }

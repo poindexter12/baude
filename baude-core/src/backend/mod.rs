@@ -54,8 +54,13 @@ pub struct SpawnPlan {
 }
 
 pub trait Backend: Send + Sync {
-    /// Stable identifier for display and config selection.
+    /// Stable identifier for config/env selection and wire payloads
+    /// (`/info`, state files). Never rename — it is contract.
     fn name(&self) -> &'static str;
+
+    /// Human-facing product name for UI surfaces ("Claude Code",
+    /// "opencode"). Display-only — never matched against.
+    fn display_name(&self) -> &'static str;
 
     /// The command run per session when neither the `BAUDE_CLAUDE_CMD` env var
     /// nor config.json `claude_cmd` overrides it.

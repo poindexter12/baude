@@ -62,6 +62,19 @@ impl Workspace {
         (self.name == DEFAULT).then(|| format!("{base}.json"))
     }
 
+    /// Human-facing label: the platform's product name, prefixed by the
+    /// workspace name when it adds information. An implicit workspace named
+    /// after its backend reads as just the platform ("Claude Code" /
+    /// "opencode"); a custom one reads as "oss · opencode" so both the pool
+    /// and the platform it operates on are visible at a glance.
+    pub fn display_label(&self) -> String {
+        if self.name == self.backend.name() {
+            self.backend.display_name().to_string()
+        } else {
+            format!("{} · {}", self.name, self.backend.display_name())
+        }
+    }
+
     /// The loopback port `auto_daemon` uses for this workspace. Implicit
     /// workspaces get stable defaults (claude keeps the historical 8642);
     /// custom workspaces must set `daemon_port` in config — `None` here means
@@ -259,6 +272,35 @@ mod tests {
         let ws = resolve(Some("../evil name"), None, &Config::default(), no_warn);
         assert_eq!(ws.name, "---evil-name");
         assert_eq!(ws.state_file("state"), "state----evil-name.json");
+    }
+
+    #[test]
+    fn display_label_shows_platform_and_custom_name() {
+        // Implicit workspaces read as just the platform product name —
+        // "claude" the id renders as "Claude Code" the product.
+        let ws = resolve(None, None, &Config::default(), no_warn);
+        assert_eq!(ws.display_label(), "Claude Code");
+        let ws = resolve(None, Some("opencode"), &Config::default(), no_warn);
+        assert_eq!(ws.display_label(), "opencode");
+        // Custom names show pool AND platform.
+        let oss_cfg = cfg(&[(
+            "oss",
+            WorkspaceConfig {
+                backend: Some("opencode".into()),
+                ..Default::default()
+            },
+        )]);
+        let ws = resolve(Some("oss"), None, &oss_cfg, no_warn);
+        assert_eq!(ws.display_label(), "oss · opencode");
+        let work_cfg = cfg(&[(
+            "work",
+            WorkspaceConfig {
+                backend: Some("claude".into()),
+                ..Default::default()
+            },
+        )]);
+        let ws = resolve(Some("work"), None, &work_cfg, no_warn);
+        assert_eq!(ws.display_label(), "work · Claude Code");
     }
 
     #[test]
