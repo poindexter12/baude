@@ -96,10 +96,16 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
       - name: package
+        # Both binaries: the TUI and the daemon. bauded historically shipped
+        # only via the ghcr image, so mise/tarball installs couldn't satisfy
+        # auto_daemon's next-to-the-binary/PATH lookup — with per-workspace
+        # auto-daemons that lookup is the normal path, so the daemon rides
+        # along. `cargo build --release` above already builds the whole
+        # workspace, bauded included.
         run: |
           mkdir -p dist
           tar -C "target/${{ matrix.target }}/release" -czf \
-            "dist/baude-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" baude
+            "dist/baude-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" baude bauded
       - uses: actions/upload-artifact@v7
         with:
           name: baude-${{ matrix.target }}
