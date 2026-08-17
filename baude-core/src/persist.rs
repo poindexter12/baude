@@ -37,9 +37,16 @@ fn state_path(file: &str) -> PathBuf {
 /// User configuration, ~/.config/baude/config.json. All fields optional.
 #[derive(Deserialize, Default)]
 pub struct Config {
-    /// Command run for each session; BAUDE_CLAUDE_CMD overrides this.
+    /// Command run for each CLAUDE-backend session; BAUDE_CLAUDE_CMD
+    /// overrides this. Applies ONLY when the active backend is claude — an
+    /// opencode workspace ignores it (a configured `claude
+    /// --dangerously-skip-permissions` must never become the opencode spawn
+    /// command; claude rejects opencode's flags with "unknown option").
     /// Example: "claude --dangerously-skip-permissions"
     pub claude_cmd: Option<String>,
+    /// Command run for each OPENCODE-backend session; BAUDE_OPENCODE_CMD
+    /// overrides this. The opencode sibling of `claude_cmd`.
+    pub opencode_cmd: Option<String>,
     /// Prefill for the new-session path prompt, e.g. "~/Code/github.com".
     /// Defaults to the directory baude was launched from.
     pub new_session_dir: Option<String>,

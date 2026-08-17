@@ -192,11 +192,12 @@ pub fn default_auto_archive_ms() -> u64 {
 
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
 /// `claude_cmd`, then plain `claude`.
+/// The per-session base command, resolved PER BACKEND (claude:
+/// BAUDE_CLAUDE_CMD/`claude_cmd`; opencode: BAUDE_OPENCODE_CMD/
+/// `opencode_cmd`; then the backend default) — a configured claude_cmd must
+/// never become an opencode spawn command.
 pub fn default_claude_cmd() -> String {
-    std::env::var("BAUDE_CLAUDE_CMD")
-        .ok()
-        .or_else(|| persist::load_config().claude_cmd)
-        .unwrap_or_else(|| backend::active().default_cmd().to_string())
+    backend::command_for(backend::active(), &persist::load_config())
 }
 
 impl Manager {

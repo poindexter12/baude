@@ -345,13 +345,12 @@ impl App {
         (waiting, busy, completed)
     }
 
-    /// The command run for each session: BAUDE_CLAUDE_CMD env, then
-    /// config.json `claude_cmd`, then plain `claude`.
+    /// The command run for each session, resolved PER BACKEND (claude:
+    /// BAUDE_CLAUDE_CMD/`claude_cmd`; opencode: BAUDE_OPENCODE_CMD/
+    /// `opencode_cmd`; then the backend default) — a configured claude_cmd
+    /// must never become an opencode spawn command.
     fn claude_cmd(&self) -> String {
-        std::env::var("BAUDE_CLAUDE_CMD")
-            .ok()
-            .or_else(|| self.config.claude_cmd.clone())
-            .unwrap_or_else(|| backend::active().default_cmd().to_string())
+        backend::command_for(backend::active(), &self.config)
     }
 
     /// The editor launched by the sidebar `e` key: BAUDE_EDITOR_CMD env,
