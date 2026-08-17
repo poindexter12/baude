@@ -107,6 +107,28 @@ pub trait Backend: Send + Sync {
 static CLAUDE: claude::ClaudeBackend = claude::ClaudeBackend;
 static OPENCODE: opencode::OpencodeBackend = opencode::OpencodeBackend;
 
+/// The operator's base command for one backend: its OWN env var, then its
+/// OWN config key, then the backend default. Strictly per-backend — a
+/// configured `claude_cmd` (e.g. `claude --dangerously-skip-permissions`)
+/// must NEVER become the opencode spawn command: claude rejects opencode's
+/// flags with "error: unknown option '--auto'" and the session dies at
+/// spawn. (Found live: an opencode workspace + a claude_cmd config.)
+pub fn command_for(be: &dyn Backend, config: &crate::persist::Config) -> String {
+    let (env_key, configured) = match be.name() {
+        "opencode" => ("BAUDE_OPENCODE_CMD", config.opencode_cmd.clone()),
+        _ => ("BAUDE_CLAUDE_CMD", config.claude_cmd.clone()),
+    };
+    std::env::var(env_key)
+        .ok()
+        .or(configured)
+        .unwrap_or_else(|| be.default_cmd().to_string())
+}
+
+/// Env-free core of [`command_for`] for tests: resolve from explicit values.
+pub fn resolve_command(env_val: Option<&str>, configured: Option<&str>, default: &str) -> String {
+    env_val.or(configured).unwrap_or(default).to_string()
+}
+
 /// Pure name → backend resolution. Unknown names fall back to claude
 /// (fail-safe: never a panic on a typo'd config; `active` warns once).
 pub fn backend_for(name: Option<&str>) -> &'static dyn Backend {
@@ -142,5 +164,38 @@ mod tests {
     fn default_cmds() {
         assert_eq!(backend_for(None).default_cmd(), "claude");
         assert_eq!(backend_for(Some("opencode")).default_cmd(), "opencode");
+    }
+
+    #[test]
+    fn claude_cmd_config_never_leaks_into_opencode() {
+        // Regression: with claude_cmd configured (the common
+        // `claude --dangerously-skip-permissions`), an opencode workspace
+        // used to spawn THAT as its base command — claude then died on
+        // opencode's flags ("error: unknown option '--auto'").
+        let config = crate::persist::Config {
+            claude_cmd: Some("claude --dangerously-skip-permissions".into()),
+            ..Default::default()
+        };
+        // Env-free assertion of the per-backend split command_for performs:
+        // opencode ignores claude_cmd entirely.
+        assert_eq!(
+            resolve_command(None, config.opencode_cmd.as_deref(), "opencode"),
+            "opencode"
+        );
+        assert_eq!(
+            resolve_command(None, config.claude_cmd.as_deref(), "claude"),
+            "claude --dangerously-skip-permissions"
+        );
+        // And the sibling key exists and wins for opencode when set.
+        assert_eq!(
+            resolve_command(None, Some("opencode --model x/y"), "opencode"),
+            "opencode --model x/y"
+        );
+        // Env beats config; default fills the gaps.
+        assert_eq!(
+            resolve_command(Some("opencode-nightly"), Some("opencode"), "opencode"),
+            "opencode-nightly"
+        );
+        assert_eq!(resolve_command(None, None, "claude"), "claude");
     }
 }

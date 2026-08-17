@@ -241,8 +241,11 @@ the profile's shell.
 }
 ```
 
-- `claude_cmd` — command to run per session, default `claude`.
-  `BAUDE_CLAUDE_CMD` env var overrides the config file.
+- `claude_cmd` — command to run per claude-backend session, default
+  `claude`. `BAUDE_CLAUDE_CMD` env var overrides the config file. Ignored
+  by other backends.
+- `opencode_cmd` — command to run per opencode-backend session, default
+  `opencode`. `BAUDE_OPENCODE_CMD` env var overrides the config file.
 - `new_session_dir` — prefill for the `n` new-session prompt (tab-complete
   from there); defaults to the directory baude was launched from.
 - `clone_base_dir` — base for the `c` clone prompt's default destination,
@@ -309,8 +312,9 @@ Setting `backend` to `opencode` (or `BAUDE_BACKEND=opencode`) runs
 [opencode](https://opencode.ai) sessions instead of Claude Code. Each session
 pins its opencode server to a local port, and baude reads status, model,
 title, tokens, and cost over that server's HTTP API — no hooks or statusline
-wiring needed. `claude_cmd`/`BAUDE_CLAUDE_CMD` still name the command
-(default `opencode`).
+wiring needed. The command is named by `opencode_cmd`/`BAUDE_OPENCODE_CMD`
+(default `opencode`); `claude_cmd` applies only to the claude backend and is
+ignored here.
 
 Permission modes map as follows: the default `skip` spawns with `--auto`
 (auto-approve anything not explicitly denied — the
