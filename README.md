@@ -1,17 +1,20 @@
 # baude
 
-A TUI for running multiple Claude Code sessions in one terminal.
+A TUI for running multiple AI coding sessions in one terminal — Claude Code
+by default, [opencode](https://opencode.ai) as an alternative backend, each
+in its own hard-separated [workspace](#workspaces).
 
-Start it from any git repo and it spawns a `claude` session there. Add more
-repos, or spin up isolated git-worktree sessions for parallel work in the same
-repo. A shell pane at the session's folder is one keystroke away. The sidebar
-sorts sessions alphabetically by name — when one is **waiting for your input**
-it flashes in place (with a wait timer) instead of jumping around, so the list
+Start it from any git repo and it spawns a session there. Add more repos, or
+spin up isolated git-worktree sessions for parallel work in the same repo. A
+shell pane at the session's folder is one keystroke away. The sidebar sorts
+sessions alphabetically by name — when one is **waiting for your input** it
+flashes in place (with a wait timer) instead of jumping around, so the list
 stays where your eye expects it while still telling you who needs you next.
+On macOS, a [desktop banner](#configuration) also names the session that
+blocked.
 
-Each session also surfaces live Claude Code metadata — model, context usage,
-permission mode, token counts, and GSD project state — read from the artifacts
-Claude writes to disk.
+Each session surfaces live metadata — model, token counts, cost, GSD project
+state, and (Claude Code) context usage and permission mode.
 
 ```
 ╭ baude ──────────────────╮╭ api · waiting · bypass ───────────────╮
@@ -26,10 +29,12 @@ Claude writes to disk.
 
 ## Install
 
-Via [mise](https://mise.jdx.dev) (pulls the prebuilt binary from GitHub releases):
+Via [mise](https://mise.jdx.dev) (pulls the prebuilt binaries from GitHub
+releases; since v0.14.0 the tarball ships both `baude` and `bauded`, so
+`auto_daemon` works out of the box):
 
 ```sh
-mise use -g ubi:poindexter12/baude
+mise use -g github:poindexter12/baude
 ```
 
 Or from source:
@@ -45,11 +50,16 @@ cd ~/code/some-repo
 baude            # or: baude /path/to/repo
 ```
 
-Sessions, worktrees, and shell-pane state persist across restarts
-(`~/.config/baude/state.json`). On relaunch each session resumes its most
-recent conversation via `claude --continue`.
+Sessions, worktrees, and shell-pane state persist across restarts, per
+workspace (`~/.config/baude/state-<workspace>.json`). On relaunch each
+session resumes its most recent conversation via the backend's resume form
+(`claude --continue` / `opencode --continue`).
 
 ## How it works
+
+This section describes the default **Claude Code** backend; the
+[opencode backend](#opencode-backend) inverts the model — opencode runs an
+HTTP server per session and baude polls that instead of reading files.
 
 baude never asks Claude Code for anything — it **reads what Claude writes to
 disk**. Every session is a real `claude` process in a PTY that baude owns.
@@ -124,10 +134,12 @@ shell pane's readline (end-of-line, next-history, `ctrl+x` prefix) or Claude.
 - `◐` working — animated spinner
 - `✗` exited (`r` to restart)
 
-Waiting is detected from PTY output silence: Claude streams spinner output
-continuously while working, so ~2s of quiet means it's your turn. When Claude's
-own session file or hook events are present they take precedence over this
-heuristic (`exited > hook event > session file > output silence`).
+Waiting is detected from PTY output silence: the CLI streams spinner output
+continuously while working, so ~2s of quiet means it's your turn. Better
+sources take precedence when present
+(`exited > hook event > session file > output silence`): Claude Code's own
+session file and lifecycle hooks, or — for opencode — the session server's
+live status endpoint (reported at the session-file tier).
 
 ```mermaid
 stateDiagram-v2
@@ -329,6 +341,28 @@ Known gaps vs the Claude backend: no context-% gauge, no account rate-limit
 windows, and the PWA chat/activity views stay empty (they read Claude's
 transcript and hook streams).
 
+## Permission modes
+
+`BAUDE_PERMISSION_MODE` picks how sessions handle tool permissions, per
+deploy:
+
+- **`skip` (the default)** — sessions never block on a permission: claude
+  spawns with `--dangerously-skip-permissions`, opencode with `--auto`. The
+  unattended mode; a flag already baked into your `*_cmd` isn't doubled.
+- **`prompt` (opt-in, exact string)** — tool calls wait for a human
+  decision. Under the daemon, pending permissions surface on the PWA as an
+  approve/deny card plus a distinct push — approve from your phone. For
+  claude this rides a `--permission-prompt-tool` MCP bridge and **requires
+  the daemon** (a bare-TUI prompt-mode claude session denies everything,
+  and baude warns loudly); opencode prompts in its own TUI locally, with
+  the daemon adding remote approval on top. Deny is always the failure
+  mode: timeouts (default 120s, `BAUDE_PERMISSION_TIMEOUT_S`) and missing
+  daemons deny, never allow.
+
+Any other value falls back to `skip`. In `prompt` mode a conflicting
+skip-style flag in `claude_cmd`/`opencode_cmd` is stripped (with a warning)
+so the prompt can actually fire.
+
 ## Remote sessions in the TUI
 
 With `daemon_url` set, the daemon's sessions list in the sidebar below your
@@ -341,12 +375,14 @@ panes, worktrees, and the editor key stay local-only.
 
 ## bauded (experimental)
 
-A headless daemon (`cargo run -p bauded`) that owns sessions the same way the
-TUI does but exposes them over REST + SSE, so thin clients can triage and
-chat remotely. Sessions keep running when clients disconnect; daemon restarts
-restore them via `claude --continue`. Binds `127.0.0.1:8642` by default
-(`--bind` / `BAUDED_BIND`); security model is "bind the VPN interface" — no
-auth layer. See `docs/remote-daemon-plan.md`.
+A headless daemon (shipped in the release tarball, or `cargo run -p bauded`)
+that owns sessions the same way the TUI does but exposes them over REST +
+SSE, so thin clients can triage and chat remotely. Sessions keep running
+when clients disconnect; daemon restarts restore them via the backend's
+resume form. Each daemon serves exactly one [workspace](#workspaces)
+(`BAUDE_WORKSPACE`, reported at `GET /info`). Binds `127.0.0.1:8642` by
+default (`--bind` / `BAUDED_BIND`); security model is "bind the VPN
+interface" — no auth layer. See `docs/remote-daemon-plan.md`.
 
 The daemon serves a phone-first PWA at `/`: a triage list of sessions (who's
 waiting and for how long, model, context %, cost, branch), a chat view with
@@ -363,6 +399,7 @@ external assets.
 
 | Endpoint | What |
 |----------|------|
+| `GET /info` | daemon identity: workspace, backend, version |
 | `GET /sessions` | session list: status, waiting-for, model, context %, branch, cost |
 | `POST /sessions` | `{repo, worktree?, name?}` — spawn (worktree = branch name) |
 | `DELETE /sessions/{id}` | kill and remove |
@@ -376,6 +413,7 @@ external assets.
 | `POST /sessions/{id}/keys` | `{keys}` — named keys or literal text into the PTY |
 | `GET /sessions/{id}/pty` | websocket: raw terminal attach (snapshot, then live bytes) |
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
+| `GET/POST /sessions/{id}/permission` | prompt mode: pending tool-permission request / `{decision}` allow·deny |
 | `GET /push/key` · `POST/DELETE /push/subscribe` | Web Push: VAPID key + subscriptions |
 
 ### Deploy (compose + Tailscale)
@@ -401,3 +439,7 @@ Sessions run as `claude --dangerously-skip-permissions` (set per-deploy via
 `BAUDE_CLAUDE_CMD`) so permission prompts never block unattended work. For
 unattended git pushes, uncomment the ssh volume in `compose.yaml` and put an
 automation key + config in `./ssh/`.
+
+Note: the container image installs only the claude CLI, so a containerized
+bauded serves claude workspaces only — opencode workspaces need a host-run
+bauded (or an image with opencode added) for now.
