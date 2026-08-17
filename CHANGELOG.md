@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.14.0](https://github.com/poindexter12/baude/compare/v0.13.0...v0.14.0) (2026-08-17)
+
+
+### Features
+
+* workspace display labels — named pools show their platform, claude reads as Claude Code ([fde1743](https://github.com/poindexter12/baude/commit/fde1743c0b27360c1056a25cb88e4867acdf8d58))
+* workspace display labels — named pools show their platform, claude reads as Claude Code ([256ef7a](https://github.com/poindexter12/baude/commit/256ef7a377a3c89ec8d838d167e81d2a8570ee17))
+
+
+### Bug Fixes
+
+* resolve the session base command per backend — claude_cmd no longer poisons opencode spawns ([3826ba1](https://github.com/poindexter12/baude/commit/3826ba199c945fdccacebd530f916bfe178ce68c))
+* resolve the session base command per backend — claude_cmd no longer poisons opencode spawns ([cd0ea87](https://github.com/poindexter12/baude/commit/cd0ea87b6c5e80fd1c1f787de9a257f038e49056))
+* ship bauded in the release tarballs alongside baude ([5aed6f2](https://github.com/poindexter12/baude/commit/5aed6f2baf9816c631965644be03af53428399f1))
+* ship bauded in the release tarballs alongside baude ([99b8b30](https://github.com/poindexter12/baude/commit/99b8b30005f7e5c4ded54364229e8744352dc321))
+
 ## [0.13.0](https://github.com/poindexter12/baude/compare/v0.12.0...v0.13.0) (2026-08-16)
 
 
