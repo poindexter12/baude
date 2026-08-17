@@ -1,4 +1,4 @@
-//! bauded — headless baude session daemon. Owns Claude Code sessions in PTYs
+//! bauded — headless baude session daemon. Owns AI coding sessions in PTYs
 //! (via baude-core) and exposes them over REST + SSE so thin clients (the
 //! phone PWA, eventually the TUI) can triage and chat from anywhere on the
 //! tailnet. See docs/remote-daemon-plan.md.
@@ -137,8 +137,12 @@ async fn main() -> Result<()> {
                  options:\n  \
                  --bind <addr>   listen address (default {DEFAULT_BIND}; env BAUDED_BIND)\n\n\
                  env:\n  \
-                 BAUDE_CLAUDE_CMD   command run per session (default \"claude\")\n  \
-                 BAUDED_BIND        listen address\n\n\
+                 BAUDE_WORKSPACE         workspace this daemon serves (default \"claude\")\n  \
+                 BAUDE_BACKEND           backend when the workspace has no binding (claude|opencode)\n  \
+                 BAUDE_CLAUDE_CMD        claude-backend session command (default \"claude\")\n  \
+                 BAUDE_OPENCODE_CMD      opencode-backend session command (default \"opencode\")\n  \
+                 BAUDE_PERMISSION_MODE   skip (default) | prompt — see README \"Permission modes\"\n  \
+                 BAUDED_BIND             listen address\n\n\
                  Serves the phone PWA at / and the REST+SSE API under /sessions.",
                 env!("CARGO_PKG_VERSION")
             );

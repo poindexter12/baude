@@ -1,5 +1,6 @@
-//! Core session engine for baude: PTY management, Claude Code session
-//! metadata, state persistence, and git worktree helpers. No UI dependencies —
+//! Core session engine for baude: PTY management, the backend seam
+//! (Claude Code, opencode) with per-session metadata, workspaces, state
+//! persistence, and git worktree helpers. No UI dependencies —
 //! shared by the `baude` TUI and the `bauded` daemon.
 
 pub use vt100;

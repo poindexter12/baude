@@ -259,7 +259,7 @@ fn main() -> Result<()> {
         }
         Some("--help" | "-h") => {
             println!(
-                "baude {} — multiple Claude Code sessions in one terminal\n\n\
+                "baude {} — multiple AI coding sessions in one terminal\n\n\
                  usage: baude [<repo-dir>]\n\n\
                  subcommands: statusline, hook, permission-mcp\n\
                  options:     --version/-V, --help/-h",
