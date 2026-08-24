@@ -1366,7 +1366,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  ctrl+\\      toggle shell pane (focuses it)"),
                 Line::raw("  ctrl+e      open folder in editor"),
                 Line::raw("  ctrl+n      new session"),
-                Line::raw("  ctrl+x      close session"),
+                Line::raw("  ctrl+q, x   close session"),
                 Line::raw("  alt+←/→     cycle prev/next session"),
                 Line::raw(""),
                 Line::from(Span::styled(

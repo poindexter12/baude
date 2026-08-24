@@ -858,12 +858,6 @@ impl App {
             self.open_new_session_modal();
             return;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('x')) {
-            self.focus = Focus::Sidebar;
-            self.confirm_close_selected();
-            return;
-        }
-
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
             Focus::Claude => self.forward_key(key, false),
