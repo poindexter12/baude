@@ -258,7 +258,9 @@ impl Manager {
             baude_core::workspace::active(),
             reconcile_legacy_session,
         );
-        self.restore_loaded(loaded)
+        let restored = self.restore_loaded(loaded);
+        self.save();
+        restored
     }
 
     #[cfg(test)]
@@ -272,7 +274,9 @@ impl Manager {
             workspace,
             reconcile_legacy_session,
         );
-        self.restore_loaded(loaded)
+        let restored = self.restore_loaded(loaded);
+        self.save_at(root, workspace);
+        restored
     }
 
     fn restore_loaded(
@@ -299,24 +303,14 @@ impl Manager {
             .collect();
         let mut restored = 0;
         for checkout in checkouts {
-            if self.runtime_checkouts.contains_key(&checkout.key)
-                || !matches!(checkout.health, CheckoutHealth::Available)
-            {
+            if self.runtime_checkouts.contains_key(&checkout.key) {
+                continue;
+            }
+            if !self.reconcile_checkout(checkout.key) {
                 continue;
             }
             let saved = checkout.session;
             let cwd = saved.cwd.to_path_buf();
-            if !cwd.exists() {
-                if let Some(record) = self
-                    .repository_state
-                    .checkouts
-                    .iter_mut()
-                    .find(|record| record.key == checkout.key)
-                {
-                    record.health = CheckoutHealth::Unavailable(UnavailableCause::Missing);
-                }
-                continue;
-            }
             match self.spawn(
                 cwd,
                 saved.repo_root.to_path_buf(),
@@ -339,6 +333,57 @@ impl Manager {
             }
         }
         restored
+    }
+
+    fn reconcile_checkout(&mut self, checkout_key: CheckoutKey) -> bool {
+        let Some(checkout_index) = self
+            .repository_state
+            .checkouts
+            .iter()
+            .position(|checkout| checkout.key == checkout_key)
+        else {
+            return false;
+        };
+        let repository_key = self.repository_state.checkouts[checkout_index].repository_key;
+        let Some(repository_index) = self
+            .repository_state
+            .repositories
+            .iter()
+            .position(|repository| repository.key == repository_key)
+        else {
+            return false;
+        };
+        let checkout = &self.repository_state.checkouts[checkout_index];
+        let expected_path = checkout.observed_path.to_path_buf();
+        let expected_branch = checkout.observed_branch.clone();
+        let expected_common = self.repository_state.repositories[repository_index]
+            .observed_common_dir
+            .to_path_buf();
+
+        match git::reconcile_checkout(
+            &expected_common,
+            &expected_path,
+            expected_branch.as_deref(),
+        ) {
+            Ok(_) => {
+                self.repository_state.checkouts[checkout_index].health = CheckoutHealth::Available;
+                self.repository_state.repositories[repository_index].health =
+                    RepositoryHealth::Available;
+                true
+            }
+            Err(error) => {
+                let cause = if matches!(error, git::ReconciliationUnavailable::Missing { .. }) {
+                    UnavailableCause::Missing
+                } else {
+                    UnavailableCause::Other(error.to_string())
+                };
+                self.repository_state.checkouts[checkout_index].health =
+                    CheckoutHealth::Unavailable(cause.clone());
+                self.repository_state.repositories[repository_index].health =
+                    RepositoryHealth::Unavailable(cause);
+                false
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -1123,10 +1168,105 @@ fn session_info(s: &Session) -> SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     fn mgr() -> Manager {
         Manager::new("sleep 30".into(), false)
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn manager_restore_reconciles_current_git_before_spawn_and_persists_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-manager-reconcile-{}",
+            std::process::id()
+        ));
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let snapshot = git::discover_repository(&repo).unwrap();
+
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key();
+        let checkout_key = state.allocate_checkout_key();
+        let repository_order = state.allocate_first_seen_order();
+        let checkout_order = state.allocate_first_seen_order();
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        state.checkouts.push(SavedCheckout {
+            key: checkout_key,
+            repository_key,
+            role: CheckoutRole::ManagedBranch,
+            managed_by_baude: false,
+            observed_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+            observed_branch: snapshot.selected_worktree.branch.clone(),
+            first_seen_order: checkout_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name: "changed checkout".into(),
+                cwd: PersistedPath::from_path(&snapshot.selected_worktree.path),
+                repo_root: PersistedPath::from_path(&snapshot.main_worktree),
+                branch: Some("main".into()),
+                is_worktree: false,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+            },
+            health: CheckoutHealth::Available,
+        });
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        persist::save_current_at(
+            &state_root,
+            &workspace.state_file(STATE_BASE),
+            &StateFile::new(state),
+        )
+        .unwrap();
+        git(&repo, &["checkout", "-b", "changed"]);
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&state_root, &workspace), 0);
+        assert!(manager.sessions.is_empty());
+        assert!(matches!(
+            manager.repository_state.checkouts[0].health,
+            CheckoutHealth::Unavailable(_)
+        ));
+        let persisted = persist::load_current_at(
+            &state_root,
+            &workspace.state_file(STATE_BASE),
+        )
+        .unwrap();
+        assert!(matches!(
+            persisted.state.checkouts[0].health,
+            CheckoutHealth::Unavailable(_)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
