@@ -1281,6 +1281,17 @@ impl Manager {
                     .and_then(|checkout| checkout.session.resume_id.clone())
             }),
         };
+        if let Err(error) = self.session_mut(id)?.kill_and_wait() {
+            lifecycle::mark_teardown_pending(&mut self.repository_state, checkout_key, &error)
+                .map_err(anyhow::Error::new)?;
+            if let Err(save_error) = self.save_checked() {
+                return Err(anyhow!(
+                    "{error}; could not persist pending teardown recovery: {save_error}"
+                )
+                .into());
+            }
+            return Err(anyhow::Error::new(error).into());
+        }
         let state_before = self.repository_state.clone();
         lifecycle::plan_close(
             &mut self.repository_state,
@@ -1298,7 +1309,6 @@ impl Manager {
             Err(error) => Some(error),
             Ok(()) => None,
         };
-        self.session_mut(id)?.kill_and_wait()?;
         self.sessions.retain(|s| s.id != id);
         self.runtime_checkouts.remove(&checkout_key);
         // Wake any lingering permission waiter (it will re-check, find the

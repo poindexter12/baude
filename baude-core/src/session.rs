@@ -329,7 +329,7 @@ impl Session {
     /// Stop and reap every process owned by this session. The agent is waited
     /// first so callers never begin destructive worktree inspection while it
     /// may still be writing into the checkout.
-    pub fn kill_and_wait(&mut self) -> Result<()> {
+    pub fn kill_and_wait(&mut self) -> std::result::Result<(), SessionTeardownError> {
         // Attempt each owned process independently. A partially successful
         // stop remains retryable because Pty::kill_and_wait is idempotent.
         let claude = self.claude.kill_and_wait().err();
@@ -340,6 +340,8 @@ impl Session {
         match (claude, shell) {
             (None, None) => Ok(()),
             (claude, shell) => {
+                let agent_stopped = claude.is_none();
+                let shell_stopped = shell.is_none();
                 let mut failures = Vec::new();
                 if let Some(error) = claude {
                     failures.push(format!("agent: {error}"));
@@ -347,14 +349,38 @@ impl Session {
                 if let Some(error) = shell {
                     failures.push(format!("shell: {error}"));
                 }
-                Err(anyhow::anyhow!(
-                    "session process teardown incomplete ({})",
-                    failures.join("; ")
-                ))
+                Err(SessionTeardownError {
+                    agent_pid: self.claude.pid(),
+                    shell_pid: self.shell.as_ref().and_then(Pty::pid),
+                    agent_stopped,
+                    shell_stopped,
+                    detail: failures.join("; "),
+                })
             }
         }
     }
 }
+
+#[derive(Debug)]
+pub struct SessionTeardownError {
+    pub agent_pid: Option<u32>,
+    pub shell_pid: Option<u32>,
+    pub agent_stopped: bool,
+    pub shell_stopped: bool,
+    pub detail: String,
+}
+
+impl std::fmt::Display for SessionTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session process teardown incomplete (agent stopped: {}, shell stopped: {}; {})",
+            self.agent_stopped, self.shell_stopped, self.detail
+        )
+    }
+}
+
+impl std::error::Error for SessionTeardownError {}
 
 pub fn human_duration(ms: u64) -> String {
     let secs = ms / 1000;

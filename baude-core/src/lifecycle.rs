@@ -281,6 +281,7 @@ pub fn plan_close(
         .ok_or(LifecycleError::CheckoutMissing(request.checkout))?;
     checkout.session = request.runtime;
     checkout.active_intent = false;
+    checkout.health = CheckoutHealth::Available;
     next.validate()?;
     *state = next;
     Ok(ClosePlan {
@@ -294,6 +295,28 @@ pub fn plan_close(
             checkout: request.checkout,
         },
     })
+}
+
+pub fn mark_teardown_pending(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+    error: &crate::session::SessionTeardownError,
+) -> Result<(), LifecycleError> {
+    let checkout = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    checkout.active_intent = true;
+    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+        agent_pid: error.agent_pid,
+        shell_pid: error.shell_pid,
+        agent_stopped: error.agent_stopped,
+        shell_stopped: error.shell_stopped,
+        detail: error.detail.clone(),
+    });
+    state.validate()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

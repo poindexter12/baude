@@ -55,6 +55,15 @@ pub enum UnavailableCause {
     /// Destructive authority was durably revoked before or during a removal
     /// attempt. Ordinary reconciliation must never adopt a replacement path.
     RemovalTombstone(String),
+    /// A close stopped only part of the runtime. Active intent is retained so
+    /// the owning process can retry without presenting the checkout as closed.
+    TeardownPending {
+        agent_pid: Option<u32>,
+        shell_pid: Option<u32>,
+        agent_stopped: bool,
+        shell_stopped: bool,
+        detail: String,
+    },
     Io(String),
     Other(String),
 }

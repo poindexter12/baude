@@ -1529,6 +1529,21 @@ impl App {
         let checkout_key = checkout_for_runtime(&self.runtime_checkouts, id)
             .ok_or_else(|| anyhow::anyhow!("runtime {id} has no retained checkout"))?;
         let snapshot = self.retained_runtime_snapshot(id)?;
+        if let Err(error) = self
+            .session_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?
+            .kill_and_wait()
+        {
+            lifecycle::mark_teardown_pending(&mut self.repository_state, checkout_key, &error)?;
+            if let Err(save_error) = self.save_durable_status() {
+                self.persistence_dirty = true;
+                return Err(anyhow::anyhow!(
+                    "{error}; could not persist pending teardown recovery: {save_error}"
+                ));
+            }
+            self.persistence_dirty = false;
+            return Err(anyhow::Error::new(error));
+        }
         let before = self.repository_state.clone();
         let plan = lifecycle::plan_close(
             &mut self.repository_state,
@@ -1540,7 +1555,12 @@ impl App {
         match self.save_durable_status() {
             Ok(()) => {
                 self.persistence_dirty = false;
-                self.stop_closed_runtime(checkout_key, id)?;
+                self.runtime_checkouts.remove(&checkout_key);
+                self.sessions.retain(|session| session.id != id);
+                if self.selected_id == Some(SelId::Local(id)) {
+                    self.selected_id = self.ordered_ids().first().copied();
+                }
+                self.focus = Focus::Sidebar;
                 Ok(plan.outcome)
             }
             Err(error) if !error.replacement_committed() => {
@@ -1550,7 +1570,6 @@ impl App {
             }
             Err(error) => {
                 self.persistence_dirty = true;
-                self.stop_closed_runtime(checkout_key, id)?;
                 Err(anyhow::anyhow!(
                     "inactive state committed but directory durability failed: {error}"
                 ))
