@@ -5,16 +5,16 @@ milestone_name: Repository Worktree Management (Planned)
 current_phase: 6
 current_phase_name: safe managed worktree lifecycle
 status: executing
-stopped_at: Completed 06-01-PLAN.md
-last_updated: "2026-08-30T20:30:45.239Z"
+stopped_at: Completed 06-02-PLAN.md
+last_updated: "2026-08-30T20:45:56.072Z"
 last_activity: 2026-08-30
-state_head: 475f14911c5f0d4b443dcba064586a55f23ebb3a
+state_head: 39ec427dca574d90d4e22c8fb8dcd12f6de5dc22
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 9
-  completed_plans: 4
-  percent: 44
+  completed_plans: 5
+  percent: 56
 ---
 
 # Project State
@@ -29,25 +29,25 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 6 of 9 (safe managed worktree lifecycle)
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-08-30
 
-Progress: [██░░░░░░░░] 17%
+Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- v2.0 plans completed: 4
+- v2.0 plans completed: 5
 - Prior milestone: 14 plans completed across 4 phases
 - Average duration: 13 min
-- Total execution time: 51 min
+- Total execution time: 63 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
-| 6. Safe Managed Worktree Lifecycle | 1/6 | 13 min | 13 min |
+| 6. Safe Managed Worktree Lifecycle | 2/6 | 25 min | 13 min |
 | 7. Local Repository Hierarchy & Branch Control | 0/TBD | - | - |
 | 8. Daemon & Remote TUI Parity | 0/TBD | - | - |
 | 9. PWA Hierarchy & Cross-Surface Completion | 0/TBD | - | - |
@@ -59,6 +59,7 @@ Progress: [██░░░░░░░░] 17%
 | Phase 05 P02 | 14min | 3 tasks | 3 files |
 | Phase 5 P3 | 14min | 3 tasks | 4 files |
 | Phase 06 P01 | 13min | 2 tasks | 5 files |
+| Phase 06 P02 | 12min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 6]: Branch text is accepted only after literal Git validation, exact local-ref classification, and fresh inventory checks.
 - [Phase 6]: Repository lifecycle mutations reserve by durable RepositoryKey and release through RAII guards.
 - [Phase 6]: App and Manager persist shared activation transitions before associating runtimes by CheckoutKey.
+- [Phase 6]: Managed branch labels are bounded display components only; durable repository and checkout keys supply filesystem identity.
+- [Phase 6]: Pre-replacement creation failures compensate only newly added managed worktrees through verified plain Git removal while retaining the branch.
+- [Phase 6]: Committed-save and spawn failures retain one durable active child for retry without a runtime association.
 
 ### Pending Todos
 
@@ -109,6 +113,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T20:30:38.464Z
-Stopped at: Completed 06-01-PLAN.md
+Last session: 2026-08-30T20:45:47.035Z
+Stopped at: Completed 06-02-PLAN.md
 Resume file: None
