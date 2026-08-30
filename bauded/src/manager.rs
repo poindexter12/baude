@@ -2194,6 +2194,56 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_reopen_manager_reuses_one_runtime_and_preserves_failed_save() {
+        let (root, workspace) = persistence_fixture("reopen-manager");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, None);
+        let runtime = manager
+            .create(repo.to_str().unwrap(), None, Some("retained daemon"))
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        manager.session_id_for_test(runtime, "opaque-daemon-target");
+        manager.remove(runtime).unwrap();
+
+        let outcome = manager.reopen_checkout(checkout).unwrap();
+        let reopened_runtime = match outcome {
+            LifecycleOutcome::Reopened { checkout: key, runtime } if key == checkout => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+        assert!(manager.repository_state.checkouts[0].active_intent);
+        assert_eq!(
+            manager.reopen_checkout(checkout).unwrap(),
+            LifecycleOutcome::Focused {
+                checkout,
+                runtime: reopened_runtime,
+            }
+        );
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+
+        manager.remove(reopened_runtime).unwrap();
+        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+        assert!(manager.reopen_checkout(checkout).is_err());
+        assert!(!manager.repository_state.checkouts[0].active_intent);
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn archive_persistence_failure_rolls_back_or_keeps_the_replacement() {
         for (label, failure, committed) in [
             ("archive-pre", persist::AtomicFailure::Rename, false),

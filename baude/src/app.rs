@@ -3092,4 +3092,60 @@ mod repository_admission_tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+
+    #[test]
+    fn lifecycle_reopen_local_targets_retained_checkout_once_and_obeys_save_boundary() {
+        let repo = admission_repo("retained-reopen");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + 90_000;
+        let created = app
+            .activate_branch_worktree(&repo, "feature/retained-reopen")
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.session_mut(runtime).unwrap().meta.session_id = Some("opaque-local-target".into());
+        app.close_retained_session(runtime).unwrap();
+        let attempts_before = app.spawn_attempts_for_test;
+
+        let reopened = app.reopen_checkout(checkout).unwrap();
+        let reopened_runtime = match reopened {
+            LifecycleOutcome::Reopened { checkout: key, runtime } if key == checkout => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        assert!(app.repository_state.checkouts[0].active_intent);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, reopened_runtime)]));
+        assert_eq!(app.spawn_attempts_for_test, attempts_before + 1);
+        assert_eq!(
+            app.reopen_checkout(checkout).unwrap(),
+            LifecycleOutcome::Focused {
+                checkout,
+                runtime: reopened_runtime,
+            }
+        );
+        assert_eq!(app.spawn_attempts_for_test, attempts_before + 1);
+
+        app.close_retained_session(reopened_runtime).unwrap();
+        app.atomic_failure_for_test = Some(baude_core::persist::AtomicFailure::Rename);
+        let attempts_before_failure = app.spawn_attempts_for_test;
+        assert!(app.reopen_checkout(checkout).is_err());
+        assert!(!app.repository_state.checkouts[0].active_intent);
+        assert!(!app.runtime_checkouts.contains_key(&checkout));
+        assert_eq!(app.spawn_attempts_for_test, attempts_before_failure);
+
+        let path = app.repository_state.checkouts[0].observed_path.to_path_buf();
+        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
