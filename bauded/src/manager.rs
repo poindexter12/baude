@@ -539,7 +539,7 @@ impl Manager {
                 shell_open: false,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
-                resume_id: None,
+                resume_id: session.meta.session_id.clone(),
             };
         }
         state
@@ -983,26 +983,39 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> MutationResult<()> {
-        self.session(id)?;
-        let state_before = self.repository_state.clone();
+        let session = self.session(id)?;
         let checkout_key = self
             .runtime_checkouts
             .iter()
             .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
-        if let Some(checkout_key) = checkout_key {
-            self.repository_state
-                .checkouts
-                .retain(|checkout| checkout.key != checkout_key);
-            let used: std::collections::HashSet<_> = self
-                .repository_state
-                .checkouts
-                .iter()
-                .map(|checkout| checkout.repository_key)
-                .collect();
-            self.repository_state
-                .repositories
-                .retain(|repository| used.contains(&repository.key));
-        }
+        let Some(checkout_key) = checkout_key else {
+            self.session_mut(id)?.kill();
+            self.sessions.retain(|session| session.id != id);
+            if let Some(notify) = self.permission_notify.remove(&id) {
+                notify.notify_waiters();
+            }
+            return Ok(());
+        };
+        let snapshot = RetainedSessionState {
+            name: session.name.clone(),
+            cwd: PersistedPath::from_path(&session.cwd),
+            repo_root: PersistedPath::from_path(&session.repo_root),
+            branch: session.branch.clone(),
+            is_worktree: session.is_worktree,
+            shell_open: false,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session.meta.session_id.clone(),
+        };
+        let state_before = self.repository_state.clone();
+        lifecycle::plan_close(
+            &mut self.repository_state,
+            lifecycle::CloseRequest {
+                checkout: checkout_key,
+                runtime: snapshot,
+            },
+        )
+        .map_err(anyhow::Error::new)?;
         let save_error = match self.save_checked() {
             Err(error) if !error.replacement_committed() => {
                 self.repository_state = state_before;
@@ -1013,9 +1026,7 @@ impl Manager {
         };
         self.session_mut(id)?.kill();
         self.sessions.retain(|s| s.id != id);
-        if let Some(checkout_key) = checkout_key {
-            self.runtime_checkouts.remove(&checkout_key);
-        }
+        self.runtime_checkouts.remove(&checkout_key);
         // Wake any lingering permission waiter (it will re-check, find the
         // session gone, and bail) and drop its handle so the map doesn't leak.
         if let Some(n) = self.permission_notify.remove(&id) {
@@ -2130,6 +2141,47 @@ mod tests {
             }
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn lifecycle_close_manager_success_retains_exact_child_context() {
+        let (root, workspace) = persistence_fixture("close-success");
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, None);
+        let id = manager
+            .create("/tmp", None, Some("retained daemon"))
+            .unwrap()
+            .id;
+        manager.session_id_for_test(id, "opaque-daemon-resume");
+        manager.session_mut(id).unwrap().archived = true;
+        manager.session_mut(id).unwrap().archived_by_user = true;
+        let before = manager.repository_state.clone();
+
+        manager.remove(id).unwrap();
+
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(manager.repository_state.repositories, before.repositories);
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        let retained = &manager.repository_state.checkouts[0];
+        let original = &before.checkouts[0];
+        assert_eq!(retained.key, original.key);
+        assert_eq!(retained.repository_key, original.repository_key);
+        assert_eq!(retained.role, original.role);
+        assert_eq!(retained.managed_by_baude, original.managed_by_baude);
+        assert_eq!(retained.observed_path, original.observed_path);
+        assert_eq!(retained.observed_branch, original.observed_branch);
+        assert_eq!(retained.first_seen_order, original.first_seen_order);
+        assert!(!retained.active_intent);
+        assert_eq!(retained.session.name, "retained daemon");
+        assert!(retained.session.archived);
+        assert!(retained.session.archived_by_user);
+        assert_eq!(
+            retained.session.resume_id.as_deref(),
+            Some("opaque-daemon-resume")
+        );
+        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

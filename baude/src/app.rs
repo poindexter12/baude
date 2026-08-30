@@ -590,7 +590,7 @@ impl App {
                 shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
-                resume_id: None,
+                resume_id: session.meta.session_id.clone(),
             };
         }
         state
@@ -1170,21 +1170,70 @@ impl App {
         Ok(id)
     }
 
-    fn remove_session(&mut self, id: u64) {
-        if let Some(checkout_key) = self
-            .runtime_checkouts
-            .iter()
-            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
-        {
-            if let Some(checkout) = self
-                .repository_state
-                .checkouts
-                .iter_mut()
-                .find(|checkout| checkout.key == checkout_key)
-            {
-                checkout.active_intent = false;
+    fn stop_closed_runtime(&mut self, checkout_key: CheckoutKey, id: u64) {
+        self.runtime_checkouts.remove(&checkout_key);
+        if let Some(s) = self.session_mut(id) {
+            s.kill();
+        }
+        self.sessions.retain(|s| s.id != id);
+        if self.selected_id == Some(SelId::Local(id)) {
+            self.selected_id = self.ordered_ids().first().copied();
+        }
+        self.focus = Focus::Sidebar;
+    }
+
+    fn close_retained_session(&mut self, id: u64) -> Result<LifecycleOutcome> {
+        let checkout_key = checkout_for_runtime(&self.runtime_checkouts, id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} has no retained checkout"))?;
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?;
+        let snapshot = RetainedSessionState {
+            name: session.name.clone(),
+            cwd: PersistedPath::from_path(&session.cwd),
+            repo_root: PersistedPath::from_path(&session.repo_root),
+            branch: session.branch.clone(),
+            is_worktree: session.is_worktree,
+            shell_open: session.shell_open,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session.meta.session_id.clone(),
+        };
+        let before = self.repository_state.clone();
+        let plan = lifecycle::plan_close(
+            &mut self.repository_state,
+            lifecycle::CloseRequest {
+                checkout: checkout_key,
+                runtime: snapshot,
+            },
+        )?;
+        match self.save_durable_status() {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                self.stop_closed_runtime(checkout_key, id);
+                Ok(plan.outcome)
             }
-            self.runtime_checkouts.remove(&checkout_key);
+            Err(error) if !error.replacement_committed() => {
+                self.repository_state = before;
+                self.persistence_dirty = true;
+                Err(anyhow::Error::new(error))
+            }
+            Err(error) => {
+                self.persistence_dirty = true;
+                self.stop_closed_runtime(checkout_key, id);
+                Err(anyhow::anyhow!(
+                    "inactive state committed but directory durability failed: {error}"
+                ))
+            }
+        }
+    }
+
+    fn remove_session(&mut self, id: u64) {
+        if checkout_for_runtime(&self.runtime_checkouts, id).is_some() {
+            if let Err(error) = self.close_retained_session(id) {
+                self.set_message(format!("session close degraded or blocked: {error}"));
+            }
+            return;
         }
         if let Some(s) = self.session_mut(id) {
             s.kill();
@@ -1736,8 +1785,11 @@ impl App {
                 match key.code {
                     KeyCode::Char('k') => {
                         self.modal = Modal::None;
-                        self.remove_session(id);
-                        self.set_message("session closed — worktree kept".into());
+                        match self.close_retained_session(id) {
+                            Ok(_) => self.set_message("session closed — worktree kept".into()),
+                            Err(error) => self
+                                .set_message(format!("session close degraded or blocked: {error}")),
+                        }
                     }
                     KeyCode::Char('r') => {
                         self.modal = Modal::None;
