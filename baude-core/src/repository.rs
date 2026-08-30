@@ -157,6 +157,9 @@ pub enum ValidationError {
     RegressingCheckoutCounter,
     RegressingOrderCounter,
     DuplicateFirstSeenOrder(u64),
+    ExhaustedRepositoryCounter,
+    ExhaustedCheckoutCounter,
+    ExhaustedOrderCounter,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -167,26 +170,59 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AllocationError {
+    RepositoryKeysExhausted,
+    CheckoutKeysExhausted,
+    FirstSeenOrderExhausted,
+}
+
+impl std::fmt::Display for AllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "repository state allocation failed: {self:?}")
+    }
+}
+
+impl std::error::Error for AllocationError {}
+
 impl RepositoryState {
-    pub fn allocate_repository_key(&mut self) -> RepositoryKey {
+    pub fn allocate_repository_key(&mut self) -> Result<RepositoryKey, AllocationError> {
         let key = RepositoryKey(self.next_repository_key);
-        self.next_repository_key += 1;
-        key
+        self.next_repository_key = self
+            .next_repository_key
+            .checked_add(1)
+            .ok_or(AllocationError::RepositoryKeysExhausted)?;
+        Ok(key)
     }
 
-    pub fn allocate_checkout_key(&mut self) -> CheckoutKey {
+    pub fn allocate_checkout_key(&mut self) -> Result<CheckoutKey, AllocationError> {
         let key = CheckoutKey(self.next_checkout_key);
-        self.next_checkout_key += 1;
-        key
+        self.next_checkout_key = self
+            .next_checkout_key
+            .checked_add(1)
+            .ok_or(AllocationError::CheckoutKeysExhausted)?;
+        Ok(key)
     }
 
-    pub fn allocate_first_seen_order(&mut self) -> u64 {
+    pub fn allocate_first_seen_order(&mut self) -> Result<u64, AllocationError> {
         let order = self.next_first_seen_order;
-        self.next_first_seen_order += 1;
-        order
+        self.next_first_seen_order = self
+            .next_first_seen_order
+            .checked_add(1)
+            .ok_or(AllocationError::FirstSeenOrderExhausted)?;
+        Ok(order)
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.next_repository_key == u64::MAX {
+            return Err(ValidationError::ExhaustedRepositoryCounter);
+        }
+        if self.next_checkout_key == u64::MAX {
+            return Err(ValidationError::ExhaustedCheckoutCounter);
+        }
+        if self.next_first_seen_order == u64::MAX {
+            return Err(ValidationError::ExhaustedOrderCounter);
+        }
         let mut repository_keys = HashSet::new();
         let mut repository_identities = HashSet::new();
         let mut checkout_keys = HashSet::new();
@@ -326,10 +362,10 @@ mod tests {
     #[test]
     fn allocation_is_monotonic_and_validation_rejects_invalid_graphs() {
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let checkout_key = state.allocate_checkout_key();
-        let repository_order = state.allocate_first_seen_order();
-        let checkout_order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let checkout_key = state.allocate_checkout_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
         state
             .repositories
             .push(repository(repository_key, repository_order));
@@ -348,8 +384,8 @@ mod tests {
         ));
 
         let mut duplicate_identity = state.clone();
-        let second_repository_key = duplicate_identity.allocate_repository_key();
-        let second_repository_order = duplicate_identity.allocate_first_seen_order();
+        let second_repository_key = duplicate_identity.allocate_repository_key().unwrap();
+        let second_repository_order = duplicate_identity.allocate_first_seen_order().unwrap();
         duplicate_identity.repositories.push(SavedRepository {
             key: second_repository_key,
             first_seen_order: second_repository_order,
@@ -361,14 +397,14 @@ mod tests {
         ));
 
         let mut duplicate_ownership = state.clone();
-        let second_repository_key = duplicate_ownership.allocate_repository_key();
-        let second_repository_order = duplicate_ownership.allocate_first_seen_order();
+        let second_repository_key = duplicate_ownership.allocate_repository_key().unwrap();
+        let second_repository_order = duplicate_ownership.allocate_first_seen_order().unwrap();
         let mut second_repository = repository(second_repository_key, second_repository_order);
         second_repository.observed_common_dir = path("/other/.git");
         second_repository.observed_main_worktree = path("/other");
         duplicate_ownership.repositories.push(second_repository);
-        let duplicate_checkout_key = duplicate_ownership.allocate_checkout_key();
-        let duplicate_checkout_order = duplicate_ownership.allocate_first_seen_order();
+        let duplicate_checkout_key = duplicate_ownership.allocate_checkout_key().unwrap();
+        let duplicate_checkout_order = duplicate_ownership.allocate_first_seen_order().unwrap();
         duplicate_ownership.checkouts.push(SavedCheckout {
             key: duplicate_checkout_key,
             repository_key: second_repository_key,
@@ -389,8 +425,8 @@ mod tests {
         ));
 
         let mut duplicate_primary = state.clone();
-        let duplicate_key = duplicate_primary.allocate_checkout_key();
-        let duplicate_order = duplicate_primary.allocate_first_seen_order();
+        let duplicate_key = duplicate_primary.allocate_checkout_key().unwrap();
+        let duplicate_order = duplicate_primary.allocate_first_seen_order().unwrap();
         duplicate_primary
             .checkouts
             .push(checkout(duplicate_key, repository_key, duplicate_order));
@@ -417,6 +453,28 @@ mod tests {
             zeroed.validate(),
             Err(ValidationError::RegressingRepositoryCounter),
             "empty state must still retain the monotonic counter origin"
+        );
+
+        for (field, expected) in [
+            ("repository", ValidationError::ExhaustedRepositoryCounter),
+            ("checkout", ValidationError::ExhaustedCheckoutCounter),
+            ("order", ValidationError::ExhaustedOrderCounter),
+        ] {
+            let mut exhausted = RepositoryState::default();
+            match field {
+                "repository" => exhausted.next_repository_key = u64::MAX,
+                "checkout" => exhausted.next_checkout_key = u64::MAX,
+                "order" => exhausted.next_first_seen_order = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert_eq!(exhausted.validate(), Err(expected));
+        }
+
+        let mut exhausted = RepositoryState::default();
+        exhausted.next_repository_key = u64::MAX;
+        assert_eq!(
+            exhausted.allocate_repository_key(),
+            Err(AllocationError::RepositoryKeysExhausted)
         );
     }
 }

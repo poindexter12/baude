@@ -410,8 +410,8 @@ fn migrate_legacy(
         let repository_key = if let Some(key) = repositories.get(&identity) {
             *key
         } else {
-            let key = state.allocate_repository_key();
-            let first_seen_order = state.allocate_first_seen_order();
+            let key = state.allocate_repository_key()?;
+            let first_seen_order = state.allocate_first_seen_order()?;
             state.repositories.push(SavedRepository {
                 key,
                 observed_common_dir: common_dir,
@@ -432,8 +432,8 @@ fn migrate_legacy(
             checkout_role = CheckoutRole::ManagedBranch;
         }
 
-        let checkout_key = state.allocate_checkout_key();
-        let first_seen_order = state.allocate_first_seen_order();
+        let checkout_key = state.allocate_checkout_key()?;
+        let first_seen_order = state.allocate_first_seen_order()?;
         state.checkouts.push(SavedCheckout {
             key: checkout_key,
             repository_key,
@@ -684,10 +684,10 @@ mod tests {
 
     fn current_fixture(prefix: &str) -> StateFile {
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let checkout_key = state.allocate_checkout_key();
-        let repository_order = state.allocate_first_seen_order();
-        let checkout_order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let checkout_key = state.allocate_checkout_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
         let main = PathBuf::from(format!("/{prefix}/repo"));
         let checkout_path = PathBuf::from(format!("/{prefix}/repo-default"));
         state.repositories.push(SavedRepository {

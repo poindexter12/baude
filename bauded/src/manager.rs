@@ -468,7 +468,7 @@ impl Manager {
         };
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         if self.persist {
-            self.record_runtime(id);
+            self.record_runtime(id)?;
         }
         self.save();
         Ok(self.info(id).expect("session just spawned"))
@@ -566,24 +566,26 @@ impl Manager {
         }
     }
 
-    fn record_runtime(&mut self, id: u64) {
+    fn record_runtime(&mut self, id: u64) -> Result<()> {
         let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
-            return;
+            return Ok(());
         };
         let snapshot = git::discover_repository(&session.cwd).ok();
         let common = snapshot
             .as_ref()
             .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
             .unwrap_or_else(|| PersistedPath::from_path(&session.repo_root));
-        let repository_key = self
+        let existing_repository_key = self
             .repository_state
             .repositories
             .iter()
             .find(|repository| repository.observed_common_dir == common)
-            .map(|repository| repository.key)
-            .unwrap_or_else(|| {
-                let key = self.repository_state.allocate_repository_key();
-                let first_seen_order = self.repository_state.allocate_first_seen_order();
+            .map(|repository| repository.key);
+        let repository_key = match existing_repository_key {
+            Some(key) => key,
+            None => {
+                let key = self.repository_state.allocate_repository_key()?;
+                let first_seen_order = self.repository_state.allocate_first_seen_order()?;
                 self.repository_state.repositories.push(SavedRepository {
                     key,
                     observed_common_dir: common,
@@ -601,9 +603,10 @@ impl Manager {
                     },
                 });
                 key
-            });
-        let checkout_key = self.repository_state.allocate_checkout_key();
-        let first_seen_order = self.repository_state.allocate_first_seen_order();
+            }
+        };
+        let checkout_key = self.repository_state.allocate_checkout_key()?;
+        let first_seen_order = self.repository_state.allocate_first_seen_order()?;
         self.repository_state.checkouts.push(SavedCheckout {
             key: checkout_key,
             repository_key,
@@ -633,6 +636,7 @@ impl Manager {
             },
         });
         self.runtime_checkouts.insert(checkout_key, id);
+        Ok(())
     }
 
     pub fn remove(&mut self, id: u64) -> Result<()> {
@@ -1204,10 +1208,10 @@ mod tests {
         let snapshot = git::discover_repository(&repo).unwrap();
 
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let checkout_key = state.allocate_checkout_key();
-        let repository_order = state.allocate_first_seen_order();
-        let checkout_order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let checkout_key = state.allocate_checkout_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
         state.repositories.push(SavedRepository {
             key: repository_key,
             observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),

@@ -552,8 +552,8 @@ impl App {
         {
             Some(key) => key,
             None => {
-                let key = self.repository_state.allocate_repository_key();
-                let first_seen_order = self.repository_state.allocate_first_seen_order();
+                let key = self.repository_state.allocate_repository_key()?;
+                let first_seen_order = self.repository_state.allocate_first_seen_order()?;
                 self.repository_state.repositories.push(SavedRepository {
                     key,
                     observed_common_dir: common.clone(),
@@ -614,8 +614,10 @@ impl App {
                 return Ok(None);
             }
         }
-        let checkout_key =
-            existing_key.unwrap_or_else(|| self.repository_state.allocate_checkout_key());
+        let checkout_key = match existing_key {
+            Some(key) => key,
+            None => self.repository_state.allocate_checkout_key()?,
+        };
         let managed_path =
             git::managed_default_worktree_path(repository_key.get(), checkout_key.get());
         let outcome = git::ensure_default_worktree(&snapshot, &default, &managed_path)?;
@@ -647,7 +649,7 @@ impl App {
             checkout.session.branch = Some(default.local_branch.clone());
             checkout.session.is_worktree = is_worktree;
         } else {
-            let first_seen_order = self.repository_state.allocate_first_seen_order();
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
             let name = snapshot
                 .main_worktree
                 .file_name()
@@ -2204,8 +2206,8 @@ mod repository_admission_tests {
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
         let repository_key = state.repositories[0].key;
-        let key = state.allocate_checkout_key();
-        let order = state.allocate_first_seen_order();
+        let key = state.allocate_checkout_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
         let path = PersistedPath::from_path(Path::new("/repo/checkout"));
         state.checkouts.push(SavedCheckout {
             key,
@@ -2233,8 +2235,8 @@ mod repository_admission_tests {
     #[test]
     fn restore_includes_active_primary_and_linked_worktree_sessions() {
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
         let path = PersistedPath::from_path(Path::new("/repo"));
         state.repositories.push(SavedRepository {
             key: repository_key,
@@ -2254,8 +2256,8 @@ mod repository_admission_tests {
     #[test]
     fn managed_checkout_ownership_cannot_move_to_an_external_path() {
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
         let path = PersistedPath::from_path(Path::new("/managed/default"));
         state.repositories.push(SavedRepository {
             key: repository_key,
@@ -2280,8 +2282,8 @@ mod repository_admission_tests {
     #[test]
     fn manual_restart_resolves_managed_runtime_for_reconciliation() {
         let mut state = RepositoryState::default();
-        let repository_key = state.allocate_repository_key();
-        let order = state.allocate_first_seen_order();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
         let path = PersistedPath::from_path(Path::new("/repo"));
         state.repositories.push(SavedRepository {
             key: repository_key,
