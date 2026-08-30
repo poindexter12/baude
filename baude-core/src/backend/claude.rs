@@ -114,6 +114,7 @@ fn seed_mcp_config(cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::SpawnMode;
 
     // ---- spawn_plan -----------------------------------------------------
     //
@@ -128,10 +129,14 @@ mod tests {
         // and fresh commands must start with `export BAUDE_EVENT_URL=<url>;`.
         let url = "http://127.0.0.1:8642/sessions/3/event";
 
-        let fresh = ClaudeBackend.spawn_plan("claude", Some(url), false).cmd;
+        let fresh = ClaudeBackend
+            .spawn_plan("claude", Some(url), SpawnMode::Fresh)
+            .cmd;
         assert_eq!(fresh, format!("export BAUDE_EVENT_URL={url}; exec claude"));
 
-        let resumed = ClaudeBackend.spawn_plan("claude", Some(url), true).cmd;
+        let resumed = ClaudeBackend
+            .spawn_plan("claude", Some(url), SpawnMode::ContinueLatest)
+            .cmd;
         let prefix = format!("export BAUDE_EVENT_URL={url}; ");
         assert!(
             resumed.starts_with(&prefix),
@@ -152,13 +157,38 @@ mod tests {
         // which routes hook events to the /tmp append path. Exact strings the
         // TUI spawn used before the seam.
         assert_eq!(
-            ClaudeBackend.spawn_plan("claude", None, false).cmd,
+            ClaudeBackend
+                .spawn_plan("claude", None, SpawnMode::Fresh)
+                .cmd,
             "exec claude"
         );
         assert_eq!(
-            ClaudeBackend.spawn_plan("claude", None, true).cmd,
+            ClaudeBackend
+                .spawn_plan("claude", None, SpawnMode::ContinueLatest)
+                .cmd,
             "claude --continue 2>/dev/null || exec claude"
         );
+    }
+
+    #[test]
+    fn targeted_resume_is_opaque_environment_data() {
+        let hostile = "--help ; $(touch /tmp/baude-nope) ' quoted value";
+        let plan = ClaudeBackend.spawn_plan(
+            "claude --dangerously-skip-permissions",
+            None,
+            SpawnMode::ResumeId(hostile.into()),
+        );
+
+        assert_eq!(
+            plan.cmd,
+            "exec claude --dangerously-skip-permissions --resume \"$BAUDE_RESUME_ID\""
+        );
+        assert_eq!(
+            plan.env,
+            vec![("BAUDE_RESUME_ID".into(), hostile.to_string())]
+        );
+        assert!(!plan.cmd.contains(hostile));
+        assert!(!plan.cmd.contains("--continue"));
     }
 
     #[test]
@@ -181,7 +211,7 @@ mod tests {
         // never the prompt flag (fail-safe default).
         for mode in [None, Some("skip"), Some("bogus")] {
             let cmd = ClaudeBackend
-                .spawn_plan(&flagged("claude", mode), Some(url), false)
+                .spawn_plan(&flagged("claude", mode), Some(url), SpawnMode::Fresh)
                 .cmd;
             assert!(
                 cmd.contains("--dangerously-skip-permissions"),
@@ -196,7 +226,11 @@ mod tests {
         // prompt -> prompt flag present, skip flag absent; survives the resume
         // `--continue || exec` fallback (appended to the inner base cmd).
         let cmd = ClaudeBackend
-            .spawn_plan(&flagged("claude", Some("prompt")), Some(url), true)
+            .spawn_plan(
+                &flagged("claude", Some("prompt")),
+                Some(url),
+                SpawnMode::ContinueLatest,
+            )
             .cmd;
         assert!(
             cmd.contains("--permission-prompt-tool mcp__baude__approve"),
@@ -221,7 +255,7 @@ mod tests {
             .spawn_plan(
                 &flagged("claude --dangerously-skip-permissions", Some("prompt")),
                 Some(url),
-                false,
+                SpawnMode::Fresh,
             )
             .cmd;
         assert!(

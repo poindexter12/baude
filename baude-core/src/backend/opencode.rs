@@ -270,6 +270,7 @@ fn apply_status(meta: &mut ClaudeMeta, busy: bool, now_unix: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::SpawnMode;
     use serde_json::json;
 
     // ---- resolve_opencode_cmd ------------------------------------------
@@ -303,18 +304,47 @@ mod tests {
     #[test]
     fn spawn_cmd_pins_port_and_resume_flag() {
         assert_eq!(
-            compose_spawn_cmd("opencode --auto", 14711, false, false),
+            compose_spawn_cmd("opencode --auto", 14711, SpawnMode::Fresh, false),
             "exec opencode --auto --port 14711 --hostname 127.0.0.1"
         );
         assert_eq!(
-            compose_spawn_cmd("opencode --auto", 14711, true, false),
+            compose_spawn_cmd(
+                "opencode --auto",
+                14711,
+                SpawnMode::ContinueLatest,
+                false,
+            ),
             "exec opencode --auto --port 14711 --hostname 127.0.0.1 --continue"
         );
     }
 
     #[test]
+    fn targeted_session_is_opaque_environment_data() {
+        let hostile = "--help ; $(touch /tmp/baude-nope) ' quoted value";
+        let plan = OpencodeBackend.spawn_plan(
+            "opencode --auto",
+            None,
+            SpawnMode::ResumeId(hostile.into()),
+        );
+        let port = plan.server_port.expect("loopback port allocated");
+
+        assert_eq!(
+            plan.cmd,
+            format!(
+                "exec opencode --auto --port {port} --hostname 127.0.0.1 --session \"$BAUDE_RESUME_ID\""
+            )
+        );
+        assert_eq!(
+            plan.env,
+            vec![("BAUDE_RESUME_ID".into(), hostile.to_string())]
+        );
+        assert!(!plan.cmd.contains(hostile));
+        assert!(!plan.cmd.contains("--continue"));
+    }
+
+    #[test]
     fn prompt_mode_exports_inline_ask_config() {
-        let cmd = compose_spawn_cmd("opencode", 9000, true, true);
+        let cmd = compose_spawn_cmd("opencode", 9000, SpawnMode::ContinueLatest, true);
         assert!(
             cmd.starts_with("export OPENCODE_CONFIG_CONTENT='{\"permission\""),
             "got: {cmd}"
@@ -409,7 +439,7 @@ mod tests {
 
     #[test]
     fn spawn_plan_allocates_a_real_port() {
-        let plan = OpencodeBackend.spawn_plan("opencode --auto", None, false);
+        let plan = OpencodeBackend.spawn_plan("opencode --auto", None, SpawnMode::Fresh);
         let port = plan.server_port.expect("loopback port allocated");
         assert!(port > 0);
         assert!(plan.cmd.contains(&format!("--port {port}")), "{}", plan.cmd);
