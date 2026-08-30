@@ -343,7 +343,9 @@ pub fn discover_repository(
         .iter()
         .find(|record| record.path == selected_path)
         .cloned()
-        .ok_or_else(|| RepositoryDiscoveryError::SelectedWorktreeMissing(selected_path))?;
+        .ok_or(RepositoryDiscoveryError::SelectedWorktreeMissing(
+            selected_path,
+        ))?;
 
     Ok(RepositorySnapshot {
         canonical_input,
@@ -352,6 +354,486 @@ pub fn discover_repository(
         selected_worktree,
         worktrees,
     })
+}
+
+/// A locally verified remote default and its exact local/remote ref names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultBranch {
+    pub remote: String,
+    pub remote_ref: String,
+    pub local_branch: String,
+    pub local_ref: String,
+}
+
+/// Actionable reasons why local Git metadata cannot authorize a default checkout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultBranchUnavailable {
+    DetachedMainHead,
+    UnbornMainHead {
+        head_ref: String,
+    },
+    NoCandidate {
+        remotes: Vec<String>,
+    },
+    MalformedMainHead {
+        detail: String,
+    },
+    MalformedTarget {
+        remote: String,
+        target: String,
+    },
+    DanglingTarget {
+        remote: String,
+        target: String,
+    },
+    UnsupportedCommand {
+        operation: &'static str,
+        detail: String,
+    },
+}
+
+impl fmt::Display for DefaultBranchUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DetachedMainHead => write!(
+                f,
+                "the main worktree is detached; check out a local branch and record a remote HEAD"
+            ),
+            Self::UnbornMainHead { head_ref } => write!(
+                f,
+                "the main worktree branch {head_ref} is unborn; create its first commit before admission"
+            ),
+            Self::NoCandidate { remotes } => write!(
+                f,
+                "no verified local remote HEAD was found (tried {}); fetch or set the remote HEAD explicitly",
+                remotes.join(", ")
+            ),
+            Self::MalformedMainHead { detail } => {
+                write!(f, "the main worktree HEAD is malformed: {detail}")
+            }
+            Self::MalformedTarget { remote, target } => write!(
+                f,
+                "remote {remote} HEAD points outside its remote-tracking namespace: {target}"
+            ),
+            Self::DanglingTarget { remote, target } => write!(
+                f,
+                "remote {remote} HEAD target {target} is missing; refresh local remote metadata"
+            ),
+            Self::UnsupportedCommand { operation, detail } => write!(
+                f,
+                "installed Git cannot perform {operation}: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DefaultBranchUnavailable {}
+
+fn git_probe(
+    repo: &Path,
+    args: &[&OsStr],
+    operation: &'static str,
+) -> std::result::Result<Output, DefaultBranchUnavailable> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| DefaultBranchUnavailable::UnsupportedCommand {
+            operation,
+            detail: error.to_string(),
+        })
+}
+
+fn utf8_line(
+    stdout: &[u8],
+    operation: &'static str,
+) -> std::result::Result<String, DefaultBranchUnavailable> {
+    let line = std::str::from_utf8(stdout).map_err(|error| {
+        DefaultBranchUnavailable::UnsupportedCommand {
+            operation,
+            detail: format!("non-UTF-8 ref output: {error}"),
+        }
+    })?;
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.contains(['\r', '\n', '\0']) {
+        return Err(DefaultBranchUnavailable::UnsupportedCommand {
+            operation,
+            detail: "empty or multi-line ref output".into(),
+        });
+    }
+    Ok(line.to_owned())
+}
+
+fn unsupported_from_output(operation: &'static str, output: &Output) -> DefaultBranchUnavailable {
+    DefaultBranchUnavailable::UnsupportedCommand {
+        operation,
+        detail: format!(
+            "status {}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn verify_commit(
+    repo: &Path,
+    reference: &str,
+    operation: &'static str,
+) -> std::result::Result<Output, DefaultBranchUnavailable> {
+    let commit = format!("{reference}^{{commit}}");
+    git_probe(
+        repo,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new("--end-of-options"),
+            OsStr::new(&commit),
+        ],
+        operation,
+    )
+}
+
+/// Resolve the default branch solely from verified local refs in the main worktree.
+pub fn resolve_default_branch(
+    snapshot: &RepositorySnapshot,
+) -> std::result::Result<DefaultBranch, DefaultBranchUnavailable> {
+    let main_record =
+        snapshot
+            .worktrees
+            .first()
+            .ok_or_else(|| DefaultBranchUnavailable::MalformedMainHead {
+                detail: "worktree inventory is empty".into(),
+            })?;
+    if main_record.path != snapshot.main_worktree {
+        return Err(DefaultBranchUnavailable::MalformedMainHead {
+            detail: "the first inventory record is not the recorded main worktree".into(),
+        });
+    }
+    if main_record.detached {
+        return Err(DefaultBranchUnavailable::DetachedMainHead);
+    }
+
+    let symbolic = git_probe(
+        &snapshot.main_worktree,
+        &[
+            OsStr::new("symbolic-ref"),
+            OsStr::new("-q"),
+            OsStr::new("HEAD"),
+        ],
+        "main HEAD symbolic-ref",
+    )?;
+    if !symbolic.status.success() {
+        if symbolic.status.code() == Some(1) {
+            return Err(DefaultBranchUnavailable::DetachedMainHead);
+        }
+        return Err(unsupported_from_output("main HEAD symbolic-ref", &symbolic));
+    }
+    let main_head = utf8_line(&symbolic.stdout, "main HEAD symbolic-ref")?;
+    let branch_name = main_head
+        .strip_prefix("refs/heads/")
+        .filter(|name| !name.is_empty());
+    if branch_name.is_none() || main_record.branch.as_deref() != Some(main_head.as_str()) {
+        return Err(DefaultBranchUnavailable::MalformedMainHead {
+            detail: format!(
+                "symbolic HEAD {main_head} does not match inventory branch {:?}",
+                main_record.branch
+            ),
+        });
+    }
+
+    let verified_main = verify_commit(
+        &snapshot.main_worktree,
+        &main_head,
+        "verify main branch commit",
+    )?;
+    if !verified_main.status.success() {
+        if verified_main.status.code() == Some(1) {
+            return Err(DefaultBranchUnavailable::UnbornMainHead {
+                head_ref: main_head,
+            });
+        }
+        return Err(unsupported_from_output(
+            "verify main branch commit",
+            &verified_main,
+        ));
+    }
+
+    let upstream = git_probe(
+        &snapshot.main_worktree,
+        &[
+            OsStr::new("for-each-ref"),
+            OsStr::new("--format=%(upstream:remotename)"),
+            OsStr::new("--"),
+            OsStr::new(&main_head),
+        ],
+        "resolve main upstream remote",
+    )?;
+    if !upstream.status.success() {
+        return Err(unsupported_from_output(
+            "resolve main upstream remote",
+            &upstream,
+        ));
+    }
+    let upstream = std::str::from_utf8(&upstream.stdout)
+        .map_err(|error| DefaultBranchUnavailable::UnsupportedCommand {
+            operation: "resolve main upstream remote",
+            detail: error.to_string(),
+        })?
+        .trim_end_matches(['\r', '\n']);
+    if upstream.contains(['\r', '\n', '\0']) {
+        return Err(DefaultBranchUnavailable::UnsupportedCommand {
+            operation: "resolve main upstream remote",
+            detail: "multi-line remote output".into(),
+        });
+    }
+
+    let mut remotes = Vec::with_capacity(2);
+    if !upstream.is_empty() && upstream != "." {
+        remotes.push(upstream.to_owned());
+    }
+    if !remotes.iter().any(|remote| remote == "origin") {
+        remotes.push("origin".into());
+    }
+
+    let mut dangling = None;
+    for remote in &remotes {
+        let remote_head = format!("refs/remotes/{remote}/HEAD");
+        let symbolic = git_probe(
+            &snapshot.main_worktree,
+            &[
+                OsStr::new("symbolic-ref"),
+                OsStr::new("-q"),
+                OsStr::new(&remote_head),
+            ],
+            "remote HEAD symbolic-ref",
+        )?;
+        if !symbolic.status.success() {
+            if symbolic.status.code() == Some(1) {
+                continue;
+            }
+            return Err(unsupported_from_output(
+                "remote HEAD symbolic-ref",
+                &symbolic,
+            ));
+        }
+        let target = utf8_line(&symbolic.stdout, "remote HEAD symbolic-ref")?;
+        let prefix = format!("refs/remotes/{remote}/");
+        let Some(local_branch) = target.strip_prefix(&prefix).filter(|name| !name.is_empty())
+        else {
+            return Err(DefaultBranchUnavailable::MalformedTarget {
+                remote: remote.clone(),
+                target,
+            });
+        };
+        let local_branch = local_branch.to_owned();
+        let verified = verify_commit(
+            &snapshot.main_worktree,
+            &target,
+            "verify remote HEAD target",
+        )?;
+        if verified.status.success() {
+            return Ok(DefaultBranch {
+                remote: remote.clone(),
+                remote_ref: target,
+                local_branch: local_branch.clone(),
+                local_ref: format!("refs/heads/{local_branch}"),
+            });
+        }
+        if verified.status.code() != Some(1) {
+            return Err(unsupported_from_output(
+                "verify remote HEAD target",
+                &verified,
+            ));
+        }
+        dangling = Some((remote.clone(), target));
+    }
+
+    if let Some((remote, target)) = dangling {
+        Err(DefaultBranchUnavailable::DanglingTarget { remote, target })
+    } else {
+        Err(DefaultBranchUnavailable::NoCandidate { remotes })
+    }
+}
+
+/// Where an ensured default checkout came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultWorktreeOutcome {
+    Main(WorktreeRecord),
+    ExistingLinked(WorktreeRecord),
+    CreatedManaged(WorktreeRecord),
+}
+
+#[derive(Debug)]
+pub enum EnsureDefaultWorktreeError {
+    PathCollision(PathBuf),
+    CreateParent {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CommandStart(std::io::Error),
+    GitCommand {
+        status: Option<i32>,
+        stderr: String,
+    },
+    Discovery(RepositoryDiscoveryError),
+    Verification(String),
+}
+
+impl fmt::Display for EnsureDefaultWorktreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PathCollision(path) => write!(
+                f,
+                "managed worktree path collision at {}; the path is not registered by Git",
+                path.display()
+            ),
+            Self::CreateParent { path, source } => {
+                write!(
+                    f,
+                    "create managed worktree parent {}: {source}",
+                    path.display()
+                )
+            }
+            Self::CommandStart(source) => write!(f, "start Git worktree add: {source}"),
+            Self::GitCommand { status, stderr } => write!(
+                f,
+                "Git worktree add failed (status {}): {stderr}",
+                status.map_or_else(|| "signal".to_owned(), |code| code.to_string())
+            ),
+            Self::Discovery(error) => write!(f, "verify created worktree: {error}"),
+            Self::Verification(detail) => {
+                write!(f, "created worktree failed verification: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnsureDefaultWorktreeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateParent { source, .. } | Self::CommandStart(source) => Some(source),
+            Self::Discovery(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Reuse or create the exact verified default checkout without changing the main checkout.
+pub fn ensure_default_worktree(
+    snapshot: &RepositorySnapshot,
+    default: &DefaultBranch,
+    managed_path: &Path,
+) -> std::result::Result<DefaultWorktreeOutcome, EnsureDefaultWorktreeError> {
+    if let Some(main) = snapshot.worktrees.first() {
+        if main.branch.as_deref() == Some(default.local_ref.as_str()) {
+            return Ok(DefaultWorktreeOutcome::Main(main.clone()));
+        }
+    }
+    if let Some(linked) = snapshot
+        .worktrees
+        .iter()
+        .skip(1)
+        .find(|record| record.branch.as_deref() == Some(default.local_ref.as_str()))
+    {
+        return Ok(DefaultWorktreeOutcome::ExistingLinked(linked.clone()));
+    }
+    if managed_path.exists() {
+        return Err(EnsureDefaultWorktreeError::PathCollision(
+            managed_path.to_path_buf(),
+        ));
+    }
+    if let Some(parent) = managed_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            EnsureDefaultWorktreeError::CreateParent {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
+    let local_commit = format!("{}^{{commit}}", default.local_ref);
+    let local = Command::new("git")
+        .arg("-C")
+        .arg(&snapshot.main_worktree)
+        .args([
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new("--end-of-options"),
+            OsStr::new(&local_commit),
+        ])
+        .output()
+        .map_err(EnsureDefaultWorktreeError::CommandStart)?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&snapshot.main_worktree);
+    if local.status.success() {
+        command
+            .args([OsStr::new("worktree"), OsStr::new("add"), OsStr::new("--")])
+            .arg(managed_path)
+            .arg(&default.local_branch);
+    } else if local.status.code() == Some(1) {
+        // The remote target was already commit-verified by resolve_default_branch.
+        let source = format!("{}/{}", default.remote, default.local_branch);
+        command
+            .args([
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--track"),
+                OsStr::new("-b"),
+                OsStr::new(&default.local_branch),
+                OsStr::new("--"),
+            ])
+            .arg(managed_path)
+            .arg(source);
+    } else {
+        return Err(EnsureDefaultWorktreeError::GitCommand {
+            status: local.status.code(),
+            stderr: String::from_utf8_lossy(&local.stderr).trim().to_owned(),
+        });
+    }
+    let output = command
+        .output()
+        .map_err(EnsureDefaultWorktreeError::CommandStart)?;
+    if !output.status.success() {
+        return Err(EnsureDefaultWorktreeError::GitCommand {
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    let fresh = discover_repository(managed_path).map_err(EnsureDefaultWorktreeError::Discovery)?;
+    let canonical_managed =
+        managed_path
+            .canonicalize()
+            .map_err(|source| EnsureDefaultWorktreeError::CreateParent {
+                path: managed_path.to_path_buf(),
+                source,
+            })?;
+    if fresh.common_dir != snapshot.common_dir {
+        return Err(EnsureDefaultWorktreeError::Verification(
+            "repository common directory changed".into(),
+        ));
+    }
+    if fresh.selected_worktree.path != canonical_managed {
+        return Err(EnsureDefaultWorktreeError::Verification(
+            "selected path does not match the managed allocation".into(),
+        ));
+    }
+    if fresh.selected_worktree.branch.as_deref() != Some(default.local_ref.as_str()) {
+        return Err(EnsureDefaultWorktreeError::Verification(format!(
+            "expected branch {}, observed {:?}",
+            default.local_ref, fresh.selected_worktree.branch
+        )));
+    }
+    Ok(DefaultWorktreeOutcome::CreatedManaged(
+        fresh.selected_worktree,
+    ))
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -528,9 +1010,8 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_repository, ensure_default_worktree, parse_clone_target,
-        parse_worktree_porcelain, resolve_default_branch, DefaultBranchUnavailable,
-        DefaultWorktreeOutcome,
+        discover_repository, ensure_default_worktree, parse_clone_target, parse_worktree_porcelain,
+        resolve_default_branch, DefaultBranchUnavailable, DefaultWorktreeOutcome,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -786,10 +1267,7 @@ mod tests {
             assert_eq!(default.remote, "upstream");
             assert_eq!(default.local_branch, "team/default");
             assert_eq!(default.local_ref, "refs/heads/team/default");
-            assert_eq!(
-                default.remote_ref,
-                "refs/remotes/upstream/team/default"
-            );
+            assert_eq!(default.remote_ref, "refs/remotes/upstream/team/default");
         }
 
         #[test]
@@ -808,10 +1286,7 @@ mod tests {
             let fixture = GitFixture::new();
 
             let detached = fixture.repo("detached");
-            git_ok(
-                &detached,
-                &[OsStr::new("checkout"), OsStr::new("--detach")],
-            );
+            git_ok(&detached, &[OsStr::new("checkout"), OsStr::new("--detach")]);
             assert!(matches!(
                 resolve_default_branch(&discover_repository(&detached).unwrap()),
                 Err(DefaultBranchUnavailable::DetachedMainHead)
@@ -882,16 +1357,8 @@ mod tests {
             ));
 
             let linked_repo = fixture.repo("linked default");
-            git_ok(
-                &linked_repo,
-                &[OsStr::new("branch"), OsStr::new("team/default")],
-            );
             fixture.remote_head(&linked_repo, "origin", "team/default");
-            let linked = fixture.linked_worktree(
-                &linked_repo,
-                "external default",
-                "team/default",
-            );
+            let linked = fixture.linked_worktree(&linked_repo, "external default", "team/default");
             let snapshot = discover_repository(&linked_repo).unwrap();
             let default = resolve_default_branch(&snapshot).unwrap();
             assert!(matches!(
@@ -906,15 +1373,16 @@ mod tests {
         fn creates_verified_default_without_mutating_main_checkout() {
             let fixture = GitFixture::new();
             let repo = fixture.repo("creation");
-            git_ok(
-                &repo,
-                &[OsStr::new("branch"), OsStr::new("team/default")],
-            );
+            git_ok(&repo, &[OsStr::new("branch"), OsStr::new("team/default")]);
             fixture.remote_head(&repo, "origin", "team/default");
             let before_head = git_ok(&repo, &[OsStr::new("symbolic-ref"), OsStr::new("HEAD")]);
             let before_status = git_ok(
                 &repo,
-                &[OsStr::new("status"), OsStr::new("--porcelain"), OsStr::new("-z")],
+                &[
+                    OsStr::new("status"),
+                    OsStr::new("--porcelain"),
+                    OsStr::new("-z"),
+                ],
             );
             let before_file = std::fs::read(repo.join("tracked.txt")).unwrap();
             let before_index = std::fs::read(repo.join(".git/index")).unwrap();
@@ -937,12 +1405,22 @@ mod tests {
             assert_eq!(
                 git_ok(
                     &repo,
-                    &[OsStr::new("status"), OsStr::new("--porcelain"), OsStr::new("-z")],
+                    &[
+                        OsStr::new("status"),
+                        OsStr::new("--porcelain"),
+                        OsStr::new("-z")
+                    ],
                 ),
                 before_status
             );
-            assert_eq!(std::fs::read(repo.join("tracked.txt")).unwrap(), before_file);
-            assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), before_index);
+            assert_eq!(
+                std::fs::read(repo.join("tracked.txt")).unwrap(),
+                before_file
+            );
+            assert_eq!(
+                std::fs::read(repo.join(".git/index")).unwrap(),
+                before_index
+            );
         }
 
         #[test]
@@ -970,10 +1448,7 @@ mod tests {
         fn rejects_unregistered_managed_path_collision() {
             let fixture = GitFixture::new();
             let repo = fixture.repo("collision");
-            git_ok(
-                &repo,
-                &[OsStr::new("branch"), OsStr::new("trunk")],
-            );
+            git_ok(&repo, &[OsStr::new("branch"), OsStr::new("trunk")]);
             fixture.remote_head(&repo, "origin", "trunk");
             let collision = fixture.root.join("collision path");
             std::fs::create_dir(&collision).unwrap();
