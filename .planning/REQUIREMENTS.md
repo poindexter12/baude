@@ -35,10 +35,10 @@
 
 ### Persistence and Reconciliation
 
-- [ ] **PERS-01**: Repository membership, child ownership, managed status, branch, ordering timestamp, and relevant UI and session state survive restart per workspace.
-- [ ] **PERS-02**: Existing flat local and daemon session state migrates idempotently into repository parents without losing valid Claude Code or OpenCode sessions.
+- [x] **PERS-01**: Repository membership, child ownership, managed status, branch, ordering timestamp, and relevant UI and session state survive restart per workspace.
+- [x] **PERS-02**: Existing flat local and daemon session state migrates idempotently into repository parents without losing valid Claude Code or OpenCode sessions.
 - [ ] **PERS-03**: Baude reconciles persisted repository and worktree intent against Git topology before reuse, activation, removal, or launch.
-- [ ] **PERS-04**: State updates are atomic, and malformed or partially written state is surfaced rather than replaced with an empty hierarchy.
+- [x] **PERS-04**: State updates are atomic, and malformed or partially written state is surfaced rather than replaced with an empty hierarchy.
 
 ### Interaction and Surface Parity
 
@@ -100,10 +100,10 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | WORK-05 | Phase 6 | Pending |
 | WORK-06 | Phase 6 | Pending |
 | WORK-07 | Phase 7 | Pending |
-| PERS-01 | Phase 5 | Pending |
-| PERS-02 | Phase 5 | Pending |
+| PERS-01 | Phase 5 | Complete |
+| PERS-02 | Phase 5 | Complete |
 | PERS-03 | Phase 5 | Pending |
-| PERS-04 | Phase 5 | Pending |
+| PERS-04 | Phase 5 | Complete |
 | SURF-01 | Phase 7 | Pending |
 | SURF-02 | Phase 7 | Pending |
 | SURF-03 | Phase 8 | Pending |

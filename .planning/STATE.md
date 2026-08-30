@@ -5,16 +5,16 @@ milestone_name: Repository Worktree Management (Planned)
 current_phase: 5
 current_phase_name: milestone phase 1 of 5
 status: executing
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-08-30T17:38:05.451Z"
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-08-30T17:40:45.397Z"
 last_activity: 2026-08-30
 last_activity_desc: v2.0 roadmap created with all 28 requirements mapped
-state_head: efd0e5ce6c9ca67e56706e597a5474fc6fc78bf5
+state_head: 536b9121444ca3331032de4df91d9bb26399206f
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 3
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 5 of 9 (milestone phase 1 of 5)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: Ready to execute
 Last activity: 2026-08-30 — v2.0 roadmap created with all 28 requirements mapped
 
@@ -57,6 +57,7 @@ Progress: [░░░░░░░░░░] 0%
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 05 P01 | 10m | 2 tasks | 1 files |
+| Phase 05 P02 | 14min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -72,6 +73,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 05]: Repository identity uses the canonical common directory plus Git's main-first worktree inventory; show-toplevel only selects an inventory member.
 - [Phase 05]: Default resolution prefers the main branch upstream remote, then origin, and requires exact commit-verified local remote HEAD targets.
 - [Phase 05]: Managed default creation verifies full refs, uses exact branch semantics, and rediscovery proves common directory, path, and branch.
+- [Phase 5]: Repository and checkout keys are persisted monotonic u64 newtypes scoped to one workspace state file.
+- [Phase 5]: Legacy migration accepts reconciled identity as an injected value and never infers baude ownership from is_worktree.
+- [Phase 5]: Only NotFound is first-run state; malformed, unsupported, unreadable, and invalid aggregates are path-aware blocking errors.
 
 ### Pending Todos
 
@@ -98,6 +102,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T17:38:05.439Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-08-30T17:40:45.383Z
+Stopped at: Completed 05-02-PLAN.md
 Resume file: None
