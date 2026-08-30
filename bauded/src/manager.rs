@@ -1231,14 +1231,33 @@ impl Manager {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn stop_removed_runtime(&mut self, checkout: CheckoutKey, id: u64) -> Result<()> {
-        self.session_mut(id)?.kill_and_wait()?;
+    fn teardown_retained_runtime(&mut self, checkout: CheckoutKey, id: u64) -> Result<()> {
+        let session_index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow!("session {id} not found"))?;
+        if let Err(error) = lifecycle::destructive_teardown(
+            &mut self.repository_state,
+            checkout,
+            &mut self.sessions[session_index],
+        ) {
+            if let Err(save_error) = self.save_checked() {
+                return Err(anyhow!(
+                    "{error}; could not persist pending teardown recovery: {save_error}"
+                ));
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
+    }
+
+    fn forget_stopped_runtime(&mut self, checkout: CheckoutKey, id: u64) {
         self.sessions.retain(|session| session.id != id);
         self.runtime_checkouts.remove(&checkout);
         if let Some(notify) = self.permission_notify.remove(&id) {
             notify.notify_waiters();
         }
-        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1329,9 +1348,11 @@ impl Manager {
             .transpose()
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         if let Some(id) = runtime_id {
-            self.stop_removed_runtime(checkout, id).map_err(|error| {
-                lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
-            })?;
+            self.teardown_retained_runtime(checkout, id)
+                .map_err(|error| {
+                    lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
+                })?;
+            self.forget_stopped_runtime(checkout, id);
         }
 
         let target =
@@ -1480,17 +1501,7 @@ impl Manager {
                     .and_then(|checkout| checkout.session.resume_id.clone())
             }),
         };
-        if let Err(error) = self.session_mut(id)?.kill_and_wait() {
-            lifecycle::mark_teardown_pending(&mut self.repository_state, checkout_key, &error)
-                .map_err(anyhow::Error::new)?;
-            if let Err(save_error) = self.save_checked() {
-                return Err(anyhow!(
-                    "{error}; could not persist pending teardown recovery: {save_error}"
-                )
-                .into());
-            }
-            return Err(anyhow::Error::new(error).into());
-        }
+        self.teardown_retained_runtime(checkout_key, id)?;
         let state_before = self.repository_state.clone();
         lifecycle::plan_close(
             &mut self.repository_state,
@@ -1508,13 +1519,7 @@ impl Manager {
             Err(error) => Some(error),
             Ok(()) => None,
         };
-        self.sessions.retain(|s| s.id != id);
-        self.runtime_checkouts.remove(&checkout_key);
-        // Wake any lingering permission waiter (it will re-check, find the
-        // session gone, and bail) and drop its handle so the map doesn't leak.
-        if let Some(n) = self.permission_notify.remove(&id) {
-            n.notify_waiters();
-        }
+        self.forget_stopped_runtime(checkout_key, id);
         save_error.map_or(Ok(()), |error| Err(MutationError::Persistence(error)))
     }
 
@@ -2419,6 +2424,74 @@ mod tests {
         (root, workspace)
     }
 
+    fn removal_manager(
+        label: &str,
+        offset: u64,
+    ) -> (
+        Manager,
+        PathBuf,
+        PathBuf,
+        baude_core::workspace::Workspace,
+        PathBuf,
+        CheckoutKey,
+        u64,
+        PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("bauded-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + offset;
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        let created = manager
+            .activate_branch_worktree(&repo, &format!("feature/{label}"), None)
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let path = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        (
+            manager, state_root, root, workspace, repo, checkout, runtime, path,
+        )
+    }
+
     fn persisted_at(root: &Path, workspace: &baude_core::workspace::Workspace) -> RepositoryState {
         persist::load_current_at(root, &workspace.state_file(STATE_BASE))
             .unwrap()
@@ -3025,6 +3098,63 @@ mod tests {
             .unwrap()
             .success());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_remove_manager_partial_teardown_is_durable_and_retryable() {
+        for (label, fail_agent, offset) in [
+            ("remove-agent-partial", true, 120_000),
+            ("remove-shell-partial", false, 130_000),
+        ] {
+            let (mut manager, state_root, root, workspace, _repo, checkout, runtime, path) =
+                removal_manager(label, offset);
+            manager
+                .session_mut(runtime)
+                .unwrap()
+                .open_shell(5, 40)
+                .unwrap();
+            if fail_agent {
+                manager
+                    .session(runtime)
+                    .unwrap()
+                    .claude
+                    .fail_next_teardown_for_test("agent stop refused once");
+            } else {
+                manager
+                    .session(runtime)
+                    .unwrap()
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .fail_next_teardown_for_test("shell stop refused once");
+            }
+            let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+
+            let error = manager
+                .confirm_remove_worktree(confirmation.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("runtime stop failed"), "got: {error}");
+            assert!(path.exists());
+            assert!(manager.runtime_checkouts.contains_key(&checkout));
+            assert!(matches!(
+                manager.repository_state.checkouts[0].health,
+                CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
+            ));
+            assert_eq!(
+                persisted_at(&state_root, &workspace),
+                manager.repository_state
+            );
+
+            assert!(matches!(
+                manager.confirm_remove_worktree(confirmation).unwrap(),
+                LifecycleOutcome::Removed { checkout: key, .. } if key == checkout
+            ));
+            assert!(!path.exists());
+            assert!(manager.sessions.is_empty());
+            assert!(manager.runtime_checkouts.is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -1474,17 +1474,36 @@ impl App {
         Ok(id)
     }
 
-    fn stop_closed_runtime(&mut self, checkout_key: CheckoutKey, id: u64) -> Result<()> {
-        self.session_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?
-            .kill_and_wait()?;
+    fn teardown_retained_runtime(&mut self, checkout_key: CheckoutKey, id: u64) -> Result<()> {
+        let session_index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?;
+        if let Err(error) = lifecycle::destructive_teardown(
+            &mut self.repository_state,
+            checkout_key,
+            &mut self.sessions[session_index],
+        ) {
+            if let Err(save_error) = self.save_durable_status() {
+                self.persistence_dirty = true;
+                return Err(anyhow::anyhow!(
+                    "{error}; could not persist pending teardown recovery: {save_error}"
+                ));
+            }
+            self.persistence_dirty = false;
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
+    }
+
+    fn forget_stopped_runtime(&mut self, checkout_key: CheckoutKey, id: u64) {
         self.runtime_checkouts.remove(&checkout_key);
         self.sessions.retain(|s| s.id != id);
         if self.selected_id == Some(SelId::Local(id)) {
             self.selected_id = self.ordered_ids().first().copied();
         }
         self.focus = Focus::Sidebar;
-        Ok(())
     }
 
     fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
@@ -1606,9 +1625,11 @@ impl App {
             )));
         }
         if let Some(id) = runtime_id {
-            self.stop_closed_runtime(checkout, id).map_err(|error| {
-                lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
-            })?;
+            self.teardown_retained_runtime(checkout, id)
+                .map_err(|error| {
+                    lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
+                })?;
+            self.forget_stopped_runtime(checkout, id);
         }
 
         let target =
@@ -1735,21 +1756,7 @@ impl App {
         let checkout_key = checkout_for_runtime(&self.runtime_checkouts, id)
             .ok_or_else(|| anyhow::anyhow!("runtime {id} has no retained checkout"))?;
         let snapshot = self.retained_runtime_snapshot(id)?;
-        if let Err(error) = self
-            .session_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?
-            .kill_and_wait()
-        {
-            lifecycle::mark_teardown_pending(&mut self.repository_state, checkout_key, &error)?;
-            if let Err(save_error) = self.save_durable_status() {
-                self.persistence_dirty = true;
-                return Err(anyhow::anyhow!(
-                    "{error}; could not persist pending teardown recovery: {save_error}"
-                ));
-            }
-            self.persistence_dirty = false;
-            return Err(anyhow::Error::new(error));
-        }
+        self.teardown_retained_runtime(checkout_key, id)?;
         let before = self.repository_state.clone();
         let plan = lifecycle::plan_close(
             &mut self.repository_state,
@@ -1761,12 +1768,7 @@ impl App {
         match self.save_durable_status() {
             Ok(()) => {
                 self.persistence_dirty = false;
-                self.runtime_checkouts.remove(&checkout_key);
-                self.sessions.retain(|session| session.id != id);
-                if self.selected_id == Some(SelId::Local(id)) {
-                    self.selected_id = self.ordered_ids().first().copied();
-                }
-                self.focus = Focus::Sidebar;
+                self.forget_stopped_runtime(checkout_key, id);
                 Ok(plan.outcome)
             }
             Err(error) if !error.replacement_committed() => {
@@ -3025,7 +3027,7 @@ mod repository_admission_tests {
     use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
     use baude_core::repository::{
         CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
-        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
@@ -4042,6 +4044,53 @@ mod repository_admission_tests {
         std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
         git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_remove_local_partial_teardown_is_durable_and_retryable() {
+        for (label, fail_agent, offset) in [
+            ("remove-agent-partial", true, 170_000),
+            ("remove-shell-partial", false, 180_000),
+        ] {
+            let (mut app, repo, root, checkout, runtime, path) = removal_app(label, offset);
+            app.session_mut(runtime).unwrap().open_shell(5, 40).unwrap();
+            if fail_agent {
+                app.session(runtime)
+                    .unwrap()
+                    .claude
+                    .fail_next_teardown_for_test("agent stop refused once");
+            } else {
+                app.session(runtime)
+                    .unwrap()
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .fail_next_teardown_for_test("shell stop refused once");
+            }
+            let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+
+            let error = app
+                .confirm_remove_worktree(confirmation.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("runtime stop failed"), "got: {error}");
+            assert!(path.exists());
+            assert!(app.runtime_checkouts.contains_key(&checkout));
+            assert!(matches!(
+                app.repository_state.checkouts[0].health,
+                CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
+            ));
+
+            assert!(matches!(
+                app.confirm_remove_worktree(confirmation).unwrap(),
+                LifecycleOutcome::Removed { checkout: key, .. } if key == checkout
+            ));
+            assert!(!path.exists());
+            assert!(app.sessions.is_empty());
+            assert!(app.runtime_checkouts.is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+            drop(repo);
+        }
     }
 
     #[test]

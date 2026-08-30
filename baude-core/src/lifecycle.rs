@@ -319,6 +319,41 @@ pub fn mark_teardown_pending(
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum DestructiveTeardownError {
+    Pending(crate::session::SessionTeardownError),
+    State(LifecycleError),
+}
+
+impl std::fmt::Display for DestructiveTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending(error) => error.fmt(f),
+            Self::State(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for DestructiveTeardownError {}
+
+/// The single typed stop boundary for close and confirmed removal. A partial
+/// agent/shell outcome is transferred into durable aggregate ownership before
+/// it is returned to either runtime owner.
+pub fn destructive_teardown(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+    session: &mut crate::session::Session,
+) -> Result<(), DestructiveTeardownError> {
+    match session.kill_and_wait() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            mark_teardown_pending(state, checkout_key, &error)
+                .map_err(DestructiveTeardownError::State)?;
+            Err(DestructiveTeardownError::Pending(error))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TeardownRecoveryResolution {
     Completed {
