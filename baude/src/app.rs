@@ -345,7 +345,7 @@ pub struct App {
     persistence_blocked: bool,
     persistence_dirty: bool,
     #[cfg(test)]
-    save_override_for_test: Option<std::result::Result<(), String>>,
+    persistence_root_for_test: Option<PathBuf>,
     #[cfg(test)]
     save_attempts_for_test: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -425,7 +425,7 @@ impl App {
             persistence_blocked: false,
             persistence_dirty: false,
             #[cfg(test)]
-            save_override_for_test: None,
+            persistence_root_for_test: None,
             #[cfg(test)]
             save_attempts_for_test: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -498,6 +498,20 @@ impl App {
 
     pub fn restore(&mut self) {
         let mut primary_repositories = std::collections::HashSet::new();
+        #[cfg(test)]
+        let loaded = if let Some(root) = &self.persistence_root_for_test {
+            persist::load_for_workspace_strict_at(
+                root,
+                "state",
+                baude_core::workspace::active(),
+                |saved| reconcile_legacy_session(saved, &mut primary_repositories),
+            )
+        } else {
+            persist::load_for_workspace("state", baude_core::workspace::active(), |saved| {
+                reconcile_legacy_session(saved, &mut primary_repositories)
+            })
+        };
+        #[cfg(not(test))]
         let loaded =
             persist::load_for_workspace("state", baude_core::workspace::active(), |saved| {
                 reconcile_legacy_session(saved, &mut primary_repositories)
@@ -548,13 +562,8 @@ impl App {
             anyhow::bail!("automatic persistence is blocked after a state load failure");
         }
         #[cfg(test)]
-        if let Some(result) = &self.save_override_for_test {
-            self.save_attempts_for_test
-                .set(self.save_attempts_for_test.get() + 1);
-            return result
-                .clone()
-                .map_err(|error| anyhow::anyhow!("test persistence failure: {error}"));
-        }
+        self.save_attempts_for_test
+            .set(self.save_attempts_for_test.get() + 1);
         let mut state = self.repository_state.clone();
         for checkout in &mut state.checkouts {
             let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
@@ -575,6 +584,14 @@ impl App {
             };
         }
         state.validate()?;
+        #[cfg(test)]
+        if let Some(root) = &self.persistence_root_for_test {
+            return persist::save_current_at(
+                root,
+                &baude_core::workspace::active().state_file("state"),
+                &StateFile::new(state),
+            );
+        }
         persist::save(&StateFile::new(state))
     }
 
@@ -2448,19 +2465,22 @@ mod repository_admission_tests {
     fn production_admission_retains_intent_without_runtime_on_save_failure() {
         let repo = admission_repo("save-failure");
         let root = repo.parent().unwrap().to_path_buf();
+        let blocked_root = root.join("persistence-root");
+        std::fs::write(&blocked_root, b"not a directory").unwrap();
         let mut app = App::new(repo.clone());
         app.remote = None;
-        app.save_override_for_test = Some(Err("disk full".into()));
+        app.persistence_root_for_test = Some(blocked_root.clone());
 
         let error = app.admit_repository(&repo).unwrap_err().to_string();
 
-        assert!(error.contains("disk full"), "got: {error}");
+        assert!(!error.is_empty());
         assert_eq!(app.save_attempts_for_test.get(), 1);
         assert_eq!(app.spawn_attempts_for_test, 0);
         assert!(app.sessions.is_empty());
         assert!(app.runtime_checkouts.is_empty());
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert!(app.repository_state.checkouts[0].active_intent);
+        assert_eq!(std::fs::read(&blocked_root).unwrap(), b"not a directory");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2468,9 +2488,11 @@ mod repository_admission_tests {
     fn production_admission_retains_saved_intent_on_spawn_failure() {
         let repo = admission_repo("spawn-failure");
         let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
         let mut app = App::new(repo.clone());
         app.remote = None;
-        app.save_override_for_test = Some(Ok(()));
+        app.persistence_root_for_test = Some(state_root.clone());
         app.spawn_error_for_test = Some("pty unavailable".into());
 
         let error = app.admit_repository(&repo).unwrap_err().to_string();
@@ -2482,6 +2504,21 @@ mod repository_admission_tests {
         assert!(app.runtime_checkouts.is_empty());
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert!(app.repository_state.checkouts[0].active_intent);
+
+        let state_file = baude_core::workspace::active().state_file("state");
+        let persisted = baude_core::persist::load_current_at(&state_root, &state_file).unwrap();
+        assert_eq!(persisted.state, app.repository_state);
+
+        let mut restarted = App::new(repo.clone());
+        restarted.remote = None;
+        restarted.persistence_root_for_test = Some(state_root.clone());
+        restarted.spawn_error_for_test = Some("pty unavailable after restart".into());
+        restarted.restore();
+
+        assert_eq!(restarted.repository_state, persisted.state);
+        assert!(restarted.repository_state.checkouts[0].active_intent);
+        assert!(restarted.sessions.is_empty());
+        assert!(restarted.runtime_checkouts.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
