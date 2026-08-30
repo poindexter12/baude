@@ -406,17 +406,13 @@ match runtime_session_for(primary_child.key) {
 
 All claims in this research were verified against current project source/runtime state or cited from official Git, Rust, and Serde documentation; no unverified claims remain.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **What minimum Git version does baude officially support?**
-   - What we know: the local runtime is Git 2.50.1, and official current manuals document all proposed commands. [VERIFIED: local `git --version`] [CITED: https://git-scm.com/docs/git-worktree]
-   - What's unclear: the project has no documented minimum Git version. [VERIFIED: codebase search]
-   - Recommendation: do not invent a version floor in this phase; exercise required commands in macOS and Ubuntu CI and return an actionable unsupported-command error if a target Git lacks one.
+   - Resolution: Phase 5 supports the currently tested Git baseline: the Git versions exercised by the project's macOS and Ubuntu CI, with local validation on Git 2.50.1. This is a behavioral compatibility floor rather than an unverified lower numeric version claim. Admission must feature-detect the required porcelain behavior, including NUL-delimited `git worktree list --porcelain -z` and the other structured commands used by discovery/default resolution, and return an actionable `DefaultBranchUnavailable`/Git compatibility error when required behavior is absent or malformed instead of falling back to human output, lossy parsing, branch guessing, or mutation. [VERIFIED: local `git --version`; codebase `.github/workflows/ci.yml`] [CITED: https://git-scm.com/docs/git-worktree]
 
 2. **How should non-Unix persisted paths be encoded if Windows support is later added?**
-   - What we know: current CI targets macOS and Ubuntu, while the byte-preserving `OsStringExt::from_vec` API cited here is Unix-only. [VERIFIED: codebase `.github/workflows/ci.yml`] [CITED: https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStringExt.html]
-   - What's unclear: Phase 5 requirements do not define Windows state portability. [VERIFIED: `.planning/REQUIREMENTS.md`]
-   - Recommendation: implement the Unix byte adapter behind `cfg(unix)` and keep path serialization isolated behind `PersistedPath`; add a platform adapter only when a supported non-Unix target is declared.
+   - Resolution: Phase 5 byte-preserving path behavior is Unix-focused for the current macOS and Ubuntu targets. Implement the byte adapter behind `cfg(unix)` and keep path serialization isolated behind `PersistedPath`; Windows path encoding and its platform adapter are explicitly deferred until Windows becomes a supported target. Do not claim cross-platform byte portability from the Unix representation. [VERIFIED: codebase `.github/workflows/ci.yml`; `.planning/REQUIREMENTS.md`] [CITED: https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStringExt.html]
 
 ## Environment Availability
 

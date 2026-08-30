@@ -32,13 +32,14 @@ created: 2026-08-30
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 05-01-01 | 01 | 0 | REPO-01 | T-05-01 | Canonical Git identity rejects path alias confusion | real-Git integration | `cargo test -p baude-core git::tests::admission_identity` | ❌ W0 | ⬜ pending |
-| 05-01-02 | 01 | 0 | REPO-04, REPO-06 | T-05-02 | Default resolution never switches, fetches, or guesses | real-Git integration | `cargo test -p baude-core git::tests::default_branch` | ❌ W0 | ⬜ pending |
-| 05-02-01 | 02 | 0 | PERS-01 | T-05-03 | Workspace-scoped durable records round-trip without cross-wiring | unit | `cargo test -p baude-core persist::tests::current_round_trip` | ❌ W0 | ⬜ pending |
-| 05-02-02 | 02 | 0 | PERS-02 | T-05-03 | Legacy state migrates once without field loss | fixture/integration | `cargo test -p baude-core persist::tests::legacy_migration` | ❌ W0 | ⬜ pending |
-| 05-02-03 | 02 | 0 | PERS-04 | T-05-04 | Malformed state and failed writes preserve prior bytes | unit/integration | `cargo test -p baude-core persist::tests::atomic` | ❌ W0 | ⬜ pending |
-| 05-03-01 | 03 | 1 | REPO-02, REPO-03 | T-05-05 | Admission ensures at most one primary process | unit/integration | `cargo test -p baude repository_admission` | ❌ W0 | ⬜ pending |
-| 05-03-02 | 03 | 1 | PERS-03 | T-05-01 | Reconciliation blocks stale identity before launch or mutation | real-Git integration | `cargo test -p baude-core git::tests::reconciliation` | ❌ W0 | ⬜ pending |
+| 05-01-01 | 01 | 0 | REPO-01 | T-05-01, T-05-04 | Canonical Git identity rejects path alias confusion and malformed porcelain without retaining partial topology | real-Git integration | `cargo test -p baude-core git::tests::admission_identity` | ❌ W0 | ⬜ pending |
+| 05-01-02 | 01 | 0 | REPO-04, REPO-06 | T-05-02, T-05-03 | Default resolution never switches, fetches, or guesses; worktree reuse/create is inventory-verified | real-Git integration | `cargo test -p baude-core git::tests::default_branch && cargo test -p baude-core git::tests::default_worktree` | ❌ W0 | ⬜ pending |
+| 05-02-01 | 02 | 0 | PERS-01 | T-05-05, T-05-08 | Validated workspace-scoped durable records round-trip without cross-wiring | unit | `cargo test -p baude-core persist::tests::current_round_trip` | ❌ W0 | ⬜ pending |
+| 05-02-02 | 02 | 0 | PERS-02 | T-05-07, T-05-08 | Selected legacy state migrates once by reconciled identity without field loss or fallback merging | fixture/integration | `cargo test -p baude-core persist::tests::legacy_migration` | ❌ W0 | ⬜ pending |
+| 05-02-03 | 02 | 0 | PERS-04 | T-05-05, T-05-06 | Malformed state is blocking and failed writes preserve prior bytes | unit/integration | `cargo test -p baude-core persist::tests::atomic` | ❌ W0 | ⬜ pending |
+| 05-03-01 | 03 | 1 | REPO-02, REPO-03 | T-05-10, T-05-12, T-05-13 | Admission saves before spawn and ensures at most one active-backend primary process | unit/integration | `cargo test -p baude repository_admission` | ❌ W0 | ⬜ pending |
+| 05-03-02 | 03 | 1 | PERS-03 | T-05-09, T-05-11 | Reconciliation blocks stale identity and malformed persisted evidence before launch or mutation | real-Git + App integration | `cargo test -p baude-core git::tests::reconciliation` | ❌ W0 | ⬜ pending |
+| 05-03-03 | 03 | 1 | REPO-02, REPO-03, PERS-03 | T-05-10, T-05-11, T-05-13 | All local routes converge while Manager strict-load failures block save/spawn and backend identity remains workspace-selected | unit/integration | `cargo test -p baude admission_routes && cargo test -p bauded manager_persistence` | ❌ W0 | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -61,6 +62,7 @@ All phase behaviors have automated verification.
 - [x] Wave 0 covers all missing references.
 - [x] No watch-mode flags.
 - [x] Feedback latency target is below 120 seconds.
+- [x] Task 05-03-03 uses focused App/Manager filters targeted below 30 seconds; full `cargo test` remains a wave/plan gate.
 - [x] `nyquist_compliant: true` is set.
 
 **Approval:** approved 2026-08-30
