@@ -566,6 +566,15 @@ pub enum LifecycleError {
     RepositoryMissing(RepositoryKey),
     CheckoutMissing(CheckoutKey),
     Topology(String),
+    PostVerificationCompensationFailed {
+        repository: std::path::PathBuf,
+        checkout: CheckoutKey,
+        path: std::path::PathBuf,
+        branch: String,
+        created_branch: bool,
+        verification: String,
+        compensation: String,
+    },
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -582,6 +591,21 @@ impl std::fmt::Display for LifecycleError {
                 write!(f, "lifecycle checkout {} is missing", key.get())
             }
             Self::Topology(detail) => write!(f, "activation topology mismatch: {detail}"),
+            Self::PostVerificationCompensationFailed {
+                repository,
+                checkout,
+                path,
+                branch,
+                created_branch,
+                verification,
+                compensation,
+            } => write!(
+                f,
+                "post-verification activation compensation failed for checkout {} branch {branch} at {} in {} (created branch: {created_branch}): {verification}; compensation failed: {compensation}",
+                checkout.get(),
+                path.display(),
+                repository.display()
+            ),
         }
     }
 }
@@ -593,6 +617,7 @@ impl LifecycleError {
         matches!(
             self,
             Self::Git(BranchActivationError::PostAddCompensationFailed { .. })
+                | Self::PostVerificationCompensationFailed { .. }
         )
     }
 }
@@ -702,6 +727,15 @@ pub fn execute_activation(
     repository_child: &std::path::Path,
     prepared: PreparedActivation,
 ) -> Result<RecordedActivation, LifecycleError> {
+    execute_activation_with_post_git_hook(state, repository_child, prepared, |_| {})
+}
+
+fn execute_activation_with_post_git_hook(
+    state: &mut RepositoryState,
+    repository_child: &std::path::Path,
+    prepared: PreparedActivation,
+    after_git: impl FnOnce(&std::path::Path),
+) -> Result<RecordedActivation, LifecycleError> {
     let state_before = state.clone();
     let activation_repository = git::discover_repository(repository_child)?;
     let outcome = match git::activate_branch(
@@ -746,6 +780,8 @@ pub fn execute_activation(
     };
     let (disposition, created_by_baude, record) = activation_parts(outcome);
     let added_path = record.path.clone();
+    let activation_branch = prepared.request.branch.clone();
+    after_git(&added_path);
     let result = (|| {
         let fresh = git::discover_repository(&record.path)?;
         let full_ref = format!("refs/heads/{}", prepared.request.branch);
@@ -846,9 +882,41 @@ pub fn execute_activation(
             if let Err(compensation) =
                 git::remove_added_worktree(&activation_repository.main_worktree, &added_path)
             {
-                return Err(LifecycleError::Topology(format!(
-                    "post-add lifecycle verification failed: {error}; plain Git compensation failed: {compensation}"
-                )));
+                let recovery = SavedCheckout {
+                    key: prepared.checkout,
+                    repository_key: prepared.request.repository,
+                    role: CheckoutRole::ManagedBranch,
+                    managed_by_baude: true,
+                    observed_path: PersistedPath::from_path(&added_path),
+                    observed_branch: Some(format!("refs/heads/{activation_branch}")),
+                    first_seen_order: prepared.first_seen_order,
+                    active_intent: false,
+                    session: RetainedSessionState {
+                        name: activation_branch.clone(),
+                        cwd: PersistedPath::from_path(&added_path),
+                        repo_root: PersistedPath::from_path(&activation_repository.main_worktree),
+                        branch: Some(activation_branch.clone()),
+                        is_worktree: true,
+                        shell_open: false,
+                        archived: false,
+                        archived_by_user: false,
+                        resume_id: None,
+                    },
+                    health: CheckoutHealth::Unavailable(UnavailableCause::Other(format!(
+                        "post-verification compensation pending: {error}; {compensation}"
+                    ))),
+                };
+                state.checkouts.push(recovery);
+                state.validate()?;
+                return Err(LifecycleError::PostVerificationCompensationFailed {
+                    repository: activation_repository.main_worktree,
+                    checkout: prepared.checkout,
+                    path: added_path,
+                    branch: activation_branch,
+                    created_branch: matches!(disposition, ActivationDisposition::Created),
+                    verification: error.to_string(),
+                    compensation: compensation.to_string(),
+                });
             }
         }
         return Err(error);
