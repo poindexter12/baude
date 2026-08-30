@@ -1063,6 +1063,20 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(p, rect);
         }
+        Modal::ConfirmRemoveWorktree { confirmation } => {
+            let lines = remove_confirmation_lines(confirmation.path(), confirmation.branch_ref());
+            let rect = centered(area, 76, lines.len() as u16 + 2);
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(" remove managed worktree "),
+                );
+            frame.render_widget(p, rect);
+        }
         Modal::Info => {
             if let Some(r) = app.selected_remote() {
                 let dim = Style::default().fg(Color::DarkGray);
@@ -1394,6 +1408,16 @@ fn draw_modal(frame: &mut Frame, app: &App) {
     }
 }
 
+fn remove_confirmation_lines(path: &std::path::Path, branch_ref: &str) -> Vec<String> {
+    vec![
+        "Remove this clean baude-managed linked worktree?".into(),
+        format!("branch: {branch_ref}"),
+        format!("path:   {}", path.display()),
+        "The branch is retained. The repository parent and siblings are unchanged.".into(),
+        "y remove · n/esc cancel".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rate_5h_chip, remove_confirmation_lines};
@@ -1440,7 +1464,9 @@ mod tests {
             std::path::Path::new("/tmp/repo worktree"),
             "refs/heads/feature/safe-remove",
         );
-        assert!(lines.iter().any(|line| line.contains("refs/heads/feature/safe-remove")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("refs/heads/feature/safe-remove")));
         assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
         assert!(lines.iter().any(|line| line.contains("branch is retained")));
     }

@@ -237,6 +237,9 @@ pub enum Modal {
     ConfirmCloseWorktree {
         id: u64,
     },
+    ConfirmRemoveWorktree {
+        confirmation: lifecycle::RemovalConfirmation,
+    },
 }
 
 /// Active text selection within a content pane (claude or shell).
@@ -2003,21 +2006,21 @@ impl App {
                         }
                     }
                     KeyCode::Char('r') => {
-                        self.modal = Modal::None;
-                        let info = self
-                            .session(id)
-                            .map(|s| (s.repo_root.clone(), s.cwd.clone()));
-                        self.remove_session(id);
-                        if let Some((repo, wt)) = info {
-                            if git::is_dirty(&wt) {
-                                self.set_message(
-                                    "worktree has uncommitted changes — kept on disk".into(),
-                                );
-                            } else {
-                                match git::remove_worktree(&repo, &wt) {
-                                    Ok(()) => self.set_message("worktree removed".into()),
-                                    Err(e) => self.set_message(format!("worktree kept: {e}")),
-                                }
+                        let checkout = checkout_for_runtime(&self.runtime_checkouts, id);
+                        match checkout
+                            .ok_or_else(|| {
+                                lifecycle::RemovalFailure::Inspection(format!(
+                                    "runtime {id} has no retained checkout"
+                                ))
+                            })
+                            .and_then(|checkout| self.prepare_remove_worktree(checkout))
+                        {
+                            Ok(confirmation) => {
+                                self.modal = Modal::ConfirmRemoveWorktree { confirmation };
+                            }
+                            Err(error) => {
+                                self.modal = Modal::None;
+                                self.set_message(error.to_string());
                             }
                         }
                     }
@@ -2025,6 +2028,29 @@ impl App {
                     _ => {}
                 }
             }
+            Modal::ConfirmRemoveWorktree { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let modal = std::mem::replace(&mut self.modal, Modal::None);
+                    let Modal::ConfirmRemoveWorktree { confirmation } = modal else {
+                        unreachable!();
+                    };
+                    match self.confirm_remove_worktree(confirmation) {
+                        Ok(LifecycleOutcome::Removed { branch_ref, .. }) => self.set_message(
+                            format!("worktree removed — local branch {branch_ref} retained"),
+                        ),
+                        Ok(LifecycleOutcome::TopologyCommittedStateDegraded { detail, .. }) => {
+                            self.set_message(format!(
+                                "worktree topology changed; retained state needs repair: {detail}"
+                            ));
+                        }
+                        Ok(other) => self
+                            .set_message(format!("unexpected worktree removal outcome: {other:?}")),
+                        Err(error) => self.set_message(error.to_string()),
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                _ => {}
+            },
             Modal::None => {}
         }
     }
@@ -2660,10 +2686,10 @@ mod repository_admission_tests {
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
         RetainedSessionState, SavedCheckout, SavedRepository,
     };
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn git(repo: &Path, args: &[&str]) {
         assert!(Command::new("git")
