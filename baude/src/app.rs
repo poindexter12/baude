@@ -333,6 +333,10 @@ pub struct App {
     spawn_error_for_test: Option<String>,
     #[cfg(test)]
     spawn_attempts_for_test: usize,
+    #[cfg(test)]
+    remove_stop_error_for_test: Option<String>,
+    #[cfg(test)]
+    remove_git_refusal_for_test: bool,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -416,6 +420,10 @@ impl App {
             spawn_error_for_test: None,
             #[cfg(test)]
             spawn_attempts_for_test: 0,
+            #[cfg(test)]
+            remove_stop_error_for_test: None,
+            #[cfg(test)]
+            remove_git_refusal_for_test: false,
         }
     }
 
@@ -1331,6 +1339,12 @@ impl App {
             .map(|id| self.retained_runtime_snapshot(id))
             .transpose()
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        #[cfg(test)]
+        if let Some(error) = &self.remove_stop_error_for_test {
+            return Err(lifecycle::RemovalFailure::Inspection(format!(
+                "runtime stop failed: {error}"
+            )));
+        }
         if let Some(id) = runtime_id {
             self.stop_closed_runtime(checkout, id);
         }
@@ -1342,6 +1356,11 @@ impl App {
                     return self.compensate_failed_removal(checkout, runtime, failure);
                 }
             };
+        #[cfg(test)]
+        if self.remove_git_refusal_for_test {
+            std::fs::write(target.path().join("agent-race-after-second"), b"unsaved\n")
+                .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        }
         let removal = match lifecycle::execute_verified_removal(&target) {
             Ok(removal) => removal,
             Err(git::RemoveVerifiedError::Postcondition(failure)) => {
@@ -2683,8 +2702,8 @@ mod repository_admission_tests {
     };
     use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
     use baude_core::repository::{
-        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
-        RetainedSessionState, SavedCheckout, SavedRepository,
+        CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
+        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
@@ -2729,6 +2748,36 @@ mod repository_admission_tests {
             ],
         );
         repo
+    }
+
+    fn removal_app(
+        label: &str,
+        key_offset: u64,
+    ) -> (App, PathBuf, PathBuf, CheckoutKey, u64, PathBuf) {
+        let repo = admission_repo(label);
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + key_offset;
+        let created = app
+            .activate_branch_worktree(&repo, &format!("feature/{label}"))
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let path = app.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        (app, repo, root, checkout, runtime, path)
     }
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
@@ -3503,6 +3552,67 @@ mod repository_admission_tests {
             }
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn lifecycle_remove_clean_local_stop_git_and_compensation_failures_preserve_context() {
+        let (mut app, repo, root, checkout, runtime, path) =
+            removal_app("safe-remove-stop-refusal", 150_000);
+        let before = app.repository_state.clone();
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+        app.remove_stop_error_for_test = Some("teardown unavailable".into());
+
+        let stop_error = app
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(stop_error.contains("runtime stop failed"));
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+
+        app.remove_stop_error_for_test = None;
+        app.remove_git_refusal_for_test = true;
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+        let refusal = app
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("plain Git removal refused"),
+            "got: {refusal}"
+        );
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts.len(), 1);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(path.join("agent-race-after-second").is_file());
+
+        let compensated_runtime = *app.runtime_checkouts.get(&checkout).unwrap();
+        app.spawn_error_for_test = Some("resume unavailable".into());
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap_err();
+        assert!(confirmation.to_string().contains("Untracked"));
+        app.session_mut(compensated_runtime).unwrap().kill();
+        std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
+        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        std::fs::remove_dir_all(root).unwrap();
+
+        let (mut app, repo, root, checkout, _, path) =
+            removal_app("safe-remove-compensation-failure", 160_000);
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+        app.remove_git_refusal_for_test = true;
+        app.spawn_error_for_test = Some("resume unavailable".into());
+
+        let error = app
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("compensation also failed"), "got: {error}");
+        assert_eq!(app.repository_state.checkouts.len(), 1);
+        assert!(app.repository_state.checkouts[0].active_intent);
+        assert!(app.runtime_checkouts.is_empty());
+        assert!(app.sessions.is_empty());
+        std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
+        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
