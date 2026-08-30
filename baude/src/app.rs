@@ -84,13 +84,13 @@ fn checkout_for_runtime(
         .find_map(|(key, id)| (*id == runtime_id).then_some(*key))
 }
 
-#[cfg(test)]
-fn commit_then_spawn<T, E>(
-    save: impl FnOnce() -> std::result::Result<(), E>,
-    spawn: impl FnOnce() -> std::result::Result<T, E>,
+fn commit_then_spawn<C, T, E>(
+    context: &mut C,
+    save: impl FnOnce(&mut C) -> std::result::Result<(), E>,
+    spawn: impl FnOnce(&mut C) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
-    save()?;
-    spawn()
+    save(context)?;
+    spawn(context)
 }
 
 fn reconcile_legacy_session(
@@ -692,7 +692,6 @@ impl App {
             });
         }
         self.repository_state.validate()?;
-        self.save_durable()?;
         self.ensure_primary(checkout_key)
     }
 
@@ -701,7 +700,6 @@ impl App {
             self.save_durable()?;
             return Ok(None);
         }
-        self.save_durable()?;
         let checkout = self
             .repository_state
             .checkouts
@@ -715,24 +713,32 @@ impl App {
         });
         match primary_dispatch(checkout.active_intent, runtime) {
             PrimaryDispatch::Focus(id) => {
+                self.save_durable()?;
                 self.selected_id = Some(SelId::Local(id));
                 self.focus = Focus::Claude;
                 Ok(Some(id))
             }
             PrimaryDispatch::Restart(id) => {
+                self.save_durable()?;
                 self.restart_session_with_resume(id, true)?;
                 Ok(Some(id))
             }
             PrimaryDispatch::Spawn => {
                 let cwd = checkout.observed_path.to_path_buf();
                 let session = checkout.session;
-                let id = self.add_session(
-                    cwd,
-                    Some(session.repo_root.to_path_buf()),
-                    session.branch,
-                    session.is_worktree,
-                    true,
-                    session.shell_open,
+                let id = commit_then_spawn(
+                    self,
+                    |app| app.save_durable(),
+                    |app| {
+                        app.add_session(
+                            cwd,
+                            Some(session.repo_root.to_path_buf()),
+                            session.branch.clone(),
+                            session.is_worktree,
+                            true,
+                            session.shell_open,
+                        )
+                    },
                 )?;
                 if let Some(runtime) = self.session_mut(id) {
                     runtime.name = session.name;
@@ -743,7 +749,10 @@ impl App {
                 self.focus = Focus::Claude;
                 Ok(Some(id))
             }
-            PrimaryDispatch::Idle => Ok(None),
+            PrimaryDispatch::Idle => {
+                self.save_durable()?;
+                Ok(None)
+            }
         }
     }
 
@@ -2332,11 +2341,12 @@ mod repository_admission_tests {
     fn repository_admission_saves_before_spawn_and_blocks_spawn_on_save_error() {
         let events = std::cell::RefCell::new(Vec::new());
         commit_then_spawn(
-            || {
+            &mut (),
+            |_| {
                 events.borrow_mut().push("save");
                 Ok::<_, &'static str>(())
             },
-            || {
+            |_| {
                 events.borrow_mut().push("spawn");
                 Ok::<_, &'static str>(23)
             },
@@ -2346,11 +2356,12 @@ mod repository_admission_tests {
 
         events.borrow_mut().clear();
         let result = commit_then_spawn(
-            || {
+            &mut (),
+            |_| {
                 events.borrow_mut().push("save");
                 Err::<(), _>("disk full")
             },
-            || {
+            |_| {
                 events.borrow_mut().push("spawn");
                 Ok(23)
             },
