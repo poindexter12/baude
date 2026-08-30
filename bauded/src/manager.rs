@@ -2715,13 +2715,46 @@ mod tests {
         let created = manager
             .activate_branch_worktree(&repo, "feature/safe-remove-manager", None)
             .unwrap();
-        let (checkout, _) = match created {
+        let (checkout, runtime) = match created {
             LifecycleOutcome::Created {
                 checkout,
                 runtime: Some(runtime),
             } => (checkout, runtime),
             other => panic!("unexpected activation outcome: {other:?}"),
         };
+        manager.session_id_for_test(runtime, "fresh-manager-removal-target");
+        let path = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::Rename),
+        );
+        let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+        let error = manager
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("durably revoke"));
+        assert!(path.exists());
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+        assert_eq!(manager.sessions.len(), 1);
+        assert_eq!(
+            manager.repository_state.checkouts[0]
+                .session
+                .resume_id
+                .as_deref(),
+            Some("fresh-manager-removal-target")
+        );
+        assert_eq!(
+            persisted_at(&state_root, &workspace).checkouts[0]
+                .session
+                .resume_id
+                .as_deref(),
+            Some("fresh-manager-removal-target")
+        );
         let before = manager.repository_state.clone();
 
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
