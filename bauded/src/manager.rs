@@ -1453,6 +1453,7 @@ fn session_info(s: &Session) -> SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baude_core::lifecycle::LifecycleOutcome;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -1694,6 +1695,81 @@ mod tests {
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
         assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_create_activate_manager_persists_once_and_reuses_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-activate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&state_root, &workspace, None);
+
+        let created = manager
+            .activate_branch_worktree(&repo, "feature/manager-contract", None)
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert!(manager.repository_state.checkouts[0].managed_by_baude);
+        assert_eq!(
+            manager.runtime_checkouts,
+            HashMap::from([(checkout, runtime)])
+        );
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+
+        assert_eq!(
+            manager
+                .activate_branch_worktree(&repo, "feature/manager-contract", None)
+                .unwrap(),
+            LifecycleOutcome::Focused { checkout, runtime }
+        );
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+        manager.kill_all();
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -2268,6 +2268,7 @@ mod repository_admission_tests {
         active_restore_checkouts, checkout_for_runtime, commit_then_spawn, local_admission_route,
         primary_dispatch, require_same_checkout_path, App, LocalAdmissionRoute, PrimaryDispatch,
     };
+    use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
     use baude_core::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
         RetainedSessionState, SavedCheckout, SavedRepository,
@@ -2532,5 +2533,71 @@ mod repository_admission_tests {
             assert!(local_admission_route(route, false));
             assert!(!local_admission_route(route, true));
         }
+    }
+
+    #[test]
+    fn lifecycle_create_activate_local_persists_once_and_reuses_runtime() {
+        let repo = admission_repo("branch-activation");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let snapshot = baude_core::git::discover_repository(&repo).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        let repository = app.repository_state.allocate_repository_key().unwrap();
+        let order = app.repository_state.allocate_first_seen_order().unwrap();
+        app.repository_state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+
+        let created = app
+            .activate_branch_worktree(&repo, "feature/local-contract")
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        assert_eq!(app.repository_state.checkouts.len(), 1);
+        assert!(app.repository_state.checkouts[0].managed_by_baude);
+        assert!(app.repository_state.checkouts[0].active_intent);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+        let state_file = baude_core::workspace::active().state_file("state");
+        assert_eq!(
+            baude_core::persist::load_current_at(&state_root, &state_file)
+                .unwrap()
+                .state,
+            app.repository_state
+        );
+
+        assert_eq!(
+            app.activate_branch_worktree(&repo, "feature/local-contract")
+                .unwrap(),
+            LifecycleOutcome::Focused { checkout, runtime }
+        );
+        assert_eq!(app.repository_state.checkouts.len(), 1);
+        assert_eq!(app.runtime_checkouts.len(), 1);
+
+        app.repository_reservations = RepositoryReservations::default();
+        let reservation = app.repository_reservations.reserve(repository).unwrap();
+        assert_eq!(
+            app.activate_branch_worktree(&repo, "feature/while-busy")
+                .unwrap(),
+            LifecycleOutcome::Busy { repository }
+        );
+        drop(reservation);
+        for session in &mut app.sessions {
+            session.kill();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
