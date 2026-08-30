@@ -241,8 +241,30 @@ pub fn mark_removed_checkout_unavailable(
         .find(|checkout| checkout.key == checkout_key)
     {
         checkout.active_intent = true;
-        checkout.health = CheckoutHealth::Unavailable(UnavailableCause::Other(detail.into()));
+        checkout.managed_by_baude = false;
+        checkout.health =
+            CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(detail.into()));
     }
+}
+
+/// Revoke destructive ownership before crossing the Git removal boundary.
+/// Persisting this tombstone first ensures stale durable bytes cannot later
+/// grant baude authority over an externally recreated checkout.
+pub fn revoke_removal_authority(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+) -> Result<(), LifecycleError> {
+    let checkout = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    checkout.managed_by_baude = false;
+    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(
+        "removal authority revoked before Git mutation".into(),
+    ));
+    state.validate()?;
+    Ok(())
 }
 
 /// Snapshot one runtime into its durable child and deactivate only that child.
@@ -360,6 +382,15 @@ pub fn plan_reopen(
         .repositories
         .iter()
         .position(|candidate| candidate.key == repository);
+
+    if let CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(detail)) =
+        &state.checkouts[checkout_index].health
+    {
+        return Err(ReopenBlocked {
+            checkout: request.checkout,
+            cause: UnavailableCause::RemovalTombstone(detail.clone()),
+        });
+    }
 
     if let Err(error) = request.reconciliation {
         let cause = unavailable_cause(&error);
@@ -871,8 +902,9 @@ impl Drop for RepositoryReservation {
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_close, plan_reopen, ActivationRequest, CloseEffect, CloseRequest, LifecycleOutcome,
-        ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
+        plan_close, plan_reopen, revoke_removal_authority, ActivationRequest, CloseEffect,
+        CloseRequest, LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime,
+        RepositoryReservations,
     };
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
@@ -1068,6 +1100,36 @@ mod tests {
                 CheckoutHealth::Unavailable(_)
             ));
         }
+    }
+
+    #[test]
+    fn removal_tombstone_cannot_reopen_or_regain_management() {
+        let mut state = close_state();
+        let checkout = state.checkouts[0].key;
+        revoke_removal_authority(&mut state, checkout).unwrap();
+        let durable: RepositoryState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        state = durable;
+
+        let blocked = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Ok(()),
+                runtime: ReopenRuntime::Absent,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            blocked.cause,
+            crate::repository::UnavailableCause::RemovalTombstone(_)
+        ));
+        assert!(!state.checkouts[0].managed_by_baude);
+        assert!(matches!(
+            state.checkouts[0].health,
+            CheckoutHealth::Unavailable(crate::repository::UnavailableCause::RemovalTombstone(_))
+        ));
     }
 
     #[test]

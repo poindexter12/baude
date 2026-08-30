@@ -52,6 +52,9 @@ pub enum UnavailableCause {
     Missing,
     NotRepository,
     IdentityChanged,
+    /// Destructive authority was durably revoked before or during a removal
+    /// attempt. Ordinary reconciliation must never adopt a replacement path.
+    RemovalTombstone(String),
     Io(String),
     Other(String),
 }

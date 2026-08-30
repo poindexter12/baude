@@ -461,6 +461,20 @@ impl Manager {
         }
     }
 
+    fn save_removal_revocation(&mut self) -> std::result::Result<(), persist::SaveError> {
+        #[cfg(test)]
+        {
+            let failure = self.atomic_failure_for_test.take();
+            let result = self.save_checked();
+            self.atomic_failure_for_test = failure;
+            result
+        }
+        #[cfg(not(test))]
+        {
+            self.save_checked()
+        }
+    }
+
     pub fn persistence_status(&self) -> PersistenceStatus {
         PersistenceStatus {
             enabled: self.persist,
@@ -1129,6 +1143,33 @@ impl Manager {
                     return self.compensate_failed_removal(checkout, runtime, failure);
                 }
             };
+        let before_revocation = self.repository_state.clone();
+        if let Some(saved) = runtime.clone() {
+            if let Some(retained) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|retained| retained.key == checkout)
+            {
+                retained.session = saved;
+            }
+        }
+        lifecycle::revoke_removal_authority(&mut self.repository_state, checkout)
+            .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        if let Err(error) = self.save_removal_revocation() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = before_revocation;
+            }
+            return self.compensate_failed_removal(
+                checkout,
+                runtime,
+                lifecycle::RemovalFailure::Inspection(format!(
+                    "could not durably revoke removal authority: {error}"
+                )),
+            );
+        }
+        let revoked_state = self.repository_state.clone();
         let removal = match lifecycle::execute_verified_removal(&target) {
             Ok(removal) => removal,
             Err(git::RemoveVerifiedError::Postcondition(failure)) => {
@@ -1155,6 +1196,11 @@ impl Manager {
                 return Ok(LifecycleOutcome::TopologyCommittedStateDegraded { checkout, detail });
             }
             Err(error) => {
+                self.repository_state = before_revocation;
+                if self.save_removal_revocation().is_err() {
+                    self.repository_state = revoked_state;
+                    self.persistence_dirty = true;
+                }
                 return self.compensate_failed_removal(
                     checkout,
                     runtime,
