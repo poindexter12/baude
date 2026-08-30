@@ -55,6 +55,15 @@ fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> Primar
     }
 }
 
+fn active_restore_checkouts(state: &RepositoryState) -> Vec<CheckoutKey> {
+    state
+        .checkouts
+        .iter()
+        .filter(|checkout| checkout.active_intent)
+        .map(|checkout| checkout.key)
+        .collect()
+}
+
 #[cfg(test)]
 fn commit_then_spawn<T, E>(
     save: impl FnOnce() -> std::result::Result<(), E>,
@@ -461,15 +470,7 @@ impl App {
                 return;
             }
         };
-        let active: Vec<_> = self
-            .repository_state
-            .checkouts
-            .iter()
-            .filter(|checkout| {
-                checkout.role == CheckoutRole::PrimaryDefault && checkout.active_intent
-            })
-            .map(|checkout| checkout.key)
-            .collect();
+        let active = active_restore_checkouts(&self.repository_state);
         for key in active {
             if let Err(error) = self.ensure_primary(key) {
                 self.set_message(format!("restore primary: {error}"));
@@ -2151,9 +2152,63 @@ mod clipboard_tests {
 #[cfg(test)]
 mod repository_admission_tests {
     use super::{
-        commit_then_spawn, local_admission_route, primary_dispatch, LocalAdmissionRoute,
-        PrimaryDispatch,
+        active_restore_checkouts, commit_then_spawn, local_admission_route, primary_dispatch,
+        LocalAdmissionRoute, PrimaryDispatch,
     };
+    use baude_core::repository::{
+        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+        RetainedSessionState, SavedCheckout, SavedRepository,
+    };
+    use std::path::Path;
+
+    fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
+        let repository_key = state.repositories[0].key;
+        let key = state.allocate_checkout_key();
+        let order = state.allocate_first_seen_order();
+        let path = PersistedPath::from_path(Path::new("/repo/checkout"));
+        state.checkouts.push(SavedCheckout {
+            key,
+            repository_key,
+            role,
+            managed_by_baude: false,
+            observed_path: path.clone(),
+            observed_branch: Some("refs/heads/main".into()),
+            first_seen_order: order,
+            active_intent,
+            session: RetainedSessionState {
+                name: format!("{role:?}"),
+                cwd: path.clone(),
+                repo_root: path,
+                branch: Some("main".into()),
+                is_worktree: role != CheckoutRole::Main,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+            },
+            health: CheckoutHealth::Available,
+        });
+    }
+
+    #[test]
+    fn restore_includes_active_primary_and_linked_worktree_sessions() {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key();
+        let order = state.allocate_first_seen_order();
+        let path = PersistedPath::from_path(Path::new("/repo"));
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: path.clone(),
+            observed_main_worktree: path,
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, true);
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, true);
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+
+        assert_eq!(active_restore_checkouts(&state).len(), 3);
+    }
 
     #[test]
     fn repository_admission_dispatches_every_primary_state() {
