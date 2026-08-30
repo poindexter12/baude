@@ -527,7 +527,11 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_repository, parse_clone_target, parse_worktree_porcelain};
+    use super::{
+        discover_repository, ensure_default_worktree, parse_clone_target,
+        parse_worktree_porcelain, resolve_default_branch, DefaultBranchUnavailable,
+        DefaultWorktreeOutcome,
+    };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -577,7 +581,67 @@ mod tests {
                     OsStr::new("fixture"),
                 ],
             );
+            git_ok(
+                &repo,
+                &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("topic")],
+            );
             repo
+        }
+
+        fn unborn_repo(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let repo = self.root.join(relative);
+            git_ok(&self.root, &[OsStr::new("init"), repo.as_os_str()]);
+            repo
+        }
+
+        fn remote_head(&self, repo: &Path, remote: &str, branch: &str) {
+            let url = self.root.join(format!("{remote}-remote.git"));
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("remote"),
+                    OsStr::new("add"),
+                    OsStr::new(remote),
+                    url.as_os_str(),
+                ],
+            );
+            let tracking = format!("refs/remotes/{remote}/{branch}");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("update-ref"),
+                    OsStr::new(&tracking),
+                    OsStr::new("HEAD"),
+                ],
+            );
+            let remote_head = format!("refs/remotes/{remote}/HEAD");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new(&remote_head),
+                    OsStr::new(&tracking),
+                ],
+            );
+        }
+
+        fn set_main_upstream_remote(&self, repo: &Path, remote: &str) {
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("branch.topic.remote"),
+                    OsStr::new(remote),
+                ],
+            );
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("branch.topic.merge"),
+                    OsStr::new("refs/heads/topic"),
+                ],
+            );
         }
 
         fn linked_worktree(
@@ -704,6 +768,223 @@ mod tests {
             let missing_error = discover_repository(&missing).unwrap_err().to_string();
             assert!(missing_error.contains("canonicalize"));
             assert!(!missing.exists());
+        }
+    }
+
+    mod default_branch {
+        use super::*;
+
+        #[test]
+        fn main_upstream_remote_wins_and_slash_branch_is_preserved() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("preferred");
+            fixture.remote_head(&repo, "origin", "origin-default");
+            fixture.remote_head(&repo, "upstream", "team/default");
+            fixture.set_main_upstream_remote(&repo, "upstream");
+
+            let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(default.remote, "upstream");
+            assert_eq!(default.local_branch, "team/default");
+            assert_eq!(default.local_ref, "refs/heads/team/default");
+            assert_eq!(
+                default.remote_ref,
+                "refs/remotes/upstream/team/default"
+            );
+        }
+
+        #[test]
+        fn origin_is_deduplicated_fallback() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("origin fallback");
+            fixture.remote_head(&repo, "origin", "trunk");
+
+            let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(default.remote, "origin");
+            assert_eq!(default.local_branch, "trunk");
+        }
+
+        #[test]
+        fn detached_unborn_and_no_remote_are_unavailable() {
+            let fixture = GitFixture::new();
+
+            let detached = fixture.repo("detached");
+            git_ok(
+                &detached,
+                &[OsStr::new("checkout"), OsStr::new("--detach")],
+            );
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&detached).unwrap()),
+                Err(DefaultBranchUnavailable::DetachedMainHead)
+            ));
+
+            let unborn = fixture.unborn_repo("unborn");
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&unborn).unwrap()),
+                Err(DefaultBranchUnavailable::UnbornMainHead { .. })
+            ));
+
+            let no_remote = fixture.repo("no remote");
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&no_remote).unwrap()),
+                Err(DefaultBranchUnavailable::NoCandidate { .. })
+            ));
+        }
+
+        #[test]
+        fn malformed_and_dangling_remote_heads_fail_closed() {
+            let fixture = GitFixture::new();
+            let malformed = fixture.repo("malformed");
+            fixture.remote_head(&malformed, "origin", "trunk");
+            git_ok(
+                &malformed,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                    OsStr::new("refs/heads/topic"),
+                ],
+            );
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&malformed).unwrap()),
+                Err(DefaultBranchUnavailable::MalformedTarget { .. })
+            ));
+
+            let dangling = fixture.repo("dangling");
+            fixture.remote_head(&dangling, "origin", "trunk");
+            git_ok(
+                &dangling,
+                &[
+                    OsStr::new("update-ref"),
+                    OsStr::new("-d"),
+                    OsStr::new("refs/remotes/origin/trunk"),
+                ],
+            );
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&dangling).unwrap()),
+                Err(DefaultBranchUnavailable::DanglingTarget { .. })
+            ));
+        }
+    }
+
+    mod default_worktree {
+        use super::*;
+
+        #[test]
+        fn reuses_main_then_existing_linked_worktree() {
+            let fixture = GitFixture::new();
+            let main = fixture.repo("main default");
+            fixture.remote_head(&main, "origin", "topic");
+            let snapshot = discover_repository(&main).unwrap();
+            let default = resolve_default_branch(&snapshot).unwrap();
+            assert!(matches!(
+                ensure_default_worktree(&snapshot, &default, &fixture.root.join("unused"))
+                    .unwrap(),
+                DefaultWorktreeOutcome::Main(record) if record.path == main.canonicalize().unwrap()
+            ));
+
+            let linked_repo = fixture.repo("linked default");
+            git_ok(
+                &linked_repo,
+                &[OsStr::new("branch"), OsStr::new("team/default")],
+            );
+            fixture.remote_head(&linked_repo, "origin", "team/default");
+            let linked = fixture.linked_worktree(
+                &linked_repo,
+                "external default",
+                "team/default",
+            );
+            let snapshot = discover_repository(&linked_repo).unwrap();
+            let default = resolve_default_branch(&snapshot).unwrap();
+            assert!(matches!(
+                ensure_default_worktree(&snapshot, &default, &fixture.root.join("also unused"))
+                    .unwrap(),
+                DefaultWorktreeOutcome::ExistingLinked(record)
+                    if record.path == linked.canonicalize().unwrap()
+            ));
+        }
+
+        #[test]
+        fn creates_verified_default_without_mutating_main_checkout() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("creation");
+            git_ok(
+                &repo,
+                &[OsStr::new("branch"), OsStr::new("team/default")],
+            );
+            fixture.remote_head(&repo, "origin", "team/default");
+            let before_head = git_ok(&repo, &[OsStr::new("symbolic-ref"), OsStr::new("HEAD")]);
+            let before_status = git_ok(
+                &repo,
+                &[OsStr::new("status"), OsStr::new("--porcelain"), OsStr::new("-z")],
+            );
+            let before_file = std::fs::read(repo.join("tracked.txt")).unwrap();
+            let before_index = std::fs::read(repo.join(".git/index")).unwrap();
+
+            let snapshot = discover_repository(&repo).unwrap();
+            let default = resolve_default_branch(&snapshot).unwrap();
+            let managed = fixture.root.join("managed/default");
+            let outcome = ensure_default_worktree(&snapshot, &default, &managed).unwrap();
+            assert!(matches!(
+                outcome,
+                DefaultWorktreeOutcome::CreatedManaged(record)
+                    if record.path == managed.canonicalize().unwrap()
+                        && record.branch.as_deref() == Some("refs/heads/team/default")
+            ));
+
+            assert_eq!(
+                git_ok(&repo, &[OsStr::new("symbolic-ref"), OsStr::new("HEAD")]),
+                before_head
+            );
+            assert_eq!(
+                git_ok(
+                    &repo,
+                    &[OsStr::new("status"), OsStr::new("--porcelain"), OsStr::new("-z")],
+                ),
+                before_status
+            );
+            assert_eq!(std::fs::read(repo.join("tracked.txt")).unwrap(), before_file);
+            assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), before_index);
+        }
+
+        #[test]
+        fn creates_local_branch_from_exact_verified_remote_source() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("remote source");
+            fixture.remote_head(&repo, "origin", "team/default");
+            let snapshot = discover_repository(&repo).unwrap();
+            let default = resolve_default_branch(&snapshot).unwrap();
+            let managed = fixture.root.join("remote-created");
+
+            let outcome = ensure_default_worktree(&snapshot, &default, &managed).unwrap();
+            assert!(matches!(outcome, DefaultWorktreeOutcome::CreatedManaged(_)));
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--verify"),
+                    OsStr::new("refs/heads/team/default^{commit}"),
+                ],
+            );
+        }
+
+        #[test]
+        fn rejects_unregistered_managed_path_collision() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("collision");
+            git_ok(
+                &repo,
+                &[OsStr::new("branch"), OsStr::new("trunk")],
+            );
+            fixture.remote_head(&repo, "origin", "trunk");
+            let collision = fixture.root.join("collision path");
+            std::fs::create_dir(&collision).unwrap();
+            let snapshot = discover_repository(&repo).unwrap();
+            let default = resolve_default_branch(&snapshot).unwrap();
+
+            let error = ensure_default_worktree(&snapshot, &default, &collision)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("collision"));
+            assert!(discover_repository(&collision).is_err());
         }
     }
 
