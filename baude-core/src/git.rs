@@ -1569,10 +1569,10 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 mod tests {
     use super::{
         activate_branch, classify_branch, discover_repository, ensure_default_worktree,
-        existing_branch_add_arguments, new_branch_add_arguments, parse_clone_target,
-        parse_worktree_porcelain, reconcile_checkout, resolve_default_branch, BranchActivation,
-        BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
-        DefaultWorktreeOutcome, ReconciliationUnavailable,
+        existing_branch_add_arguments, managed_branch_worktree_path, new_branch_add_arguments,
+        parse_clone_target, parse_worktree_porcelain, reconcile_checkout, resolve_default_branch,
+        BranchActivation, BranchActivationError, BranchActivationOutcome,
+        DefaultBranchUnavailable, DefaultWorktreeOutcome, ReconciliationUnavailable,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2191,6 +2191,137 @@ mod tests {
                 for forbidden in ["--force", "-B", "fetch", "delete", "remove"] {
                     assert!(!new.iter().chain(&existing).any(|arg| arg == forbidden));
                 }
+            }
+        }
+
+        mod creation_safety {
+            use super::*;
+
+            #[test]
+            fn git_rejects_malformed_literals_before_allocating_a_path() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("invalid literals");
+                let snapshot = discover_repository(&repo).unwrap();
+
+                for (index, literal) in [
+                    "-leading",
+                    "name.lock",
+                    "two..dots",
+                    "@",
+                    "@{-1}",
+                    "with space",
+                    "with\u{7f}control",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let candidate = fixture.root.join(format!("candidate-{index}"));
+                    assert!(matches!(
+                        classify_branch(&snapshot, literal),
+                        Err(BranchActivationError::InvalidLiteral { .. })
+                    ));
+                    assert!(!candidate.exists());
+                }
+            }
+
+            #[test]
+            fn every_filesystem_entry_blocks_a_managed_candidate() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("filesystem collisions");
+
+                for (label, make) in [
+                    ("file", 0_u8),
+                    ("directory", 1_u8),
+                    ("symlink", 2_u8),
+                ] {
+                    let candidate = fixture.root.join(label);
+                    match make {
+                        0 => std::fs::write(&candidate, b"occupied").unwrap(),
+                        1 => std::fs::create_dir(&candidate).unwrap(),
+                        #[cfg(unix)]
+                        2 => std::os::unix::fs::symlink(&repo, &candidate).unwrap(),
+                        _ => continue,
+                    }
+                    let error = activate_branch(&repo, "existing", &candidate).unwrap_err();
+                    assert!(matches!(error, BranchActivationError::PathCollision(path) if path == candidate));
+                    assert!(classify_branch(&discover_repository(&repo).unwrap(), "existing")
+                        .is_ok());
+                }
+            }
+
+            #[test]
+            fn missing_but_registered_prunable_path_still_blocks_reuse() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("inventory collision");
+                let registered = fixture.linked_worktree(&repo, "missing registered", "registered");
+                let registered = registered.canonicalize().unwrap();
+                git_ok(&repo, &[OsStr::new("branch"), OsStr::new("existing")]);
+                git_ok(
+                    &repo,
+                    &[
+                        OsStr::new("worktree"),
+                        OsStr::new("lock"),
+                        registered.as_os_str(),
+                    ],
+                );
+                std::fs::remove_dir_all(&registered).unwrap();
+
+                let snapshot = discover_repository(&repo).unwrap();
+                assert!(snapshot
+                    .worktrees
+                    .iter()
+                    .any(|record| record.path == registered));
+                assert!(matches!(
+                    activate_branch(&repo, "existing", &registered),
+                    Err(BranchActivationError::PathCollision(path)) if path == registered
+                ));
+            }
+
+            #[test]
+            fn durable_keys_not_labels_supply_bounded_path_identity() {
+                let slash = managed_branch_worktree_path(7, 11, "feature/a");
+                let dash = managed_branch_worktree_path(7, 12, "feature-a");
+                let other_repository = managed_branch_worktree_path(8, 11, "feature/a");
+                assert_ne!(slash, dash);
+                assert_ne!(slash, other_repository);
+                assert!(slash.to_string_lossy().contains("repository-7"));
+                assert!(slash.file_name().unwrap().to_string_lossy().ends_with("-11"));
+
+                let unicode = managed_branch_worktree_path(7, 13, &"界".repeat(40));
+                let component = unicode.file_name().unwrap().to_string_lossy();
+                assert!(!component.is_empty());
+                assert!(component.len() <= 48 + "-13".len());
+            }
+
+            #[test]
+            fn lifecycle_add_argv_has_no_bypass_or_destructive_command() {
+                let path = Path::new("/tmp/untrusted target");
+                let commands = [
+                    new_branch_add_arguments("feature/literal", path, "refs/heads/main"),
+                    existing_branch_add_arguments("feature/literal", path),
+                ];
+                let forbidden = [
+                    "--force", "-B", "prune", "repair", "clean", "reset", "stash",
+                    "fetch", "delete", "-d", "-D",
+                ];
+                for command in commands {
+                    let command: Vec<_> = command
+                        .iter()
+                        .map(|argument| argument.to_string_lossy().into_owned())
+                        .collect();
+                    for forbidden in forbidden {
+                        assert!(!command.iter().any(|argument| argument == forbidden));
+                    }
+                }
+            }
+
+            #[test]
+            fn malformed_inventory_is_a_typed_refusal() {
+                let malformed = b"worktree /tmp/example\0HEAD deadbeef\0branch refs/heads/main\0";
+                assert!(matches!(
+                    parse_worktree_porcelain(malformed),
+                    Err(super::super::super::RepositoryDiscoveryError::MalformedTopology(_))
+                ));
             }
         }
     }
