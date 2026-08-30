@@ -439,13 +439,61 @@ impl Drop for RepositoryReservation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationRequest, LifecycleOutcome, RepositoryReservations};
-    use crate::repository::{RepositoryKey, RepositoryState};
-    use std::path::PathBuf;
+    use super::{
+        plan_close, ActivationRequest, CloseEffect, CloseRequest, LifecycleOutcome,
+        RepositoryReservations,
+    };
+    use crate::repository::{
+        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryKey,
+        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+    };
+    use std::path::{Path, PathBuf};
 
     fn repository_key() -> RepositoryKey {
         let mut state = RepositoryState::default();
         state.allocate_repository_key().unwrap()
+    }
+
+    fn path(value: &str) -> PersistedPath {
+        PersistedPath::from_path(Path::new(value))
+    }
+
+    fn close_state() -> RepositoryState {
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let checkout = state.allocate_checkout_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: path("/repo/.git"),
+            observed_main_worktree: path("/repo"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        state.checkouts.push(SavedCheckout {
+            key: checkout,
+            repository_key: repository,
+            role: CheckoutRole::ManagedBranch,
+            managed_by_baude: true,
+            observed_path: path("/repo-feature"),
+            observed_branch: Some("refs/heads/feature/close".into()),
+            first_seen_order: checkout_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name: "old name".into(),
+                cwd: path("/repo-feature"),
+                repo_root: path("/repo"),
+                branch: Some("feature/close".into()),
+                is_worktree: true,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+            health: CheckoutHealth::Available,
+        });
+        state
     }
 
     #[test]
@@ -474,5 +522,73 @@ mod tests {
         );
         drop(guard);
         assert!(reservations.reserve(repository).is_ok());
+    }
+
+    #[test]
+    fn close_schema_defaults_missing_resume_id_and_round_trips_opaque_value() {
+        let mut old = serde_json::to_value(close_state().checkouts[0].session.clone()).unwrap();
+        old.as_object_mut().unwrap().remove("resume_id");
+        let compatible: RetainedSessionState = serde_json::from_value(old).unwrap();
+        assert_eq!(compatible.resume_id, None);
+
+        let hostile = "../../repo; $(touch nope)\nopaque\0conversation";
+        let mut present = serde_json::to_value(compatible).unwrap();
+        present["resume_id"] = serde_json::Value::String(hostile.into());
+        let retained: RetainedSessionState = serde_json::from_value(present).unwrap();
+        assert_eq!(retained.resume_id.as_deref(), Some(hostile));
+        let round_trip: RetainedSessionState =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert_eq!(round_trip.resume_id.as_deref(), Some(hostile));
+    }
+
+    #[test]
+    fn close_preserves_hierarchy_and_orders_snapshot_save_before_stop() {
+        let mut state = close_state();
+        let before = state.clone();
+        let checkout = state.checkouts[0].key;
+        let runtime = RetainedSessionState {
+            name: "live name".into(),
+            cwd: path("/repo-feature"),
+            repo_root: path("/repo"),
+            branch: Some("feature/close".into()),
+            is_worktree: true,
+            shell_open: true,
+            archived: true,
+            archived_by_user: true,
+            resume_id: Some("backend-owned-id".into()),
+        };
+
+        let plan = plan_close(
+            &mut state,
+            CloseRequest {
+                checkout,
+                runtime: runtime.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.effects,
+            [
+                CloseEffect::SnapshotRuntime,
+                CloseEffect::SaveInactiveIntent,
+                CloseEffect::StopRuntime,
+            ]
+        );
+        assert_eq!(plan.outcome, LifecycleOutcome::Closed { checkout });
+        assert_eq!(state.repositories, before.repositories);
+        assert_eq!(state.checkouts.len(), before.checkouts.len());
+        let closed = &state.checkouts[0];
+        let original = &before.checkouts[0];
+        assert_eq!(closed.key, original.key);
+        assert_eq!(closed.repository_key, original.repository_key);
+        assert_eq!(closed.role, original.role);
+        assert_eq!(closed.managed_by_baude, original.managed_by_baude);
+        assert_eq!(closed.observed_path, original.observed_path);
+        assert_eq!(closed.observed_branch, original.observed_branch);
+        assert_eq!(closed.first_seen_order, original.first_seen_order);
+        assert_eq!(closed.health, original.health);
+        assert_eq!(closed.session, runtime);
+        assert!(!closed.active_intent);
     }
 }
