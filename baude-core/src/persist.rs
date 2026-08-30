@@ -306,6 +306,7 @@ fn migrate_legacy(
 ) -> Result<RepositoryState> {
     let mut state = RepositoryState::default();
     let mut repositories = HashMap::new();
+    let mut singleton_roles = std::collections::HashSet::new();
 
     for (source_order, session) in legacy.sessions.into_iter().enumerate() {
         let (
@@ -315,7 +316,7 @@ fn migrate_legacy(
             repository_health,
             checkout_path,
             observed_branch,
-            checkout_role,
+            mut checkout_role,
             managed_by_baude,
             checkout_health,
         ) = match reconcile(&session) {
@@ -371,6 +372,15 @@ fn migrate_legacy(
             repositories.insert(identity, key);
             key
         };
+
+        if matches!(checkout_role, CheckoutRole::Main | CheckoutRole::PrimaryDefault)
+            && !singleton_roles.insert((repository_key, checkout_role))
+        {
+            // Legacy state permits multiple sessions in one checkout. Keep one
+            // structural singleton and retain every additional session as an
+            // independently restorable non-singleton child.
+            checkout_role = CheckoutRole::ManagedBranch;
+        }
 
         let checkout_key = state.allocate_checkout_key();
         let first_seen_order = state.allocate_first_seen_order();
@@ -800,6 +810,33 @@ mod tests {
     #[test]
     fn legacy_migration_daemon() {
         assert_legacy_migration("daemon-state");
+    }
+
+    #[test]
+    fn legacy_migration_retains_duplicate_main_and_linked_sessions() {
+        let mut legacy = legacy_fixture("duplicates");
+        legacy.sessions.push(legacy.sessions[0].clone());
+        legacy.sessions.push(legacy.sessions[1].clone());
+
+        let migrated = migrate_legacy(legacy, &mut reconcile_legacy).unwrap();
+        assert_eq!(migrated.checkouts.len(), 5);
+        let shared_repository = migrated.checkouts[0].repository_key;
+        assert_eq!(
+            migrated
+                .checkouts
+                .iter()
+                .filter(|checkout| {
+                    checkout.repository_key == shared_repository
+                        && checkout.role == CheckoutRole::Main
+                })
+                .count(),
+            1
+        );
+        assert!(migrated
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.active_intent));
+        migrated.validate().unwrap();
     }
 
     #[test]
