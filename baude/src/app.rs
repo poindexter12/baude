@@ -75,6 +75,15 @@ fn require_same_checkout_path(checkout: &SavedCheckout, observed: &Path) -> Resu
     Ok(())
 }
 
+fn checkout_for_runtime(
+    runtime_checkouts: &HashMap<CheckoutKey, u64>,
+    runtime_id: u64,
+) -> Option<CheckoutKey> {
+    runtime_checkouts
+        .iter()
+        .find_map(|(key, id)| (*id == runtime_id).then_some(*key))
+}
+
 #[cfg(test)]
 fn commit_then_spawn<T, E>(
     save: impl FnOnce() -> std::result::Result<(), E>,
@@ -1946,7 +1955,17 @@ impl App {
     }
 
     fn restart_session(&mut self, id: u64) {
-        if let Err(error) = self.restart_session_with_resume(id, false) {
+        let result = (|| -> Result<()> {
+            if let Some(checkout_key) = checkout_for_runtime(&self.runtime_checkouts, id) {
+                if !self.reconcile_primary(checkout_key) {
+                    self.save_durable()?;
+                    anyhow::bail!("checkout changed externally; restart blocked");
+                }
+                self.save_durable()?;
+            }
+            self.restart_session_with_resume(id, false)
+        })();
+        if let Err(error) = result {
             self.set_message(format!("restart failed: {error}"));
         }
     }
@@ -2174,12 +2193,13 @@ mod clipboard_tests {
 mod repository_admission_tests {
     use super::{
         active_restore_checkouts, commit_then_spawn, local_admission_route, primary_dispatch,
-        require_same_checkout_path, LocalAdmissionRoute, PrimaryDispatch,
+        require_same_checkout_path, checkout_for_runtime, LocalAdmissionRoute, PrimaryDispatch,
     };
     use baude_core::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
         RetainedSessionState, SavedCheckout, SavedRepository,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
@@ -2255,6 +2275,27 @@ mod repository_admission_tests {
             state.checkouts[0].observed_path.to_path_buf(),
             PathBuf::from("/managed/default")
         );
+    }
+
+    #[test]
+    fn manual_restart_resolves_managed_runtime_for_reconciliation() {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key();
+        let order = state.allocate_first_seen_order();
+        let path = PersistedPath::from_path(Path::new("/repo"));
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: path.clone(),
+            observed_main_worktree: path,
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
+        let checkout_key = state.checkouts[0].key;
+        let runtimes = HashMap::from([(checkout_key, 41)]);
+
+        assert_eq!(checkout_for_runtime(&runtimes, 41), Some(checkout_key));
+        assert_eq!(checkout_for_runtime(&runtimes, 99), None);
     }
 
     #[test]
