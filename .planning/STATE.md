@@ -1,17 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.0
-milestone_name: Repository Worktree Management
+milestone_name: Repository Worktree Management (Planned)
+current_phase: 6
+current_phase_name: safe managed worktree lifecycle
 status: executing
-stopped_at: Completed 05-03-PLAN.md
-last_updated: "2026-08-30T19:28:38.974Z"
+stopped_at: Completed 06-01-PLAN.md
+last_updated: "2026-08-30T20:30:45.239Z"
 last_activity: 2026-08-30
+state_head: 475f14911c5f0d4b443dcba064586a55f23ebb3a
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 3
-  completed_plans: 3
-  percent: 20
+  total_plans: 9
+  completed_plans: 4
+  percent: 44
 ---
 
 # Project State
@@ -21,30 +24,30 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 5 — Durable Repository Admission
+**Current focus:** Phase 6 — Safe Managed Worktree Lifecycle
 
 ## Current Position
 
 Phase: 6 of 9 (safe managed worktree lifecycle)
-Plan: Not started
+Plan: 2 of 6
 Status: Ready to execute
 Last activity: 2026-08-30
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██░░░░░░░░] 17%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- v2.0 plans completed: 0
+- v2.0 plans completed: 4
 - Prior milestone: 14 plans completed across 4 phases
-- Average duration: Not yet available for v2.0
-- Total execution time: Not yet available for v2.0
+- Average duration: 13 min
+- Total execution time: 51 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 5. Durable Repository Admission | 0/TBD | - | - |
-| 6. Safe Managed Worktree Lifecycle | 0/TBD | - | - |
+| 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
+| 6. Safe Managed Worktree Lifecycle | 1/6 | 13 min | 13 min |
 | 7. Local Repository Hierarchy & Branch Control | 0/TBD | - | - |
 | 8. Daemon & Remote TUI Parity | 0/TBD | - | - |
 | 9. PWA Hierarchy & Cross-Surface Completion | 0/TBD | - | - |
@@ -55,6 +58,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P01 | 10m | 2 tasks | 1 files |
 | Phase 05 P02 | 14min | 3 tasks | 3 files |
 | Phase 5 P3 | 14min | 3 tasks | 4 files |
+| Phase 06 P01 | 13min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -76,6 +80,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 5]: Primary runtime dispatch uses durable active intent plus a stable checkout-key runtime association, never display name or cwd.
 - [Phase 5]: Checkout reuse requires fresh common-directory, canonical-path, full-ref, and unlocked/non-prunable reconciliation.
 - [Phase 5]: App and daemon load failures block automatic saves and subsequent process launches until state evidence is repaired.
+- [Phase 6]: Branch text is accepted only after literal Git validation, exact local-ref classification, and fresh inventory checks.
+- [Phase 6]: Repository lifecycle mutations reserve by durable RepositoryKey and release through RAII guards.
+- [Phase 6]: App and Manager persist shared activation transitions before associating runtimes by CheckoutKey.
 
 ### Pending Todos
 
@@ -102,6 +109,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T17:59:36.904Z
-Stopped at: Completed 05-03-PLAN.md
+Last session: 2026-08-30T20:30:38.464Z
+Stopped at: Completed 06-01-PLAN.md
 Resume file: None

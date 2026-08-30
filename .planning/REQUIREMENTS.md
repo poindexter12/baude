@@ -25,7 +25,7 @@
 
 ### Worktree Lifecycle
 
-- [ ] **WORK-01**: User can create a valid named branch or activate an eligible existing local branch as a managed worktree from repository context.
+- [x] **WORK-01**: User can create a valid named branch or activate an eligible existing local branch as a managed worktree from repository context.
 - [ ] **WORK-02**: Baude refuses invalid refs, path collisions, and branches already checked out elsewhere without bypassing Git safeguards.
 - [ ] **WORK-03**: User can close a worktree session while retaining its checkout and hierarchy child for later reopening.
 - [ ] **WORK-04**: User can reopen a retained main-checkout or worktree child in the active workspace backend.
@@ -93,7 +93,7 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | HIER-04 | Phase 7 | Pending |
 | HIER-05 | Phase 7 | Pending |
 | HIER-06 | Phase 7 | Pending |
-| WORK-01 | Phase 6 | Pending |
+| WORK-01 | Phase 6 | Complete |
 | WORK-02 | Phase 6 | Pending |
 | WORK-03 | Phase 6 | Pending |
 | WORK-04 | Phase 6 | Pending |
