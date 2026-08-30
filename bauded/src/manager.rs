@@ -659,7 +659,27 @@ impl Manager {
         }
 
         if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
-            if self.sessions.iter().any(|session| session.id == runtime) {
+            if let Some(exited) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == runtime)
+                .map(|session| session.claude.is_exited())
+            {
+                if exited {
+                    let mode = self
+                        .repository_state
+                        .checkouts
+                        .iter()
+                        .find(|checkout| checkout.key == activation.checkout)
+                        .and_then(|checkout| checkout.session.resume_id.clone())
+                        .map(backend::SpawnMode::ResumeId)
+                        .unwrap_or(backend::SpawnMode::ContinueLatest);
+                    self.restart_with_mode(runtime, mode)?;
+                    return Ok(LifecycleOutcome::Reopened {
+                        checkout: activation.checkout,
+                        runtime,
+                    });
+                }
                 return Ok(LifecycleOutcome::Focused {
                     checkout: activation.checkout,
                     runtime,
@@ -2231,6 +2251,19 @@ mod tests {
         );
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(manager.runtime_checkouts.len(), 1);
+
+        manager
+            .session_mut(runtime)
+            .unwrap()
+            .kill_and_wait()
+            .unwrap();
+        assert_eq!(
+            manager
+                .activate_branch_worktree(&repo, "feature/manager-contract", None)
+                .unwrap(),
+            LifecycleOutcome::Reopened { checkout, runtime }
+        );
+        assert!(!manager.session(runtime).unwrap().claude.is_exited());
 
         let different = manager
             .activate_branch_worktree(&repo, "feature/manager-distinct", None)
