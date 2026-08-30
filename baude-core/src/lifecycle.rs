@@ -1,17 +1,18 @@
 //! Shared, UI-free repository lifecycle contracts.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::backend::SpawnMode;
 use crate::git::{
-    self, BranchActivationError, BranchActivationOutcome, RepositoryDiscoveryError,
-    RepositorySnapshot, WorktreeRecord,
+    self, BranchActivationError, BranchActivationOutcome, ReconciliationUnavailable,
+    RepositoryDiscoveryError, RepositorySnapshot, WorktreeRecord,
 };
 use crate::repository::{
     AllocationError, CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
     RepositoryKey, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
-    ValidationError,
+    UnavailableCause, ValidationError,
 };
 
 /// A literal branch activation rooted in one durable repository identity.
@@ -96,6 +97,139 @@ pub fn plan_close(
         outcome: LifecycleOutcome::Closed {
             checkout: request.checkout,
         },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenRuntime {
+    Absent,
+    Live { id: u64 },
+    Exited { id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenDispatch {
+    Focus { id: u64 },
+    Restart { id: u64 },
+    Spawn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenEffect {
+    SaveActiveIntent,
+    DispatchRuntime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReopenRequest {
+    pub checkout: CheckoutKey,
+    /// A fresh exact-path/common-directory/full-ref/lock reconciliation made
+    /// after the repository reservation was acquired.
+    pub reconciliation: Result<(), ReconciliationUnavailable>,
+    pub runtime: ReopenRuntime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReopenPlan {
+    pub repository: RepositoryKey,
+    pub checkout: CheckoutKey,
+    pub effects: [ReopenEffect; 2],
+    pub dispatch: ReopenDispatch,
+    pub mode: SpawnMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReopenBlocked {
+    checkout: CheckoutKey,
+    pub cause: UnavailableCause,
+}
+
+impl ReopenBlocked {
+    pub fn checkout(&self) -> CheckoutKey {
+        self.checkout
+    }
+}
+
+fn unavailable_cause(error: &ReconciliationUnavailable) -> UnavailableCause {
+    match error {
+        ReconciliationUnavailable::Missing { .. } => UnavailableCause::Missing,
+        ReconciliationUnavailable::IdentityChanged { .. }
+        | ReconciliationUnavailable::PathChanged { .. }
+        | ReconciliationUnavailable::BranchChanged { .. }
+        | ReconciliationUnavailable::Detached
+        | ReconciliationUnavailable::LockedOrPrunable => UnavailableCause::IdentityChanged,
+        ReconciliationUnavailable::Discovery { detail, .. } => {
+            UnavailableCause::Other(detail.clone())
+        }
+    }
+}
+
+/// Apply the shared reopen transition only after the caller supplies fresh Git
+/// reconciliation. Unavailable facts update health for presentation but never
+/// flip active intent or authorize a runtime effect.
+pub fn plan_reopen(
+    state: &mut RepositoryState,
+    request: ReopenRequest,
+) -> Result<ReopenPlan, ReopenBlocked> {
+    let Some(checkout_index) = state
+        .checkouts
+        .iter()
+        .position(|checkout| checkout.key == request.checkout)
+    else {
+        return Err(ReopenBlocked {
+            checkout: request.checkout,
+            cause: UnavailableCause::Missing,
+        });
+    };
+    let repository = state.checkouts[checkout_index].repository_key;
+    let repository_index = state
+        .repositories
+        .iter()
+        .position(|candidate| candidate.key == repository);
+
+    if let Err(error) = request.reconciliation {
+        let cause = unavailable_cause(&error);
+        state.checkouts[checkout_index].health = CheckoutHealth::Unavailable(cause.clone());
+        if let Some(index) = repository_index {
+            state.repositories[index].health = RepositoryHealth::Unavailable(cause.clone());
+        }
+        return Err(ReopenBlocked {
+            checkout: request.checkout,
+            cause,
+        });
+    }
+
+    let mode = state.checkouts[checkout_index]
+        .session
+        .resume_id
+        .clone()
+        .map(SpawnMode::ResumeId)
+        .unwrap_or(SpawnMode::ContinueLatest);
+    let mut next = state.clone();
+    next.checkouts[checkout_index].active_intent = true;
+    next.checkouts[checkout_index].health = CheckoutHealth::Available;
+    if let Some(index) = repository_index {
+        next.repositories[index].health = RepositoryHealth::Available;
+    }
+    // The existing state was validated at load/admission. Reopen changes only
+    // intent and health, so this cannot create a new aggregate invariant.
+    debug_assert!(next.validate().is_ok());
+    *state = next;
+
+    let dispatch = match request.runtime {
+        ReopenRuntime::Live { id } => ReopenDispatch::Focus { id },
+        ReopenRuntime::Exited { id } => ReopenDispatch::Restart { id },
+        ReopenRuntime::Absent => ReopenDispatch::Spawn,
+    };
+    Ok(ReopenPlan {
+        repository,
+        checkout: request.checkout,
+        effects: [
+            ReopenEffect::SaveActiveIntent,
+            ReopenEffect::DispatchRuntime,
+        ],
+        dispatch,
+        mode,
     })
 }
 
@@ -457,12 +591,21 @@ pub enum LifecycleOutcome {
     Busy {
         repository: RepositoryKey,
     },
+    ReopenPending {
+        checkout: CheckoutKey,
+    },
 }
 
 /// Cloneable reservation registry. Guards release their repository on drop.
 #[derive(Clone, Debug, Default)]
 pub struct RepositoryReservations {
-    held: Arc<Mutex<HashSet<RepositoryKey>>>,
+    held: Arc<Mutex<HashMap<RepositoryKey, ReservationKind>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationKind {
+    Mutation,
+    Reopen(CheckoutKey),
 }
 
 impl RepositoryReservations {
@@ -471,9 +614,31 @@ impl RepositoryReservations {
         repository: RepositoryKey,
     ) -> Result<RepositoryReservation, LifecycleOutcome> {
         let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
-        if !held.insert(repository) {
+        if held.contains_key(&repository) {
             return Err(LifecycleOutcome::Busy { repository });
         }
+        held.insert(repository, ReservationKind::Mutation);
+        drop(held);
+        Ok(RepositoryReservation {
+            held: Arc::clone(&self.held),
+            repository,
+        })
+    }
+
+    pub fn reserve_reopen(
+        &self,
+        repository: RepositoryKey,
+        checkout: CheckoutKey,
+    ) -> Result<RepositoryReservation, LifecycleOutcome> {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        match held.get(&repository) {
+            Some(ReservationKind::Reopen(held_checkout)) if *held_checkout == checkout => {
+                return Err(LifecycleOutcome::ReopenPending { checkout });
+            }
+            Some(_) => return Err(LifecycleOutcome::Busy { repository }),
+            None => {}
+        }
+        held.insert(repository, ReservationKind::Reopen(checkout));
         drop(held);
         Ok(RepositoryReservation {
             held: Arc::clone(&self.held),
@@ -484,7 +649,7 @@ impl RepositoryReservations {
 
 #[derive(Debug)]
 pub struct RepositoryReservation {
-    held: Arc<Mutex<HashSet<RepositoryKey>>>,
+    held: Arc<Mutex<HashMap<RepositoryKey, ReservationKind>>>,
     repository: RepositoryKey,
 }
 
@@ -702,7 +867,10 @@ mod tests {
     #[test]
     fn reopen_saves_active_intent_before_deterministic_runtime_dispatch() {
         let vectors = [
-            (ReopenRuntime::Live { id: 7 }, ReopenDispatch::Focus { id: 7 }),
+            (
+                ReopenRuntime::Live { id: 7 },
+                ReopenDispatch::Focus { id: 7 },
+            ),
             (
                 ReopenRuntime::Exited { id: 8 },
                 ReopenDispatch::Restart { id: 8 },
@@ -755,7 +923,9 @@ mod tests {
         let guard = reservations.reserve_reopen(repository, checkout).unwrap();
 
         assert_eq!(
-            reservations.reserve_reopen(repository, checkout).unwrap_err(),
+            reservations
+                .reserve_reopen(repository, checkout)
+                .unwrap_err(),
             LifecycleOutcome::ReopenPending { checkout }
         );
         assert_eq!(
