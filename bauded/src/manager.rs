@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 use baude_core::backend;
 use baude_core::git;
+use baude_core::lifecycle::{self, LifecycleOutcome, RepositoryReservations};
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
@@ -88,6 +89,7 @@ pub struct Manager {
     permission_notify: HashMap<u64, Arc<Notify>>,
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
+    repository_reservations: RepositoryReservations,
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
@@ -289,6 +291,7 @@ impl Manager {
             permission_notify: HashMap::new(),
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
+            repository_reservations: RepositoryReservations::default(),
             persistence_blocked: false,
             persistence_dirty: false,
             persistence_error: None,
@@ -556,13 +559,33 @@ impl Manager {
         if !repo.is_dir() {
             return Err(anyhow!("not a directory: {}", repo.display()).into());
         }
+        if let Some(branch) = worktree {
+            let outcome = self.activate_branch_worktree(&repo, branch, name)?;
+            let runtime = match outcome {
+                LifecycleOutcome::Created {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Activated {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Reused {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Focused { runtime, .. } => runtime,
+                LifecycleOutcome::Busy { .. } => {
+                    return Err(anyhow!("repository lifecycle is busy; retry the action").into())
+                }
+                _ => return Err(anyhow!("activation produced no runtime").into()),
+            };
+            return Ok(self
+                .info(runtime)
+                .expect("activation runtime just resolved"));
+        }
         let (cwd, repo_root, branch, is_worktree) = match worktree {
-            Some(branch) => {
-                let root = git::repo_root(&repo)
-                    .ok_or_else(|| anyhow!("not a git repo: {}", repo.display()))?;
-                let dir = git::create_worktree(&root, branch)?;
-                (dir, root, Some(branch.to_string()), true)
-            }
+            Some(_) => unreachable!("worktree activation returned above"),
             None => {
                 let root = git::repo_root(&repo).unwrap_or_else(|| repo.clone());
                 (repo, root, None, false)
@@ -609,6 +632,68 @@ impl Manager {
         }
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         Ok(self.info(id).expect("session just spawned"))
+    }
+
+    fn activate_branch_worktree(
+        &mut self,
+        repository_child: &Path,
+        branch: &str,
+        name: Option<&str>,
+    ) -> MutationResult<LifecycleOutcome> {
+        let snapshot = git::discover_repository(repository_child).map_err(anyhow::Error::new)?;
+        let mut next = self.repository_state.clone();
+        let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)
+            .map_err(anyhow::Error::new)?;
+        let repository = prepared.request.repository;
+        let _reservation = match self.repository_reservations.reserve(repository) {
+            Ok(reservation) => reservation,
+            Err(busy) => return Ok(busy),
+        };
+        let activation = lifecycle::execute_activation(&mut next, repository_child, prepared)
+            .map_err(anyhow::Error::new)?;
+        if let Some(name) = name {
+            if let Some(checkout) = next
+                .checkouts
+                .iter_mut()
+                .find(|checkout| checkout.key == activation.checkout)
+            {
+                checkout.session.name = name.to_owned();
+            }
+        }
+        let state_before = self.repository_state.clone();
+        self.repository_state = next;
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+
+        if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
+            if self.sessions.iter().any(|session| session.id == runtime) {
+                return Ok(LifecycleOutcome::Focused {
+                    checkout: activation.checkout,
+                    runtime,
+                });
+            }
+        }
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == activation.checkout)
+            .cloned()
+            .ok_or_else(|| anyhow!("activated checkout is missing"))?;
+        let id = self.spawn(
+            activation.path.clone(),
+            activation.main_worktree.clone(),
+            Some(activation.branch.clone()),
+            activation.path != activation.main_worktree,
+            Some(&checkout.session.name),
+            false,
+        )?;
+        self.runtime_checkouts.insert(activation.checkout, id);
+        Ok(activation.outcome(Some(id)))
     }
 
     fn record_checkout_intent(
@@ -1738,6 +1823,7 @@ mod tests {
             |_| {},
         );
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id());
         manager.persist_at_for_test(&state_root, &workspace, None);
 
         let created = manager
@@ -1770,6 +1856,20 @@ mod tests {
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(manager.runtime_checkouts.len(), 1);
         manager.kill_all();
+        let linked: Vec<_> = manager
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.observed_path.to_path_buf())
+            .filter(|path| path != &repo)
+            .collect();
+        for path in linked {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

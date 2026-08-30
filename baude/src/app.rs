@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 
 use baude_core::backend;
 use baude_core::git;
+use baude_core::lifecycle::{self, LifecycleOutcome, RepositoryReservations};
 use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
 use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::{now_ms, Pty};
@@ -342,6 +343,7 @@ pub struct App {
     desktop_notify_enabled: bool,
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
+    repository_reservations: RepositoryReservations,
     persistence_blocked: bool,
     persistence_dirty: bool,
     #[cfg(test)]
@@ -422,6 +424,7 @@ impl App {
                 .unwrap_or(true),
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
+            repository_reservations: RepositoryReservations::default(),
             persistence_blocked: false,
             persistence_dirty: false,
             #[cfg(test)]
@@ -734,6 +737,72 @@ impl App {
         }
         self.repository_state.validate()?;
         self.ensure_primary(checkout_key)
+    }
+
+    pub fn activate_branch_worktree(
+        &mut self,
+        repository_child: &Path,
+        branch: &str,
+    ) -> Result<LifecycleOutcome> {
+        let snapshot = git::discover_repository(repository_child)?;
+        let mut next = self.repository_state.clone();
+        let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)?;
+        let repository = prepared.request.repository;
+        let _reservation = match self.repository_reservations.reserve(repository) {
+            Ok(reservation) => reservation,
+            Err(busy) => return Ok(busy),
+        };
+        let activation = lifecycle::execute_activation(&mut next, repository_child, prepared)?;
+        self.repository_state = next;
+
+        if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
+            if let Some(exited) = self
+                .session(runtime)
+                .map(|session| session.claude.is_exited())
+            {
+                self.save_durable()?;
+                if exited {
+                    self.restart_session_with_resume(runtime, true)?;
+                }
+                self.selected_id = Some(SelId::Local(runtime));
+                self.focus = Focus::Claude;
+                return Ok(LifecycleOutcome::Focused {
+                    checkout: activation.checkout,
+                    runtime,
+                });
+            }
+        }
+
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == activation.checkout)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("activated checkout is missing"))?;
+        let id = commit_then_spawn(
+            self,
+            |app| app.save_durable(),
+            |app| {
+                app.add_session(
+                    activation.path.clone(),
+                    Some(activation.main_worktree.clone()),
+                    Some(activation.branch.clone()),
+                    activation.path != activation.main_worktree,
+                    false,
+                    checkout.session.shell_open,
+                )
+            },
+        )?;
+        if let Some(runtime) = self.session_mut(id) {
+            runtime.name = checkout.session.name;
+            runtime.archived = checkout.session.archived;
+            runtime.archived_by_user = checkout.session.archived_by_user;
+        }
+        self.runtime_checkouts.insert(activation.checkout, id);
+        self.selected_id = Some(SelId::Local(id));
+        self.focus = Focus::Claude;
+        Ok(activation.outcome(Some(id)))
     }
 
     pub fn ensure_primary(&mut self, checkout_key: CheckoutKey) -> Result<Option<u64>> {
@@ -1729,21 +1798,11 @@ impl App {
                     }
                     return;
                 }
-                match git::create_worktree(&repo_root, &value) {
-                    Ok(dir) => match self.add_session(
-                        dir,
-                        Some(repo_root),
-                        Some(value),
-                        true,
-                        false,
-                        false,
-                    ) {
-                        Ok(_) => {
-                            self.focus = Focus::Claude;
-                            self.save();
-                        }
-                        Err(e) => self.set_message(format!("spawn failed: {e}")),
-                    },
+                match self.activate_branch_worktree(&repo_root, &value) {
+                    Ok(LifecycleOutcome::Busy { .. }) => {
+                        self.set_message("repository lifecycle is busy; retry the action".into())
+                    }
+                    Ok(_) => self.set_message(format!("activated branch {value}")),
                     Err(e) => self.set_message(format!("worktree: {e}")),
                 }
             }
@@ -2547,6 +2606,7 @@ mod repository_admission_tests {
         app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
         app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         app.persistence_root_for_test = Some(state_root.clone());
+        app.repository_state.next_repository_key = u64::from(std::process::id());
         let repository = app.repository_state.allocate_repository_key().unwrap();
         let order = app.repository_state.allocate_first_seen_order().unwrap();
         app.repository_state.repositories.push(SavedRepository {
@@ -2587,6 +2647,38 @@ mod repository_admission_tests {
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert_eq!(app.runtime_checkouts.len(), 1);
 
+        git(&repo, &["branch", "external-occupied"]);
+        let external = root.join("external-occupied");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                external.to_str().unwrap(),
+                "external-occupied",
+            ],
+        );
+        let reused = app
+            .activate_branch_worktree(&repo, "external-occupied")
+            .unwrap();
+        assert!(matches!(
+            reused,
+            LifecycleOutcome::Reused {
+                managed_by_baude: false,
+                runtime: Some(_),
+                ..
+            }
+        ));
+        let external = external.canonicalize().unwrap();
+        assert!(
+            !app.repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.observed_path.to_path_buf() == external)
+                .unwrap()
+                .managed_by_baude
+        );
+
         app.repository_reservations = RepositoryReservations::default();
         let reservation = app.repository_reservations.reserve(repository).unwrap();
         assert_eq!(
@@ -2597,6 +2689,20 @@ mod repository_admission_tests {
         drop(reservation);
         for session in &mut app.sessions {
             session.kill();
+        }
+        let linked: Vec<_> = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.observed_path.to_path_buf())
+            .filter(|path| path != &repo)
+            .collect();
+        for path in linked {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
         }
         std::fs::remove_dir_all(root).unwrap();
     }
