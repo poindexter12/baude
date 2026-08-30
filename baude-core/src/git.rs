@@ -982,6 +982,10 @@ pub enum BranchActivationError {
     DefaultUnavailable(DefaultBranchUnavailable),
     DefaultLocalRefMissing(String),
     PathCollision(PathBuf),
+    PathInspection {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     CreateParent {
         path: PathBuf,
         source: std::io::Error,
@@ -1018,6 +1022,9 @@ impl fmt::Display for BranchActivationError {
             Self::PathCollision(path) => {
                 write!(f, "managed branch path collision at {}", path.display())
             }
+            Self::PathInspection { path, source } => {
+                write!(f, "inspect managed branch path {}: {source}", path.display())
+            }
             Self::CreateParent { path, source } => {
                 write!(f, "create managed branch parent {}: {source}", path.display())
             }
@@ -1043,7 +1050,9 @@ impl std::error::Error for BranchActivationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::DefaultUnavailable(error) => Some(error),
-            Self::CreateParent { source, .. } | Self::CommandStart { source, .. } => Some(source),
+            Self::PathInspection { source, .. }
+            | Self::CreateParent { source, .. }
+            | Self::CommandStart { source, .. } => Some(source),
             Self::Discovery(error) => Some(error),
             _ => None,
         }
@@ -1083,6 +1092,48 @@ fn existing_branch_add_arguments(name: &str, path: &Path) -> Vec<OsString> {
         path.as_os_str().to_owned(),
         OsString::from(name),
     ]
+}
+
+fn candidate_inventory_path(path: &Path) -> std::result::Result<PathBuf, BranchActivationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(BranchActivationError::PathCollision(path.to_path_buf())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(BranchActivationError::PathInspection {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    let parent = path.parent().ok_or_else(|| {
+        BranchActivationError::Verification("managed branch path has no parent".into())
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        BranchActivationError::Verification("managed branch path has no final component".into())
+    })?;
+    match parent.canonicalize() {
+        Ok(parent) => Ok(parent.join(name)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(source) => Err(BranchActivationError::PathInspection {
+            path: parent.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn require_unoccupied_candidate(
+    snapshot: &RepositorySnapshot,
+    path: &Path,
+) -> std::result::Result<(), BranchActivationError> {
+    let candidate = candidate_inventory_path(path)?;
+    if snapshot
+        .worktrees
+        .iter()
+        .any(|record| record.path == candidate || record.path == path)
+    {
+        return Err(BranchActivationError::PathCollision(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn activation_add_command(
@@ -1138,6 +1189,15 @@ pub fn classify_branch(
     snapshot: &RepositorySnapshot,
     literal: &str,
 ) -> std::result::Result<BranchActivation, BranchActivationError> {
+    // `check-ref-format --branch` accepts lone `@` even though Git forbids it as
+    // a ref name. Lifecycle state stores an exact refs/heads identity, so refuse
+    // the one porcelain-only spelling before invoking any allocating behavior.
+    if literal == "@" {
+        return Err(BranchActivationError::InvalidLiteral {
+            name: literal.to_owned(),
+            detail: "lone @ is not a durable Git ref name".into(),
+        });
+    }
     let checked = activation_command(
         &snapshot.main_worktree,
         "check branch literal",
@@ -1260,16 +1320,7 @@ pub fn activate_branch(
     if let BranchActivation::Occupied { record, .. } = activation {
         return Ok(BranchActivationOutcome::Reused(record));
     }
-    if std::fs::symlink_metadata(managed_path).is_ok()
-        || snapshot
-            .worktrees
-            .iter()
-            .any(|record| record.path == managed_path)
-    {
-        return Err(BranchActivationError::PathCollision(
-            managed_path.to_path_buf(),
-        ));
-    }
+    require_unoccupied_candidate(&snapshot, managed_path)?;
     if let Some(parent) = managed_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| BranchActivationError::CreateParent {
             path: parent.to_path_buf(),
@@ -1277,10 +1328,25 @@ pub fn activate_branch(
         })?;
     }
 
+    // Parent creation can expose a different canonical spelling, and another
+    // process may have changed worktree topology since the request began. Use a
+    // complete fresh inventory and exact branch classification at the last
+    // decision point before Git's own non-force add safeguard.
+    let fresh =
+        discover_repository(&snapshot.main_worktree).map_err(BranchActivationError::Discovery)?;
+    if fresh.common_dir != snapshot.common_dir {
+        return Err(BranchActivationError::Verification(
+            "repository identity changed before branch activation".into(),
+        ));
+    }
+    let activation = classify_branch(&fresh, literal)?;
+    if let BranchActivation::Occupied { record, .. } = activation {
+        return Ok(BranchActivationOutcome::Reused(record));
+    }
+    require_unoccupied_candidate(&fresh, managed_path)?;
+
     let (name, full_ref, expected_oid, created) = match activation {
         BranchActivation::New { name, full_ref } => {
-            let fresh = discover_repository(&snapshot.main_worktree)
-                .map_err(BranchActivationError::Discovery)?;
             let default = resolve_default_branch(&fresh)
                 .map_err(BranchActivationError::DefaultUnavailable)?;
             let expected_oid = activation_oid(
@@ -1316,7 +1382,7 @@ pub fn activate_branch(
             // branch spelling so the resulting worktree remains attached.
             let arguments = existing_branch_add_arguments(&name, managed_path);
             let output = activation_add_command(
-                &snapshot.main_worktree,
+                &fresh.main_worktree,
                 "activate local branch worktree",
                 &arguments,
             )?;
@@ -1427,41 +1493,21 @@ pub fn managed_branch_worktree_path(
     checkout_key: u64,
     branch: &str,
 ) -> PathBuf {
-    let mut label = sanitize(branch);
+    let sanitized = sanitize(branch);
+    let mut label = String::new();
+    for character in sanitized.chars() {
+        if label.len() + character.len_utf8() > 48 {
+            break;
+        }
+        label.push(character);
+    }
     if label.is_empty() {
         label.push_str("branch");
     }
-    label.truncate(48);
     worktrees_base()
         .join(&crate::workspace::active().name)
         .join(format!("repository-{repository_key}"))
         .join(format!("{label}-{checkout_key}"))
-}
-
-/// Create a worktree for `branch` under the managed directory.
-/// Creates the branch if it doesn't exist; otherwise checks out the existing one.
-pub fn create_worktree(repo: &Path, branch: &str) -> Result<PathBuf> {
-    let repo_name = repo
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".to_string());
-    let dir = worktrees_base()
-        .join(sanitize(&repo_name))
-        .join(sanitize(branch));
-    if dir.exists() {
-        // Reuse an existing managed worktree for this branch.
-        return Ok(dir);
-    }
-    std::fs::create_dir_all(dir.parent().unwrap())?;
-    let dir_str = dir.to_string_lossy().to_string();
-
-    let new_branch = git(repo, &["worktree", "add", &dir_str, "-b", branch]);
-    if new_branch.is_ok() {
-        return Ok(dir);
-    }
-    // Branch may already exist — try checking it out instead.
-    git(repo, &["worktree", "add", &dir_str, branch]).map_err(|e| anyhow!("{e}"))?;
-    Ok(dir)
 }
 
 /// A repo named for cloning: where it lives and the URL to clone with.
@@ -1571,8 +1617,8 @@ mod tests {
         activate_branch, classify_branch, discover_repository, ensure_default_worktree,
         existing_branch_add_arguments, managed_branch_worktree_path, new_branch_add_arguments,
         parse_clone_target, parse_worktree_porcelain, reconcile_checkout, resolve_default_branch,
-        BranchActivation, BranchActivationError, BranchActivationOutcome,
-        DefaultBranchUnavailable, DefaultWorktreeOutcome, ReconciliationUnavailable,
+        BranchActivation, BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
+        DefaultWorktreeOutcome, ReconciliationUnavailable,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2229,11 +2275,7 @@ mod tests {
                 let fixture = GitFixture::new();
                 let repo = fixture.repo("filesystem collisions");
 
-                for (label, make) in [
-                    ("file", 0_u8),
-                    ("directory", 1_u8),
-                    ("symlink", 2_u8),
-                ] {
+                for (label, make) in [("file", 0_u8), ("directory", 1_u8), ("symlink", 2_u8)] {
                     let candidate = fixture.root.join(label);
                     match make {
                         0 => std::fs::write(&candidate, b"occupied").unwrap(),
@@ -2243,9 +2285,12 @@ mod tests {
                         _ => continue,
                     }
                     let error = activate_branch(&repo, "existing", &candidate).unwrap_err();
-                    assert!(matches!(error, BranchActivationError::PathCollision(path) if path == candidate));
-                    assert!(classify_branch(&discover_repository(&repo).unwrap(), "existing")
-                        .is_ok());
+                    assert!(
+                        matches!(error, BranchActivationError::PathCollision(path) if path == candidate)
+                    );
+                    assert!(
+                        classify_branch(&discover_repository(&repo).unwrap(), "existing").is_ok()
+                    );
                 }
             }
 
@@ -2285,7 +2330,11 @@ mod tests {
                 assert_ne!(slash, dash);
                 assert_ne!(slash, other_repository);
                 assert!(slash.to_string_lossy().contains("repository-7"));
-                assert!(slash.file_name().unwrap().to_string_lossy().ends_with("-11"));
+                assert!(slash
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("-11"));
 
                 let unicode = managed_branch_worktree_path(7, 13, &"界".repeat(40));
                 let component = unicode.file_name().unwrap().to_string_lossy();
@@ -2301,8 +2350,8 @@ mod tests {
                     existing_branch_add_arguments("feature/literal", path),
                 ];
                 let forbidden = [
-                    "--force", "-B", "prune", "repair", "clean", "reset", "stash",
-                    "fetch", "delete", "-d", "-D",
+                    "--force", "-B", "prune", "repair", "clean", "reset", "stash", "fetch",
+                    "delete", "-d", "-D",
                 ];
                 for command in commands {
                     let command: Vec<_> = command
