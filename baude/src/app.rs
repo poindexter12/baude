@@ -781,15 +781,34 @@ impl App {
                 .session(runtime)
                 .map(|session| session.claude.is_exited())
             {
-                self.save_durable()?;
+                if let Err(error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    let stage = if error.replacement_committed() {
+                        lifecycle::CreationFailureStage::PersistenceAfterReplacement
+                    } else {
+                        lifecycle::CreationFailureStage::PersistenceBeforeReplacement
+                    };
+                    if !error.replacement_committed() {
+                        self.repository_state = state_before;
+                    }
+                    return Err(anyhow::anyhow!("{stage} failed: {error}"));
+                }
+                self.persistence_dirty = false;
                 if exited {
                     self.restart_session_with_resume(runtime, true)?;
                 }
                 self.selected_id = Some(SelId::Local(runtime));
                 self.focus = Focus::Claude;
-                return Ok(LifecycleOutcome::Focused {
-                    checkout: activation.checkout,
-                    runtime,
+                return Ok(if exited {
+                    LifecycleOutcome::Reopened {
+                        checkout: activation.checkout,
+                        runtime,
+                    }
+                } else {
+                    LifecycleOutcome::Focused {
+                        checkout: activation.checkout,
+                        runtime,
+                    }
                 });
             }
         }
@@ -3073,6 +3092,33 @@ mod repository_admission_tests {
         );
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert_eq!(app.runtime_checkouts.len(), 1);
+
+        // An occupied activation still has a real persistence commit boundary.
+        // If that save fails before replacement, neither memory nor disk may
+        // retain the newly activated intent.
+        app.repository_state.checkouts[0].active_intent = false;
+        app.save_durable_status().unwrap();
+        let inactive = app.repository_state.clone();
+        app.atomic_failure_for_test = Some(baude_core::persist::AtomicFailure::Rename);
+        let error = app
+            .activate_branch_worktree(&repo, "feature/local-contract")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("persistence before replacement"));
+        assert_eq!(app.repository_state, inactive);
+        assert!(app.persistence_dirty);
+        assert_eq!(
+            baude_core::persist::load_current_at(&state_root, &state_file)
+                .unwrap()
+                .state,
+            inactive
+        );
+        app.atomic_failure_for_test = None;
+        assert_eq!(
+            app.activate_branch_worktree(&repo, "feature/local-contract")
+                .unwrap(),
+            LifecycleOutcome::Focused { checkout, runtime }
+        );
 
         let different = app
             .activate_branch_worktree(&repo, "feature/local-distinct")
