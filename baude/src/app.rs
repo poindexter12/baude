@@ -519,6 +519,9 @@ impl App {
                 return;
             }
         };
+        if let Err(error) = self.reconcile_activation_recoveries() {
+            self.set_message(format!("activation recovery: {error}"));
+        }
         let active = active_restore_checkouts(&self.repository_state);
         for key in active {
             if let Err(error) = self.ensure_primary(key) {
@@ -759,6 +762,75 @@ impl App {
         self.ensure_primary(checkout_key)
     }
 
+    fn reconcile_activation_recoveries(&mut self) -> Result<()> {
+        let recoveries: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter_map(|checkout| {
+                matches!(
+                    checkout.health,
+                    CheckoutHealth::Unavailable(
+                        UnavailableCause::PendingActivation { .. }
+                            | UnavailableCause::ActivationRecovery { .. }
+                    )
+                )
+                .then_some((checkout.repository_key, checkout.key))
+            })
+            .collect();
+        if recoveries.is_empty() {
+            return Ok(());
+        }
+        let before = self.repository_state.clone();
+        for (repository, checkout) in recoveries {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow::anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_activation_recovery(&mut self.repository_state, checkout)?;
+        }
+        if let Err(error) = self.save_durable_status() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        self.persistence_dirty = false;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn retry_activation_recovery(
+        &mut self,
+        checkout: CheckoutKey,
+    ) -> Result<lifecycle::ActivationRecoveryResolution> {
+        let repository = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or_else(|| anyhow::anyhow!("checkout {} is missing", checkout.get()))?
+            .repository_key;
+        let before = self.repository_state.clone();
+        let resolution = {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow::anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_activation_recovery(&mut self.repository_state, checkout)?
+        };
+        if let Err(error) = self.save_durable_status() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        self.persistence_dirty = false;
+        Ok(resolution)
+    }
+
     pub fn activate_branch_worktree(
         &mut self,
         repository_child: &Path,
@@ -872,14 +944,29 @@ impl App {
                 lifecycle::CreationFailureStage::PersistenceBeforeReplacement
             };
             if !error.replacement_committed() {
-                lifecycle::compensate_uncommitted_activation(&activation).map_err(
-                    |compensation| {
-                        anyhow::anyhow!(
-                            "{stage} failed: {error}; {} failed: {compensation}",
-                            lifecycle::CreationFailureStage::Compensation
-                        )
-                    },
-                )?;
+                if let Err(compensation) = lifecycle::compensate_uncommitted_activation(&activation)
+                {
+                    lifecycle::mark_activation_recovery(
+                        &mut self.repository_state,
+                        activation.checkout,
+                        activation.branch.clone(),
+                        matches!(
+                            activation.disposition,
+                            lifecycle::ActivationDisposition::Created
+                        ),
+                        error.to_string(),
+                        compensation.to_string(),
+                    )?;
+                    let recovery_save = self.save_durable_status();
+                    self.persistence_dirty = recovery_save.is_err();
+                    return Err(anyhow::anyhow!(
+                        "{stage} failed: {error}; {} failed: {compensation}; recovery persistence: {}",
+                        lifecycle::CreationFailureStage::Compensation,
+                        recovery_save
+                            .map(|()| "saved".to_owned())
+                            .unwrap_or_else(|save| save.to_string())
+                    ));
+                }
                 self.repository_state = state_before;
                 if let Err(clear_error) = self.save_durable_status() {
                     self.persistence_dirty = true;
@@ -3406,13 +3493,12 @@ mod repository_admission_tests {
                 restarted.remote = None;
                 restarted.persistence_root_for_test = Some(state_root.clone());
                 restarted.restore();
-                assert!(restarted.repository_state.has_pending_activation());
+                assert!(!restarted.repository_state.has_pending_activation());
+                assert!(restarted.repository_state.checkouts.is_empty());
                 assert!(restarted.sessions.is_empty());
                 assert!(restarted
-                    .activate_branch_worktree(&repo, "feature/reload-blocked")
-                    .unwrap_err()
-                    .to_string()
-                    .contains("blocked while pending ownership"));
+                    .activate_branch_worktree(&repo, "feature/reload-resolved")
+                    .is_ok());
             }
             let _ = Command::new("git")
                 .args(["worktree", "remove", "--"])

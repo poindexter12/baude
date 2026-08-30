@@ -767,6 +767,181 @@ pub fn clear_pending_activation(state: &mut RepositoryState, checkout: CheckoutK
     state.checkouts.retain(|saved| saved.key != checkout);
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivationRecoveryResolution {
+    ClearedAbsent {
+        checkout: CheckoutKey,
+    },
+    Finalized {
+        checkout: CheckoutKey,
+    },
+    Blocked {
+        checkout: CheckoutKey,
+        detail: String,
+    },
+}
+
+/// Reconcile durable activation ownership after a process restart. This never
+/// performs Git mutation: exact absence clears the phantom child, exact
+/// path/ref ownership finalizes it, and every ambiguous observation remains a
+/// typed blocked recovery record for an explicit retry.
+pub fn reconcile_activation_recovery(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+) -> Result<ActivationRecoveryResolution, LifecycleError> {
+    let index = state
+        .checkouts
+        .iter()
+        .position(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    let (branch, prior_verification, prior_compensation) = match &state.checkouts[index].health {
+        CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { branch }) => (
+            branch.clone(),
+            "activation interrupted before finalization".into(),
+            String::new(),
+        ),
+        CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+            branch,
+            verification,
+            compensation,
+            ..
+        }) => (branch.clone(), verification.clone(), compensation.clone()),
+        _ => {
+            return Err(LifecycleError::Topology(format!(
+                "checkout {} is not activation recovery",
+                checkout_key.get()
+            )))
+        }
+    };
+    let repository_key = state.checkouts[index].repository_key;
+    let repository = state
+        .repositories
+        .iter()
+        .find(|repository| repository.key == repository_key)
+        .ok_or(LifecycleError::RepositoryMissing(repository_key))?;
+    let expected_path = state.checkouts[index].observed_path.to_path_buf();
+    let expected_ref = format!("refs/heads/{branch}");
+    let snapshot = match git::discover_repository(&repository.observed_main_worktree.to_path_buf())
+    {
+        Ok(snapshot) if snapshot.common_dir == repository.observed_common_dir.to_path_buf() => {
+            snapshot
+        }
+        Ok(snapshot) => {
+            let detail = format!(
+                "repository identity conflicts with pending activation: expected {}, observed {}",
+                repository.observed_common_dir.to_path_buf().display(),
+                snapshot.common_dir.display()
+            );
+            mark_activation_recovery(
+                state,
+                checkout_key,
+                branch,
+                false,
+                detail.clone(),
+                prior_compensation,
+            )?;
+            return Ok(ActivationRecoveryResolution::Blocked {
+                checkout: checkout_key,
+                detail,
+            });
+        }
+        Err(error) => {
+            let detail = format!("could not inspect pending activation: {error}");
+            mark_activation_recovery(
+                state,
+                checkout_key,
+                branch,
+                false,
+                detail.clone(),
+                prior_compensation,
+            )?;
+            return Ok(ActivationRecoveryResolution::Blocked {
+                checkout: checkout_key,
+                detail,
+            });
+        }
+    };
+    let at_path = snapshot
+        .worktrees
+        .iter()
+        .find(|record| record.path == expected_path);
+    let at_ref = snapshot
+        .worktrees
+        .iter()
+        .find(|record| record.branch.as_deref() == Some(expected_ref.as_str()));
+    match (at_path, at_ref) {
+        (None, None) if !expected_path.exists() => {
+            clear_pending_activation(state, checkout_key);
+            state.validate()?;
+            Ok(ActivationRecoveryResolution::ClearedAbsent {
+                checkout: checkout_key,
+            })
+        }
+        (Some(path_record), Some(ref_record))
+            if path_record.path == ref_record.path
+                && !path_record.detached
+                && !path_record.locked
+                && !path_record.prunable =>
+        {
+            let checkout = &mut state.checkouts[index];
+            checkout.active_intent = true;
+            checkout.health = CheckoutHealth::Available;
+            checkout.observed_branch = Some(expected_ref);
+            checkout.session.cwd = PersistedPath::from_path(&expected_path);
+            checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
+            checkout.session.branch = Some(branch);
+            checkout.session.is_worktree = expected_path != snapshot.main_worktree;
+            state.validate()?;
+            Ok(ActivationRecoveryResolution::Finalized {
+                checkout: checkout_key,
+            })
+        }
+        _ => {
+            let detail = format!(
+                "pending activation conflicts with Git facts (path owner: {:?}, ref owner: {:?}); prior verification: {prior_verification}",
+                at_path.map(|record| (&record.path, &record.branch)),
+                at_ref.map(|record| (&record.path, &record.branch))
+            );
+            mark_activation_recovery(
+                state,
+                checkout_key,
+                branch,
+                false,
+                detail.clone(),
+                prior_compensation,
+            )?;
+            Ok(ActivationRecoveryResolution::Blocked {
+                checkout: checkout_key,
+                detail,
+            })
+        }
+    }
+}
+
+pub fn mark_activation_recovery(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+    branch: String,
+    created_branch: bool,
+    verification: String,
+    compensation: String,
+) -> Result<(), LifecycleError> {
+    let checkout = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    checkout.active_intent = false;
+    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+        branch,
+        created_branch,
+        verification,
+        compensation,
+    });
+    state.validate()?;
+    Ok(())
+}
+
 fn activation_parts(
     outcome: BranchActivationOutcome,
 ) -> (ActivationDisposition, bool, WorktreeRecord) {
@@ -1146,9 +1321,9 @@ impl Drop for RepositoryReservation {
 mod tests {
     use super::{
         execute_activation_with_post_git_hook, plan_close, plan_reopen, prepare_activation,
-        record_pending_activation, revoke_removal_authority, ActivationRequest, CloseEffect,
-        CloseRequest, LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest,
-        ReopenRuntime, RepositoryReservations,
+        reconcile_activation_recovery, record_pending_activation, revoke_removal_authority,
+        ActivationRecoveryResolution, ActivationRequest, CloseEffect, CloseRequest, LifecycleError,
+        LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
     };
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
@@ -1284,10 +1459,91 @@ mod tests {
                 crate::repository::UnavailableCause::ActivationRecovery { .. }
             )
         ));
+        let resolution = reconcile_activation_recovery(&mut state, checkout).unwrap();
+        assert!(matches!(
+            resolution,
+            ActivationRecoveryResolution::Blocked { checkout: key, .. } if key == checkout
+        ));
         let path = state.checkouts[0].observed_path.to_path_buf();
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force", "--"])
             .arg(&path)
+            .current_dir(&root)
+            .status();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_activation_recovery_distinguishes_absent_and_exact_git_facts() {
+        let root = std::env::temp_dir().join(format!(
+            "baude-lifecycle-pending-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(root.join("tracked"), b"one\n").unwrap();
+        for args in [vec!["add", "tracked"], vec!["commit", "-m", "initial"]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let snapshot = crate::git::discover_repository(&root).unwrap();
+        let mut state = RepositoryState::default();
+
+        let absent = prepare_activation(&mut state, &snapshot, "feature/absent").unwrap();
+        let absent_checkout = absent.checkout;
+        record_pending_activation(&mut state, &snapshot, &absent).unwrap();
+        assert_eq!(
+            reconcile_activation_recovery(&mut state, absent_checkout).unwrap(),
+            ActivationRecoveryResolution::ClearedAbsent {
+                checkout: absent_checkout
+            }
+        );
+
+        assert!(Command::new("git")
+            .args(["branch", "feature/exact"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let exact = prepare_activation(&mut state, &snapshot, "feature/exact").unwrap();
+        let exact_checkout = exact.checkout;
+        record_pending_activation(&mut state, &snapshot, &exact).unwrap();
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--"])
+            .arg(&exact.request.managed_path)
+            .arg("feature/exact")
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            reconcile_activation_recovery(&mut state, exact_checkout).unwrap(),
+            ActivationRecoveryResolution::Finalized {
+                checkout: exact_checkout
+            }
+        );
+        assert!(state.checkouts[0].active_intent);
+        assert_eq!(state.checkouts[0].health, CheckoutHealth::Available);
+
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(&exact.request.managed_path)
             .current_dir(&root)
             .status();
         std::fs::remove_dir_all(root).unwrap();
