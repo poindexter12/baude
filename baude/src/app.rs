@@ -3182,7 +3182,7 @@ mod repository_admission_tests {
             .activate_branch_worktree(&repo, "feature/local-contract")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("persistence before replacement"));
+        assert!(error.contains("pending activation ownership persistence"));
         assert_eq!(app.repository_state, inactive);
         assert!(app.persistence_dirty);
         assert_eq!(
@@ -3192,6 +3192,8 @@ mod repository_admission_tests {
             inactive
         );
         app.atomic_failure_for_test = None;
+        app.save();
+        assert!(!app.persistence_dirty);
         assert_eq!(
             app.activate_branch_worktree(&repo, "feature/local-contract")
                 .unwrap(),
@@ -3326,7 +3328,7 @@ mod repository_admission_tests {
         assert_eq!(app.repository_state, before);
         assert!(app.runtime_checkouts.is_empty());
         assert!(app.sessions.is_empty());
-        assert!(branch_retained);
+        assert!(!branch_retained);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3372,9 +3374,20 @@ mod repository_admission_tests {
                 .activate_branch_worktree(&repo, &branch)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains(expected_stage), "got: {error}");
+            let pending_failure = failure.is_some();
+            if pending_failure {
+                assert!(
+                    error.contains("pending activation ownership persistence"),
+                    "got: {error}"
+                );
+            } else {
+                assert!(error.contains(expected_stage), "got: {error}");
+            }
             assert_eq!(app.repository_state.checkouts.len(), 1);
-            assert!(app.repository_state.checkouts[0].active_intent);
+            assert_eq!(
+                app.repository_state.checkouts[0].active_intent,
+                !pending_failure
+            );
             assert!(app.runtime_checkouts.is_empty());
             assert!(app.sessions.is_empty());
             let state_file = baude_core::workspace::active().state_file("state");
@@ -3387,7 +3400,20 @@ mod repository_admission_tests {
             let path = app.repository_state.checkouts[0]
                 .observed_path
                 .to_path_buf();
-            assert!(path.is_dir());
+            assert_eq!(path.is_dir(), !pending_failure);
+            if pending_failure {
+                let mut restarted = App::new(root.join("not-a-repository"));
+                restarted.remote = None;
+                restarted.persistence_root_for_test = Some(state_root.clone());
+                restarted.restore();
+                assert!(restarted.repository_state.has_pending_activation());
+                assert!(restarted.sessions.is_empty());
+                assert!(restarted
+                    .activate_branch_worktree(&repo, "feature/reload-blocked")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("blocked while pending ownership"));
+            }
             let _ = Command::new("git")
                 .args(["worktree", "remove", "--"])
                 .arg(path)
@@ -3422,13 +3448,41 @@ mod repository_admission_tests {
         let before = app.repository_state.clone();
         let session = app.session_mut(runtime).unwrap();
         session.name = "retained live name".into();
-        session.shell_open = true;
+        session.open_shell(5, 40).unwrap();
+        session
+            .shell
+            .as_ref()
+            .unwrap()
+            .fail_next_teardown_for_test("shell stop refused once");
         session.archived = true;
         session.archived_by_user = true;
         session.meta.session_id = None;
         app.repository_state.checkouts[0].session.resume_id =
             Some("opaque/retained-before-poll".into());
         app.save_durable_status().unwrap();
+
+        let partial = app.close_retained_session(runtime).unwrap_err().to_string();
+        assert!(partial.contains("shell stopped: false"), "got: {partial}");
+        assert!(app.session(runtime).unwrap().claude.is_exited());
+        assert!(!app
+            .session(runtime)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
+        assert!(app.repository_state.checkouts[0].active_intent);
+        assert!(matches!(
+            app.repository_state.checkouts[0].health,
+            CheckoutHealth::Unavailable(
+                baude_core::repository::UnavailableCause::TeardownPending {
+                    agent_stopped: true,
+                    shell_stopped: false,
+                    ..
+                }
+            )
+        ));
+        assert!(app.runtime_checkouts.contains_key(&checkout));
 
         assert_eq!(
             app.close_retained_session(runtime).unwrap(),
@@ -3514,11 +3568,8 @@ mod repository_admission_tests {
             assert!(app.close_retained_session(runtime).is_err());
             assert_eq!(app.repository_state.checkouts.len(), 1);
             assert_eq!(app.repository_state.repositories.len(), 1);
-            assert_eq!(
-                app.sessions.iter().any(|session| session.id == runtime),
-                !committed
-            );
-            assert_eq!(app.runtime_checkouts.contains_key(&checkout), !committed);
+            assert!(app.sessions.iter().any(|session| session.id == runtime));
+            assert!(app.runtime_checkouts.contains_key(&checkout));
             assert_eq!(app.repository_state.checkouts[0].active_intent, !committed);
             if committed {
                 assert_eq!(
@@ -3736,7 +3787,7 @@ mod repository_admission_tests {
                     .as_deref(),
                 Some(resume_id.as_str())
             );
-            assert_eq!(app.repository_state.checkouts[0].managed_by_baude, true);
+            assert!(app.repository_state.checkouts[0].managed_by_baude);
             let state_file = baude_core::workspace::active().state_file("state");
             let persisted = baude_core::persist::load_current_at(&state_root, &state_file)
                 .unwrap()
@@ -3745,7 +3796,7 @@ mod repository_admission_tests {
                 persisted.checkouts[0].session.resume_id.as_deref(),
                 Some(resume_id.as_str())
             );
-            assert_eq!(persisted.checkouts[0].managed_by_baude, true);
+            assert!(persisted.checkouts[0].managed_by_baude);
             assert_eq!(persisted.checkouts[0].health, CheckoutHealth::Available);
             assert!(app.prepare_remove_worktree(checkout).is_ok());
             for session in &mut app.sessions {

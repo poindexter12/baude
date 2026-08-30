@@ -558,6 +558,17 @@ pub fn compensate_uncommitted_activation(
 }
 
 #[derive(Debug)]
+pub struct PostVerificationCompensationFailure {
+    pub repository: std::path::PathBuf,
+    pub checkout: CheckoutKey,
+    pub path: std::path::PathBuf,
+    pub branch: String,
+    pub created_branch: bool,
+    pub verification: String,
+    pub compensation: String,
+}
+
+#[derive(Debug)]
 pub enum LifecycleError {
     Discovery(RepositoryDiscoveryError),
     Git(BranchActivationError),
@@ -566,15 +577,7 @@ pub enum LifecycleError {
     RepositoryMissing(RepositoryKey),
     CheckoutMissing(CheckoutKey),
     Topology(String),
-    PostVerificationCompensationFailed {
-        repository: std::path::PathBuf,
-        checkout: CheckoutKey,
-        path: std::path::PathBuf,
-        branch: String,
-        created_branch: bool,
-        verification: String,
-        compensation: String,
-    },
+    PostVerificationCompensationFailed(Box<PostVerificationCompensationFailure>),
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -591,21 +594,24 @@ impl std::fmt::Display for LifecycleError {
                 write!(f, "lifecycle checkout {} is missing", key.get())
             }
             Self::Topology(detail) => write!(f, "activation topology mismatch: {detail}"),
-            Self::PostVerificationCompensationFailed {
-                repository,
-                checkout,
-                path,
-                branch,
-                created_branch,
-                verification,
-                compensation,
-            } => write!(
+            Self::PostVerificationCompensationFailed(failure) => {
+                let PostVerificationCompensationFailure {
+                    repository,
+                    checkout,
+                    path,
+                    branch,
+                    created_branch,
+                    verification,
+                    compensation,
+                } = failure.as_ref();
+                write!(
                 f,
                 "post-verification activation compensation failed for checkout {} branch {branch} at {} in {} (created branch: {created_branch}): {verification}; compensation failed: {compensation}",
                 checkout.get(),
                 path.display(),
                 repository.display()
-            ),
+                )
+            }
         }
     }
 }
@@ -617,7 +623,7 @@ impl LifecycleError {
         matches!(
             self,
             Self::Git(BranchActivationError::PostAddCompensationFailed { .. })
-                | Self::PostVerificationCompensationFailed { .. }
+                | Self::PostVerificationCompensationFailed(_)
         )
     }
 }
@@ -918,7 +924,7 @@ fn execute_activation_with_post_git_hook(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| fresh.main_worktree.display().to_string());
-            state.checkouts.push(SavedCheckout {
+            let activated = SavedCheckout {
                 key: prepared.checkout,
                 repository_key: prepared.request.repository,
                 role,
@@ -939,7 +945,16 @@ fn execute_activation_with_post_git_hook(
                     resume_id: None,
                 },
                 health: CheckoutHealth::Available,
-            });
+            };
+            if let Some(pending) = state
+                .checkouts
+                .iter_mut()
+                .find(|checkout| checkout.key == prepared.checkout)
+            {
+                *pending = activated;
+            } else {
+                state.checkouts.push(activated);
+            }
             (prepared.checkout, created_by_baude)
         };
         if checkout != prepared.checkout {
@@ -999,15 +1014,17 @@ fn execute_activation_with_post_git_hook(
                     state.checkouts.push(recovery);
                 }
                 state.validate()?;
-                return Err(LifecycleError::PostVerificationCompensationFailed {
-                    repository: activation_repository.main_worktree,
-                    checkout: prepared.checkout,
-                    path: added_path,
-                    branch: activation_branch,
-                    created_branch: matches!(disposition, ActivationDisposition::Created),
-                    verification: error.to_string(),
-                    compensation: compensation.to_string(),
-                });
+                return Err(LifecycleError::PostVerificationCompensationFailed(
+                    Box::new(PostVerificationCompensationFailure {
+                        repository: activation_repository.main_worktree,
+                        checkout: prepared.checkout,
+                        path: added_path,
+                        branch: activation_branch,
+                        created_branch: matches!(disposition, ActivationDisposition::Created),
+                        verification: error.to_string(),
+                        compensation: compensation.to_string(),
+                    }),
+                ));
             }
         }
         return Err(error);
@@ -1128,9 +1145,10 @@ impl Drop for RepositoryReservation {
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_close, plan_reopen, revoke_removal_authority, ActivationRequest, CloseEffect,
-        CloseRequest, LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime,
-        RepositoryReservations,
+        execute_activation_with_post_git_hook, plan_close, plan_reopen, prepare_activation,
+        record_pending_activation, revoke_removal_authority, ActivationRequest, CloseEffect,
+        CloseRequest, LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest,
+        ReopenRuntime, RepositoryReservations,
     };
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
@@ -1139,6 +1157,7 @@ mod tests {
         RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
     };
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     fn repository_key() -> RepositoryKey {
         let mut state = RepositoryState::default();
@@ -1199,6 +1218,79 @@ mod tests {
         assert_eq!(request.repository, repository);
         assert_eq!(request.branch, "feature/literal");
         assert_ne!(request.branch, request.managed_path.to_string_lossy());
+    }
+
+    #[test]
+    fn post_verification_compensation_failure_records_typed_recovery_child() {
+        let root = std::env::temp_dir().join(format!(
+            "baude-lifecycle-post-verification-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(root.join("tracked"), b"one\n").unwrap();
+        for args in [
+            vec!["add", "tracked"],
+            vec!["commit", "-m", "initial"],
+            vec!["branch", "feature/post-verify"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let snapshot = crate::git::discover_repository(&root).unwrap();
+        let mut state = RepositoryState::default();
+        let prepared = prepare_activation(&mut state, &snapshot, "feature/post-verify").unwrap();
+        let checkout = prepared.checkout;
+        record_pending_activation(&mut state, &snapshot, &prepared).unwrap();
+
+        let error = execute_activation_with_post_git_hook(&mut state, &root, prepared, |path| {
+            assert!(Command::new("git")
+                .args(["checkout", "--detach"])
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(path.join("compensation-blocker"), b"dirty\n").unwrap();
+        })
+        .unwrap_err();
+
+        match error {
+            LifecycleError::PostVerificationCompensationFailed(failure) => {
+                assert_eq!(failure.checkout, checkout);
+                assert!(!failure.created_branch);
+            }
+            other => panic!("unexpected activation error: {other}"),
+        }
+        assert_eq!(state.checkouts.len(), 1);
+        assert!(matches!(
+            state.checkouts[0].health,
+            CheckoutHealth::Unavailable(
+                crate::repository::UnavailableCause::ActivationRecovery { .. }
+            )
+        ));
+        let path = state.checkouts[0].observed_path.to_path_buf();
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(&path)
+            .current_dir(&root)
+            .status();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

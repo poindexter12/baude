@@ -248,6 +248,16 @@ impl Pty {
     /// Safety-sensitive callers must use this instead of the best-effort
     /// `kill`, because a signal attempt alone is not a process-stop boundary.
     pub fn kill_and_wait(&mut self) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if let Some(pid) = self.pid() {
+            if let Some(detail) = teardown_failures_for_test()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&pid)
+            {
+                anyhow::bail!("injected PTY teardown failure: {detail}");
+            }
+        }
         let mut child = self
             .child
             .lock()
@@ -277,6 +287,25 @@ impl Pty {
         self.exited.store(true, Ordering::Release);
         Ok(())
     }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn fail_next_teardown_for_test(&self, detail: impl Into<String>) {
+        if let Some(pid) = self.pid() {
+            teardown_failures_for_test()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(pid, detail.into());
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn teardown_failures_for_test() -> &'static std::sync::Mutex<std::collections::HashMap<u32, String>>
+{
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]

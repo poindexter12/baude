@@ -2495,7 +2495,7 @@ mod tests {
         assert_eq!(manager.repository_state, before);
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
-        assert!(branch_retained);
+        assert!(!branch_retained);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2555,21 +2555,16 @@ mod tests {
             manager.repository_state
         );
         assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.repository_state.has_pending_activation());
 
-        manager.persist_at_for_test(&state_root, &workspace, None);
-        manager.spawn_error_for_test = Some("pty unavailable".into());
-        let spawn_error = manager
+        let mut reloaded = Manager::new("true".into(), true);
+        assert_eq!(reloaded.restore_at(&state_root, &workspace), 0);
+        assert!(reloaded.repository_state.has_pending_activation());
+        assert!(reloaded
             .activate_branch_worktree(&repo, "feature/manager-spawn", None)
             .unwrap_err()
-            .to_string();
-        assert!(spawn_error.contains("pty unavailable"));
-        assert_eq!(manager.repository_state.checkouts.len(), 2);
-        assert_eq!(
-            persisted_at(&state_root, &workspace),
-            manager.repository_state
-        );
-        assert!(manager.runtime_checkouts.is_empty());
-        assert!(manager.sessions.is_empty());
+            .to_string()
+            .contains("blocked while pending ownership"));
 
         let linked: Vec<_> = manager
             .repository_state
@@ -2644,7 +2639,35 @@ mod tests {
         manager.session_mut(id).unwrap().meta.session_id = None;
         manager.session_mut(id).unwrap().archived = true;
         manager.session_mut(id).unwrap().archived_by_user = true;
+        manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
+        manager
+            .session_mut(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .fail_next_teardown_for_test("shell stop refused once");
         let before = manager.repository_state.clone();
+
+        let partial = manager.remove(id).unwrap_err().to_string();
+        assert!(partial.contains("shell stopped: false"), "got: {partial}");
+        assert!(manager.session(id).unwrap().claude.is_exited());
+        assert!(!manager
+            .session(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
+        assert!(manager.repository_state.checkouts[0].active_intent);
+        assert!(matches!(
+            manager.repository_state.checkouts[0].health,
+            CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                agent_stopped: true,
+                shell_stopped: false,
+                ..
+            })
+        ));
 
         manager.remove(id).unwrap();
 
