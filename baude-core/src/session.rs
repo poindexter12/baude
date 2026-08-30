@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
@@ -381,6 +382,116 @@ impl std::fmt::Display for SessionTeardownError {
 }
 
 impl std::error::Error for SessionTeardownError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedTeardownError {
+    pub agent_pid: Option<u32>,
+    pub shell_pid: Option<u32>,
+    pub agent_stopped: bool,
+    pub shell_stopped: bool,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RecordedTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "recorded process teardown remains unresolved: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RecordedTeardownError {}
+
+fn process_is_live(pid: u32) -> std::result::Result<bool, String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map_err(|error| format!("could not inspect pid {pid}: {error}"))?;
+    let state = String::from_utf8_lossy(&output.stdout);
+    Ok(output.status.success()
+        && state
+            .split_whitespace()
+            .next()
+            .is_some_and(|value| !value.starts_with('Z')))
+}
+
+fn finish_recorded_process(
+    pid: Option<u32>,
+    already_stopped: bool,
+) -> std::result::Result<(), String> {
+    if already_stopped || pid.is_none() {
+        return Ok(());
+    }
+    let pid = pid.expect("checked above");
+    if !process_is_live(pid)? {
+        return Ok(());
+    }
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("could not signal pid {pid}: {error}"))?;
+    if !output.status.success() && process_is_live(pid)? {
+        return Err(format!(
+            "pid {pid} refused termination: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    for _ in 0..25 {
+        if !process_is_live(pid)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("could not force-stop pid {pid}: {error}"))?;
+    if !output.status.success() && process_is_live(pid)? {
+        return Err(format!(
+            "pid {pid} refused forced termination: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    for _ in 0..25 {
+        if !process_is_live(pid)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(format!("pid {pid} remained live after termination"))
+}
+
+/// Idempotently finish teardown recorded before an owner crash. Already
+/// stopped or absent children are accepted; live recorded children must be
+/// confirmed gone before recovery can transition to inactive.
+pub fn finish_recorded_teardown(
+    agent_pid: Option<u32>,
+    shell_pid: Option<u32>,
+    agent_stopped: bool,
+    shell_stopped: bool,
+) -> std::result::Result<(), RecordedTeardownError> {
+    let agent = finish_recorded_process(agent_pid, agent_stopped).err();
+    let shell = finish_recorded_process(shell_pid, shell_stopped).err();
+    if agent.is_none() && shell.is_none() {
+        return Ok(());
+    }
+    let mut details = Vec::new();
+    if let Some(error) = agent.as_ref() {
+        details.push(format!("agent: {error}"));
+    }
+    if let Some(error) = shell.as_ref() {
+        details.push(format!("shell: {error}"));
+    }
+    Err(RecordedTeardownError {
+        agent_pid,
+        shell_pid,
+        agent_stopped: agent.is_none(),
+        shell_stopped: shell.is_none(),
+        detail: details.join("; "),
+    })
+}
 
 pub fn human_duration(ms: u64) -> String {
     let secs = ms / 1000;

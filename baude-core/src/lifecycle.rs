@@ -319,6 +319,74 @@ pub fn mark_teardown_pending(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TeardownRecoveryResolution {
+    Completed {
+        checkout: CheckoutKey,
+    },
+    Pending {
+        checkout: CheckoutKey,
+        detail: String,
+    },
+}
+
+pub fn reconcile_teardown_recovery(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+) -> Result<TeardownRecoveryResolution, LifecycleError> {
+    let checkout = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    let (agent_pid, shell_pid, agent_stopped, shell_stopped) = match &checkout.health {
+        CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+            agent_pid,
+            shell_pid,
+            agent_stopped,
+            shell_stopped,
+            ..
+        }) => (*agent_pid, *shell_pid, *agent_stopped, *shell_stopped),
+        _ => {
+            return Err(LifecycleError::Topology(format!(
+                "checkout {} is not pending teardown",
+                checkout_key.get()
+            )))
+        }
+    };
+    match crate::session::finish_recorded_teardown(
+        agent_pid,
+        shell_pid,
+        agent_stopped,
+        shell_stopped,
+    ) {
+        Ok(()) => {
+            checkout.active_intent = false;
+            checkout.health = CheckoutHealth::Available;
+            state.validate()?;
+            Ok(TeardownRecoveryResolution::Completed {
+                checkout: checkout_key,
+            })
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            checkout.active_intent = true;
+            checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                agent_pid: error.agent_pid,
+                shell_pid: error.shell_pid,
+                agent_stopped: error.agent_stopped,
+                shell_stopped: error.shell_stopped,
+                detail: error.detail,
+            });
+            state.validate()?;
+            Ok(TeardownRecoveryResolution::Pending {
+                checkout: checkout_key,
+                detail,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReopenRuntime {
     Absent,
@@ -406,12 +474,16 @@ pub fn plan_reopen(
         .iter()
         .position(|candidate| candidate.key == repository);
 
-    if let CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(detail)) =
-        &state.checkouts[checkout_index].health
+    if let CheckoutHealth::Unavailable(
+        cause @ (UnavailableCause::RemovalTombstone(_)
+        | UnavailableCause::TeardownPending { .. }
+        | UnavailableCause::PendingActivation { .. }
+        | UnavailableCause::ActivationRecovery { .. }),
+    ) = &state.checkouts[checkout_index].health
     {
         return Err(ReopenBlocked {
             checkout: request.checkout,
-            cause: UnavailableCause::RemovalTombstone(detail.clone()),
+            cause: cause.clone(),
         });
     }
 
@@ -1321,9 +1393,10 @@ impl Drop for RepositoryReservation {
 mod tests {
     use super::{
         execute_activation_with_post_git_hook, plan_close, plan_reopen, prepare_activation,
-        reconcile_activation_recovery, record_pending_activation, revoke_removal_authority,
-        ActivationRecoveryResolution, ActivationRequest, CloseEffect, CloseRequest, LifecycleError,
-        LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
+        reconcile_activation_recovery, reconcile_teardown_recovery, record_pending_activation,
+        revoke_removal_authority, ActivationRecoveryResolution, ActivationRequest, CloseEffect,
+        CloseRequest, LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest,
+        ReopenRuntime, RepositoryReservations, TeardownRecoveryResolution,
     };
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
@@ -1704,6 +1777,41 @@ mod tests {
             state.checkouts[0].health,
             CheckoutHealth::Unavailable(crate::repository::UnavailableCause::RemovalTombstone(_))
         ));
+    }
+
+    #[test]
+    fn teardown_pending_cannot_reopen_and_completes_inactive_before_explicit_reopen() {
+        let mut state = close_state();
+        let checkout = state.checkouts[0].key;
+        state.checkouts[0].health =
+            CheckoutHealth::Unavailable(crate::repository::UnavailableCause::TeardownPending {
+                agent_pid: Some(u32::MAX),
+                shell_pid: None,
+                agent_stopped: true,
+                shell_stopped: true,
+                detail: "owner crashed after teardown".into(),
+            });
+
+        let blocked = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Ok(()),
+                runtime: ReopenRuntime::Absent,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            blocked.cause,
+            crate::repository::UnavailableCause::TeardownPending { .. }
+        ));
+
+        assert_eq!(
+            reconcile_teardown_recovery(&mut state, checkout).unwrap(),
+            TeardownRecoveryResolution::Completed { checkout }
+        );
+        assert!(!state.checkouts[0].active_intent);
+        assert_eq!(state.checkouts[0].health, CheckoutHealth::Available);
     }
 
     #[test]

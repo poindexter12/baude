@@ -357,6 +357,9 @@ impl Manager {
         if let Err(error) = self.reconcile_activation_recoveries() {
             eprintln!("activation recovery: {error}");
         }
+        if let Err(error) = self.reconcile_teardown_recoveries() {
+            eprintln!("teardown recovery: {error}");
+        }
         let checkouts: Vec<_> = self
             .repository_state
             .checkouts
@@ -412,6 +415,70 @@ impl Manager {
             return Err(MutationError::Persistence(error));
         }
         Ok(())
+    }
+
+    fn reconcile_teardown_recoveries(&mut self) -> MutationResult<()> {
+        let recoveries: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter_map(|checkout| {
+                matches!(
+                    checkout.health,
+                    CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
+                )
+                .then_some((checkout.repository_key, checkout.key))
+            })
+            .collect();
+        if recoveries.is_empty() {
+            return Ok(());
+        }
+        let before = self.repository_state.clone();
+        for (repository, checkout) in recoveries {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_teardown_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?;
+        }
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn retry_teardown_recovery(
+        &mut self,
+        checkout: CheckoutKey,
+    ) -> MutationResult<lifecycle::TeardownRecoveryResolution> {
+        let repository = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?
+            .repository_key;
+        let before = self.repository_state.clone();
+        let resolution = {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_teardown_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?
+        };
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(resolution)
     }
 
     #[allow(dead_code)]
@@ -2753,6 +2820,16 @@ mod tests {
                 ..
             })
         ));
+
+        let mut restarted = Manager::new("sleep 30".into(), true);
+        assert_eq!(restarted.restore_at(&root, &workspace), 0);
+        assert!(restarted.sessions.is_empty());
+        assert!(restarted.runtime_checkouts.is_empty());
+        assert!(!restarted.repository_state.checkouts[0].active_intent);
+        assert_eq!(
+            restarted.repository_state.checkouts[0].health,
+            CheckoutHealth::Available
+        );
 
         manager.remove(id).unwrap();
 
