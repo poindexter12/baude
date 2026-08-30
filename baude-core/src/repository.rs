@@ -79,6 +79,7 @@ pub enum CheckoutRole {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetainedSessionState {
     pub name: String,
     pub cwd: PersistedPath,
@@ -91,6 +92,7 @@ pub struct RetainedSessionState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedRepository {
     pub key: RepositoryKey,
     pub observed_common_dir: PersistedPath,
@@ -100,6 +102,7 @@ pub struct SavedRepository {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedCheckout {
     pub key: CheckoutKey,
     pub repository_key: RepositoryKey,
@@ -114,6 +117,7 @@ pub struct SavedCheckout {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryState {
     pub next_repository_key: u64,
     pub next_checkout_key: u64,

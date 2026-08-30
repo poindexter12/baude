@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,7 @@ use crate::repository::{
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateFile {
     pub schema_version: u32,
     pub state: RepositoryState,
@@ -42,6 +46,10 @@ pub enum LoadError {
         path: PathBuf,
         cause: String,
     },
+    Persist {
+        path: PathBuf,
+        cause: String,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -60,6 +68,9 @@ impl std::fmt::Display for LoadError {
             }
             Self::InvalidState { path, cause } => {
                 write!(f, "invalid state {}: {cause}", path.display())
+            }
+            Self::Persist { path, cause } => {
+                write!(f, "persist migrated state {}: {cause}", path.display())
             }
         }
     }
@@ -107,29 +118,98 @@ impl StateFile {
 
 /// Isolated-root seam used by persistence tests and explicit state owners.
 pub fn save_current_at(root: &std::path::Path, file: &str, state: &StateFile) -> Result<()> {
-    state.state.validate()?;
-    let path = root.join(file);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(state)?)?;
-    Ok(())
+    atomic_save_current(root, file, state, None, None)
 }
 
 pub fn load_current_at(root: &std::path::Path, file: &str) -> Result<StateFile> {
-    let state: StateFile = serde_json::from_slice(&std::fs::read(root.join(file))?)?;
-    state.state.validate()?;
-    Ok(state)
+    match load_named_at(root, file)? {
+        LoadOutcome::Current(state) => Ok(state),
+        LoadOutcome::Missing => {
+            anyhow::bail!("state file {} is missing", root.join(file).display())
+        }
+        LoadOutcome::Legacy(_) => unreachable!("named current loader never migrates legacy state"),
+    }
 }
 
 pub fn load_for_workspace_strict_at(
-    _root: &std::path::Path,
-    _base: &str,
-    _ws: &crate::workspace::Workspace,
-    _reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+    root: &std::path::Path,
+    base: &str,
+    ws: &crate::workspace::Workspace,
+    mut reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
 ) -> std::result::Result<LoadOutcome, LoadError> {
-    // RED: strict decoding is implemented in the GREEN commit.
-    Ok(LoadOutcome::Missing)
+    let primary_file = ws.state_file(base);
+    let primary_path = root.join(&primary_file);
+    let (source_path, bytes) = match read_state_source(&primary_path)? {
+        Some(bytes) => (primary_path.clone(), bytes),
+        None => match ws.legacy_state_file(base) {
+            Some(legacy_file) => {
+                let legacy_path = root.join(legacy_file);
+                match read_state_source(&legacy_path)? {
+                    Some(bytes) => (legacy_path, bytes),
+                    None => return Ok(LoadOutcome::Missing),
+                }
+            }
+            None => return Ok(LoadOutcome::Missing),
+        },
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| LoadError::Malformed {
+            path: source_path.clone(),
+            cause: error.to_string(),
+        })?;
+    if let Some(version) = value.get("schema_version") {
+        let version = version.as_u64().ok_or_else(|| LoadError::Malformed {
+            path: source_path.clone(),
+            cause: "schema_version must be an unsigned integer".into(),
+        })?;
+        if version != u64::from(SCHEMA_VERSION) {
+            return Err(LoadError::UnsupportedVersion {
+                path: source_path,
+                version,
+            });
+        }
+        let current: StateFile =
+            serde_json::from_value(value).map_err(|error| LoadError::Malformed {
+                path: source_path.clone(),
+                cause: error.to_string(),
+            })?;
+        current
+            .state
+            .validate()
+            .map_err(|error| LoadError::InvalidState {
+                path: source_path,
+                cause: error.to_string(),
+            })?;
+        return Ok(LoadOutcome::Current(current));
+    }
+
+    let legacy: State = serde_json::from_value(value).map_err(|error| LoadError::Malformed {
+        path: source_path.clone(),
+        cause: error.to_string(),
+    })?;
+    let migrated_state =
+        migrate_legacy(legacy, &mut reconcile).map_err(|error| LoadError::InvalidState {
+            path: source_path,
+            cause: error.to_string(),
+        })?;
+    let migrated = StateFile::new(migrated_state);
+    save_current_at(root, &primary_file, &migrated).map_err(|error| LoadError::Persist {
+        path: primary_path,
+        cause: error.to_string(),
+    })?;
+    Ok(LoadOutcome::Legacy(migrated))
+}
+
+fn read_state_source(path: &std::path::Path) -> std::result::Result<Option<Vec<u8>>, LoadError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(LoadError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[doc(hidden)]
@@ -140,11 +220,67 @@ pub fn save_current_at_test(
     failure: Option<AtomicFailure>,
     _first_temp: Option<PathBuf>,
 ) -> Result<()> {
-    save_current_at(root, file, state)?;
-    if let Some(failure) = failure {
-        anyhow::bail!("injected {failure:?} failure");
+    atomic_save_current(root, file, state, failure, _first_temp)
+}
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+fn atomic_save_current(
+    root: &std::path::Path,
+    file: &str,
+    state: &StateFile,
+    failure: Option<AtomicFailure>,
+    first_temp: Option<PathBuf>,
+) -> Result<()> {
+    state.state.validate()?;
+    let bytes = serde_json::to_vec_pretty(state)?;
+    let destination = root.join(file);
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    Ok(())
+
+    let mut first_temp = first_temp;
+    let (temporary, output) = loop {
+        let candidate = first_temp.take().unwrap_or_else(|| {
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            root.join(format!(".{file}.tmp-{}-{sequence}", std::process::id()))
+        });
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(output) => break (candidate, output),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut output = Some(output);
+
+    let attempt = (|| -> Result<()> {
+        if failure == Some(AtomicFailure::Write) {
+            anyhow::bail!("injected write failure");
+        }
+        let file = output.as_mut().expect("owned temporary file");
+        file.write_all(&bytes)?;
+        file.flush()?;
+        if failure == Some(AtomicFailure::Sync) {
+            anyhow::bail!("injected sync failure");
+        }
+        file.sync_all()?;
+        drop(output.take());
+        if failure == Some(AtomicFailure::Rename) {
+            anyhow::bail!("injected rename failure");
+        }
+        std::fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+
+    if attempt.is_err() {
+        drop(output.take());
+        let _ = std::fs::remove_file(&temporary);
+    }
+    attempt
 }
 
 /// Select and migrate exactly one workspace-owned source under an injected root.
@@ -152,40 +288,9 @@ pub fn migrate_for_workspace_at(
     root: &std::path::Path,
     base: &str,
     ws: &crate::workspace::Workspace,
-    mut reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
-) -> Result<LoadOutcome> {
-    let primary_file = ws.state_file(base);
-    let primary_path = root.join(&primary_file);
-    let source_file = if primary_path.exists() {
-        primary_file.clone()
-    } else if let Some(legacy) = ws.legacy_state_file(base) {
-        if root.join(&legacy).exists() {
-            legacy
-        } else {
-            return Ok(LoadOutcome::Missing);
-        }
-    } else {
-        return Ok(LoadOutcome::Missing);
-    };
-
-    let bytes = std::fs::read(root.join(&source_file))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if let Some(version) = value.get("schema_version") {
-        let version = version
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("schema_version must be an unsigned integer"))?;
-        if version != u64::from(SCHEMA_VERSION) {
-            anyhow::bail!("unsupported state schema version {version}");
-        }
-        let current: StateFile = serde_json::from_value(value)?;
-        current.state.validate()?;
-        return Ok(LoadOutcome::Current(current));
-    }
-
-    let legacy: State = serde_json::from_value(value)?;
-    let migrated = StateFile::new(migrate_legacy(legacy, &mut reconcile)?);
-    save_current_at(root, &primary_file, &migrated)?;
-    Ok(LoadOutcome::Legacy(migrated))
+    reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+) -> std::result::Result<LoadOutcome, LoadError> {
+    load_for_workspace_strict_at(root, base, ws, reconcile)
 }
 
 #[derive(Hash, Eq, PartialEq)]
@@ -317,10 +422,6 @@ fn config_base() -> PathBuf {
         .join("baude")
 }
 
-fn state_path(file: &str) -> PathBuf {
-    config_base().join(file)
-}
-
 /// User configuration, ~/.config/baude/config.json. All fields optional.
 #[derive(Deserialize, Default)]
 pub struct Config {
@@ -407,52 +508,91 @@ pub fn load_config() -> Config {
         .unwrap_or_default()
 }
 
-pub fn load() -> State {
-    load_for_workspace("state", crate::workspace::active())
+pub fn load() -> std::result::Result<LoadOutcome, LoadError> {
+    load_for_workspace("state", crate::workspace::active(), |_| {
+        LegacyReconciliation::Unavailable {
+            repository_cause: UnavailableCause::Other(
+                "legacy repository has not been reconciled".into(),
+            ),
+            checkout_cause: UnavailableCause::Other(
+                "legacy checkout has not been reconciled".into(),
+            ),
+        }
+    })
 }
 
-pub fn save(state: &State) -> Result<()> {
+pub fn save(state: &StateFile) -> Result<()> {
     save_for_workspace("state", crate::workspace::active(), state)
 }
 
 /// Load a workspace's session state (`<base>-<ws>.json`), falling back to
 /// the legacy un-suffixed file for the default workspace so pre-workspace
 /// session lists survive the upgrade. Saves never target the legacy name.
-pub fn load_for_workspace(base: &str, ws: &crate::workspace::Workspace) -> State {
-    let primary = ws.state_file(base);
-    if state_path(&primary).exists() {
-        return load_named(&primary);
-    }
-    match ws.legacy_state_file(base) {
-        Some(legacy) => load_named(&legacy),
-        None => State::default(),
-    }
+pub fn load_for_workspace(
+    base: &str,
+    ws: &crate::workspace::Workspace,
+    reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+) -> std::result::Result<LoadOutcome, LoadError> {
+    load_for_workspace_strict_at(&config_base(), base, ws, reconcile)
 }
 
 pub fn save_for_workspace(
     base: &str,
     ws: &crate::workspace::Workspace,
-    state: &State,
+    state: &StateFile,
 ) -> Result<()> {
     save_named(&ws.state_file(base), state)
 }
 
 /// Load session state from a specific file under the config dir. The TUI and
 /// the daemon keep separate files so they never clobber each other's sessions.
-pub fn load_named(file: &str) -> State {
-    std::fs::read_to_string(state_path(file))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+pub fn load_named(file: &str) -> std::result::Result<LoadOutcome, LoadError> {
+    load_named_at(&config_base(), file)
 }
 
-pub fn save_named(file: &str, state: &State) -> Result<()> {
-    let path = state_path(file);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+pub fn save_named(file: &str, state: &StateFile) -> Result<()> {
+    save_current_at(&config_base(), file, state)
+}
+
+fn load_named_at(
+    root: &std::path::Path,
+    file: &str,
+) -> std::result::Result<LoadOutcome, LoadError> {
+    let path = root.join(file);
+    let Some(bytes) = read_state_source(&path)? else {
+        return Ok(LoadOutcome::Missing);
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| LoadError::Malformed {
+            path: path.clone(),
+            cause: error.to_string(),
+        })?;
+    let Some(version) = value.get("schema_version") else {
+        return Err(LoadError::Malformed {
+            path,
+            cause: "legacy state requires workspace-aware migration".into(),
+        });
+    };
+    let version = version.as_u64().ok_or_else(|| LoadError::Malformed {
+        path: path.clone(),
+        cause: "schema_version must be an unsigned integer".into(),
+    })?;
+    if version != u64::from(SCHEMA_VERSION) {
+        return Err(LoadError::UnsupportedVersion { path, version });
     }
-    std::fs::write(&path, serde_json::to_string_pretty(state)?)?;
-    Ok(())
+    let current: StateFile =
+        serde_json::from_value(value).map_err(|error| LoadError::Malformed {
+            path: path.clone(),
+            cause: error.to_string(),
+        })?;
+    current
+        .state
+        .validate()
+        .map_err(|error| LoadError::InvalidState {
+            path,
+            cause: error.to_string(),
+        })?;
+    Ok(LoadOutcome::Current(current))
 }
 
 #[cfg(test)]
