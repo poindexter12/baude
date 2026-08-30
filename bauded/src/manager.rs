@@ -400,6 +400,9 @@ impl Manager {
         worktree: Option<&str>,
         name: Option<&str>,
     ) -> Result<SessionInfo> {
+        if self.persistence_blocked {
+            bail!("daemon persistence is blocked after a state load failure");
+        }
         let repo = expand_tilde(repo);
         let repo = repo.canonicalize().unwrap_or(repo);
         if !repo.is_dir() {
@@ -785,6 +788,9 @@ impl Manager {
     /// path with no daemon POST). Now a restart is spawn-equivalent, and for
     /// opencode it re-rolls the pinned server port.
     pub fn restart(&mut self, id: u64) -> Result<()> {
+        if self.persistence_blocked {
+            bail!("daemon persistence is blocked after a state load failure");
+        }
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), true);
@@ -1143,6 +1149,7 @@ mod tests {
         assert!(manager.persistence_blocked);
         manager.save_at(&root, &workspace);
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(manager.create("/tmp", None, None).is_err());
         assert!(manager.sessions.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
