@@ -893,6 +893,33 @@ mod tests {
     }
 
     #[test]
+    fn manager_persistence_blocks_malformed_state_and_later_saves() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-manager-persistence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let path = root.join(workspace.state_file(STATE_BASE));
+        let original = b"{truncated";
+        std::fs::write(&path, original).unwrap();
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert!(manager.persistence_blocked);
+        manager.save_at(&root, &workspace);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(manager.sessions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn create_list_info_remove() {
         let mut m = mgr();
         let info = m.create("/tmp", None, Some("t1")).unwrap();

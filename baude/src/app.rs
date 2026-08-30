@@ -2151,7 +2151,10 @@ mod clipboard_tests {
 
 #[cfg(test)]
 mod repository_admission_tests {
-    use super::{commit_then_spawn, primary_dispatch, PrimaryDispatch};
+    use super::{
+        commit_then_spawn, local_admission_route, primary_dispatch, LocalAdmissionRoute,
+        PrimaryDispatch,
+    };
 
     #[test]
     fn repository_admission_dispatches_every_primary_state() {
@@ -2196,5 +2199,17 @@ mod repository_admission_tests {
         );
         assert_eq!(result, Err("disk full"));
         assert_eq!(*events.borrow(), ["save"]);
+    }
+
+    #[test]
+    fn admission_routes_share_one_local_entrypoint_and_preserve_remote_routing() {
+        for route in [
+            LocalAdmissionRoute::LaunchDirectory,
+            LocalAdmissionRoute::Open,
+            LocalAdmissionRoute::CloneCompletion,
+        ] {
+            assert!(local_admission_route(route, false));
+            assert!(!local_admission_route(route, true));
+        }
     }
 }
