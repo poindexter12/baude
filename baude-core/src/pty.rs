@@ -32,6 +32,18 @@ impl Pty {
     /// Spawn `command` under the user's shell (interactive login, so PATH from
     /// .zshrc/.zprofile — mise, homebrew — is available) inside a new PTY.
     pub fn spawn(command: Option<&str>, cwd: &Path, rows: u16, cols: u16) -> Result<Pty> {
+        Self::spawn_with_env(command, &[], cwd, rows, cols)
+    }
+
+    /// Spawn with opaque environment values attached directly to the child
+    /// process rather than interpolated into the shell command text.
+    pub fn spawn_with_env(
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Pty> {
         let rows = rows.max(2);
         let cols = cols.max(10);
         let pty_system = native_pty_system();
@@ -57,6 +69,9 @@ impl Pty {
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
         let child = pair
             .slave

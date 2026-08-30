@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::{Backend, SpawnPlan};
+use super::{Backend, SpawnMode, SpawnPlan, RESUME_ID_ENV};
 use crate::meta::ClaudeMeta;
 use crate::permission::ResolvedCmd;
 
@@ -39,11 +39,20 @@ impl Backend for ClaudeBackend {
     /// otherwise run WITHOUT the var and its hooks would silently miss the
     /// daemon transport. `export` sets it for the whole command group,
     /// surviving the `||` fallback and sub-exec (WR-01).
-    fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, resume: bool) -> SpawnPlan {
-        let inner = if resume {
-            format!("{resolved_cmd} --continue 2>/dev/null || exec {resolved_cmd}")
-        } else {
-            format!("exec {resolved_cmd}")
+    fn spawn_plan(
+        &self,
+        resolved_cmd: &str,
+        event_url: Option<&str>,
+        mode: SpawnMode,
+    ) -> SpawnPlan {
+        let inner = match &mode {
+            SpawnMode::Fresh => format!("exec {resolved_cmd}"),
+            SpawnMode::ContinueLatest => {
+                format!("{resolved_cmd} --continue 2>/dev/null || exec {resolved_cmd}")
+            }
+            SpawnMode::ResumeId(_) => {
+                format!("exec {resolved_cmd} --resume \"${RESUME_ID_ENV}\"")
+            }
         };
         let cmd = match event_url {
             Some(url) => format!("export BAUDE_EVENT_URL={url}; {inner}"),
@@ -51,6 +60,7 @@ impl Backend for ClaudeBackend {
         };
         SpawnPlan {
             cmd,
+            env: mode.environment(),
             server_port: None,
         }
     }

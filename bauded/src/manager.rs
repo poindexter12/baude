@@ -846,8 +846,13 @@ impl Manager {
             );
         }
 
-        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), resume);
-        let claude = Pty::spawn(Some(&plan.cmd), &cwd, ROWS, COLS)?;
+        let mode = if resume {
+            backend::SpawnMode::ContinueLatest
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
+        let claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?;
         let mut meta = ClaudeMeta::default();
         meta.backend_port = plan.server_port;
 
@@ -1224,10 +1229,14 @@ impl Manager {
         }
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
-        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), true);
+        let plan = be.spawn_plan(
+            &resolved.cmd,
+            Some(&event_url(id)),
+            backend::SpawnMode::ContinueLatest,
+        );
         let s = self.session_mut(id)?;
         be.prepare_cwd(&s.cwd);
-        s.claude = Pty::spawn(Some(&plan.cmd), &s.cwd, ROWS, COLS)?;
+        s.claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &s.cwd, ROWS, COLS)?;
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;

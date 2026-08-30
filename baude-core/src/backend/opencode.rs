@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Backend, SpawnPlan};
+use super::{Backend, SpawnMode, SpawnPlan, RESUME_ID_ENV};
 use crate::meta::{now_unix_ms, ClaudeMeta, Usage};
 use crate::permission::ResolvedCmd;
 
@@ -90,8 +90,17 @@ pub fn resolve_opencode_cmd(mode: Option<&str>, base_cmd: &str) -> ResolvedCmd {
 /// Pure: compose the spawn command given an allocated `port`. Split from
 /// [`Backend::spawn_plan`] so the exact strings are testable without binding
 /// sockets or reading the env.
-pub fn compose_spawn_cmd(resolved_cmd: &str, port: u16, resume: bool, prompt_mode: bool) -> String {
-    let cont = if resume { " --continue" } else { "" };
+pub fn compose_spawn_cmd(
+    resolved_cmd: &str,
+    port: u16,
+    mode: SpawnMode,
+    prompt_mode: bool,
+) -> String {
+    let cont = match mode {
+        SpawnMode::Fresh => "".to_string(),
+        SpawnMode::ContinueLatest => " --continue".to_string(),
+        SpawnMode::ResumeId(_) => format!(" --session \"${RESUME_ID_ENV}\""),
+    };
     let inner = format!("exec {resolved_cmd} --port {port} --hostname 127.0.0.1{cont}");
     if prompt_mode {
         format!("export OPENCODE_CONFIG_CONTENT='{PROMPT_CONFIG}'; {inner}")
@@ -136,16 +145,23 @@ impl Backend for OpencodeBackend {
     /// cleanly on a fresh one, so there is no `|| exec` fallback. `event_url`
     /// is claude hook plumbing — opencode has no hooks; status flows back
     /// through the pinned server port instead, so it is ignored.
-    fn spawn_plan(&self, resolved_cmd: &str, _event_url: Option<&str>, resume: bool) -> SpawnPlan {
+    fn spawn_plan(
+        &self,
+        resolved_cmd: &str,
+        _event_url: Option<&str>,
+        mode: SpawnMode,
+    ) -> SpawnPlan {
         let port = alloc_port();
+        let env = mode.environment();
         let cmd = compose_spawn_cmd(
             resolved_cmd,
             port.unwrap_or(0),
-            resume,
+            mode,
             crate::permission::is_prompt_mode(),
         );
         SpawnPlan {
             cmd,
+            env,
             // Port 0 would let opencode pick a random port baude can't
             // discover — report no server rather than a wrong one.
             server_port: port,
@@ -308,12 +324,7 @@ mod tests {
             "exec opencode --auto --port 14711 --hostname 127.0.0.1"
         );
         assert_eq!(
-            compose_spawn_cmd(
-                "opencode --auto",
-                14711,
-                SpawnMode::ContinueLatest,
-                false,
-            ),
+            compose_spawn_cmd("opencode --auto", 14711, SpawnMode::ContinueLatest, false,),
             "exec opencode --auto --port 14711 --hostname 127.0.0.1 --continue"
         );
     }

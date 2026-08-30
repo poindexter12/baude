@@ -1111,7 +1111,12 @@ impl App {
         // $BAUDE_EVENT_URL, which routes hook events to the /tmp append path
         // (only the daemon injects that var).
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
-        let plan = be.spawn_plan(&base, None, resume);
+        let mode = if resume {
+            backend::SpawnMode::ContinueLatest
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        let plan = be.spawn_plan(&base, None, mode);
 
         // Wire the session cwd before the CLI starts (for Claude: the
         // settings.local.json hook seed, plus the prompt-mode .mcp.json).
@@ -1133,7 +1138,7 @@ impl App {
         }
 
         let (rows, cols) = self.claude_spawn_size(shell_open);
-        let claude = Pty::spawn(Some(&plan.cmd), &cwd, rows, cols)?;
+        let claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, rows, cols)?;
         let mut meta = ClaudeMeta::default();
         meta.backend_port = plan.server_port;
 
@@ -2215,9 +2220,14 @@ impl App {
         // the prior behavior.
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
-        let plan = be.spawn_plan(&base, None, resume);
+        let mode = if resume {
+            backend::SpawnMode::ContinueLatest
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        let plan = be.spawn_plan(&base, None, mode);
         be.prepare_cwd(&cwd);
-        let pty = Pty::spawn(Some(&plan.cmd), &cwd, rows, cols)?;
+        let pty = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, rows, cols)?;
         if let Some(s) = self.session_mut(id) {
             s.claude = pty;
             s.spawn_unix_ms = now_unix_ms();
