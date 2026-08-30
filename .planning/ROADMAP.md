@@ -29,7 +29,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 
 **Milestone Goal:** Make repositories persistent, navigable parents so the active backend can work on the resolved default branch immediately and create isolated worktrees for parallel work without silently mutating Git state.
 
-- [ ] **Phase 5: Durable Repository Admission** - Canonical repositories, the approved default-branch contract, migration, and atomic persistence work per workspace.
+- [x] **Phase 5: Durable Repository Admission** - Canonical repositories, the approved default-branch contract, migration, and atomic persistence work per workspace. (completed 2026-08-30)
 - [ ] **Phase 6: Safe Managed Worktree Lifecycle** - Users can create, retain, reopen, and safely remove managed worktrees under Git-verified safeguards.
 - [ ] **Phase 7: Local Repository Hierarchy & Branch Control** - The local TUI presents stable repository children, dormant branches, and context-aware actions.
 - [ ] **Phase 8: Daemon & Remote TUI Parity** - Daemon-owned repositories and the remote TUI use the same identity and lifecycle semantics without breaking flat clients.
@@ -125,7 +125,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 | 2. Hook-Driven Status | v0.7 | 3/3 | Complete | 2026-06-15 |
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
-| 5. Durable Repository Admission | v2.0 | 3/3 | In Progress|  |
+| 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
 | 6. Safe Managed Worktree Lifecycle | v2.0 | 0/TBD | Not started | - |
 | 7. Local Repository Hierarchy & Branch Control | v2.0 | 0/TBD | Not started | - |
 | 8. Daemon & Remote TUI Parity | v2.0 | 0/TBD | Not started | - |
