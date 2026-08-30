@@ -505,6 +505,7 @@ fn migrate_legacy(
                 shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
+                resume_id: None,
             },
             health: checkout_health,
         });
@@ -776,6 +777,7 @@ mod tests {
                 shell_open: true,
                 archived: true,
                 archived_by_user: true,
+                resume_id: Some("opaque-retained-id".into()),
             },
             health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
         });

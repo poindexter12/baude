@@ -89,6 +89,10 @@ pub struct RetainedSessionState {
     pub shell_open: bool,
     pub archived: bool,
     pub archived_by_user: bool,
+    /// Backend-owned conversation identity. It is opaque durable data, not a
+    /// pathname or repository/session ownership key.
+    #[serde(default)]
+    pub resume_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -388,6 +392,7 @@ mod tests {
                 shell_open: true,
                 archived: false,
                 archived_by_user: false,
+                resume_id: None,
             },
             health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
         }

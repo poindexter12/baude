@@ -47,6 +47,58 @@ pub struct RecordedActivation {
     pub branch: String,
 }
 
+/// Complete runtime metadata captured at the retained-close boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloseRequest {
+    pub checkout: CheckoutKey,
+    pub runtime: RetainedSessionState,
+}
+
+/// Effects are deliberately explicit so runtime owners cannot stop a process
+/// before the inactive aggregate replacement has been authorized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseEffect {
+    SnapshotRuntime,
+    SaveInactiveIntent,
+    StopRuntime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosePlan {
+    pub checkout: CheckoutKey,
+    pub effects: [CloseEffect; 3],
+    pub outcome: LifecycleOutcome,
+}
+
+/// Snapshot one runtime into its durable child and deactivate only that child.
+/// The aggregate is replaced only after the complete candidate validates.
+pub fn plan_close(
+    state: &mut RepositoryState,
+    request: CloseRequest,
+) -> Result<ClosePlan, LifecycleError> {
+    let mut next = state.clone();
+    let checkout = next
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == request.checkout)
+        .ok_or(LifecycleError::CheckoutMissing(request.checkout))?;
+    checkout.session = request.runtime;
+    checkout.active_intent = false;
+    next.validate()?;
+    *state = next;
+    Ok(ClosePlan {
+        checkout: request.checkout,
+        effects: [
+            CloseEffect::SnapshotRuntime,
+            CloseEffect::SaveInactiveIntent,
+            CloseEffect::StopRuntime,
+        ],
+        outcome: LifecycleOutcome::Closed {
+            checkout: request.checkout,
+        },
+    })
+}
+
 impl RecordedActivation {
     pub fn outcome(&self, runtime: Option<u64>) -> LifecycleOutcome {
         match self.disposition {
@@ -150,6 +202,7 @@ pub enum LifecycleError {
     Allocation(AllocationError),
     Validation(ValidationError),
     RepositoryMissing(RepositoryKey),
+    CheckoutMissing(CheckoutKey),
     Topology(String),
 }
 
@@ -162,6 +215,9 @@ impl std::fmt::Display for LifecycleError {
             Self::Validation(error) => error.fmt(f),
             Self::RepositoryMissing(key) => {
                 write!(f, "activation repository {} is missing", key.get())
+            }
+            Self::CheckoutMissing(key) => {
+                write!(f, "lifecycle checkout {} is missing", key.get())
             }
             Self::Topology(detail) => write!(f, "activation topology mismatch: {detail}"),
         }
@@ -357,6 +413,7 @@ pub fn execute_activation(
                 shell_open: false,
                 archived: false,
                 archived_by_user: false,
+                resume_id: None,
             },
             health: CheckoutHealth::Available,
         });
@@ -393,6 +450,9 @@ pub enum LifecycleOutcome {
     Focused {
         checkout: CheckoutKey,
         runtime: u64,
+    },
+    Closed {
+        checkout: CheckoutKey,
     },
     Busy {
         repository: RepositoryKey,
