@@ -603,17 +603,14 @@ impl App {
     }
 
     fn save_removal_revocation(&mut self) -> std::result::Result<(), persist::SaveError> {
+        let result = self.save_durable_status();
         #[cfg(test)]
-        {
-            let failure = self.atomic_failure_for_test.take();
-            let result = self.save_durable_status();
-            self.atomic_failure_for_test = failure;
-            result
+        if result.is_err() {
+            // Failure injection models one atomic boundary, allowing rollback
+            // persistence to exercise the same path as a recovered filesystem.
+            self.atomic_failure_for_test = None;
         }
-        #[cfg(not(test))]
-        {
-            self.save_durable_status()
-        }
+        result
     }
 
     fn save_durable(&self) -> Result<()> {
@@ -1391,7 +1388,6 @@ impl App {
                     return self.compensate_failed_removal(checkout, runtime, failure);
                 }
             };
-        let before_revocation = self.repository_state.clone();
         if let Some(saved) = runtime.clone() {
             if let Some(retained) = self
                 .repository_state
@@ -1402,12 +1398,18 @@ impl App {
                 retained.session = saved;
             }
         }
+        // This is the authority-restorable state: it intentionally includes
+        // the runtime context captured immediately before teardown.
+        let before_revocation = self.repository_state.clone();
         lifecycle::revoke_removal_authority(&mut self.repository_state, checkout)
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         if let Err(error) = self.save_removal_revocation() {
             self.persistence_dirty = true;
             if !error.replacement_committed() {
                 self.repository_state = before_revocation;
+                if self.save_removal_revocation().is_ok() {
+                    self.persistence_dirty = false;
+                }
             }
             return self.compensate_failed_removal(
                 checkout,
@@ -3553,7 +3555,7 @@ mod repository_admission_tests {
     }
 
     #[test]
-    fn lifecycle_remove_clean_local_reports_truthful_post_git_persistence_stage() {
+    fn lifecycle_remove_revocation_failure_retains_fresh_runtime_context() {
         for (label, failure, replacement_committed) in [
             (
                 "safe-remove-save-pre",
@@ -3584,41 +3586,49 @@ mod repository_admission_tests {
             let created = app
                 .activate_branch_worktree(&repo, &format!("feature/{label}"))
                 .unwrap();
-            let checkout = match created {
-                LifecycleOutcome::Created { checkout, .. } => checkout,
+            let (checkout, runtime) = match created {
+                LifecycleOutcome::Created {
+                    checkout,
+                    runtime: Some(runtime),
+                } => (checkout, runtime),
                 other => panic!("unexpected activation outcome: {other:?}"),
             };
+            let resume_id = format!("fresh-{label}");
+            app.session_mut(runtime).unwrap().meta.session_id = Some(resume_id.clone());
             let before = app.repository_state.clone();
             let path = before.checkouts[0].observed_path.to_path_buf();
             let confirmation = app.prepare_remove_worktree(checkout).unwrap();
             app.atomic_failure_for_test = Some(failure);
 
-            let outcome = app.confirm_remove_worktree(confirmation).unwrap();
-
-            assert!(matches!(
-                outcome,
-                LifecycleOutcome::TopologyCommittedStateDegraded { checkout: key, .. }
-                    if key == checkout
-            ));
-            assert!(!path.exists());
-            assert!(app.persistence_dirty);
+            let error = app.confirm_remove_worktree(confirmation).unwrap_err();
+            assert!(error.to_string().contains("durably revoke"));
+            assert!(path.exists());
+            assert_eq!(app.runtime_checkouts.len(), 1);
+            assert_eq!(app.sessions.len(), 1);
             assert_eq!(
-                app.repository_state.checkouts.is_empty(),
-                replacement_committed
+                app.repository_state.checkouts[0]
+                    .session
+                    .resume_id
+                    .as_deref(),
+                Some(resume_id.as_str())
             );
-            if !replacement_committed {
-                assert!(matches!(
-                    app.repository_state.checkouts[0].health,
-                    CheckoutHealth::Unavailable(_)
-                ));
-            }
+            assert_eq!(
+                app.repository_state.checkouts[0].managed_by_baude,
+                !replacement_committed
+            );
             let state_file = baude_core::workspace::active().state_file("state");
             let persisted = baude_core::persist::load_current_at(&state_root, &state_file)
                 .unwrap()
                 .state;
-            assert_eq!(persisted.checkouts.is_empty(), replacement_committed);
-            if !replacement_committed {
-                assert!(!persisted.checkouts[0].managed_by_baude);
+            assert_eq!(
+                persisted.checkouts[0].session.resume_id.as_deref(),
+                Some(resume_id.as_str())
+            );
+            assert_eq!(
+                persisted.checkouts[0].managed_by_baude,
+                !replacement_committed
+            );
+            if replacement_committed {
                 assert!(matches!(
                     persisted.checkouts[0].health,
                     CheckoutHealth::Unavailable(
@@ -3626,6 +3636,19 @@ mod repository_admission_tests {
                     )
                 ));
             }
+            for session in &mut app.sessions {
+                session.kill();
+            }
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    path.to_str().unwrap(),
+                ],
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }

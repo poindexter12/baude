@@ -462,17 +462,12 @@ impl Manager {
     }
 
     fn save_removal_revocation(&mut self) -> std::result::Result<(), persist::SaveError> {
+        let result = self.save_checked();
         #[cfg(test)]
-        {
-            let failure = self.atomic_failure_for_test.take();
-            let result = self.save_checked();
-            self.atomic_failure_for_test = failure;
-            result
+        if result.is_err() {
+            self.atomic_failure_for_test = None;
         }
-        #[cfg(not(test))]
-        {
-            self.save_checked()
-        }
+        result
     }
 
     pub fn persistence_status(&self) -> PersistenceStatus {
@@ -1143,7 +1138,6 @@ impl Manager {
                     return self.compensate_failed_removal(checkout, runtime, failure);
                 }
             };
-        let before_revocation = self.repository_state.clone();
         if let Some(saved) = runtime.clone() {
             if let Some(retained) = self
                 .repository_state
@@ -1154,12 +1148,18 @@ impl Manager {
                 retained.session = saved;
             }
         }
+        // Rollback may restore management authority, but must never roll back
+        // the freshly captured conversation and shell context.
+        let before_revocation = self.repository_state.clone();
         lifecycle::revoke_removal_authority(&mut self.repository_state, checkout)
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         if let Err(error) = self.save_removal_revocation() {
             self.persistence_dirty = true;
             if !error.replacement_committed() {
                 self.repository_state = before_revocation;
+                if self.save_removal_revocation().is_ok() {
+                    self.persistence_dirty = false;
+                }
             }
             return self.compensate_failed_removal(
                 checkout,
