@@ -1142,6 +1142,11 @@ impl Manager {
         &self,
         checkout: CheckoutKey,
     ) -> std::result::Result<lifecycle::RemovalConfirmation, lifecycle::RemovalFailure> {
+        if self.persistence_dirty || self.repository_state.has_pending_activation() {
+            return Err(lifecycle::RemovalFailure::Inspection(
+                "repository lifecycle is blocked by unresolved persistence recovery".into(),
+            ));
+        }
         let saved = self
             .repository_state
             .checkouts
@@ -1200,18 +1205,22 @@ impl Manager {
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         if let Err(error) = self.save_removal_revocation() {
             self.persistence_dirty = true;
-            if !error.replacement_committed() {
-                self.repository_state = before_revocation;
-                if self.save_removal_revocation().is_ok() {
-                    self.persistence_dirty = false;
-                }
+            let original = format!("could not durably revoke removal authority: {error}");
+            self.repository_state = before_revocation;
+            if let Err(restoration) = self.save_removal_revocation() {
+                self.persistence_dirty = true;
+                return Err(lifecycle::RemovalFailure::Compensation {
+                    original,
+                    recovery: format!(
+                        "authority restoration persistence failed before runtime compensation: {restoration}"
+                    ),
+                });
             }
+            self.persistence_dirty = false;
             return self.compensate_failed_removal(
                 checkout,
                 runtime,
-                lifecycle::RemovalFailure::Inspection(format!(
-                    "could not durably revoke removal authority: {error}"
-                )),
+                lifecycle::RemovalFailure::Inspection(original),
             );
         }
         let revoked_state = self.repository_state.clone();
