@@ -58,6 +58,8 @@ pub struct Manager {
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     persistence_blocked: bool,
+    /// True after a failed save so API owners can surface degraded durability.
+    pub persistence_dirty: bool,
 }
 
 fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
@@ -244,6 +246,7 @@ impl Manager {
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
             persistence_blocked: false,
+            persistence_dirty: false,
         }
     }
 
@@ -386,7 +389,7 @@ impl Manager {
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&mut self) {
         if !self.persist || self.persistence_blocked {
             return;
         }
@@ -394,12 +397,15 @@ impl Manager {
         if let Err(e) =
             persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state)
         {
+            self.persistence_dirty = true;
             eprintln!("save state: {e}");
+        } else {
+            self.persistence_dirty = false;
         }
     }
 
     #[cfg(test)]
-    fn save_at(&self, root: &Path, workspace: &baude_core::workspace::Workspace) {
+    fn save_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) {
         if !self.persist || self.persistence_blocked {
             return;
         }
@@ -407,7 +413,10 @@ impl Manager {
         if let Err(error) =
             persist::save_current_at(root, &file, &StateFile::new(self.state_for_save()))
         {
+            self.persistence_dirty = true;
             eprintln!("save state: {error}");
+        } else {
+            self.persistence_dirty = false;
         }
     }
 

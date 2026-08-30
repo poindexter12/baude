@@ -343,6 +343,7 @@ pub struct App {
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     persistence_blocked: bool,
+    persistence_dirty: bool,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -414,12 +415,17 @@ impl App {
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
             persistence_blocked: false,
+            persistence_dirty: false,
         }
     }
 
     /// Cached today/week costs from the ccusage background poller.
     pub fn usage_costs(&self) -> UsageCosts {
         self.usage.costs()
+    }
+
+    pub fn persistence_dirty(&self) -> bool {
+        self.persistence_dirty
     }
 
     /// Freshest account rate-limit windows across all sessions (they're
@@ -509,8 +515,16 @@ impl App {
         self.selected_id = self.ordered_ids().first().copied();
     }
 
-    pub fn save(&self) {
-        let _ = self.save_durable();
+    pub fn save(&mut self) {
+        match self.save_durable() {
+            Ok(()) => self.persistence_dirty = false,
+            Err(error) => {
+                self.persistence_dirty = true;
+                self.set_message(format!(
+                    "state not saved: {error}; retry the action after repairing persistence"
+                ));
+            }
+        }
     }
 
     fn save_durable(&self) -> Result<()> {

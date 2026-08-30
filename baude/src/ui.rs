@@ -849,6 +849,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         "⬢ {}",
         baude_core::workspace::active().display_label()
     ));
+    if app.persistence_dirty() {
+        right.push("⚠ state unsaved".into());
+    }
     if waiting > 0 {
         right.push(format!("● {waiting} waiting"));
     }
