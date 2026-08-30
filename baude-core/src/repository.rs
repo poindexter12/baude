@@ -191,28 +191,40 @@ impl std::error::Error for AllocationError {}
 impl RepositoryState {
     pub fn allocate_repository_key(&mut self) -> Result<RepositoryKey, AllocationError> {
         let key = RepositoryKey(self.next_repository_key);
-        self.next_repository_key = self
+        let next = self
             .next_repository_key
             .checked_add(1)
             .ok_or(AllocationError::RepositoryKeysExhausted)?;
+        if next == u64::MAX {
+            return Err(AllocationError::RepositoryKeysExhausted);
+        }
+        self.next_repository_key = next;
         Ok(key)
     }
 
     pub fn allocate_checkout_key(&mut self) -> Result<CheckoutKey, AllocationError> {
         let key = CheckoutKey(self.next_checkout_key);
-        self.next_checkout_key = self
+        let next = self
             .next_checkout_key
             .checked_add(1)
             .ok_or(AllocationError::CheckoutKeysExhausted)?;
+        if next == u64::MAX {
+            return Err(AllocationError::CheckoutKeysExhausted);
+        }
+        self.next_checkout_key = next;
         Ok(key)
     }
 
     pub fn allocate_first_seen_order(&mut self) -> Result<u64, AllocationError> {
         let order = self.next_first_seen_order;
-        self.next_first_seen_order = self
+        let next = self
             .next_first_seen_order
             .checked_add(1)
             .ok_or(AllocationError::FirstSeenOrderExhausted)?;
+        if next == u64::MAX {
+            return Err(AllocationError::FirstSeenOrderExhausted);
+        }
+        self.next_first_seen_order = next;
         Ok(order)
     }
 
@@ -515,13 +527,28 @@ mod tests {
             assert_eq!(exhausted.validate(), Err(expected));
         }
 
-        let mut exhausted = RepositoryState {
-            next_repository_key: u64::MAX,
-            ..RepositoryState::default()
-        };
-        assert_eq!(
-            exhausted.allocate_repository_key(),
-            Err(AllocationError::RepositoryKeysExhausted)
-        );
+        for (counter, expected) in [
+            ("repository", AllocationError::RepositoryKeysExhausted),
+            ("checkout", AllocationError::CheckoutKeysExhausted),
+            ("order", AllocationError::FirstSeenOrderExhausted),
+        ] {
+            let mut exhausted = RepositoryState::default();
+            match counter {
+                "repository" => exhausted.next_repository_key = u64::MAX - 1,
+                "checkout" => exhausted.next_checkout_key = u64::MAX - 1,
+                "order" => exhausted.next_first_seen_order = u64::MAX - 1,
+                _ => unreachable!(),
+            }
+            let before = exhausted.clone();
+            let result = match counter {
+                "repository" => exhausted.allocate_repository_key().map(|_| ()),
+                "checkout" => exhausted.allocate_checkout_key().map(|_| ()),
+                "order" => exhausted.allocate_first_seen_order().map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert_eq!(result, Err(expected));
+            assert_eq!(exhausted, before, "failed allocation must not mutate state");
+            assert!(exhausted.validate().is_ok());
+        }
     }
 }

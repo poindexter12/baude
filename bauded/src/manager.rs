@@ -480,9 +480,18 @@ impl Manager {
                 (repo, root, None, false)
             }
         };
+        if self.persist {
+            self.ensure_runtime_capacity(&cwd, &repo_root)?;
+        }
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         if self.persist {
-            self.record_runtime(id)?;
+            if let Err(error) = self.record_runtime(id) {
+                if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
+                    session.kill();
+                }
+                self.sessions.retain(|session| session.id != id);
+                return Err(error);
+            }
         }
         self.save();
         Ok(self.info(id).expect("session just spawned"))
@@ -649,6 +658,26 @@ impl Manager {
             },
         });
         self.runtime_checkouts.insert(checkout_key, id);
+        Ok(())
+    }
+
+    fn ensure_runtime_capacity(&self, cwd: &Path, repo_root: &Path) -> Result<()> {
+        let mut state = self.repository_state.clone();
+        let snapshot = git::discover_repository(cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(repo_root));
+        if !state
+            .repositories
+            .iter()
+            .any(|repository| repository.observed_common_dir == common)
+        {
+            state.allocate_repository_key()?;
+            state.allocate_first_seen_order()?;
+        }
+        state.allocate_checkout_key()?;
+        state.allocate_first_seen_order()?;
         Ok(())
     }
 
@@ -1384,6 +1413,22 @@ mod tests {
         m.remove(info.id).unwrap();
         assert!(m.list().is_empty());
         assert!(m.remove(info.id).is_err());
+    }
+
+    #[test]
+    fn exhausted_durable_counter_rejects_create_before_spawn() {
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.repository_state.next_repository_key = u64::MAX - 1;
+
+        let error = match manager.create("/tmp", None, None) {
+            Ok(_) => panic!("counter exhaustion unexpectedly spawned a session"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("RepositoryKeysExhausted"), "got: {error}");
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(manager.next_id, 1);
     }
 
     #[test]
