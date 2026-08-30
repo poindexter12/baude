@@ -98,6 +98,8 @@ pub struct Manager {
     persistence_target_for_test: Option<(PathBuf, String)>,
     #[cfg(test)]
     atomic_failure_for_test: Option<persist::AtomicFailure>,
+    #[cfg(test)]
+    spawn_error_for_test: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -299,6 +301,8 @@ impl Manager {
             persistence_target_for_test: None,
             #[cfg(test)]
             atomic_failure_for_test: None,
+            #[cfg(test)]
+            spawn_error_for_test: None,
         }
     }
 
@@ -664,6 +668,15 @@ impl Manager {
         self.repository_state = next;
         if let Err(error) = self.save_checked() {
             if !error.replacement_committed() {
+                lifecycle::compensate_uncommitted_activation(&activation).map_err(
+                    |compensation| {
+                        anyhow!(
+                            "{} failed: {error}; {} failed: {compensation}",
+                            lifecycle::CreationFailureStage::PersistenceBeforeReplacement,
+                            lifecycle::CreationFailureStage::Compensation
+                        )
+                    },
+                )?;
                 self.repository_state = state_before;
             }
             return Err(MutationError::Persistence(error));
@@ -684,14 +697,21 @@ impl Manager {
             .find(|checkout| checkout.key == activation.checkout)
             .cloned()
             .ok_or_else(|| anyhow!("activated checkout is missing"))?;
-        let id = self.spawn(
-            activation.path.clone(),
-            activation.main_worktree.clone(),
-            Some(activation.branch.clone()),
-            activation.path != activation.main_worktree,
-            Some(&checkout.session.name),
-            false,
-        )?;
+        let id = self
+            .spawn(
+                activation.path.clone(),
+                activation.main_worktree.clone(),
+                Some(activation.branch.clone()),
+                activation.path != activation.main_worktree,
+                Some(&checkout.session.name),
+                false,
+            )
+            .map_err(|error| {
+                anyhow!(
+                    "{} failed after durable activation: {error}",
+                    lifecycle::CreationFailureStage::Spawn
+                )
+            })?;
         self.runtime_checkouts.insert(activation.checkout, id);
         Ok(activation.outcome(Some(id)))
     }
@@ -779,6 +799,10 @@ impl Manager {
         name: Option<&str>,
         resume: bool,
     ) -> Result<u64> {
+        #[cfg(test)]
+        if let Some(error) = &self.spawn_error_for_test {
+            bail!("test spawn failure: {error}");
+        }
         let dir_name = |p: &Path| {
             p.file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -1855,6 +1879,19 @@ mod tests {
         );
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(manager.runtime_checkouts.len(), 1);
+
+        let different = manager
+            .activate_branch_worktree(&repo, "feature/manager-distinct", None)
+            .unwrap();
+        assert!(matches!(
+            different,
+            LifecycleOutcome::Created {
+                checkout: other_checkout,
+                runtime: Some(other_runtime),
+            } if other_checkout != checkout && other_runtime != runtime
+        ));
+        assert_eq!(manager.repository_state.checkouts.len(), 2);
+        assert_eq!(manager.runtime_checkouts.len(), 2);
         manager.kill_all();
         let linked: Vec<_> = manager
             .repository_state
@@ -1921,11 +1958,7 @@ mod tests {
         );
         let before = manager.repository_state.clone();
 
-        let result = manager.activate_branch_worktree(
-            &repo,
-            "feature/manager-rollback",
-            None,
-        );
+        let result = manager.activate_branch_worktree(&repo, "feature/manager-rollback", None);
         let after = git::discover_repository(&repo).unwrap();
         let partial: Vec<_> = after
             .worktrees
@@ -1961,6 +1994,94 @@ mod tests {
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
         assert!(branch_retained);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_rollback_manager_committed_save_and_spawn_failures_retain_retry_child() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-stages-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("true".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 40_000;
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::DirectorySync),
+        );
+
+        assert!(manager
+            .activate_branch_worktree(&repo, "feature/manager-postcommit", None)
+            .is_err());
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+        assert!(manager.runtime_checkouts.is_empty());
+
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.spawn_error_for_test = Some("pty unavailable".into());
+        let spawn_error = manager
+            .activate_branch_worktree(&repo, "feature/manager-spawn", None)
+            .unwrap_err()
+            .to_string();
+        assert!(spawn_error.contains("pty unavailable"));
+        assert_eq!(manager.repository_state.checkouts.len(), 2);
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+
+        let linked: Vec<_> = manager
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.observed_path.to_path_buf())
+            .collect();
+        for path in linked {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -65,6 +65,82 @@ impl RecordedActivation {
             },
         }
     }
+
+    pub fn added_managed_worktree(&self) -> bool {
+        self.managed_by_baude
+            && matches!(
+                self.disposition,
+                ActivationDisposition::Created | ActivationDisposition::Activated
+            )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreationFailureStage {
+    PersistenceBeforeReplacement,
+    PersistenceAfterReplacement,
+    Spawn,
+    Compensation,
+}
+
+impl std::fmt::Display for CreationFailureStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PersistenceBeforeReplacement => f.write_str("persistence before replacement"),
+            Self::PersistenceAfterReplacement => f.write_str("persistence after replacement"),
+            Self::Spawn => f.write_str("runtime spawn"),
+            Self::Compensation => f.write_str("worktree compensation"),
+        }
+    }
+}
+
+/// Remove only a worktree added by this uncommitted activation. Plain Git
+/// removal retains the local branch; fresh postconditions prove both facts.
+pub fn compensate_uncommitted_activation(
+    activation: &RecordedActivation,
+) -> Result<(), LifecycleError> {
+    if !activation.added_managed_worktree() {
+        return Ok(());
+    }
+    git::remove_worktree(&activation.main_worktree, &activation.path).map_err(|error| {
+        LifecycleError::Topology(format!(
+            "plain Git worktree compensation refused {}: {error}",
+            activation.path.display()
+        ))
+    })?;
+    match std::fs::symlink_metadata(&activation.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(LifecycleError::Topology(format!(
+                "compensated worktree path {} still exists",
+                activation.path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(LifecycleError::Topology(format!(
+                "inspect compensated worktree path {}: {error}",
+                activation.path.display()
+            )));
+        }
+    }
+    let fresh = git::discover_repository(&activation.main_worktree)?;
+    if fresh
+        .worktrees
+        .iter()
+        .any(|record| record.path == activation.path)
+    {
+        return Err(LifecycleError::Topology(format!(
+            "compensated worktree {} remains registered",
+            activation.path.display()
+        )));
+    }
+    let expected = format!("refs/heads/{}", activation.branch);
+    match git::classify_branch(&fresh, &activation.branch)? {
+        git::BranchActivation::ExistingLocal { full_ref, .. } if full_ref == expected => Ok(()),
+        other => Err(LifecycleError::Topology(format!(
+            "compensation did not retain exact local branch {expected}: {other:?}"
+        ))),
+    }
 }
 
 #[derive(Debug)]

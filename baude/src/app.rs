@@ -351,6 +351,8 @@ pub struct App {
     #[cfg(test)]
     save_attempts_for_test: std::cell::Cell<usize>,
     #[cfg(test)]
+    atomic_failure_for_test: Option<persist::AtomicFailure>,
+    #[cfg(test)]
     spawn_error_for_test: Option<String>,
     #[cfg(test)]
     spawn_attempts_for_test: usize,
@@ -431,6 +433,8 @@ impl App {
             persistence_root_for_test: None,
             #[cfg(test)]
             save_attempts_for_test: std::cell::Cell::new(0),
+            #[cfg(test)]
+            atomic_failure_for_test: None,
             #[cfg(test)]
             spawn_error_for_test: None,
             #[cfg(test)]
@@ -560,9 +564,11 @@ impl App {
         }
     }
 
-    fn save_durable(&self) -> Result<()> {
+    fn save_durable_status(&self) -> std::result::Result<(), persist::SaveError> {
         if self.persistence_blocked {
-            anyhow::bail!("automatic persistence is blocked after a state load failure");
+            return Err(persist::SaveError::before_replacement(anyhow::anyhow!(
+                "automatic persistence is blocked after a state load failure"
+            )));
         }
         #[cfg(test)]
         self.save_attempts_for_test
@@ -586,16 +592,28 @@ impl App {
                 archived_by_user: session.archived_by_user,
             };
         }
-        state.validate()?;
+        state
+            .validate()
+            .map_err(persist::SaveError::before_replacement)?;
         #[cfg(test)]
         if let Some(root) = &self.persistence_root_for_test {
-            return persist::save_current_at(
+            return persist::save_current_at_test(
                 root,
                 &baude_core::workspace::active().state_file("state"),
                 &StateFile::new(state),
+                self.atomic_failure_for_test,
+                None,
             );
         }
-        persist::save(&StateFile::new(state))
+        persist::save_for_workspace_status(
+            "state",
+            baude_core::workspace::active(),
+            &StateFile::new(state),
+        )
+    }
+
+    fn save_durable(&self) -> Result<()> {
+        self.save_durable_status().map_err(anyhow::Error::new)
     }
 
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
@@ -753,6 +771,7 @@ impl App {
             Err(busy) => return Ok(busy),
         };
         let activation = lifecycle::execute_activation(&mut next, repository_child, prepared)?;
+        let state_before = self.repository_state.clone();
         self.repository_state = next;
 
         if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
@@ -780,20 +799,42 @@ impl App {
             .find(|checkout| checkout.key == activation.checkout)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("activated checkout is missing"))?;
-        let id = commit_then_spawn(
-            self,
-            |app| app.save_durable(),
-            |app| {
-                app.add_session(
-                    activation.path.clone(),
-                    Some(activation.main_worktree.clone()),
-                    Some(activation.branch.clone()),
-                    activation.path != activation.main_worktree,
-                    false,
-                    checkout.session.shell_open,
+        if let Err(error) = self.save_durable_status() {
+            self.persistence_dirty = true;
+            let stage = if error.replacement_committed() {
+                lifecycle::CreationFailureStage::PersistenceAfterReplacement
+            } else {
+                lifecycle::CreationFailureStage::PersistenceBeforeReplacement
+            };
+            if !error.replacement_committed() {
+                lifecycle::compensate_uncommitted_activation(&activation).map_err(
+                    |compensation| {
+                        anyhow::anyhow!(
+                            "{stage} failed: {error}; {} failed: {compensation}",
+                            lifecycle::CreationFailureStage::Compensation
+                        )
+                    },
+                )?;
+                self.repository_state = state_before;
+            }
+            return Err(anyhow::anyhow!("{stage} failed: {error}"));
+        }
+        self.persistence_dirty = false;
+        let id = self
+            .add_session(
+                activation.path.clone(),
+                Some(activation.main_worktree.clone()),
+                Some(activation.branch.clone()),
+                activation.path != activation.main_worktree,
+                false,
+                checkout.session.shell_open,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{} failed after durable activation: {error}",
+                    lifecycle::CreationFailureStage::Spawn
                 )
-            },
-        )?;
+            })?;
         if let Some(runtime) = self.session_mut(id) {
             runtime.name = checkout.session.name;
             runtime.archived = checkout.session.archived;
@@ -2647,6 +2688,19 @@ mod repository_admission_tests {
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert_eq!(app.runtime_checkouts.len(), 1);
 
+        let different = app
+            .activate_branch_worktree(&repo, "feature/local-distinct")
+            .unwrap();
+        assert!(matches!(
+            different,
+            LifecycleOutcome::Created {
+                checkout: other_checkout,
+                runtime: Some(other_runtime),
+            } if other_checkout != checkout && other_runtime != runtime
+        ));
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert_eq!(app.runtime_checkouts.len(), 2);
+
         git(&repo, &["branch", "external-occupied"]);
         let external = root.join("external-occupied");
         git(
@@ -2734,9 +2788,7 @@ mod repository_admission_tests {
         let partial: Vec<_> = after
             .worktrees
             .iter()
-            .filter(|record| {
-                record.branch.as_deref() == Some("refs/heads/feature/local-rollback")
-            })
+            .filter(|record| record.branch.as_deref() == Some("refs/heads/feature/local-rollback"))
             .map(|record| record.path.clone())
             .collect();
         for path in &partial {
@@ -2766,5 +2818,72 @@ mod repository_admission_tests {
         assert!(app.sessions.is_empty());
         assert!(branch_retained);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_rollback_local_committed_save_and_spawn_failures_retain_retry_child() {
+        for (label, failure, spawn_error, expected_stage) in [
+            (
+                "branch-postcommit",
+                Some(baude_core::persist::AtomicFailure::DirectorySync),
+                None,
+                "persistence after replacement",
+            ),
+            (
+                "branch-spawn",
+                None,
+                Some("pty unavailable"),
+                "runtime spawn",
+            ),
+        ] {
+            let repo = admission_repo(label);
+            let root = repo.parent().unwrap().to_path_buf();
+            let state_root = root.join("state");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let snapshot = baude_core::git::discover_repository(&repo).unwrap();
+            let mut app = App::new(repo.clone());
+            app.remote = None;
+            app.persistence_root_for_test = Some(state_root.clone());
+            app.atomic_failure_for_test = failure;
+            app.spawn_error_for_test = spawn_error.map(str::to_owned);
+            app.repository_state.next_repository_key = u64::from(std::process::id()) + 30_000;
+            let repository = app.repository_state.allocate_repository_key().unwrap();
+            let order = app.repository_state.allocate_first_seen_order().unwrap();
+            app.repository_state.repositories.push(SavedRepository {
+                key: repository,
+                observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),
+                observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+                first_seen_order: order,
+                health: RepositoryHealth::Available,
+            });
+            let branch = format!("feature/{label}");
+
+            let error = app
+                .activate_branch_worktree(&repo, &branch)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected_stage), "got: {error}");
+            assert_eq!(app.repository_state.checkouts.len(), 1);
+            assert!(app.repository_state.checkouts[0].active_intent);
+            assert!(app.runtime_checkouts.is_empty());
+            assert!(app.sessions.is_empty());
+            let state_file = baude_core::workspace::active().state_file("state");
+            assert_eq!(
+                baude_core::persist::load_current_at(&state_root, &state_file)
+                    .unwrap()
+                    .state,
+                app.repository_state
+            );
+            let path = app.repository_state.checkouts[0]
+                .observed_path
+                .to_path_buf();
+            assert!(path.is_dir());
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
