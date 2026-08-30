@@ -4,17 +4,17 @@ milestone: v2.0
 milestone_name: Repository Worktree Management (Planned)
 current_phase: 6
 current_phase_name: safe managed worktree lifecycle
-status: executing
-stopped_at: Completed 06-05-PLAN.md
-last_updated: "2026-08-30T21:18:13.560Z"
+status: verifying
+stopped_at: Completed 06-06-PLAN.md
+last_updated: "2026-08-30T21:37:40.071Z"
 last_activity: 2026-08-30
-state_head: 5f7fefe595ffb71ce7a0cc520583dbb9d48fd13a
+state_head: 2f826db1e391b1288dd9ebe1563abf63244761b6
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 9
-  completed_plans: 8
-  percent: 89
+  completed_plans: 9
+  percent: 100
 ---
 
 # Project State
@@ -30,24 +30,24 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 Phase: 6 of 9 (safe managed worktree lifecycle)
 Plan: 6 of 6
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-08-30
 
-Progress: [█████████░] 89%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- v2.0 plans completed: 8
+- v2.0 plans completed: 9
 - Prior milestone: 14 plans completed across 4 phases
-- Average duration: 12 min
-- Total execution time: 98 min
+- Average duration: 13 min
+- Total execution time: 114 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
-| 6. Safe Managed Worktree Lifecycle | 5/6 | 60 min | 12 min |
+| 6. Safe Managed Worktree Lifecycle | 6/6 | 76 min | 13 min |
 | 7. Local Repository Hierarchy & Branch Control | 0/TBD | - | - |
 | 8. Daemon & Remote TUI Parity | 0/TBD | - | - |
 | 9. PWA Hierarchy & Cross-Surface Completion | 0/TBD | - | - |
@@ -63,6 +63,7 @@ Progress: [█████████░] 89%
 | Phase 06 P03 | 11min | 2 tasks | 1 files |
 | Phase 06 P04 | 13min | 2 tasks | 6 files |
 | Phase 06 P05 | 11min | 3 tasks | 7 files |
+| Phase 06 P06 | 16min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 06]: Targeted resume IDs travel only as opaque PTY environment data referenced by a fixed quoted variable. — Prevents persisted backend data from becoming shell syntax.
 - [Phase 06]: Reopen persists active intent only after fresh exact checkout reconciliation and before one runtime effect. — Blocks stale topology and duplicate launch state.
 - [Phase 06]: Same-checkout reopen reservations return pending while conflicting repository mutations remain busy. — Allows one checkout-key runtime path under repeated requests.
+- [Phase 6]: The first safe-removal preflight supplies target-naming confirmation data but its verified Git token is discarded; confirmation always obtains a new token after runtime stop.
+- [Phase 6]: Failures before plain Git removal restore one runtime when one was active, while postcondition or persistence failures after Git commitment never recreate topology.
+- [Phase 6]: A pre-replacement final-save failure keeps an unavailable recovery child in memory while old durable context remains on disk; a committed replacement keeps child deletion in memory.
 
 ### Pending Todos
 
@@ -125,6 +129,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T21:18:13.468Z
-Stopped at: Completed 06-05-PLAN.md
+Last session: 2026-08-30T21:37:39.969Z
+Stopped at: Completed 06-06-PLAN.md
 Resume file: None

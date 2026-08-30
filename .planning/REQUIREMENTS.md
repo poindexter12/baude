@@ -29,7 +29,7 @@
 - [x] **WORK-02**: Baude refuses invalid refs, path collisions, and branches already checked out elsewhere without bypassing Git safeguards.
 - [x] **WORK-03**: User can close a worktree session while retaining its checkout and hierarchy child for later reopening.
 - [x] **WORK-04**: User can reopen a retained main-checkout or worktree child in the active workspace backend.
-- [ ] **WORK-05**: User can remove a clean managed worktree through a distinct confirmed action without deleting its branch.
+- [x] **WORK-05**: User can remove a clean managed worktree through a distinct confirmed action without deleting its branch.
 - [x] **WORK-06**: Dirty, conflicted, locked, submodule-unsafe, or indeterminate worktree state blocks removal before the running session or persisted child is changed.
 - [ ] **WORK-07**: User can explicitly delete a dormant local branch only when Git confirms it is fully merged and not checked out; unsafe deletion is refused.
 
@@ -97,7 +97,7 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | WORK-02 | Phase 6 | Complete |
 | WORK-03 | Phase 6 | Complete |
 | WORK-04 | Phase 6 | Complete |
-| WORK-05 | Phase 6 | Pending |
+| WORK-05 | Phase 6 | Complete |
 | WORK-06 | Phase 6 | Complete |
 | WORK-07 | Phase 7 | Pending |
 | PERS-01 | Phase 5 | Complete |
