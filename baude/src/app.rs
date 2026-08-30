@@ -277,41 +277,6 @@ impl Selection {
     }
 }
 
-/// Join renderer-inserted line breaks at the terminal edge. vt100 already
-/// omits genuine terminal soft wraps, but TUIs may hard-wrap text one cell
-/// before the edge and indent the continuation.
-fn unwrap_visual_linebreaks(text: &str, start_col: u16, cols: u16) -> String {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut output = String::with_capacity(text.len());
-    let mut trim_continuation = false;
-
-    for (index, line) in lines.iter().enumerate() {
-        let line = if trim_continuation {
-            line.trim_start()
-        } else {
-            line
-        };
-        output.push_str(line);
-
-        if index + 1 == lines.len() {
-            break;
-        }
-
-        let available = if index == 0 {
-            cols.saturating_sub(start_col)
-        } else {
-            cols
-        };
-        trim_continuation =
-            available > 0 && line.chars().count() >= usize::from(available.saturating_sub(1));
-        if !trim_continuation {
-            output.push('\n');
-        }
-    }
-
-    output
-}
-
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected_id: Option<SelId>,
@@ -2117,8 +2082,10 @@ impl App {
                         if let Ok(mut p) = parser.lock() {
                             p.set_scrollback(scroll);
                             let screen = p.screen();
+                            // vt100's row wrap metadata is authoritative here:
+                            // contents_between omits only newlines after rows marked
+                            // as terminal continuations and preserves explicit ones.
                             let text = screen.contents_between(sr, sc, er, ec + 1);
-                            let text = unwrap_visual_linebreaks(&text, sc, screen.size().1);
                             p.set_scrollback(0);
                             if !text.is_empty() {
                                 Self::copy_to_clipboard(&text);
@@ -2148,29 +2115,35 @@ impl App {
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::unwrap_visual_linebreaks;
+    use baude_core::vt100;
+
+    fn selected(input: &str, rows: u16, cols: u16, end_row: u16, end_col: u16) -> String {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(input.as_bytes());
+        parser.screen().contents_between(0, 0, end_row, end_col)
+    }
 
     #[test]
-    fn joins_hard_breaks_that_fill_terminal_width() {
+    fn terminal_soft_wrap_pastes_as_one_command() {
         assert_eq!(
-            unwrap_visual_linebreaks("123456789\n  abcdefghi\n  tail", 0, 10),
-            "123456789abcdefghitail"
+            selected("123456789abcdefghi", 3, 10, 1, 8),
+            "123456789abcdefghi"
         );
     }
 
     #[test]
-    fn preserves_genuine_multiline_text() {
+    fn preserves_full_width_explicit_newline_and_indentation() {
         assert_eq!(
-            unwrap_visual_linebreaks("short line\nsecond line", 0, 80),
-            "short line\nsecond line"
+            selected("123456789\r\n  second", 3, 10, 1, 8),
+            "123456789\n  second"
         );
     }
 
     #[test]
-    fn accounts_for_selection_start_column() {
+    fn preserves_tabs_combining_marks_and_wide_glyphs_across_real_newlines() {
         assert_eq!(
-            unwrap_visual_linebreaks("1234567\n  continued", 12, 20),
-            "1234567continued"
+            selected("tab\tvalue\r\ne\u{301} and 界\r\nnext", 5, 20, 2, 4),
+            "tab     value\ne\u{301} and 界\nnext"
         );
     }
 }
