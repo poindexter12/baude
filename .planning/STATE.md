@@ -5,16 +5,16 @@ milestone_name: Repository Worktree Management (Planned)
 current_phase: 6
 current_phase_name: safe managed worktree lifecycle
 status: executing
-stopped_at: Completed 06-03-PLAN.md
-last_updated: "2026-08-30T21:03:07.809Z"
+stopped_at: Completed 06-04-PLAN.md
+last_updated: "2026-08-30T21:03:46.021Z"
 last_activity: 2026-08-30
-state_head: 96cc2d4c5db9057790fb8dc02654a158876fc998
+state_head: e03f8702069d9faedaca36bd7e55949f98573515
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 9
   completed_plans: 7
-  percent: 0
+  percent: 78
 ---
 
 # Project State
@@ -33,7 +33,7 @@ Plan: 5 of 6
 Status: Ready to execute
 Last activity: 2026-08-30
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P01 | 13min | 2 tasks | 5 files |
 | Phase 06 P02 | 12min | 2 tasks | 4 files |
 | Phase 06 P03 | 11min | 2 tasks | 1 files |
+| Phase 06 P04 | 13min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 6]: Empty valid porcelain-v2 output is the only status-clean observation; malformed output and command failure remain indeterminate.
 - [Phase 6]: Removal authorization requires fresh exact managed linked topology and yields only an opaque path/parent/ref/OID target.
 - [Phase 6]: Any recursive submodule record blocks non-force worktree removal.
+- [Phase 06]: Retained conversation IDs are optional opaque strings with an explicit serde default and never participate in path or ownership identity. — Preserves backend conversation context without weakening durable repository identity.
+- [Phase 06]: Close plans snapshot runtime context, save inactive intent, then stop exactly one checkout-key runtime while retaining checkout and repository membership. — Makes save-before-stop ordering shared and non-destructive across App and Manager.
+- [Phase 06]: Pre-replacement close failures restore memory and leave the runtime live; post-replacement directory-sync failures keep inactive memory, stop the runtime, and mark persistence dirty. — Keeps memory aligned with the atomic replacement commit boundary.
 
 ### Pending Todos
 
@@ -117,6 +121,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T21:01:03.398Z
-Stopped at: Completed 06-03-PLAN.md
+Last session: 2026-08-30T21:03:24.686Z
+Stopped at: Completed 06-04-PLAN.md
 Resume file: None
