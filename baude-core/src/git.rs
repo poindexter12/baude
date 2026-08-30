@@ -1316,6 +1316,15 @@ pub fn activate_branch(
     literal: &str,
     managed_path: &Path,
 ) -> std::result::Result<BranchActivationOutcome, BranchActivationError> {
+    activate_branch_with_post_add_hook(repository_child, literal, managed_path, || {})
+}
+
+fn activate_branch_with_post_add_hook(
+    repository_child: &Path,
+    literal: &str,
+    managed_path: &Path,
+    after_add: impl FnOnce(),
+) -> std::result::Result<BranchActivationOutcome, BranchActivationError> {
     let snapshot =
         discover_repository(repository_child).map_err(BranchActivationError::Discovery)?;
     let activation = classify_branch(&snapshot, literal)?;
@@ -1401,6 +1410,7 @@ pub fn activate_branch(
         }
         BranchActivation::Occupied { .. } => unreachable!("occupied returned above"),
     };
+    after_add();
 
     // Git add is the commit boundary. Every subsequent failure compensates
     // through plain Git removal before the error escapes durable ownership.
@@ -2349,12 +2359,12 @@ pub(crate) fn remove_added_worktree(main_worktree: &Path, added_path: &Path) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_branch, classify_branch, discover_repository, ensure_default_worktree,
-        existing_branch_add_arguments, inspect_removal, inspect_removal_status,
-        inspect_removal_status_with_program, inspect_submodules, inspect_submodules_with_program,
-        managed_branch_worktree_path, new_branch_add_arguments, parse_clone_target,
-        parse_removal_status, parse_submodule_status, parse_worktree_porcelain, reconcile_checkout,
-        removal_status_arguments, remove_verified_worktree,
+        activate_branch, activate_branch_with_post_add_hook, classify_branch, discover_repository,
+        ensure_default_worktree, existing_branch_add_arguments, inspect_removal,
+        inspect_removal_status, inspect_removal_status_with_program, inspect_submodules,
+        inspect_submodules_with_program, managed_branch_worktree_path, new_branch_add_arguments,
+        parse_clone_target, parse_removal_status, parse_submodule_status, parse_worktree_porcelain,
+        reconcile_checkout, removal_status_arguments, remove_verified_worktree,
         remove_verified_worktree_with_post_remove_hook, resolve_default_branch,
         verified_remove_arguments, BranchActivation, BranchActivationError,
         BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
@@ -3344,6 +3354,41 @@ mod tests {
             }
 
             #[test]
+            fn externally_recreated_git_worktree_is_reported_and_preserved() {
+                let fixture = GitFixture::new();
+                let (repo, linked, branch, _, target) =
+                    verified_target(&fixture, "recreated git worktree");
+                let short_branch = branch.strip_prefix("refs/heads/").unwrap().to_owned();
+
+                let error = remove_verified_worktree_with_post_remove_hook(&target, || {
+                    git_ok(
+                        &repo,
+                        &[
+                            OsStr::new("worktree"),
+                            OsStr::new("add"),
+                            OsStr::new("--"),
+                            linked.as_os_str(),
+                            OsStr::new(&short_branch),
+                        ],
+                    );
+                })
+                .unwrap_err();
+
+                assert!(matches!(
+                    error,
+                    RemoveVerifiedError::Postcondition(
+                        RemovalPostconditionFailure::InventoryStillPresent(path)
+                    ) if path == linked
+                ));
+                assert!(linked.is_dir());
+                assert!(discover_repository(&repo)
+                    .unwrap()
+                    .worktrees
+                    .iter()
+                    .any(|record| record.path == linked));
+            }
+
+            #[test]
             fn changed_branch_oid_after_git_remove_is_visible_degradation() {
                 let fixture = GitFixture::new();
                 let (repo, _, branch, oid, target) = verified_target(&fixture, "changed branch");
@@ -3543,6 +3588,46 @@ mod tests {
                 for forbidden in ["--force", "-B", "fetch", "delete", "remove"] {
                     assert!(!new.iter().chain(&existing).any(|arg| arg == forbidden));
                 }
+            }
+
+            #[test]
+            fn post_add_topology_failure_is_compensated_without_deleting_branch() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("post add compensation");
+                git_ok(
+                    &repo,
+                    &[OsStr::new("branch"), OsStr::new("post-add-failure")],
+                );
+                let managed = fixture.root.join("post-add-managed");
+                let hook_path = managed.clone();
+
+                let error =
+                    activate_branch_with_post_add_hook(&repo, "post-add-failure", &managed, || {
+                        git_ok(
+                            &hook_path,
+                            &[OsStr::new("checkout"), OsStr::new("--detach")],
+                        );
+                    })
+                    .unwrap_err();
+
+                assert!(
+                    matches!(error, BranchActivationError::Verification(_)),
+                    "unexpected post-add error: {error:?}"
+                );
+                assert!(!managed.exists());
+                assert!(discover_repository(&repo)
+                    .unwrap()
+                    .worktrees
+                    .iter()
+                    .all(|record| record.path != managed));
+                git_ok(
+                    &repo,
+                    &[
+                        OsStr::new("show-ref"),
+                        OsStr::new("--verify"),
+                        OsStr::new("refs/heads/post-add-failure"),
+                    ],
+                );
             }
         }
 
