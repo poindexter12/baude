@@ -7,12 +7,12 @@
 
 ### Repository Admission
 
-- [ ] **REPO-01**: User can open a main checkout, subdirectory, symlink, or linked worktree and get exactly one canonical repository parent in the active workspace.
+- [x] **REPO-01**: User can open a main checkout, subdirectory, symlink, or linked worktree and get exactly one canonical repository parent in the active workspace.
 - [ ] **REPO-02**: Opening or cloning a repository ensures exactly one usable default-branch session using the active workspace backend.
 - [ ] **REPO-03**: Reopening an already registered repository focuses or reopens its existing default-branch child instead of creating a duplicate parent or session.
-- [ ] **REPO-04**: If the main checkout is not on the resolved default branch, baude preserves it and creates or reuses a separate managed default-branch worktree.
+- [x] **REPO-04**: If the main checkout is not on the resolved default branch, baude preserves it and creates or reuses a separate managed default-branch worktree.
 - [ ] **REPO-05**: User can see both the existing main checkout and the managed default-branch worktree beneath the repository.
-- [ ] **REPO-06**: If the default branch cannot be resolved safely from local Git data, baude reports an actionable state without switching branches, fetching, or guessing.
+- [x] **REPO-06**: If the default branch cannot be resolved safely from local Git data, baude reports an actionable state without switching branches, fetching, or guessing.
 
 ### Hierarchy and Branches
 
@@ -81,12 +81,12 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REPO-01 | Phase 5 | Pending |
+| REPO-01 | Phase 5 | Complete |
 | REPO-02 | Phase 5 | Pending |
 | REPO-03 | Phase 5 | Pending |
-| REPO-04 | Phase 5 | Pending |
+| REPO-04 | Phase 5 | Complete |
 | REPO-05 | Phase 7 | Pending |
-| REPO-06 | Phase 5 | Pending |
+| REPO-06 | Phase 5 | Complete |
 | HIER-01 | Phase 9 | Pending |
 | HIER-02 | Phase 7 | Pending |
 | HIER-03 | Phase 7 | Pending |
@@ -111,6 +111,7 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | SURF-05 | Phase 8 | Pending |
 
 **Coverage:**
+
 - v2.0 requirements: 28 total
 - Mapped to phases: 28
 - Unmapped: 0

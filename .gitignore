@@ -2,3 +2,6 @@
 
 # GSD intel — regeneratable API-surface tooling output
 .planning/intel/
+
+# GSD machine-readable state projection (regenerated from planning artifacts)
+.planning/state.json
