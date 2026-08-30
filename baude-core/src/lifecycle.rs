@@ -1,5 +1,82 @@
 //! Shared, UI-free repository lifecycle contracts.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use crate::repository::{CheckoutKey, RepositoryKey};
+
+/// A literal branch activation rooted in one durable repository identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationRequest {
+    pub repository: RepositoryKey,
+    pub branch: String,
+    pub managed_path: PathBuf,
+}
+
+/// Shared lifecycle meaning returned by local and daemon runtime owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleOutcome {
+    Created {
+        checkout: CheckoutKey,
+        runtime: Option<u64>,
+    },
+    Activated {
+        checkout: CheckoutKey,
+        runtime: Option<u64>,
+    },
+    Reused {
+        checkout: CheckoutKey,
+        runtime: Option<u64>,
+        managed_by_baude: bool,
+    },
+    Focused {
+        checkout: CheckoutKey,
+        runtime: u64,
+    },
+    Busy {
+        repository: RepositoryKey,
+    },
+}
+
+/// Cloneable reservation registry. Guards release their repository on drop.
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryReservations {
+    held: Arc<Mutex<HashSet<RepositoryKey>>>,
+}
+
+impl RepositoryReservations {
+    pub fn reserve(
+        &self,
+        repository: RepositoryKey,
+    ) -> Result<RepositoryReservation, LifecycleOutcome> {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        if !held.insert(repository) {
+            return Err(LifecycleOutcome::Busy { repository });
+        }
+        drop(held);
+        Ok(RepositoryReservation {
+            held: Arc::clone(&self.held),
+            repository,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct RepositoryReservation {
+    held: Arc<Mutex<HashSet<RepositoryKey>>>,
+    repository: RepositoryKey,
+}
+
+impl Drop for RepositoryReservation {
+    fn drop(&mut self) {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.repository);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ActivationRequest, LifecycleOutcome, RepositoryReservations};

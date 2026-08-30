@@ -942,6 +942,411 @@ pub fn ensure_default_worktree(
     ))
 }
 
+/// Git-verified classification of one literal local branch request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchActivation {
+    New {
+        name: String,
+        full_ref: String,
+    },
+    ExistingLocal {
+        name: String,
+        full_ref: String,
+        oid: String,
+    },
+    Occupied {
+        name: String,
+        full_ref: String,
+        record: WorktreeRecord,
+    },
+}
+
+/// Observable result of a verified non-force worktree activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchActivationOutcome {
+    CreatedManaged(WorktreeRecord),
+    ActivatedManaged(WorktreeRecord),
+    Reused(WorktreeRecord),
+}
+
+#[derive(Debug)]
+pub enum BranchActivationError {
+    InvalidLiteral {
+        name: String,
+        detail: String,
+    },
+    RemoteOnly {
+        name: String,
+        refs: Vec<String>,
+    },
+    DefaultUnavailable(DefaultBranchUnavailable),
+    DefaultLocalRefMissing(String),
+    PathCollision(PathBuf),
+    CreateParent {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CommandStart {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    GitCommand {
+        operation: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    Discovery(RepositoryDiscoveryError),
+    Verification(String),
+}
+
+impl fmt::Display for BranchActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLiteral { name, detail } => {
+                write!(f, "invalid literal branch {name:?}: {detail}")
+            }
+            Self::RemoteOnly { name, refs } => write!(
+                f,
+                "branch {name:?} exists only as remote refs ({}); create an explicit local branch first",
+                refs.join(", ")
+            ),
+            Self::DefaultUnavailable(error) => write!(f, "resolve repository default: {error}"),
+            Self::DefaultLocalRefMissing(reference) => write!(
+                f,
+                "verified default local ref {reference} is missing; reopen the repository primary first"
+            ),
+            Self::PathCollision(path) => {
+                write!(f, "managed branch path collision at {}", path.display())
+            }
+            Self::CreateParent { path, source } => {
+                write!(f, "create managed branch parent {}: {source}", path.display())
+            }
+            Self::CommandStart { operation, source } => {
+                write!(f, "start Git {operation}: {source}")
+            }
+            Self::GitCommand {
+                operation,
+                status,
+                stderr,
+            } => write!(
+                f,
+                "Git {operation} failed (status {}): {stderr}",
+                status.map_or_else(|| "signal".to_owned(), |code| code.to_string())
+            ),
+            Self::Discovery(error) => write!(f, "discover branch worktree: {error}"),
+            Self::Verification(detail) => write!(f, "verify branch activation: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for BranchActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DefaultUnavailable(error) => Some(error),
+            Self::CreateParent { source, .. } | Self::CommandStart { source, .. } => Some(source),
+            Self::Discovery(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn activation_command(
+    repo: &Path,
+    operation: &'static str,
+    args: &[&OsStr],
+) -> std::result::Result<Output, BranchActivationError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|source| BranchActivationError::CommandStart { operation, source })
+}
+
+fn activation_oid(
+    repo: &Path,
+    reference: &str,
+    operation: &'static str,
+) -> std::result::Result<String, BranchActivationError> {
+    let commit = format!("{reference}^{{commit}}");
+    let output = activation_command(
+        repo,
+        operation,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new("--end-of-options"),
+            OsStr::new(&commit),
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(BranchActivationError::GitCommand {
+            operation,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let oid = std::str::from_utf8(&output.stdout)
+        .map_err(|error| BranchActivationError::Verification(error.to_string()))?
+        .trim_end_matches(['\r', '\n']);
+    if oid.is_empty() || oid.contains(['\r', '\n', '\0']) {
+        return Err(BranchActivationError::Verification(format!(
+            "Git {operation} returned malformed object id"
+        )));
+    }
+    Ok(oid.to_owned())
+}
+
+/// Validate a branch as literal text and classify only its exact local ref.
+pub fn classify_branch(
+    snapshot: &RepositorySnapshot,
+    literal: &str,
+) -> std::result::Result<BranchActivation, BranchActivationError> {
+    let checked = activation_command(
+        &snapshot.main_worktree,
+        "check branch literal",
+        &[
+            OsStr::new("check-ref-format"),
+            OsStr::new("--branch"),
+            OsStr::new(literal),
+        ],
+    )?;
+    if !checked.status.success() {
+        return Err(BranchActivationError::InvalidLiteral {
+            name: literal.to_owned(),
+            detail: String::from_utf8_lossy(&checked.stderr).trim().to_owned(),
+        });
+    }
+    let validated = std::str::from_utf8(&checked.stdout)
+        .map_err(|error| BranchActivationError::InvalidLiteral {
+            name: literal.to_owned(),
+            detail: format!("non-UTF-8 validation output: {error}"),
+        })?
+        .trim_end_matches(['\r', '\n']);
+    if validated != literal || validated.contains(['\r', '\n', '\0']) {
+        return Err(BranchActivationError::InvalidLiteral {
+            name: literal.to_owned(),
+            detail: "Git expanded or altered the requested branch".into(),
+        });
+    }
+
+    let full_ref = format!("refs/heads/{literal}");
+    let local = activation_command(
+        &snapshot.main_worktree,
+        "find exact local branch",
+        &[
+            OsStr::new("show-ref"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new("--"),
+            OsStr::new(&full_ref),
+        ],
+    )?;
+    if local.status.success() {
+        if let Some(record) = snapshot
+            .worktrees
+            .iter()
+            .find(|record| record.branch.as_deref() == Some(full_ref.as_str()))
+        {
+            return Ok(BranchActivation::Occupied {
+                name: literal.to_owned(),
+                full_ref,
+                record: record.clone(),
+            });
+        }
+        let oid = activation_oid(
+            &snapshot.main_worktree,
+            &full_ref,
+            "verify exact local branch commit",
+        )?;
+        return Ok(BranchActivation::ExistingLocal {
+            name: literal.to_owned(),
+            full_ref,
+            oid,
+        });
+    }
+    if local.status.code() != Some(1) {
+        return Err(BranchActivationError::GitCommand {
+            operation: "find exact local branch",
+            status: local.status.code(),
+            stderr: String::from_utf8_lossy(&local.stderr).trim().to_owned(),
+        });
+    }
+
+    let remotes = activation_command(
+        &snapshot.main_worktree,
+        "find matching remote branches",
+        &[
+            OsStr::new("for-each-ref"),
+            OsStr::new("--format=%(refname)"),
+            OsStr::new("refs/remotes"),
+        ],
+    )?;
+    if !remotes.status.success() {
+        return Err(BranchActivationError::GitCommand {
+            operation: "find matching remote branches",
+            status: remotes.status.code(),
+            stderr: String::from_utf8_lossy(&remotes.stderr).trim().to_owned(),
+        });
+    }
+    let suffix = format!("/{literal}");
+    let matching: Vec<String> = std::str::from_utf8(&remotes.stdout)
+        .map_err(|error| BranchActivationError::Verification(error.to_string()))?
+        .lines()
+        .filter(|reference| {
+            reference.starts_with("refs/remotes/")
+                && reference.ends_with(&suffix)
+                && !reference.ends_with("/HEAD")
+        })
+        .map(str::to_owned)
+        .collect();
+    if !matching.is_empty() {
+        return Err(BranchActivationError::RemoteOnly {
+            name: literal.to_owned(),
+            refs: matching,
+        });
+    }
+    Ok(BranchActivation::New {
+        name: literal.to_owned(),
+        full_ref,
+    })
+}
+
+/// Rediscover, classify, and add or reuse one branch worktree without force or guessing.
+pub fn activate_branch(
+    repository_child: &Path,
+    literal: &str,
+    managed_path: &Path,
+) -> std::result::Result<BranchActivationOutcome, BranchActivationError> {
+    let snapshot =
+        discover_repository(repository_child).map_err(BranchActivationError::Discovery)?;
+    let activation = classify_branch(&snapshot, literal)?;
+    if let BranchActivation::Occupied { record, .. } = activation {
+        return Ok(BranchActivationOutcome::Reused(record));
+    }
+    if std::fs::symlink_metadata(managed_path).is_ok()
+        || snapshot
+            .worktrees
+            .iter()
+            .any(|record| record.path == managed_path)
+    {
+        return Err(BranchActivationError::PathCollision(
+            managed_path.to_path_buf(),
+        ));
+    }
+    if let Some(parent) = managed_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| BranchActivationError::CreateParent {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let (name, full_ref, expected_oid, created) = match activation {
+        BranchActivation::New { name, full_ref } => {
+            let fresh = discover_repository(&snapshot.main_worktree)
+                .map_err(BranchActivationError::Discovery)?;
+            let default = resolve_default_branch(&fresh)
+                .map_err(BranchActivationError::DefaultUnavailable)?;
+            let expected_oid = activation_oid(
+                &fresh.main_worktree,
+                &default.local_ref,
+                "verify default local branch commit",
+            )
+            .map_err(|error| match error {
+                BranchActivationError::GitCommand {
+                    status: Some(1), ..
+                } => BranchActivationError::DefaultLocalRefMissing(default.local_ref.clone()),
+                other => other,
+            })?;
+            let output = activation_command(
+                &fresh.main_worktree,
+                "create branch worktree",
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("-b"),
+                    OsStr::new(&name),
+                    OsStr::new("--"),
+                    managed_path.as_os_str(),
+                    OsStr::new(&default.local_ref),
+                ],
+            )?;
+            if !output.status.success() {
+                return Err(BranchActivationError::GitCommand {
+                    operation: "create branch worktree",
+                    status: output.status.code(),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            (name, full_ref, expected_oid, true)
+        }
+        BranchActivation::ExistingLocal {
+            name,
+            full_ref,
+            oid,
+        } => {
+            // Git 2.50 detaches when given refs/heads/<name> here. The exact full
+            // ref was classified and commit-verified above; pass its literal short
+            // branch spelling so the resulting worktree remains attached.
+            let output = activation_command(
+                &snapshot.main_worktree,
+                "activate local branch worktree",
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--"),
+                    managed_path.as_os_str(),
+                    OsStr::new(&name),
+                ],
+            )?;
+            if !output.status.success() {
+                return Err(BranchActivationError::GitCommand {
+                    operation: "activate local branch worktree",
+                    status: output.status.code(),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            (name, full_ref, oid, false)
+        }
+        BranchActivation::Occupied { .. } => unreachable!("occupied returned above"),
+    };
+
+    let fresh = discover_repository(managed_path).map_err(BranchActivationError::Discovery)?;
+    let canonical =
+        managed_path
+            .canonicalize()
+            .map_err(|source| BranchActivationError::CreateParent {
+                path: managed_path.to_path_buf(),
+                source,
+            })?;
+    if fresh.common_dir != snapshot.common_dir
+        || fresh.selected_worktree.path != canonical
+        || fresh.selected_worktree.branch.as_deref() != Some(full_ref.as_str())
+    {
+        return Err(BranchActivationError::Verification(format!(
+            "expected {full_ref} at {}, observed {:?}",
+            canonical.display(),
+            fresh.selected_worktree
+        )));
+    }
+    let observed_oid = activation_oid(&canonical, "HEAD", "verify activated branch commit")?;
+    if observed_oid != expected_oid {
+        return Err(BranchActivationError::Verification(format!(
+            "branch {name} changed from {expected_oid} to {observed_oid}"
+        )));
+    }
+    if created {
+        Ok(BranchActivationOutcome::CreatedManaged(
+            fresh.selected_worktree,
+        ))
+    } else {
+        Ok(BranchActivationOutcome::ActivatedManaged(
+            fresh.selected_worktree,
+        ))
+    }
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -994,6 +1399,23 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Stable workspace-local path for a durable managed branch checkout.
+pub fn managed_branch_worktree_path(
+    repository_key: u64,
+    checkout_key: u64,
+    branch: &str,
+) -> PathBuf {
+    let mut label = sanitize(branch);
+    if label.is_empty() {
+        label.push_str("branch");
+    }
+    label.truncate(48);
+    worktrees_base()
+        .join(&crate::workspace::active().name)
+        .join(format!("repository-{repository_key}"))
+        .join(format!("{label}-{checkout_key}"))
 }
 
 /// Create a worktree for `branch` under the managed directory.
@@ -1602,14 +2024,20 @@ mod tests {
                 );
                 let default_oid = git_ok(
                     &repo,
-                    &[OsStr::new("rev-parse"), OsStr::new("refs/heads/trunk^{commit}")],
+                    &[
+                        OsStr::new("rev-parse"),
+                        OsStr::new("refs/heads/trunk^{commit}"),
+                    ],
                 );
                 let child_oid = git_ok(&child, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
                 assert_ne!(default_oid, child_oid);
 
                 let managed = fixture.root.join("managed/new literal");
                 let outcome = activate_branch(&child, "feature/literal", &managed).unwrap();
-                assert!(matches!(outcome, BranchActivationOutcome::CreatedManaged(_)));
+                assert!(matches!(
+                    outcome,
+                    BranchActivationOutcome::CreatedManaged(_)
+                ));
                 assert_eq!(
                     git_ok(&managed, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]),
                     default_oid
@@ -1627,7 +2055,10 @@ mod tests {
                 git_ok(&repo, &[OsStr::new("branch"), OsStr::new("existing")]);
                 let before = git_ok(
                     &repo,
-                    &[OsStr::new("rev-parse"), OsStr::new("refs/heads/existing^{commit}")],
+                    &[
+                        OsStr::new("rev-parse"),
+                        OsStr::new("refs/heads/existing^{commit}"),
+                    ],
                 );
 
                 let managed = fixture.root.join("managed/existing");
@@ -1643,7 +2074,10 @@ mod tests {
                 assert_eq!(
                     git_ok(
                         &repo,
-                        &[OsStr::new("rev-parse"), OsStr::new("refs/heads/existing^{commit}")]
+                        &[
+                            OsStr::new("rev-parse"),
+                            OsStr::new("refs/heads/existing^{commit}")
+                        ]
                     ),
                     before
                 );
@@ -1661,12 +2095,9 @@ mod tests {
                     BranchActivation::Occupied { ref record, .. }
                         if record.path == external.canonicalize().unwrap()
                 ));
-                let outcome = activate_branch(
-                    &repo,
-                    "occupied",
-                    &fixture.root.join("must-not-be-created"),
-                )
-                .unwrap();
+                let outcome =
+                    activate_branch(&repo, "occupied", &fixture.root.join("must-not-be-created"))
+                        .unwrap();
                 assert!(matches!(
                     outcome,
                     BranchActivationOutcome::Reused(record)
