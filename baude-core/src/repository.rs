@@ -64,6 +64,15 @@ pub enum UnavailableCause {
         shell_stopped: bool,
         detail: String,
     },
+    PendingActivation {
+        branch: String,
+    },
+    ActivationRecovery {
+        branch: String,
+        created_branch: bool,
+        verification: String,
+        compensation: String,
+    },
     Io(String),
     Other(String),
 }
@@ -205,6 +214,15 @@ impl std::fmt::Display for AllocationError {
 impl std::error::Error for AllocationError {}
 
 impl RepositoryState {
+    pub fn has_pending_activation(&self) -> bool {
+        self.checkouts.iter().any(|checkout| {
+            matches!(
+                checkout.health,
+                CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { .. })
+            )
+        })
+    }
+
     pub fn allocate_repository_key(&mut self) -> Result<RepositoryKey, AllocationError> {
         let key = RepositoryKey(self.next_repository_key);
         let next = self

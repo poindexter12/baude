@@ -764,25 +764,60 @@ impl App {
         repository_child: &Path,
         branch: &str,
     ) -> Result<LifecycleOutcome> {
+        if self.persistence_dirty || self.repository_state.has_pending_activation() {
+            anyhow::bail!(
+                "repository lifecycle is blocked while pending ownership is not durable; repair persistence and save before retrying"
+            );
+        }
         let snapshot = git::discover_repository(repository_child)?;
+        let state_before = self.repository_state.clone();
         let mut next = self.repository_state.clone();
         let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)?;
+        let pending_checkout = prepared.checkout;
+        lifecycle::record_pending_activation(&mut next, &snapshot, &prepared)?;
         let repository = prepared.request.repository;
         let _reservation = match self.repository_reservations.reserve(repository) {
             Ok(reservation) => reservation,
             Err(busy) => return Ok(busy),
         };
+        self.repository_state = next.clone();
+        if let Err(error) = self.save_durable_status() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(anyhow::anyhow!(
+                "pending activation ownership persistence failed before Git mutation: {error}"
+            ));
+        }
+        self.persistence_dirty = false;
         let activation = match lifecycle::execute_activation(&mut next, repository_child, prepared)
         {
             Ok(activation) => activation,
             Err(error) if error.recovery_child_recorded() => {
                 self.repository_state = next;
-                self.save_durable_status().map_err(anyhow::Error::new)?;
+                if let Err(save_error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    return Err(anyhow::anyhow!(
+                        "{error}; recovery ownership persistence failed: {save_error}"
+                    ));
+                }
+                self.persistence_dirty = false;
                 return Err(anyhow::Error::new(error));
             }
-            Err(error) => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+                lifecycle::clear_pending_activation(&mut next, pending_checkout);
+                self.repository_state = next;
+                if let Err(save_error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    return Err(anyhow::anyhow!(
+                        "{error}; clearing pending activation ownership failed: {save_error}"
+                    ));
+                }
+                self.persistence_dirty = false;
+                return Err(anyhow::Error::new(error));
+            }
         };
-        let state_before = self.repository_state.clone();
         self.repository_state = next;
 
         if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
@@ -846,6 +881,12 @@ impl App {
                     },
                 )?;
                 self.repository_state = state_before;
+                if let Err(clear_error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    return Err(anyhow::anyhow!(
+                        "{stage} failed: {error}; activation compensated but pending ownership cleanup failed: {clear_error}"
+                    ));
+                }
             }
             return Err(anyhow::anyhow!("{stage} failed: {error}"));
         }

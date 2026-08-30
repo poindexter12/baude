@@ -707,6 +707,60 @@ pub fn prepare_activation(
     })
 }
 
+/// Record ownership of the exact checkout identity before Git may add it.
+/// Owners must durably save this child before calling [`execute_activation`].
+pub fn record_pending_activation(
+    state: &mut RepositoryState,
+    snapshot: &RepositorySnapshot,
+    prepared: &PreparedActivation,
+) -> Result<(), LifecycleError> {
+    if state
+        .checkouts
+        .iter()
+        .any(|checkout| checkout.key == prepared.checkout)
+    {
+        return Err(LifecycleError::Topology(format!(
+            "pending activation checkout {} already exists",
+            prepared.checkout.get()
+        )));
+    }
+    let repository_name = snapshot
+        .main_worktree
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| snapshot.main_worktree.display().to_string());
+    state.checkouts.push(SavedCheckout {
+        key: prepared.checkout,
+        repository_key: prepared.request.repository,
+        role: CheckoutRole::ManagedBranch,
+        managed_by_baude: true,
+        observed_path: PersistedPath::from_path(&prepared.request.managed_path),
+        observed_branch: Some(format!("refs/heads/{}", prepared.request.branch)),
+        first_seen_order: prepared.first_seen_order,
+        active_intent: false,
+        session: RetainedSessionState {
+            name: format!("{repository_name}:{}", prepared.request.branch),
+            cwd: PersistedPath::from_path(&prepared.request.managed_path),
+            repo_root: PersistedPath::from_path(&snapshot.main_worktree),
+            branch: Some(prepared.request.branch.clone()),
+            is_worktree: true,
+            shell_open: false,
+            archived: false,
+            archived_by_user: false,
+            resume_id: None,
+        },
+        health: CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
+            branch: prepared.request.branch.clone(),
+        }),
+    });
+    state.validate()?;
+    Ok(())
+}
+
+pub fn clear_pending_activation(state: &mut RepositoryState, checkout: CheckoutKey) {
+    state.checkouts.retain(|saved| saved.key != checkout);
+}
+
 fn activation_parts(
     outcome: BranchActivationOutcome,
 ) -> (ActivationDisposition, bool, WorktreeRecord) {
@@ -751,7 +805,7 @@ fn execute_activation_with_post_git_hook(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| activation_repository.main_worktree.display().to_string());
-            state.checkouts.push(SavedCheckout {
+            let recovery = SavedCheckout {
                 key: prepared.checkout,
                 repository_key: prepared.request.repository,
                 role: CheckoutRole::ManagedBranch,
@@ -771,8 +825,31 @@ fn execute_activation_with_post_git_hook(
                     archived_by_user: false,
                     resume_id: None,
                 },
-                health: CheckoutHealth::Unavailable(UnavailableCause::Other(error.to_string())),
-            });
+                health: match &error {
+                    BranchActivationError::PostAddCompensationFailed {
+                        branch,
+                        created_branch,
+                        verification,
+                        compensation,
+                        ..
+                    } => CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+                        branch: branch.clone(),
+                        created_branch: *created_branch,
+                        verification: verification.to_string(),
+                        compensation: compensation.clone(),
+                    }),
+                    _ => unreachable!(),
+                },
+            };
+            if let Some(existing) = state
+                .checkouts
+                .iter_mut()
+                .find(|checkout| checkout.key == prepared.checkout)
+            {
+                *existing = recovery;
+            } else {
+                state.checkouts.push(recovery);
+            }
             state.validate()?;
             return Err(LifecycleError::Git(error));
         }
@@ -865,6 +942,9 @@ fn execute_activation_with_post_git_hook(
             });
             (prepared.checkout, created_by_baude)
         };
+        if checkout != prepared.checkout {
+            clear_pending_activation(state, prepared.checkout);
+        }
         state.validate()?;
         Ok(RecordedActivation {
             repository: prepared.request.repository,
@@ -902,11 +982,22 @@ fn execute_activation_with_post_git_hook(
                         archived_by_user: false,
                         resume_id: None,
                     },
-                    health: CheckoutHealth::Unavailable(UnavailableCause::Other(format!(
-                        "post-verification compensation pending: {error}; {compensation}"
-                    ))),
+                    health: CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+                        branch: activation_branch.clone(),
+                        created_branch: matches!(disposition, ActivationDisposition::Created),
+                        verification: error.to_string(),
+                        compensation: compensation.to_string(),
+                    }),
                 };
-                state.checkouts.push(recovery);
+                if let Some(existing) = state
+                    .checkouts
+                    .iter_mut()
+                    .find(|checkout| checkout.key == prepared.checkout)
+                {
+                    *existing = recovery;
+                } else {
+                    state.checkouts.push(recovery);
+                }
                 state.validate()?;
                 return Err(LifecycleError::PostVerificationCompensationFailed {
                     repository: activation_repository.main_worktree,
