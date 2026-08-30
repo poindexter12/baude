@@ -2552,6 +2552,237 @@ mod tests {
             }
         }
 
+        mod removal_topology {
+            use super::*;
+            use crate::repository::{
+                CheckoutHealth, CheckoutRole, PersistedPath, RepositoryState, RetainedSessionState,
+                SavedCheckout,
+            };
+
+            fn saved_checkout(path: &Path, branch: &str, managed: bool) -> SavedCheckout {
+                let mut state = RepositoryState::default();
+                let repository_key = state.allocate_repository_key().unwrap();
+                let checkout_key = state.allocate_checkout_key().unwrap();
+                SavedCheckout {
+                    key: checkout_key,
+                    repository_key,
+                    role: CheckoutRole::ManagedBranch,
+                    managed_by_baude: managed,
+                    observed_path: PersistedPath::from_path(path),
+                    observed_branch: Some(branch.to_owned()),
+                    first_seen_order: state.allocate_first_seen_order().unwrap(),
+                    active_intent: true,
+                    session: RetainedSessionState {
+                        name: "managed".into(),
+                        cwd: PersistedPath::from_path(path),
+                        repo_root: PersistedPath::from_path(path),
+                        branch: Some(branch.to_owned()),
+                        is_worktree: true,
+                        shell_open: false,
+                        archived: false,
+                        archived_by_user: false,
+                        resume_id: None,
+                    },
+                    health: CheckoutHealth::Available,
+                }
+            }
+
+            fn linked_target(
+                fixture: &GitFixture,
+                label: &str,
+            ) -> (PathBuf, PathBuf, PathBuf, String, SavedCheckout) {
+                let repo = fixture.repo(format!("{label} repo"));
+                let linked = fixture.linked_worktree(
+                    &repo,
+                    format!("{label} linked"),
+                    &format!("{label}-branch"),
+                );
+                let snapshot = discover_repository(&linked).unwrap();
+                let branch = snapshot.selected_worktree.branch.clone().unwrap();
+                let checkout = saved_checkout(&linked, &branch, true);
+                (repo, linked, snapshot.common_dir, branch, checkout)
+            }
+
+            fn assert_blocked(safety: RemovalSafety, expected: RemovalBlocker) {
+                match safety {
+                    RemovalSafety::Blocked(blockers) => assert!(blockers.contains(&expected)),
+                    RemovalSafety::Safe(_) => panic!("unsafe target received a removal token"),
+                }
+            }
+
+            #[test]
+            fn only_exact_managed_linked_topology_produces_an_opaque_target() {
+                let fixture = GitFixture::new();
+                let (repo, linked, common, branch, checkout) =
+                    linked_target(&fixture, "safe topology");
+                let expected_oid = String::from_utf8(git_ok(
+                    &linked,
+                    &[
+                        OsStr::new("rev-parse"),
+                        OsStr::new("--verify"),
+                        OsStr::new("HEAD"),
+                    ],
+                ))
+                .unwrap()
+                .trim()
+                .to_owned();
+
+                let target = match inspect_removal(&common, &checkout).unwrap() {
+                    RemovalSafety::Safe(target) => target,
+                    RemovalSafety::Blocked(blockers) => {
+                        panic!("clean target blocked: {blockers:?}")
+                    }
+                };
+                assert_eq!(target.path(), linked.canonicalize().unwrap());
+                assert_eq!(target.common_dir(), common);
+                assert_eq!(target.main_worktree(), repo.canonicalize().unwrap());
+                assert_eq!(target.branch_ref(), branch);
+                assert_eq!(target.branch_oid(), expected_oid);
+            }
+
+            #[test]
+            fn main_external_locked_detached_and_stale_facts_never_become_safe() {
+                let fixture = GitFixture::new();
+
+                let main = fixture.repo("main target");
+                let main_snapshot = discover_repository(&main).unwrap();
+                let main_branch = main_snapshot.selected_worktree.branch.clone().unwrap();
+                let main_checkout = saved_checkout(&main, &main_branch, true);
+                assert_blocked(
+                    inspect_removal(&main_snapshot.common_dir, &main_checkout).unwrap(),
+                    RemovalBlocker::MainWorktree,
+                );
+
+                let (_, linked, common, branch, mut checkout) =
+                    linked_target(&fixture, "external target");
+                checkout.managed_by_baude = false;
+                assert_blocked(
+                    inspect_removal(&common, &checkout).unwrap(),
+                    RemovalBlocker::NotManaged,
+                );
+
+                checkout.managed_by_baude = true;
+                git_ok(&linked, &[OsStr::new("worktree"), OsStr::new("lock")]);
+                assert_blocked(
+                    inspect_removal(&common, &checkout).unwrap(),
+                    RemovalBlocker::Locked,
+                );
+                git_ok(&linked, &[OsStr::new("worktree"), OsStr::new("unlock")]);
+
+                git_ok(&linked, &[OsStr::new("checkout"), OsStr::new("--detach")]);
+                assert_blocked(
+                    inspect_removal(&common, &checkout).unwrap(),
+                    RemovalBlocker::Detached,
+                );
+
+                let (_, fresh_linked, fresh_common, fresh_branch, fresh_checkout) =
+                    linked_target(&fixture, "stale target");
+                assert_blocked(
+                    inspect_removal(Path::new("/definitely/different/common"), &fresh_checkout)
+                        .unwrap(),
+                    RemovalBlocker::IdentityChanged,
+                );
+                let changed = saved_checkout(&fresh_linked, "refs/heads/other", true);
+                assert_blocked(
+                    inspect_removal(&fresh_common, &changed).unwrap(),
+                    RemovalBlocker::BranchChanged,
+                );
+
+                let moved = fixture.root.join("moved outside git");
+                std::fs::rename(&fresh_linked, &moved).unwrap();
+                let moved_checkout = saved_checkout(&moved, &fresh_branch, true);
+                assert!(inspect_removal(&fresh_common, &moved_checkout).is_err());
+
+                assert_ne!(branch, fresh_branch);
+            }
+
+            #[test]
+            fn every_submodule_row_blocks_and_malformed_or_failing_output_is_indeterminate() {
+                let oid = b"0123456789012345678901234567890123456789";
+                for status in [b' ', b'-', b'+', b'U'] {
+                    let mut row = vec![status];
+                    row.extend_from_slice(oid);
+                    row.extend_from_slice(b" modules/child (heads/main)\n");
+                    assert_eq!(
+                        parse_submodule_status(&row).unwrap(),
+                        vec![RemovalBlocker::SubmodulePresent {
+                            path: b"modules/child".to_vec(),
+                            status,
+                        }]
+                    );
+                }
+                let nested = format!(
+                    " {} modules/parent (heads/main)\n-{} modules/parent/nested\n",
+                    String::from_utf8_lossy(oid),
+                    String::from_utf8_lossy(oid)
+                );
+                assert_eq!(parse_submodule_status(nested.as_bytes()).unwrap().len(), 2);
+                for malformed in [
+                    b"x0123456789012345678901234567890123456789 path\n".as_slice(),
+                    b" 0123 path\n".as_slice(),
+                    b" 0123456789012345678901234567890123456789\n".as_slice(),
+                    b" 0123456789012345678901234567890123456789 path".as_slice(),
+                ] {
+                    assert!(matches!(
+                        parse_submodule_status(malformed),
+                        Err(InspectionError::MalformedSubmoduleStatus(_))
+                    ));
+                }
+
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("submodule command failures");
+                assert!(matches!(
+                    inspect_submodules_with_program(
+                        &repo,
+                        OsStr::new("baude-definitely-missing-git")
+                    ),
+                    Err(InspectionError::CommandStart { .. })
+                ));
+                let ordinary = fixture.root.join("ordinary submodule path");
+                std::fs::create_dir(&ordinary).unwrap();
+                assert!(matches!(
+                    inspect_submodules(&ordinary),
+                    Err(InspectionError::GitCommand { .. })
+                ));
+            }
+
+            #[test]
+            fn a_recorded_clean_submodule_blocks_real_git_removal_preflight() {
+                let fixture = GitFixture::new();
+                let submodule = fixture.repo("submodule source");
+                let (_, linked, common, _, checkout) =
+                    linked_target(&fixture, "submodule superproject");
+                git_ok(
+                    &linked,
+                    &[
+                        OsStr::new("-c"),
+                        OsStr::new("protocol.file.allow=always"),
+                        OsStr::new("submodule"),
+                        OsStr::new("add"),
+                        submodule.as_os_str(),
+                        OsStr::new("modules/child"),
+                    ],
+                );
+                git_ok(
+                    &linked,
+                    &[
+                        OsStr::new("commit"),
+                        OsStr::new("-am"),
+                        OsStr::new("submodule"),
+                    ],
+                );
+
+                let safety = inspect_removal(&common, &checkout).unwrap();
+                match safety {
+                    RemovalSafety::Blocked(blockers) => assert!(blockers.iter().any(|blocker| {
+                        matches!(blocker, RemovalBlocker::SubmodulePresent { path, status: b' ' }
+                            if path == b"modules/child")
+                    })),
+                    RemovalSafety::Safe(_) => panic!("recorded submodule received removal token"),
+                }
+            }
+        }
+
         mod branch_activation {
             use super::*;
 
