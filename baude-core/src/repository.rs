@@ -464,7 +464,9 @@ mod tests {
         mismatched_repository.checkouts[0].session.repo_root = path("/other");
         assert_eq!(
             mismatched_repository.validate(),
-            Err(ValidationError::RetainedRepositoryPathMismatch(checkout_key))
+            Err(ValidationError::RetainedRepositoryPathMismatch(
+                checkout_key
+            ))
         );
 
         let mut mismatched_worktree = state.clone();

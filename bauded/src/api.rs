@@ -798,10 +798,8 @@ mod tests {
 
     #[tokio::test]
     async fn restart_api_refuses_checkout_branch_change() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-api-restart-branch-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("bauded-api-restart-branch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let repo = initialized_repo(&root, "repo");
         let (state, id) = exited_tracked_manager(&repo);
@@ -812,7 +810,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(crate::manager::lock(&state).info(id).unwrap().status, "exited");
+        assert_eq!(
+            crate::manager::lock(&state).info(id).unwrap().status,
+            "exited"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -837,7 +838,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(crate::manager::lock(&state).info(id).unwrap().status, "exited");
+        assert_eq!(
+            crate::manager::lock(&state).info(id).unwrap().status,
+            "exited"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

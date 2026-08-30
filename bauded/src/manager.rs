@@ -943,12 +943,15 @@ impl Manager {
         if !self.session(id)?.claude.is_exited() {
             bail!("claude is still running");
         }
-        if let Some(checkout_key) = self.runtime_checkouts.iter().find_map(|(key, runtime_id)| {
-            (*runtime_id == id).then_some(*key)
-        }) {
+        if let Some(checkout_key) = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+        {
             let reconciled = self.reconcile_checkout(checkout_key);
-            self.save_checked()
-                .map_err(|error| anyhow!("checkout reconciliation could not be persisted: {error}"))?;
+            self.save_checked().map_err(|error| {
+                anyhow!("checkout reconciliation could not be persisted: {error}")
+            })?;
             if !reconciled {
                 bail!("checkout changed since admission; restart refused");
             }

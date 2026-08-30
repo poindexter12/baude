@@ -2269,10 +2269,8 @@ mod repository_admission_tests {
     }
 
     fn admission_repo(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "baude-admission-{name}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let origin = root.join("origin.git");
         let repo = root.join("repo");
@@ -2285,7 +2283,10 @@ mod repository_admission_tests {
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
-        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
         git(&repo, &["push", "-u", "origin", "main"]);
         git(
             &repo,
