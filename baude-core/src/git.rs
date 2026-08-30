@@ -5,6 +5,8 @@ use std::process::{Command, Output};
 
 use anyhow::{anyhow, Result};
 
+use crate::repository::SavedCheckout;
+
 /// One checkout reported by Git's stable, NUL-delimited worktree inventory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeRecord {
@@ -1625,6 +1627,45 @@ pub enum RemovalBlocker {
     SubmodulePresent { path: Vec<u8>, status: u8 },
 }
 
+/// Git facts captured only after every removal inspection succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRemovalTarget {
+    path: PathBuf,
+    common_dir: PathBuf,
+    main_worktree: PathBuf,
+    branch_ref: String,
+    branch_oid: String,
+}
+
+impl VerifiedRemovalTarget {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
+    pub fn main_worktree(&self) -> &Path {
+        &self.main_worktree
+    }
+
+    pub fn branch_ref(&self) -> &str {
+        &self.branch_ref
+    }
+
+    pub fn branch_oid(&self) -> &str {
+        &self.branch_oid
+    }
+}
+
+/// Removal is either conclusively blocked or carries an opaque verified target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemovalSafety {
+    Safe(VerifiedRemovalTarget),
+    Blocked(Vec<RemovalBlocker>),
+}
+
 /// External inspection failed, so removal authorization cannot be issued.
 #[derive(Debug)]
 pub enum InspectionError {
@@ -1713,7 +1754,7 @@ fn valid_submodule_field(field: &[u8]) -> bool {
 }
 
 fn valid_mode(field: &[u8]) -> bool {
-    field.len() == 6 && field.iter().all(u8::is_ascii_digit)
+    field.len() == 6 && field.iter().all(|byte| b"01234567".contains(byte))
 }
 
 fn valid_oid(field: &[u8]) -> bool {
@@ -1884,7 +1925,244 @@ fn inspect_removal_status(
     inspect_removal_status_with_program(worktree, OsStr::new("git"))
 }
 
-#[deprecated(note = "managed lifecycle removal must use inspect_removal")]
+fn parse_submodule_status(
+    bytes: &[u8],
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(InspectionError::MalformedSubmoduleStatus(
+            "output is not newline terminated".into(),
+        ));
+    }
+
+    let mut blockers = Vec::new();
+    for row in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        if row.len() < 43 || !b" -+U".contains(&row[0]) {
+            return Err(InspectionError::MalformedSubmoduleStatus(
+                "invalid row prefix".into(),
+            ));
+        }
+        let oid_end = row[1..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                InspectionError::MalformedSubmoduleStatus("row has no path separator".into())
+            })?;
+        let oid = &row[1..oid_end];
+        if !matches!(oid.len(), 40 | 64) || !oid.iter().all(u8::is_ascii_hexdigit) {
+            return Err(InspectionError::MalformedSubmoduleStatus(
+                "row has an invalid object ID".into(),
+            ));
+        }
+        let remainder = &row[oid_end + 1..];
+        if remainder.is_empty() {
+            return Err(InspectionError::MalformedSubmoduleStatus(
+                "row has an empty path".into(),
+            ));
+        }
+        let path_end = remainder
+            .windows(2)
+            .rposition(|window| window == b" (")
+            .unwrap_or(remainder.len());
+        let path = &remainder[..path_end];
+        if path.is_empty() {
+            return Err(InspectionError::MalformedSubmoduleStatus(
+                "row has an empty path".into(),
+            ));
+        }
+        blockers.push(RemovalBlocker::SubmodulePresent {
+            path: path.to_vec(),
+            status: row[0],
+        });
+    }
+    Ok(blockers)
+}
+
+fn inspect_submodules_with_program(
+    worktree: &Path,
+    program: &OsStr,
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(worktree)
+        .args(["submodule", "status", "--recursive"])
+        .output()
+        .map_err(|source| InspectionError::CommandStart {
+            operation: "recursive submodule inspection",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(InspectionError::GitCommand {
+            operation: "recursive submodule inspection",
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    parse_submodule_status(&output.stdout)
+}
+
+fn inspect_submodules(
+    worktree: &Path,
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    inspect_submodules_with_program(worktree, OsStr::new("git"))
+}
+
+fn removal_oid(worktree: &Path, revision: &OsStr) -> std::result::Result<String, InspectionError> {
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(worktree)
+        .args([OsStr::new("rev-parse"), OsStr::new("--verify")])
+        .arg(revision)
+        .output()
+        .map_err(|source| InspectionError::CommandStart {
+            operation: "removal branch OID inspection",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(InspectionError::GitCommand {
+            operation: "removal branch OID inspection",
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let oid = std::str::from_utf8(&output.stdout)
+        .map_err(|_| InspectionError::MalformedStatus("branch OID is not UTF-8".into()))?
+        .trim_end_matches(['\r', '\n']);
+    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(InspectionError::MalformedStatus(
+            "branch OID is not a full object ID".into(),
+        ));
+    }
+    Ok(oid.to_owned())
+}
+
+fn topology_blockers(
+    expected_common_dir: &Path,
+    expected_path: &Path,
+    expected_branch: Option<&str>,
+    managed_by_baude: bool,
+    snapshot: &RepositorySnapshot,
+) -> Vec<RemovalBlocker> {
+    let mut blockers = Vec::new();
+    if !managed_by_baude {
+        blockers.push(RemovalBlocker::NotManaged);
+    }
+    if snapshot.common_dir != expected_common_dir {
+        blockers.push(RemovalBlocker::IdentityChanged);
+    }
+    if snapshot.selected_worktree.path != expected_path {
+        blockers.push(RemovalBlocker::PathChanged);
+    }
+    if snapshot.selected_worktree.path == snapshot.main_worktree {
+        blockers.push(RemovalBlocker::MainWorktree);
+    }
+    if snapshot.selected_worktree.bare {
+        blockers.push(RemovalBlocker::NotLinked);
+    }
+    if snapshot.selected_worktree.detached {
+        blockers.push(RemovalBlocker::Detached);
+    }
+    if snapshot.selected_worktree.branch.as_deref() != expected_branch {
+        blockers.push(RemovalBlocker::BranchChanged);
+    }
+    if snapshot.selected_worktree.locked {
+        blockers.push(RemovalBlocker::Locked);
+    }
+    if snapshot.selected_worktree.prunable {
+        blockers.push(RemovalBlocker::Prunable);
+    }
+    blockers
+}
+
+/// Prove persisted ownership against fresh topology, status, and submodule facts.
+/// No caller can construct a verified removal target directly.
+pub fn inspect_removal(
+    expected_common_dir: &Path,
+    checkout: &SavedCheckout,
+) -> std::result::Result<RemovalSafety, InspectionError> {
+    let persisted_path = checkout.observed_path.to_path_buf();
+    let expected_path =
+        persisted_path
+            .canonicalize()
+            .map_err(|source| InspectionError::Canonicalize {
+                path: persisted_path,
+                source,
+            })?;
+    let first = discover_repository(&expected_path).map_err(InspectionError::Topology)?;
+    let mut blockers = topology_blockers(
+        expected_common_dir,
+        &expected_path,
+        checkout.observed_branch.as_deref(),
+        checkout.managed_by_baude,
+        &first,
+    );
+    if !blockers.is_empty() {
+        return Ok(RemovalSafety::Blocked(blockers));
+    }
+
+    blockers.extend(inspect_removal_status(&expected_path)?);
+    blockers.extend(inspect_submodules(&expected_path)?);
+    if !blockers.is_empty() {
+        return Ok(RemovalSafety::Blocked(blockers));
+    }
+
+    let branch_ref = checkout
+        .observed_branch
+        .as_deref()
+        .ok_or_else(|| InspectionError::MalformedStatus("managed target has no branch".into()))?;
+    let revision = OsString::from(format!("{branch_ref}^{{commit}}"));
+    let branch_oid = removal_oid(&expected_path, &revision)?;
+    let head_oid = removal_oid(&expected_path, OsStr::new("HEAD"))?;
+    if branch_oid != head_oid {
+        return Ok(RemovalSafety::Blocked(vec![RemovalBlocker::BranchChanged]));
+    }
+
+    let final_snapshot = discover_repository(&expected_path).map_err(InspectionError::Topology)?;
+    blockers.extend(topology_blockers(
+        expected_common_dir,
+        &expected_path,
+        Some(branch_ref),
+        true,
+        &final_snapshot,
+    ));
+    if !blockers.is_empty() || first != final_snapshot {
+        if blockers.is_empty() {
+            blockers.push(RemovalBlocker::PathChanged);
+        }
+        return Ok(RemovalSafety::Blocked(blockers));
+    }
+
+    Ok(RemovalSafety::Safe(VerifiedRemovalTarget {
+        path: expected_path,
+        common_dir: final_snapshot.common_dir,
+        main_worktree: final_snapshot.main_worktree,
+        branch_ref: branch_ref.to_owned(),
+        branch_oid,
+    }))
+}
+
+/// Invoke plain, non-force Git removal for a target produced by `inspect_removal`.
+pub fn remove_verified_worktree(target: &VerifiedRemovalTarget) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&target.main_worktree)
+        .args(["worktree", "remove", "--"])
+        .arg(&target.path)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "git worktree remove: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 pub fn is_dirty(worktree: &Path) -> bool {
     inspect_removal_status(worktree)
         .map(|blockers| !blockers.is_empty())
@@ -1900,12 +2178,13 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 mod tests {
     use super::{
         activate_branch, classify_branch, discover_repository, ensure_default_worktree,
-        existing_branch_add_arguments, inspect_removal_status, inspect_removal_status_with_program,
+        existing_branch_add_arguments, inspect_removal, inspect_removal_status,
+        inspect_removal_status_with_program, inspect_submodules, inspect_submodules_with_program,
         managed_branch_worktree_path, new_branch_add_arguments, parse_clone_target,
-        parse_removal_status, parse_worktree_porcelain, reconcile_checkout,
+        parse_removal_status, parse_submodule_status, parse_worktree_porcelain, reconcile_checkout,
         removal_status_arguments, resolve_default_branch, BranchActivation, BranchActivationError,
         BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
-        ReconciliationUnavailable, RemovalBlocker,
+        ReconciliationUnavailable, RemovalBlocker, RemovalSafety,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2368,7 +2647,7 @@ mod tests {
                 let linked = fixture.linked_worktree(
                     &repo,
                     format!("{label} linked"),
-                    &format!("{label}-branch"),
+                    &format!("{}-branch", label.replace(' ', "-")),
                 );
                 (repo, linked)
             }
@@ -2595,7 +2874,7 @@ mod tests {
                 let linked = fixture.linked_worktree(
                     &repo,
                     format!("{label} linked"),
-                    &format!("{label}-branch"),
+                    &format!("{}-branch", label.replace(' ', "-")),
                 );
                 let snapshot = discover_repository(&linked).unwrap();
                 let branch = snapshot.selected_worktree.branch.clone().unwrap();
@@ -2662,12 +2941,26 @@ mod tests {
                 );
 
                 checkout.managed_by_baude = true;
-                git_ok(&linked, &[OsStr::new("worktree"), OsStr::new("lock")]);
+                git_ok(
+                    &linked,
+                    &[
+                        OsStr::new("worktree"),
+                        OsStr::new("lock"),
+                        linked.as_os_str(),
+                    ],
+                );
                 assert_blocked(
                     inspect_removal(&common, &checkout).unwrap(),
                     RemovalBlocker::Locked,
                 );
-                git_ok(&linked, &[OsStr::new("worktree"), OsStr::new("unlock")]);
+                git_ok(
+                    &linked,
+                    &[
+                        OsStr::new("worktree"),
+                        OsStr::new("unlock"),
+                        linked.as_os_str(),
+                    ],
+                );
 
                 git_ok(&linked, &[OsStr::new("checkout"), OsStr::new("--detach")]);
                 assert_blocked(
@@ -2699,7 +2992,7 @@ mod tests {
             #[test]
             fn every_submodule_row_blocks_and_malformed_or_failing_output_is_indeterminate() {
                 let oid = b"0123456789012345678901234567890123456789";
-                for status in [b' ', b'-', b'+', b'U'] {
+                for status in *b" -+U" {
                     let mut row = vec![status];
                     row.extend_from_slice(oid);
                     row.extend_from_slice(b" modules/child (heads/main)\n");
