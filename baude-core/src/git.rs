@@ -1,7 +1,358 @@
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::{anyhow, Result};
+
+/// One checkout reported by Git's stable, NUL-delimited worktree inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub bare: bool,
+    pub detached: bool,
+    pub locked: bool,
+    pub prunable: bool,
+}
+
+/// Canonical Git-owned facts for a repository and the checkout containing the input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositorySnapshot {
+    pub canonical_input: PathBuf,
+    pub common_dir: PathBuf,
+    pub main_worktree: PathBuf,
+    pub selected_worktree: WorktreeRecord,
+    pub worktrees: Vec<WorktreeRecord>,
+}
+
+/// Fail-closed repository discovery failures, kept typed for admission callers.
+#[derive(Debug)]
+pub enum RepositoryDiscoveryError {
+    Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CommandStart {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    GitCommand {
+        operation: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    MalformedTopology(String),
+    InvalidPathOutput(&'static str),
+    SelectedWorktreeMissing(PathBuf),
+}
+
+impl fmt::Display for RepositoryDiscoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Canonicalize { path, source } => {
+                write!(
+                    f,
+                    "canonicalize repository input {}: {source}",
+                    path.display()
+                )
+            }
+            Self::CommandStart { operation, source } => {
+                write!(f, "start Git {operation}: {source}")
+            }
+            Self::GitCommand {
+                operation,
+                status,
+                stderr,
+            } => write!(
+                f,
+                "Git {operation} failed (status {}): {stderr}",
+                status.map_or_else(|| "signal".to_owned(), |code| code.to_string())
+            ),
+            Self::MalformedTopology(reason) => {
+                write!(f, "malformed Git worktree topology: {reason}")
+            }
+            Self::InvalidPathOutput(operation) => {
+                write!(f, "Git {operation} returned an invalid path")
+            }
+            Self::SelectedWorktreeMissing(path) => write!(
+                f,
+                "Git selected checkout {} is absent from its worktree inventory",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RepositoryDiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Canonicalize { source, .. } | Self::CommandStart { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn git_bytes(
+    repo: &Path,
+    args: &[&OsStr],
+    operation: &'static str,
+) -> std::result::Result<Output, RepositoryDiscoveryError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|source| RepositoryDiscoveryError::CommandStart { operation, source })?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(RepositoryDiscoveryError::GitCommand {
+            operation,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
+fn os_string_from_git(bytes: Vec<u8>) -> std::result::Result<OsString, ()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).map(OsString::from).map_err(|_| ())
+    }
+}
+
+fn path_from_git_stdout(
+    mut bytes: Vec<u8>,
+    operation: &'static str,
+) -> std::result::Result<PathBuf, RepositoryDiscoveryError> {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(RepositoryDiscoveryError::InvalidPathOutput(operation));
+    }
+    os_string_from_git(bytes)
+        .map(PathBuf::from)
+        .map_err(|_| RepositoryDiscoveryError::InvalidPathOutput(operation))
+}
+
+#[derive(Default)]
+struct WorktreeRecordBuilder {
+    path: Option<PathBuf>,
+    has_head: bool,
+    branch: Option<String>,
+    bare: bool,
+    detached: bool,
+    locked: bool,
+    prunable: bool,
+}
+
+impl WorktreeRecordBuilder {
+    fn finish(self) -> std::result::Result<WorktreeRecord, RepositoryDiscoveryError> {
+        let path = self.path.ok_or_else(|| {
+            RepositoryDiscoveryError::MalformedTopology("record has no worktree path".into())
+        })?;
+        if !self.bare && !self.has_head {
+            return Err(RepositoryDiscoveryError::MalformedTopology(format!(
+                "worktree {} has no HEAD field",
+                path.display()
+            )));
+        }
+        if self.bare && (self.has_head || self.branch.is_some() || self.detached) {
+            return Err(RepositoryDiscoveryError::MalformedTopology(format!(
+                "bare repository {} contains checkout fields",
+                path.display()
+            )));
+        }
+        if !self.bare && (self.branch.is_some() == self.detached) {
+            return Err(RepositoryDiscoveryError::MalformedTopology(format!(
+                "worktree {} must contain exactly one branch or detached marker",
+                path.display()
+            )));
+        }
+        Ok(WorktreeRecord {
+            path,
+            branch: self.branch,
+            bare: self.bare,
+            detached: self.detached,
+            locked: self.locked,
+            prunable: self.prunable,
+        })
+    }
+}
+
+fn parse_worktree_porcelain(
+    bytes: &[u8],
+) -> std::result::Result<Vec<WorktreeRecord>, RepositoryDiscoveryError> {
+    if bytes.is_empty() || !bytes.ends_with(b"\0\0") {
+        return Err(RepositoryDiscoveryError::MalformedTopology(
+            "inventory is not terminated by an empty NUL field".into(),
+        ));
+    }
+
+    let mut records = Vec::new();
+    let mut current: Option<WorktreeRecordBuilder> = None;
+    for field in bytes.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(builder) = current.take() {
+                records.push(builder.finish()?);
+            }
+            continue;
+        }
+
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if current.is_some() || path.is_empty() {
+                return Err(RepositoryDiscoveryError::MalformedTopology(
+                    "unexpected worktree field".into(),
+                ));
+            }
+            let path = os_string_from_git(path.to_vec()).map_err(|_| {
+                RepositoryDiscoveryError::MalformedTopology(
+                    "worktree path is not representable on this platform".into(),
+                )
+            })?;
+            current = Some(WorktreeRecordBuilder {
+                path: Some(PathBuf::from(path)),
+                ..WorktreeRecordBuilder::default()
+            });
+            continue;
+        }
+
+        let builder = current.as_mut().ok_or_else(|| {
+            RepositoryDiscoveryError::MalformedTopology(
+                "field appears before its worktree path".into(),
+            )
+        })?;
+        if let Some(head) = field.strip_prefix(b"HEAD ") {
+            if builder.has_head || head.is_empty() {
+                return Err(RepositoryDiscoveryError::MalformedTopology(
+                    "invalid or duplicate HEAD field".into(),
+                ));
+            }
+            builder.has_head = true;
+        } else if let Some(branch) = field.strip_prefix(b"branch ") {
+            if builder.branch.is_some() || branch.is_empty() {
+                return Err(RepositoryDiscoveryError::MalformedTopology(
+                    "invalid or duplicate branch field".into(),
+                ));
+            }
+            builder.branch = Some(String::from_utf8(branch.to_vec()).map_err(|_| {
+                RepositoryDiscoveryError::MalformedTopology("branch ref is not UTF-8".into())
+            })?);
+        } else if field == b"bare" {
+            builder.bare = true;
+        } else if field == b"detached" {
+            builder.detached = true;
+        } else if field == b"locked" || field.starts_with(b"locked ") {
+            builder.locked = true;
+        } else if field == b"prunable" || field.starts_with(b"prunable ") {
+            builder.prunable = true;
+        } else {
+            return Err(RepositoryDiscoveryError::MalformedTopology(format!(
+                "unknown field {:?}",
+                String::from_utf8_lossy(field)
+            )));
+        }
+    }
+
+    if records.is_empty() {
+        return Err(RepositoryDiscoveryError::MalformedTopology(
+            "inventory contains no worktrees".into(),
+        ));
+    }
+    Ok(records)
+}
+
+/// Discover canonical repository membership without reading Git's on-disk layout.
+pub fn discover_repository(
+    path: &Path,
+) -> std::result::Result<RepositorySnapshot, RepositoryDiscoveryError> {
+    let canonical_input =
+        path.canonicalize()
+            .map_err(|source| RepositoryDiscoveryError::Canonicalize {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+    let common_output = git_bytes(
+        &canonical_input,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+        ],
+        "rev-parse common directory",
+    )?;
+    let common_dir = path_from_git_stdout(common_output.stdout, "rev-parse common directory")?
+        .canonicalize()
+        .map_err(|source| RepositoryDiscoveryError::Canonicalize {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let inventory_output = git_bytes(
+        &canonical_input,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("list"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+        ],
+        "worktree inventory",
+    )?;
+    let mut worktrees = parse_worktree_porcelain(&inventory_output.stdout)?;
+    for record in &mut worktrees {
+        if let Ok(canonical) = record.path.canonicalize() {
+            record.path = canonical;
+        }
+    }
+    let main_worktree = worktrees
+        .first()
+        .expect("parser rejects an empty inventory")
+        .path
+        .clone();
+
+    // This query identifies the selected checkout only; repository identity is the
+    // canonical common directory plus Git's main-first worktree inventory above.
+    let selected_output = git_bytes(
+        &canonical_input,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--show-toplevel"),
+        ],
+        "rev-parse selected worktree",
+    )?;
+    let selected_path =
+        path_from_git_stdout(selected_output.stdout, "rev-parse selected worktree")?
+            .canonicalize()
+            .map_err(|source| RepositoryDiscoveryError::Canonicalize {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    let selected_worktree = worktrees
+        .iter()
+        .find(|record| record.path == selected_path)
+        .cloned()
+        .ok_or_else(|| RepositoryDiscoveryError::SelectedWorktreeMissing(selected_path))?;
+
+    Ok(RepositorySnapshot {
+        canonical_input,
+        common_dir,
+        main_worktree,
+        selected_worktree,
+        worktrees,
+    })
+}
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -191,10 +542,8 @@ mod tests {
     impl GitFixture {
         fn new() -> Self {
             let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "baude-git-test-{}-{sequence}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("baude-git-test-{}-{sequence}", std::process::id()));
             std::fs::create_dir(&root).expect("create unique Git fixture root");
             Self { root }
         }
@@ -204,7 +553,11 @@ mod tests {
             git_ok(&self.root, &[OsStr::new("init"), repo.as_os_str()]);
             git_ok(
                 &repo,
-                &[OsStr::new("config"), OsStr::new("user.name"), OsStr::new("Baude Test")],
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("user.name"),
+                    OsStr::new("Baude Test"),
+                ],
             );
             git_ok(
                 &repo,
@@ -218,17 +571,23 @@ mod tests {
             git_ok(&repo, &[OsStr::new("add"), OsStr::new("tracked.txt")]);
             git_ok(
                 &repo,
-                &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("fixture")],
+                &[
+                    OsStr::new("commit"),
+                    OsStr::new("-m"),
+                    OsStr::new("fixture"),
+                ],
             );
             repo
         }
 
-        fn linked_worktree(&self, repo: &Path, relative: impl AsRef<Path>, branch: &str) -> PathBuf {
+        fn linked_worktree(
+            &self,
+            repo: &Path,
+            relative: impl AsRef<Path>,
+            branch: &str,
+        ) -> PathBuf {
             let path = self.root.join(relative);
-            git_ok(
-                repo,
-                &[OsStr::new("branch"), OsStr::new(branch)],
-            );
+            git_ok(repo, &[OsStr::new("branch"), OsStr::new(branch)]);
             git_ok(
                 repo,
                 &[
@@ -317,7 +676,10 @@ mod tests {
             let linked = fixture.linked_worktree(&repo, "linked space\nline", "unusual");
 
             let snapshot = discover_repository(&linked).unwrap();
-            assert_eq!(snapshot.selected_worktree.path, linked.canonicalize().unwrap());
+            assert_eq!(
+                snapshot.selected_worktree.path,
+                linked.canonicalize().unwrap()
+            );
             assert!(snapshot
                 .worktrees
                 .iter()
