@@ -13,5 +13,6 @@ pub mod meta;
 pub mod permission;
 pub mod persist;
 pub mod pty;
+pub mod repository;
 pub mod session;
 pub mod workspace;

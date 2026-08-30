@@ -3,6 +3,42 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::repository::RepositoryState;
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateFile {
+    pub schema_version: u32,
+    pub state: RepositoryState,
+}
+
+impl StateFile {
+    pub fn new(state: RepositoryState) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            state,
+        }
+    }
+}
+
+/// Isolated-root seam used by persistence tests and explicit state owners.
+pub fn save_current_at(root: &std::path::Path, file: &str, state: &StateFile) -> Result<()> {
+    state.state.validate()?;
+    let path = root.join(file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+pub fn load_current_at(root: &std::path::Path, file: &str) -> Result<StateFile> {
+    let state: StateFile = serde_json::from_slice(&std::fs::read(root.join(file))?)?;
+    state.state.validate()?;
+    Ok(state)
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct State {
     pub sessions: Vec<SavedSession>,
@@ -171,6 +207,104 @@ pub fn save_named(file: &str, state: &State) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::{
+        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RetainedSessionState,
+        SavedCheckout, SavedRepository, UnavailableCause,
+    };
+
+    fn isolated_root(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "baude-persist-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn current_fixture(prefix: &str) -> StateFile {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key();
+        let checkout_key = state.allocate_checkout_key();
+        let repository_order = state.allocate_first_seen_order();
+        let checkout_order = state.allocate_first_seen_order();
+        let main = PathBuf::from(format!("/{prefix}/repo"));
+        let checkout_path = PathBuf::from(format!("/{prefix}/repo-default"));
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(&main.join(".git")),
+            observed_main_worktree: PersistedPath::from_path(&main),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged),
+        });
+        state.checkouts.push(SavedCheckout {
+            key: checkout_key,
+            repository_key,
+            role: CheckoutRole::PrimaryDefault,
+            managed_by_baude: true,
+            observed_path: PersistedPath::from_path(&checkout_path),
+            observed_branch: Some("feature/retained".into()),
+            first_seen_order: checkout_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name: format!("{prefix}-session"),
+                cwd: PersistedPath::from_path(&checkout_path),
+                repo_root: PersistedPath::from_path(&main),
+                branch: Some("feature/retained".into()),
+                is_worktree: true,
+                shell_open: true,
+                archived: true,
+                archived_by_user: true,
+            },
+            health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
+        });
+        StateFile::new(state)
+    }
+
+    #[test]
+    fn current_round_trip() {
+        let claude_root = isolated_root("current-claude");
+        let opencode_root = isolated_root("current-opencode");
+        let claude = current_fixture("claude");
+        let opencode = current_fixture("opencode");
+        save_current_at(&claude_root, "state-claude.json", &claude).unwrap();
+        save_current_at(&opencode_root, "state-opencode.json", &opencode).unwrap();
+        assert_eq!(
+            load_current_at(&claude_root, "state-claude.json").unwrap(),
+            claude
+        );
+        assert_eq!(
+            load_current_at(&opencode_root, "state-opencode.json").unwrap(),
+            opencode
+        );
+        assert_ne!(claude.state.repositories[0].observed_main_worktree, opencode.state.repositories[0].observed_main_worktree);
+        std::fs::remove_dir_all(claude_root).unwrap();
+        std::fs::remove_dir_all(opencode_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_round_trip() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = isolated_root("non-utf8");
+        let original = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/repo-\xff".to_vec()));
+        let persisted = PersistedPath::from_path(&original);
+        assert_eq!(persisted.as_bytes(), original.as_os_str().as_bytes());
+        let mut fixture = current_fixture("bytes");
+        fixture.state.repositories[0].observed_common_dir = persisted.clone();
+        fixture.state.repositories[0].observed_main_worktree = persisted.clone();
+        fixture.state.checkouts[0].observed_path = persisted.clone();
+        fixture.state.checkouts[0].session.cwd = persisted.clone();
+        fixture.state.checkouts[0].session.repo_root = persisted;
+        save_current_at(&root, "state-claude.json", &fixture).unwrap();
+        let loaded = load_current_at(&root, "state-claude.json").unwrap();
+        let reconciled = |path: &PersistedPath| path.to_path_buf();
+        let reconstructed = reconciled(&loaded.state.checkouts[0].observed_path);
+        assert_eq!(reconstructed.as_os_str().as_bytes(), original.as_os_str().as_bytes());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn auto_archive_ms_resolves_env_then_config_then_default() {
