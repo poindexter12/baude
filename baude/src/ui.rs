@@ -1396,7 +1396,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::rate_5h_chip;
+    use super::{rate_5h_chip, remove_confirmation_lines};
     use ratatui::style::{Color, Style};
 
     #[test]
@@ -1432,5 +1432,16 @@ mod tests {
         // Degenerate widths never panic.
         assert_eq!(input_tail("abc", 0), "…");
         assert_eq!(input_tail("abc", 1), "…");
+    }
+
+    #[test]
+    fn remove_confirmation_names_exact_branch_and_path() {
+        let lines = remove_confirmation_lines(
+            std::path::Path::new("/tmp/repo worktree"),
+            "refs/heads/feature/safe-remove",
+        );
+        assert!(lines.iter().any(|line| line.contains("refs/heads/feature/safe-remove")));
+        assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
+        assert!(lines.iter().any(|line| line.contains("branch is retained")));
     }
 }

@@ -2653,7 +2653,7 @@ mod clipboard_tests {
 mod repository_admission_tests {
     use super::{
         active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, LocalAdmissionRoute,
+        require_same_checkout_path, App, LocalAdmissionRoute, Modal,
     };
     use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
     use baude_core::repository::{
@@ -2663,6 +2663,7 @@ mod repository_admission_tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn git(repo: &Path, args: &[&str]) {
         assert!(Command::new("git")
@@ -3476,5 +3477,64 @@ mod repository_admission_tests {
             }
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn remove_confirmation_is_distinct_targeted_and_cancel_is_non_mutating() {
+        let repo = admission_repo("remove-confirmation");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + 140_000;
+        let created = app
+            .activate_branch_worktree(&repo, "feature/remove-confirmation")
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let before = app.repository_state.clone();
+        app.modal = Modal::ConfirmCloseWorktree { id: runtime };
+
+        app.handle_modal_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        let target_path = before.checkouts[0].observed_path.to_path_buf();
+        assert!(matches!(
+            &app.modal,
+            Modal::ConfirmRemoveWorktree { confirmation }
+                if confirmation.checkout() == checkout
+                    && confirmation.path() == target_path
+                    && confirmation.branch_ref() == "refs/heads/feature/remove-confirmation"
+        ));
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+
+        std::fs::write(target_path.join("blocked"), b"keep\n").unwrap();
+        app.modal = Modal::ConfirmCloseWorktree { id: runtime };
+        app.handle_modal_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.message.as_ref().unwrap().0.contains("Untracked"));
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+        app.session_mut(runtime).unwrap().kill();
+        std::fs::remove_file(target_path.join("blocked")).unwrap();
+        git(
+            &repo,
+            &["worktree", "remove", "--", target_path.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
