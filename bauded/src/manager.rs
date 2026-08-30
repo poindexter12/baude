@@ -2363,6 +2363,71 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_remove_clean_manager_uses_the_shared_child_only_transaction() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-safe-remove-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 110_000;
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        let created = manager
+            .activate_branch_worktree(&repo, "feature/safe-remove-manager", None)
+            .unwrap();
+        let (checkout, _) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let before = manager.repository_state.clone();
+
+        let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+        let removed = manager.confirm_remove_worktree(confirmation).unwrap();
+
+        assert!(matches!(removed, LifecycleOutcome::Removed { checkout: key, .. } if key == checkout));
+        assert!(manager.repository_state.checkouts.is_empty());
+        assert_eq!(manager.repository_state.repositories, before.repositories);
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert_eq!(persisted_at(&state_root, &workspace), manager.repository_state);
+        assert!(Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "--", "refs/heads/feature/safe-remove-manager"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn archive_persistence_failure_rolls_back_or_keeps_the_replacement() {
         for (label, failure, committed) in [
             ("archive-pre", persist::AtomicFailure::Rename, false),

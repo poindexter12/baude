@@ -3167,4 +3167,71 @@ mod repository_admission_tests {
         git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn lifecycle_remove_clean_local_rechecks_after_stop_and_compensates_a_race() {
+        let repo = admission_repo("safe-remove-local");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + 100_000;
+        let created = app
+            .activate_branch_worktree(&repo, "feature/safe-remove-local")
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let path = app.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let before = app.repository_state.clone();
+
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+        std::fs::write(path.join("agent-race"), b"unsaved\n").unwrap();
+
+        let blocked = app
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(blocked.contains("Untracked"), "got: {blocked}");
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts.len(), 1);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(path.is_dir());
+
+        std::fs::remove_file(path.join("agent-race")).unwrap();
+        let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+        let removed = app.confirm_remove_worktree(confirmation).unwrap();
+        assert!(matches!(
+            removed,
+            LifecycleOutcome::Removed {
+                checkout: key,
+                repository: _,
+                branch_ref: _
+            } if key == checkout
+        ));
+        assert!(app.repository_state.checkouts.is_empty());
+        assert_eq!(app.repository_state.repositories, before.repositories);
+        assert!(app.runtime_checkouts.is_empty());
+        assert!(app.sessions.is_empty());
+        assert!(!path.exists());
+        assert!(Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "--", "refs/heads/feature/safe-remove-local"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
