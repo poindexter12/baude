@@ -90,6 +90,7 @@ pub enum AtomicFailure {
     Write,
     Sync,
     Rename,
+    DirectorySync,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +275,19 @@ fn atomic_save_current(
             anyhow::bail!("injected rename failure");
         }
         std::fs::rename(&temporary, &destination)?;
+        if failure == Some(AtomicFailure::DirectorySync) {
+            anyhow::bail!("injected directory sync failure");
+        }
+        // On Unix, rename durability requires syncing the containing directory
+        // as well as the temporary file. Other targets retain rename's native
+        // guarantees until they gain an equivalent directory-sync primitive.
+        #[cfg(unix)]
+        {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("state destination has no parent"))?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     })();
 
@@ -924,6 +938,21 @@ mod tests {
                 "failed attempt must clean only its owned temp"
             );
         }
+
+        std::fs::write(&destination, old).unwrap();
+        assert!(save_current_at_test(
+            &root,
+            "state-claude.json",
+            &fixture,
+            Some(AtomicFailure::DirectorySync),
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            load_current_at(&root, "state-claude.json").unwrap(),
+            fixture,
+            "a post-rename sync error is reported even though the rename is already visible"
+        );
 
         let collision = root.join(".state-claude.json.tmp-collision");
         std::fs::write(&collision, b"other writer").unwrap();
