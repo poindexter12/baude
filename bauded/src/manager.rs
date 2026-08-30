@@ -63,6 +63,10 @@ pub struct Manager {
     persistence_error: Option<String>,
     #[cfg(test)]
     save_error_for_test: Option<String>,
+    #[cfg(test)]
+    persistence_target_for_test: Option<(PathBuf, String)>,
+    #[cfg(test)]
+    atomic_failure_for_test: Option<persist::AtomicFailure>,
 }
 
 #[derive(Serialize)]
@@ -261,6 +265,10 @@ impl Manager {
             persistence_error: None,
             #[cfg(test)]
             save_error_for_test: None,
+            #[cfg(test)]
+            persistence_target_for_test: None,
+            #[cfg(test)]
+            atomic_failure_for_test: None,
         }
     }
 
@@ -415,21 +423,34 @@ impl Manager {
         }
     }
 
-    fn save_checked(&mut self) -> Result<()> {
+    fn save_checked(&mut self) -> std::result::Result<(), persist::SaveError> {
         if !self.persist {
             return Ok(());
         }
         if self.persistence_blocked {
-            bail!("persistence is blocked after a state load failure");
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "persistence is blocked after a state load failure"
+            )));
         }
         #[cfg(test)]
         if let Some(error) = self.save_error_for_test.clone() {
             self.persistence_dirty = true;
             self.persistence_error = Some(error.clone());
-            bail!("persistence save failed: {error}");
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "persistence save failed: {error}"
+            )));
         }
         let state = StateFile::new(self.state_for_save());
-        match persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state) {
+        #[cfg(test)]
+        let saved = if let Some((root, file)) = &self.persistence_target_for_test {
+            persist::save_current_at_test(root, file, &state, self.atomic_failure_for_test, None)
+        } else {
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state)
+        };
+        #[cfg(not(test))]
+        let saved =
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state);
+        match saved {
             Ok(()) => {
                 self.persistence_dirty = false;
                 self.persistence_error = None;
@@ -438,7 +459,7 @@ impl Manager {
             Err(error) => {
                 self.persistence_dirty = true;
                 self.persistence_error = Some(error.to_string());
-                Err(anyhow!("persistence save failed: {error}"))
+                Err(error)
             }
         }
     }
@@ -528,31 +549,118 @@ impl Manager {
         if self.persist {
             self.ensure_runtime_capacity(&cwd, &repo_root)?;
         }
-        let state_before = self.repository_state.clone();
-        let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         if self.persist {
-            if let Err(error) = self.record_runtime(id) {
-                if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
-                    session.kill();
+            let state_before = self.repository_state.clone();
+            let dir_name = |path: &Path| {
+                path.file_name()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            let base = name.map(str::to_owned).unwrap_or_else(|| match &branch {
+                Some(branch) => format!("{}:{branch}", dir_name(&repo_root)),
+                None => dir_name(&cwd),
+            });
+            let session_name = self.unique_name(&base);
+            let checkout_key = self.record_checkout_intent(
+                &cwd,
+                &repo_root,
+                branch.clone(),
+                is_worktree,
+                session_name.clone(),
+            )?;
+            if let Err(error) = self.save_checked() {
+                if !error.replacement_committed() {
+                    self.repository_state = state_before;
                 }
-                self.sessions.retain(|session| session.id != id);
-                self.runtime_checkouts
-                    .retain(|_, runtime_id| *runtime_id != id);
-                self.repository_state = state_before;
-                return Err(error);
+                return Err(error.into());
             }
+            let id = self.spawn(
+                cwd,
+                repo_root,
+                branch,
+                is_worktree,
+                Some(&session_name),
+                false,
+            )?;
+            self.runtime_checkouts.insert(checkout_key, id);
+            return Ok(self.info(id).expect("session just spawned"));
         }
-        if let Err(error) = self.save_checked() {
-            if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
-                session.kill();
-            }
-            self.sessions.retain(|session| session.id != id);
-            self.runtime_checkouts
-                .retain(|_, runtime_id| *runtime_id != id);
-            self.repository_state = state_before;
-            return Err(error);
-        }
+        let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         Ok(self.info(id).expect("session just spawned"))
+    }
+
+    fn record_checkout_intent(
+        &mut self,
+        cwd: &Path,
+        repo_root: &Path,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: String,
+    ) -> Result<CheckoutKey> {
+        let snapshot = git::discover_repository(cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(repo_root));
+        let repository_key = if let Some(key) = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.observed_common_dir == common)
+            .map(|repository| repository.key)
+        {
+            key
+        } else {
+            let key = self.repository_state.allocate_repository_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: common,
+                observed_main_worktree: PersistedPath::from_path(
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.main_worktree.as_path())
+                        .unwrap_or(repo_root),
+                ),
+                first_seen_order,
+                health: if snapshot.is_some() {
+                    RepositoryHealth::Available
+                } else {
+                    RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
+                },
+            });
+            key
+        };
+        let checkout_key = self.repository_state.allocate_checkout_key()?;
+        let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+        self.repository_state.checkouts.push(SavedCheckout {
+            key: checkout_key,
+            repository_key,
+            role: CheckoutRole::ManagedBranch,
+            managed_by_baude: is_worktree,
+            observed_path: PersistedPath::from_path(cwd),
+            observed_branch: snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
+            first_seen_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name,
+                cwd: PersistedPath::from_path(cwd),
+                repo_root: PersistedPath::from_path(repo_root),
+                branch,
+                is_worktree,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+            },
+            health: if snapshot.is_some() {
+                CheckoutHealth::Available
+            } else {
+                CheckoutHealth::Unavailable(UnavailableCause::NotRepository)
+            },
+        });
+        Ok(checkout_key)
     }
 
     fn spawn(
@@ -647,6 +755,7 @@ impl Manager {
         }
     }
 
+    #[cfg(test)]
     fn record_runtime(&mut self, id: u64) -> Result<()> {
         let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
             return Ok(());
@@ -740,15 +849,13 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> Result<()> {
-        let s = self.session_mut(id)?;
-        s.kill();
-        self.sessions.retain(|s| s.id != id);
-        if let Some(checkout_key) = self
+        self.session(id)?;
+        let state_before = self.repository_state.clone();
+        let checkout_key = self
             .runtime_checkouts
             .iter()
-            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
-        {
-            self.runtime_checkouts.remove(&checkout_key);
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
+        if let Some(checkout_key) = checkout_key {
             self.repository_state
                 .checkouts
                 .retain(|checkout| checkout.key != checkout_key);
@@ -762,12 +869,24 @@ impl Manager {
                 .repositories
                 .retain(|repository| used.contains(&repository.key));
         }
+        let save_error = self.save_checked().err();
+        if let Some(error) = &save_error {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+                return Err(anyhow!(error.to_string()));
+            }
+        }
+        self.session_mut(id)?.kill();
+        self.sessions.retain(|s| s.id != id);
+        if let Some(checkout_key) = checkout_key {
+            self.runtime_checkouts.remove(&checkout_key);
+        }
         // Wake any lingering permission waiter (it will re-check, find the
         // session gone, and bail) and drop its handle so the map doesn't leak.
         if let Some(n) = self.permission_notify.remove(&id) {
             n.notify_waiters();
         }
-        self.save_checked()
+        save_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     /// How long to wait between pasting the text and pressing Enter. Claude
@@ -1119,8 +1238,18 @@ impl Manager {
     /// or re-engaged; an automatic one also lifts when a new turn starts.
     pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
         let s = self.session_mut(id)?;
+        let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
-        self.save_checked()
+        match self.save_checked() {
+            Ok(()) => Ok(()),
+            Err(error) if error.replacement_committed() => Err(error.into()),
+            Err(error) => {
+                let s = self.session_mut(id)?;
+                s.archived = archived_before.0;
+                s.archived_by_user = archived_before.1;
+                Err(error.into())
+            }
+        }
     }
 
     /// Test-only: pin a session's resolved Claude `session_id` so handlers
@@ -1139,6 +1268,19 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn fail_saves_for_test(&mut self, error: &str) {
         self.save_error_for_test = Some(error.to_string());
+    }
+
+    #[cfg(test)]
+    fn persist_at_for_test(
+        &mut self,
+        root: &Path,
+        workspace: &baude_core::workspace::Workspace,
+        failure: Option<persist::AtomicFailure>,
+    ) {
+        self.save_error_for_test = None;
+        self.persistence_target_for_test =
+            Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
+        self.atomic_failure_for_test = failure;
     }
 
     /// Test-only deterministic Claude metadata poll. The process running the
@@ -1491,6 +1633,101 @@ mod tests {
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
         assert_eq!(manager.next_id, 1);
+    }
+
+    fn persistence_fixture(label: &str) -> (PathBuf, baude_core::workspace::Workspace) {
+        let root =
+            std::env::temp_dir().join(format!("bauded-transaction-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        (root, workspace)
+    }
+
+    fn persisted_at(root: &Path, workspace: &baude_core::workspace::Workspace) -> RepositoryState {
+        persist::load_current_at(root, &workspace.state_file(STATE_BASE))
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn create_persistence_failure_keeps_memory_process_and_disk_consistent() {
+        let (root, workspace) = persistence_fixture("create");
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+
+        assert!(manager.create("/tmp", None, Some("pre")).is_err());
+        assert!(manager.repository_state.checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert!(!root.join(workspace.state_file(STATE_BASE)).exists());
+
+        manager.persist_at_for_test(
+            &root,
+            &workspace,
+            Some(persist::AtomicFailure::DirectorySync),
+        );
+        assert!(manager.create("/tmp", None, Some("post")).is_err());
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remove_persistence_failure_rolls_back_or_finishes_the_delete() {
+        for (label, failure, committed) in [
+            ("remove-pre", persist::AtomicFailure::Rename, false),
+            ("remove-post", persist::AtomicFailure::DirectorySync, true),
+        ] {
+            let (root, workspace) = persistence_fixture(label);
+            let mut manager = Manager::new("sleep 30".into(), true);
+            manager.persist_at_for_test(&root, &workspace, None);
+            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            manager.persist_at_for_test(&root, &workspace, Some(failure));
+
+            assert!(manager.remove(id).is_err());
+            assert_eq!(manager.sessions.is_empty(), committed);
+            assert_eq!(manager.repository_state.checkouts.is_empty(), committed);
+            assert_eq!(
+                persisted_at(&root, &workspace).checkouts.is_empty(),
+                committed
+            );
+            if !committed {
+                manager.kill_all();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn archive_persistence_failure_rolls_back_or_keeps_the_replacement() {
+        for (label, failure, committed) in [
+            ("archive-pre", persist::AtomicFailure::Rename, false),
+            ("archive-post", persist::AtomicFailure::DirectorySync, true),
+        ] {
+            let (root, workspace) = persistence_fixture(label);
+            let mut manager = Manager::new("sleep 30".into(), true);
+            manager.persist_at_for_test(&root, &workspace, None);
+            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            manager.persist_at_for_test(&root, &workspace, Some(failure));
+
+            assert!(manager.set_archived(id, true).is_err());
+            assert_eq!(manager.info(id).unwrap().archived, committed);
+            assert_eq!(
+                persisted_at(&root, &workspace).checkouts[0]
+                    .session
+                    .archived,
+                committed
+            );
+            manager.kill_all();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

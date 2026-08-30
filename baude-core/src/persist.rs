@@ -94,6 +94,41 @@ pub enum AtomicFailure {
     DirectorySync,
 }
 
+#[derive(Debug)]
+pub struct SaveError {
+    replacement_committed: bool,
+    source: anyhow::Error,
+}
+
+impl SaveError {
+    fn not_committed(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            replacement_committed: false,
+            source: source.into(),
+        }
+    }
+
+    pub fn before_replacement(source: impl Into<anyhow::Error>) -> Self {
+        Self::not_committed(source)
+    }
+
+    pub fn replacement_committed(&self) -> bool {
+        self.replacement_committed
+    }
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for SaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyReconciliation {
     Available {
@@ -121,6 +156,14 @@ impl StateFile {
 
 /// Isolated-root seam used by persistence tests and explicit state owners.
 pub fn save_current_at(root: &std::path::Path, file: &str, state: &StateFile) -> Result<()> {
+    save_current_at_status(root, file, state).map_err(anyhow::Error::new)
+}
+
+pub fn save_current_at_status(
+    root: &std::path::Path,
+    file: &str,
+    state: &StateFile,
+) -> std::result::Result<(), SaveError> {
     atomic_save_current(root, file, state, None, None)
 }
 
@@ -226,7 +269,7 @@ pub fn save_current_at_test(
     state: &StateFile,
     failure: Option<AtomicFailure>,
     _first_temp: Option<PathBuf>,
-) -> Result<()> {
+) -> std::result::Result<(), SaveError> {
     atomic_save_current(root, file, state, failure, _first_temp)
 }
 
@@ -270,14 +313,14 @@ fn atomic_save_current(
     state: &StateFile,
     failure: Option<AtomicFailure>,
     first_temp: Option<PathBuf>,
-) -> Result<()> {
-    state.state.validate()?;
-    let bytes = serde_json::to_vec_pretty(state)?;
+) -> std::result::Result<(), SaveError> {
+    state.state.validate().map_err(SaveError::not_committed)?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(SaveError::not_committed)?;
     let destination = root.join(file);
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(SaveError::not_committed)?;
     }
-    hold_state_lock(&destination)?;
+    hold_state_lock(&destination).map_err(SaveError::not_committed)?;
 
     let mut first_temp = first_temp;
     let (temporary, output) = loop {
@@ -292,11 +335,12 @@ fn atomic_save_current(
         {
             Ok(output) => break (candidate, output),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(SaveError::not_committed(error)),
         }
     };
     let mut output = Some(output);
 
+    let mut replacement_committed = false;
     let attempt = (|| -> Result<()> {
         if failure == Some(AtomicFailure::Write) {
             anyhow::bail!("injected write failure");
@@ -313,6 +357,7 @@ fn atomic_save_current(
             anyhow::bail!("injected rename failure");
         }
         std::fs::rename(&temporary, &destination)?;
+        replacement_committed = true;
         if failure == Some(AtomicFailure::DirectorySync) {
             anyhow::bail!("injected directory sync failure");
         }
@@ -333,7 +378,10 @@ fn atomic_save_current(
         drop(output.take());
         let _ = std::fs::remove_file(&temporary);
     }
-    attempt
+    attempt.map_err(|source| SaveError {
+        replacement_committed,
+        source,
+    })
 }
 
 /// Select and migrate exactly one workspace-owned source under an injected root.
@@ -615,6 +663,14 @@ pub fn save_for_workspace(
     state: &StateFile,
 ) -> Result<()> {
     save_named(&ws.state_file(base), state)
+}
+
+pub fn save_for_workspace_status(
+    base: &str,
+    ws: &crate::workspace::Workspace,
+    state: &StateFile,
+) -> std::result::Result<(), SaveError> {
+    save_current_at_status(&config_base(), &ws.state_file(base), state)
 }
 
 /// Load session state from a specific file under the config dir. The TUI and
