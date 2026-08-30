@@ -772,7 +772,16 @@ impl App {
             Ok(reservation) => reservation,
             Err(busy) => return Ok(busy),
         };
-        let activation = lifecycle::execute_activation(&mut next, repository_child, prepared)?;
+        let activation = match lifecycle::execute_activation(&mut next, repository_child, prepared)
+        {
+            Ok(activation) => activation,
+            Err(error) if error.recovery_child_recorded() => {
+                self.repository_state = next;
+                self.save_durable_status().map_err(anyhow::Error::new)?;
+                return Err(anyhow::Error::new(error));
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        };
         let state_before = self.repository_state.clone();
         self.repository_state = next;
 

@@ -565,6 +565,15 @@ impl std::fmt::Display for LifecycleError {
 
 impl std::error::Error for LifecycleError {}
 
+impl LifecycleError {
+    pub fn recovery_child_recorded(&self) -> bool {
+        matches!(
+            self,
+            Self::Git(BranchActivationError::PostAddCompensationFailed { .. })
+        )
+    }
+}
+
 impl From<RepositoryDiscoveryError> for LifecycleError {
     fn from(error: RepositoryDiscoveryError) -> Self {
         Self::Discovery(error)
@@ -672,11 +681,46 @@ pub fn execute_activation(
 ) -> Result<RecordedActivation, LifecycleError> {
     let state_before = state.clone();
     let activation_repository = git::discover_repository(repository_child)?;
-    let outcome = git::activate_branch(
+    let outcome = match git::activate_branch(
         repository_child,
         &prepared.request.branch,
         &prepared.request.managed_path,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(error @ BranchActivationError::PostAddCompensationFailed { .. }) => {
+            let full_ref = format!("refs/heads/{}", prepared.request.branch);
+            let repository_name = activation_repository
+                .main_worktree
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| activation_repository.main_worktree.display().to_string());
+            state.checkouts.push(SavedCheckout {
+                key: prepared.checkout,
+                repository_key: prepared.request.repository,
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                observed_path: PersistedPath::from_path(&prepared.request.managed_path),
+                observed_branch: Some(full_ref),
+                first_seen_order: prepared.first_seen_order,
+                active_intent: false,
+                session: RetainedSessionState {
+                    name: format!("{repository_name}:{}", prepared.request.branch),
+                    cwd: PersistedPath::from_path(&prepared.request.managed_path),
+                    repo_root: PersistedPath::from_path(&activation_repository.main_worktree),
+                    branch: Some(prepared.request.branch.clone()),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+                health: CheckoutHealth::Unavailable(UnavailableCause::Other(error.to_string())),
+            });
+            state.validate()?;
+            return Err(LifecycleError::Git(error));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let (disposition, created_by_baude, record) = activation_parts(outcome);
     let added_path = record.path.clone();
     let result = (|| {

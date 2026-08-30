@@ -638,8 +638,16 @@ impl Manager {
             Ok(reservation) => reservation,
             Err(busy) => return Ok(busy),
         };
-        let activation = lifecycle::execute_activation(&mut next, repository_child, prepared)
-            .map_err(anyhow::Error::new)?;
+        let activation = match lifecycle::execute_activation(&mut next, repository_child, prepared)
+        {
+            Ok(activation) => activation,
+            Err(error) if error.recovery_child_recorded() => {
+                self.repository_state = next;
+                self.save_checked()?;
+                return Err(anyhow::Error::new(error).into());
+            }
+            Err(error) => return Err(anyhow::Error::new(error).into()),
+        };
         if let Some(name) = name {
             if let Some(checkout) = next
                 .checkouts

@@ -1003,6 +1003,14 @@ pub enum BranchActivationError {
     },
     Discovery(RepositoryDiscoveryError),
     Verification(String),
+    PostAddCompensationFailed {
+        repository: PathBuf,
+        path: PathBuf,
+        branch: String,
+        created_branch: bool,
+        verification: Box<BranchActivationError>,
+        compensation: String,
+    },
 }
 
 impl fmt::Display for BranchActivationError {
@@ -1044,6 +1052,19 @@ impl fmt::Display for BranchActivationError {
             ),
             Self::Discovery(error) => write!(f, "discover branch worktree: {error}"),
             Self::Verification(detail) => write!(f, "verify branch activation: {detail}"),
+            Self::PostAddCompensationFailed {
+                repository,
+                path,
+                branch,
+                created_branch,
+                verification,
+                compensation,
+            } => write!(
+                f,
+                "post-add activation verification failed for {branch} at {} in {} (created branch: {created_branch}): {verification}; compensation failed: {compensation}",
+                path.display(),
+                repository.display()
+            ),
         }
     }
 }
@@ -1056,6 +1077,7 @@ impl std::error::Error for BranchActivationError {
             | Self::CreateParent { source, .. }
             | Self::CommandStart { source, .. } => Some(source),
             Self::Discovery(error) => Some(error),
+            Self::PostAddCompensationFailed { verification, .. } => Some(verification),
             _ => None,
         }
     }
@@ -1446,9 +1468,14 @@ fn activate_branch_with_post_add_hook(
         Err(error) => {
             if let Err(compensation) = remove_added_worktree(&snapshot.main_worktree, managed_path)
             {
-                return Err(BranchActivationError::Verification(format!(
-                    "post-add verification failed: {error}; plain Git compensation failed: {compensation}"
-                )));
+                return Err(BranchActivationError::PostAddCompensationFailed {
+                    repository: snapshot.main_worktree.clone(),
+                    path: managed_path.to_path_buf(),
+                    branch: name,
+                    created_branch: created,
+                    verification: Box::new(error),
+                    compensation: compensation.to_string(),
+                });
             }
             return Err(error);
         }
@@ -3628,6 +3655,43 @@ mod tests {
                         OsStr::new("refs/heads/post-add-failure"),
                     ],
                 );
+            }
+
+            #[test]
+            fn post_add_compensation_refusal_returns_recoverable_topology() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("post add compensation refusal");
+                git_ok(
+                    &repo,
+                    &[OsStr::new("branch"), OsStr::new("post-add-stranded")],
+                );
+                let managed = fixture.root.join("post-add-stranded");
+                let hook_path = managed.clone();
+
+                let error = activate_branch_with_post_add_hook(
+                    &repo,
+                    "post-add-stranded",
+                    &managed,
+                    || {
+                        std::fs::write(hook_path.join("untracked"), b"retain me\n").unwrap();
+                        git_ok(
+                            &hook_path,
+                            &[OsStr::new("checkout"), OsStr::new("--detach")],
+                        );
+                    },
+                )
+                .unwrap_err();
+
+                assert!(matches!(
+                    error,
+                    BranchActivationError::PostAddCompensationFailed {
+                        ref path,
+                        ref branch,
+                        created_branch: false,
+                        ..
+                    } if path == &managed && branch == "post-add-stranded"
+                ));
+                assert!(managed.join("untracked").is_file());
             }
         }
 
