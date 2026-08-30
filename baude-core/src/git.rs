@@ -1021,7 +1021,8 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 mod tests {
     use super::{
         discover_repository, ensure_default_worktree, parse_clone_target, parse_worktree_porcelain,
-        resolve_default_branch, DefaultBranchUnavailable, DefaultWorktreeOutcome,
+        reconcile_checkout, resolve_default_branch, DefaultBranchUnavailable,
+        DefaultWorktreeOutcome, ReconciliationUnavailable,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -1470,6 +1471,63 @@ mod tests {
                 .to_string();
             assert!(error.contains("collision"));
             assert!(discover_repository(&collision).is_err());
+        }
+    }
+
+    mod reconciliation {
+        use super::*;
+
+        #[test]
+        fn accepts_only_the_expected_common_dir_path_and_full_branch() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("reconcile available");
+            let snapshot = discover_repository(&repo).unwrap();
+            let branch = snapshot.selected_worktree.branch.clone().unwrap();
+            assert!(reconcile_checkout(
+                &snapshot.common_dir,
+                &snapshot.selected_worktree.path,
+                Some(&branch),
+            )
+            .is_ok());
+
+            let other = fixture.repo("other identity");
+            assert!(matches!(
+                reconcile_checkout(
+                    &discover_repository(&other).unwrap().common_dir,
+                    &snapshot.selected_worktree.path,
+                    Some(&branch),
+                ),
+                Err(ReconciliationUnavailable::IdentityChanged { .. })
+            ));
+        }
+
+        #[test]
+        fn missing_changed_detached_and_locked_checkouts_fail_closed() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("reconcile stale");
+            let linked = fixture.linked_worktree(&repo, "reconcile linked", "linked");
+            let expected = discover_repository(&linked).unwrap();
+            let common = expected.common_dir.clone();
+            let branch = expected.selected_worktree.branch.clone().unwrap();
+
+            git_ok(&linked, &[OsStr::new("checkout"), OsStr::new("--detach")]);
+            assert!(matches!(
+                reconcile_checkout(&common, &linked, Some(&branch)),
+                Err(ReconciliationUnavailable::Detached)
+                    | Err(ReconciliationUnavailable::BranchChanged { .. })
+            ));
+
+            git_ok(&repo, &[OsStr::new("worktree"), OsStr::new("lock"), linked.as_os_str()]);
+            assert!(matches!(
+                reconcile_checkout(&common, &linked, None),
+                Err(ReconciliationUnavailable::LockedOrPrunable)
+            ));
+
+            let missing = fixture.root.join("missing checkout");
+            assert!(matches!(
+                reconcile_checkout(&common, &missing, Some(&branch)),
+                Err(ReconciliationUnavailable::Missing { .. })
+            ));
         }
     }
 
