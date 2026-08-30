@@ -344,5 +344,18 @@ mod tests {
             regressing.validate(),
             Err(ValidationError::RegressingRepositoryCounter)
         );
+
+        let zeroed = RepositoryState {
+            next_repository_key: 0,
+            next_checkout_key: 0,
+            next_first_seen_order: 0,
+            repositories: Vec::new(),
+            checkouts: Vec::new(),
+        };
+        assert_eq!(
+            zeroed.validate(),
+            Err(ValidationError::RegressingRepositoryCounter),
+            "empty state must still retain the monotonic counter origin"
+        );
     }
 }
