@@ -1063,6 +1063,41 @@ fn activation_command(
         .map_err(|source| BranchActivationError::CommandStart { operation, source })
 }
 
+fn new_branch_add_arguments(name: &str, path: &Path, start_ref: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("worktree"),
+        OsString::from("add"),
+        OsString::from("-b"),
+        OsString::from(name),
+        OsString::from("--"),
+        path.as_os_str().to_owned(),
+        OsString::from(start_ref),
+    ]
+}
+
+fn existing_branch_add_arguments(name: &str, path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("worktree"),
+        OsString::from("add"),
+        OsString::from("--"),
+        path.as_os_str().to_owned(),
+        OsString::from(name),
+    ]
+}
+
+fn activation_add_command(
+    repo: &Path,
+    operation: &'static str,
+    args: &[OsString],
+) -> std::result::Result<Output, BranchActivationError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|source| BranchActivationError::CommandStart { operation, source })
+}
+
 fn activation_oid(
     repo: &Path,
     reference: &str,
@@ -1259,19 +1294,9 @@ pub fn activate_branch(
                 } => BranchActivationError::DefaultLocalRefMissing(default.local_ref.clone()),
                 other => other,
             })?;
-            let output = activation_command(
-                &fresh.main_worktree,
-                "create branch worktree",
-                &[
-                    OsStr::new("worktree"),
-                    OsStr::new("add"),
-                    OsStr::new("-b"),
-                    OsStr::new(&name),
-                    OsStr::new("--"),
-                    managed_path.as_os_str(),
-                    OsStr::new(&default.local_ref),
-                ],
-            )?;
+            let arguments = new_branch_add_arguments(&name, managed_path, &default.local_ref);
+            let output =
+                activation_add_command(&fresh.main_worktree, "create branch worktree", &arguments)?;
             if !output.status.success() {
                 return Err(BranchActivationError::GitCommand {
                     operation: "create branch worktree",
@@ -1289,16 +1314,11 @@ pub fn activate_branch(
             // Git 2.50 detaches when given refs/heads/<name> here. The exact full
             // ref was classified and commit-verified above; pass its literal short
             // branch spelling so the resulting worktree remains attached.
-            let output = activation_command(
+            let arguments = existing_branch_add_arguments(&name, managed_path);
+            let output = activation_add_command(
                 &snapshot.main_worktree,
                 "activate local branch worktree",
-                &[
-                    OsStr::new("worktree"),
-                    OsStr::new("add"),
-                    OsStr::new("--"),
-                    managed_path.as_os_str(),
-                    OsStr::new(&name),
-                ],
+                &arguments,
             )?;
             if !output.status.success() {
                 return Err(BranchActivationError::GitCommand {
@@ -1549,8 +1569,9 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 mod tests {
     use super::{
         activate_branch, classify_branch, discover_repository, ensure_default_worktree,
-        parse_clone_target, parse_worktree_porcelain, reconcile_checkout, resolve_default_branch,
-        BranchActivation, BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
+        existing_branch_add_arguments, new_branch_add_arguments, parse_clone_target,
+        parse_worktree_porcelain, reconcile_checkout, resolve_default_branch, BranchActivation,
+        BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
         DefaultWorktreeOutcome, ReconciliationUnavailable,
     };
     use std::ffi::OsStr;
@@ -2129,6 +2150,47 @@ mod tests {
                     classify_branch(&snapshot, "@{-1}"),
                     Err(BranchActivationError::InvalidLiteral { .. })
                 ));
+            }
+
+            #[test]
+            fn add_commands_are_explicit_and_never_force_reset_fetch_or_delete() {
+                let path = Path::new("/tmp/literal target");
+                let new = new_branch_add_arguments("feature/literal", path, "refs/heads/main");
+                let existing = existing_branch_add_arguments("feature/literal", path);
+                let new: Vec<_> = new
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect();
+                let existing: Vec<_> = existing
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect();
+
+                assert_eq!(
+                    new,
+                    [
+                        "worktree",
+                        "add",
+                        "-b",
+                        "feature/literal",
+                        "--",
+                        "/tmp/literal target",
+                        "refs/heads/main",
+                    ]
+                );
+                assert_eq!(
+                    existing,
+                    [
+                        "worktree",
+                        "add",
+                        "--",
+                        "/tmp/literal target",
+                        "feature/literal",
+                    ]
+                );
+                for forbidden in ["--force", "-B", "fetch", "delete", "remove"] {
+                    assert!(!new.iter().chain(&existing).any(|arg| arg == forbidden));
+                }
             }
         }
     }
