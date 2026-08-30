@@ -1227,16 +1227,17 @@ impl App {
         Ok(id)
     }
 
-    fn stop_closed_runtime(&mut self, checkout_key: CheckoutKey, id: u64) {
+    fn stop_closed_runtime(&mut self, checkout_key: CheckoutKey, id: u64) -> Result<()> {
+        self.session_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?
+            .kill_and_wait()?;
         self.runtime_checkouts.remove(&checkout_key);
-        if let Some(s) = self.session_mut(id) {
-            s.kill();
-        }
         self.sessions.retain(|s| s.id != id);
         if self.selected_id == Some(SelId::Local(id)) {
             self.selected_id = self.ordered_ids().first().copied();
         }
         self.focus = Focus::Sidebar;
+        Ok(())
     }
 
     fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
@@ -1346,7 +1347,9 @@ impl App {
             )));
         }
         if let Some(id) = runtime_id {
-            self.stop_closed_runtime(checkout, id);
+            self.stop_closed_runtime(checkout, id).map_err(|error| {
+                lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
+            })?;
         }
 
         let target =
@@ -1443,7 +1446,7 @@ impl App {
         match self.save_durable_status() {
             Ok(()) => {
                 self.persistence_dirty = false;
-                self.stop_closed_runtime(checkout_key, id);
+                self.stop_closed_runtime(checkout_key, id)?;
                 Ok(plan.outcome)
             }
             Err(error) if !error.replacement_committed() => {
@@ -1453,7 +1456,7 @@ impl App {
             }
             Err(error) => {
                 self.persistence_dirty = true;
-                self.stop_closed_runtime(checkout_key, id);
+                self.stop_closed_runtime(checkout_key, id)?;
                 Err(anyhow::anyhow!(
                     "inactive state committed but directory durability failed: {error}"
                 ))

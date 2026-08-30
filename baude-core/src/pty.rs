@@ -243,6 +243,20 @@ impl Pty {
         }
         self.exited.store(true, Ordering::Relaxed);
     }
+
+    /// Stop the child and confirm that it has exited before reporting success.
+    /// Safety-sensitive callers must use this instead of the best-effort
+    /// `kill`, because a signal attempt alone is not a process-stop boundary.
+    pub fn kill_and_wait(&mut self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
+        child.kill().context("failed to kill PTY child")?;
+        child.wait().context("failed to wait for PTY child")?;
+        self.exited.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +309,14 @@ mod tests {
             "snapshot bytes duplicated on channel"
         );
         pty.kill();
+    }
+
+    #[test]
+    fn kill_and_wait_confirms_child_exit() {
+        let mut pty = Pty::spawn(Some("sleep 30"), Path::new("/tmp"), 5, 40).unwrap();
+        assert!(!pty.is_exited());
+        pty.kill_and_wait().unwrap();
+        assert!(pty.is_exited());
     }
 
     #[test]

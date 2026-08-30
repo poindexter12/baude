@@ -325,6 +325,17 @@ impl Session {
             shell.kill();
         }
     }
+
+    /// Stop and reap every process owned by this session. The agent is waited
+    /// first so callers never begin destructive worktree inspection while it
+    /// may still be writing into the checkout.
+    pub fn kill_and_wait(&mut self) -> Result<()> {
+        self.claude.kill_and_wait()?;
+        if let Some(shell) = &mut self.shell {
+            shell.kill_and_wait()?;
+        }
+        Ok(())
+    }
 }
 
 pub fn human_duration(ms: u64) -> String {

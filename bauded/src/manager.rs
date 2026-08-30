@@ -989,15 +989,14 @@ impl Manager {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn stop_removed_runtime(&mut self, checkout: CheckoutKey, id: u64) {
-        if let Ok(session) = self.session_mut(id) {
-            session.kill();
-        }
+    fn stop_removed_runtime(&mut self, checkout: CheckoutKey, id: u64) -> Result<()> {
+        self.session_mut(id)?.kill_and_wait()?;
         self.sessions.retain(|session| session.id != id);
         self.runtime_checkouts.remove(&checkout);
         if let Some(notify) = self.permission_notify.remove(&id) {
             notify.notify_waiters();
         }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1083,7 +1082,9 @@ impl Manager {
             .transpose()
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         if let Some(id) = runtime_id {
-            self.stop_removed_runtime(checkout, id);
+            self.stop_removed_runtime(checkout, id).map_err(|error| {
+                lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
+            })?;
         }
 
         let target =
@@ -1202,7 +1203,7 @@ impl Manager {
             Err(error) => Some(error),
             Ok(()) => None,
         };
-        self.session_mut(id)?.kill();
+        self.session_mut(id)?.kill_and_wait()?;
         self.sessions.retain(|s| s.id != id);
         self.runtime_checkouts.remove(&checkout_key);
         // Wake any lingering permission waiter (it will re-check, find the
