@@ -69,14 +69,14 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
   4. A distinct confirmed remove action removes a clean managed worktree while retaining its branch.
   5. Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks removal before the running session or persisted child changes, leaving the user's work and context intact.
 
-**Plans**: 2/6 plans executed
+**Plans**: 4/6 plans executed
 
 Plans:
 
 - [x] 06-01-PLAN.md — Trace valid named/local branch activation through shared Git, lifecycle, App, and Manager semantics.
 - [x] 06-02-PLAN.md — Fail closed on invalid refs, path collisions, partial failures, and concurrent creation.
-- [ ] 06-03-PLAN.md — Prove result-valued dirty, conflict, topology, lock, and submodule removal blockers.
-- [ ] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context.
+- [x] 06-03-PLAN.md — Prove result-valued dirty, conflict, topology, lock, and submodule removal blockers.
+- [x] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context.
 - [ ] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime.
 - [ ] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context.
 
@@ -135,7 +135,7 @@ Plans:
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
-| 6. Safe Managed Worktree Lifecycle | v2.0 | 2/6 | In Progress|  |
+| 6. Safe Managed Worktree Lifecycle | v2.0 | 4/6 | In Progress|  |
 | 7. Local Repository Hierarchy & Branch Control | v2.0 | 0/TBD | Not started | - |
 | 8. Daemon & Remote TUI Parity | v2.0 | 0/TBD | Not started | - |
 | 9. PWA Hierarchy & Cross-Surface Completion | v2.0 | 0/TBD | Not started | - |
