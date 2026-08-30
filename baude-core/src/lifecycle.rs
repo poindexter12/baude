@@ -500,9 +500,11 @@ impl Drop for RepositoryReservation {
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_close, ActivationRequest, CloseEffect, CloseRequest, LifecycleOutcome,
-        RepositoryReservations,
+        plan_close, plan_reopen, ActivationRequest, CloseEffect, CloseRequest, LifecycleOutcome,
+        ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
     };
+    use crate::backend::SpawnMode;
+    use crate::git::ReconciliationUnavailable;
     use crate::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryKey,
         RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
@@ -650,5 +652,117 @@ mod tests {
         assert_eq!(closed.health, original.health);
         assert_eq!(closed.session, runtime);
         assert!(!closed.active_intent);
+    }
+
+    #[test]
+    fn reopen_blocks_every_unavailable_topology_before_active_intent() {
+        let unavailable = [
+            ReconciliationUnavailable::Missing {
+                path: PathBuf::from("/moved"),
+            },
+            ReconciliationUnavailable::PathChanged {
+                expected: PathBuf::from("/repo-feature"),
+                observed: PathBuf::from("/elsewhere"),
+            },
+            ReconciliationUnavailable::BranchChanged {
+                expected: Some("refs/heads/feature/close".into()),
+                observed: Some("refs/heads/other".into()),
+            },
+            ReconciliationUnavailable::Detached,
+            ReconciliationUnavailable::LockedOrPrunable,
+            ReconciliationUnavailable::IdentityChanged {
+                expected_common_dir: PathBuf::from("/repo/.git"),
+                observed_common_dir: PathBuf::from("/replacement/.git"),
+            },
+        ];
+
+        for topology in unavailable {
+            let mut state = close_state();
+            state.checkouts[0].active_intent = false;
+            let checkout = state.checkouts[0].key;
+            let error = plan_reopen(
+                &mut state,
+                ReopenRequest {
+                    checkout,
+                    reconciliation: Err(topology),
+                    runtime: ReopenRuntime::Absent,
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(error.checkout(), checkout);
+            assert!(!state.checkouts[0].active_intent);
+            assert!(matches!(
+                state.checkouts[0].health,
+                CheckoutHealth::Unavailable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn reopen_saves_active_intent_before_deterministic_runtime_dispatch() {
+        let vectors = [
+            (ReopenRuntime::Live { id: 7 }, ReopenDispatch::Focus { id: 7 }),
+            (
+                ReopenRuntime::Exited { id: 8 },
+                ReopenDispatch::Restart { id: 8 },
+            ),
+            (ReopenRuntime::Absent, ReopenDispatch::Spawn),
+        ];
+
+        for (runtime, expected) in vectors {
+            let mut state = close_state();
+            state.checkouts[0].active_intent = false;
+            state.checkouts[0].session.resume_id = Some("conversation-42".into());
+            let checkout = state.checkouts[0].key;
+            let plan = plan_reopen(
+                &mut state,
+                ReopenRequest {
+                    checkout,
+                    reconciliation: Ok(()),
+                    runtime,
+                },
+            )
+            .unwrap();
+
+            assert!(state.checkouts[0].active_intent);
+            assert_eq!(plan.dispatch, expected);
+            assert_eq!(plan.mode, SpawnMode::ResumeId("conversation-42".into()));
+            assert_eq!(plan.effects[0], super::ReopenEffect::SaveActiveIntent);
+        }
+
+        let mut state = close_state();
+        state.checkouts[0].active_intent = false;
+        let checkout = state.checkouts[0].key;
+        let plan = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Ok(()),
+                runtime: ReopenRuntime::Absent,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.mode, SpawnMode::ContinueLatest);
+    }
+
+    #[test]
+    fn reopen_reservation_allows_only_one_same_checkout_spawn_path() {
+        let state = close_state();
+        let checkout = state.checkouts[0].key;
+        let repository = state.checkouts[0].repository_key;
+        let reservations = RepositoryReservations::default();
+        let guard = reservations.reserve_reopen(repository, checkout).unwrap();
+
+        assert_eq!(
+            reservations.reserve_reopen(repository, checkout).unwrap_err(),
+            LifecycleOutcome::ReopenPending { checkout }
+        );
+        assert_eq!(
+            reservations.reserve(repository).unwrap_err(),
+            LifecycleOutcome::Busy { repository }
+        );
+        drop(guard);
+        assert!(reservations.reserve_reopen(repository, checkout).is_ok());
     }
 }
