@@ -35,6 +35,17 @@ pub enum PrimaryDispatch {
     Idle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalAdmissionRoute {
+    LaunchDirectory,
+    Open,
+    CloneCompletion,
+}
+
+fn local_admission_route(_route: LocalAdmissionRoute, remote_configured: bool) -> bool {
+    !remote_configured
+}
+
 fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> PrimaryDispatch {
     match runtime {
         Some((id, false)) => PrimaryDispatch::Focus(id),
@@ -44,6 +55,7 @@ fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> Primar
     }
 }
 
+#[cfg(test)]
 fn commit_then_spawn<T, E>(
     save: impl FnOnce() -> std::result::Result<(), E>,
     spawn: impl FnOnce() -> std::result::Result<T, E>,
@@ -52,24 +64,31 @@ fn commit_then_spawn<T, E>(
     spawn()
 }
 
-fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
+fn reconcile_legacy_session(
+    saved: &persist::SavedSession,
+    primary_repositories: &mut std::collections::HashSet<PersistedPath>,
+) -> LegacyReconciliation {
     let Ok(snapshot) = git::discover_repository(&saved.cwd) else {
         return LegacyReconciliation::Unavailable {
             repository_cause: UnavailableCause::Missing,
             checkout_cause: UnavailableCause::Missing,
         };
     };
+    let common_dir = PersistedPath::from_path(&snapshot.common_dir);
     let role = match git::resolve_default_branch(&snapshot) {
         Ok(default)
             if snapshot.selected_worktree.branch.as_deref() == Some(default.local_ref.as_str()) =>
         {
-            CheckoutRole::PrimaryDefault
+            if primary_repositories.insert(common_dir.clone()) {
+                CheckoutRole::PrimaryDefault
+            } else {
+                CheckoutRole::ManagedBranch
+            }
         }
-        _ if snapshot.selected_worktree.path == snapshot.main_worktree => CheckoutRole::Main,
         _ => CheckoutRole::ManagedBranch,
     };
     LegacyReconciliation::Available {
-        common_dir: PersistedPath::from_path(&snapshot.common_dir),
+        common_dir,
         main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
         checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
         checkout_role: role,
@@ -461,11 +480,11 @@ impl App {
     // ---- startup / persistence ----
 
     pub fn restore(&mut self) {
-        let loaded = persist::load_for_workspace(
-            "state",
-            baude_core::workspace::active(),
-            reconcile_legacy_session,
-        );
+        let mut primary_repositories = std::collections::HashSet::new();
+        let loaded =
+            persist::load_for_workspace("state", baude_core::workspace::active(), |saved| {
+                reconcile_legacy_session(saved, &mut primary_repositories)
+            });
         self.repository_state = match loaded {
             Ok(LoadOutcome::Missing) => RepositoryState::default(),
             Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
@@ -493,7 +512,9 @@ impl App {
         }
         // Premise: baude is started from a repo folder. Auto-add it if new.
         let launch = self.launch_dir.clone();
-        if git::discover_repository(&launch).is_ok() {
+        if local_admission_route(LocalAdmissionRoute::LaunchDirectory, self.remote.is_some())
+            && git::discover_repository(&launch).is_ok()
+        {
             if let Err(e) = self.admit_repository(&launch) {
                 self.set_message(format!("start session: {e}"));
             }
@@ -1686,6 +1707,10 @@ impl App {
     /// configured (so it survives TUI restarts), locally otherwise. Shared by
     /// the `n` new-session flow and clone completion.
     fn open_repo_session(&mut self, path: PathBuf) {
+        self.open_repo_session_via(path, LocalAdmissionRoute::Open);
+    }
+
+    fn open_repo_session_via(&mut self, path: PathBuf, route: LocalAdmissionRoute) {
         if let Some(remote) = &self.remote {
             match remote.create(&path.to_string_lossy(), None, None) {
                 Ok(()) => self.set_message("session queued on daemon".into()),
@@ -1693,12 +1718,13 @@ impl App {
             }
             return;
         }
-        match self.add_session(path, None, None, false, false, false) {
-            Ok(_) => {
+        debug_assert!(local_admission_route(route, false));
+        match self.admit_repository(&path) {
+            Ok(Some(_)) => {
                 self.focus = Focus::Claude;
-                self.save();
             }
-            Err(e) => self.set_message(format!("spawn failed: {e}")),
+            Ok(None) => {}
+            Err(e) => self.set_message(format!("repository admission failed: {e}")),
         }
     }
 
@@ -1722,7 +1748,7 @@ impl App {
                 Ok(()) => {
                     let (prev_sel, prev_focus) = (self.selected_id, self.focus);
                     self.set_message(format!("cloned {}", pc.name));
-                    self.open_repo_session(pc.dest);
+                    self.open_repo_session_via(pc.dest, LocalAdmissionRoute::CloneCompletion);
                     if prev_focus != Focus::Sidebar {
                         self.selected_id = prev_sel;
                         self.focus = prev_focus;

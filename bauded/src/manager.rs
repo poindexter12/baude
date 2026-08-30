@@ -14,8 +14,12 @@ use tokio::sync::Notify;
 use baude_core::backend;
 use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
-use baude_core::persist::{self, SavedSession, State};
+use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
+use baude_core::repository::{
+    CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+};
 use baude_core::session::{Session, StateSource, Status};
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
@@ -51,6 +55,33 @@ pub struct Manager {
     /// permission never stalls other sessions (Pitfall 4 — "decide under the
     /// lock, act outside it"). `resolve_pending` fires `notify_waiters()`.
     permission_notify: HashMap<u64, Arc<Notify>>,
+    repository_state: RepositoryState,
+    runtime_checkouts: HashMap<CheckoutKey, u64>,
+    persistence_blocked: bool,
+}
+
+fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
+    match git::discover_repository(&saved.cwd) {
+        Ok(snapshot) => LegacyReconciliation::Available {
+            common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+            checkout_role: if snapshot.selected_worktree.path == snapshot.main_worktree {
+                CheckoutRole::Main
+            } else {
+                CheckoutRole::ManagedBranch
+            },
+            managed_by_baude: false,
+        },
+        Err(error) => LegacyReconciliation::Unavailable {
+            repository_cause: UnavailableCause::Other(error.to_string()),
+            checkout_cause: if saved.cwd.exists() {
+                UnavailableCause::NotRepository
+            } else {
+                UnavailableCause::Missing
+            },
+        },
+    }
 }
 
 /// One row of `GET /sessions`.
@@ -209,21 +240,85 @@ impl Manager {
             persist,
             auto_archive_ms: default_auto_archive_ms(),
             permission_notify: HashMap::new(),
+            repository_state: RepositoryState::default(),
+            runtime_checkouts: HashMap::new(),
+            persistence_blocked: false,
         }
     }
 
     /// Respawn every saved session with `claude --continue`. Returns how many
     /// came back.
     pub fn restore(&mut self) -> usize {
-        let state = persist::load_for_workspace(STATE_BASE, baude_core::workspace::active());
+        if !self.persist {
+            return 0;
+        }
+        let loaded = persist::load_for_workspace(
+            STATE_BASE,
+            baude_core::workspace::active(),
+            reconcile_legacy_session,
+        );
+        self.restore_loaded(loaded)
+    }
+
+    #[cfg(test)]
+    fn restore_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) -> usize {
+        if !self.persist {
+            return 0;
+        }
+        let loaded = persist::load_for_workspace_strict_at(
+            root,
+            STATE_BASE,
+            workspace,
+            reconcile_legacy_session,
+        );
+        self.restore_loaded(loaded)
+    }
+
+    fn restore_loaded(
+        &mut self,
+        loaded: std::result::Result<LoadOutcome, persist::LoadError>,
+    ) -> usize {
+        self.repository_state = match loaded {
+            Ok(LoadOutcome::Missing) => RepositoryState::default(),
+            Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
+            Err(error) => {
+                self.persistence_blocked = true;
+                eprintln!(
+                    "daemon persistence blocked: {error}; repair or move the named state file, then restart"
+                );
+                return 0;
+            }
+        };
+        let checkouts: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.active_intent)
+            .cloned()
+            .collect();
         let mut restored = 0;
-        for saved in &state.sessions {
-            if !saved.cwd.exists() {
+        for checkout in checkouts {
+            if self.runtime_checkouts.contains_key(&checkout.key)
+                || !matches!(checkout.health, CheckoutHealth::Available)
+            {
+                continue;
+            }
+            let saved = checkout.session;
+            let cwd = saved.cwd.to_path_buf();
+            if !cwd.exists() {
+                if let Some(record) = self
+                    .repository_state
+                    .checkouts
+                    .iter_mut()
+                    .find(|record| record.key == checkout.key)
+                {
+                    record.health = CheckoutHealth::Unavailable(UnavailableCause::Missing);
+                }
                 continue;
             }
             match self.spawn(
-                saved.cwd.clone(),
-                saved.repo_root.clone(),
+                cwd,
+                saved.repo_root.to_path_buf(),
                 saved.branch.clone(),
                 saved.is_worktree,
                 Some(&saved.name),
@@ -231,6 +326,7 @@ impl Manager {
             ) {
                 Ok(id) => {
                     restored += 1;
+                    self.runtime_checkouts.insert(checkout.key, id);
                     if saved.archived {
                         if let Ok(s) = self.session_mut(id) {
                             s.archived = true;
@@ -241,35 +337,59 @@ impl Manager {
                 Err(e) => eprintln!("restore {}: {e}", saved.name),
             }
         }
-        self.save();
         restored
     }
 
     pub fn save(&self) {
-        if !self.persist {
+        if !self.persist || self.persistence_blocked {
             return;
         }
-        let state = State {
-            sessions: self
-                .sessions
-                .iter()
-                .map(|s| SavedSession {
-                    name: s.name.clone(),
-                    cwd: s.cwd.clone(),
-                    repo_root: s.repo_root.clone(),
-                    branch: s.branch.clone(),
-                    is_worktree: s.is_worktree,
-                    shell_open: false,
-                    archived: s.archived,
-                    archived_by_user: s.archived_by_user,
-                })
-                .collect(),
-        };
+        let state = StateFile::new(self.state_for_save());
         if let Err(e) =
             persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state)
         {
             eprintln!("save state: {e}");
         }
+    }
+
+    #[cfg(test)]
+    fn save_at(&self, root: &Path, workspace: &baude_core::workspace::Workspace) {
+        if !self.persist || self.persistence_blocked {
+            return;
+        }
+        let file = workspace.state_file(STATE_BASE);
+        if let Err(error) =
+            persist::save_current_at(root, &file, &StateFile::new(self.state_for_save()))
+        {
+            eprintln!("save state: {error}");
+        }
+    }
+
+    fn state_for_save(&self) -> RepositoryState {
+        let mut state = self.repository_state.clone();
+        for checkout in &mut state.checkouts {
+            let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
+                continue;
+            };
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == *runtime_id)
+            else {
+                continue;
+            };
+            checkout.session = RetainedSessionState {
+                name: session.name.clone(),
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch.clone(),
+                is_worktree: session.is_worktree,
+                shell_open: false,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+            };
+        }
+        state
     }
 
     /// `POST /sessions` — spawn a fresh session in `repo`, optionally in a
@@ -298,6 +418,9 @@ impl Manager {
             }
         };
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
+        if self.persist {
+            self.record_runtime(id);
+        }
         self.save();
         Ok(self.info(id).expect("session just spawned"))
     }
@@ -394,10 +517,98 @@ impl Manager {
         }
     }
 
+    fn record_runtime(&mut self, id: u64) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+            return;
+        };
+        let snapshot = git::discover_repository(&session.cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(&session.repo_root));
+        let repository_key = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.observed_common_dir == common)
+            .map(|repository| repository.key)
+            .unwrap_or_else(|| {
+                let key = self.repository_state.allocate_repository_key();
+                let first_seen_order = self.repository_state.allocate_first_seen_order();
+                self.repository_state.repositories.push(SavedRepository {
+                    key,
+                    observed_common_dir: common,
+                    observed_main_worktree: PersistedPath::from_path(
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.main_worktree.as_path())
+                            .unwrap_or(&session.repo_root),
+                    ),
+                    first_seen_order,
+                    health: if snapshot.is_some() {
+                        RepositoryHealth::Available
+                    } else {
+                        RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
+                    },
+                });
+                key
+            });
+        let checkout_key = self.repository_state.allocate_checkout_key();
+        let first_seen_order = self.repository_state.allocate_first_seen_order();
+        self.repository_state.checkouts.push(SavedCheckout {
+            key: checkout_key,
+            repository_key,
+            role: CheckoutRole::ManagedBranch,
+            managed_by_baude: session.is_worktree,
+            observed_path: PersistedPath::from_path(&session.cwd),
+            observed_branch: session
+                .branch
+                .as_ref()
+                .map(|branch| format!("refs/heads/{branch}")),
+            first_seen_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name: session.name.clone(),
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch.clone(),
+                is_worktree: session.is_worktree,
+                shell_open: false,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+            },
+            health: if snapshot.is_some() {
+                CheckoutHealth::Available
+            } else {
+                CheckoutHealth::Unavailable(UnavailableCause::NotRepository)
+            },
+        });
+        self.runtime_checkouts.insert(checkout_key, id);
+    }
+
     pub fn remove(&mut self, id: u64) -> Result<()> {
         let s = self.session_mut(id)?;
         s.kill();
         self.sessions.retain(|s| s.id != id);
+        if let Some(checkout_key) = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+        {
+            self.runtime_checkouts.remove(&checkout_key);
+            self.repository_state
+                .checkouts
+                .retain(|checkout| checkout.key != checkout_key);
+            let used: std::collections::HashSet<_> = self
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.repository_key)
+                .collect();
+            self.repository_state
+                .repositories
+                .retain(|repository| used.contains(&repository.key));
+        }
         // Wake any lingering permission waiter (it will re-check, find the
         // session gone, and bail) and drop its handle so the map doesn't leak.
         if let Some(n) = self.permission_notify.remove(&id) {
@@ -894,10 +1105,8 @@ mod tests {
 
     #[test]
     fn manager_persistence_blocks_malformed_state_and_later_saves() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-manager-persistence-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-persistence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let workspace = baude_core::workspace::resolve(
@@ -916,6 +1125,54 @@ mod tests {
         manager.save_at(&root, &workspace);
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(manager.sessions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manager_persistence_migrates_selected_legacy_once_without_field_loss() {
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let legacy_path = root.join(workspace.legacy_state_file(STATE_BASE).unwrap());
+        let legacy = baude_core::persist::State {
+            sessions: vec![baude_core::persist::SavedSession {
+                name: "retained daemon".into(),
+                cwd: PathBuf::from("/missing/checkout"),
+                repo_root: PathBuf::from("/missing/repository"),
+                branch: Some("feature/retained".into()),
+                is_worktree: true,
+                shell_open: true,
+                archived: true,
+                archived_by_user: true,
+            }],
+        };
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert!(!manager.persistence_blocked);
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        let retained = &manager.repository_state.checkouts[0].session;
+        assert_eq!(retained.name, "retained daemon");
+        assert_eq!(retained.branch.as_deref(), Some("feature/retained"));
+        assert!(retained.is_worktree);
+        assert!(retained.shell_open);
+        assert!(retained.archived);
+        assert!(retained.archived_by_user);
+        let first = manager.repository_state.clone();
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert_eq!(manager.repository_state, first);
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            serde_json::to_vec_pretty(&legacy).unwrap()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
