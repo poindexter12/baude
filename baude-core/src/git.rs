@@ -1126,8 +1126,9 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_repository, ensure_default_worktree, parse_clone_target, parse_worktree_porcelain,
-        reconcile_checkout, resolve_default_branch, DefaultBranchUnavailable,
+        activate_branch, classify_branch, discover_repository, ensure_default_worktree,
+        parse_clone_target, parse_worktree_porcelain, reconcile_checkout, resolve_default_branch,
+        BranchActivation, BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
         DefaultWorktreeOutcome, ReconciliationUnavailable,
     };
     use std::ffi::OsStr;
@@ -1577,6 +1578,127 @@ mod tests {
                 .to_string();
             assert!(error.contains("collision"));
             assert!(discover_repository(&collision).is_err());
+        }
+    }
+
+    mod lifecycle {
+        use super::*;
+
+        mod branch_activation {
+            use super::*;
+
+            #[test]
+            fn new_branch_from_child_starts_at_freshly_verified_default() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("new branch base");
+                git_ok(&repo, &[OsStr::new("branch"), OsStr::new("trunk")]);
+                fixture.remote_head(&repo, "origin", "trunk");
+                let child = fixture.linked_worktree(&repo, "request child", "caller-feature");
+                std::fs::write(child.join("child-only"), b"different head\n").unwrap();
+                git_ok(&child, &[OsStr::new("add"), OsStr::new("child-only")]);
+                git_ok(
+                    &child,
+                    &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("child")],
+                );
+                let default_oid = git_ok(
+                    &repo,
+                    &[OsStr::new("rev-parse"), OsStr::new("refs/heads/trunk^{commit}")],
+                );
+                let child_oid = git_ok(&child, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+                assert_ne!(default_oid, child_oid);
+
+                let managed = fixture.root.join("managed/new literal");
+                let outcome = activate_branch(&child, "feature/literal", &managed).unwrap();
+                assert!(matches!(outcome, BranchActivationOutcome::CreatedManaged(_)));
+                assert_eq!(
+                    git_ok(&managed, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]),
+                    default_oid
+                );
+                assert_eq!(
+                    git_ok(&managed, &[OsStr::new("symbolic-ref"), OsStr::new("HEAD")]),
+                    b"refs/heads/feature/literal\n"
+                );
+            }
+
+            #[test]
+            fn existing_local_branch_activates_without_resetting_oid() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("existing local");
+                git_ok(&repo, &[OsStr::new("branch"), OsStr::new("existing")]);
+                let before = git_ok(
+                    &repo,
+                    &[OsStr::new("rev-parse"), OsStr::new("refs/heads/existing^{commit}")],
+                );
+
+                let managed = fixture.root.join("managed/existing");
+                let outcome = activate_branch(&repo, "existing", &managed).unwrap();
+                assert!(matches!(
+                    outcome,
+                    BranchActivationOutcome::ActivatedManaged(_)
+                ));
+                assert_eq!(
+                    git_ok(&managed, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]),
+                    before
+                );
+                assert_eq!(
+                    git_ok(
+                        &repo,
+                        &[OsStr::new("rev-parse"), OsStr::new("refs/heads/existing^{commit}")]
+                    ),
+                    before
+                );
+            }
+
+            #[test]
+            fn occupied_branch_reuses_inventory_record_without_second_add() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("occupied");
+                let external = fixture.linked_worktree(&repo, "external occupied", "occupied");
+                let before = discover_repository(&repo).unwrap().worktrees.len();
+
+                assert!(matches!(
+                    classify_branch(&discover_repository(&repo).unwrap(), "occupied").unwrap(),
+                    BranchActivation::Occupied { ref record, .. }
+                        if record.path == external.canonicalize().unwrap()
+                ));
+                let outcome = activate_branch(
+                    &repo,
+                    "occupied",
+                    &fixture.root.join("must-not-be-created"),
+                )
+                .unwrap();
+                assert!(matches!(
+                    outcome,
+                    BranchActivationOutcome::Reused(record)
+                        if record.path == external.canonicalize().unwrap()
+                ));
+                assert_eq!(discover_repository(&repo).unwrap().worktrees.len(), before);
+                assert!(!fixture.root.join("must-not-be-created").exists());
+            }
+
+            #[test]
+            fn remote_only_and_previous_checkout_shorthand_are_rejected() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("remote only");
+                git_ok(
+                    &repo,
+                    &[
+                        OsStr::new("update-ref"),
+                        OsStr::new("refs/remotes/origin/remote-only"),
+                        OsStr::new("HEAD"),
+                    ],
+                );
+                let snapshot = discover_repository(&repo).unwrap();
+
+                assert!(matches!(
+                    classify_branch(&snapshot, "remote-only"),
+                    Err(BranchActivationError::RemoteOnly { .. })
+                ));
+                assert!(matches!(
+                    classify_branch(&snapshot, "@{-1}"),
+                    Err(BranchActivationError::InvalidLiteral { .. })
+                ));
+            }
         }
     }
 

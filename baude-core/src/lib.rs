@@ -9,6 +9,7 @@ pub mod backend;
 pub mod bridge;
 pub mod git;
 pub mod hook;
+pub mod lifecycle;
 pub mod meta;
 pub mod permission;
 pub mod persist;
