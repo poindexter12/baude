@@ -639,104 +639,123 @@ pub fn execute_activation(
     repository_child: &std::path::Path,
     prepared: PreparedActivation,
 ) -> Result<RecordedActivation, LifecycleError> {
+    let state_before = state.clone();
+    let activation_repository = git::discover_repository(repository_child)?;
     let outcome = git::activate_branch(
         repository_child,
         &prepared.request.branch,
         &prepared.request.managed_path,
     )?;
     let (disposition, created_by_baude, record) = activation_parts(outcome);
-    let fresh = git::discover_repository(&record.path)?;
-    let full_ref = format!("refs/heads/{}", prepared.request.branch);
-    if fresh.selected_worktree.path != record.path
-        || record.branch.as_deref() != Some(full_ref.as_str())
-        || fresh.selected_worktree.branch.as_deref() != Some(full_ref.as_str())
-    {
-        return Err(LifecycleError::Topology(format!(
-            "expected {full_ref} at {}, observed {:?}",
-            record.path.display(),
-            fresh.selected_worktree
-        )));
-    }
-    let repository = state
-        .repositories
-        .iter()
-        .find(|saved| saved.key == prepared.request.repository)
-        .ok_or(LifecycleError::RepositoryMissing(
-            prepared.request.repository,
-        ))?;
-    if repository.observed_common_dir.to_path_buf() != fresh.common_dir
-        || repository.observed_main_worktree.to_path_buf() != fresh.main_worktree
-    {
-        return Err(LifecycleError::Topology(
-            "repository identity changed during activation".into(),
-        ));
-    }
-
-    let existing = state.checkouts.iter().position(|checkout| {
-        checkout.repository_key == prepared.request.repository
-            && checkout.observed_path.to_path_buf() == record.path
-    });
-    let (checkout, managed_by_baude) = if let Some(index) = existing {
-        let checkout = &mut state.checkouts[index];
-        if checkout.observed_branch.as_deref() != Some(full_ref.as_str()) {
+    let added_path = record.path.clone();
+    let result = (|| {
+        let fresh = git::discover_repository(&record.path)?;
+        let full_ref = format!("refs/heads/{}", prepared.request.branch);
+        if fresh.selected_worktree.path != record.path
+            || record.branch.as_deref() != Some(full_ref.as_str())
+            || fresh.selected_worktree.branch.as_deref() != Some(full_ref.as_str())
+        {
             return Err(LifecycleError::Topology(format!(
-                "checkout {} changed branch identity",
-                checkout.key.get()
+                "expected {full_ref} at {}, observed {:?}",
+                record.path.display(),
+                fresh.selected_worktree
             )));
         }
-        checkout.active_intent = true;
-        checkout.health = CheckoutHealth::Available;
-        checkout.session.cwd = PersistedPath::from_path(&record.path);
-        checkout.session.repo_root = PersistedPath::from_path(&fresh.main_worktree);
-        checkout.session.branch = Some(prepared.request.branch.clone());
-        checkout.session.is_worktree = record.path != fresh.main_worktree;
-        (checkout.key, checkout.managed_by_baude)
-    } else {
-        let is_worktree = record.path != fresh.main_worktree;
-        let role = if is_worktree {
-            CheckoutRole::ManagedBranch
-        } else {
-            CheckoutRole::Main
-        };
-        let repository_name = fresh
-            .main_worktree
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| fresh.main_worktree.display().to_string());
-        state.checkouts.push(SavedCheckout {
-            key: prepared.checkout,
-            repository_key: prepared.request.repository,
-            role,
-            managed_by_baude: created_by_baude,
-            observed_path: PersistedPath::from_path(&record.path),
-            observed_branch: Some(full_ref),
-            first_seen_order: prepared.first_seen_order,
-            active_intent: true,
-            session: RetainedSessionState {
-                name: format!("{repository_name}:{}", prepared.request.branch),
-                cwd: PersistedPath::from_path(&record.path),
-                repo_root: PersistedPath::from_path(&fresh.main_worktree),
-                branch: Some(prepared.request.branch.clone()),
-                is_worktree,
-                shell_open: false,
-                archived: false,
-                archived_by_user: false,
-                resume_id: None,
-            },
-            health: CheckoutHealth::Available,
+        let repository = state
+            .repositories
+            .iter()
+            .find(|saved| saved.key == prepared.request.repository)
+            .ok_or(LifecycleError::RepositoryMissing(
+                prepared.request.repository,
+            ))?;
+        if repository.observed_common_dir.to_path_buf() != fresh.common_dir
+            || repository.observed_main_worktree.to_path_buf() != fresh.main_worktree
+        {
+            return Err(LifecycleError::Topology(
+                "repository identity changed during activation".into(),
+            ));
+        }
+
+        let existing = state.checkouts.iter().position(|checkout| {
+            checkout.repository_key == prepared.request.repository
+                && checkout.observed_path.to_path_buf() == record.path
         });
-        (prepared.checkout, created_by_baude)
-    };
-    state.validate()?;
-    Ok(RecordedActivation {
-        repository: prepared.request.repository,
-        checkout,
-        disposition,
-        managed_by_baude,
-        path: record.path,
-        main_worktree: fresh.main_worktree,
-        branch: prepared.request.branch,
-    })
+        let (checkout, managed_by_baude) = if let Some(index) = existing {
+            let checkout = &mut state.checkouts[index];
+            if checkout.observed_branch.as_deref() != Some(full_ref.as_str()) {
+                return Err(LifecycleError::Topology(format!(
+                    "checkout {} changed branch identity",
+                    checkout.key.get()
+                )));
+            }
+            checkout.active_intent = true;
+            checkout.health = CheckoutHealth::Available;
+            checkout.session.cwd = PersistedPath::from_path(&record.path);
+            checkout.session.repo_root = PersistedPath::from_path(&fresh.main_worktree);
+            checkout.session.branch = Some(prepared.request.branch.clone());
+            checkout.session.is_worktree = record.path != fresh.main_worktree;
+            (checkout.key, checkout.managed_by_baude)
+        } else {
+            let is_worktree = record.path != fresh.main_worktree;
+            let role = if is_worktree {
+                CheckoutRole::ManagedBranch
+            } else {
+                CheckoutRole::Main
+            };
+            let repository_name = fresh
+                .main_worktree
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| fresh.main_worktree.display().to_string());
+            state.checkouts.push(SavedCheckout {
+                key: prepared.checkout,
+                repository_key: prepared.request.repository,
+                role,
+                managed_by_baude: created_by_baude,
+                observed_path: PersistedPath::from_path(&record.path),
+                observed_branch: Some(full_ref),
+                first_seen_order: prepared.first_seen_order,
+                active_intent: true,
+                session: RetainedSessionState {
+                    name: format!("{repository_name}:{}", prepared.request.branch),
+                    cwd: PersistedPath::from_path(&record.path),
+                    repo_root: PersistedPath::from_path(&fresh.main_worktree),
+                    branch: Some(prepared.request.branch.clone()),
+                    is_worktree,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+                health: CheckoutHealth::Available,
+            });
+            (prepared.checkout, created_by_baude)
+        };
+        state.validate()?;
+        Ok(RecordedActivation {
+            repository: prepared.request.repository,
+            checkout,
+            disposition,
+            managed_by_baude,
+            path: record.path,
+            main_worktree: fresh.main_worktree,
+            branch: prepared.request.branch,
+        })
+    })();
+    if let Err(error) = result {
+        *state = state_before;
+        if created_by_baude {
+            if let Err(compensation) =
+                git::remove_added_worktree(&activation_repository.main_worktree, &added_path)
+            {
+                return Err(LifecycleError::Topology(format!(
+                    "post-add lifecycle verification failed: {error}; plain Git compensation failed: {compensation}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    result
 }
 
 /// Shared lifecycle meaning returned by local and daemon runtime owners.

@@ -1362,7 +1362,9 @@ pub fn activate_branch(
                 } => BranchActivationError::DefaultLocalRefMissing(default.local_ref.clone()),
                 other => other,
             })?;
-            let arguments = new_branch_add_arguments(&name, managed_path, &default.local_ref);
+            // Use the already captured commit, not the mutable default ref, so
+            // a concurrent default-branch update cannot change the add base.
+            let arguments = new_branch_add_arguments(&name, managed_path, &expected_oid);
             let output =
                 activation_add_command(&fresh.main_worktree, "create branch worktree", &arguments)?;
             if !output.status.success() {
@@ -1400,30 +1402,47 @@ pub fn activate_branch(
         BranchActivation::Occupied { .. } => unreachable!("occupied returned above"),
     };
 
-    let fresh = discover_repository(managed_path).map_err(BranchActivationError::Discovery)?;
-    let canonical =
-        managed_path
-            .canonicalize()
-            .map_err(|source| BranchActivationError::CreateParent {
-                path: managed_path.to_path_buf(),
-                source,
-            })?;
-    if fresh.common_dir != snapshot.common_dir
-        || fresh.selected_worktree.path != canonical
-        || fresh.selected_worktree.branch.as_deref() != Some(full_ref.as_str())
-    {
-        return Err(BranchActivationError::Verification(format!(
-            "expected {full_ref} at {}, observed {:?}",
-            canonical.display(),
-            fresh.selected_worktree
-        )));
-    }
-    let observed_oid = activation_oid(&canonical, "HEAD", "verify activated branch commit")?;
-    if observed_oid != expected_oid {
-        return Err(BranchActivationError::Verification(format!(
-            "branch {name} changed from {expected_oid} to {observed_oid}"
-        )));
-    }
+    // Git add is the commit boundary. Every subsequent failure compensates
+    // through plain Git removal before the error escapes durable ownership.
+    let verified = (|| {
+        let fresh = discover_repository(managed_path).map_err(BranchActivationError::Discovery)?;
+        let canonical =
+            managed_path
+                .canonicalize()
+                .map_err(|source| BranchActivationError::CreateParent {
+                    path: managed_path.to_path_buf(),
+                    source,
+                })?;
+        if fresh.common_dir != snapshot.common_dir
+            || fresh.selected_worktree.path != canonical
+            || fresh.selected_worktree.branch.as_deref() != Some(full_ref.as_str())
+        {
+            return Err(BranchActivationError::Verification(format!(
+                "expected {full_ref} at {}, observed {:?}",
+                canonical.display(),
+                fresh.selected_worktree
+            )));
+        }
+        let observed_oid = activation_oid(&canonical, "HEAD", "verify activated branch commit")?;
+        if observed_oid != expected_oid {
+            return Err(BranchActivationError::Verification(format!(
+                "branch {name} changed from {expected_oid} to {observed_oid}"
+            )));
+        }
+        Ok((fresh, canonical))
+    })();
+    let (fresh, _) = match verified {
+        Ok(verified) => verified,
+        Err(error) => {
+            if let Err(compensation) = remove_added_worktree(&snapshot.main_worktree, managed_path)
+            {
+                return Err(BranchActivationError::Verification(format!(
+                    "post-add verification failed: {error}; plain Git compensation failed: {compensation}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     if created {
         Ok(BranchActivationOutcome::CreatedManaged(
             fresh.selected_worktree,
@@ -3487,7 +3506,8 @@ mod tests {
             #[test]
             fn add_commands_are_explicit_and_never_force_reset_fetch_or_delete() {
                 let path = Path::new("/tmp/literal target");
-                let new = new_branch_add_arguments("feature/literal", path, "refs/heads/main");
+                let captured_oid = "0123456789abcdef0123456789abcdef01234567";
+                let new = new_branch_add_arguments("feature/literal", path, captured_oid);
                 let existing = existing_branch_add_arguments("feature/literal", path);
                 let new: Vec<_> = new
                     .iter()
@@ -3507,7 +3527,7 @@ mod tests {
                         "feature/literal",
                         "--",
                         "/tmp/literal target",
-                        "refs/heads/main",
+                        captured_oid,
                     ]
                 );
                 assert_eq!(
