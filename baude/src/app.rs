@@ -344,6 +344,14 @@ pub struct App {
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     persistence_blocked: bool,
     persistence_dirty: bool,
+    #[cfg(test)]
+    save_override_for_test: Option<std::result::Result<(), String>>,
+    #[cfg(test)]
+    save_attempts_for_test: std::cell::Cell<usize>,
+    #[cfg(test)]
+    spawn_error_for_test: Option<String>,
+    #[cfg(test)]
+    spawn_attempts_for_test: usize,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -416,6 +424,14 @@ impl App {
             runtime_checkouts: HashMap::new(),
             persistence_blocked: false,
             persistence_dirty: false,
+            #[cfg(test)]
+            save_override_for_test: None,
+            #[cfg(test)]
+            save_attempts_for_test: std::cell::Cell::new(0),
+            #[cfg(test)]
+            spawn_error_for_test: None,
+            #[cfg(test)]
+            spawn_attempts_for_test: 0,
         }
     }
 
@@ -530,6 +546,14 @@ impl App {
     fn save_durable(&self) -> Result<()> {
         if self.persistence_blocked {
             anyhow::bail!("automatic persistence is blocked after a state load failure");
+        }
+        #[cfg(test)]
+        if let Some(result) = &self.save_override_for_test {
+            self.save_attempts_for_test
+                .set(self.save_attempts_for_test.get() + 1);
+            return result
+                .clone()
+                .map_err(|error| anyhow::anyhow!("test persistence failure: {error}"));
         }
         let mut state = self.repository_state.clone();
         for checkout in &mut state.checkouts {
@@ -923,6 +947,13 @@ impl App {
         resume: bool,
         shell_open: bool,
     ) -> Result<u64> {
+        #[cfg(test)]
+        {
+            self.spawn_attempts_for_test += 1;
+            if let Some(error) = &self.spawn_error_for_test {
+                anyhow::bail!("test spawn failure: {error}");
+            }
+        }
         // For worktree sessions the caller passes the main repo root —
         // `rev-parse --show-toplevel` inside a worktree returns the worktree.
         let repo_root =
@@ -2218,7 +2249,7 @@ mod clipboard_tests {
 mod repository_admission_tests {
     use super::{
         active_restore_checkouts, checkout_for_runtime, commit_then_spawn, local_admission_route,
-        primary_dispatch, require_same_checkout_path, LocalAdmissionRoute, PrimaryDispatch,
+        primary_dispatch, require_same_checkout_path, App, LocalAdmissionRoute, PrimaryDispatch,
     };
     use baude_core::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
@@ -2226,6 +2257,46 @@ mod repository_admission_tests {
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn admission_repo(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "baude-admission-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let origin = root.join("origin.git");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        repo
+    }
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
         let repository_key = state.repositories[0].key;
@@ -2370,6 +2441,47 @@ mod repository_admission_tests {
         );
         assert_eq!(result, Err("disk full"));
         assert_eq!(*events.borrow(), ["save"]);
+    }
+
+    #[test]
+    fn production_admission_retains_intent_without_runtime_on_save_failure() {
+        let repo = admission_repo("save-failure");
+        let root = repo.parent().unwrap().to_path_buf();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.save_override_for_test = Some(Err("disk full".into()));
+
+        let error = app.admit_repository(&repo).unwrap_err().to_string();
+
+        assert!(error.contains("disk full"), "got: {error}");
+        assert_eq!(app.save_attempts_for_test.get(), 1);
+        assert_eq!(app.spawn_attempts_for_test, 0);
+        assert!(app.sessions.is_empty());
+        assert!(app.runtime_checkouts.is_empty());
+        assert_eq!(app.repository_state.checkouts.len(), 1);
+        assert!(app.repository_state.checkouts[0].active_intent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_admission_retains_saved_intent_on_spawn_failure() {
+        let repo = admission_repo("spawn-failure");
+        let root = repo.parent().unwrap().to_path_buf();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.save_override_for_test = Some(Ok(()));
+        app.spawn_error_for_test = Some("pty unavailable".into());
+
+        let error = app.admit_repository(&repo).unwrap_err().to_string();
+
+        assert!(error.contains("pty unavailable"), "got: {error}");
+        assert_eq!(app.save_attempts_for_test.get(), 1);
+        assert_eq!(app.spawn_attempts_for_test, 1);
+        assert!(app.sessions.is_empty());
+        assert!(app.runtime_checkouts.is_empty());
+        assert_eq!(app.repository_state.checkouts.len(), 1);
+        assert!(app.repository_state.checkouts[0].active_intent);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
