@@ -590,6 +590,7 @@ impl App {
                 shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
+                resume_id: None,
             };
         }
         state
@@ -749,6 +750,7 @@ impl App {
                     shell_open: false,
                     archived: false,
                     archived_by_user: false,
+                    resume_id: None,
                 },
                 health: CheckoutHealth::Available,
             });
@@ -2440,6 +2442,7 @@ mod repository_admission_tests {
                 shell_open: false,
                 archived: false,
                 archived_by_user: false,
+                resume_id: None,
             },
             health: CheckoutHealth::Available,
         });
@@ -2883,6 +2886,147 @@ mod repository_admission_tests {
                 .arg(path)
                 .current_dir(&repo)
                 .status();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn lifecycle_close_local_snapshots_resume_context_and_retains_hierarchy() {
+        let repo = admission_repo("retained-close");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + 60_000;
+        let created = app
+            .activate_branch_worktree(&repo, "feature/retained-close")
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let before = app.repository_state.clone();
+        let session = app.session_mut(runtime).unwrap();
+        session.name = "retained live name".into();
+        session.shell_open = true;
+        session.archived = true;
+        session.archived_by_user = true;
+        session.meta.session_id = Some("opaque/local;$(nope)".into());
+
+        assert_eq!(
+            app.close_retained_session(runtime).unwrap(),
+            LifecycleOutcome::Closed { checkout }
+        );
+
+        assert!(app.sessions.iter().all(|session| session.id != runtime));
+        assert!(!app.runtime_checkouts.contains_key(&checkout));
+        assert_eq!(app.repository_state.repositories, before.repositories);
+        assert_eq!(app.repository_state.checkouts.len(), before.checkouts.len());
+        let retained = &app.repository_state.checkouts[0];
+        assert_eq!(retained.key, before.checkouts[0].key);
+        assert_eq!(retained.repository_key, before.checkouts[0].repository_key);
+        assert_eq!(
+            retained.first_seen_order,
+            before.checkouts[0].first_seen_order
+        );
+        assert_eq!(retained.observed_path, before.checkouts[0].observed_path);
+        assert_eq!(
+            retained.observed_branch,
+            before.checkouts[0].observed_branch
+        );
+        assert!(!retained.active_intent);
+        assert_eq!(retained.session.name, "retained live name");
+        assert!(retained.session.shell_open);
+        assert!(retained.session.archived);
+        assert!(retained.session.archived_by_user);
+        assert_eq!(
+            retained.session.resume_id.as_deref(),
+            Some("opaque/local;$(nope)")
+        );
+        let state_file = baude_core::workspace::active().state_file("state");
+        assert_eq!(
+            baude_core::persist::load_current_at(&state_root, &state_file)
+                .unwrap()
+                .state,
+            app.repository_state
+        );
+        let path = retained.observed_path.to_path_buf();
+        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_close_local_obeys_persistence_commit_boundary() {
+        for (label, failure, committed) in [
+            (
+                "close-precommit",
+                baude_core::persist::AtomicFailure::Rename,
+                false,
+            ),
+            (
+                "close-postcommit",
+                baude_core::persist::AtomicFailure::DirectorySync,
+                true,
+            ),
+        ] {
+            let repo = admission_repo(label);
+            let root = repo.parent().unwrap().to_path_buf();
+            let state_root = root.join("state");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let mut app = App::new(repo.clone());
+            app.remote = None;
+            app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+            app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+            app.persistence_root_for_test = Some(state_root.clone());
+            app.repository_state.next_repository_key =
+                u64::from(std::process::id()) + if committed { 80_000 } else { 70_000 };
+            let created = app
+                .activate_branch_worktree(&repo, &format!("feature/{label}"))
+                .unwrap();
+            let (checkout, runtime) = match created {
+                LifecycleOutcome::Created {
+                    checkout,
+                    runtime: Some(runtime),
+                } => (checkout, runtime),
+                other => panic!("unexpected activation outcome: {other:?}"),
+            };
+            app.session_mut(runtime).unwrap().meta.session_id = Some(format!("resume-{label}"));
+            let before = app.repository_state.clone();
+            app.atomic_failure_for_test = Some(failure);
+
+            assert!(app.close_retained_session(runtime).is_err());
+            assert_eq!(app.repository_state.checkouts.len(), 1);
+            assert_eq!(app.repository_state.repositories.len(), 1);
+            assert_eq!(
+                app.sessions.iter().any(|session| session.id == runtime),
+                !committed
+            );
+            assert_eq!(app.runtime_checkouts.contains_key(&checkout), !committed);
+            assert_eq!(app.repository_state.checkouts[0].active_intent, !committed);
+            if committed {
+                assert_eq!(
+                    app.repository_state.checkouts[0]
+                        .session
+                        .resume_id
+                        .as_deref(),
+                    Some(format!("resume-{label}").as_str())
+                );
+                assert!(app.persistence_dirty);
+            } else {
+                assert_eq!(app.repository_state, before);
+                app.session_mut(runtime).unwrap().kill();
+            }
+            let path = app.repository_state.checkouts[0]
+                .observed_path
+                .to_path_buf();
+            git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
             std::fs::remove_dir_all(root).unwrap();
         }
     }

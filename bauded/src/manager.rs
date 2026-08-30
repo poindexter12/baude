@@ -539,6 +539,7 @@ impl Manager {
                 shell_open: false,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
+                resume_id: None,
             };
         }
         state
@@ -780,6 +781,7 @@ impl Manager {
                 shell_open: false,
                 archived: false,
                 archived_by_user: false,
+                resume_id: None,
             },
             health: if snapshot.is_some() {
                 CheckoutHealth::Available
@@ -948,6 +950,7 @@ impl Manager {
                 shell_open: false,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
+                resume_id: None,
             },
             health: if snapshot.is_some() {
                 CheckoutHealth::Available
@@ -1626,6 +1629,7 @@ mod tests {
                 shell_open: false,
                 archived: false,
                 archived_by_user: false,
+                resume_id: None,
             },
             health: CheckoutHealth::Available,
         });
@@ -2086,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_persistence_failure_rolls_back_or_finishes_the_delete() {
+    fn lifecycle_close_manager_persistence_failure_retains_child_and_parent() {
         for (label, failure, committed) in [
             ("remove-pre", persist::AtomicFailure::Rename, false),
             ("remove-post", persist::AtomicFailure::DirectorySync, true),
@@ -2095,16 +2099,33 @@ mod tests {
             let mut manager = Manager::new("sleep 30".into(), true);
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            manager.session_id_for_test(id, &format!("opaque-{label}"));
+            let before = manager.repository_state.clone();
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
             assert!(manager.remove(id).is_err());
             assert_eq!(manager.sessions.is_empty(), committed);
-            assert_eq!(manager.repository_state.checkouts.is_empty(), committed);
+            assert_eq!(manager.repository_state.repositories.len(), 1);
+            assert_eq!(manager.repository_state.checkouts.len(), 1);
             assert_eq!(
-                persisted_at(&root, &workspace).checkouts.is_empty(),
-                committed
+                manager.repository_state.checkouts[0].active_intent,
+                !committed
             );
-            if !committed {
+            assert_eq!(
+                persisted_at(&root, &workspace).checkouts[0].active_intent,
+                !committed
+            );
+            if committed {
+                assert_eq!(
+                    manager.repository_state.checkouts[0]
+                        .session
+                        .resume_id
+                        .as_deref(),
+                    Some(format!("opaque-{label}").as_str())
+                );
+                assert!(manager.persistence_dirty);
+            } else {
+                assert_eq!(manager.repository_state, before);
                 manager.kill_all();
             }
             std::fs::remove_dir_all(root).unwrap();
