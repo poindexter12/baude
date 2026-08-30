@@ -1525,7 +1525,14 @@ impl Manager {
         ) {
             Ok(plan) => plan,
             Err(blocked) => {
-                self.save_checked().map_err(MutationError::Persistence)?;
+                if let Err(error) = self.save_checked() {
+                    self.persistence_dirty = true;
+                    if !error.replacement_committed() {
+                        self.repository_state = state_before;
+                    }
+                    return Err(MutationError::Persistence(error));
+                }
+                self.persistence_dirty = false;
                 return Err(anyhow!(
                     "retained checkout {} is unavailable: {:?}",
                     blocked.checkout().get(),

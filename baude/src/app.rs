@@ -907,7 +907,14 @@ impl App {
         ) {
             Ok(plan) => plan,
             Err(blocked) => {
-                self.save_durable_status().map_err(anyhow::Error::new)?;
+                if let Err(error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    if !error.replacement_committed() {
+                        self.repository_state = state_before;
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+                self.persistence_dirty = false;
                 return Err(anyhow::anyhow!(
                     "retained checkout {} is unavailable: {:?}",
                     blocked.checkout().get(),
