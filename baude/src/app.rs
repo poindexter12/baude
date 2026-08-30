@@ -3058,6 +3058,19 @@ mod repository_admission_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    fn pid_is_live(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|state| !state.starts_with('Z'))
+            })
+    }
+
     fn git(repo: &Path, args: &[&str]) {
         assert!(Command::new("git")
             .args(args)
@@ -3676,6 +3689,13 @@ mod repository_admission_tests {
             restarted.repository_state.checkouts[0].health,
             CheckoutHealth::Available
         );
+        assert!(app
+            .session(runtime)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
 
         assert_eq!(
             app.close_retained_session(runtime).unwrap(),
@@ -3755,6 +3775,8 @@ mod repository_admission_tests {
                 other => panic!("unexpected activation outcome: {other:?}"),
             };
             app.session_mut(runtime).unwrap().meta.session_id = Some(format!("resume-{label}"));
+            let original_pid = app.session(runtime).unwrap().claude.pid().unwrap();
+            assert!(pid_is_live(original_pid));
             let before = app.repository_state.clone();
             app.atomic_failure_for_test = Some(failure);
 
@@ -3762,6 +3784,7 @@ mod repository_admission_tests {
             assert_eq!(app.repository_state.checkouts.len(), 1);
             assert_eq!(app.repository_state.repositories.len(), 1);
             assert_eq!(app.repository_state.checkouts[0].active_intent, !committed);
+            assert!(!pid_is_live(original_pid));
             if committed {
                 assert!(app.sessions.is_empty());
                 assert!(app.runtime_checkouts.is_empty());
@@ -3779,6 +3802,9 @@ mod repository_admission_tests {
                 let compensated = *app.runtime_checkouts.get(&checkout).unwrap();
                 assert_ne!(compensated, runtime);
                 assert!(!app.session(compensated).unwrap().claude.is_exited());
+                assert!(pid_is_live(
+                    app.session(compensated).unwrap().claude.pid().unwrap()
+                ));
                 app.session_mut(compensated).unwrap().kill();
             }
             let path = app.repository_state.checkouts[0]

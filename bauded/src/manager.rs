@@ -2250,6 +2250,19 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn pid_is_live(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|state| !state.starts_with('Z'))
+            })
+    }
+
     #[test]
     fn manager_restore_reconciles_current_git_before_spawn_and_persists_failure() {
         let root =
@@ -2844,6 +2857,8 @@ mod tests {
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
             manager.session_id_for_test(id, &format!("opaque-{label}"));
             let before = manager.repository_state.clone();
+            let original_pid = manager.session(id).unwrap().claude.pid().unwrap();
+            assert!(pid_is_live(original_pid));
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
             let close_error = manager.remove(id).unwrap_err().to_string();
@@ -2857,6 +2872,7 @@ mod tests {
                 persisted_at(&root, &workspace).checkouts[0].active_intent,
                 !committed
             );
+            assert!(!pid_is_live(original_pid));
             if committed {
                 assert!(manager.sessions.is_empty());
                 assert!(manager.runtime_checkouts.is_empty());
@@ -2875,6 +2891,9 @@ mod tests {
                 let compensated = manager.runtime_checkouts[&compensated];
                 assert_ne!(compensated, id);
                 assert!(!manager.session(compensated).unwrap().claude.is_exited());
+                assert!(pid_is_live(
+                    manager.session(compensated).unwrap().claude.pid().unwrap()
+                ));
                 manager.kill_all();
             }
             std::fs::remove_dir_all(root).unwrap();
@@ -2934,6 +2953,13 @@ mod tests {
             restarted.repository_state.checkouts[0].health,
             CheckoutHealth::Available
         );
+        assert!(manager
+            .session(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
 
         manager.remove(id).unwrap();
 
