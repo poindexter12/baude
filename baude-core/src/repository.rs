@@ -470,8 +470,10 @@ mod tests {
             assert_eq!(exhausted.validate(), Err(expected));
         }
 
-        let mut exhausted = RepositoryState::default();
-        exhausted.next_repository_key = u64::MAX;
+        let mut exhausted = RepositoryState {
+            next_repository_key: u64::MAX,
+            ..RepositoryState::default()
+        };
         assert_eq!(
             exhausted.allocate_repository_key(),
             Err(AllocationError::RepositoryKeysExhausted)
