@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use crate::backend::SpawnMode;
 use crate::git::{
     self, BranchActivationError, BranchActivationOutcome, ReconciliationUnavailable,
-    RepositoryDiscoveryError, RepositorySnapshot, WorktreeRecord,
+    RemovalBlocker, RemovalSafety, RemoveVerifiedError, RepositoryDiscoveryError,
+    RepositorySnapshot, VerifiedRemoval, VerifiedRemovalTarget, WorktreeRecord,
 };
 use crate::repository::{
     AllocationError, CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
@@ -69,6 +70,179 @@ pub struct ClosePlan {
     pub checkout: CheckoutKey,
     pub effects: [CloseEffect; 3],
     pub outcome: LifecycleOutcome,
+}
+
+/// A confirmation capability identifies one freshly inspected durable child,
+/// but deliberately does not retain the first preflight's mutation token.
+/// Confirmation must inspect again after the runtime has stopped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovalConfirmation {
+    repository: RepositoryKey,
+    checkout: CheckoutKey,
+    path: PathBuf,
+    branch_ref: String,
+}
+
+impl RemovalConfirmation {
+    pub fn repository(&self) -> RepositoryKey {
+        self.repository
+    }
+
+    pub fn checkout(&self) -> CheckoutKey {
+        self.checkout
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn branch_ref(&self) -> &str {
+        &self.branch_ref
+    }
+}
+
+#[derive(Debug)]
+pub enum RemovalFailure {
+    CheckoutMissing(CheckoutKey),
+    RepositoryMissing(RepositoryKey),
+    ConfirmationStale,
+    Inspection(String),
+    Blocked(Vec<RemovalBlocker>),
+    GitRefused(String),
+    Compensation { original: String, recovery: String },
+}
+
+impl std::fmt::Display for RemovalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CheckoutMissing(key) => write!(f, "removal checkout {} is missing", key.get()),
+            Self::RepositoryMissing(key) => {
+                write!(f, "removal repository {} is missing", key.get())
+            }
+            Self::ConfirmationStale => f.write_str("removal confirmation target changed"),
+            Self::Inspection(detail) => write!(f, "removal inspection failed: {detail}"),
+            Self::Blocked(blockers) => write!(f, "removal blocked: {blockers:?}"),
+            Self::GitRefused(detail) => write!(f, "plain Git removal refused: {detail}"),
+            Self::Compensation { original, recovery } => write!(
+                f,
+                "{original}; runtime compensation also failed: {recovery}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemovalFailure {}
+
+fn removal_facts(
+    state: &RepositoryState,
+    checkout_key: CheckoutKey,
+) -> Result<(&SavedRepository, &SavedCheckout), RemovalFailure> {
+    let checkout = state
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(RemovalFailure::CheckoutMissing(checkout_key))?;
+    let repository = state
+        .repositories
+        .iter()
+        .find(|repository| repository.key == checkout.repository_key)
+        .ok_or(RemovalFailure::RepositoryMissing(checkout.repository_key))?;
+    Ok((repository, checkout))
+}
+
+fn inspect_removal_facts(
+    repository: &SavedRepository,
+    checkout: &SavedCheckout,
+) -> Result<VerifiedRemovalTarget, RemovalFailure> {
+    match git::inspect_removal(&repository.observed_common_dir.to_path_buf(), checkout)
+        .map_err(|error| RemovalFailure::Inspection(error.to_string()))?
+    {
+        RemovalSafety::Safe(target) => Ok(target),
+        RemovalSafety::Blocked(blockers) => Err(RemovalFailure::Blocked(blockers)),
+    }
+}
+
+/// First preflight: produces target-naming confirmation data while leaving the
+/// aggregate and runtime untouched. The verified Git token is intentionally
+/// discarded so it cannot be cached across human confirmation.
+pub fn prepare_removal(
+    state: &RepositoryState,
+    checkout_key: CheckoutKey,
+) -> Result<RemovalConfirmation, RemovalFailure> {
+    let (repository, checkout) = removal_facts(state, checkout_key)?;
+    let target = inspect_removal_facts(repository, checkout)?;
+    Ok(RemovalConfirmation {
+        repository: checkout.repository_key,
+        checkout: checkout.key,
+        path: target.path().to_path_buf(),
+        branch_ref: target.branch_ref().to_owned(),
+    })
+}
+
+/// Second preflight: validate that the confirmation still names the exact
+/// durable child, then perform a wholly fresh inspection after runtime stop.
+pub fn inspect_confirmed_removal(
+    state: &RepositoryState,
+    confirmation: &RemovalConfirmation,
+) -> Result<VerifiedRemovalTarget, RemovalFailure> {
+    let (repository, checkout) = removal_facts(state, confirmation.checkout)?;
+    if checkout.repository_key != confirmation.repository
+        || checkout.observed_path.to_path_buf() != confirmation.path
+        || checkout.observed_branch.as_deref() != Some(confirmation.branch_ref.as_str())
+    {
+        return Err(RemovalFailure::ConfirmationStale);
+    }
+    inspect_removal_facts(repository, checkout)
+}
+
+pub fn execute_verified_removal(
+    target: &VerifiedRemovalTarget,
+) -> Result<VerifiedRemoval, RemoveVerifiedError> {
+    git::remove_verified_worktree(target)
+}
+
+/// Apply child-only membership deletion after Git and all postconditions have
+/// committed. Repository parent, siblings, counters, and branch facts remain.
+pub fn commit_removed_checkout(
+    state: &mut RepositoryState,
+    confirmation: &RemovalConfirmation,
+    removal: &VerifiedRemoval,
+) -> Result<LifecycleOutcome, LifecycleError> {
+    let index = state
+        .checkouts
+        .iter()
+        .position(|checkout| checkout.key == confirmation.checkout)
+        .ok_or(LifecycleError::CheckoutMissing(confirmation.checkout))?;
+    if state.checkouts[index].repository_key != confirmation.repository
+        || removal.removed_path() != confirmation.path
+        || removal.branch_ref() != confirmation.branch_ref
+    {
+        return Err(LifecycleError::Topology(
+            "verified removal no longer matches confirmed child".into(),
+        ));
+    }
+    state.checkouts.remove(index);
+    state.validate()?;
+    Ok(LifecycleOutcome::Removed {
+        repository: confirmation.repository,
+        checkout: confirmation.checkout,
+        branch_ref: removal.branch_ref().to_owned(),
+    })
+}
+
+pub fn mark_removed_checkout_unavailable(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+    detail: impl Into<String>,
+) {
+    if let Some(checkout) = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+    {
+        checkout.active_intent = true;
+        checkout.health = CheckoutHealth::Unavailable(UnavailableCause::Other(detail.into()));
+    }
 }
 
 /// Snapshot one runtime into its durable child and deactivate only that child.
@@ -591,6 +765,15 @@ pub enum LifecycleOutcome {
     },
     Closed {
         checkout: CheckoutKey,
+    },
+    Removed {
+        repository: RepositoryKey,
+        checkout: CheckoutKey,
+        branch_ref: String,
+    },
+    TopologyCommittedStateDegraded {
+        checkout: CheckoutKey,
+        detail: String,
     },
     Busy {
         repository: RepositoryKey,

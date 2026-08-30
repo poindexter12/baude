@@ -1228,13 +1228,11 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
-    fn close_retained_session(&mut self, id: u64) -> Result<LifecycleOutcome> {
-        let checkout_key = checkout_for_runtime(&self.runtime_checkouts, id)
-            .ok_or_else(|| anyhow::anyhow!("runtime {id} has no retained checkout"))?;
+    fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
         let session = self
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?;
-        let snapshot = RetainedSessionState {
+        Ok(RetainedSessionState {
             name: session.name.clone(),
             cwd: PersistedPath::from_path(&session.cwd),
             repo_root: PersistedPath::from_path(&session.repo_root),
@@ -1244,7 +1242,174 @@ impl App {
             archived: session.archived,
             archived_by_user: session.archived_by_user,
             resume_id: session.meta.session_id.clone(),
+        })
+    }
+
+    fn restore_removed_runtime(
+        &mut self,
+        checkout: CheckoutKey,
+        saved: RetainedSessionState,
+    ) -> Result<u64> {
+        if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
+            self.selected_id = Some(SelId::Local(id));
+            self.focus = Focus::Claude;
+            return Ok(id);
+        }
+        let mode = saved
+            .resume_id
+            .clone()
+            .map(backend::SpawnMode::ResumeId)
+            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        let id = self.add_session_with_mode(
+            saved.cwd.to_path_buf(),
+            Some(saved.repo_root.to_path_buf()),
+            saved.branch.clone(),
+            saved.is_worktree,
+            mode,
+            saved.shell_open,
+        )?;
+        if let Some(runtime) = self.session_mut(id) {
+            runtime.name = saved.name;
+            runtime.archived = saved.archived;
+            runtime.archived_by_user = saved.archived_by_user;
+        }
+        self.runtime_checkouts.insert(checkout, id);
+        self.selected_id = Some(SelId::Local(id));
+        self.focus = Focus::Claude;
+        Ok(id)
+    }
+
+    fn compensate_failed_removal(
+        &mut self,
+        checkout: CheckoutKey,
+        runtime: Option<RetainedSessionState>,
+        failure: lifecycle::RemovalFailure,
+    ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
+        let original = failure.to_string();
+        if let Some(saved) = runtime {
+            if let Err(error) = self.restore_removed_runtime(checkout, saved) {
+                return Err(lifecycle::RemovalFailure::Compensation {
+                    original,
+                    recovery: error.to_string(),
+                });
+            }
+        }
+        Err(failure)
+    }
+
+    pub fn prepare_remove_worktree(
+        &self,
+        checkout: CheckoutKey,
+    ) -> std::result::Result<lifecycle::RemovalConfirmation, lifecycle::RemovalFailure> {
+        let saved = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or(lifecycle::RemovalFailure::CheckoutMissing(checkout))?;
+        let _reservation = self
+            .repository_reservations
+            .reserve(saved.repository_key)
+            .map_err(|outcome| lifecycle::RemovalFailure::Inspection(format!("{outcome:?}")))?;
+        lifecycle::prepare_removal(&self.repository_state, checkout)
+    }
+
+    pub fn confirm_remove_worktree(
+        &mut self,
+        confirmation: lifecycle::RemovalConfirmation,
+    ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
+        let _reservation = self
+            .repository_reservations
+            .reserve(confirmation.repository())
+            .map_err(|outcome| lifecycle::RemovalFailure::Inspection(format!("{outcome:?}")))?;
+        let checkout = confirmation.checkout();
+        let runtime_id = self.runtime_checkouts.get(&checkout).copied();
+        let runtime = runtime_id
+            .map(|id| self.retained_runtime_snapshot(id))
+            .transpose()
+            .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        if let Some(id) = runtime_id {
+            self.stop_closed_runtime(checkout, id);
+        }
+
+        let target =
+            match lifecycle::inspect_confirmed_removal(&self.repository_state, &confirmation) {
+                Ok(target) => target,
+                Err(failure) => {
+                    return self.compensate_failed_removal(checkout, runtime, failure);
+                }
+            };
+        let removal = match lifecycle::execute_verified_removal(&target) {
+            Ok(removal) => removal,
+            Err(git::RemoveVerifiedError::Postcondition(failure)) => {
+                if let Some(saved) = runtime {
+                    if let Some(retained) = self
+                        .repository_state
+                        .checkouts
+                        .iter_mut()
+                        .find(|retained| retained.key == checkout)
+                    {
+                        retained.session = saved;
+                    }
+                }
+                let detail =
+                    format!("Git topology committed but postconditions degraded: {failure:?}");
+                lifecycle::mark_removed_checkout_unavailable(
+                    &mut self.repository_state,
+                    checkout,
+                    detail.clone(),
+                );
+                if self.save_durable_status().is_err() {
+                    self.persistence_dirty = true;
+                }
+                return Ok(LifecycleOutcome::TopologyCommittedStateDegraded { checkout, detail });
+            }
+            Err(error) => {
+                return self.compensate_failed_removal(
+                    checkout,
+                    runtime,
+                    lifecycle::RemovalFailure::GitRefused(error.to_string()),
+                );
+            }
         };
+
+        let before_deletion = self.repository_state.clone();
+        let outcome =
+            lifecycle::commit_removed_checkout(&mut self.repository_state, &confirmation, &removal)
+                .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        self.runtime_checkouts.remove(&checkout);
+        match self.save_durable_status() {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                Ok(outcome)
+            }
+            Err(error) if !error.replacement_committed() => {
+                self.repository_state = before_deletion;
+                lifecycle::mark_removed_checkout_unavailable(
+                    &mut self.repository_state,
+                    checkout,
+                    format!("Git removal committed before persistence replacement: {error}"),
+                );
+                self.persistence_dirty = true;
+                Ok(LifecycleOutcome::TopologyCommittedStateDegraded {
+                    checkout,
+                    detail: error.to_string(),
+                })
+            }
+            Err(error) => {
+                self.persistence_dirty = true;
+                Ok(LifecycleOutcome::TopologyCommittedStateDegraded {
+                    checkout,
+                    detail: error.to_string(),
+                })
+            }
+        }
+    }
+
+    fn close_retained_session(&mut self, id: u64) -> Result<LifecycleOutcome> {
+        let checkout_key = checkout_for_runtime(&self.runtime_checkouts, id)
+            .ok_or_else(|| anyhow::anyhow!("runtime {id} has no retained checkout"))?;
+        let snapshot = self.retained_runtime_snapshot(id)?;
         let before = self.repository_state.clone();
         let plan = lifecycle::plan_close(
             &mut self.repository_state,
@@ -3227,11 +3392,89 @@ mod repository_admission_tests {
         assert!(app.sessions.is_empty());
         assert!(!path.exists());
         assert!(Command::new("git")
-            .args(["show-ref", "--verify", "--quiet", "--", "refs/heads/feature/safe-remove-local"])
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/feature/safe-remove-local"
+            ])
             .current_dir(&repo)
             .status()
             .unwrap()
             .success());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_remove_clean_local_reports_truthful_post_git_persistence_stage() {
+        for (label, failure, replacement_committed) in [
+            (
+                "safe-remove-save-pre",
+                baude_core::persist::AtomicFailure::Rename,
+                false,
+            ),
+            (
+                "safe-remove-save-post",
+                baude_core::persist::AtomicFailure::DirectorySync,
+                true,
+            ),
+        ] {
+            let repo = admission_repo(label);
+            let root = repo.parent().unwrap().to_path_buf();
+            let state_root = root.join("state");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let mut app = App::new(repo.clone());
+            app.remote = None;
+            app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+            app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+            app.persistence_root_for_test = Some(state_root.clone());
+            app.repository_state.next_repository_key = u64::from(std::process::id())
+                + if replacement_committed {
+                    130_000
+                } else {
+                    120_000
+                };
+            let created = app
+                .activate_branch_worktree(&repo, &format!("feature/{label}"))
+                .unwrap();
+            let checkout = match created {
+                LifecycleOutcome::Created { checkout, .. } => checkout,
+                other => panic!("unexpected activation outcome: {other:?}"),
+            };
+            let before = app.repository_state.clone();
+            let path = before.checkouts[0].observed_path.to_path_buf();
+            let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+            app.atomic_failure_for_test = Some(failure);
+
+            let outcome = app.confirm_remove_worktree(confirmation).unwrap();
+
+            assert!(matches!(
+                outcome,
+                LifecycleOutcome::TopologyCommittedStateDegraded { checkout: key, .. }
+                    if key == checkout
+            ));
+            assert!(!path.exists());
+            assert!(app.persistence_dirty);
+            assert_eq!(
+                app.repository_state.checkouts.is_empty(),
+                replacement_committed
+            );
+            if !replacement_committed {
+                assert!(matches!(
+                    app.repository_state.checkouts[0].health,
+                    CheckoutHealth::Unavailable(_)
+                ));
+            }
+            let state_file = baude_core::workspace::active().state_file("state");
+            let persisted = baude_core::persist::load_current_at(&state_root, &state_file)
+                .unwrap()
+                .state;
+            assert_eq!(persisted.checkouts.is_empty(), replacement_committed);
+            if !replacement_committed {
+                assert_eq!(persisted, before);
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
