@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::repository::RepositoryState;
+use crate::repository::{CheckoutRole, PersistedPath, RepositoryState, UnavailableCause};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -11,6 +11,28 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct StateFile {
     pub schema_version: u32,
     pub state: RepositoryState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoadOutcome {
+    Missing,
+    Legacy(StateFile),
+    Current(StateFile),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyReconciliation {
+    Available {
+        common_dir: PersistedPath,
+        main_worktree: PersistedPath,
+        checkout_path: PersistedPath,
+        checkout_role: CheckoutRole,
+        managed_by_baude: bool,
+    },
+    Unavailable {
+        repository_cause: UnavailableCause,
+        checkout_cause: UnavailableCause,
+    },
 }
 
 impl StateFile {
@@ -39,12 +61,25 @@ pub fn load_current_at(root: &std::path::Path, file: &str) -> Result<StateFile> 
     Ok(state)
 }
 
-#[derive(Serialize, Deserialize, Default)]
+/// Select and migrate exactly one workspace-owned source under an injected root.
+pub fn migrate_for_workspace_at(
+    _root: &std::path::Path,
+    _base: &str,
+    _ws: &crate::workspace::Workspace,
+    _reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+) -> Result<LoadOutcome> {
+    // RED: selected-source migration is implemented in the GREEN commit.
+    Ok(LoadOutcome::Missing)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     pub sessions: Vec<SavedSession>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedSession {
     pub name: String,
     pub cwd: PathBuf,
@@ -260,6 +295,134 @@ mod tests {
             health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
         });
         StateFile::new(state)
+    }
+
+    fn legacy_fixture(prefix: &str) -> State {
+        State {
+            sessions: vec![
+                SavedSession {
+                    name: format!("{prefix}-main"),
+                    cwd: PathBuf::from(format!("/{prefix}/repo")),
+                    repo_root: PathBuf::from(format!("/{prefix}/repo")),
+                    branch: Some("develop".into()),
+                    is_worktree: false,
+                    shell_open: true,
+                    archived: false,
+                    archived_by_user: false,
+                },
+                SavedSession {
+                    name: format!("{prefix}-child"),
+                    cwd: PathBuf::from(format!("/{prefix}/child")),
+                    repo_root: PathBuf::from(format!("/{prefix}/repo")),
+                    branch: Some("feature/one".into()),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: true,
+                    archived_by_user: true,
+                },
+                SavedSession {
+                    name: format!("{prefix}-missing"),
+                    cwd: PathBuf::from(format!("/{prefix}/missing")),
+                    repo_root: PathBuf::from(format!("/{prefix}/gone")),
+                    branch: None,
+                    is_worktree: true,
+                    shell_open: true,
+                    archived: false,
+                    archived_by_user: true,
+                },
+            ],
+        }
+    }
+
+    fn test_workspace(name: &str) -> crate::workspace::Workspace {
+        crate::workspace::resolve(Some(name), None, &Config::default(), |message| {
+            panic!("unexpected workspace warning: {message}")
+        })
+    }
+
+    fn reconcile_legacy(session: &SavedSession) -> LegacyReconciliation {
+        if session.name.ends_with("missing") {
+            LegacyReconciliation::Unavailable {
+                repository_cause: UnavailableCause::Missing,
+                checkout_cause: UnavailableCause::Missing,
+            }
+        } else {
+            LegacyReconciliation::Available {
+                common_dir: PersistedPath::from_path(&session.repo_root.join(".git")),
+                main_worktree: PersistedPath::from_path(&session.repo_root),
+                checkout_path: PersistedPath::from_path(&session.cwd),
+                checkout_role: if session.is_worktree {
+                    CheckoutRole::ManagedBranch
+                } else {
+                    CheckoutRole::Main
+                },
+                managed_by_baude: false,
+            }
+        }
+    }
+
+    fn assert_legacy_migration(base: &str) {
+        let root = isolated_root(base);
+        let workspace = test_workspace("claude");
+        let selected = legacy_fixture(base);
+        let dormant = legacy_fixture("dormant");
+        let primary_path = root.join(workspace.state_file(base));
+        let fallback_path = root.join(workspace.legacy_state_file(base).unwrap());
+        let selected_bytes = serde_json::to_vec_pretty(&selected).unwrap();
+        std::fs::write(&fallback_path, &selected_bytes).unwrap();
+
+        let outcome = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
+        let LoadOutcome::Legacy(migrated) = outcome else {
+            panic!("expected migrated legacy state");
+        };
+        assert!(primary_path.exists());
+        assert_eq!(std::fs::read(&fallback_path).unwrap(), selected_bytes);
+        assert_eq!(
+            migrated.state.repositories.len(),
+            2,
+            "shared identity groups sessions"
+        );
+        assert_eq!(
+            migrated.state.checkouts.len(),
+            3,
+            "unavailable session is retained"
+        );
+        assert_eq!(
+            migrated.state.checkouts[1].session.name,
+            format!("{base}-child")
+        );
+        assert!(migrated.state.checkouts[1].session.archived);
+        assert!(migrated.state.checkouts[1].session.archived_by_user);
+        assert!(
+            migrated
+                .state
+                .checkouts
+                .iter()
+                .all(|checkout| !checkout.managed_by_baude),
+            "legacy is_worktree alone must not prove baude ownership"
+        );
+
+        let first_bytes = std::fs::read(&primary_path).unwrap();
+        let second = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
+        assert_eq!(second, LoadOutcome::Current(migrated));
+        assert_eq!(std::fs::read(&primary_path).unwrap(), first_bytes);
+
+        let dormant_bytes = serde_json::to_vec_pretty(&dormant).unwrap();
+        std::fs::write(&fallback_path, &dormant_bytes).unwrap();
+        let third = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
+        assert!(matches!(third, LoadOutcome::Current(_)));
+        assert_eq!(std::fs::read(&fallback_path).unwrap(), dormant_bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_migration_local() {
+        assert_legacy_migration("state");
+    }
+
+    #[test]
+    fn legacy_migration_daemon() {
+        assert_legacy_migration("daemon-state");
     }
 
     #[test]
