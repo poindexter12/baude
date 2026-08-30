@@ -35,6 +35,37 @@ const STATE_BASE: &str = "daemon-state";
 
 pub type Shared = Arc<Mutex<Manager>>;
 
+#[derive(Debug)]
+pub enum MutationError {
+    Domain(anyhow::Error),
+    Persistence(persist::SaveError),
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Domain(error) => error.fmt(f),
+            Self::Persistence(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for MutationError {}
+
+impl From<anyhow::Error> for MutationError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Domain(error)
+    }
+}
+
+impl From<persist::SaveError> for MutationError {
+    fn from(error: persist::SaveError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+type MutationResult<T> = std::result::Result<T, MutationError>;
+
 /// Lock the manager, recovering from poisoning (a panicked handler must not
 /// take the whole daemon's session list with it).
 pub fn lock(shared: &Shared) -> MutexGuard<'_, Manager> {
@@ -61,8 +92,6 @@ pub struct Manager {
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
     persistence_error: Option<String>,
-    #[cfg(test)]
-    save_error_for_test: Option<String>,
     #[cfg(test)]
     persistence_target_for_test: Option<(PathBuf, String)>,
     #[cfg(test)]
@@ -264,8 +293,6 @@ impl Manager {
             persistence_dirty: false,
             persistence_error: None,
             #[cfg(test)]
-            save_error_for_test: None,
-            #[cfg(test)]
             persistence_target_for_test: None,
             #[cfg(test)]
             atomic_failure_for_test: None,
@@ -432,14 +459,6 @@ impl Manager {
                 "persistence is blocked after a state load failure"
             )));
         }
-        #[cfg(test)]
-        if let Some(error) = self.save_error_for_test.clone() {
-            self.persistence_dirty = true;
-            self.persistence_error = Some(error.clone());
-            return Err(persist::SaveError::before_replacement(anyhow!(
-                "persistence save failed: {error}"
-            )));
-        }
         let state = StateFile::new(self.state_for_save());
         #[cfg(test)]
         let saved = if let Some((root, file)) = &self.persistence_target_for_test {
@@ -525,14 +544,17 @@ impl Manager {
         repo: &str,
         worktree: Option<&str>,
         name: Option<&str>,
-    ) -> Result<SessionInfo> {
+    ) -> MutationResult<SessionInfo> {
         if self.persistence_blocked {
-            bail!("daemon persistence is blocked after a state load failure");
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
         }
         let repo = expand_tilde(repo);
         let repo = repo.canonicalize().unwrap_or(repo);
         if !repo.is_dir() {
-            bail!("not a directory: {}", repo.display());
+            return Err(anyhow!("not a directory: {}", repo.display()).into());
         }
         let (cwd, repo_root, branch, is_worktree) = match worktree {
             Some(branch) => {
@@ -572,7 +594,7 @@ impl Manager {
                 if !error.replacement_committed() {
                     self.repository_state = state_before;
                 }
-                return Err(error.into());
+                return Err(MutationError::Persistence(error));
             }
             let id = self.spawn(
                 cwd,
@@ -848,7 +870,7 @@ impl Manager {
         Ok(())
     }
 
-    pub fn remove(&mut self, id: u64) -> Result<()> {
+    pub fn remove(&mut self, id: u64) -> MutationResult<()> {
         self.session(id)?;
         let state_before = self.repository_state.clone();
         let checkout_key = self
@@ -869,13 +891,14 @@ impl Manager {
                 .repositories
                 .retain(|repository| used.contains(&repository.key));
         }
-        let save_error = self.save_checked().err();
-        if let Some(error) = &save_error {
-            if !error.replacement_committed() {
+        let save_error = match self.save_checked() {
+            Err(error) if !error.replacement_committed() => {
                 self.repository_state = state_before;
-                return Err(anyhow!(error.to_string()));
+                return Err(MutationError::Persistence(error));
             }
-        }
+            Err(error) => Some(error),
+            Ok(()) => None,
+        };
         self.session_mut(id)?.kill();
         self.sessions.retain(|s| s.id != id);
         if let Some(checkout_key) = checkout_key {
@@ -886,7 +909,7 @@ impl Manager {
         if let Some(n) = self.permission_notify.remove(&id) {
             n.notify_waiters();
         }
-        save_error.map_or(Ok(()), |error| Err(error.into()))
+        save_error.map_or(Ok(()), |error| Err(MutationError::Persistence(error)))
     }
 
     /// How long to wait between pasting the text and pressing Enter. Claude
@@ -1055,12 +1078,15 @@ impl Manager {
     /// `$BAUDE_EVENT_URL` export (hook events regressed to the /tmp file
     /// path with no daemon POST). Now a restart is spawn-equivalent, and for
     /// opencode it re-rolls the pinned server port.
-    pub fn restart(&mut self, id: u64) -> Result<()> {
+    pub fn restart(&mut self, id: u64) -> MutationResult<()> {
         if self.persistence_blocked {
-            bail!("daemon persistence is blocked after a state load failure");
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
         }
         if !self.session(id)?.claude.is_exited() {
-            bail!("claude is still running");
+            return Err(anyhow!("claude is still running").into());
         }
         if let Some(checkout_key) = self
             .runtime_checkouts
@@ -1068,11 +1094,9 @@ impl Manager {
             .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
         {
             let reconciled = self.reconcile_checkout(checkout_key);
-            self.save_checked().map_err(|error| {
-                anyhow!("checkout reconciliation could not be persisted: {error}")
-            })?;
+            self.save_checked().map_err(MutationError::Persistence)?;
             if !reconciled {
-                bail!("checkout changed since admission; restart refused");
+                return Err(anyhow!("checkout changed since admission; restart refused").into());
             }
         }
         let be = backend::active();
@@ -1236,18 +1260,18 @@ impl Manager {
     /// Park or unpark a session. Archived sessions sort last in clients and
     /// stop sending notifications. A manual archive sticks until unarchived
     /// or re-engaged; an automatic one also lifts when a new turn starts.
-    pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
+    pub fn set_archived(&mut self, id: u64, archived: bool) -> MutationResult<()> {
         let s = self.session_mut(id)?;
         let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
         match self.save_checked() {
             Ok(()) => Ok(()),
-            Err(error) if error.replacement_committed() => Err(error.into()),
+            Err(error) if error.replacement_committed() => Err(MutationError::Persistence(error)),
             Err(error) => {
                 let s = self.session_mut(id)?;
                 s.archived = archived_before.0;
                 s.archived_by_user = archived_before.1;
-                Err(error.into())
+                Err(MutationError::Persistence(error))
             }
         }
     }
@@ -1266,18 +1290,12 @@ impl Manager {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_saves_for_test(&mut self, error: &str) {
-        self.save_error_for_test = Some(error.to_string());
-    }
-
-    #[cfg(test)]
-    fn persist_at_for_test(
+    pub(crate) fn persist_at_for_test(
         &mut self,
         root: &Path,
         workspace: &baude_core::workspace::Workspace,
         failure: Option<persist::AtomicFailure>,
     ) {
-        self.save_error_for_test = None;
         self.persistence_target_for_test =
             Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
         self.atomic_failure_for_test = failure;
