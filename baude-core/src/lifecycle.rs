@@ -319,6 +319,23 @@ pub fn mark_teardown_pending(
     Ok(())
 }
 
+pub fn mark_stopped_active_recovery(
+    state: &mut RepositoryState,
+    checkout_key: CheckoutKey,
+    detail: String,
+) -> Result<(), LifecycleError> {
+    let checkout = state
+        .checkouts
+        .iter_mut()
+        .find(|checkout| checkout.key == checkout_key)
+        .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    checkout.active_intent = true;
+    checkout.health =
+        CheckoutHealth::Unavailable(UnavailableCause::StoppedActiveRecovery { detail });
+    state.validate()?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum DestructiveTeardownError {
     Pending(crate::session::SessionTeardownError),
@@ -513,7 +530,8 @@ pub fn plan_reopen(
         cause @ (UnavailableCause::RemovalTombstone(_)
         | UnavailableCause::TeardownPending { .. }
         | UnavailableCause::PendingActivation { .. }
-        | UnavailableCause::ActivationRecovery { .. }),
+        | UnavailableCause::ActivationRecovery { .. }
+        | UnavailableCause::StoppedActiveRecovery { .. }),
     ) = &state.checkouts[checkout_index].health
     {
         return Err(ReopenBlocked {

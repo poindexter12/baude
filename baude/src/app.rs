@@ -1762,7 +1762,7 @@ impl App {
             &mut self.repository_state,
             lifecycle::CloseRequest {
                 checkout: checkout_key,
-                runtime: snapshot,
+                runtime: snapshot.clone(),
             },
         )?;
         match self.save_durable_status() {
@@ -1774,10 +1774,34 @@ impl App {
             Err(error) if !error.replacement_committed() => {
                 self.repository_state = before;
                 self.persistence_dirty = true;
-                Err(anyhow::Error::new(error))
+                self.forget_stopped_runtime(checkout_key, id);
+                match self.restore_removed_runtime(checkout_key, snapshot) {
+                    Ok(runtime) => Err(anyhow::anyhow!(
+                        "{error}; close persistence rolled back and retained runtime restarted as {runtime}"
+                    )),
+                    Err(restart) => {
+                        let detail = format!(
+                            "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
+                        );
+                        lifecycle::mark_stopped_active_recovery(
+                            &mut self.repository_state,
+                            checkout_key,
+                            detail.clone(),
+                        )?;
+                        let recovery_save = self.save_durable_status();
+                        self.persistence_dirty = recovery_save.is_err();
+                        Err(anyhow::anyhow!(
+                            "{detail}; recovery persistence: {}",
+                            recovery_save
+                                .map(|()| "saved".to_owned())
+                                .unwrap_or_else(|save| save.to_string())
+                        ))
+                    }
+                }
             }
             Err(error) => {
                 self.persistence_dirty = true;
+                self.forget_stopped_runtime(checkout_key, id);
                 Err(anyhow::anyhow!(
                     "inactive state committed but directory durability failed: {error}"
                 ))
@@ -3734,13 +3758,13 @@ mod repository_admission_tests {
             let before = app.repository_state.clone();
             app.atomic_failure_for_test = Some(failure);
 
-            assert!(app.close_retained_session(runtime).is_err());
+            let close_error = app.close_retained_session(runtime).unwrap_err().to_string();
             assert_eq!(app.repository_state.checkouts.len(), 1);
             assert_eq!(app.repository_state.repositories.len(), 1);
-            assert!(app.sessions.iter().any(|session| session.id == runtime));
-            assert!(app.runtime_checkouts.contains_key(&checkout));
             assert_eq!(app.repository_state.checkouts[0].active_intent, !committed);
             if committed {
+                assert!(app.sessions.is_empty());
+                assert!(app.runtime_checkouts.is_empty());
                 assert_eq!(
                     app.repository_state.checkouts[0]
                         .session
@@ -3750,8 +3774,12 @@ mod repository_admission_tests {
                 );
                 assert!(app.persistence_dirty);
             } else {
+                assert!(close_error.contains("retained runtime restarted"));
                 assert_eq!(app.repository_state, before);
-                app.session_mut(runtime).unwrap().kill();
+                let compensated = *app.runtime_checkouts.get(&checkout).unwrap();
+                assert_ne!(compensated, runtime);
+                assert!(!app.session(compensated).unwrap().claude.is_exited());
+                app.session_mut(compensated).unwrap().kill();
             }
             let path = app.repository_state.checkouts[0]
                 .observed_path

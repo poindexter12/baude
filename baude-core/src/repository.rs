@@ -73,6 +73,11 @@ pub enum UnavailableCause {
         verification: String,
         compensation: String,
     },
+    /// Close stopped the retained runtime, persistence rolled back active
+    /// intent, and exact runtime restart compensation also failed.
+    StoppedActiveRecovery {
+        detail: String,
+    },
     Io(String),
     Other(String),
 }

@@ -1507,14 +1507,39 @@ impl Manager {
             &mut self.repository_state,
             lifecycle::CloseRequest {
                 checkout: checkout_key,
-                runtime: snapshot,
+                runtime: snapshot.clone(),
             },
         )
         .map_err(anyhow::Error::new)?;
         let save_error = match self.save_checked() {
             Err(error) if !error.replacement_committed() => {
                 self.repository_state = state_before;
-                return Err(MutationError::Persistence(error));
+                self.forget_stopped_runtime(checkout_key, id);
+                return match self.restore_removed_runtime(checkout_key, snapshot) {
+                    Ok(runtime) => Err(anyhow!(
+                        "{error}; close persistence rolled back and retained runtime restarted as {runtime}"
+                    )
+                    .into()),
+                    Err(restart) => {
+                        let detail = format!(
+                            "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
+                        );
+                        lifecycle::mark_stopped_active_recovery(
+                            &mut self.repository_state,
+                            checkout_key,
+                            detail.clone(),
+                        )
+                        .map_err(anyhow::Error::new)?;
+                        let recovery_save = self.save_checked();
+                        Err(anyhow!(
+                            "{detail}; recovery persistence: {}",
+                            recovery_save
+                                .map(|()| "saved".to_owned())
+                                .unwrap_or_else(|save| save.to_string())
+                        )
+                        .into())
+                    }
+                };
             }
             Err(error) => Some(error),
             Ok(()) => None,
@@ -2821,8 +2846,7 @@ mod tests {
             let before = manager.repository_state.clone();
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
-            assert!(manager.remove(id).is_err());
-            assert_eq!(manager.sessions.is_empty(), committed);
+            let close_error = manager.remove(id).unwrap_err().to_string();
             assert_eq!(manager.repository_state.repositories.len(), 1);
             assert_eq!(manager.repository_state.checkouts.len(), 1);
             assert_eq!(
@@ -2834,6 +2858,8 @@ mod tests {
                 !committed
             );
             if committed {
+                assert!(manager.sessions.is_empty());
+                assert!(manager.runtime_checkouts.is_empty());
                 assert_eq!(
                     manager.repository_state.checkouts[0]
                         .session
@@ -2843,7 +2869,12 @@ mod tests {
                 );
                 assert!(manager.persistence_dirty);
             } else {
+                assert!(close_error.contains("retained runtime restarted"));
                 assert_eq!(manager.repository_state, before);
+                let compensated = *manager.runtime_checkouts.keys().next().unwrap();
+                let compensated = manager.runtime_checkouts[&compensated];
+                assert_ne!(compensated, id);
+                assert!(!manager.session(compensated).unwrap().claude.is_exited());
                 manager.kill_all();
             }
             std::fs::remove_dir_all(root).unwrap();
