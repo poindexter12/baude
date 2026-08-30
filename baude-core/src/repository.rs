@@ -148,6 +148,9 @@ pub enum ValidationError {
         first_repository: RepositoryKey,
         second_repository: RepositoryKey,
     },
+    RetainedCheckoutPathMismatch(CheckoutKey),
+    RetainedRepositoryPathMismatch(CheckoutKey),
+    RetainedWorktreeFlagMismatch(CheckoutKey),
     DanglingRepositoryKey(RepositoryKey),
     DuplicateRole {
         repository_key: RepositoryKey,
@@ -227,6 +230,11 @@ impl RepositoryState {
         let mut repository_identities = HashSet::new();
         let mut checkout_keys = HashSet::new();
         let mut checkout_owners = HashMap::new();
+        let repositories_by_key: HashMap<_, _> = self
+            .repositories
+            .iter()
+            .map(|repository| (repository.key, repository))
+            .collect();
         let mut orders = HashSet::new();
         let mut unique_roles = HashSet::new();
 
@@ -254,6 +262,20 @@ impl RepositoryState {
                 return Err(ValidationError::DanglingRepositoryKey(
                     checkout.repository_key,
                 ));
+            }
+            let repository = repositories_by_key[&checkout.repository_key];
+            if checkout.session.cwd != checkout.observed_path {
+                return Err(ValidationError::RetainedCheckoutPathMismatch(checkout.key));
+            }
+            if checkout.session.repo_root != repository.observed_main_worktree {
+                return Err(ValidationError::RetainedRepositoryPathMismatch(
+                    checkout.key,
+                ));
+            }
+            if checkout.session.is_worktree
+                != (checkout.observed_path != repository.observed_main_worktree)
+            {
+                return Err(ValidationError::RetainedWorktreeFlagMismatch(checkout.key));
             }
             if let Some(first_repository) =
                 checkout_owners.insert(&checkout.observed_path, checkout.repository_key)
@@ -405,17 +427,40 @@ mod tests {
         duplicate_ownership.repositories.push(second_repository);
         let duplicate_checkout_key = duplicate_ownership.allocate_checkout_key().unwrap();
         let duplicate_checkout_order = duplicate_ownership.allocate_first_seen_order().unwrap();
-        duplicate_ownership.checkouts.push(SavedCheckout {
+        let mut duplicate_checkout = SavedCheckout {
             key: duplicate_checkout_key,
             repository_key: second_repository_key,
             role: CheckoutRole::ManagedBranch,
             first_seen_order: duplicate_checkout_order,
             ..duplicate_ownership.checkouts[0].clone()
-        });
+        };
+        duplicate_checkout.session.repo_root = path("/other");
+        duplicate_ownership.checkouts.push(duplicate_checkout);
         assert!(matches!(
             duplicate_ownership.validate(),
             Err(ValidationError::DuplicateCheckoutOwnership { .. })
         ));
+
+        let mut mismatched_checkout = state.clone();
+        mismatched_checkout.checkouts[0].session.cwd = path("/unverified");
+        assert_eq!(
+            mismatched_checkout.validate(),
+            Err(ValidationError::RetainedCheckoutPathMismatch(checkout_key))
+        );
+
+        let mut mismatched_repository = state.clone();
+        mismatched_repository.checkouts[0].session.repo_root = path("/other");
+        assert_eq!(
+            mismatched_repository.validate(),
+            Err(ValidationError::RetainedRepositoryPathMismatch(checkout_key))
+        );
+
+        let mut mismatched_worktree = state.clone();
+        mismatched_worktree.checkouts[0].session.is_worktree = false;
+        assert_eq!(
+            mismatched_worktree.validate(),
+            Err(ValidationError::RetainedWorktreeFlagMismatch(checkout_key))
+        );
 
         let mut dangling = state.clone();
         dangling.checkouts[0].repository_key = RepositoryKey(99);

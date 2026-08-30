@@ -313,10 +313,18 @@ impl Manager {
                 continue;
             }
             let saved = checkout.session;
-            let cwd = saved.cwd.to_path_buf();
+            let cwd = checkout.observed_path.to_path_buf();
+            let repo_root = self
+                .repository_state
+                .repositories
+                .iter()
+                .find(|repository| repository.key == checkout.repository_key)
+                .expect("validated checkout repository")
+                .observed_main_worktree
+                .to_path_buf();
             match self.spawn(
                 cwd,
-                saved.repo_root.to_path_buf(),
+                repo_root,
                 saved.branch.clone(),
                 saved.is_worktree,
                 Some(&saved.name),

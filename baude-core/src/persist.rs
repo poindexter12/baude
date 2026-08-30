@@ -417,7 +417,7 @@ fn migrate_legacy(
             state.repositories.push(SavedRepository {
                 key,
                 observed_common_dir: common_dir,
-                observed_main_worktree: main_worktree,
+                observed_main_worktree: main_worktree.clone(),
                 first_seen_order,
                 health: repository_health,
             });
@@ -438,21 +438,22 @@ fn migrate_legacy(
 
         let checkout_key = state.allocate_checkout_key()?;
         let first_seen_order = state.allocate_first_seen_order()?;
+        let is_worktree = checkout_path != main_worktree;
         state.checkouts.push(SavedCheckout {
             key: checkout_key,
             repository_key,
             role: checkout_role,
             managed_by_baude,
-            observed_path: checkout_path,
+            observed_path: checkout_path.clone(),
             observed_branch,
             first_seen_order,
             active_intent: true,
             session: RetainedSessionState {
                 name: session.name,
-                cwd: PersistedPath::from_path(&session.cwd),
-                repo_root: PersistedPath::from_path(&session.repo_root),
+                cwd: checkout_path,
+                repo_root: main_worktree,
                 branch: session.branch,
-                is_worktree: session.is_worktree,
+                is_worktree,
                 shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
@@ -1087,6 +1088,7 @@ mod tests {
         fixture.state.checkouts[0].observed_path = persisted.clone();
         fixture.state.checkouts[0].session.cwd = persisted.clone();
         fixture.state.checkouts[0].session.repo_root = persisted;
+        fixture.state.checkouts[0].session.is_worktree = false;
         save_current_at(&root, "state-claude.json", &fixture).unwrap();
         let loaded = load_current_at(&root, "state-claude.json").unwrap();
         let reconciled = |path: &PersistedPath| path.to_path_buf();
