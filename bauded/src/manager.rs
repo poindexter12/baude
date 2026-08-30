@@ -958,6 +958,25 @@ impl Manager {
     pub fn session_id_for_test(&mut self, id: u64, sid: &str) {
         if let Ok(s) = self.session_mut(id) {
             s.meta.session_id = Some(sid.to_string());
+            // Keep unrelated real Claude session files for the test cwd from
+            // replacing the explicitly pinned id during the next metadata poll.
+            s.spawn_unix_ms = u64::MAX;
+        }
+    }
+
+    /// Test-only deterministic Claude metadata poll. The process running the
+    /// suite may itself select the OpenCode workspace, which must not redirect
+    /// fixtures that explicitly seed Claude hook-event files.
+    #[cfg(test)]
+    pub fn poll_claude_meta_for_test(&mut self, id: u64) {
+        if let Ok(session) = self.session_mut(id) {
+            let pid = session.claude.pid();
+            let (cwd, spawn, root) = (
+                session.cwd.clone(),
+                session.spawn_unix_ms,
+                session.repo_root.clone(),
+            );
+            session.meta.poll(&cwd, pid, spawn, &root);
         }
     }
 
@@ -1230,7 +1249,7 @@ mod tests {
         .unwrap();
         m.session_id_for_test(id, &sid);
         // Drive read_event_tail so the ring fills from the on-disk file.
-        m.poll();
+        m.poll_claude_meta_for_test(id);
 
         // The last 2 events, newest at back.
         let recent = m.activity(id, 2).unwrap();

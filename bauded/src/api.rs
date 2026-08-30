@@ -788,7 +788,7 @@ mod tests {
         {
             let mut m = lock(&state);
             m.session_id_for_test(id, &sid);
-            m.poll();
+            m.poll_claude_meta_for_test(id);
         }
         let app = super::router(Arc::clone(&state));
 
