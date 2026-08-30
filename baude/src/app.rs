@@ -2217,8 +2217,8 @@ mod clipboard_tests {
 #[cfg(test)]
 mod repository_admission_tests {
     use super::{
-        active_restore_checkouts, commit_then_spawn, local_admission_route, primary_dispatch,
-        require_same_checkout_path, checkout_for_runtime, LocalAdmissionRoute, PrimaryDispatch,
+        active_restore_checkouts, checkout_for_runtime, commit_then_spawn, local_admission_route,
+        primary_dispatch, require_same_checkout_path, LocalAdmissionRoute, PrimaryDispatch,
     };
     use baude_core::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
@@ -2293,8 +2293,10 @@ mod repository_admission_tests {
         state.checkouts[0].managed_by_baude = true;
         state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/managed/default"));
 
-        assert!(require_same_checkout_path(&state.checkouts[0], Path::new("/external/default"))
-            .is_err());
+        assert!(
+            require_same_checkout_path(&state.checkouts[0], Path::new("/external/default"))
+                .is_err()
+        );
         assert!(state.checkouts[0].managed_by_baude);
         assert_eq!(
             state.checkouts[0].observed_path.to_path_buf(),

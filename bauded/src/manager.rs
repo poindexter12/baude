@@ -363,11 +363,8 @@ impl Manager {
             .observed_common_dir
             .to_path_buf();
 
-        match git::reconcile_checkout(
-            &expected_common,
-            &expected_path,
-            expected_branch.as_deref(),
-        ) {
+        match git::reconcile_checkout(&expected_common, &expected_path, expected_branch.as_deref())
+        {
             Ok(_) => {
                 self.repository_state.checkouts[checkout_index].health = CheckoutHealth::Available;
                 self.repository_state.repositories[repository_index].health =
@@ -1199,10 +1196,8 @@ mod tests {
 
     #[test]
     fn manager_restore_reconciles_current_git_before_spawn_and_persists_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-manager-reconcile-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-reconcile-{}", std::process::id()));
         let repo = root.join("repo");
         let state_root = root.join("state");
         let _ = std::fs::remove_dir_all(&root);
@@ -1270,11 +1265,8 @@ mod tests {
             manager.repository_state.checkouts[0].health,
             CheckoutHealth::Unavailable(_)
         ));
-        let persisted = persist::load_current_at(
-            &state_root,
-            &workspace.state_file(STATE_BASE),
-        )
-        .unwrap();
+        let persisted =
+            persist::load_current_at(&state_root, &workspace.state_file(STATE_BASE)).unwrap();
         assert!(matches!(
             persisted.state.checkouts[0].health,
             CheckoutHealth::Unavailable(_)

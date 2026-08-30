@@ -244,7 +244,9 @@ fn lock_path(destination: &std::path::Path) -> PathBuf {
 fn hold_state_lock(destination: &std::path::Path) -> std::io::Result<()> {
     let path = lock_path(destination);
     let locks = HELD_STATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if locks.contains_key(&path) {
         return Ok(());
     }
@@ -423,8 +425,10 @@ fn migrate_legacy(
             key
         };
 
-        if matches!(checkout_role, CheckoutRole::Main | CheckoutRole::PrimaryDefault)
-            && !singleton_roles.insert((repository_key, checkout_role))
+        if matches!(
+            checkout_role,
+            CheckoutRole::Main | CheckoutRole::PrimaryDefault
+        ) && !singleton_roles.insert((repository_key, checkout_role))
         {
             // Legacy state permits multiple sessions in one checkout. Keep one
             // structural singleton and retain every additional session as an
