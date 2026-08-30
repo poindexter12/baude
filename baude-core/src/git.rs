@@ -1666,6 +1666,70 @@ pub enum RemovalSafety {
     Blocked(Vec<RemovalBlocker>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRemoval {
+    removed_path: PathBuf,
+    branch_ref: String,
+    branch_oid: String,
+}
+
+impl VerifiedRemoval {
+    pub fn removed_path(&self) -> &Path {
+        &self.removed_path
+    }
+
+    pub fn branch_ref(&self) -> &str {
+        &self.branch_ref
+    }
+
+    pub fn branch_oid(&self) -> &str {
+        &self.branch_oid
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemovalPostconditionFailure {
+    RepositoryUnavailable(String),
+    ParentIdentityChanged,
+    InventoryStillPresent(PathBuf),
+    PathPresent(PathBuf),
+    PathInspection { path: PathBuf, detail: String },
+    BranchUnavailable(String),
+    BranchChanged { expected: String, observed: String },
+}
+
+#[derive(Debug)]
+pub enum RemoveVerifiedError {
+    CommandStart(std::io::Error),
+    GitRefused { status: Option<i32>, stderr: String },
+    Postcondition(RemovalPostconditionFailure),
+}
+
+impl fmt::Display for RemoveVerifiedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandStart(error) => write!(f, "start Git worktree removal: {error}"),
+            Self::GitRefused { status, stderr } => write!(
+                f,
+                "plain Git worktree removal refused (status {}): {stderr}",
+                status.map_or_else(|| "signal".to_owned(), |code| code.to_string())
+            ),
+            Self::Postcondition(failure) => {
+                write!(f, "worktree removal postcondition failed: {failure:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveVerifiedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandStart(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// External inspection failed, so removal authorization cannot be issued.
 #[derive(Debug)]
 pub enum InspectionError {
@@ -2145,22 +2209,102 @@ pub fn inspect_removal(
     }))
 }
 
-/// Invoke plain, non-force Git removal for a target produced by `inspect_removal`.
-pub fn remove_verified_worktree(target: &VerifiedRemovalTarget) -> Result<()> {
+fn verified_remove_arguments() -> [&'static OsStr; 3] {
+    [
+        OsStr::new("worktree"),
+        OsStr::new("remove"),
+        OsStr::new("--"),
+    ]
+}
+
+fn verify_removal_postconditions(
+    target: &VerifiedRemovalTarget,
+) -> std::result::Result<VerifiedRemoval, RemoveVerifiedError> {
+    let fresh = discover_repository(&target.main_worktree).map_err(|error| {
+        RemoveVerifiedError::Postcondition(RemovalPostconditionFailure::RepositoryUnavailable(
+            error.to_string(),
+        ))
+    })?;
+    if fresh.common_dir != target.common_dir || fresh.main_worktree != target.main_worktree {
+        return Err(RemoveVerifiedError::Postcondition(
+            RemovalPostconditionFailure::ParentIdentityChanged,
+        ));
+    }
+    if fresh
+        .worktrees
+        .iter()
+        .any(|record| record.path == target.path)
+    {
+        return Err(RemoveVerifiedError::Postcondition(
+            RemovalPostconditionFailure::InventoryStillPresent(target.path.clone()),
+        ));
+    }
+    match std::fs::symlink_metadata(&target.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(RemoveVerifiedError::Postcondition(
+                RemovalPostconditionFailure::PathPresent(target.path.clone()),
+            ));
+        }
+        Err(error) => {
+            return Err(RemoveVerifiedError::Postcondition(
+                RemovalPostconditionFailure::PathInspection {
+                    path: target.path.clone(),
+                    detail: error.to_string(),
+                },
+            ));
+        }
+    }
+    let revision = OsString::from(format!("{}^{{commit}}", target.branch_ref));
+    let observed = removal_oid(&target.main_worktree, &revision).map_err(|error| {
+        RemoveVerifiedError::Postcondition(RemovalPostconditionFailure::BranchUnavailable(
+            error.to_string(),
+        ))
+    })?;
+    if observed != target.branch_oid {
+        return Err(RemoveVerifiedError::Postcondition(
+            RemovalPostconditionFailure::BranchChanged {
+                expected: target.branch_oid.clone(),
+                observed,
+            },
+        ));
+    }
+    Ok(VerifiedRemoval {
+        removed_path: target.path.clone(),
+        branch_ref: target.branch_ref.clone(),
+        branch_oid: target.branch_oid.clone(),
+    })
+}
+
+fn remove_verified_worktree_with_post_remove_hook(
+    target: &VerifiedRemovalTarget,
+    after_remove: impl FnOnce(),
+) -> std::result::Result<VerifiedRemoval, RemoveVerifiedError> {
+    let arguments = verified_remove_arguments();
     let output = Command::new("git")
         .arg("-C")
         .arg(&target.main_worktree)
-        .args(["worktree", "remove", "--"])
+        .args(arguments)
         .arg(&target.path)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "git worktree remove: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        .output()
+        .map_err(RemoveVerifiedError::CommandStart)?;
+    if !output.status.success() {
+        return Err(RemoveVerifiedError::GitRefused {
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
     }
+    after_remove();
+    verify_removal_postconditions(target)
+}
+
+/// Invoke plain, non-force Git removal for a target produced by `inspect_removal`,
+/// then prove the exact path/inventory record disappeared while its parent and
+/// unchanged local branch remain.
+pub fn remove_verified_worktree(
+    target: &VerifiedRemovalTarget,
+) -> std::result::Result<VerifiedRemoval, RemoveVerifiedError> {
+    remove_verified_worktree_with_post_remove_hook(target, || {})
 }
 
 pub fn is_dirty(worktree: &Path) -> bool {
@@ -2183,10 +2327,11 @@ mod tests {
         managed_branch_worktree_path, new_branch_add_arguments, parse_clone_target,
         parse_removal_status, parse_submodule_status, parse_worktree_porcelain, reconcile_checkout,
         removal_status_arguments, remove_verified_worktree,
-        remove_verified_worktree_with_post_remove_hook, resolve_default_branch, BranchActivation,
-        BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
-        DefaultWorktreeOutcome, InspectionError, ReconciliationUnavailable, RemovalBlocker,
-        RemovalPostconditionFailure, RemovalSafety, RemoveVerifiedError,
+        remove_verified_worktree_with_post_remove_hook, resolve_default_branch,
+        verified_remove_arguments, BranchActivation, BranchActivationError,
+        BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
+        ReconciliationUnavailable, RemovalBlocker, RemovalPostconditionFailure, RemovalSafety,
+        RemoveVerifiedError,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2840,7 +2985,11 @@ mod tests {
                 SavedCheckout,
             };
 
-            pub(super) fn saved_checkout(path: &Path, branch: &str, managed: bool) -> SavedCheckout {
+            pub(super) fn saved_checkout(
+                path: &Path,
+                branch: &str,
+                managed: bool,
+            ) -> SavedCheckout {
                 let mut state = RepositoryState::default();
                 let repository_key = state.allocate_repository_key().unwrap();
                 let checkout_key = state.allocate_checkout_key().unwrap();
@@ -3084,7 +3233,13 @@ mod tests {
             fn verified_target(
                 fixture: &GitFixture,
                 label: &str,
-            ) -> (PathBuf, PathBuf, String, String, crate::git::VerifiedRemovalTarget) {
+            ) -> (
+                PathBuf,
+                PathBuf,
+                String,
+                String,
+                crate::git::VerifiedRemovalTarget,
+            ) {
                 let repo = fixture.repo(format!("{label} repo"));
                 let linked = fixture.linked_worktree(
                     &repo,
@@ -3096,8 +3251,11 @@ mod tests {
                 let checkout = removal_topology::saved_checkout(&linked, &branch, true);
                 let target = match inspect_removal(&snapshot.common_dir, &checkout).unwrap() {
                     RemovalSafety::Safe(target) => target,
-                    RemovalSafety::Blocked(blockers) => panic!("clean target blocked: {blockers:?}"),
+                    RemovalSafety::Blocked(blockers) => {
+                        panic!("clean target blocked: {blockers:?}")
+                    }
                 };
+                let linked = target.path().to_path_buf();
                 let oid = target.branch_oid().to_owned();
                 (repo, linked, branch, oid, target)
             }
@@ -3107,11 +3265,24 @@ mod tests {
                 let fixture = GitFixture::new();
                 let (repo, linked, branch, oid, target) =
                     verified_target(&fixture, "remove postconditions");
-                let sibling = fixture.linked_worktree(&repo, "preserved sibling", "sibling-branch");
+                let sibling = fixture
+                    .linked_worktree(&repo, "preserved sibling", "sibling-branch")
+                    .canonicalize()
+                    .unwrap();
+                let arguments = verified_remove_arguments();
+                assert_eq!(
+                    arguments,
+                    [
+                        OsStr::new("worktree"),
+                        OsStr::new("remove"),
+                        OsStr::new("--")
+                    ]
+                );
+                assert!(!arguments.contains(&OsStr::new("--force")));
 
                 let outcome = remove_verified_worktree(&target).unwrap();
 
-                assert_eq!(outcome.removed_path(), linked.canonicalize().unwrap_or(linked.clone()));
+                assert_eq!(outcome.removed_path(), linked);
                 assert_eq!(outcome.branch_ref(), branch);
                 assert_eq!(outcome.branch_oid(), oid);
                 assert!(repo.is_dir());
@@ -3150,7 +3321,10 @@ mod tests {
                 let (repo, _, branch, oid, target) = verified_target(&fixture, "changed branch");
                 std::fs::write(repo.join("later"), b"later\n").unwrap();
                 git_ok(&repo, &[OsStr::new("add"), OsStr::new("later")]);
-                git_ok(&repo, &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("later")]);
+                git_ok(
+                    &repo,
+                    &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("later")],
+                );
                 let later = git_ok(&repo, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
                 let later = String::from_utf8(later).unwrap().trim().to_owned();
 
