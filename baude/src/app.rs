@@ -1811,3 +1811,47 @@ mod clipboard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod repository_admission_tests {
+    use super::{commit_then_spawn, primary_dispatch, PrimaryDispatch};
+
+    #[test]
+    fn repository_admission_dispatches_every_primary_state() {
+        assert_eq!(primary_dispatch(true, Some((7, false))), PrimaryDispatch::Focus(7));
+        assert_eq!(primary_dispatch(true, Some((7, true))), PrimaryDispatch::Restart(7));
+        assert_eq!(primary_dispatch(true, None), PrimaryDispatch::Spawn);
+        assert_eq!(primary_dispatch(false, None), PrimaryDispatch::Idle);
+    }
+
+    #[test]
+    fn repository_admission_saves_before_spawn_and_blocks_spawn_on_save_error() {
+        let mut events = Vec::new();
+        commit_then_spawn(
+            || {
+                events.push("save");
+                Ok::<_, &'static str>(())
+            },
+            || {
+                events.push("spawn");
+                Ok::<_, &'static str>(23)
+            },
+        )
+        .unwrap();
+        assert_eq!(events, ["save", "spawn"]);
+
+        events.clear();
+        let result = commit_then_spawn(
+            || {
+                events.push("save");
+                Err::<(), _>("disk full")
+            },
+            || {
+                events.push("spawn");
+                Ok(23)
+            },
+        );
+        assert_eq!(result, Err("disk full"));
+        assert_eq!(events, ["save"]);
+    }
+}
