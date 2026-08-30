@@ -176,7 +176,174 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_clone_target;
+    use super::{discover_repository, parse_clone_target, parse_worktree_porcelain};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct GitFixture {
+        root: PathBuf,
+    }
+
+    impl GitFixture {
+        fn new() -> Self {
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "baude-git-test-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).expect("create unique Git fixture root");
+            Self { root }
+        }
+
+        fn repo(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let repo = self.root.join(relative);
+            git_ok(&self.root, &[OsStr::new("init"), repo.as_os_str()]);
+            git_ok(
+                &repo,
+                &[OsStr::new("config"), OsStr::new("user.name"), OsStr::new("Baude Test")],
+            );
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("user.email"),
+                    OsStr::new("baude@example.invalid"),
+                ],
+            );
+            std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
+            git_ok(&repo, &[OsStr::new("add"), OsStr::new("tracked.txt")]);
+            git_ok(
+                &repo,
+                &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("fixture")],
+            );
+            repo
+        }
+
+        fn linked_worktree(&self, repo: &Path, relative: impl AsRef<Path>, branch: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            git_ok(
+                repo,
+                &[OsStr::new("branch"), OsStr::new(branch)],
+            );
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    path.as_os_str(),
+                    OsStr::new(branch),
+                ],
+            );
+            path
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git_ok(cwd: &Path, args: &[&OsStr]) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("run fixture Git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    mod admission_identity {
+        use super::*;
+
+        #[test]
+        fn aliases_converge_on_common_directory_and_main_record() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("main repo");
+            let nested = repo.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            let linked = fixture.linked_worktree(&repo, "linked checkout", "linked");
+
+            let mut inputs = vec![repo.clone(), nested, linked];
+            #[cfg(unix)]
+            {
+                let alias = fixture.root.join("repo alias");
+                std::os::unix::fs::symlink(&repo, &alias).unwrap();
+                inputs.push(alias);
+            }
+
+            let snapshots: Vec<_> = inputs
+                .iter()
+                .map(|path| discover_repository(path).unwrap())
+                .collect();
+            let expected_common = snapshots[0].common_dir.clone();
+            let expected_main = snapshots[0].main_worktree.clone();
+            for snapshot in snapshots {
+                assert_eq!(snapshot.common_dir, expected_common);
+                assert_eq!(snapshot.main_worktree, expected_main);
+                assert_eq!(snapshot.worktrees.first().unwrap().path, expected_main);
+                assert!(snapshot.worktrees.contains(&snapshot.selected_worktree));
+            }
+        }
+
+        #[test]
+        fn repositories_with_the_same_basename_remain_distinct() {
+            let fixture = GitFixture::new();
+            let first = fixture.repo("first/same-name");
+            let second = fixture.repo("second/same-name");
+
+            let first = discover_repository(&first).unwrap();
+            let second = discover_repository(&second).unwrap();
+            assert_ne!(first.common_dir, second.common_dir);
+            assert_ne!(first.main_worktree, second.main_worktree);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn nul_inventory_preserves_spaces_and_newlines_in_paths() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("unusual repo");
+            let linked = fixture.linked_worktree(&repo, "linked space\nline", "unusual");
+
+            let snapshot = discover_repository(&linked).unwrap();
+            assert_eq!(snapshot.selected_worktree.path, linked.canonicalize().unwrap());
+            assert!(snapshot
+                .worktrees
+                .iter()
+                .any(|record| record.path == linked.canonicalize().unwrap()));
+        }
+
+        #[test]
+        fn malformed_porcelain_fails_closed() {
+            let malformed = b"worktree /tmp/example\0HEAD deadbeef\0branch refs/heads/main\0";
+            assert!(parse_worktree_porcelain(malformed).is_err());
+        }
+
+        #[test]
+        fn invalid_inputs_are_actionable_and_non_mutating() {
+            let fixture = GitFixture::new();
+            let ordinary = fixture.root.join("ordinary");
+            std::fs::create_dir(&ordinary).unwrap();
+            let missing = fixture.root.join("missing");
+
+            let ordinary_error = discover_repository(&ordinary).unwrap_err().to_string();
+            assert!(ordinary_error.contains("Git") || ordinary_error.contains("repository"));
+            let missing_error = discover_repository(&missing).unwrap_err().to_string();
+            assert!(missing_error.contains("canonicalize"));
+            assert!(!missing.exists());
+        }
+    }
 
     fn parts(input: &str) -> (String, String, String, String) {
         let t = parse_clone_target(input).expect(input);
