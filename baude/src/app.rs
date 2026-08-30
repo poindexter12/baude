@@ -1774,12 +1774,17 @@ impl App {
             Err(error) if !error.replacement_committed() => {
                 self.repository_state = before;
                 self.persistence_dirty = true;
-                self.forget_stopped_runtime(checkout_key, id);
-                match self.restore_removed_runtime(checkout_key, snapshot) {
-                    Ok(runtime) => Err(anyhow::anyhow!(
-                        "{error}; close persistence rolled back and retained runtime restarted as {runtime}"
+                let mode = snapshot
+                    .resume_id
+                    .clone()
+                    .map(backend::SpawnMode::ResumeId)
+                    .unwrap_or(backend::SpawnMode::ContinueLatest);
+                match self.restart_session_with_mode(id, mode) {
+                    Ok(()) => Err(anyhow::anyhow!(
+                        "{error}; close persistence rolled back and retained runtime {id} restarted"
                     )),
                     Err(restart) => {
+                        self.forget_stopped_runtime(checkout_key, id);
                         let detail = format!(
                             "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
                         );
@@ -3797,10 +3802,10 @@ mod repository_admission_tests {
                 );
                 assert!(app.persistence_dirty);
             } else {
-                assert!(close_error.contains("retained runtime restarted"));
+                assert!(close_error.contains(&format!("runtime {runtime} restarted")));
                 assert_eq!(app.repository_state, before);
                 let compensated = *app.runtime_checkouts.get(&checkout).unwrap();
-                assert_ne!(compensated, runtime);
+                assert_eq!(compensated, runtime);
                 assert!(!app.session(compensated).unwrap().claude.is_exited());
                 assert!(pid_is_live(
                     app.session(compensated).unwrap().claude.pid().unwrap()

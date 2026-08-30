@@ -1514,13 +1514,15 @@ impl Manager {
         let save_error = match self.save_checked() {
             Err(error) if !error.replacement_committed() => {
                 self.repository_state = state_before;
-                self.forget_stopped_runtime(checkout_key, id);
-                return match self.restore_removed_runtime(checkout_key, snapshot) {
-                    Ok(runtime) => Err(anyhow!(
-                        "{error}; close persistence rolled back and retained runtime restarted as {runtime}"
-                    )
-                    .into()),
+                let mode = snapshot
+                    .resume_id
+                    .clone()
+                    .map(backend::SpawnMode::ResumeId)
+                    .unwrap_or(backend::SpawnMode::ContinueLatest);
+                return match self.restart_with_mode(id, mode) {
+                    Ok(()) => Err(MutationError::Persistence(error)),
                     Err(restart) => {
+                        self.forget_stopped_runtime(checkout_key, id);
                         let detail = format!(
                             "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
                         );
@@ -2885,11 +2887,11 @@ mod tests {
                 );
                 assert!(manager.persistence_dirty);
             } else {
-                assert!(close_error.contains("retained runtime restarted"));
+                assert!(!close_error.is_empty());
                 assert_eq!(manager.repository_state, before);
                 let compensated = *manager.runtime_checkouts.keys().next().unwrap();
                 let compensated = manager.runtime_checkouts[&compensated];
-                assert_ne!(compensated, id);
+                assert_eq!(compensated, id);
                 assert!(!manager.session(compensated).unwrap().claude.is_exited());
                 assert!(pid_is_live(
                     manager.session(compensated).unwrap().claude.pid().unwrap()
