@@ -627,10 +627,9 @@ impl Manager {
             role: CheckoutRole::ManagedBranch,
             managed_by_baude: session.is_worktree,
             observed_path: PersistedPath::from_path(&session.cwd),
-            observed_branch: session
-                .branch
+            observed_branch: snapshot
                 .as_ref()
-                .map(|branch| format!("refs/heads/{branch}")),
+                .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
             first_seen_order,
             active_intent: true,
             session: RetainedSessionState {
@@ -855,19 +854,36 @@ impl Manager {
         if self.persistence_blocked {
             bail!("daemon persistence is blocked after a state load failure");
         }
+        if !self.session(id)?.claude.is_exited() {
+            bail!("claude is still running");
+        }
+        if let Some(checkout_key) = self.runtime_checkouts.iter().find_map(|(key, runtime_id)| {
+            (*runtime_id == id).then_some(*key)
+        }) {
+            let reconciled = self.reconcile_checkout(checkout_key);
+            self.save();
+            if self.persistence_dirty {
+                bail!("checkout reconciliation could not be persisted; restart refused");
+            }
+            if !reconciled {
+                bail!("checkout changed since admission; restart refused");
+            }
+        }
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), true);
         let s = self.session_mut(id)?;
-        if !s.claude.is_exited() {
-            bail!("claude is still running");
-        }
         be.prepare_cwd(&s.cwd);
         s.claude = Pty::spawn(Some(&plan.cmd), &s.cwd, ROWS, COLS)?;
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_runtime_for_test(&mut self, id: u64) {
+        self.record_runtime(id).unwrap();
     }
 
     /// Local port of the session's backend server (opencode), if it runs one.

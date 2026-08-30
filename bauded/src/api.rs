@@ -644,7 +644,10 @@ async fn activity_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
@@ -671,6 +674,42 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json.to_string()))
             .unwrap()
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn initialized_repo(root: &Path, name: &str) -> std::path::PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn exited_tracked_manager(repo: &Path) -> (crate::manager::Shared, u64) {
+        let state = Arc::new(Mutex::new(Manager::new("true".into(), false)));
+        let id = crate::manager::lock(&state)
+            .create(repo.to_str().unwrap(), None, None)
+            .unwrap()
+            .id;
+        crate::manager::lock(&state).track_runtime_for_test(id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::manager::lock(&state).info(id).unwrap().status != "exited" {
+            assert!(Instant::now() < deadline, "stub never exited");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (state, id)
     }
 
     #[tokio::test]
@@ -716,6 +755,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn restart_api_refuses_checkout_branch_change() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-api-restart-branch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = initialized_repo(&root, "repo");
+        let (state, id) = exited_tracked_manager(&repo);
+        git(&repo, &["checkout", "-b", "changed"]);
+
+        let response = super::router(Arc::clone(&state))
+            .oneshot(post_json(&format!("/sessions/{id}/restart"), ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(crate::manager::lock(&state).info(id).unwrap().status, "exited");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_api_refuses_replaced_repository_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "bauded-api-restart-replaced-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = initialized_repo(&root, "repo");
+        let replacement = initialized_repo(&root, "replacement");
+        let (state, id) = exited_tracked_manager(&repo);
+        std::fs::rename(&repo, root.join("original")).unwrap();
+        symlink(&replacement, &repo).unwrap();
+
+        let response = super::router(Arc::clone(&state))
+            .oneshot(post_json(&format!("/sessions/{id}/restart"), ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(crate::manager::lock(&state).info(id).unwrap().status, "exited");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
