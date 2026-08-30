@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,10 @@ pub fn load_for_workspace_strict_at(
 ) -> std::result::Result<LoadOutcome, LoadError> {
     let primary_file = ws.state_file(base);
     let primary_path = root.join(&primary_file);
+    hold_state_lock(&primary_path).map_err(|source| LoadError::Read {
+        path: lock_path(&primary_path),
+        source,
+    })?;
     let (source_path, bytes) = match read_state_source(&primary_path)? {
         Some(bytes) => (primary_path.clone(), bytes),
         None => match ws.legacy_state_file(base) {
@@ -226,6 +231,36 @@ pub fn save_current_at_test(
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+static HELD_STATE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+
+fn lock_path(destination: &std::path::Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("state"))
+        .to_string_lossy();
+    destination.with_file_name(format!(".{name}.lock"))
+}
+
+fn hold_state_lock(destination: &std::path::Path) -> std::io::Result<()> {
+    let path = lock_path(destination);
+    let locks = HELD_STATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if locks.contains_key(&path) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    lock.try_lock()?;
+    locks.insert(path, lock);
+    Ok(())
+}
 
 fn atomic_save_current(
     root: &std::path::Path,
@@ -240,6 +275,7 @@ fn atomic_save_current(
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    hold_state_lock(&destination)?;
 
     let mut first_temp = first_temp;
     let (temporary, output) = loop {
@@ -905,6 +941,30 @@ mod tests {
             load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
             Err(LoadError::Read { ref path, .. }) if path == &primary
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn second_workspace_owner_cannot_load_while_writer_lock_is_held() {
+        let root = isolated_root("writer-lock");
+        let workspace = test_workspace("claude");
+        let destination = root.join(workspace.state_file("state"));
+        let lock_path = lock_path(&destination);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::Read { ref path, ref source })
+                if path == &lock_path && source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        lock.unlock().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
