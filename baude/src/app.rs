@@ -741,13 +741,26 @@ impl App {
         let expected_common = self.repository_state.repositories[repository_index]
             .observed_common_dir
             .clone();
-        let snapshot = match git::discover_repository(&path) {
+        match git::reconcile_checkout(
+            &expected_common.to_path_buf(),
+            &path,
+            expected_branch.as_deref(),
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let cause = if path.exists() {
-                    UnavailableCause::Other(error.to_string())
-                } else {
+                let cause = if matches!(error, git::ReconciliationUnavailable::Missing { .. }) {
                     UnavailableCause::Missing
+                } else if matches!(
+                    error,
+                    git::ReconciliationUnavailable::IdentityChanged { .. }
+                        | git::ReconciliationUnavailable::PathChanged { .. }
+                        | git::ReconciliationUnavailable::BranchChanged { .. }
+                        | git::ReconciliationUnavailable::Detached
+                        | git::ReconciliationUnavailable::LockedOrPrunable
+                ) {
+                    UnavailableCause::IdentityChanged
+                } else {
+                    UnavailableCause::Other(error.to_string())
                 };
                 self.repository_state.checkouts[index].health =
                     CheckoutHealth::Unavailable(cause.clone());
@@ -756,20 +769,6 @@ impl App {
                 return false;
             }
         };
-        let selected = &snapshot.selected_worktree;
-        if PersistedPath::from_path(&snapshot.common_dir) != expected_common
-            || selected.path != path
-            || selected.branch != expected_branch
-            || selected.detached
-            || selected.locked
-            || selected.prunable
-        {
-            self.repository_state.checkouts[index].health =
-                CheckoutHealth::Unavailable(UnavailableCause::IdentityChanged);
-            self.repository_state.repositories[repository_index].health =
-                RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged);
-            return false;
-        }
         self.repository_state.checkouts[index].health = CheckoutHealth::Available;
         self.repository_state.repositories[repository_index].health = RepositoryHealth::Available;
         true

@@ -356,6 +356,112 @@ pub fn discover_repository(
     })
 }
 
+/// A persisted checkout observation that no longer authorizes reuse or launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconciliationUnavailable {
+    Missing {
+        path: PathBuf,
+    },
+    Discovery {
+        path: PathBuf,
+        detail: String,
+    },
+    IdentityChanged {
+        expected_common_dir: PathBuf,
+        observed_common_dir: PathBuf,
+    },
+    PathChanged {
+        expected: PathBuf,
+        observed: PathBuf,
+    },
+    BranchChanged {
+        expected: Option<String>,
+        observed: Option<String>,
+    },
+    Detached,
+    LockedOrPrunable,
+}
+
+impl fmt::Display for ReconciliationUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { path } => write!(f, "checkout {} is missing", path.display()),
+            Self::Discovery { path, detail } => {
+                write!(f, "cannot inspect checkout {}: {detail}", path.display())
+            }
+            Self::IdentityChanged {
+                expected_common_dir,
+                observed_common_dir,
+            } => write!(
+                f,
+                "repository identity changed from {} to {}",
+                expected_common_dir.display(),
+                observed_common_dir.display()
+            ),
+            Self::PathChanged { expected, observed } => write!(
+                f,
+                "registered checkout path changed from {} to {}",
+                expected.display(),
+                observed.display()
+            ),
+            Self::BranchChanged { expected, observed } => {
+                write!(
+                    f,
+                    "checkout branch changed from {expected:?} to {observed:?}"
+                )
+            }
+            Self::Detached => write!(f, "checkout is detached"),
+            Self::LockedOrPrunable => write!(f, "checkout is locked or prunable"),
+        }
+    }
+}
+
+impl std::error::Error for ReconciliationUnavailable {}
+
+/// Rediscover and compare every Git-owned fact that authorizes checkout reuse.
+pub fn reconcile_checkout(
+    expected_common_dir: &Path,
+    expected_path: &Path,
+    expected_branch: Option<&str>,
+) -> std::result::Result<RepositorySnapshot, ReconciliationUnavailable> {
+    if !expected_path.exists() {
+        return Err(ReconciliationUnavailable::Missing {
+            path: expected_path.to_path_buf(),
+        });
+    }
+    let snapshot = discover_repository(expected_path).map_err(|error| {
+        ReconciliationUnavailable::Discovery {
+            path: expected_path.to_path_buf(),
+            detail: error.to_string(),
+        }
+    })?;
+    if snapshot.common_dir != expected_common_dir {
+        return Err(ReconciliationUnavailable::IdentityChanged {
+            expected_common_dir: expected_common_dir.to_path_buf(),
+            observed_common_dir: snapshot.common_dir.clone(),
+        });
+    }
+    if snapshot.selected_worktree.path != expected_path {
+        return Err(ReconciliationUnavailable::PathChanged {
+            expected: expected_path.to_path_buf(),
+            observed: snapshot.selected_worktree.path.clone(),
+        });
+    }
+    if snapshot.selected_worktree.locked || snapshot.selected_worktree.prunable {
+        return Err(ReconciliationUnavailable::LockedOrPrunable);
+    }
+    if snapshot.selected_worktree.detached {
+        return Err(ReconciliationUnavailable::Detached);
+    }
+    if snapshot.selected_worktree.branch.as_deref() != expected_branch {
+        return Err(ReconciliationUnavailable::BranchChanged {
+            expected: expected_branch.map(str::to_owned),
+            observed: snapshot.selected_worktree.branch.clone(),
+        });
+    }
+    Ok(snapshot)
+}
+
 /// A locally verified remote default and its exact local/remote ref names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefaultBranch {
@@ -1509,6 +1615,7 @@ mod tests {
             let expected = discover_repository(&linked).unwrap();
             let common = expected.common_dir.clone();
             let branch = expected.selected_worktree.branch.clone().unwrap();
+            let linked = expected.selected_worktree.path;
 
             git_ok(&linked, &[OsStr::new("checkout"), OsStr::new("--detach")]);
             assert!(matches!(
@@ -1517,7 +1624,14 @@ mod tests {
                     | Err(ReconciliationUnavailable::BranchChanged { .. })
             ));
 
-            git_ok(&repo, &[OsStr::new("worktree"), OsStr::new("lock"), linked.as_os_str()]);
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("lock"),
+                    linked.as_os_str(),
+                ],
+            );
             assert!(matches!(
                 reconcile_checkout(&common, &linked, None),
                 Err(ReconciliationUnavailable::LockedOrPrunable)
