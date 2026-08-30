@@ -29,14 +29,6 @@ const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrimaryDispatch {
-    Focus(u64),
-    Restart(u64),
-    Spawn,
-    Idle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalAdmissionRoute {
     LaunchDirectory,
     Open,
@@ -45,15 +37,6 @@ enum LocalAdmissionRoute {
 
 fn local_admission_route(_route: LocalAdmissionRoute, remote_configured: bool) -> bool {
     !remote_configured
-}
-
-fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> PrimaryDispatch {
-    match runtime {
-        Some((id, false)) => PrimaryDispatch::Focus(id),
-        Some((id, true)) => PrimaryDispatch::Restart(id),
-        None if active_intent => PrimaryDispatch::Spawn,
-        None => PrimaryDispatch::Idle,
-    }
 }
 
 fn active_restore_checkouts(state: &RepositoryState) -> Vec<CheckoutKey> {
@@ -83,15 +66,6 @@ fn checkout_for_runtime(
     runtime_checkouts
         .iter()
         .find_map(|(key, id)| (*id == runtime_id).then_some(*key))
-}
-
-fn commit_then_spawn<C, T, E>(
-    context: &mut C,
-    save: impl FnOnce(&mut C) -> std::result::Result<(), E>,
-    spawn: impl FnOnce(&mut C) -> std::result::Result<T, E>,
-) -> std::result::Result<T, E> {
-    save(context)?;
-    spawn(context)
 }
 
 fn reconcile_legacy_session(
@@ -2513,8 +2487,8 @@ mod clipboard_tests {
 #[cfg(test)]
 mod repository_admission_tests {
     use super::{
-        active_restore_checkouts, checkout_for_runtime, commit_then_spawn, local_admission_route,
-        primary_dispatch, require_same_checkout_path, App, LocalAdmissionRoute, PrimaryDispatch,
+        active_restore_checkouts, checkout_for_runtime, local_admission_route,
+        require_same_checkout_path, App, LocalAdmissionRoute,
     };
     use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
     use baude_core::repository::{
@@ -2662,53 +2636,6 @@ mod repository_admission_tests {
 
         assert_eq!(checkout_for_runtime(&runtimes, 41), Some(checkout_key));
         assert_eq!(checkout_for_runtime(&runtimes, 99), None);
-    }
-
-    #[test]
-    fn repository_admission_dispatches_every_primary_state() {
-        assert_eq!(
-            primary_dispatch(true, Some((7, false))),
-            PrimaryDispatch::Focus(7)
-        );
-        assert_eq!(
-            primary_dispatch(true, Some((7, true))),
-            PrimaryDispatch::Restart(7)
-        );
-        assert_eq!(primary_dispatch(true, None), PrimaryDispatch::Spawn);
-        assert_eq!(primary_dispatch(false, None), PrimaryDispatch::Idle);
-    }
-
-    #[test]
-    fn repository_admission_saves_before_spawn_and_blocks_spawn_on_save_error() {
-        let events = std::cell::RefCell::new(Vec::new());
-        commit_then_spawn(
-            &mut (),
-            |_| {
-                events.borrow_mut().push("save");
-                Ok::<_, &'static str>(())
-            },
-            |_| {
-                events.borrow_mut().push("spawn");
-                Ok::<_, &'static str>(23)
-            },
-        )
-        .unwrap();
-        assert_eq!(*events.borrow(), ["save", "spawn"]);
-
-        events.borrow_mut().clear();
-        let result = commit_then_spawn(
-            &mut (),
-            |_| {
-                events.borrow_mut().push("save");
-                Err::<(), _>("disk full")
-            },
-            |_| {
-                events.borrow_mut().push("spawn");
-                Ok(23)
-            },
-        );
-        assert_eq!(result, Err("disk full"));
-        assert_eq!(*events.borrow(), ["save"]);
     }
 
     #[test]
