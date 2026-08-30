@@ -24,6 +24,63 @@ pub enum LoadOutcome {
     Current(StateFile),
 }
 
+#[derive(Debug)]
+pub enum LoadError {
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Malformed {
+        path: PathBuf,
+        cause: String,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u64,
+    },
+    InvalidState {
+        path: PathBuf,
+        cause: String,
+    },
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(f, "read {}: {source}", path.display()),
+            Self::Malformed { path, cause } => {
+                write!(f, "malformed state {}: {cause}", path.display())
+            }
+            Self::UnsupportedVersion { path, version } => {
+                write!(
+                    f,
+                    "unsupported state schema version {version} in {}",
+                    path.display()
+                )
+            }
+            Self::InvalidState { path, cause } => {
+                write!(f, "invalid state {}: {cause}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicFailure {
+    Write,
+    Sync,
+    Rename,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyReconciliation {
     Available {
@@ -63,6 +120,31 @@ pub fn load_current_at(root: &std::path::Path, file: &str) -> Result<StateFile> 
     let state: StateFile = serde_json::from_slice(&std::fs::read(root.join(file))?)?;
     state.state.validate()?;
     Ok(state)
+}
+
+pub fn load_for_workspace_strict_at(
+    _root: &std::path::Path,
+    _base: &str,
+    _ws: &crate::workspace::Workspace,
+    _reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+) -> std::result::Result<LoadOutcome, LoadError> {
+    // RED: strict decoding is implemented in the GREEN commit.
+    Ok(LoadOutcome::Missing)
+}
+
+#[doc(hidden)]
+pub fn save_current_at_test(
+    root: &std::path::Path,
+    file: &str,
+    state: &StateFile,
+    failure: Option<AtomicFailure>,
+    _first_temp: Option<PathBuf>,
+) -> Result<()> {
+    save_current_at(root, file, state)?;
+    if let Some(failure) = failure {
+        anyhow::bail!("injected {failure:?} failure");
+    }
+    Ok(())
 }
 
 /// Select and migrate exactly one workspace-owned source under an injected root.
@@ -557,6 +639,122 @@ mod tests {
     #[test]
     fn legacy_migration_daemon() {
         assert_legacy_migration("daemon-state");
+    }
+
+    #[test]
+    fn atomic_load_errors_are_not_first_run() {
+        let root = isolated_root("atomic-load");
+        let workspace = test_workspace("claude");
+        let primary = root.join(workspace.state_file("state"));
+
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy).unwrap(),
+            LoadOutcome::Missing
+        ));
+
+        for bytes in [b"{".as_slice(), b"not json".as_slice()] {
+            std::fs::write(&primary, bytes).unwrap();
+            assert!(matches!(
+                load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+                Err(LoadError::Malformed { ref path, .. }) if path == &primary
+            ));
+        }
+
+        std::fs::write(
+            &primary,
+            br#"{"schema_version":99,"state":{"next_repository_key":1,"next_checkout_key":1,"next_first_seen_order":1,"repositories":[],"checkouts":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::UnsupportedVersion { ref path, version: 99 }) if path == &primary
+        ));
+
+        std::fs::write(&primary, br#"{"schema_version":1,"state":{}}"#).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::Malformed { ref path, .. }) if path == &primary
+        ));
+
+        let mut invalid = current_fixture("invalid");
+        invalid
+            .state
+            .repositories
+            .push(invalid.state.repositories[0].clone());
+        std::fs::write(&primary, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::InvalidState { ref path, .. }) if path == &primary
+        ));
+
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::create_dir(&primary).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::Read { ref path, .. }) if path == &primary
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_replacement_preserves_old_bytes_and_owned_temp_only() {
+        let root = isolated_root("atomic-replace");
+        let destination = root.join("state-claude.json");
+        let old = b"old destination bytes";
+        let fixture = current_fixture("replacement");
+
+        for failure in [
+            AtomicFailure::Write,
+            AtomicFailure::Sync,
+            AtomicFailure::Rename,
+        ] {
+            std::fs::write(&destination, old).unwrap();
+            assert!(save_current_at_test(
+                &root,
+                "state-claude.json",
+                &fixture,
+                Some(failure),
+                None,
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&destination).unwrap(), old);
+            assert!(
+                std::fs::read_dir(&root)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")),
+                "failed attempt must clean only its owned temp"
+            );
+        }
+
+        let collision = root.join(".state-claude.json.tmp-collision");
+        std::fs::write(&collision, b"other writer").unwrap();
+        save_current_at_test(
+            &root,
+            "state-claude.json",
+            &fixture,
+            None,
+            Some(collision.clone()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&collision).unwrap(), b"other writer");
+        assert_eq!(
+            load_current_at(&root, "state-claude.json").unwrap(),
+            fixture
+        );
+
+        std::fs::remove_file(&destination).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(
+                &root,
+                "state",
+                &test_workspace("claude"),
+                reconcile_legacy
+            )
+            .unwrap(),
+            LoadOutcome::Missing
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
