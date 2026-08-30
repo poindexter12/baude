@@ -107,16 +107,27 @@ fn not_found(e: anyhow::Error) -> ApiError {
     (StatusCode::NOT_FOUND, e.to_string())
 }
 
+fn mutation_error(error: anyhow::Error, fallback: StatusCode) -> ApiError {
+    let message = error.to_string();
+    if message.contains("persistence") {
+        (StatusCode::SERVICE_UNAVAILABLE, message)
+    } else {
+        (fallback, message)
+    }
+}
+
 /// `GET /info` — daemon identity: which workspace (and thus backend) this
 /// daemon serves, so clients can refuse to route sessions into the wrong
 /// pool (the TUI's cross-workspace guard). Daemons predating workspaces
 /// 404 here; clients treat that as "claude workspace, old version".
-async fn info() -> Json<serde_json::Value> {
+async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
     let ws = baude_core::workspace::active();
+    let persistence = lock(&state).persistence_status();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
         "version": env!("CARGO_PKG_VERSION"),
+        "persistence": persistence,
     }))
 }
 
@@ -148,7 +159,7 @@ async fn create_session(
 ) -> Result<(StatusCode, Json<SessionInfo>), ApiError> {
     let info = lock(&state)
         .create(&body.repo, body.worktree.as_deref(), body.name.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|error| mutation_error(error, StatusCode::BAD_REQUEST))?;
     crate::permission_bridge::watch_if_needed(&state, info.id);
     Ok((StatusCode::CREATED, Json(info)))
 }
@@ -157,7 +168,9 @@ async fn delete_session(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).remove(id).map_err(not_found)?;
+    lock(&state)
+        .remove(id)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -238,10 +251,12 @@ async fn interrupt(
 }
 
 async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
-    lock(&state).restart(id).map_err(|e| {
-        let msg = e.to_string();
+    lock(&state).restart(id).map_err(|error| {
+        let msg = error.to_string();
         if msg.starts_with("no session") {
             (StatusCode::NOT_FOUND, msg)
+        } else if msg.contains("persistence") {
+            (StatusCode::SERVICE_UNAVAILABLE, msg)
         } else {
             (StatusCode::CONFLICT, msg) // still running
         }
@@ -252,7 +267,9 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
 }
 
 async fn archive(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
-    lock(&state).set_archived(id, true).map_err(not_found)?;
+    lock(&state)
+        .set_archived(id, true)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -260,7 +277,9 @@ async fn unarchive(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).set_archived(id, false).map_err(not_found)?;
+    lock(&state)
+        .set_archived(id, false)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -755,6 +774,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_is_api_visible_and_fails_create() {
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        crate::manager::lock(&state).fail_saves_for_test("disk full");
+        let app = super::router(Arc::clone(&state));
+
+        let response = app
+            .clone()
+            .oneshot(post_json("/sessions", r#"{"repo":"/tmp"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(crate::manager::lock(&state).list().is_empty());
+
+        let info = body_json(app.oneshot(get("/info")).await.unwrap()).await;
+        assert_eq!(info["persistence"]["enabled"], true);
+        assert_eq!(info["persistence"]["dirty"], true);
+        assert_eq!(info["persistence"]["error"], "disk full");
     }
 
     #[tokio::test]

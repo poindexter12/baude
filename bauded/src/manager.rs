@@ -60,6 +60,17 @@ pub struct Manager {
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
+    persistence_error: Option<String>,
+    #[cfg(test)]
+    save_error_for_test: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PersistenceStatus {
+    pub enabled: bool,
+    pub blocked: bool,
+    pub dirty: bool,
+    pub error: Option<String>,
 }
 
 fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
@@ -247,6 +258,9 @@ impl Manager {
             runtime_checkouts: HashMap::new(),
             persistence_blocked: false,
             persistence_dirty: false,
+            persistence_error: None,
+            #[cfg(test)]
+            save_error_for_test: None,
         }
     }
 
@@ -291,6 +305,7 @@ impl Manager {
             Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
             Err(error) => {
                 self.persistence_blocked = true;
+                self.persistence_error = Some(error.to_string());
                 eprintln!(
                     "daemon persistence blocked: {error}; repair or move the named state file, then restart"
                 );
@@ -395,17 +410,45 @@ impl Manager {
     }
 
     pub fn save(&mut self) {
-        if !self.persist || self.persistence_blocked {
-            return;
+        if let Err(error) = self.save_checked() {
+            eprintln!("save state: {error}");
+        }
+    }
+
+    fn save_checked(&mut self) -> Result<()> {
+        if !self.persist {
+            return Ok(());
+        }
+        if self.persistence_blocked {
+            bail!("persistence is blocked after a state load failure");
+        }
+        #[cfg(test)]
+        if let Some(error) = self.save_error_for_test.clone() {
+            self.persistence_dirty = true;
+            self.persistence_error = Some(error.clone());
+            bail!("persistence save failed: {error}");
         }
         let state = StateFile::new(self.state_for_save());
-        if let Err(e) =
-            persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state)
-        {
-            self.persistence_dirty = true;
-            eprintln!("save state: {e}");
-        } else {
-            self.persistence_dirty = false;
+        match persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state) {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                self.persistence_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.persistence_dirty = true;
+                self.persistence_error = Some(error.to_string());
+                Err(anyhow!("persistence save failed: {error}"))
+            }
+        }
+    }
+
+    pub fn persistence_status(&self) -> PersistenceStatus {
+        PersistenceStatus {
+            enabled: self.persist,
+            blocked: self.persistence_blocked,
+            dirty: self.persistence_dirty,
+            error: self.persistence_error.clone(),
         }
     }
 
@@ -419,9 +462,11 @@ impl Manager {
             persist::save_current_at(root, &file, &StateFile::new(self.state_for_save()))
         {
             self.persistence_dirty = true;
+            self.persistence_error = Some(error.to_string());
             eprintln!("save state: {error}");
         } else {
             self.persistence_dirty = false;
+            self.persistence_error = None;
         }
     }
 
@@ -483,6 +528,7 @@ impl Manager {
         if self.persist {
             self.ensure_runtime_capacity(&cwd, &repo_root)?;
         }
+        let state_before = self.repository_state.clone();
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
         if self.persist {
             if let Err(error) = self.record_runtime(id) {
@@ -490,10 +536,22 @@ impl Manager {
                     session.kill();
                 }
                 self.sessions.retain(|session| session.id != id);
+                self.runtime_checkouts
+                    .retain(|_, runtime_id| *runtime_id != id);
+                self.repository_state = state_before;
                 return Err(error);
             }
         }
-        self.save();
+        if let Err(error) = self.save_checked() {
+            if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
+                session.kill();
+            }
+            self.sessions.retain(|session| session.id != id);
+            self.runtime_checkouts
+                .retain(|_, runtime_id| *runtime_id != id);
+            self.repository_state = state_before;
+            return Err(error);
+        }
         Ok(self.info(id).expect("session just spawned"))
     }
 
@@ -709,8 +767,7 @@ impl Manager {
         if let Some(n) = self.permission_notify.remove(&id) {
             n.notify_waiters();
         }
-        self.save();
-        Ok(())
+        self.save_checked()
     }
 
     /// How long to wait between pasting the text and pressing Enter. Claude
@@ -753,7 +810,7 @@ impl Manager {
         std::thread::sleep(Self::SUBMIT_DELAY);
         s.claude.write_input(b"\r");
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -890,10 +947,8 @@ impl Manager {
             (*runtime_id == id).then_some(*key)
         }) {
             let reconciled = self.reconcile_checkout(checkout_key);
-            self.save();
-            if self.persistence_dirty {
-                bail!("checkout reconciliation could not be persisted; restart refused");
-            }
+            self.save_checked()
+                .map_err(|error| anyhow!("checkout reconciliation could not be persisted: {error}"))?;
             if !reconciled {
                 bail!("checkout changed since admission; restart refused");
             }
@@ -939,7 +994,7 @@ impl Manager {
         }
         s.claude.write_input(bytes);
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -1031,7 +1086,7 @@ impl Manager {
             s.claude.write_input(&key_bytes(key, app_cursor));
         }
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -1062,8 +1117,7 @@ impl Manager {
     pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
         let s = self.session_mut(id)?;
         s.set_archived(archived);
-        self.save();
-        Ok(())
+        self.save_checked()
     }
 
     /// Test-only: pin a session's resolved Claude `session_id` so handlers
@@ -1077,6 +1131,11 @@ impl Manager {
             // replacing the explicitly pinned id during the next metadata poll.
             s.spawn_unix_ms = u64::MAX;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_saves_for_test(&mut self, error: &str) {
+        self.save_error_for_test = Some(error.to_string());
     }
 
     /// Test-only deterministic Claude metadata poll. The process running the
