@@ -66,6 +66,7 @@ fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliati
             common_dir: PersistedPath::from_path(&snapshot.common_dir),
             main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+            observed_branch: snapshot.selected_worktree.branch.clone(),
             checkout_role: if snapshot.selected_worktree.path == snapshot.main_worktree {
                 CheckoutRole::Main
             } else {

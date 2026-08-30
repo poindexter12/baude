@@ -98,6 +98,7 @@ pub enum LegacyReconciliation {
         common_dir: PersistedPath,
         main_worktree: PersistedPath,
         checkout_path: PersistedPath,
+        observed_branch: Option<String>,
         checkout_role: CheckoutRole,
         managed_by_baude: bool,
     },
@@ -313,6 +314,7 @@ fn migrate_legacy(
             main_worktree,
             repository_health,
             checkout_path,
+            observed_branch,
             checkout_role,
             managed_by_baude,
             checkout_health,
@@ -321,6 +323,7 @@ fn migrate_legacy(
                 common_dir,
                 main_worktree,
                 checkout_path,
+                observed_branch,
                 checkout_role,
                 managed_by_baude,
             } => (
@@ -329,6 +332,7 @@ fn migrate_legacy(
                 main_worktree,
                 RepositoryHealth::Available,
                 checkout_path,
+                observed_branch,
                 checkout_role,
                 managed_by_baude,
                 CheckoutHealth::Available,
@@ -342,6 +346,10 @@ fn migrate_legacy(
                 PersistedPath::from_path(&session.repo_root),
                 RepositoryHealth::Unavailable(repository_cause),
                 PersistedPath::from_path(&session.cwd),
+                session
+                    .branch
+                    .as_ref()
+                    .map(|branch| format!("refs/heads/{branch}")),
                 CheckoutRole::Main,
                 false,
                 CheckoutHealth::Unavailable(checkout_cause),
@@ -372,7 +380,7 @@ fn migrate_legacy(
             role: checkout_role,
             managed_by_baude,
             observed_path: checkout_path,
-            observed_branch: session.branch.clone(),
+            observed_branch,
             first_seen_order,
             active_intent: true,
             session: RetainedSessionState {
@@ -707,6 +715,10 @@ mod tests {
                 common_dir: PersistedPath::from_path(&session.repo_root.join(".git")),
                 main_worktree: PersistedPath::from_path(&session.repo_root),
                 checkout_path: PersistedPath::from_path(&session.cwd),
+                observed_branch: session
+                    .branch
+                    .as_ref()
+                    .map(|branch| format!("refs/heads/{branch}")),
                 checkout_role: if session.is_worktree {
                     CheckoutRole::ManagedBranch
                 } else {
@@ -746,6 +758,15 @@ mod tests {
         assert_eq!(
             migrated.state.checkouts[1].session.name,
             format!("{base}-child")
+        );
+        assert_eq!(
+            migrated.state.checkouts[0].observed_branch.as_deref(),
+            Some("refs/heads/develop"),
+            "reconciliation must persist Git's full ref separately from the legacy display branch"
+        );
+        assert_eq!(
+            migrated.state.checkouts[0].session.branch.as_deref(),
+            Some("develop")
         );
         assert!(migrated.state.checkouts[1].session.archived);
         assert!(migrated.state.checkouts[1].session.archived_by_user);

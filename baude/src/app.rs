@@ -100,6 +100,7 @@ fn reconcile_legacy_session(
         common_dir,
         main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
         checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+        observed_branch: snapshot.selected_worktree.branch.clone(),
         checkout_role: role,
         managed_by_baude: false,
     }
