@@ -64,6 +64,17 @@ fn active_restore_checkouts(state: &RepositoryState) -> Vec<CheckoutKey> {
         .collect()
 }
 
+fn require_same_checkout_path(checkout: &SavedCheckout, observed: &Path) -> Result<()> {
+    if checkout.observed_path.to_path_buf() != observed {
+        anyhow::bail!(
+            "refusing to transfer checkout ownership from {} to {}",
+            checkout.observed_path.to_path_buf().display(),
+            observed.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn commit_then_spawn<T, E>(
     save: impl FnOnce() -> std::result::Result<(), E>,
@@ -584,6 +595,16 @@ impl App {
                     && checkout.role == CheckoutRole::PrimaryDefault
             })
             .map(|checkout| checkout.key);
+        if let Some(existing_key) = existing_key {
+            if !self.reconcile_primary(existing_key) {
+                self.save_durable()?;
+                self.set_message(
+                    "persisted primary changed externally; retained unavailable without transferring ownership"
+                        .into(),
+                );
+                return Ok(None);
+            }
+        }
         let checkout_key =
             existing_key.unwrap_or_else(|| self.repository_state.allocate_checkout_key());
         let managed_path =
@@ -609,8 +630,7 @@ impl App {
             .iter_mut()
             .find(|checkout| checkout.key == checkout_key)
         {
-            checkout.managed_by_baude |= managed_by_baude;
-            checkout.observed_path = PersistedPath::from_path(&record.path);
+            require_same_checkout_path(checkout, &record.path)?;
             checkout.observed_branch = Some(default.local_ref.clone());
             checkout.active_intent = true;
             checkout.health = CheckoutHealth::Available;
@@ -2154,13 +2174,13 @@ mod clipboard_tests {
 mod repository_admission_tests {
     use super::{
         active_restore_checkouts, commit_then_spawn, local_admission_route, primary_dispatch,
-        LocalAdmissionRoute, PrimaryDispatch,
+        require_same_checkout_path, LocalAdmissionRoute, PrimaryDispatch,
     };
     use baude_core::repository::{
         CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
         RetainedSessionState, SavedCheckout, SavedRepository,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
         let repository_key = state.repositories[0].key;
@@ -2209,6 +2229,32 @@ mod repository_admission_tests {
         add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
 
         assert_eq!(active_restore_checkouts(&state).len(), 3);
+    }
+
+    #[test]
+    fn managed_checkout_ownership_cannot_move_to_an_external_path() {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key();
+        let order = state.allocate_first_seen_order();
+        let path = PersistedPath::from_path(Path::new("/managed/default"));
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: path.clone(),
+            observed_main_worktree: path,
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
+        state.checkouts[0].managed_by_baude = true;
+        state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/managed/default"));
+
+        assert!(require_same_checkout_path(&state.checkouts[0], Path::new("/external/default"))
+            .is_err());
+        assert!(state.checkouts[0].managed_by_baude);
+        assert_eq!(
+            state.checkouts[0].observed_path.to_path_buf(),
+            PathBuf::from("/managed/default")
+        );
     }
 
     #[test]
