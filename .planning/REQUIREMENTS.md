@@ -77,16 +77,44 @@
 
 ## Traceability
 
-Roadmap traceability is populated during roadmap creation. Every v2.0 requirement must map to exactly one phase.
+Every v2.0 requirement maps to exactly one roadmap phase.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| REPO-01 | Phase 5 | Pending |
+| REPO-02 | Phase 5 | Pending |
+| REPO-03 | Phase 5 | Pending |
+| REPO-04 | Phase 5 | Pending |
+| REPO-05 | Phase 7 | Pending |
+| REPO-06 | Phase 5 | Pending |
+| HIER-01 | Phase 9 | Pending |
+| HIER-02 | Phase 7 | Pending |
+| HIER-03 | Phase 7 | Pending |
+| HIER-04 | Phase 7 | Pending |
+| HIER-05 | Phase 7 | Pending |
+| HIER-06 | Phase 7 | Pending |
+| WORK-01 | Phase 6 | Pending |
+| WORK-02 | Phase 6 | Pending |
+| WORK-03 | Phase 6 | Pending |
+| WORK-04 | Phase 6 | Pending |
+| WORK-05 | Phase 6 | Pending |
+| WORK-06 | Phase 6 | Pending |
+| WORK-07 | Phase 7 | Pending |
+| PERS-01 | Phase 5 | Pending |
+| PERS-02 | Phase 5 | Pending |
+| PERS-03 | Phase 5 | Pending |
+| PERS-04 | Phase 5 | Pending |
+| SURF-01 | Phase 7 | Pending |
+| SURF-02 | Phase 7 | Pending |
+| SURF-03 | Phase 8 | Pending |
+| SURF-04 | Phase 9 | Pending |
+| SURF-05 | Phase 8 | Pending |
 
 **Coverage:**
 - v2.0 requirements: 28 total
-- Mapped to phases: 0
-- Unmapped: 28
+- Mapped to phases: 28
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-08-30*
-*Last updated: 2026-08-30 after v2.0 scope approval*
+*Last updated: 2026-08-30 after v2.0 roadmap creation*
