@@ -54,7 +54,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 
 - [x] 05-01-PLAN.md
 - [x] 05-02-PLAN.md
-- [ ] 05-03-PLAN.md
+- [x] 05-03-PLAN.md
 
 ### Phase 6: Safe Managed Worktree Lifecycle
 
@@ -125,7 +125,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 | 2. Hook-Driven Status | v0.7 | 3/3 | Complete | 2026-06-15 |
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
-| 5. Durable Repository Admission | v2.0 | 2/3 | In Progress|  |
+| 5. Durable Repository Admission | v2.0 | 3/3 | In Progress|  |
 | 6. Safe Managed Worktree Lifecycle | v2.0 | 0/TBD | Not started | - |
 | 7. Local Repository Hierarchy & Branch Control | v2.0 | 0/TBD | Not started | - |
 | 8. Daemon & Remote TUI Parity | v2.0 | 0/TBD | Not started | - |

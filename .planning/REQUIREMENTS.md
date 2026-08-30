@@ -8,8 +8,8 @@
 ### Repository Admission
 
 - [x] **REPO-01**: User can open a main checkout, subdirectory, symlink, or linked worktree and get exactly one canonical repository parent in the active workspace.
-- [ ] **REPO-02**: Opening or cloning a repository ensures exactly one usable default-branch session using the active workspace backend.
-- [ ] **REPO-03**: Reopening an already registered repository focuses or reopens its existing default-branch child instead of creating a duplicate parent or session.
+- [x] **REPO-02**: Opening or cloning a repository ensures exactly one usable default-branch session using the active workspace backend.
+- [x] **REPO-03**: Reopening an already registered repository focuses or reopens its existing default-branch child instead of creating a duplicate parent or session.
 - [x] **REPO-04**: If the main checkout is not on the resolved default branch, baude preserves it and creates or reuses a separate managed default-branch worktree.
 - [ ] **REPO-05**: User can see both the existing main checkout and the managed default-branch worktree beneath the repository.
 - [x] **REPO-06**: If the default branch cannot be resolved safely from local Git data, baude reports an actionable state without switching branches, fetching, or guessing.
@@ -37,7 +37,7 @@
 
 - [x] **PERS-01**: Repository membership, child ownership, managed status, branch, ordering timestamp, and relevant UI and session state survive restart per workspace.
 - [x] **PERS-02**: Existing flat local and daemon session state migrates idempotently into repository parents without losing valid Claude Code or OpenCode sessions.
-- [ ] **PERS-03**: Baude reconciles persisted repository and worktree intent against Git topology before reuse, activation, removal, or launch.
+- [x] **PERS-03**: Baude reconciles persisted repository and worktree intent against Git topology before reuse, activation, removal, or launch.
 - [x] **PERS-04**: State updates are atomic, and malformed or partially written state is surfaced rather than replaced with an empty hierarchy.
 
 ### Interaction and Surface Parity
@@ -82,8 +82,8 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | REPO-01 | Phase 5 | Complete |
-| REPO-02 | Phase 5 | Pending |
-| REPO-03 | Phase 5 | Pending |
+| REPO-02 | Phase 5 | Complete |
+| REPO-03 | Phase 5 | Complete |
 | REPO-04 | Phase 5 | Complete |
 | REPO-05 | Phase 7 | Pending |
 | REPO-06 | Phase 5 | Complete |
@@ -102,7 +102,7 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | WORK-07 | Phase 7 | Pending |
 | PERS-01 | Phase 5 | Complete |
 | PERS-02 | Phase 5 | Complete |
-| PERS-03 | Phase 5 | Pending |
+| PERS-03 | Phase 5 | Complete |
 | PERS-04 | Phase 5 | Complete |
 | SURF-01 | Phase 7 | Pending |
 | SURF-02 | Phase 7 | Pending |
