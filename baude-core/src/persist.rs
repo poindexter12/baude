@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::repository::{CheckoutRole, PersistedPath, RepositoryState, UnavailableCause};
+use crate::repository::{
+    CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -63,13 +67,143 @@ pub fn load_current_at(root: &std::path::Path, file: &str) -> Result<StateFile> 
 
 /// Select and migrate exactly one workspace-owned source under an injected root.
 pub fn migrate_for_workspace_at(
-    _root: &std::path::Path,
-    _base: &str,
-    _ws: &crate::workspace::Workspace,
-    _reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
+    root: &std::path::Path,
+    base: &str,
+    ws: &crate::workspace::Workspace,
+    mut reconcile: impl FnMut(&SavedSession) -> LegacyReconciliation,
 ) -> Result<LoadOutcome> {
-    // RED: selected-source migration is implemented in the GREEN commit.
-    Ok(LoadOutcome::Missing)
+    let primary_file = ws.state_file(base);
+    let primary_path = root.join(&primary_file);
+    let source_file = if primary_path.exists() {
+        primary_file.clone()
+    } else if let Some(legacy) = ws.legacy_state_file(base) {
+        if root.join(&legacy).exists() {
+            legacy
+        } else {
+            return Ok(LoadOutcome::Missing);
+        }
+    } else {
+        return Ok(LoadOutcome::Missing);
+    };
+
+    let bytes = std::fs::read(root.join(&source_file))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Some(version) = value.get("schema_version") {
+        let version = version
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("schema_version must be an unsigned integer"))?;
+        if version != u64::from(SCHEMA_VERSION) {
+            anyhow::bail!("unsupported state schema version {version}");
+        }
+        let current: StateFile = serde_json::from_value(value)?;
+        current.state.validate()?;
+        return Ok(LoadOutcome::Current(current));
+    }
+
+    let legacy: State = serde_json::from_value(value)?;
+    let migrated = StateFile::new(migrate_legacy(legacy, &mut reconcile)?);
+    save_current_at(root, &primary_file, &migrated)?;
+    Ok(LoadOutcome::Legacy(migrated))
+}
+
+#[derive(Hash, Eq, PartialEq)]
+enum LegacyRepositoryIdentity {
+    Available(PersistedPath),
+    Unavailable(usize),
+}
+
+fn migrate_legacy(
+    legacy: State,
+    reconcile: &mut impl FnMut(&SavedSession) -> LegacyReconciliation,
+) -> Result<RepositoryState> {
+    let mut state = RepositoryState::default();
+    let mut repositories = HashMap::new();
+
+    for (source_order, session) in legacy.sessions.into_iter().enumerate() {
+        let (
+            identity,
+            common_dir,
+            main_worktree,
+            repository_health,
+            checkout_path,
+            checkout_role,
+            managed_by_baude,
+            checkout_health,
+        ) = match reconcile(&session) {
+            LegacyReconciliation::Available {
+                common_dir,
+                main_worktree,
+                checkout_path,
+                checkout_role,
+                managed_by_baude,
+            } => (
+                LegacyRepositoryIdentity::Available(common_dir.clone()),
+                common_dir,
+                main_worktree,
+                RepositoryHealth::Available,
+                checkout_path,
+                checkout_role,
+                managed_by_baude,
+                CheckoutHealth::Available,
+            ),
+            LegacyReconciliation::Unavailable {
+                repository_cause,
+                checkout_cause,
+            } => (
+                LegacyRepositoryIdentity::Unavailable(source_order),
+                PersistedPath::from_path(&session.repo_root),
+                PersistedPath::from_path(&session.repo_root),
+                RepositoryHealth::Unavailable(repository_cause),
+                PersistedPath::from_path(&session.cwd),
+                CheckoutRole::Main,
+                false,
+                CheckoutHealth::Unavailable(checkout_cause),
+            ),
+        };
+
+        let repository_key = if let Some(key) = repositories.get(&identity) {
+            *key
+        } else {
+            let key = state.allocate_repository_key();
+            let first_seen_order = state.allocate_first_seen_order();
+            state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: common_dir,
+                observed_main_worktree: main_worktree,
+                first_seen_order,
+                health: repository_health,
+            });
+            repositories.insert(identity, key);
+            key
+        };
+
+        let checkout_key = state.allocate_checkout_key();
+        let first_seen_order = state.allocate_first_seen_order();
+        state.checkouts.push(SavedCheckout {
+            key: checkout_key,
+            repository_key,
+            role: checkout_role,
+            managed_by_baude,
+            observed_path: checkout_path,
+            observed_branch: session.branch.clone(),
+            first_seen_order,
+            active_intent: true,
+            session: RetainedSessionState {
+                name: session.name,
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch,
+                is_worktree: session.is_worktree,
+                shell_open: session.shell_open,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+            },
+            health: checkout_health,
+        });
+    }
+
+    state.validate()?;
+    Ok(state)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
