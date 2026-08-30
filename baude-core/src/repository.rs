@@ -1,6 +1,6 @@
 //! Durable, workspace-scoped repository and checkout intent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -141,7 +141,13 @@ impl Default for RepositoryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     DuplicateRepositoryKey(RepositoryKey),
+    DuplicateRepositoryIdentity(PersistedPath),
     DuplicateCheckoutKey(CheckoutKey),
+    DuplicateCheckoutOwnership {
+        path: PersistedPath,
+        first_repository: RepositoryKey,
+        second_repository: RepositoryKey,
+    },
     DanglingRepositoryKey(RepositoryKey),
     DuplicateRole {
         repository_key: RepositoryKey,
@@ -182,13 +188,20 @@ impl RepositoryState {
 
     pub fn validate(&self) -> Result<(), ValidationError> {
         let mut repository_keys = HashSet::new();
+        let mut repository_identities = HashSet::new();
         let mut checkout_keys = HashSet::new();
+        let mut checkout_owners = HashMap::new();
         let mut orders = HashSet::new();
         let mut unique_roles = HashSet::new();
 
         for repository in &self.repositories {
             if !repository_keys.insert(repository.key) {
                 return Err(ValidationError::DuplicateRepositoryKey(repository.key));
+            }
+            if !repository_identities.insert(&repository.observed_common_dir) {
+                return Err(ValidationError::DuplicateRepositoryIdentity(
+                    repository.observed_common_dir.clone(),
+                ));
             }
             if !orders.insert(repository.first_seen_order) {
                 return Err(ValidationError::DuplicateFirstSeenOrder(
@@ -205,6 +218,17 @@ impl RepositoryState {
                 return Err(ValidationError::DanglingRepositoryKey(
                     checkout.repository_key,
                 ));
+            }
+            if let Some(first_repository) =
+                checkout_owners.insert(&checkout.observed_path, checkout.repository_key)
+            {
+                if first_repository != checkout.repository_key {
+                    return Err(ValidationError::DuplicateCheckoutOwnership {
+                        path: checkout.observed_path.clone(),
+                        first_repository,
+                        second_repository: checkout.repository_key,
+                    });
+                }
             }
             if !orders.insert(checkout.first_seen_order) {
                 return Err(ValidationError::DuplicateFirstSeenOrder(
@@ -321,6 +345,40 @@ mod tests {
         assert!(matches!(
             duplicate.validate(),
             Err(ValidationError::DuplicateRepositoryKey(_))
+        ));
+
+        let mut duplicate_identity = state.clone();
+        let second_repository_key = duplicate_identity.allocate_repository_key();
+        let second_repository_order = duplicate_identity.allocate_first_seen_order();
+        duplicate_identity.repositories.push(SavedRepository {
+            key: second_repository_key,
+            first_seen_order: second_repository_order,
+            ..duplicate_identity.repositories[0].clone()
+        });
+        assert!(matches!(
+            duplicate_identity.validate(),
+            Err(ValidationError::DuplicateRepositoryIdentity(_))
+        ));
+
+        let mut duplicate_ownership = state.clone();
+        let second_repository_key = duplicate_ownership.allocate_repository_key();
+        let second_repository_order = duplicate_ownership.allocate_first_seen_order();
+        let mut second_repository = repository(second_repository_key, second_repository_order);
+        second_repository.observed_common_dir = path("/other/.git");
+        second_repository.observed_main_worktree = path("/other");
+        duplicate_ownership.repositories.push(second_repository);
+        let duplicate_checkout_key = duplicate_ownership.allocate_checkout_key();
+        let duplicate_checkout_order = duplicate_ownership.allocate_first_seen_order();
+        duplicate_ownership.checkouts.push(SavedCheckout {
+            key: duplicate_checkout_key,
+            repository_key: second_repository_key,
+            role: CheckoutRole::ManagedBranch,
+            first_seen_order: duplicate_checkout_order,
+            ..duplicate_ownership.checkouts[0].clone()
+        });
+        assert!(matches!(
+            duplicate_ownership.validate(),
+            Err(ValidationError::DuplicateCheckoutOwnership { .. })
         ));
 
         let mut dangling = state.clone();
