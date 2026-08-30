@@ -2073,6 +2073,198 @@ mod tests {
     mod lifecycle {
         use super::*;
 
+        mod removal_preflight {
+            use super::*;
+
+            fn linked_for_status(fixture: &GitFixture, label: &str) -> (PathBuf, PathBuf) {
+                let repo = fixture.repo(format!("{label} repo"));
+                let linked = fixture.linked_worktree(
+                    &repo,
+                    format!("{label} linked"),
+                    &format!("{label}-branch"),
+                );
+                (repo, linked)
+            }
+
+            fn blockers(path: &Path) -> Vec<RemovalBlocker> {
+                inspect_removal_status(path).expect("status inspection must be conclusive")
+            }
+
+            #[test]
+            fn status_command_is_config_independent_and_complete() {
+                let arguments: Vec<_> = removal_status_arguments()
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(
+                    arguments,
+                    [
+                        "--no-optional-locks",
+                        "status",
+                        "--porcelain=v2",
+                        "-z",
+                        "--untracked-files=all",
+                        "--ignore-submodules=none",
+                        "--ignored=matching",
+                    ]
+                );
+            }
+
+            #[test]
+            fn staged_and_unstaged_changes_are_distinct_blockers() {
+                let fixture = GitFixture::new();
+
+                let (_, staged_add) = linked_for_status(&fixture, "staged-add");
+                std::fs::write(staged_add.join("added.txt"), b"added\n").unwrap();
+                git_ok(&staged_add, &[OsStr::new("add"), OsStr::new("added.txt")]);
+                assert!(blockers(&staged_add)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::StagedAdd { .. })));
+
+                let (_, staged_delete) = linked_for_status(&fixture, "staged-delete");
+                git_ok(
+                    &staged_delete,
+                    &[OsStr::new("rm"), OsStr::new("tracked.txt")],
+                );
+                assert!(blockers(&staged_delete)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::StagedDelete { .. })));
+
+                let (_, staged_rename) = linked_for_status(&fixture, "staged-rename");
+                git_ok(
+                    &staged_rename,
+                    &[
+                        OsStr::new("mv"),
+                        OsStr::new("tracked.txt"),
+                        OsStr::new("renamed.txt"),
+                    ],
+                );
+                assert!(blockers(&staged_rename)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::StagedRename { .. })));
+
+                let (_, unstaged_edit) = linked_for_status(&fixture, "unstaged-edit");
+                std::fs::write(unstaged_edit.join("tracked.txt"), b"changed\n").unwrap();
+                assert!(blockers(&unstaged_edit)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::UnstagedModification { .. })));
+
+                let (_, unstaged_delete) = linked_for_status(&fixture, "unstaged-delete");
+                std::fs::remove_file(unstaged_delete.join("tracked.txt")).unwrap();
+                assert!(blockers(&unstaged_delete)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::UnstagedDelete { .. })));
+            }
+
+            #[test]
+            fn untracked_ignored_conflicted_and_unusual_names_block() {
+                let fixture = GitFixture::new();
+
+                let (_, untracked) = linked_for_status(&fixture, "untracked");
+                std::fs::create_dir(untracked.join("new dir")).unwrap();
+                std::fs::write(untracked.join("new dir/file.txt"), b"new\n").unwrap();
+                assert!(blockers(&untracked)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::Untracked { .. })));
+
+                let ignored_repo = fixture.repo("ignored repo");
+                std::fs::write(ignored_repo.join(".gitignore"), b"ignored*\n").unwrap();
+                git_ok(
+                    &ignored_repo,
+                    &[OsStr::new("add"), OsStr::new(".gitignore")],
+                );
+                git_ok(
+                    &ignored_repo,
+                    &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("ignore")],
+                );
+                let ignored =
+                    fixture.linked_worktree(&ignored_repo, "ignored linked", "ignored-branch");
+                std::fs::create_dir(ignored.join("ignored-dir")).unwrap();
+                std::fs::write(ignored.join("ignored-dir/file"), b"ignored\n").unwrap();
+                std::fs::write(ignored.join("ignored-file"), b"ignored\n").unwrap();
+                assert!(blockers(&ignored)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::Ignored { .. })));
+
+                let conflict_repo = fixture.repo("conflict repo");
+                let conflict =
+                    fixture.linked_worktree(&conflict_repo, "conflict linked", "conflict-branch");
+                std::fs::write(conflict.join("tracked.txt"), b"linked\n").unwrap();
+                git_ok(
+                    &conflict,
+                    &[
+                        OsStr::new("commit"),
+                        OsStr::new("-am"),
+                        OsStr::new("linked"),
+                    ],
+                );
+                std::fs::write(conflict_repo.join("tracked.txt"), b"main\n").unwrap();
+                git_ok(
+                    &conflict_repo,
+                    &[OsStr::new("commit"), OsStr::new("-am"), OsStr::new("main")],
+                );
+                let merge = Command::new("git")
+                    .arg("-C")
+                    .arg(&conflict)
+                    .args(["merge", "topic"])
+                    .output()
+                    .unwrap();
+                assert!(!merge.status.success());
+                assert!(blockers(&conflict)
+                    .iter()
+                    .any(|blocker| matches!(blocker, RemovalBlocker::Conflict { .. })));
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let (_, unusual) = linked_for_status(&fixture, "unusual");
+                    let name = OsStr::from_bytes(b"line\nspace-\xff");
+                    std::fs::write(unusual.join(name), b"unusual\n").unwrap();
+                    assert!(blockers(&unusual).iter().any(|blocker| {
+                        matches!(blocker, RemovalBlocker::Untracked { path } if path == b"line\nspace-\xff")
+                    }));
+                }
+            }
+
+            #[test]
+            fn only_empty_valid_status_is_clean_and_malformed_output_fails_closed() {
+                assert_eq!(parse_removal_status(b"").unwrap(), Vec::new());
+                for malformed in [
+                    b"x unknown\0".as_slice(),
+                    b"?\0".as_slice(),
+                    b"1 M. N... too few\0".as_slice(),
+                    b"2 R. N... 100644 100644 100644 a b R100 path\0".as_slice(),
+                    b"1 \xff. N... 100644 100644 100644 a b path\0".as_slice(),
+                    b"? unterminated".as_slice(),
+                ] {
+                    assert!(matches!(
+                        parse_removal_status(malformed),
+                        Err(InspectionError::MalformedStatus(_))
+                    ));
+                }
+            }
+
+            #[test]
+            fn process_start_and_nonzero_status_are_indeterminate() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("command failures");
+                assert!(matches!(
+                    inspect_removal_status_with_program(
+                        &repo,
+                        OsStr::new("baude-definitely-missing-git")
+                    ),
+                    Err(InspectionError::CommandStart { .. })
+                ));
+
+                let ordinary = fixture.root.join("not a repository");
+                std::fs::create_dir(&ordinary).unwrap();
+                assert!(matches!(
+                    inspect_removal_status(&ordinary),
+                    Err(InspectionError::GitCommand { .. })
+                ));
+            }
+        }
+
         mod branch_activation {
             use super::*;
 
