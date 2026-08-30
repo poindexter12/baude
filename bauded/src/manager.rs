@@ -510,7 +510,11 @@ impl Manager {
                 shell_open: false,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
-                resume_id: session.meta.session_id.clone(),
+                resume_id: session
+                    .meta
+                    .session_id
+                    .clone()
+                    .or_else(|| checkout.session.resume_id.clone()),
             };
         }
         state
@@ -975,6 +979,17 @@ impl Manager {
     #[cfg_attr(not(test), allow(dead_code))]
     fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
         let session = self.session(id)?;
+        let durable_resume_id = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            });
         Ok(RetainedSessionState {
             name: session.name.clone(),
             cwd: PersistedPath::from_path(&session.cwd),
@@ -984,7 +999,7 @@ impl Manager {
             shell_open: false,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
-            resume_id: session.meta.session_id.clone(),
+            resume_id: session.meta.session_id.clone().or(durable_resume_id),
         })
     }
 
@@ -1184,7 +1199,13 @@ impl Manager {
             shell_open: false,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
-            resume_id: session.meta.session_id.clone(),
+            resume_id: session.meta.session_id.clone().or_else(|| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == checkout_key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            }),
         };
         let state_before = self.repository_state.clone();
         lifecycle::plan_close(
@@ -2468,7 +2489,9 @@ mod tests {
             .create("/tmp", None, Some("retained daemon"))
             .unwrap()
             .id;
-        manager.session_id_for_test(id, "opaque-daemon-resume");
+        manager.repository_state.checkouts[0].session.resume_id =
+            Some("opaque-daemon-before-poll".into());
+        manager.session_mut(id).unwrap().meta.session_id = None;
         manager.session_mut(id).unwrap().archived = true;
         manager.session_mut(id).unwrap().archived_by_user = true;
         let before = manager.repository_state.clone();
@@ -2494,7 +2517,7 @@ mod tests {
         assert!(retained.session.archived_by_user);
         assert_eq!(
             retained.session.resume_id.as_deref(),
-            Some("opaque-daemon-resume")
+            Some("opaque-daemon-before-poll")
         );
         assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
         std::fs::remove_dir_all(root).unwrap();

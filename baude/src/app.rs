@@ -575,7 +575,11 @@ impl App {
                 shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
-                resume_id: session.meta.session_id.clone(),
+                resume_id: session
+                    .meta
+                    .session_id
+                    .clone()
+                    .or_else(|| checkout.session.resume_id.clone()),
             };
         }
         state
@@ -1244,6 +1248,13 @@ impl App {
         let session = self
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("runtime {id} is missing"))?;
+        let durable_resume_id = checkout_for_runtime(&self.runtime_checkouts, id).and_then(|key| {
+            self.repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .and_then(|checkout| checkout.session.resume_id.clone())
+        });
         Ok(RetainedSessionState {
             name: session.name.clone(),
             cwd: PersistedPath::from_path(&session.cwd),
@@ -1253,7 +1264,7 @@ impl App {
             shell_open: session.shell_open,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
-            resume_id: session.meta.session_id.clone(),
+            resume_id: session.meta.session_id.clone().or(durable_resume_id),
         })
     }
 
@@ -3235,7 +3246,10 @@ mod repository_admission_tests {
         session.shell_open = true;
         session.archived = true;
         session.archived_by_user = true;
-        session.meta.session_id = Some("opaque/local;$(nope)".into());
+        session.meta.session_id = None;
+        app.repository_state.checkouts[0].session.resume_id =
+            Some("opaque/retained-before-poll".into());
+        app.save_durable_status().unwrap();
 
         assert_eq!(
             app.close_retained_session(runtime).unwrap(),
@@ -3265,7 +3279,7 @@ mod repository_admission_tests {
         assert!(retained.session.archived_by_user);
         assert_eq!(
             retained.session.resume_id.as_deref(),
-            Some("opaque/local;$(nope)")
+            Some("opaque/retained-before-poll")
         );
         let state_file = baude_core::workspace::active().state_file("state");
         assert_eq!(
