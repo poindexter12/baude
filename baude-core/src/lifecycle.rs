@@ -462,7 +462,7 @@ pub fn compensate_uncommitted_activation(
     if !activation.added_managed_worktree() {
         return Ok(());
     }
-    git::remove_worktree(&activation.main_worktree, &activation.path).map_err(|error| {
+    git::remove_added_worktree(&activation.main_worktree, &activation.path).map_err(|error| {
         LifecycleError::Topology(format!(
             "plain Git worktree compensation refused {}: {error}",
             activation.path.display()

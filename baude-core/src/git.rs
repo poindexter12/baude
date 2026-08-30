@@ -2307,15 +2307,24 @@ pub fn remove_verified_worktree(
     remove_verified_worktree_with_post_remove_hook(target, || {})
 }
 
-pub fn is_dirty(worktree: &Path) -> bool {
-    inspect_removal_status(worktree)
-        .map(|blockers| !blockers.is_empty())
-        .unwrap_or(true)
-}
-
-pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
-    git(repo, &["worktree", "remove", &worktree.to_string_lossy()])?;
-    Ok(())
+/// Compensation-only removal for a worktree that the current uncommitted
+/// activation just added. Safe user-requested removal must instead consume a
+/// `VerifiedRemovalTarget` through `remove_verified_worktree`.
+pub(crate) fn remove_added_worktree(main_worktree: &Path, added_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(main_worktree)
+        .args(["worktree", "remove", "--"])
+        .arg(added_path)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "git worktree remove compensation: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(test)]

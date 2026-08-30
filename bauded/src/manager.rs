@@ -970,6 +970,9 @@ impl Manager {
         Ok(())
     }
 
+    // Phase 6 establishes daemon-owner parity internally; the network entrypoint
+    // is deliberately deferred to Phase 8.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
         let session = self.session(id)?;
         Ok(RetainedSessionState {
@@ -985,6 +988,7 @@ impl Manager {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn stop_removed_runtime(&mut self, checkout: CheckoutKey, id: u64) {
         if let Ok(session) = self.session_mut(id) {
             session.kill();
@@ -996,6 +1000,7 @@ impl Manager {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn restore_removed_runtime(
         &mut self,
         checkout: CheckoutKey,
@@ -1025,6 +1030,7 @@ impl Manager {
         Ok(id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn compensate_failed_removal(
         &mut self,
         checkout: CheckoutKey,
@@ -1043,7 +1049,8 @@ impl Manager {
         Err(failure)
     }
 
-    pub(crate) fn prepare_remove_worktree(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn prepare_remove_worktree(
         &self,
         checkout: CheckoutKey,
     ) -> std::result::Result<lifecycle::RemovalConfirmation, lifecycle::RemovalFailure> {
@@ -1060,7 +1067,8 @@ impl Manager {
         lifecycle::prepare_removal(&self.repository_state, checkout)
     }
 
-    pub(crate) fn confirm_remove_worktree(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn confirm_remove_worktree(
         &mut self,
         confirmation: lifecycle::RemovalConfirmation,
     ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
