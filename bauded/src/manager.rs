@@ -1874,6 +1874,97 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_creation_rollback_manager_precommit_save_failure_has_no_partial_child() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("true".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 20_000;
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::Rename),
+        );
+        let before = manager.repository_state.clone();
+
+        let result = manager.activate_branch_worktree(
+            &repo,
+            "feature/manager-rollback",
+            None,
+        );
+        let after = git::discover_repository(&repo).unwrap();
+        let partial: Vec<_> = after
+            .worktrees
+            .iter()
+            .filter(|record| {
+                record.branch.as_deref() == Some("refs/heads/feature/manager-rollback")
+            })
+            .map(|record| record.path.clone())
+            .collect();
+        for path in &partial {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
+        let branch_retained = Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/feature/manager-rollback",
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+
+        assert!(result.is_err());
+        assert!(partial.is_empty(), "save failure left a linked worktree");
+        assert_eq!(manager.repository_state, before);
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert!(branch_retained);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn remove_persistence_failure_rolls_back_or_finishes_the_delete() {
         for (label, failure, committed) in [
             ("remove-pre", persist::AtomicFailure::Rename, false),

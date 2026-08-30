@@ -2706,4 +2706,65 @@ mod repository_admission_tests {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn lifecycle_creation_rollback_local_precommit_save_failure_has_no_partial_child() {
+        let repo = admission_repo("branch-rollback");
+        let root = repo.parent().unwrap().to_path_buf();
+        let blocked_root = root.join("blocked-state-root");
+        std::fs::write(&blocked_root, b"not a directory").unwrap();
+        let snapshot = baude_core::git::discover_repository(&repo).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.persistence_root_for_test = Some(blocked_root);
+        app.repository_state.next_repository_key = u64::from(std::process::id()) + 10_000;
+        let repository = app.repository_state.allocate_repository_key().unwrap();
+        let order = app.repository_state.allocate_first_seen_order().unwrap();
+        app.repository_state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        let before = app.repository_state.clone();
+
+        let result = app.activate_branch_worktree(&repo, "feature/local-rollback");
+        let after = baude_core::git::discover_repository(&repo).unwrap();
+        let partial: Vec<_> = after
+            .worktrees
+            .iter()
+            .filter(|record| {
+                record.branch.as_deref() == Some("refs/heads/feature/local-rollback")
+            })
+            .map(|record| record.path.clone())
+            .collect();
+        for path in &partial {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
+        let branch_retained = Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/feature/local-rollback",
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+
+        assert!(result.is_err());
+        assert!(partial.is_empty(), "save failure left a linked worktree");
+        assert_eq!(app.repository_state, before);
+        assert!(app.runtime_checkouts.is_empty());
+        assert!(app.sessions.is_empty());
+        assert!(branch_retained);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
