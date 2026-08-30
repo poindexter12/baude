@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -10,8 +11,12 @@ use ratatui::layout::Rect;
 use baude_core::backend;
 use baude_core::git;
 use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
-use baude_core::persist::{self, Config, SavedSession, State};
+use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::{now_ms, Pty};
+use baude_core::repository::{
+    CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+};
 use baude_core::session::{Session, Status};
 
 use crate::keys::encode_key;
@@ -21,6 +26,56 @@ use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimaryDispatch {
+    Focus(u64),
+    Restart(u64),
+    Spawn,
+    Idle,
+}
+
+fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> PrimaryDispatch {
+    match runtime {
+        Some((id, false)) => PrimaryDispatch::Focus(id),
+        Some((id, true)) => PrimaryDispatch::Restart(id),
+        None if active_intent => PrimaryDispatch::Spawn,
+        None => PrimaryDispatch::Idle,
+    }
+}
+
+fn commit_then_spawn<T, E>(
+    save: impl FnOnce() -> std::result::Result<(), E>,
+    spawn: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    save()?;
+    spawn()
+}
+
+fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
+    let Ok(snapshot) = git::discover_repository(&saved.cwd) else {
+        return LegacyReconciliation::Unavailable {
+            repository_cause: UnavailableCause::Missing,
+            checkout_cause: UnavailableCause::Missing,
+        };
+    };
+    let role = match git::resolve_default_branch(&snapshot) {
+        Ok(default)
+            if snapshot.selected_worktree.branch.as_deref() == Some(default.local_ref.as_str()) =>
+        {
+            CheckoutRole::PrimaryDefault
+        }
+        _ if snapshot.selected_worktree.path == snapshot.main_worktree => CheckoutRole::Main,
+        _ => CheckoutRole::ManagedBranch,
+    };
+    LegacyReconciliation::Available {
+        common_dir: PersistedPath::from_path(&snapshot.common_dir),
+        main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+        checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+        checkout_role: role,
+        managed_by_baude: false,
+    }
+}
 
 /// Encode a mouse scroll event for delivery to a PTY.
 /// `up` true → scroll up (button 64), false → scroll down (button 65).
@@ -271,6 +326,9 @@ pub struct App {
     /// Resolved once at startup: BAUDE_NOTIFY env, then config
     /// `desktop_notifications`, then on.
     desktop_notify_enabled: bool,
+    repository_state: RepositoryState,
+    runtime_checkouts: HashMap<CheckoutKey, u64>,
+    persistence_blocked: bool,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -339,6 +397,9 @@ impl App {
                 .map(|v| !matches!(v.as_str(), "0" | "false"))
                 .or(config_notify)
                 .unwrap_or(true),
+            repository_state: RepositoryState::default(),
+            runtime_checkouts: HashMap::new(),
+            persistence_blocked: false,
         }
     }
 
@@ -400,60 +461,318 @@ impl App {
     // ---- startup / persistence ----
 
     pub fn restore(&mut self) {
-        let state = persist::load();
-        for saved in &state.sessions {
-            if !saved.cwd.exists() {
-                continue;
+        let loaded = persist::load_for_workspace(
+            "state",
+            baude_core::workspace::active(),
+            reconcile_legacy_session,
+        );
+        self.repository_state = match loaded {
+            Ok(LoadOutcome::Missing) => RepositoryState::default(),
+            Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
+            Err(error) => {
+                self.persistence_blocked = true;
+                self.set_message(format!(
+                    "repository state blocked: {error}; repair or move the named state file, then restart"
+                ));
+                return;
             }
-            match self.add_session(
-                saved.cwd.clone(),
-                Some(saved.repo_root.clone()),
-                saved.branch.clone(),
-                saved.is_worktree,
-                true,
-                saved.shell_open,
-            ) {
-                Ok(id) => {
-                    if saved.archived {
-                        if let Some(s) = self.session_mut(id) {
-                            s.archived = true;
-                            s.archived_by_user = saved.archived_by_user;
-                        }
-                    }
-                }
-                Err(e) => self.set_message(format!("restore {}: {e}", saved.name)),
+        };
+        let active: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| {
+                checkout.role == CheckoutRole::PrimaryDefault && checkout.active_intent
+            })
+            .map(|checkout| checkout.key)
+            .collect();
+        for key in active {
+            if let Err(error) = self.ensure_primary(key) {
+                self.set_message(format!("restore primary: {error}"));
             }
         }
         // Premise: baude is started from a repo folder. Auto-add it if new.
         let launch = self.launch_dir.clone();
-        let already = self.sessions.iter().any(|s| s.cwd == launch);
-        if !already && git::repo_root(&launch).is_some() {
-            if let Err(e) = self.add_session(launch, None, None, false, false, false) {
+        if git::discover_repository(&launch).is_ok() {
+            if let Err(e) = self.admit_repository(&launch) {
                 self.set_message(format!("start session: {e}"));
             }
         }
         self.selected_id = self.ordered_ids().first().copied();
-        self.save();
     }
 
     pub fn save(&self) {
-        let state = State {
-            sessions: self
-                .sessions
-                .iter()
-                .map(|s| SavedSession {
-                    name: s.name.clone(),
-                    cwd: s.cwd.clone(),
-                    repo_root: s.repo_root.clone(),
-                    branch: s.branch.clone(),
-                    is_worktree: s.is_worktree,
-                    shell_open: s.shell_open,
-                    archived: s.archived,
-                    archived_by_user: s.archived_by_user,
-                })
-                .collect(),
+        let _ = self.save_durable();
+    }
+
+    fn save_durable(&self) -> Result<()> {
+        if self.persistence_blocked {
+            anyhow::bail!("automatic persistence is blocked after a state load failure");
+        }
+        let mut state = self.repository_state.clone();
+        for checkout in &mut state.checkouts {
+            let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
+                continue;
+            };
+            let Some(session) = self.session(*runtime_id) else {
+                continue;
+            };
+            checkout.session = RetainedSessionState {
+                name: session.name.clone(),
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch.clone(),
+                is_worktree: session.is_worktree,
+                shell_open: session.shell_open,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+            };
+        }
+        state.validate()?;
+        persist::save(&StateFile::new(state))
+    }
+
+    pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
+        let snapshot = git::discover_repository(path)?;
+        let common = PersistedPath::from_path(&snapshot.common_dir);
+        let repository_key = match self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.observed_common_dir == common)
+            .map(|repository| repository.key)
+        {
+            Some(key) => key,
+            None => {
+                let key = self.repository_state.allocate_repository_key();
+                let first_seen_order = self.repository_state.allocate_first_seen_order();
+                self.repository_state.repositories.push(SavedRepository {
+                    key,
+                    observed_common_dir: common.clone(),
+                    observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+                    first_seen_order,
+                    health: RepositoryHealth::Available,
+                });
+                key
+            }
         };
-        let _ = persist::save(&state);
+        if let Some(repository) = self
+            .repository_state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.key == repository_key)
+        {
+            repository.observed_common_dir = common;
+            repository.observed_main_worktree = PersistedPath::from_path(&snapshot.main_worktree);
+            repository.health = RepositoryHealth::Available;
+        }
+
+        let default = match git::resolve_default_branch(&snapshot) {
+            Ok(default) => default,
+            Err(error) => {
+                if let Some(repository) = self
+                    .repository_state
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.key == repository_key)
+                {
+                    repository.health =
+                        RepositoryHealth::Unavailable(UnavailableCause::Other(error.to_string()));
+                }
+                self.save_durable()?;
+                self.set_message(format!(
+                    "default checkout unavailable: {error}; repair local remote HEAD metadata and reopen"
+                ));
+                return Ok(None);
+            }
+        };
+
+        let existing_key = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| {
+                checkout.repository_key == repository_key
+                    && checkout.role == CheckoutRole::PrimaryDefault
+            })
+            .map(|checkout| checkout.key);
+        let checkout_key =
+            existing_key.unwrap_or_else(|| self.repository_state.allocate_checkout_key());
+        let managed_path =
+            git::managed_default_worktree_path(repository_key.get(), checkout_key.get());
+        let outcome = git::ensure_default_worktree(&snapshot, &default, &managed_path)?;
+        let (record, managed_by_baude) = match outcome {
+            git::DefaultWorktreeOutcome::Main(record)
+            | git::DefaultWorktreeOutcome::ExistingLinked(record) => (record, false),
+            git::DefaultWorktreeOutcome::CreatedManaged(record) => (record, true),
+        };
+        let fresh = git::discover_repository(&record.path)?;
+        if fresh.common_dir != snapshot.common_dir
+            || fresh.selected_worktree.path != record.path
+            || fresh.selected_worktree.branch.as_deref() != Some(default.local_ref.as_str())
+        {
+            anyhow::bail!("fresh Git topology did not verify the primary checkout");
+        }
+
+        let is_worktree = record.path != fresh.main_worktree;
+        if let Some(checkout) = self
+            .repository_state
+            .checkouts
+            .iter_mut()
+            .find(|checkout| checkout.key == checkout_key)
+        {
+            checkout.managed_by_baude |= managed_by_baude;
+            checkout.observed_path = PersistedPath::from_path(&record.path);
+            checkout.observed_branch = Some(default.local_ref.clone());
+            checkout.active_intent = true;
+            checkout.health = CheckoutHealth::Available;
+            checkout.session.cwd = PersistedPath::from_path(&record.path);
+            checkout.session.branch = Some(default.local_branch.clone());
+            checkout.session.is_worktree = is_worktree;
+        } else {
+            let first_seen_order = self.repository_state.allocate_first_seen_order();
+            let name = snapshot
+                .main_worktree
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| snapshot.main_worktree.display().to_string());
+            self.repository_state.checkouts.push(SavedCheckout {
+                key: checkout_key,
+                repository_key,
+                role: CheckoutRole::PrimaryDefault,
+                managed_by_baude,
+                observed_path: PersistedPath::from_path(&record.path),
+                observed_branch: Some(default.local_ref.clone()),
+                first_seen_order,
+                active_intent: true,
+                session: RetainedSessionState {
+                    name,
+                    cwd: PersistedPath::from_path(&record.path),
+                    repo_root: PersistedPath::from_path(&fresh.main_worktree),
+                    branch: Some(default.local_branch),
+                    is_worktree,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                },
+                health: CheckoutHealth::Available,
+            });
+        }
+        self.repository_state.validate()?;
+        self.save_durable()?;
+        self.ensure_primary(checkout_key)
+    }
+
+    pub fn ensure_primary(&mut self, checkout_key: CheckoutKey) -> Result<Option<u64>> {
+        if !self.reconcile_primary(checkout_key) {
+            self.save_durable()?;
+            return Ok(None);
+        }
+        self.save_durable()?;
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == checkout_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("primary checkout is missing"))?;
+        let runtime = self.runtime_checkouts.get(&checkout_key).and_then(|id| {
+            self.session(*id)
+                .map(|session| (*id, session.claude.is_exited()))
+        });
+        match primary_dispatch(checkout.active_intent, runtime) {
+            PrimaryDispatch::Focus(id) => {
+                self.selected_id = Some(SelId::Local(id));
+                self.focus = Focus::Claude;
+                Ok(Some(id))
+            }
+            PrimaryDispatch::Restart(id) => {
+                self.restart_session_with_resume(id, true)?;
+                Ok(Some(id))
+            }
+            PrimaryDispatch::Spawn => {
+                let cwd = checkout.observed_path.to_path_buf();
+                let session = checkout.session;
+                let id = self.add_session(
+                    cwd,
+                    Some(session.repo_root.to_path_buf()),
+                    session.branch,
+                    session.is_worktree,
+                    true,
+                    session.shell_open,
+                )?;
+                if let Some(runtime) = self.session_mut(id) {
+                    runtime.name = session.name;
+                    runtime.archived = session.archived;
+                    runtime.archived_by_user = session.archived_by_user;
+                }
+                self.runtime_checkouts.insert(checkout_key, id);
+                self.focus = Focus::Claude;
+                Ok(Some(id))
+            }
+            PrimaryDispatch::Idle => Ok(None),
+        }
+    }
+
+    fn reconcile_primary(&mut self, checkout_key: CheckoutKey) -> bool {
+        let Some(index) = self
+            .repository_state
+            .checkouts
+            .iter()
+            .position(|checkout| checkout.key == checkout_key)
+        else {
+            return false;
+        };
+        let repository_key = self.repository_state.checkouts[index].repository_key;
+        let path = self.repository_state.checkouts[index]
+            .observed_path
+            .to_path_buf();
+        let expected_branch = self.repository_state.checkouts[index]
+            .observed_branch
+            .clone();
+        let Some(repository_index) = self
+            .repository_state
+            .repositories
+            .iter()
+            .position(|repository| repository.key == repository_key)
+        else {
+            return false;
+        };
+        let expected_common = self.repository_state.repositories[repository_index]
+            .observed_common_dir
+            .clone();
+        let snapshot = match git::discover_repository(&path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let cause = if path.exists() {
+                    UnavailableCause::Other(error.to_string())
+                } else {
+                    UnavailableCause::Missing
+                };
+                self.repository_state.checkouts[index].health =
+                    CheckoutHealth::Unavailable(cause.clone());
+                self.repository_state.repositories[repository_index].health =
+                    RepositoryHealth::Unavailable(cause);
+                return false;
+            }
+        };
+        let selected = &snapshot.selected_worktree;
+        if PersistedPath::from_path(&snapshot.common_dir) != expected_common
+            || selected.path != path
+            || selected.branch != expected_branch
+            || selected.detached
+            || selected.locked
+            || selected.prunable
+        {
+            self.repository_state.checkouts[index].health =
+                CheckoutHealth::Unavailable(UnavailableCause::IdentityChanged);
+            self.repository_state.repositories[repository_index].health =
+                RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged);
+            return false;
+        }
+        self.repository_state.checkouts[index].health = CheckoutHealth::Available;
+        self.repository_state.repositories[repository_index].health = RepositoryHealth::Available;
+        true
     }
 
     // ---- session bookkeeping ----
@@ -651,6 +970,21 @@ impl App {
     }
 
     fn remove_session(&mut self, id: u64) {
+        if let Some(checkout_key) = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+        {
+            if let Some(checkout) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|checkout| checkout.key == checkout_key)
+            {
+                checkout.active_intent = false;
+            }
+            self.runtime_checkouts.remove(&checkout_key);
+        }
         if let Some(s) = self.session_mut(id) {
             s.kill();
         }
@@ -1600,11 +1934,18 @@ impl App {
     }
 
     fn restart_session(&mut self, id: u64) {
+        if let Err(error) = self.restart_session_with_resume(id, false) {
+            self.set_message(format!("restart failed: {error}"));
+        }
+    }
+
+    fn restart_session_with_resume(&mut self, id: u64, resume: bool) -> Result<()> {
         let (rows, cols) = {
-            let Some(s) = self.session(id) else { return };
+            let Some(s) = self.session(id) else {
+                anyhow::bail!("session {id} is missing");
+            };
             if !s.claude.is_exited() {
-                self.set_message("claude is still running".into());
-                return;
+                anyhow::bail!("claude is still running");
             }
             self.claude_spawn_size(s.shell_open)
         };
@@ -1616,20 +1957,17 @@ impl App {
         // the prior behavior.
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
-        let plan = be.spawn_plan(&base, None, false);
+        let plan = be.spawn_plan(&base, None, resume);
         be.prepare_cwd(&cwd);
-        match Pty::spawn(Some(&plan.cmd), &cwd, rows, cols) {
-            Ok(pty) => {
-                if let Some(s) = self.session_mut(id) {
-                    s.claude = pty;
-                    s.spawn_unix_ms = now_unix_ms();
-                    s.meta = ClaudeMeta::default();
-                    s.meta.backend_port = plan.server_port;
-                }
-                self.focus = Focus::Claude;
-            }
-            Err(e) => self.set_message(format!("restart failed: {e}")),
+        let pty = Pty::spawn(Some(&plan.cmd), &cwd, rows, cols)?;
+        if let Some(s) = self.session_mut(id) {
+            s.claude = pty;
+            s.spawn_unix_ms = now_unix_ms();
+            s.meta = ClaudeMeta::default();
+            s.meta.backend_port = plan.server_port;
         }
+        self.focus = Focus::Claude;
+        Ok(())
     }
 
     // ---- mouse handling ----
@@ -1818,40 +2156,46 @@ mod repository_admission_tests {
 
     #[test]
     fn repository_admission_dispatches_every_primary_state() {
-        assert_eq!(primary_dispatch(true, Some((7, false))), PrimaryDispatch::Focus(7));
-        assert_eq!(primary_dispatch(true, Some((7, true))), PrimaryDispatch::Restart(7));
+        assert_eq!(
+            primary_dispatch(true, Some((7, false))),
+            PrimaryDispatch::Focus(7)
+        );
+        assert_eq!(
+            primary_dispatch(true, Some((7, true))),
+            PrimaryDispatch::Restart(7)
+        );
         assert_eq!(primary_dispatch(true, None), PrimaryDispatch::Spawn);
         assert_eq!(primary_dispatch(false, None), PrimaryDispatch::Idle);
     }
 
     #[test]
     fn repository_admission_saves_before_spawn_and_blocks_spawn_on_save_error() {
-        let mut events = Vec::new();
+        let events = std::cell::RefCell::new(Vec::new());
         commit_then_spawn(
             || {
-                events.push("save");
+                events.borrow_mut().push("save");
                 Ok::<_, &'static str>(())
             },
             || {
-                events.push("spawn");
+                events.borrow_mut().push("spawn");
                 Ok::<_, &'static str>(23)
             },
         )
         .unwrap();
-        assert_eq!(events, ["save", "spawn"]);
+        assert_eq!(*events.borrow(), ["save", "spawn"]);
 
-        events.clear();
+        events.borrow_mut().clear();
         let result = commit_then_spawn(
             || {
-                events.push("save");
+                events.borrow_mut().push("save");
                 Err::<(), _>("disk full")
             },
             || {
-                events.push("spawn");
+                events.borrow_mut().push("spawn");
                 Ok(23)
             },
         );
         assert_eq!(result, Err("disk full"));
-        assert_eq!(events, ["save"]);
+        assert_eq!(*events.borrow(), ["save"]);
     }
 }

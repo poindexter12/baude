@@ -868,6 +868,16 @@ fn worktrees_base() -> PathBuf {
         .join("worktrees")
 }
 
+/// Deterministic workspace-local allocation for a durable primary checkout.
+/// The opaque keys are scoped by the active workspace state file, so include
+/// the workspace name to keep independent backends from sharing a path.
+pub fn managed_default_worktree_path(repository_key: u64, checkout_key: u64) -> PathBuf {
+    worktrees_base()
+        .join(&crate::workspace::active().name)
+        .join(format!("repository-{repository_key}"))
+        .join(format!("primary-{checkout_key}"))
+}
+
 fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| {
