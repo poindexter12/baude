@@ -1600,10 +1600,295 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<()> {
     }
 }
 
+/// A conclusive reason why a linked worktree cannot be removed safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemovalBlocker {
+    NotManaged,
+    MainWorktree,
+    NotLinked,
+    Detached,
+    Locked,
+    Prunable,
+    IdentityChanged,
+    PathChanged,
+    BranchChanged,
+    StagedAdd { path: Vec<u8> },
+    StagedDelete { path: Vec<u8> },
+    StagedRename { path: Vec<u8> },
+    StagedModification { path: Vec<u8> },
+    UnstagedModification { path: Vec<u8> },
+    UnstagedDelete { path: Vec<u8> },
+    Conflict { path: Vec<u8> },
+    Untracked { path: Vec<u8> },
+    Ignored { path: Vec<u8> },
+    SubmoduleChange { path: Vec<u8> },
+    SubmodulePresent { path: Vec<u8>, status: u8 },
+}
+
+/// External inspection failed, so removal authorization cannot be issued.
+#[derive(Debug)]
+pub enum InspectionError {
+    CommandStart {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    GitCommand {
+        operation: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    MalformedStatus(String),
+    MalformedSubmoduleStatus(String),
+    Topology(RepositoryDiscoveryError),
+    Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for InspectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandStart { operation, source } => {
+                write!(f, "start Git {operation}: {source}")
+            }
+            Self::GitCommand {
+                operation,
+                status,
+                stderr,
+            } => write!(
+                f,
+                "Git {operation} failed (status {}): {stderr}",
+                status.map_or_else(|| "signal".to_owned(), |code| code.to_string())
+            ),
+            Self::MalformedStatus(reason) => write!(f, "malformed Git status: {reason}"),
+            Self::MalformedSubmoduleStatus(reason) => {
+                write!(f, "malformed Git submodule status: {reason}")
+            }
+            Self::Topology(error) => write!(f, "inspect worktree topology: {error}"),
+            Self::Canonicalize { path, source } => {
+                write!(
+                    f,
+                    "canonicalize removal target {}: {source}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for InspectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandStart { source, .. } | Self::Canonicalize { source, .. } => Some(source),
+            Self::Topology(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn removal_status_arguments() -> [&'static OsStr; 7] {
+    [
+        OsStr::new("--no-optional-locks"),
+        OsStr::new("status"),
+        OsStr::new("--porcelain=v2"),
+        OsStr::new("-z"),
+        OsStr::new("--untracked-files=all"),
+        OsStr::new("--ignore-submodules=none"),
+        OsStr::new("--ignored=matching"),
+    ]
+}
+
+fn valid_xy(xy: &[u8]) -> bool {
+    xy.len() == 2 && xy.iter().all(|byte| b".MADRCUT".contains(byte))
+}
+
+fn valid_submodule_field(field: &[u8]) -> bool {
+    field == b"N..."
+        || (field.len() == 4
+            && field[0] == b'S'
+            && b".C".contains(&field[1])
+            && b".M".contains(&field[2])
+            && b".U".contains(&field[3]))
+}
+
+fn valid_mode(field: &[u8]) -> bool {
+    field.len() == 6 && field.iter().all(u8::is_ascii_digit)
+}
+
+fn valid_oid(field: &[u8]) -> bool {
+    !field.is_empty() && field.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn malformed_status(reason: impl Into<String>) -> InspectionError {
+    InspectionError::MalformedStatus(reason.into())
+}
+
+fn tracked_blockers(
+    xy: &[u8],
+    submodule: &[u8],
+    path: &[u8],
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    if !valid_xy(xy) {
+        return Err(malformed_status("invalid XY field"));
+    }
+    if !valid_submodule_field(submodule) {
+        return Err(malformed_status("invalid submodule field"));
+    }
+    if path.is_empty() {
+        return Err(malformed_status("tracked record has an empty path"));
+    }
+
+    let path = path.to_vec();
+    let mut blockers = Vec::new();
+    match xy[0] {
+        b'.' => {}
+        b'A' => blockers.push(RemovalBlocker::StagedAdd { path: path.clone() }),
+        b'D' => blockers.push(RemovalBlocker::StagedDelete { path: path.clone() }),
+        b'R' => blockers.push(RemovalBlocker::StagedRename { path: path.clone() }),
+        b'U' => blockers.push(RemovalBlocker::Conflict { path: path.clone() }),
+        b'M' | b'C' | b'T' => {
+            blockers.push(RemovalBlocker::StagedModification { path: path.clone() })
+        }
+        _ => return Err(malformed_status("unsupported index status")),
+    }
+    match xy[1] {
+        b'.' => {}
+        b'D' => blockers.push(RemovalBlocker::UnstagedDelete { path: path.clone() }),
+        b'M' | b'T' => blockers.push(RemovalBlocker::UnstagedModification { path: path.clone() }),
+        b'A' | b'R' | b'C' | b'U' => blockers.push(RemovalBlocker::Conflict { path: path.clone() }),
+        _ => return Err(malformed_status("unsupported worktree status")),
+    }
+    if submodule != b"N..." {
+        blockers.push(RemovalBlocker::SubmoduleChange { path });
+    }
+    if blockers.is_empty() {
+        return Err(malformed_status("tracked record reports no change"));
+    }
+    Ok(blockers)
+}
+
+fn parse_removal_status(bytes: &[u8]) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\0") {
+        return Err(malformed_status("output is not NUL terminated"));
+    }
+
+    let fields: Vec<&[u8]> = bytes[..bytes.len() - 1].split(|byte| *byte == 0).collect();
+    let mut blockers = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let record = fields[index];
+        if record.is_empty() {
+            return Err(malformed_status("empty status record"));
+        }
+        if let Some(path) = record.strip_prefix(b"? ") {
+            if path.is_empty() {
+                return Err(malformed_status("untracked record has an empty path"));
+            }
+            blockers.push(RemovalBlocker::Untracked {
+                path: path.to_vec(),
+            });
+        } else if let Some(path) = record.strip_prefix(b"! ") {
+            if path.is_empty() {
+                return Err(malformed_status("ignored record has an empty path"));
+            }
+            blockers.push(RemovalBlocker::Ignored {
+                path: path.to_vec(),
+            });
+        } else if record.starts_with(b"1 ") {
+            let parts: Vec<_> = record.splitn(9, |byte| *byte == b' ').collect();
+            if parts.len() != 9
+                || parts[0] != b"1"
+                || !parts[3..=5].iter().all(|field| valid_mode(field))
+                || !parts[6..=7].iter().all(|field| valid_oid(field))
+            {
+                return Err(malformed_status("invalid ordinary tracked record"));
+            }
+            blockers.extend(tracked_blockers(parts[1], parts[2], parts[8])?);
+        } else if record.starts_with(b"2 ") {
+            let parts: Vec<_> = record.splitn(10, |byte| *byte == b' ').collect();
+            if parts.len() != 10
+                || parts[0] != b"2"
+                || !parts[3..=5].iter().all(|field| valid_mode(field))
+                || !parts[6..=7].iter().all(|field| valid_oid(field))
+                || parts[8].len() < 2
+                || !b"RC".contains(&parts[8][0])
+                || !parts[8][1..].iter().all(u8::is_ascii_digit)
+            {
+                return Err(malformed_status("invalid renamed or copied record"));
+            }
+            index += 1;
+            if index >= fields.len() || fields[index].is_empty() {
+                return Err(malformed_status("renamed record has no original path"));
+            }
+            blockers.extend(tracked_blockers(parts[1], parts[2], parts[9])?);
+        } else if record.starts_with(b"u ") {
+            let parts: Vec<_> = record.splitn(11, |byte| *byte == b' ').collect();
+            if parts.len() != 11
+                || parts[0] != b"u"
+                || !valid_xy(parts[1])
+                || !valid_submodule_field(parts[2])
+                || !parts[3..=6].iter().all(|field| valid_mode(field))
+                || !parts[7..=9].iter().all(|field| valid_oid(field))
+                || parts[10].is_empty()
+            {
+                return Err(malformed_status("invalid unmerged record"));
+            }
+            blockers.push(RemovalBlocker::Conflict {
+                path: parts[10].to_vec(),
+            });
+            if parts[2] != b"N..." {
+                blockers.push(RemovalBlocker::SubmoduleChange {
+                    path: parts[10].to_vec(),
+                });
+            }
+        } else {
+            return Err(malformed_status("unknown status record kind"));
+        }
+        index += 1;
+    }
+    Ok(blockers)
+}
+
+fn inspect_removal_status_with_program(
+    worktree: &Path,
+    program: &OsStr,
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    let arguments = removal_status_arguments();
+    let output = Command::new(program)
+        .arg(arguments[0])
+        .arg("-C")
+        .arg(worktree)
+        .args(&arguments[1..])
+        .output()
+        .map_err(|source| InspectionError::CommandStart {
+            operation: "removal status inspection",
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(InspectionError::GitCommand {
+            operation: "removal status inspection",
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    parse_removal_status(&output.stdout)
+}
+
+fn inspect_removal_status(
+    worktree: &Path,
+) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
+    inspect_removal_status_with_program(worktree, OsStr::new("git"))
+}
+
+#[deprecated(note = "managed lifecycle removal must use inspect_removal")]
 pub fn is_dirty(worktree: &Path) -> bool {
-    git(worktree, &["status", "--porcelain"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+    inspect_removal_status(worktree)
+        .map(|blockers| !blockers.is_empty())
+        .unwrap_or(true)
 }
 
 pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
@@ -1615,10 +1900,12 @@ pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
 mod tests {
     use super::{
         activate_branch, classify_branch, discover_repository, ensure_default_worktree,
-        existing_branch_add_arguments, managed_branch_worktree_path, new_branch_add_arguments,
-        parse_clone_target, parse_worktree_porcelain, reconcile_checkout, resolve_default_branch,
-        BranchActivation, BranchActivationError, BranchActivationOutcome, DefaultBranchUnavailable,
-        DefaultWorktreeOutcome, ReconciliationUnavailable,
+        existing_branch_add_arguments, inspect_removal_status, inspect_removal_status_with_program,
+        managed_branch_worktree_path, new_branch_add_arguments, parse_clone_target,
+        parse_removal_status, parse_worktree_porcelain, reconcile_checkout,
+        removal_status_arguments, resolve_default_branch, BranchActivation, BranchActivationError,
+        BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
+        ReconciliationUnavailable, RemovalBlocker,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2218,10 +2505,10 @@ mod tests {
                 {
                     use std::os::unix::ffi::OsStrExt;
                     let (_, unusual) = linked_for_status(&fixture, "unusual");
-                    let name = OsStr::from_bytes(b"line\nspace-\xff");
+                    let name = OsStr::from_bytes(b"line\nspace name");
                     std::fs::write(unusual.join(name), b"unusual\n").unwrap();
                     assert!(blockers(&unusual).iter().any(|blocker| {
-                        matches!(blocker, RemovalBlocker::Untracked { path } if path == b"line\nspace-\xff")
+                        matches!(blocker, RemovalBlocker::Untracked { path } if path == b"line\nspace name")
                     }));
                 }
             }
