@@ -252,7 +252,27 @@ impl Pty {
             .child
             .lock()
             .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
-        child.kill().context("failed to kill PTY child")?;
+        if child
+            .try_wait()
+            .context("failed to inspect PTY child before stop")?
+            .is_some()
+        {
+            self.exited.store(true, Ordering::Release);
+            return Ok(());
+        }
+        if let Err(kill_error) = child.kill() {
+            // The child can exit between try_wait and kill. Reap that race and
+            // report success only when termination is actually confirmed.
+            if child
+                .try_wait()
+                .context("failed to inspect PTY child after kill refusal")?
+                .is_some()
+            {
+                self.exited.store(true, Ordering::Release);
+                return Ok(());
+            }
+            return Err(kill_error).context("failed to kill PTY child");
+        }
         child.wait().context("failed to wait for PTY child")?;
         self.exited.store(true, Ordering::Release);
         Ok(())
@@ -317,6 +337,18 @@ mod tests {
         assert!(!pty.is_exited());
         pty.kill_and_wait().unwrap();
         assert!(pty.is_exited());
+    }
+
+    #[test]
+    fn kill_and_wait_accepts_and_retries_naturally_exited_child() {
+        let mut pty = Pty::spawn(Some("exit 0"), Path::new("/tmp"), 5, 40).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pty.is_exited() {
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pty.kill_and_wait().unwrap();
+        pty.kill_and_wait().unwrap();
     }
 
     #[test]

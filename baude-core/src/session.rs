@@ -330,11 +330,29 @@ impl Session {
     /// first so callers never begin destructive worktree inspection while it
     /// may still be writing into the checkout.
     pub fn kill_and_wait(&mut self) -> Result<()> {
-        self.claude.kill_and_wait()?;
-        if let Some(shell) = &mut self.shell {
-            shell.kill_and_wait()?;
+        // Attempt each owned process independently. A partially successful
+        // stop remains retryable because Pty::kill_and_wait is idempotent.
+        let claude = self.claude.kill_and_wait().err();
+        let shell = self
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.kill_and_wait().err());
+        match (claude, shell) {
+            (None, None) => Ok(()),
+            (claude, shell) => {
+                let mut failures = Vec::new();
+                if let Some(error) = claude {
+                    failures.push(format!("agent: {error}"));
+                }
+                if let Some(error) = shell {
+                    failures.push(format!("shell: {error}"));
+                }
+                Err(anyhow::anyhow!(
+                    "session process teardown incomplete ({})",
+                    failures.join("; ")
+                ))
+            }
         }
-        Ok(())
     }
 }
 
