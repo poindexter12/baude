@@ -363,41 +363,12 @@ impl Manager {
             .collect();
         let mut restored = 0;
         for checkout in checkouts {
-            if self.runtime_checkouts.contains_key(&checkout.key) {
-                continue;
-            }
-            if !self.reconcile_checkout(checkout.key) {
-                continue;
-            }
-            let saved = checkout.session;
-            let cwd = checkout.observed_path.to_path_buf();
-            let repo_root = self
-                .repository_state
-                .repositories
-                .iter()
-                .find(|repository| repository.key == checkout.repository_key)
-                .expect("validated checkout repository")
-                .observed_main_worktree
-                .to_path_buf();
-            match self.spawn(
-                cwd,
-                repo_root,
-                saved.branch.clone(),
-                saved.is_worktree,
-                Some(&saved.name),
-                true,
-            ) {
-                Ok(id) => {
+            match self.reopen_checkout(checkout.key) {
+                Ok(LifecycleOutcome::Reopened { .. } | LifecycleOutcome::Focused { .. }) => {
                     restored += 1;
-                    self.runtime_checkouts.insert(checkout.key, id);
-                    if saved.archived {
-                        if let Ok(s) = self.session_mut(id) {
-                            s.archived = true;
-                            s.archived_by_user = saved.archived_by_user;
-                        }
-                    }
                 }
-                Err(e) => eprintln!("restore {}: {e}", saved.name),
+                Ok(_) => {}
+                Err(e) => eprintln!("restore {}: {e}", checkout.session.name),
             }
         }
         restored
@@ -801,6 +772,23 @@ impl Manager {
         name: Option<&str>,
         resume: bool,
     ) -> Result<u64> {
+        let mode = if resume {
+            backend::SpawnMode::ContinueLatest
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        self.spawn_with_mode(cwd, repo_root, branch, is_worktree, name, mode)
+    }
+
+    fn spawn_with_mode(
+        &mut self,
+        cwd: PathBuf,
+        repo_root: PathBuf,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: Option<&str>,
+        mode: backend::SpawnMode,
+    ) -> Result<u64> {
         #[cfg(test)]
         if let Some(error) = &self.spawn_error_for_test {
             bail!("test spawn failure: {error}");
@@ -846,11 +834,6 @@ impl Manager {
             );
         }
 
-        let mode = if resume {
-            backend::SpawnMode::ContinueLatest
-        } else {
-            backend::SpawnMode::Fresh
-        };
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
         let claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?;
         let mut meta = ClaudeMeta::default();
@@ -1206,6 +1189,120 @@ impl Manager {
     /// `$BAUDE_EVENT_URL` export (hook events regressed to the /tmp file
     /// path with no daemon POST). Now a restart is spawn-equivalent, and for
     /// opencode it re-rolls the pinned server port.
+    pub fn reopen_checkout(
+        &mut self,
+        checkout_key: CheckoutKey,
+    ) -> MutationResult<LifecycleOutcome> {
+        if self.persistence_blocked {
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
+        }
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == checkout_key)
+            .cloned()
+            .ok_or_else(|| anyhow!("retained checkout {} is missing", checkout_key.get()))?;
+        let _reservation = match self
+            .repository_reservations
+            .reserve_reopen(checkout.repository_key, checkout_key)
+        {
+            Ok(reservation) => reservation,
+            Err(outcome) => return Ok(outcome),
+        };
+        let runtime = self.runtime_checkouts.get(&checkout_key).and_then(|id| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == *id)
+                .map(|session| (*id, session.claude.is_exited()))
+        });
+        let runtime_fact = match runtime {
+            Some((id, false)) => lifecycle::ReopenRuntime::Live { id },
+            Some((id, true)) => lifecycle::ReopenRuntime::Exited { id },
+            None => lifecycle::ReopenRuntime::Absent,
+        };
+        let repository = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.key == checkout.repository_key)
+            .ok_or_else(|| anyhow!("retained checkout repository is missing"))?;
+        let reconciliation = git::reconcile_checkout(
+            &repository.observed_common_dir.to_path_buf(),
+            &checkout.observed_path.to_path_buf(),
+            checkout.observed_branch.as_deref(),
+        )
+        .map(|_| ());
+        let state_before = self.repository_state.clone();
+        let plan = match lifecycle::plan_reopen(
+            &mut self.repository_state,
+            lifecycle::ReopenRequest {
+                checkout: checkout_key,
+                reconciliation,
+                runtime: runtime_fact,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(blocked) => {
+                self.save_checked().map_err(MutationError::Persistence)?;
+                return Err(anyhow!(
+                    "retained checkout {} is unavailable: {:?}",
+                    blocked.checkout().get(),
+                    blocked.cause
+                )
+                .into());
+            }
+        };
+        if let Err(error) = self.save_checked() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        self.persistence_dirty = false;
+
+        match plan.dispatch {
+            lifecycle::ReopenDispatch::Focus { id } => Ok(LifecycleOutcome::Focused {
+                checkout: checkout_key,
+                runtime: id,
+            }),
+            lifecycle::ReopenDispatch::Restart { id } => {
+                self.restart_with_mode(id, plan.mode)?;
+                Ok(LifecycleOutcome::Reopened {
+                    checkout: checkout_key,
+                    runtime: id,
+                })
+            }
+            lifecycle::ReopenDispatch::Spawn => {
+                let saved = checkout.session;
+                let id = self.spawn_with_mode(
+                    checkout.observed_path.to_path_buf(),
+                    saved.repo_root.to_path_buf(),
+                    saved.branch.clone(),
+                    saved.is_worktree,
+                    Some(&saved.name),
+                    plan.mode,
+                )?;
+                if let Ok(session) = self.session_mut(id) {
+                    session.archived = saved.archived;
+                    session.archived_by_user = saved.archived_by_user;
+                    if saved.shell_open {
+                        let _ = session.open_shell(ROWS, COLS);
+                    }
+                }
+                self.runtime_checkouts.insert(checkout_key, id);
+                Ok(LifecycleOutcome::Reopened {
+                    checkout: checkout_key,
+                    runtime: id,
+                })
+            }
+        }
+    }
+
     pub fn restart(&mut self, id: u64) -> MutationResult<()> {
         if self.persistence_blocked {
             return Err(persist::SaveError::before_replacement(anyhow!(
@@ -1227,13 +1324,32 @@ impl Manager {
                 return Err(anyhow!("checkout changed since admission; restart refused").into());
             }
         }
+        let targeted = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            })
+            .or_else(|| {
+                self.session(id)
+                    .ok()
+                    .and_then(|session| session.meta.session_id.clone())
+            });
+        let mode = targeted
+            .map(backend::SpawnMode::ResumeId)
+            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        self.restart_with_mode(id, mode)
+    }
+
+    fn restart_with_mode(&mut self, id: u64, mode: backend::SpawnMode) -> MutationResult<()> {
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
-        let plan = be.spawn_plan(
-            &resolved.cmd,
-            Some(&event_url(id)),
-            backend::SpawnMode::ContinueLatest,
-        );
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
         let s = self.session_mut(id)?;
         be.prepare_cwd(&s.cwd);
         s.claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &s.cwd, ROWS, COLS)?;
@@ -2220,7 +2336,10 @@ mod tests {
 
         let outcome = manager.reopen_checkout(checkout).unwrap();
         let reopened_runtime = match outcome {
-            LifecycleOutcome::Reopened { checkout: key, runtime } if key == checkout => runtime,
+            LifecycleOutcome::Reopened {
+                checkout: key,
+                runtime,
+            } if key == checkout => runtime,
             other => panic!("unexpected reopen outcome: {other:?}"),
         };
         assert_eq!(manager.runtime_checkouts.len(), 1);

@@ -585,6 +585,10 @@ pub enum LifecycleOutcome {
         checkout: CheckoutKey,
         runtime: u64,
     },
+    Reopened {
+        checkout: CheckoutKey,
+        runtime: u64,
+    },
     Closed {
         checkout: CheckoutKey,
     },
