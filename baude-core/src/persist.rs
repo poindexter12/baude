@@ -278,7 +278,10 @@ mod tests {
             load_current_at(&opencode_root, "state-opencode.json").unwrap(),
             opencode
         );
-        assert_ne!(claude.state.repositories[0].observed_main_worktree, opencode.state.repositories[0].observed_main_worktree);
+        assert_ne!(
+            claude.state.repositories[0].observed_main_worktree,
+            opencode.state.repositories[0].observed_main_worktree
+        );
         std::fs::remove_dir_all(claude_root).unwrap();
         std::fs::remove_dir_all(opencode_root).unwrap();
     }
@@ -302,7 +305,10 @@ mod tests {
         let loaded = load_current_at(&root, "state-claude.json").unwrap();
         let reconciled = |path: &PersistedPath| path.to_path_buf();
         let reconstructed = reconciled(&loaded.state.checkouts[0].observed_path);
-        assert_eq!(reconstructed.as_os_str().as_bytes(), original.as_os_str().as_bytes());
+        assert_eq!(
+            reconstructed.as_os_str().as_bytes(),
+            original.as_os_str().as_bytes()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

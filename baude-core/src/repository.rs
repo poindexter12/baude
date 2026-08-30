@@ -1,5 +1,6 @@
 //! Durable, workspace-scoped repository and checkout intent.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -69,7 +70,7 @@ pub enum CheckoutHealth {
     Unavailable(UnavailableCause),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutRole {
     Main,
@@ -176,7 +177,75 @@ impl RepositoryState {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        // RED: validation behavior is implemented in the GREEN commit.
+        let mut repository_keys = HashSet::new();
+        let mut checkout_keys = HashSet::new();
+        let mut orders = HashSet::new();
+        let mut unique_roles = HashSet::new();
+
+        for repository in &self.repositories {
+            if !repository_keys.insert(repository.key) {
+                return Err(ValidationError::DuplicateRepositoryKey(repository.key));
+            }
+            if !orders.insert(repository.first_seen_order) {
+                return Err(ValidationError::DuplicateFirstSeenOrder(
+                    repository.first_seen_order,
+                ));
+            }
+        }
+
+        for checkout in &self.checkouts {
+            if !checkout_keys.insert(checkout.key) {
+                return Err(ValidationError::DuplicateCheckoutKey(checkout.key));
+            }
+            if !repository_keys.contains(&checkout.repository_key) {
+                return Err(ValidationError::DanglingRepositoryKey(
+                    checkout.repository_key,
+                ));
+            }
+            if !orders.insert(checkout.first_seen_order) {
+                return Err(ValidationError::DuplicateFirstSeenOrder(
+                    checkout.first_seen_order,
+                ));
+            }
+            if matches!(
+                checkout.role,
+                CheckoutRole::Main | CheckoutRole::PrimaryDefault
+            ) && !unique_roles.insert((checkout.repository_key, checkout.role))
+            {
+                return Err(ValidationError::DuplicateRole {
+                    repository_key: checkout.repository_key,
+                    role: checkout.role,
+                });
+            }
+        }
+
+        if self
+            .repositories
+            .iter()
+            .any(|repository| repository.key.get() >= self.next_repository_key)
+        {
+            return Err(ValidationError::RegressingRepositoryCounter);
+        }
+        if self
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.key.get() >= self.next_checkout_key)
+        {
+            return Err(ValidationError::RegressingCheckoutCounter);
+        }
+        if self
+            .repositories
+            .iter()
+            .map(|repository| repository.first_seen_order)
+            .chain(
+                self.checkouts
+                    .iter()
+                    .map(|checkout| checkout.first_seen_order),
+            )
+            .any(|order| order >= self.next_first_seen_order)
+        {
+            return Err(ValidationError::RegressingOrderCounter);
+        }
         Ok(())
     }
 }
@@ -230,7 +299,9 @@ mod tests {
         let checkout_key = state.allocate_checkout_key();
         let repository_order = state.allocate_first_seen_order();
         let checkout_order = state.allocate_first_seen_order();
-        state.repositories.push(repository(repository_key, repository_order));
+        state
+            .repositories
+            .push(repository(repository_key, repository_order));
         state
             .checkouts
             .push(checkout(checkout_key, repository_key, checkout_order));
