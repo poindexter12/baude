@@ -2,24 +2,34 @@
 
 ## What This Is
 
-baude is a Rust workspace for running and orchestrating many Claude Code
-sessions at once: a ratatui **TUI** (`baude`) for juggling sessions across repos
-and git worktrees in one terminal, a headless **daemon** (`bauded`) that owns
-those sessions over REST/SSE/WebSocket and keeps them running unattended, and a
-phone-first **PWA** for triaging and chatting with them remotely. It's
-single-user and self-hosted, secured by binding a Tailscale/VPN interface rather
-than an auth layer.
+baude is a Rust workspace for running and orchestrating many coding-agent
+sessions at once. Its ratatui **TUI** (`baude`) manages Claude Code and OpenCode
+sessions across repositories and git worktrees, while a headless **daemon**
+(`bauded`) owns sessions over REST/SSE/WebSocket and a phone-first **PWA** makes
+them available remotely. It is single-user and self-hosted, secured by binding
+a Tailscale/VPN interface rather than an auth layer.
 
 ## Core Value
 
-You can see at a glance which of your many Claude Code sessions needs you next —
+You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
+
+## Current Milestone: v2.0 Repository Worktree Management
+
+**Goal:** Make repositories persistent, navigable UI parents so the active backend can work on the default branch immediately and create isolated worktrees for parallel work.
+
+**Target features:**
+- Opening or cloning a repository creates a persistent repository parent and launches its default-branch session using the active workspace backend
+- Worktree sessions appear beneath their repository parent and can be created from named branches
+- Managed worktrees can be closed or safely removed, with removal blocked while uncommitted changes exist
+- Repository and worktree actions use context-aware shortcuts
+- Repository hierarchy and worktree metadata persist across restart
 
 ## Requirements
 
 ### Validated
 
-<!-- Shipped and confirmed valuable (v0.1–v0.6.1). -->
+<!-- Shipped and confirmed valuable. -->
 
 - ✓ Multi-session TUI with stable sidebar order, in-place waiting flash, and live status (waiting/working/exited) — v0.1–v0.2
 - ✓ Git-worktree sessions for parallel work in one repo; keep/remove on close — v0.1
@@ -36,14 +46,19 @@ and act on it — whether you're at the terminal or on your phone.
 - ✓ Hook-driven working/waiting/done state (Claude Code hooks; silence heuristic demoted to a labeled `StateSource` fallback) — v0.7
 - ✓ Live per-session tool-activity timeline (capped ring → `GET /activity` + SSE) in the PWA and TUI — v0.7
 - ✓ Remote tool-permission approve/deny from the phone (opt-in `prompt` mode via `--permission-prompt-tool` MCP bridge; distinct push) — v0.7
+- ✓ Backend-isolated Claude Code and OpenCode workspaces, commands, metadata, and session pools — v0.8-v0.14
 
 > v0.7 code-complete; data paths Claude-validated live (4 integration bugs found + fixed). Pending human UATs before public ship: hook-state flip visual (BL-01), PWA activity-strip + TUI `v` overlay visuals, live-`claude` `--permission-prompt-tool` MCP wire contract, first-phone Web Push. Tracked in `.planning/STATE.md` Deferred Items + per-phase UAT.md.
 
 ### Active
 
-<!-- Next milestone: TBD. v0.7 shipped (code-complete). Run /gsd-new-milestone to scope the next. -->
+<!-- Current milestone scope. -->
 
-- [ ] (none scheduled — define the next milestone)
+- [ ] Repositories are persistent parent entries with their default branch opened automatically in the active backend
+- [ ] Worktrees are created and displayed beneath their repository for parallel work
+- [ ] Managed worktrees can be closed or removed safely without discarding dirty changes
+- [ ] Open, clone, session, and worktree shortcuts behave according to repository context
+- [ ] Repository/worktree hierarchy survives restart
 
 ### Out of Scope
 
@@ -51,23 +66,23 @@ and act on it — whether you're at the terminal or on your phone.
 
 - Multi-user / auth layer — security model is "bind the VPN interface"; single-user by design
 - Native Claude remote (claude.ai/code, `--remote-control`) as the backend — baude owns its own stack
-- Supporting agents other than Claude Code — baude is Claude-native on purpose
+- Supporting coding agents other than Claude Code and OpenCode — backend support is intentionally explicit
 - Remote vt100 rendering as the primary remote UX — the message/chat model is the core; raw PTY is an escape hatch
 
 ## Context
 
-- Mature codebase at **v0.6.1**; public repo `github.com/poindexter12/baude`, MIT.
+- Mature codebase at **v0.14.0**; public repo `github.com/poindexter12/baude`, MIT.
 - Cargo workspace: `baude-core/` (pty, session, meta, persist, git, bridge — no UI deps), `baude/` (ratatui TUI), `bauded/` (axum daemon + embedded PWA).
 - Distributed as prebuilt binaries via `mise`/`ubi` (release.yml builds 4 targets) and a multi-arch `ghcr.io/poindexter12/bauded` image.
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
-- v0.7 theme ("Native Claude integration") comes from a researched feature roadmap; full plans live in `docs/plans/tier-1..4-*.md`. This milestone is Tier 1; Tiers 2–4 (diff/review loop, orchestration, ergonomics) are future milestones.
-- Key prior art: Claude writes per-session JSON (`sessions/<pid>.json`), transcript JSONL, and a statusLine payload to disk; baude already reads these in `baude-core/src/meta.rs` and `bridge.rs`. v0.7 leans harder on these first-party sources and on Claude Code hooks.
+- The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
+- Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
 
 ## Constraints
 
 - **Tech stack**: Rust (ratatui TUI, axum/tokio daemon, portable-pty + vt100); vanilla JS/CSS PWA embedded in the binary with no build step — keep it that way.
 - **Security**: VPN/Tailscale-only; no auth layer is added. New endpoints inherit this model.
-- **Compatibility**: must tolerate Claude Code schema drift (snake/camel key variants) — see `bridge.rs::window()`; pin verified Claude Code versions in comments.
+- **Compatibility**: backend-specific integrations must tolerate upstream schema drift; pin verified Claude Code and OpenCode versions in comments where wire assumptions are made.
 - **Safety**: managed sessions run `--dangerously-skip-permissions` for unattended work; any permission-prompting mode is opt-in and must not become the unattended default.
 - **No regressions**: stable sidebar order and the dual-source (session-file + silence-fallback) waiting logic are hard-won; changes must preserve current behavior as a labeled fallback.
 
@@ -99,4 +114,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-16 after v0.7 Native Claude Integration milestone (code-complete; human UATs deferred — see STATE.md Deferred Items)*
+*Last updated: 2026-08-30 after starting v2.0 Repository Worktree Management*
