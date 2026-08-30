@@ -50,7 +50,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
   4. Repository ownership, children, managed state, branch, first-seen ordering, and relevant session state survive restart independently in each workspace, including valid migrated Claude Code and OpenCode sessions.
   5. Before reuse or mutation, persisted intent is reconciled with current Git topology; malformed or partial state is surfaced rather than silently replaced, and successful state changes are atomic.
 
-**Plans**: TBD
+**Plans**: 3 plans
 
 - [x] 05-01-PLAN.md
 - [x] 05-02-PLAN.md
@@ -69,7 +69,15 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
   4. A distinct confirmed remove action removes a clean managed worktree while retaining its branch.
   5. Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks removal before the running session or persisted child changes, leaving the user's work and context intact.
 
-**Plans**: TBD
+**Plans**: 6 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Trace valid named/local branch activation through shared Git, lifecycle, App, and Manager semantics.
+- [ ] 06-02-PLAN.md — Fail closed on invalid refs, path collisions, partial failures, and concurrent creation.
+- [ ] 06-03-PLAN.md — Prove result-valued dirty, conflict, topology, lock, and submodule removal blockers.
+- [ ] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context.
+- [ ] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime.
+- [ ] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context.
 
 ### Phase 7: Local Repository Hierarchy & Branch Control
 
@@ -126,7 +134,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
-| 6. Safe Managed Worktree Lifecycle | v2.0 | 0/TBD | Not started | - |
+| 6. Safe Managed Worktree Lifecycle | v2.0 | 0/6 | Planned | - |
 | 7. Local Repository Hierarchy & Branch Control | v2.0 | 0/TBD | Not started | - |
 | 8. Daemon & Remote TUI Parity | v2.0 | 0/TBD | Not started | - |
 | 9. PWA Hierarchy & Cross-Surface Completion | v2.0 | 0/TBD | Not started | - |
