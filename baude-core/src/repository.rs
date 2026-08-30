@@ -223,30 +223,33 @@ impl RepositoryState {
             }
         }
 
-        if self
-            .repositories
-            .iter()
-            .any(|repository| repository.key.get() >= self.next_repository_key)
+        if self.next_repository_key == 0
+            || self
+                .repositories
+                .iter()
+                .any(|repository| repository.key.get() >= self.next_repository_key)
         {
             return Err(ValidationError::RegressingRepositoryCounter);
         }
-        if self
-            .checkouts
-            .iter()
-            .any(|checkout| checkout.key.get() >= self.next_checkout_key)
+        if self.next_checkout_key == 0
+            || self
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key.get() >= self.next_checkout_key)
         {
             return Err(ValidationError::RegressingCheckoutCounter);
         }
-        if self
-            .repositories
-            .iter()
-            .map(|repository| repository.first_seen_order)
-            .chain(
-                self.checkouts
-                    .iter()
-                    .map(|checkout| checkout.first_seen_order),
-            )
-            .any(|order| order >= self.next_first_seen_order)
+        if self.next_first_seen_order == 0
+            || self
+                .repositories
+                .iter()
+                .map(|repository| repository.first_seen_order)
+                .chain(
+                    self.checkouts
+                        .iter()
+                        .map(|checkout| checkout.first_seen_order),
+                )
+                .any(|order| order >= self.next_first_seen_order)
         {
             return Err(ValidationError::RegressingOrderCounter);
         }
