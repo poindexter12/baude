@@ -311,6 +311,8 @@ pub fn mark_teardown_pending(
     checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
         agent_pid: error.agent_pid,
         shell_pid: error.shell_pid,
+        agent_identity: error.agent_identity.clone(),
+        shell_identity: error.shell_identity.clone(),
         agent_stopped: error.agent_stopped,
         shell_stopped: error.shell_stopped,
         detail: error.detail.clone(),
@@ -391,24 +393,36 @@ pub fn reconcile_teardown_recovery(
         .iter_mut()
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
-    let (agent_pid, shell_pid, agent_stopped, shell_stopped) = match &checkout.health {
-        CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
-            agent_pid,
-            shell_pid,
-            agent_stopped,
-            shell_stopped,
-            ..
-        }) => (*agent_pid, *shell_pid, *agent_stopped, *shell_stopped),
-        _ => {
-            return Err(LifecycleError::Topology(format!(
-                "checkout {} is not pending teardown",
-                checkout_key.get()
-            )))
-        }
-    };
+    let (agent_pid, shell_pid, agent_identity, shell_identity, agent_stopped, shell_stopped) =
+        match &checkout.health {
+            CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                agent_pid,
+                shell_pid,
+                agent_identity,
+                shell_identity,
+                agent_stopped,
+                shell_stopped,
+                ..
+            }) => (
+                *agent_pid,
+                *shell_pid,
+                agent_identity.clone(),
+                shell_identity.clone(),
+                *agent_stopped,
+                *shell_stopped,
+            ),
+            _ => {
+                return Err(LifecycleError::Topology(format!(
+                    "checkout {} is not pending teardown",
+                    checkout_key.get()
+                )))
+            }
+        };
     match crate::session::finish_recorded_teardown(
         agent_pid,
         shell_pid,
+        agent_identity,
+        shell_identity,
         agent_stopped,
         shell_stopped,
     ) {
@@ -426,6 +440,8 @@ pub fn reconcile_teardown_recovery(
             checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
                 agent_pid: error.agent_pid,
                 shell_pid: error.shell_pid,
+                agent_identity: error.agent_identity,
+                shell_identity: error.shell_identity,
                 agent_stopped: error.agent_stopped,
                 shell_stopped: error.shell_stopped,
                 detail: error.detail,
@@ -1930,6 +1946,8 @@ mod tests {
             CheckoutHealth::Unavailable(crate::repository::UnavailableCause::TeardownPending {
                 agent_pid: Some(u32::MAX),
                 shell_pid: None,
+                agent_identity: None,
+                shell_identity: None,
                 agent_stopped: true,
                 shell_stopped: true,
                 detail: "owner crashed after teardown".into(),

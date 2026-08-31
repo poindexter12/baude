@@ -7,6 +7,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::repository::ProcessIdentity;
+
 /// Milliseconds since program start. Monotonic clock shared by all sessions.
 pub fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -21,6 +23,7 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    identity: ProcessIdentity,
     pub last_output_ms: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     size: (u16, u16), // (rows, cols)
@@ -73,11 +76,42 @@ impl Pty {
             cmd.env(key, value);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("failed to spawn command in pty")?;
         drop(pair.slave);
+        let identity = child
+            .process_id()
+            .ok_or_else(|| anyhow::anyhow!("PTY child did not expose a process id"))
+            .and_then(|pid| {
+                crate::session::inspect_process_identity(pid)
+                    .map_err(anyhow::Error::msg)?
+                    .ok_or_else(|| anyhow::anyhow!("PTY child {pid} exited before identification"))
+            });
+        let identity = match identity {
+            Ok(identity)
+                if identity.process_group == identity.pid as i32
+                    && identity.session == identity.pid as i32 =>
+            {
+                identity
+            }
+            Ok(identity) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "PTY child {} does not own its process group/session ({}/{})",
+                    identity.pid,
+                    identity.process_group,
+                    identity.session
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to establish PTY process identity"));
+            }
+        };
 
         let mut reader = pair
             .master
@@ -129,6 +163,7 @@ impl Pty {
             master: pair.master,
             writer,
             child: Arc::new(Mutex::new(child)),
+            identity,
             last_output_ms,
             exited,
             size: (rows, cols),
@@ -222,6 +257,10 @@ impl Pty {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.lock().ok().and_then(|c| c.process_id())
+    }
+
+    pub fn process_identity(&self) -> &ProcessIdentity {
+        &self.identity
     }
 
     pub fn is_exited(&self) -> bool {

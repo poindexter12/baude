@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+libc = "0.2"
 portable-pty = "0.8"
 serde.workspace = true
 serde_json.workspace = true

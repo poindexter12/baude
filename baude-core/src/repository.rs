@@ -46,6 +46,18 @@ impl PersistedPath {
     }
 }
 
+/// Durable authority for one PTY-owned process group. A numeric PID alone is
+/// never sufficient because it can be reused after the original child exits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// Linux `/proc/<pid>/stat` start ticks or macOS start-time microseconds.
+    pub start_time: u64,
+    pub process_group: i32,
+    pub session: i32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableCause {
@@ -60,6 +72,10 @@ pub enum UnavailableCause {
     TeardownPending {
         agent_pid: Option<u32>,
         shell_pid: Option<u32>,
+        #[serde(default)]
+        agent_identity: Option<ProcessIdentity>,
+        #[serde(default)]
+        shell_identity: Option<ProcessIdentity>,
         agent_stopped: bool,
         shell_stopped: bool,
         detail: String,

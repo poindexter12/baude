@@ -215,6 +215,7 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
