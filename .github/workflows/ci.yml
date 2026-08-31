@@ -55,3 +55,38 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8642/sessions | grep '"status":"waiting"'
           docker rm -f smoke
+
+  artifact-readiness:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: artifact-readiness-${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - name: build locked release binaries
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: archive and verify both binaries
+        run: |
+          mkdir -p dist verify
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/baude-v2.0.0-beta-${{ matrix.target }}.tar.gz" baude bauded
+          tar -C verify -xzf "dist/baude-v2.0.0-beta-${{ matrix.target }}.tar.gz"
+          test "$(verify/baude --version)" = "baude 2.0.0-beta"
+          test "$(verify/bauded --version)" = "bauded 2.0.0-beta"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: baude-v2.0.0-beta-${{ matrix.target }}
+          path: dist/*.tar.gz
