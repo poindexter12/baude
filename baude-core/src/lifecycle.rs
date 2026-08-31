@@ -1580,6 +1580,70 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    #[test]
+    fn lifecycle_protocol_core_legal_transition_table() {
+        use super::{reduce_lifecycle, LifecycleEvent, LifecycleTraceEntry};
+        use crate::repository::{CheckoutLifecycle, RuntimeGeneration};
+
+        let legal = [
+            (
+                CheckoutLifecycle::Inactive,
+                LifecycleEvent::RequestActivation,
+                CheckoutLifecycle::Activating,
+                LifecycleTraceEntry::PersistActivation,
+            ),
+            (
+                CheckoutLifecycle::Activating,
+                LifecycleEvent::ActivationVerified,
+                CheckoutLifecycle::Active,
+                LifecycleTraceEntry::PersistActive,
+            ),
+            (
+                CheckoutLifecycle::Active,
+                LifecycleEvent::LaunchRegistered(RuntimeGeneration::initial()),
+                CheckoutLifecycle::Launching(RuntimeGeneration::initial()),
+                LifecycleTraceEntry::PersistRuntime,
+            ),
+            (
+                CheckoutLifecycle::Launching(RuntimeGeneration::initial()),
+                LifecycleEvent::LaunchReleased,
+                CheckoutLifecycle::Running(RuntimeGeneration::initial()),
+                LifecycleTraceEntry::ReleaseRuntime,
+            ),
+            (
+                CheckoutLifecycle::Running(RuntimeGeneration::initial()),
+                LifecycleEvent::RequestClose,
+                CheckoutLifecycle::Stopping(RuntimeGeneration::initial()),
+                LifecycleTraceEntry::PersistStop,
+            ),
+            (
+                CheckoutLifecycle::Stopping(RuntimeGeneration::initial()),
+                LifecycleEvent::RuntimeExtinct,
+                CheckoutLifecycle::Inactive,
+                LifecycleTraceEntry::PersistInactive,
+            ),
+        ];
+
+        for (before, event, after, effect) in legal {
+            let transition = reduce_lifecycle(&before, &event);
+            assert_eq!(transition.state, after);
+            assert_eq!(transition.effects, vec![effect]);
+        }
+
+        let protected = CheckoutLifecycle::RemovalCommitted;
+        for event in [
+            LifecycleEvent::RequestActivation,
+            LifecycleEvent::ActivationVerified,
+            LifecycleEvent::LaunchReleased,
+            LifecycleEvent::RequestClose,
+            LifecycleEvent::RuntimeExtinct,
+        ] {
+            let refused = reduce_lifecycle(&protected, &event);
+            assert_eq!(refused.state, protected);
+            assert!(refused.effects.is_empty());
+        }
+    }
+
     fn repository_key() -> RepositoryKey {
         let mut state = RepositoryState::default();
         state.allocate_repository_key().unwrap()

@@ -1171,4 +1171,36 @@ mod tests {
         assert_eq!(c.auto_archive_ms(), 60_000, "env overrides config");
         std::env::remove_var("BAUDED_AUTO_ARCHIVE_MIN");
     }
+
+    #[test]
+    fn lifecycle_schema_v2_migrates_protected_states() {
+        assert_eq!(SCHEMA_VERSION, 2);
+        let root = isolated_root("lifecycle-schema-v2");
+        let workspace = test_workspace("claude");
+        let file = workspace.state_file("state");
+        let legacy = schema_v1_protected_fixture();
+        std::fs::write(root.join(&file), serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let first = load_for_workspace_strict_at(&root, "state", &workspace, |_| {
+            panic!("schema-v1 migration must not use flat legacy reconciliation")
+        })
+        .unwrap();
+        let LoadOutcome::Legacy(first) = first else {
+            panic!("schema-v1 input was not migrated")
+        };
+        assert!(first.state.checkouts.iter().all(|checkout| {
+            checkout.lifecycle().is_protected() && !checkout.lifecycle().is_launchable()
+        }));
+        let first_bytes = std::fs::read(root.join(&file)).unwrap();
+        let second = load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!())
+            .unwrap();
+        assert!(matches!(second, LoadOutcome::Current(_)));
+        assert_eq!(std::fs::read(root.join(&file)).unwrap(), first_bytes);
+
+        let malformed = malformed_schema_v1_ownership_fixture();
+        std::fs::write(root.join(&file), serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert!(load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!())
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
