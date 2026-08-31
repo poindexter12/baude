@@ -353,6 +353,56 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn pre_exec_registration_gate_owner_death_and_release() {
+        let root = std::env::temp_dir().join(format!(
+            "baude-registration-gate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("released");
+        let command = format!(
+            "trap '' HUP; printf released > {}; sleep 30",
+            marker.display()
+        );
+
+        let failed = Pty::spawn_registered_with(
+            Some(&command),
+            &[],
+            &root,
+            5,
+            40,
+            |_| anyhow::bail!("persistence refused"),
+        );
+        assert!(failed.is_err());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "failed registration released command");
+
+        let mut pty = Pty::spawn_registered_with(
+            Some(&command),
+            &[],
+            &root,
+            5,
+            40,
+            |identity| {
+                assert_eq!(identity.pid as i32, identity.process_group);
+                assert_eq!(identity.pid as i32, identity.session);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let identity = pty.process_identity().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < deadline, "gate was not released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pty.process_identity(), &identity);
+        pty.kill_and_wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn subscribe_snapshot_then_live_bytes() {
         let mut pty = Pty::spawn(
             Some("echo before; cat; echo after"),

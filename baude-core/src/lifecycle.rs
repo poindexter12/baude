@@ -1826,6 +1826,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lifecycle_startup_recovery_is_idempotent() {
+        use super::{startup_recovery_program, RecoveryStep};
+
+        let mut state = close_state();
+        let repository = state.checkouts[0].repository_key;
+        let process = state.checkouts[0].key;
+        state.checkouts[0].lifecycle = CheckoutLifecycle::Stopping(RuntimeGeneration::initial());
+
+        let activation = state.allocate_checkout_key().unwrap();
+        let activation_order = state.allocate_first_seen_order().unwrap();
+        let mut activation_checkout = state.checkouts[0].clone();
+        activation_checkout.key = activation;
+        activation_checkout.first_seen_order = activation_order;
+        activation_checkout.observed_path = path("/repo-activation");
+        activation_checkout.session.cwd = path("/repo-activation");
+        activation_checkout.lifecycle = CheckoutLifecycle::Activating;
+        state.checkouts.push(activation_checkout);
+
+        let launch = state.allocate_checkout_key().unwrap();
+        let launch_order = state.allocate_first_seen_order().unwrap();
+        let mut launch_checkout = state.checkouts[0].clone();
+        launch_checkout.key = launch;
+        launch_checkout.first_seen_order = launch_order;
+        launch_checkout.observed_path = path("/repo-launch");
+        launch_checkout.session.cwd = path("/repo-launch");
+        launch_checkout.lifecycle = CheckoutLifecycle::Active;
+        state.checkouts.push(launch_checkout);
+
+        assert_eq!(
+            startup_recovery_program(&state),
+            vec![
+                RecoveryStep::StopOwned(process),
+                RecoveryStep::RecoverActivation(activation),
+                RecoveryStep::Launch(launch),
+            ]
+        );
+        for checkout in &mut state.checkouts {
+            checkout.lifecycle = CheckoutLifecycle::Inactive;
+            checkout.active_intent = false;
+            checkout.health = CheckoutHealth::Available;
+        }
+        assert!(startup_recovery_program(&state).is_empty());
+        assert!(startup_recovery_program(&state).is_empty());
+        assert_eq!(state.repositories[0].key, repository);
+    }
+
     fn repository_key() -> RepositoryKey {
         let mut state = RepositoryState::default();
         state.allocate_repository_key().unwrap()

@@ -665,6 +665,59 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
+    fn lifecycle_process_contract_exact_ownership() {
+        let agent = ProcessIdentity {
+            pid: 41,
+            start_time: 100,
+            process_group: 41,
+            session: 41,
+        };
+        let shell = ProcessIdentity {
+            pid: 42,
+            start_time: 101,
+            process_group: 42,
+            session: 42,
+        };
+        for snapshot in [
+            RuntimeSnapshot::new(agent.clone(), None),
+            RuntimeSnapshot::new(agent.clone(), Some(shell.clone())),
+        ] {
+            assert_eq!(snapshot.agent(), &agent);
+            assert_eq!(snapshot.shell().is_some(), snapshot.shell_requested());
+            assert!(snapshot.validate().is_ok());
+        }
+
+        let report = StopReport::from_observations(
+            Some(agent.clone()),
+            Some(shell.clone()),
+            true,
+            false,
+            "shell refused",
+        );
+        assert!(!report.all_extinct());
+        assert_eq!(report.remaining(), vec![shell.clone()]);
+
+        let reused = ProcessIdentity {
+            start_time: 999,
+            ..agent.clone()
+        };
+        let signals = AtomicUsize::new(0);
+        finish_recorded_process_with(
+            Some(agent.clone()),
+            false,
+            |_| Ok(Some(reused.clone())),
+            |identity, signal| {
+                assert_eq!(identity.process_group, identity.pid as i32);
+                assert!(signal == libc::SIGTERM || signal == libc::SIGKILL);
+                signals.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(signals.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
     fn human_duration_buckets() {
         assert_eq!(human_duration(5_000), "5s");
         assert_eq!(human_duration(120_000), "2m");
