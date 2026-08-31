@@ -283,6 +283,13 @@ pub fn default_claude_cmd() -> String {
 }
 
 impl Manager {
+    #[cfg(test)]
+    fn lifecycle_contract_trace(
+        vector: lifecycle::CanonicalLifecycleVector,
+    ) -> lifecycle::LifecycleTrace {
+        lifecycle::canonical_lifecycle_trace(vector)
+    }
+
     pub fn new(claude_cmd: String, persist: bool) -> Manager {
         Manager {
             sessions: Vec::new(),
@@ -354,17 +361,22 @@ impl Manager {
                 return 0;
             }
         };
-        if let Err(error) = self.reconcile_activation_recoveries() {
-            eprintln!("activation recovery: {error}");
-        }
         if let Err(error) = self.reconcile_teardown_recoveries() {
             eprintln!("teardown recovery: {error}");
+        }
+        if let Err(error) = self.reconcile_activation_recoveries() {
+            eprintln!("activation recovery: {error}");
         }
         let checkouts: Vec<_> = self
             .repository_state
             .checkouts
             .iter()
-            .filter(|checkout| checkout.active_intent)
+            .filter(|checkout| {
+                matches!(
+                    checkout.lifecycle(),
+                    CheckoutLifecycle::Active | CheckoutLifecycle::Launching(_)
+                ) || (checkout.active_intent && checkout.health == CheckoutHealth::Available)
+            })
             .cloned()
             .collect();
         let mut restored = 0;
@@ -653,7 +665,7 @@ impl Manager {
                 repo_root: PersistedPath::from_path(&session.repo_root),
                 branch: session.branch.clone(),
                 is_worktree: session.is_worktree,
-                shell_open: false,
+                shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
                 resume_id: session
@@ -1164,6 +1176,11 @@ impl Manager {
                 .as_ref()
                 .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
             first_seen_order,
+            lifecycle: if snapshot.is_some() {
+                CheckoutLifecycle::Active
+            } else {
+                CheckoutLifecycle::Protected(UnavailableCause::NotRepository)
+            },
             active_intent: true,
             session: RetainedSessionState {
                 name: session.name.clone(),
@@ -1171,7 +1188,7 @@ impl Manager {
                 repo_root: PersistedPath::from_path(&session.repo_root),
                 branch: session.branch.clone(),
                 is_worktree: session.is_worktree,
-                shell_open: false,
+                shell_open: session.shell_open,
                 archived: session.archived,
                 archived_by_user: session.archived_by_user,
                 resume_id: None,
@@ -1228,7 +1245,7 @@ impl Manager {
             repo_root: PersistedPath::from_path(&session.repo_root),
             branch: session.branch.clone(),
             is_worktree: session.is_worktree,
-            shell_open: false,
+            shell_open: session.shell_open,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
             resume_id: session.meta.session_id.clone().or(durable_resume_id),
@@ -1495,7 +1512,7 @@ impl Manager {
             repo_root: PersistedPath::from_path(&session.repo_root),
             branch: session.branch.clone(),
             is_worktree: session.is_worktree,
-            shell_open: false,
+            shell_open: session.shell_open,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
             resume_id: session.meta.session_id.clone().or_else(|| {
@@ -1524,18 +1541,24 @@ impl Manager {
                     .clone()
                     .map(backend::SpawnMode::ResumeId)
                     .unwrap_or(backend::SpawnMode::ContinueLatest);
-                return match self.restart_with_mode(id, mode) {
+                return match self.restore_stopped_runtime(id, mode, snapshot.shell_open) {
                     Ok(()) => Err(MutationError::Persistence(error)),
                     Err(restart) => {
-                        self.forget_stopped_runtime(checkout_key, id);
                         let detail = format!(
                             "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
                         );
+                        if let Err(cleanup) = self.teardown_retained_runtime(checkout_key, id) {
+                            return Err(anyhow!(
+                                "{detail}; restarted runtime cleanup remains durably pending: {cleanup}"
+                            )
+                            .into());
+                        }
+                        self.forget_stopped_runtime(checkout_key, id);
                         lifecycle::mark_stopped_active_recovery(
                             &mut self.repository_state,
                             checkout_key,
                             false,
-                            true,
+                            false,
                             detail.clone(),
                         )
                         .map_err(anyhow::Error::new)?;
@@ -1897,6 +1920,26 @@ impl Manager {
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;
+        Ok(())
+    }
+
+    fn restore_stopped_runtime(
+        &mut self,
+        id: u64,
+        mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> MutationResult<()> {
+        self.restart_with_mode(id, mode)?;
+        if shell_open {
+            let session = self.session_mut(id)?;
+            session.open_shell(ROWS, COLS)?;
+        }
+        let session = self.session(id)?;
+        if session.claude.is_exited()
+            || (shell_open && session.shell.as_ref().is_none_or(|shell| shell.is_exited()))
+        {
+            return Err(anyhow!("agent and requested shell were not both restored").into());
+        }
         Ok(())
     }
 
@@ -2320,6 +2363,7 @@ mod tests {
             observed_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
             observed_branch: snapshot.selected_worktree.branch.clone(),
             first_seen_order: checkout_order,
+            lifecycle: CheckoutLifecycle::Active,
             active_intent: true,
             session: RetainedSessionState {
                 name: "changed checkout".into(),
@@ -2950,9 +2994,19 @@ mod tests {
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
             manager.session_id_for_test(id, &format!("opaque-{label}"));
+            manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
             let before = manager.repository_state.clone();
             let original_pid = manager.session(id).unwrap().claude.pid().unwrap();
+            let original_shell_pid = manager
+                .session(id)
+                .unwrap()
+                .shell
+                .as_ref()
+                .unwrap()
+                .pid()
+                .unwrap();
             assert!(pid_is_live(original_pid));
+            assert!(pid_is_live(original_shell_pid));
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
             let close_error = manager.remove(id).unwrap_err().to_string();
@@ -2967,6 +3021,7 @@ mod tests {
                 !committed
             );
             assert!(!pid_is_live(original_pid));
+            assert!(!pid_is_live(original_shell_pid));
             if committed {
                 assert!(manager.sessions.is_empty());
                 assert!(manager.runtime_checkouts.is_empty());
@@ -2987,6 +3042,17 @@ mod tests {
                 assert!(!manager.session(compensated).unwrap().claude.is_exited());
                 assert!(pid_is_live(
                     manager.session(compensated).unwrap().claude.pid().unwrap()
+                ));
+                assert!(manager.session(compensated).unwrap().shell_open);
+                assert!(pid_is_live(
+                    manager
+                        .session(compensated)
+                        .unwrap()
+                        .shell
+                        .as_ref()
+                        .unwrap()
+                        .pid()
+                        .unwrap()
                 ));
                 manager.kill_all();
             }

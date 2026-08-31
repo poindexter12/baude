@@ -153,6 +153,40 @@ pub fn canonical_lifecycle_contract_vectors() -> &'static [CanonicalLifecycleVec
     ]
 }
 
+pub fn canonical_lifecycle_trace(vector: CanonicalLifecycleVector) -> LifecycleTrace {
+    let (mut state, events) = match vector {
+        CanonicalLifecycleVector::Activate => (
+            CheckoutLifecycle::Inactive,
+            vec![
+                LifecycleEvent::RequestActivation,
+                LifecycleEvent::ActivationVerified,
+            ],
+        ),
+        CanonicalLifecycleVector::Launch => (
+            CheckoutLifecycle::Active,
+            vec![
+                LifecycleEvent::LaunchRegistered(RuntimeGeneration::initial()),
+                LifecycleEvent::LaunchReleased,
+            ],
+        ),
+        CanonicalLifecycleVector::Close => (
+            CheckoutLifecycle::Running(RuntimeGeneration::initial()),
+            vec![LifecycleEvent::RequestClose, LifecycleEvent::RuntimeExtinct],
+        ),
+        CanonicalLifecycleVector::ProtectedRefusal => (
+            CheckoutLifecycle::RemovalCommitted,
+            vec![LifecycleEvent::RequestActivation],
+        ),
+    };
+    let mut trace = Vec::new();
+    for event in events {
+        let transition = reduce_lifecycle(&state, &event);
+        state = transition.state;
+        trace.extend(transition.effects);
+    }
+    trace
+}
+
 pub fn normalize_lifecycle_trace(trace: &[LifecycleTraceEntry]) -> LifecycleTrace {
     trace.to_vec()
 }
@@ -472,6 +506,7 @@ pub fn plan_close(
     checkout.session = request.runtime;
     checkout.active_intent = false;
     checkout.health = CheckoutHealth::Available;
+    checkout.lifecycle = CheckoutLifecycle::Inactive;
     next.validate()?;
     *state = next;
     Ok(ClosePlan {
@@ -497,8 +532,7 @@ pub fn mark_teardown_pending(
         .iter_mut()
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
-    checkout.active_intent = true;
-    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+    let cause = UnavailableCause::TeardownPending {
         agent_pid: error.agent_pid,
         shell_pid: error.shell_pid,
         agent_identity: error.agent_identity.clone(),
@@ -506,7 +540,11 @@ pub fn mark_teardown_pending(
         agent_stopped: error.agent_stopped,
         shell_stopped: error.shell_stopped,
         detail: error.detail.clone(),
-    });
+    };
+    checkout.active_intent = true;
+    checkout.session.shell_open = error.shell_pid.is_some();
+    checkout.health = CheckoutHealth::Unavailable(cause.clone());
+    checkout.lifecycle = CheckoutLifecycle::Protected(cause);
     state.validate()?;
     Ok(())
 }
@@ -1540,14 +1578,25 @@ fn execute_activation_with_post_git_hook(
                     checkout.key.get()
                 )));
             }
-            if let CheckoutHealth::Unavailable(cause) = &checkout.health {
+            if checkout.key != prepared.checkout {
+                if let CheckoutHealth::Unavailable(cause) = &checkout.health {
+                    return Err(LifecycleError::Topology(format!(
+                        "occupied checkout {} has unresolved recovery: {cause:?}",
+                        checkout.key.get()
+                    )));
+                }
+            } else if !matches!(
+                checkout.health,
+                CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { .. })
+            ) {
                 return Err(LifecycleError::Topology(format!(
-                    "occupied checkout {} has unresolved recovery: {cause:?}",
+                    "activation checkout {} lost its pending candidate",
                     checkout.key.get()
                 )));
             }
             checkout.active_intent = true;
             checkout.health = CheckoutHealth::Available;
+            checkout.lifecycle = CheckoutLifecycle::Active;
             checkout.session.cwd = PersistedPath::from_path(&record.path);
             checkout.session.repo_root = PersistedPath::from_path(&fresh.main_worktree);
             checkout.session.branch = Some(prepared.request.branch.clone());

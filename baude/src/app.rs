@@ -43,7 +43,12 @@ fn active_restore_checkouts(state: &RepositoryState) -> Vec<CheckoutKey> {
     state
         .checkouts
         .iter()
-        .filter(|checkout| checkout.active_intent)
+        .filter(|checkout| {
+            matches!(
+                checkout.lifecycle(),
+                CheckoutLifecycle::Active | CheckoutLifecycle::Launching(_)
+            ) || (checkout.active_intent && checkout.health == CheckoutHealth::Available)
+        })
         .map(|checkout| checkout.key)
         .collect()
 }
@@ -287,8 +292,6 @@ impl Selection {
 
 #[derive(Debug)]
 struct RuntimeRestartFailure {
-    agent_restarted: bool,
-    shell_restarted: bool,
     detail: String,
 }
 
@@ -382,6 +385,13 @@ pub fn inner(r: Rect) -> Rect {
 }
 
 impl App {
+    #[cfg(test)]
+    fn lifecycle_contract_trace(
+        vector: lifecycle::CanonicalLifecycleVector,
+    ) -> lifecycle::LifecycleTrace {
+        lifecycle::canonical_lifecycle_trace(vector)
+    }
+
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
         let config_notify = config.desktop_notifications;
@@ -532,11 +542,11 @@ impl App {
                 return;
             }
         };
-        if let Err(error) = self.reconcile_activation_recoveries() {
-            self.set_message(format!("activation recovery: {error}"));
-        }
         if let Err(error) = self.reconcile_teardown_recoveries() {
             self.set_message(format!("teardown recovery: {error}"));
+        }
+        if let Err(error) = self.reconcile_activation_recoveries() {
+            self.set_message(format!("activation recovery: {error}"));
         }
         let active = active_restore_checkouts(&self.repository_state);
         for key in active {
@@ -1798,15 +1808,21 @@ impl App {
                         "{error}; close persistence rolled back and retained runtime {id} restarted (agent and shell restored)"
                     )),
                     Err(restart) => {
-                        self.forget_stopped_runtime(checkout_key, id);
                         let detail = format!(
                             "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
                         );
+                        if let Err(cleanup) = self.teardown_retained_runtime(checkout_key, id) {
+                            self.persistence_dirty = true;
+                            return Err(anyhow::anyhow!(
+                                "{detail}; restarted runtime cleanup remains durably pending: {cleanup}"
+                            ));
+                        }
+                        self.forget_stopped_runtime(checkout_key, id);
                         lifecycle::mark_stopped_active_recovery(
                             &mut self.repository_state,
                             checkout_key,
-                            restart.agent_restarted,
-                            restart.shell_restarted,
+                            false,
+                            false,
                             detail.clone(),
                         )?;
                         let recovery_save = self.save_durable_status();
@@ -2883,8 +2899,6 @@ impl App {
     ) -> std::result::Result<(), RuntimeRestartFailure> {
         if let Err(error) = self.restart_session_with_mode(id, mode) {
             return Err(RuntimeRestartFailure {
-                agent_restarted: false,
-                shell_restarted: !shell_open,
                 detail: format!("agent: {error}"),
             });
         }
@@ -2909,12 +2923,7 @@ impl App {
         if agent_restarted && shell_restarted {
             return Ok(());
         }
-        if let Some(session) = self.session_mut(id) {
-            let _ = session.kill_and_wait();
-        }
         Err(RuntimeRestartFailure {
-            agent_restarted,
-            shell_restarted,
             detail: format!(
                 "agent live: {agent_restarted}; shell live/restored: {shell_restarted}"
             ),
@@ -3111,11 +3120,23 @@ mod clipboard_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::App;
-    use baude_core::lifecycle::{
-        canonical_lifecycle_contract_vectors, canonical_lifecycle_trace,
-        normalize_lifecycle_trace,
+    use super::{
+        active_restore_checkouts, checkout_for_runtime, local_admission_route,
+        require_same_checkout_path, App, LocalAdmissionRoute, Modal,
     };
+    use baude_core::lifecycle::{
+        canonical_lifecycle_contract_vectors, canonical_lifecycle_trace, normalize_lifecycle_trace,
+        LifecycleOutcome, RepositoryReservations,
+    };
+    use baude_core::repository::{
+        CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
+        RepositoryHealth, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+        UnavailableCause,
+    };
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn lifecycle_protocol_contract_app_vectors() {
@@ -3127,23 +3148,6 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod repository_admission_tests {
-    use super::{
-        active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, LocalAdmissionRoute, Modal,
-    };
-    use baude_core::lifecycle::{LifecycleOutcome, RepositoryReservations};
-    use baude_core::repository::{
-        CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
-        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
-    };
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     fn pid_is_live(pid: u32) -> bool {
         Command::new("ps")
@@ -3241,6 +3245,11 @@ mod repository_admission_tests {
             observed_path: path.clone(),
             observed_branch: Some("refs/heads/main".into()),
             first_seen_order: order,
+            lifecycle: if active_intent {
+                CheckoutLifecycle::Active
+            } else {
+                CheckoutLifecycle::Inactive
+            },
             active_intent,
             session: RetainedSessionState {
                 name: format!("{role:?}"),
@@ -3456,7 +3465,7 @@ mod repository_admission_tests {
         // An occupied activation still has a real persistence commit boundary.
         // If that save fails before replacement, neither memory nor disk may
         // retain the newly activated intent.
-        app.repository_state.checkouts[0].active_intent = false;
+        app.repository_state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
         app.save_durable_status().unwrap();
         let inactive = app.repository_state.clone();
         app.atomic_failure_for_test = Some(baude_core::persist::AtomicFailure::Rename);
