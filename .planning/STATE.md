@@ -5,16 +5,16 @@ milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
 status: verification
-stopped_at: Completed 07-01-PLAN.md; Phase 6 certification and Phase 7 UAT remain pending
-last_updated: "2026-08-31T08:03:21.185Z"
+stopped_at: Completed 07-02-PLAN.md; requirements, Phase 6 certification, and Phase 7 UAT remain pending
+last_updated: "2026-08-31T08:47:28.824Z"
 last_activity: 2026-08-30
 last_activity_desc: completed shared lifecycle engine cutover and full local gate; certification pending
-state_head: 5252f4f099320b8ffbb0f11b04d1cf08198b69ab
+state_head: b66178425507a0ce68b90f397aa398853e8ce289
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 16
-  completed_plans: 11
+  completed_plans: 12
   percent: 33
 ---
 
@@ -40,16 +40,16 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 11
+- v2.0 plans completed: 12
 - Prior milestone: 14 plans completed across 4 phases
-- Average duration: 18 min
-- Total execution time: 200 min
+- Average duration: 20 min
+- Total execution time: 234 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
-| 7. Local TUI Dogfood Release | 1/6 | 17 min | 17 min |
+| 7. Local TUI Dogfood Release | 2/6 | 51 min | 26 min |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -65,6 +65,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 06 P06 | 16min | 3 tasks | 5 files |
 | Phase 06 P07 | 69m | 3 tasks | 10 files |
 | Phase 07 P01 | 17min | 2 tasks | 5 files |
+| Phase 07 P02 | 34min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -111,6 +112,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Structural hierarchy and ordering come only from persisted repository state; runtime, status, and archive facts are decoration joins. — Prevents volatile process churn from changing structural identity or order.
 - [Phase 07]: Normal navigation visits repository parents while cycle navigation visits only actionable checkout and remote rows. — Parents remain discoverable without becoming action targets.
 - [Phase 07]: Invalid local selection falls back within its repository before its parent; restart prefers the first local parent before remote rows. — Keeps local context deterministic across refresh, removal, and restart.
+- [Phase 07]: Only eligible inactive retained checkouts expose RetryReopen; only implemented activation, teardown, and stopped-active paths expose RetryRecovery. — Keeps every presented retry capability paired with a concrete safe App dispatcher.
+- [Phase 07]: Lowercase x is retained close only; Shift+X alone enters separately confirmed, freshly rechecked managed-worktree removal. — Prevents ordinary close intent from escalating into physical Git topology removal.
+- [Phase 07]: Local action authority resolves durable RepositoryKey and CheckoutKey rather than presentation or runtime absence. — Keeps stale glyphs, labels, status, and volatile runtime decoration non-authoritative.
 
 ### Pending Todos
 
@@ -137,6 +141,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T08:03:21.091Z
-Stopped at: Completed 07-01-PLAN.md; Phase 6 certification and Phase 7 UAT remain pending
+Last session: 2026-08-31T08:47:28.718Z
+Stopped at: Completed 07-02-PLAN.md; requirements, Phase 6 certification, and Phase 7 UAT remain pending
 Resume file: None
