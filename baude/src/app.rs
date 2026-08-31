@@ -21,7 +21,9 @@ use baude_core::repository::{
 };
 use baude_core::session::{Session, Status};
 
-use crate::hierarchy::{self, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget};
+use crate::hierarchy::{
+    self, ActionKind, ActionView, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
+};
 use crate::keys::encode_key;
 use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
@@ -200,6 +202,150 @@ pub enum SelId {
     Repository(RepositoryKey),
     Checkout(CheckoutKey),
     Remote(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarRefusal {
+    RepositoryClose,
+    RepositoryRemove,
+    RepositoryShell,
+    RepositoryArchive,
+    AlreadyClosed,
+    MainRemove,
+    UnmanagedRemove,
+    NoLiveRuntime,
+    UnavailableReopen,
+    UnavailableBranch,
+    UnavailableClose,
+    UnavailableRemove,
+    UnavailableArchive,
+    RecoveryReopen,
+    RecoveryBranch,
+    RecoveryClose,
+    RecoveryRemove,
+    RetryNotAuthorized,
+    RemoteShell,
+    RemoteEditor,
+    RemoteGsd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryKind {
+    Activation,
+    Teardown,
+    Removal,
+    StoppedActive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarAction {
+    None,
+    Open,
+    Branch,
+    Close,
+    RetryReopen,
+    RetryRecovery,
+    Remove,
+    Shell,
+    Editor,
+    Info,
+    Activity,
+    Gsd,
+    Archive,
+    RemoteOpen,
+    RemoteClose,
+    RemoteRestart,
+    RemoteArchive,
+    Refuse(SidebarRefusal),
+}
+
+fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
+    let remove_key = matches!(key.code, KeyCode::Char('X'))
+        || matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::SHIFT);
+    if remove_key {
+        return match view.kind {
+            ActionKind::Repository => SidebarAction::Refuse(SidebarRefusal::RepositoryRemove),
+            ActionKind::Main => SidebarAction::Refuse(SidebarRefusal::MainRemove),
+            ActionKind::Managed if view.can_remove => SidebarAction::Remove,
+            ActionKind::External => SidebarAction::Refuse(SidebarRefusal::UnmanagedRemove),
+            ActionKind::Unavailable
+                if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
+            {
+                SidebarAction::Refuse(SidebarRefusal::RecoveryRemove)
+            }
+            ActionKind::Unavailable => SidebarAction::Refuse(SidebarRefusal::UnavailableRemove),
+            ActionKind::Remote => SidebarAction::None,
+            ActionKind::Managed => SidebarAction::Refuse(SidebarRefusal::UnmanagedRemove),
+        };
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match view.kind {
+            ActionKind::Remote => SidebarAction::RemoteOpen,
+            ActionKind::Unavailable
+                if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
+            {
+                SidebarAction::Refuse(SidebarRefusal::RecoveryReopen)
+            }
+            ActionKind::Unavailable => SidebarAction::Refuse(SidebarRefusal::UnavailableReopen),
+            _ => SidebarAction::Open,
+        },
+        KeyCode::Char('w') => match view.kind {
+            ActionKind::Remote => SidebarAction::None,
+            ActionKind::Unavailable
+                if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
+            {
+                SidebarAction::Refuse(SidebarRefusal::RecoveryBranch)
+            }
+            ActionKind::Unavailable => SidebarAction::Refuse(SidebarRefusal::UnavailableBranch),
+            _ => SidebarAction::Branch,
+        },
+        KeyCode::Char('x') => match view.kind {
+            ActionKind::Remote => SidebarAction::RemoteClose,
+            ActionKind::Repository => SidebarAction::Refuse(SidebarRefusal::RepositoryClose),
+            ActionKind::Unavailable
+                if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
+            {
+                SidebarAction::Refuse(SidebarRefusal::RecoveryClose)
+            }
+            ActionKind::Unavailable => SidebarAction::Refuse(SidebarRefusal::UnavailableClose),
+            _ if view.can_close => SidebarAction::Close,
+            _ => SidebarAction::Refuse(SidebarRefusal::AlreadyClosed),
+        },
+        KeyCode::Char('r') => match view.kind {
+            ActionKind::Remote => SidebarAction::RemoteRestart,
+            _ => match view.capability {
+                Some(lifecycle::LifecycleCapability::RetryReopen) => SidebarAction::RetryReopen,
+                Some(lifecycle::LifecycleCapability::RetryRecovery) => SidebarAction::RetryRecovery,
+                None => SidebarAction::Refuse(SidebarRefusal::RetryNotAuthorized),
+            },
+        },
+        KeyCode::Char('t') => match view.kind {
+            ActionKind::Remote => SidebarAction::Refuse(SidebarRefusal::RemoteShell),
+            ActionKind::Repository => SidebarAction::Refuse(SidebarRefusal::RepositoryShell),
+            _ if view.has_runtime => SidebarAction::Shell,
+            _ => SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+        },
+        KeyCode::Char('e') => match view.kind {
+            ActionKind::Remote => SidebarAction::Refuse(SidebarRefusal::RemoteEditor),
+            _ => SidebarAction::Editor,
+        },
+        KeyCode::Char('i') => SidebarAction::Info,
+        KeyCode::Char('v') => match view.kind {
+            ActionKind::Repository => SidebarAction::None,
+            _ => SidebarAction::Activity,
+        },
+        KeyCode::Char('g') => match view.kind {
+            ActionKind::Remote => SidebarAction::Refuse(SidebarRefusal::RemoteGsd),
+            _ => SidebarAction::Gsd,
+        },
+        KeyCode::Char('a') => match view.kind {
+            ActionKind::Remote => SidebarAction::RemoteArchive,
+            ActionKind::Repository => SidebarAction::Refuse(SidebarRefusal::RepositoryArchive),
+            ActionKind::Unavailable => SidebarAction::Refuse(SidebarRefusal::UnavailableArchive),
+            _ => SidebarAction::Archive,
+        },
+        _ => SidebarAction::None,
+    }
 }
 
 pub enum InputKind {
@@ -610,6 +756,223 @@ impl App {
             })
             .collect();
         hierarchy::project_local(&self.repository_state, &decorations)
+    }
+
+    fn selected_action_view(&self) -> Option<ActionView> {
+        match self.selected_id? {
+            SelId::Repository(key) => self.hierarchy_rows().into_iter().find_map(|row| match row {
+                LocalRow::Repository(parent) if parent.key == key => Some(parent.actions),
+                _ => None,
+            }),
+            SelId::Checkout(key) => self.hierarchy_rows().into_iter().find_map(|row| match row {
+                LocalRow::Checkout(checkout) if checkout.key == key => Some(checkout.actions),
+                _ => None,
+            }),
+            SelId::Remote(_) => Some(hierarchy::action_view(
+                hierarchy::ActionSelection::Remote,
+                true,
+                None,
+            )),
+        }
+    }
+
+    fn selected_repository(&self) -> Option<&SavedRepository> {
+        let key = match self.selected_id? {
+            SelId::Repository(key) => key,
+            SelId::Checkout(key) => {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)?
+                    .repository_key
+            }
+            SelId::Remote(_) => return None,
+        };
+        self.repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.key == key)
+    }
+
+    fn selected_checkout(&self) -> Option<&SavedCheckout> {
+        let SelId::Checkout(key) = self.selected_id? else {
+            return None;
+        };
+        self.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+    }
+
+    fn repository_label(repository: &SavedRepository) -> String {
+        repository
+            .observed_main_worktree
+            .to_path_buf()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                repository
+                    .observed_main_worktree
+                    .to_path_buf()
+                    .display()
+                    .to_string()
+            })
+    }
+
+    fn selected_target_label(&self) -> String {
+        self.selected_checkout()
+            .map(|checkout| checkout.session.name.clone())
+            .or_else(|| self.selected_repository().map(Self::repository_label))
+            .or_else(|| self.selected_remote().map(|remote| remote.name.clone()))
+            .unwrap_or_else(|| "selected target".into())
+    }
+
+    fn selected_unavailable_cause(&self) -> Option<&UnavailableCause> {
+        let checkout = self.selected_checkout()?;
+        match checkout.lifecycle() {
+            CheckoutLifecycle::Protected(cause) => Some(cause),
+            CheckoutLifecycle::RemovalCommitted => None,
+            _ => match checkout.health() {
+                CheckoutHealth::Unavailable(cause) => Some(cause),
+                CheckoutHealth::Available => None,
+            },
+        }
+    }
+
+    fn selected_recovery_kind(&self) -> Option<RecoveryKind> {
+        match self.selected_checkout()?.lifecycle() {
+            CheckoutLifecycle::Activating
+            | CheckoutLifecycle::Protected(
+                UnavailableCause::PendingActivation { .. }
+                | UnavailableCause::ActivationRecovery { .. },
+            ) => Some(RecoveryKind::Activation),
+            CheckoutLifecycle::Stopping(_)
+            | CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. }) => {
+                Some(RecoveryKind::Teardown)
+            }
+            CheckoutLifecycle::RemovalCommitted
+            | CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)) => {
+                Some(RecoveryKind::Removal)
+            }
+            CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery { .. }) => {
+                Some(RecoveryKind::StoppedActive)
+            }
+            _ => None,
+        }
+    }
+
+    fn unavailable_cause_label(cause: Option<&UnavailableCause>) -> &'static str {
+        match cause {
+            Some(UnavailableCause::Missing) => "missing",
+            Some(UnavailableCause::NotRepository) => "not a repository",
+            Some(UnavailableCause::IdentityChanged) => "identity changed",
+            Some(UnavailableCause::RemovalTombstone(_)) => "protected removal state",
+            Some(UnavailableCause::PendingActivation { .. })
+            | Some(UnavailableCause::ActivationRecovery { .. }) => "activation recovery",
+            Some(UnavailableCause::TeardownPending { .. }) => "teardown recovery",
+            Some(UnavailableCause::StoppedActiveRecovery { .. }) => "runtime ownership recovery",
+            Some(UnavailableCause::Io(_)) => "I/O failure",
+            Some(UnavailableCause::Other(_)) | None => "indeterminate topology",
+        }
+    }
+
+    fn refuse_sidebar_action(&mut self, refusal: SidebarRefusal) {
+        let target = self.selected_target_label();
+        let repository = self
+            .selected_repository()
+            .map(Self::repository_label)
+            .unwrap_or_else(|| target.clone());
+        let checkout = self.selected_checkout();
+        let worktree = checkout.is_some_and(|saved| saved.role != CheckoutRole::Main);
+        let path = checkout
+            .map(|saved| saved.observed_path.to_path_buf())
+            .unwrap_or_default();
+        let cause = Self::unavailable_cause_label(self.selected_unavailable_cause());
+        let recovery = self.selected_recovery_kind();
+        let message = match refusal {
+            SidebarRefusal::RepositoryClose => format!(
+                "Cannot close “{repository}”: a repository parent is not a session. Select a running checkout, then press x."
+            ),
+            SidebarRefusal::RepositoryRemove => format!(
+                "Cannot remove “{repository}”: repository parents are never removed by this action. Select a baude-managed worktree, then press X."
+            ),
+            SidebarRefusal::RepositoryShell => format!(
+                "Cannot open a shell for “{repository}”: a repository parent has no checkout directory or live session. Select a live checkout child under “{repository}”, then press t."
+            ),
+            SidebarRefusal::RepositoryArchive => format!(
+                "Cannot archive “{repository}”: a repository parent is a durable container, not checkout session state. Select a checkout child under “{repository}” with applicable session state, then press a."
+            ),
+            SidebarRefusal::AlreadyClosed => format!(
+                "Cannot close “{target}”: its session is already closed and the {} is kept. Press enter to reopen it.",
+                if worktree { "worktree" } else { "checkout" }
+            ),
+            SidebarRefusal::MainRemove => format!(
+                "Cannot remove “{target}”: the main checkout is never removable from baude. Keep it in Git and select a baude-managed linked worktree if removal is intended."
+            ),
+            SidebarRefusal::UnmanagedRemove => format!(
+                "Cannot remove “{target}”: it is not a baude-managed linked worktree. Keep it unchanged or remove it manually with Git if intended; nothing was removed."
+            ),
+            SidebarRefusal::NoLiveRuntime => format!(
+                "Cannot open a shell for “{target}”: no live local runtime is associated with this checkout. Press enter to reopen it first."
+            ),
+            SidebarRefusal::UnavailableBranch if recovery == Some(RecoveryKind::Removal) => format!(
+                "Cannot create or activate a branch in “{repository}”: “{target}” has protected removal state. Open details with i and let lifecycle recovery reconcile the committed Git facts first."
+            ),
+            SidebarRefusal::UnavailableBranch => format!(
+                "Cannot create or activate a branch in “{repository}”: checkout “{target}” no longer matches the recorded Git topology ({cause}). Repair or restore the checkout at “{}”, open details with i, then use only the authorized action shown there.",
+                path.display()
+            ),
+            SidebarRefusal::UnavailableClose if recovery == Some(RecoveryKind::Removal) => format!(
+                "Cannot close “{target}”: protected removal recovery owns this checkout. Open details with i; no process or persisted child was changed."
+            ),
+            SidebarRefusal::UnavailableClose => format!(
+                "Cannot close “{target}”: its recorded runtime/topology state is unavailable ({cause}). Open details with i and repair the checkout; no session or checkout was changed."
+            ),
+            SidebarRefusal::UnavailableReopen if recovery == Some(RecoveryKind::Removal) => format!(
+                "Cannot reopen “{target}”: protected removal recovery may represent already-committed Git topology. Open details with i; baude will not recreate or launch it."
+            ),
+            SidebarRefusal::UnavailableReopen => format!(
+                "Cannot reopen “{target}”: Git topology is unavailable ({cause}) and this state is not retryable from the TUI. Open details with i and repair the checkout; no runtime was started."
+            ),
+            SidebarRefusal::UnavailableRemove if recovery == Some(RecoveryKind::Removal) => format!(
+                "Cannot start another removal for “{target}”: protected removal recovery is already in progress. Open details with i; nothing else was removed."
+            ),
+            SidebarRefusal::UnavailableRemove => format!(
+                "Cannot remove “{target}”: its Git topology is unavailable ({cause}), so safe removal cannot be proven. Repair or reconcile it with Git, then press X for a fresh preflight; nothing was removed."
+            ),
+            SidebarRefusal::RecoveryBranch => match recovery {
+                Some(RecoveryKind::Activation) => format!("Cannot create or activate a branch in “{repository}”: “{target}” has an unfinished activation. Open details with i and complete the lifecycle-authorized recovery before starting another branch action."),
+                Some(RecoveryKind::Teardown) => format!("Cannot create or activate a branch in “{repository}”: “{target}” still has teardown ownership to resolve. Open details with i and complete the authorized teardown recovery first."),
+                _ => format!("Cannot create or activate a branch in “{repository}”: “{target}” has unresolved runtime ownership or unsaved lifecycle state. Repair persistence, open details with i, and complete the authorized recovery first."),
+            },
+            SidebarRefusal::RecoveryClose => match recovery {
+                Some(RecoveryKind::Activation) => format!("Cannot close “{target}”: activation recovery must finish before close is legal. Open details with i; no runtime or checkout was changed."),
+                Some(RecoveryKind::Teardown) => format!("Cannot start a new close for “{target}”: teardown is already pending. Press r to continue the authorized teardown recovery."),
+                _ => format!("Cannot close “{target}”: runtime ownership recovery is unresolved. Repair persistence and open details with i; no process ownership was discarded."),
+            },
+            SidebarRefusal::RecoveryReopen => match recovery {
+                Some(RecoveryKind::Activation) => format!("Cannot reopen “{target}” until activation recovery completes. Press r to continue the authorized recovery."),
+                Some(RecoveryKind::Teardown) => format!("Cannot reopen “{target}”: teardown recovery must reach a stable closed state first. Open details with i and use r only if retry is shown."),
+                _ => format!("Cannot reopen “{target}” as a new runtime while ownership recovery is unresolved. Repair persistence, then press r to continue the authorized recovery."),
+            },
+            SidebarRefusal::RecoveryRemove => match recovery {
+                Some(RecoveryKind::Activation) => format!("Cannot remove “{target}”: activation recovery must finish before removal can be inspected. Open details with i; nothing was removed."),
+                Some(RecoveryKind::Teardown) => format!("Cannot remove “{target}”: teardown recovery must complete before a fresh removal preflight. Open details with i; nothing was removed."),
+                _ => format!("Cannot remove “{target}”: runtime ownership or persistence recovery is unresolved. Repair persistence and complete the authorized recovery before pressing X; nothing was removed."),
+            },
+            SidebarRefusal::RetryNotAuthorized => format!(
+                "Cannot retry “{target}”: this state has no lifecycle-authorized manual retry. Open details with i; no runtime or checkout was changed."
+            ),
+            SidebarRefusal::UnavailableArchive => format!(
+                "Cannot archive “{target}”: lifecycle or topology recovery is unresolved. Open details with i; no checkout state was changed."
+            ),
+            SidebarRefusal::RemoteShell => "no shell pane for remote sessions".into(),
+            SidebarRefusal::RemoteEditor => {
+                "remote session — folder lives on the daemon host".into()
+            }
+            SidebarRefusal::RemoteGsd => "GSD view is for local sessions".into(),
+        };
+        self.set_message(message);
     }
 
     fn selection_target(&self) -> Option<SelectionTarget> {
@@ -1149,7 +1512,7 @@ impl App {
             }
             Err(error) => {
                 lifecycle::clear_pending_activation(&mut next, pending_checkout);
-                self.repository_state = next;
+                self.repository_state = state_before.clone();
                 if let Err(save_error) = self.save_durable_status() {
                     self.persistence_dirty = true;
                     return Err(anyhow::anyhow!(
@@ -2601,14 +2964,8 @@ impl App {
                 };
             }
             Some(SelId::Checkout(key)) => {
-                if let Some(s) = self.selected() {
-                    self.modal = if s.is_worktree {
-                        Modal::ConfirmCloseWorktree { id: s.id }
-                    } else {
-                        Modal::ConfirmKill {
-                            id: SelId::Checkout(key),
-                        }
-                    };
+                if let Some(id) = self.runtime_checkouts.get(&key).copied() {
+                    self.modal = Modal::ConfirmCloseWorktree { id };
                 }
             }
             Some(SelId::Repository(_)) => {}
@@ -2616,30 +2973,196 @@ impl App {
         }
     }
 
+    fn default_checkout(&self, repository: RepositoryKey) -> Option<CheckoutKey> {
+        self.repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| {
+                checkout.repository_key == repository
+                    && matches!(
+                        checkout.role,
+                        CheckoutRole::PrimaryDefault | CheckoutRole::Main
+                    )
+            })
+            .min_by_key(|checkout| {
+                let priority = match checkout.role {
+                    CheckoutRole::PrimaryDefault => 0,
+                    CheckoutRole::Main => 1,
+                    CheckoutRole::ManagedBranch => 2,
+                };
+                (priority, checkout.first_seen_order, checkout.key)
+            })
+            .map(|checkout| checkout.key)
+    }
+
+    fn action_checkout(&self) -> Option<CheckoutKey> {
+        match self.selected_id? {
+            SelId::Checkout(key) => Some(key),
+            SelId::Repository(repository) => self.default_checkout(repository),
+            SelId::Remote(_) => None,
+        }
+    }
+
+    fn open_local_target(&mut self) {
+        let Some(checkout) = self.action_checkout() else {
+            let repository = self.selected_target_label();
+            self.set_message(format!(
+                "Cannot reopen “{repository}”: its default checkout is unavailable. Open details with i, repair the reported Git topology, then use the action authorized there."
+            ));
+            return;
+        };
+        if let Some(runtime) = self.runtime_checkouts.get(&checkout).copied() {
+            if self
+                .session(runtime)
+                .is_some_and(|session| !session.claude.is_exited())
+            {
+                self.selected_id = Some(SelId::Checkout(checkout));
+                self.focus = Focus::Claude;
+                return;
+            }
+        }
+        let capability = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .and_then(|saved| lifecycle::lifecycle_capability(saved.lifecycle()));
+        if capability != Some(lifecycle::LifecycleCapability::RetryReopen) {
+            if matches!(self.selected_id, Some(SelId::Repository(_))) {
+                let repository = self.selected_target_label();
+                self.set_message(format!(
+                    "Cannot reopen “{repository}”: its default checkout is unavailable. Open details with i, repair the reported Git topology, then use the action authorized there."
+                ));
+            } else {
+                self.refuse_sidebar_action(SidebarRefusal::RetryNotAuthorized);
+            }
+            return;
+        }
+        if let Err(error) = self.reopen_checkout(checkout) {
+            self.set_message(format!("reopen blocked: {error}"));
+        }
+    }
+
+    fn open_branch_modal(&mut self) {
+        let Some(repository) = self.selected_repository() else {
+            return;
+        };
+        let repo_root = repository.observed_main_worktree.to_path_buf();
+        let label = Self::repository_label(repository);
+        self.modal = Modal::Input {
+            kind: InputKind::NewWorktreeBranch { repo_root },
+            title: format!("create or activate branch in {label} — local branch name"),
+            buf: String::new(),
+            candidates: Vec::new(),
+        };
+    }
+
+    fn retry_selected_recovery(&mut self) {
+        let Some(SelId::Checkout(checkout)) = self.selected_id else {
+            self.refuse_sidebar_action(SidebarRefusal::RetryNotAuthorized);
+            return;
+        };
+        let lifecycle = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .map(|saved| saved.lifecycle().clone());
+        let result = match lifecycle {
+            Some(CheckoutLifecycle::Activating)
+            | Some(CheckoutLifecycle::Protected(
+                UnavailableCause::PendingActivation { .. }
+                | UnavailableCause::ActivationRecovery { .. },
+            )) => self
+                .retry_activation_recovery(checkout)
+                .map(|outcome| format!("activation recovery: {outcome:?}")),
+            Some(CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. })) => self
+                .retry_teardown_recovery(checkout)
+                .map(|outcome| format!("teardown recovery: {outcome:?}")),
+            Some(CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery {
+                ..
+            })) => self
+                .drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RuntimeExtinct,
+                    |_, _| Ok(()),
+                )
+                .map(|_| "runtime ownership recovery completed".into()),
+            _ => {
+                self.refuse_sidebar_action(SidebarRefusal::RetryNotAuthorized);
+                return;
+            }
+        };
+        match result {
+            Ok(message) => self.set_message(message),
+            Err(error) => self.set_message(format!("lifecycle recovery blocked: {error}")),
+        }
+    }
+
+    fn removal_refusal(&self, failure: &lifecycle::RemovalFailure) -> String {
+        let target = self.selected_target_label();
+        match failure {
+            lifecycle::RemovalFailure::Blocked(blockers)
+                if blockers
+                    .iter()
+                    .any(|blocker| matches!(blocker, git::RemovalBlocker::Conflict { .. })) =>
+            {
+                format!("Cannot remove “{target}”: unresolved Git conflicts are present. Resolve or abort the Git operation yourself, then press X to run a new safety check; nothing was removed.")
+            }
+            lifecycle::RemovalFailure::Blocked(blockers)
+                if blockers
+                    .iter()
+                    .any(|blocker| matches!(blocker, git::RemovalBlocker::Locked)) =>
+            {
+                format!("Cannot remove “{target}”: Git reports this worktree as locked. Review and unlock it with Git if safe, then press X to run a new safety check; nothing was removed.")
+            }
+            lifecycle::RemovalFailure::Blocked(blockers)
+                if blockers.iter().any(|blocker| {
+                    matches!(
+                        blocker,
+                        git::RemovalBlocker::SubmoduleChange { .. }
+                            | git::RemovalBlocker::SubmodulePresent { .. }
+                    )
+                }) => format!("Cannot remove “{target}”: recursive submodule state makes non-force removal unsafe. Resolve the submodule worktrees yourself, then press X to run a new safety check; nothing was removed."),
+            lifecycle::RemovalFailure::Blocked(blockers)
+                if blockers.iter().any(|blocker| {
+                    matches!(
+                        blocker,
+                        git::RemovalBlocker::StagedAdd { .. }
+                            | git::RemovalBlocker::StagedDelete { .. }
+                            | git::RemovalBlocker::StagedRename { .. }
+                            | git::RemovalBlocker::StagedModification { .. }
+                            | git::RemovalBlocker::UnstagedModification { .. }
+                            | git::RemovalBlocker::UnstagedDelete { .. }
+                            | git::RemovalBlocker::Untracked { .. }
+                            | git::RemovalBlocker::Ignored { .. }
+                    )
+                }) => format!("Cannot remove “{target}”: dirty tracked or untracked files are present. Commit, move, or clean those files yourself, then press X to run a new safety check; nothing was removed."),
+            _ => format!("Cannot remove “{target}”: baude could not conclusively verify clean Git status and topology. Inspect the repository with Git, repair the reported error, then press X to run a new safety check; nothing was removed."),
+        }
+    }
+
+    fn prepare_selected_removal(&mut self) {
+        let Some(SelId::Checkout(checkout)) = self.selected_id else {
+            self.refuse_sidebar_action(SidebarRefusal::RepositoryRemove);
+            return;
+        };
+        match self.prepare_remove_worktree(checkout) {
+            Ok(confirmation) => self.modal = Modal::ConfirmRemoveWorktree { confirmation },
+            Err(failure) => {
+                let message = self.removal_refusal(&failure);
+                self.set_message(message);
+            }
+        }
+    }
+
     fn handle_sidebar_key(&mut self, key: KeyEvent) {
-        let remote_selected = matches!(self.selected_id, Some(SelId::Remote(_)));
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                if remote_selected {
-                    self.attach_selected_remote();
-                } else if let Some(s) = self.selected() {
-                    if s.claude.is_exited() {
-                        self.set_message("claude exited — press r to restart".into());
-                    } else {
-                        self.focus = Focus::Claude;
-                    }
-                }
-            }
-            KeyCode::Char('t') if remote_selected => {
-                self.set_message("no shell pane for remote sessions".into());
-            }
-            KeyCode::Char('t') => self.toggle_shell(true),
-            KeyCode::Char('e') => self.open_editor_for_selection(),
             KeyCode::Char('n') => self.open_new_session_modal(),
             KeyCode::Char('c') => {
                 self.modal = Modal::Input {
@@ -2649,58 +3172,36 @@ impl App {
                     candidates: Vec::new(),
                 };
             }
-            KeyCode::Char('w') => {
-                if let Some(s) = self.selected() {
-                    self.modal = Modal::Input {
-                        kind: InputKind::NewWorktreeBranch {
-                            repo_root: s.repo_root.clone(),
-                        },
-                        title: format!(
-                            "new worktree in {} — branch name",
-                            s.repo_root
-                                .file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        ),
-                        buf: String::new(),
-                        candidates: Vec::new(),
-                    };
-                } else {
-                    self.set_message("no session selected — press n to add a repo first".into());
-                }
-            }
-            KeyCode::Char('a') => self.toggle_archive(),
-            KeyCode::Char('r') => match self.selected_id {
-                Some(SelId::Checkout(key)) => {
-                    if let Some(id) = self.runtime_checkouts.get(&key).copied() {
-                        self.restart_session(id);
-                    }
-                }
-                Some(SelId::Repository(_)) => {}
-                Some(SelId::Remote(id)) => self.restart_remote(id),
-                None => {}
-            },
-            KeyCode::Char('x') => self.confirm_close_selected(),
-            KeyCode::Char('i') => {
-                if self.selected().is_some() || self.selected_remote().is_some() {
-                    self.modal = Modal::Info;
-                }
-            }
-            KeyCode::Char('v') => {
-                if self.selected().is_some() || self.selected_remote().is_some() {
-                    self.modal = Modal::Activity;
-                }
-            }
-            KeyCode::Char('g') if remote_selected => {
-                self.set_message("GSD view is for local sessions".into());
-            }
-            KeyCode::Char('g') => {
-                if self.selected().is_some() {
-                    self.modal = Modal::Gsd;
-                }
-            }
             KeyCode::Char('?') => self.modal = Modal::Help,
-            _ => {}
+            _ => {
+                let Some(view) = self.selected_action_view() else {
+                    return;
+                };
+                match sidebar_action(view, key) {
+                    SidebarAction::None => {}
+                    SidebarAction::Open => self.open_local_target(),
+                    SidebarAction::Branch => self.open_branch_modal(),
+                    SidebarAction::Close => self.confirm_close_selected(),
+                    SidebarAction::RetryReopen => self.open_local_target(),
+                    SidebarAction::RetryRecovery => self.retry_selected_recovery(),
+                    SidebarAction::Remove => self.prepare_selected_removal(),
+                    SidebarAction::Shell => self.toggle_shell(true),
+                    SidebarAction::Editor => self.open_editor_for_selection(),
+                    SidebarAction::Info => self.modal = Modal::Info,
+                    SidebarAction::Activity => self.modal = Modal::Activity,
+                    SidebarAction::Gsd => self.modal = Modal::Gsd,
+                    SidebarAction::Archive => self.toggle_archive(),
+                    SidebarAction::RemoteOpen => self.attach_selected_remote(),
+                    SidebarAction::RemoteClose => self.confirm_close_selected(),
+                    SidebarAction::RemoteRestart => {
+                        if let Some(SelId::Remote(id)) = self.selected_id {
+                            self.restart_remote(id);
+                        }
+                    }
+                    SidebarAction::RemoteArchive => self.toggle_archive(),
+                    SidebarAction::Refuse(refusal) => self.refuse_sidebar_action(refusal),
+                }
+            }
         }
     }
 
@@ -2771,34 +3272,15 @@ impl App {
             Modal::ConfirmCloseWorktree { id } => {
                 let id = *id;
                 match key.code {
-                    KeyCode::Char('k') => {
+                    KeyCode::Char('y') | KeyCode::Enter => {
                         self.modal = Modal::None;
                         match self.close_retained_session(id) {
-                            Ok(_) => self.set_message("session closed — worktree kept".into()),
+                            Ok(_) => self.set_message("session closed — checkout kept".into()),
                             Err(error) => self
                                 .set_message(format!("session close degraded or blocked: {error}")),
                         }
                     }
-                    KeyCode::Char('r') => {
-                        let checkout = checkout_for_runtime(&self.runtime_checkouts, id);
-                        match checkout
-                            .ok_or_else(|| {
-                                lifecycle::RemovalFailure::Inspection(format!(
-                                    "runtime {id} has no retained checkout"
-                                ))
-                            })
-                            .and_then(|checkout| self.prepare_remove_worktree(checkout))
-                        {
-                            Ok(confirmation) => {
-                                self.modal = Modal::ConfirmRemoveWorktree { confirmation };
-                            }
-                            Err(error) => {
-                                self.modal = Modal::None;
-                                self.set_message(error.to_string());
-                            }
-                        }
-                    }
-                    KeyCode::Esc => self.modal = Modal::None,
+                    KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
                     _ => {}
                 }
             }
@@ -2819,7 +3301,10 @@ impl App {
                         }
                         Ok(other) => self
                             .set_message(format!("unexpected worktree removal outcome: {other:?}")),
-                        Err(error) => self.set_message(error.to_string()),
+                        Err(error) => {
+                            let message = self.removal_refusal(&error);
+                            self.set_message(message);
+                        }
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
@@ -2904,15 +3389,73 @@ impl App {
                     }
                     return;
                 }
+                let repository = repo_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| repo_root.display().to_string());
                 match self.activate_branch_worktree(&repo_root, &value) {
-                    Ok(LifecycleOutcome::Busy { .. }) => {
-                        self.set_message("repository lifecycle is busy; retry the action".into())
+                    Ok(LifecycleOutcome::Busy { .. }) => self.set_message(format!(
+                        "Cannot create or activate a branch in “{repository}”: another lifecycle action is in progress. Wait for it to finish, then press w to retry."
+                    )),
+                    Ok(LifecycleOutcome::Created { .. }) => {
+                        self.set_message(format!("created worktree for {value}"))
                     }
-                    Ok(_) => self.set_message(format!("activated branch {value}")),
-                    Err(e) => self.set_message(format!("worktree: {e}")),
+                    Ok(LifecycleOutcome::Activated { .. }) => {
+                        self.set_message(format!("activated {value}"))
+                    }
+                    Ok(LifecycleOutcome::Reused { .. } | LifecycleOutcome::Focused { .. }) => {
+                        self.set_message(format!("focused existing {value}"))
+                    }
+                    Ok(other) => self.set_message(format!(
+                        "unexpected branch activation outcome for {value}: {other:?}"
+                    )),
+                    Err(error) => {
+                        let message = self.activation_refusal(&error, &value, &repository);
+                        self.set_message(message);
+                    }
                 }
             }
         }
+    }
+
+    fn activation_refusal(&self, error: &anyhow::Error, branch: &str, repository: &str) -> String {
+        if let Some(lifecycle::LifecycleError::OccupiedProtected { checkout, cause }) =
+            error.downcast_ref::<lifecycle::LifecycleError>()
+        {
+            let target = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == *checkout)
+                .map(|saved| saved.session.name.clone())
+                .unwrap_or_else(|| format!("checkout {}", checkout.get()));
+            let recovery = Self::unavailable_cause_label(Some(cause));
+            return format!(
+                "Cannot activate “{branch}” in “{repository}”: checkout “{target}” is in protected {recovery} state. Open details with i and complete the lifecycle-authorized recovery before pressing w again."
+            );
+        }
+        if let Some(lifecycle::LifecycleError::Git(git_error)) =
+            error.downcast_ref::<lifecycle::LifecycleError>()
+        {
+            return match git_error {
+                git::BranchActivationError::InvalidLiteral { .. } => format!(
+                    "Cannot create or activate “{branch}” in “{repository}”: “{branch}” is not a valid literal local branch name. Press w and enter a name accepted by Git."
+                ),
+                git::BranchActivationError::RemoteOnly { .. } => format!(
+                    "Cannot activate “{branch}” in “{repository}”: only a remote-tracking branch exists. Create an explicit local branch outside baude, then press w to activate it."
+                ),
+                git::BranchActivationError::PathCollision(path) => format!(
+                    "Cannot create or activate “{branch}” in “{repository}”: the managed worktree path “{}” collides with existing filesystem or Git state. Move or reconcile that path, then press w to retry.",
+                    path.display()
+                ),
+                _ => format!(
+                    "Cannot create or activate “{branch}” in “{repository}”: Git refused the literal local branch request ({git_error}). Inspect the repository with Git, then press w to retry."
+                ),
+            };
+        }
+        format!(
+            "Cannot create or activate “{branch}” in “{repository}”: {error}. Open details with i, repair the reported lifecycle or Git state, then press w to retry."
+        )
     }
 
     /// Open the clone-destination prompt for a parsed clone target. The
@@ -3066,16 +3609,42 @@ impl App {
     fn toggle_archive(&mut self) {
         match self.selected_id {
             Some(SelId::Checkout(key)) => {
-                let Some(id) = self.runtime_checkouts.get(&key).copied() else {
+                if let Some(id) = self.runtime_checkouts.get(&key).copied() {
+                    let Some(s) = self.session_mut(id) else {
+                        return;
+                    };
+                    s.set_archived(!s.archived);
+                    let msg = if s.archived { "archived" } else { "unarchived" };
+                    self.set_message(msg.into());
+                    self.save();
+                    return;
+                }
+                let before = self.repository_state.clone();
+                let Some(saved) = self
+                    .repository_state
+                    .checkouts
+                    .iter_mut()
+                    .find(|saved| saved.key == key)
+                else {
                     return;
                 };
-                let Some(s) = self.session_mut(id) else {
+                saved.session.archived = !saved.session.archived;
+                saved.session.archived_by_user = saved.session.archived;
+                let archived = saved.session.archived;
+                if let Err(error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    if !error.replacement_committed() {
+                        self.repository_state = before;
+                    }
+                    self.set_message(format!("archive state not saved: {error}"));
                     return;
-                };
-                s.set_archived(!s.archived);
-                let msg = if s.archived { "archived" } else { "unarchived" };
-                self.set_message(msg.into());
-                self.save();
+                }
+                self.persistence_dirty = false;
+                self.set_message(if archived {
+                    "archived".into()
+                } else {
+                    "unarchived".into()
+                });
             }
             Some(SelId::Remote(id)) => {
                 let archived = self.is_archived(SelId::Remote(id));
@@ -3154,7 +3723,22 @@ impl App {
     /// Detached, with no inherited stdio, so a GUI editor (the `code` default)
     /// doesn't disturb the TUI.
     fn open_editor(&mut self) {
-        let Some(cwd) = self.selected().map(|s| s.cwd.clone()) else {
+        let cwd = match self.selected_id {
+            Some(SelId::Repository(key)) => self
+                .repository_state
+                .repositories
+                .iter()
+                .find(|repository| repository.key == key)
+                .map(|repository| repository.observed_main_worktree.to_path_buf()),
+            Some(SelId::Checkout(key)) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .map(|checkout| checkout.observed_path.to_path_buf()),
+            _ => None,
+        };
+        let Some(cwd) = cwd else {
             self.set_message("no session selected".into());
             return;
         };
@@ -3200,19 +3784,6 @@ impl App {
             }
         }
         self.save();
-    }
-
-    fn restart_session(&mut self, id: u64) {
-        let result = (|| -> Result<()> {
-            if let Some(checkout_key) = checkout_for_runtime(&self.runtime_checkouts, id) {
-                self.reopen_checkout(checkout_key)?;
-                return Ok(());
-            }
-            self.restart_session_with_mode(id, backend::SpawnMode::Fresh)
-        })();
-        if let Err(error) = result {
-            self.set_message(format!("restart failed: {error}"));
-        }
     }
 
     fn restart_session_with_mode(&mut self, id: u64, mode: backend::SpawnMode) -> Result<()> {
@@ -3929,6 +4500,29 @@ mod tests {
                 );
             }
         }
+        let managed = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: true,
+            },
+            true,
+            None,
+        );
+        assert_eq!(
+            super::sidebar_action(
+                managed,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            SidebarAction::Close
+        );
+        assert_eq!(
+            super::sidebar_action(
+                managed,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SHIFT)
+            ),
+            SidebarAction::Remove
+        );
 
         // Defensive refusals are pure: stale hidden-key dispatch cannot alter
         // durable state, process association, row order, or selection.
@@ -3951,6 +4545,246 @@ mod tests {
             assert_eq!(app.ordered_ids(), before_rows);
             assert_eq!(app.selected_id, before_selection);
         }
+
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: PersistedPath::from_path(Path::new("/repo/project/.git")),
+            observed_main_worktree: PersistedPath::from_path(Path::new("/repo/project")),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::Main, false);
+        state.checkouts[0].session.name = "project:main".into();
+        state.checkouts[0].session.is_worktree = false;
+        state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/repo/project"));
+        state.checkouts[0].session.cwd = PersistedPath::from_path(Path::new("/repo/project"));
+        state.checkouts[0].session.repo_root = PersistedPath::from_path(Path::new("/repo/project"));
+        let main = state.checkouts[0].key;
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+        state.checkouts[1].managed_by_baude = false;
+        state.checkouts[1].session.name = "project:external".into();
+        state.checkouts[1].session.repo_root = PersistedPath::from_path(Path::new("/repo/project"));
+        let external = state.checkouts[1].key;
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+        let unavailable = state.checkouts[2].key;
+        let unavailable_saved = state.checkouts[2].clone();
+        state.checkouts[2] = SavedCheckout::new(
+            unavailable_saved.key,
+            unavailable_saved.repository_key,
+            unavailable_saved.role,
+            true,
+            PersistedPath::from_path(Path::new("/repo/missing")),
+            unavailable_saved.observed_branch,
+            unavailable_saved.first_seen_order,
+            CheckoutLifecycle::Protected(UnavailableCause::Missing),
+            RetainedSessionState {
+                name: "project:missing".into(),
+                cwd: PersistedPath::from_path(Path::new("/repo/missing")),
+                repo_root: PersistedPath::from_path(Path::new("/repo/project")),
+                ..unavailable_saved.session
+            },
+        );
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        let action_state_root = std::env::temp_dir().join(format!(
+            "baude-hierarchy-action-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&action_state_root);
+        std::fs::create_dir_all(&action_state_root).unwrap();
+        app.persistence_root_for_test = Some(action_state_root.clone());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+
+        let exact_refusals = [
+            (
+                super::SelId::Repository(repository),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                "Cannot close “project”: a repository parent is not a session. Select a running checkout, then press x.",
+            ),
+            (
+                super::SelId::Repository(repository),
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                "Cannot remove “project”: repository parents are never removed by this action. Select a baude-managed worktree, then press X.",
+            ),
+            (
+                super::SelId::Checkout(main),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                "Cannot close “project:main”: its session is already closed and the checkout is kept. Press enter to reopen it.",
+            ),
+            (
+                super::SelId::Checkout(main),
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                "Cannot remove “project:main”: the main checkout is never removable from baude. Keep it in Git and select a baude-managed linked worktree if removal is intended.",
+            ),
+            (
+                super::SelId::Checkout(external),
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                "Cannot remove “project:external”: it is not a baude-managed linked worktree. Keep it unchanged or remove it manually with Git if intended; nothing was removed.",
+            ),
+            (
+                super::SelId::Checkout(unavailable),
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                "Cannot reopen “project:missing”: Git topology is unavailable (missing) and this state is not retryable from the TUI. Open details with i and repair the checkout; no runtime was started.",
+            ),
+        ];
+        let before_state = app.repository_state.clone();
+        let before_runtimes = app.runtime_checkouts.clone();
+        let before_order = app.ordered_ids();
+        for selection in [
+            super::SelId::Repository(repository),
+            super::SelId::Checkout(main),
+            super::SelId::Checkout(external),
+        ] {
+            app.selected_id = Some(selection);
+            app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+            assert!(matches!(
+                &app.modal,
+                Modal::Input {
+                    kind: super::InputKind::NewWorktreeBranch { repo_root },
+                    title,
+                    ..
+                } if repo_root == Path::new("/repo/project")
+                    && title == "create or activate branch in project — local branch name"
+            ));
+            app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.repository_state, before_state);
+            assert_eq!(app.runtime_checkouts, before_runtimes);
+            assert_eq!(app.ordered_ids(), before_order);
+            assert_eq!(app.selected_id, Some(selection));
+        }
+        for (selection, key, expected) in exact_refusals {
+            app.selected_id = Some(selection);
+            app.handle_sidebar_key(key);
+            assert_eq!(app.message.as_ref().unwrap().0, expected);
+            assert_eq!(app.repository_state, before_state);
+            assert_eq!(app.runtime_checkouts, before_runtimes);
+            assert_eq!(app.ordered_ids(), before_order);
+            assert_eq!(app.selected_id, Some(selection));
+        }
+        app.selected_id = Some(super::SelId::Checkout(main));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            app.repository_state.checkouts[0].session.archived,
+            "archive result: {:?}",
+            app.message
+        );
+        assert_eq!(app.runtime_checkouts, before_runtimes);
+        assert_eq!(app.ordered_ids(), before_order);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(main)));
+        std::fs::remove_dir_all(action_state_root).unwrap();
+
+        let (mut app, repo, root, checkout, runtime, worktree_path) =
+            removal_app("hierarchy-action-matrix", 180_000);
+        let repository = app.repository_state.checkouts[0].repository_key;
+        let baseline_state = app.repository_state.clone();
+        let baseline_runtimes = app.runtime_checkouts.clone();
+        let baseline_order = app.ordered_ids();
+        let baseline_selection = app.selected_id;
+        let worktree_inventory = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout;
+
+        app.submit_input(
+            super::InputKind::NewWorktreeBranch {
+                repo_root: repo.clone(),
+            },
+            "bad ref".into(),
+        );
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            "Cannot create or activate “bad ref” in “repo”: “bad ref” is not a valid literal local branch name. Press w and enter a name accepted by Git."
+        );
+        assert_eq!(app.repository_state, baseline_state);
+        assert_eq!(app.runtime_checkouts, baseline_runtimes);
+        assert_eq!(app.ordered_ids(), baseline_order);
+        assert_eq!(app.selected_id, baseline_selection);
+        assert_eq!(
+            Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+            worktree_inventory
+        );
+
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/remote-only", "HEAD"],
+        );
+        app.submit_input(
+            super::InputKind::NewWorktreeBranch {
+                repo_root: repo.clone(),
+            },
+            "remote-only".into(),
+        );
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            "Cannot activate “remote-only” in “repo”: only a remote-tracking branch exists. Create an explicit local branch outside baude, then press w to activate it."
+        );
+        assert_eq!(app.repository_state, baseline_state);
+        assert_eq!(app.runtime_checkouts, baseline_runtimes);
+        assert_eq!(app.ordered_ids(), baseline_order);
+        assert_eq!(app.selected_id, baseline_selection);
+        assert_eq!(
+            Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+            worktree_inventory
+        );
+
+        let mut allocation = baseline_state.clone();
+        let next_checkout = allocation.allocate_checkout_key().unwrap();
+        let collision = baude_core::git::managed_branch_worktree_path(
+            repository.get(),
+            next_checkout.get(),
+            "collision",
+        );
+        std::fs::create_dir_all(&collision).unwrap();
+        app.submit_input(
+            super::InputKind::NewWorktreeBranch {
+                repo_root: repo.clone(),
+            },
+            "collision".into(),
+        );
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            format!(
+                "Cannot create or activate “collision” in “repo”: the managed worktree path “{}” collides with existing filesystem or Git state. Move or reconcile that path, then press w to retry.",
+                collision.display()
+            )
+        );
+        assert_eq!(app.repository_state, baseline_state);
+        assert_eq!(app.runtime_checkouts, baseline_runtimes);
+        assert_eq!(app.ordered_ids(), baseline_order);
+        assert_eq!(app.selected_id, baseline_selection);
+        assert_eq!(
+            Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+            worktree_inventory
+        );
+
+        app.session_mut(runtime).unwrap().kill();
+        std::fs::remove_dir_all(&collision).unwrap();
+        git(
+            &repo,
+            &["worktree", "remove", "--", worktree_path.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(checkout, baseline_state.checkouts[0].key);
     }
 
     #[test]
@@ -5048,9 +5882,19 @@ mod tests {
             other => panic!("unexpected activation outcome: {other:?}"),
         };
         let before = app.repository_state.clone();
-        app.modal = Modal::ConfirmCloseWorktree { id: runtime };
+        app.selected_id = Some(super::SelId::Checkout(checkout));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::ConfirmCloseWorktree { id } if id == runtime));
 
+        // Close confirmation cannot be promoted into destructive removal.
         app.handle_modal_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::ConfirmCloseWorktree { id } if id == runtime));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.repository_state, before);
+        assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
 
         let target_path = before.checkouts[0].observed_path.to_path_buf();
         assert!(matches!(
@@ -5069,10 +5913,12 @@ mod tests {
         assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
 
         std::fs::write(target_path.join("blocked"), b"keep\n").unwrap();
-        app.modal = Modal::ConfirmCloseWorktree { id: runtime };
-        app.handle_modal_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
         assert!(matches!(app.modal, Modal::None));
-        assert!(app.message.as_ref().unwrap().0.contains("Untracked"));
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            "Cannot remove “repo:feature/remove-confirmation”: dirty tracked or untracked files are present. Commit, move, or clean those files yourself, then press X to run a new safety check; nothing was removed."
+        );
         assert_eq!(app.repository_state, before);
         assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
         app.session_mut(runtime).unwrap().kill();

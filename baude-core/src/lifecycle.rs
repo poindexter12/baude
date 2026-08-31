@@ -79,6 +79,13 @@ pub fn reduce_lifecycle(state: &CheckoutLifecycle, event: &LifecycleEvent) -> Li
             LifecycleTraceEntry::PersistInactive,
         )),
         (
+            CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery { .. }),
+            LifecycleEvent::RuntimeExtinct,
+        ) => Some((
+            CheckoutLifecycle::Inactive,
+            LifecycleTraceEntry::PersistInactive,
+        )),
+        (
             CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)),
             LifecycleEvent::RestoreRemovalAuthority,
         ) => Some((
@@ -1211,6 +1218,10 @@ pub enum LifecycleError {
     Validation(ValidationError),
     RepositoryMissing(RepositoryKey),
     CheckoutMissing(CheckoutKey),
+    OccupiedProtected {
+        checkout: CheckoutKey,
+        cause: UnavailableCause,
+    },
     Topology(String),
     PostVerificationCompensationFailed(Box<PostVerificationCompensationFailure>),
 }
@@ -1228,6 +1239,11 @@ impl std::fmt::Display for LifecycleError {
             Self::CheckoutMissing(key) => {
                 write!(f, "lifecycle checkout {} is missing", key.get())
             }
+            Self::OccupiedProtected { checkout, cause } => write!(
+                f,
+                "occupied checkout {} has unresolved recovery: {cause:?}",
+                checkout.get()
+            ),
             Self::Topology(detail) => write!(f, "activation topology mismatch: {detail}"),
             Self::PostVerificationCompensationFailed(failure) => {
                 let PostVerificationCompensationFailure {
@@ -1848,10 +1864,10 @@ fn execute_activation_with_post_git_hook(
             }
             if checkout.key != prepared.checkout {
                 if let CheckoutHealth::Unavailable(cause) = &checkout.health {
-                    return Err(LifecycleError::Topology(format!(
-                        "occupied checkout {} has unresolved recovery: {cause:?}",
-                        checkout.key.get()
-                    )));
+                    return Err(LifecycleError::OccupiedProtected {
+                        checkout: checkout.key,
+                        cause: cause.clone(),
+                    });
                 }
             } else if !matches!(
                 checkout.health,
@@ -2133,7 +2149,10 @@ mod tests {
 
     #[test]
     fn lifecycle_capabilities_expose_only_dispatchable_reopen_and_recovery_actions() {
-        use super::{lifecycle_capability, LifecycleCapability};
+        use super::{
+            lifecycle_capability, reduce_lifecycle, LifecycleCapability, LifecycleEvent,
+            LifecycleTraceEntry,
+        };
         use crate::repository::{ProcessIdentity, UnavailableCause};
 
         let identity = ProcessIdentity {
@@ -2201,6 +2220,18 @@ mod tests {
                 "recoverable lifecycle {lifecycle:?}"
             );
         }
+        let stopped_active =
+            CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery {
+                agent_restarted: false,
+                shell_restarted: false,
+                detail: "runtime is known stopped".into(),
+            });
+        let transition = reduce_lifecycle(&stopped_active, &LifecycleEvent::RuntimeExtinct);
+        assert_eq!(transition.state, CheckoutLifecycle::Inactive);
+        assert_eq!(
+            transition.effects,
+            vec![LifecycleTraceEntry::PersistInactive]
+        );
         for lifecycle in unavailable {
             assert_eq!(
                 lifecycle_capability(&lifecycle),

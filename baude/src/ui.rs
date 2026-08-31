@@ -1196,9 +1196,11 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let rect = centered(area, 56, 4);
             frame.render_widget(Clear, rect);
             let p = Paragraph::new(vec![
-                Line::raw(format!("close worktree session \"{name}\"?")),
+                Line::raw(format!(
+                    "Close session “{name}” and keep its checkout for reopening?"
+                )),
                 Line::from(Span::styled(
-                    "k keep worktree · r remove worktree · esc cancel",
+                    "y/enter close · n/esc keep session open",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -1206,8 +1208,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(" close worktree session "),
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" close checkout session "),
             );
             frame.render_widget(p, rect);
         }
