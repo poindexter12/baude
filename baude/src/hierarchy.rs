@@ -247,7 +247,10 @@ mod tests {
     };
     use baude_core::session::Status;
 
-    use super::{project_local, CheckoutDecoration, LocalRow, LocalRowId};
+    use super::{
+        initial_selection, project_local, reconcile_after_removal, reconcile_selection,
+        CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
+    };
 
     fn path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
@@ -432,5 +435,209 @@ mod tests {
                 LocalRowId::Repository(second)
             ]
         );
+    }
+
+    #[test]
+    fn local_hierarchy_order_ignores_runtime_and_session_status() {
+        let mut state = RepositoryState::default();
+        let repository = add_repository(&mut state, "/repos/steady");
+        let first = add_checkout(
+            &mut state,
+            repository,
+            "/repos/steady",
+            "/repos/steady",
+            CheckoutRole::Main,
+            false,
+            10,
+            "main",
+        );
+        let second = add_checkout(
+            &mut state,
+            repository,
+            "/repos/steady",
+            "/worktrees/steady-second",
+            CheckoutRole::ManagedBranch,
+            true,
+            20,
+            "feature/second",
+        );
+        let expected = vec![
+            LocalRowId::Repository(repository),
+            LocalRowId::Checkout(first),
+            LocalRowId::Checkout(second),
+        ];
+
+        for (status, archived) in [
+            (Some(Status::Waiting), false),
+            (Some(Status::Busy), false),
+            (Some(Status::Completed), false),
+            (Some(Status::Exited), false),
+            (None, false),
+            (Some(Status::Waiting), true),
+        ] {
+            let decorations = HashMap::from([(
+                second,
+                CheckoutDecoration {
+                    runtime_id: status.map(|_| 99),
+                    status,
+                    waiting_for_ms: 44,
+                    archived,
+                },
+            )]);
+            let rows = project_local(&state, &decorations);
+            assert_eq!(rows.iter().map(LocalRow::id).collect::<Vec<_>>(), expected);
+            assert!(rows.iter().any(|row| matches!(
+                row,
+                LocalRow::Checkout(child)
+                    if child.key == second
+                        && child.runtime_id == status.map(|_| 99)
+                        && child.archived == archived
+            )));
+        }
+
+        // Display/session/topology decoration changes cannot become sort keys.
+        state.checkouts[1].session.name = "aaa renamed".into();
+        state.checkouts[1].session.branch = Some("aaa/renamed".into());
+        state.checkouts[1].observed_branch = Some("refs/heads/aaa/renamed".into());
+        state.checkouts[1].role = CheckoutRole::PrimaryDefault;
+        state.checkouts[1].session.archived = true;
+        let saved = state.checkouts[1].clone();
+        state.checkouts[1] = SavedCheckout::new(
+            saved.key,
+            saved.repository_key,
+            saved.role,
+            saved.managed_by_baude,
+            saved.observed_path,
+            saved.observed_branch,
+            saved.first_seen_order,
+            CheckoutLifecycle::Protected(baude_core::repository::UnavailableCause::Missing),
+            saved.session,
+        );
+        assert_eq!(
+            project_local(&state, &HashMap::new())
+                .iter()
+                .map(LocalRow::id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn local_hierarchy_selection_survives_refresh_and_removal_falls_back_locally() {
+        let mut state = RepositoryState::default();
+        let alpha = add_repository(&mut state, "/repos/alpha");
+        let alpha_first = add_checkout(
+            &mut state,
+            alpha,
+            "/repos/alpha",
+            "/repos/alpha",
+            CheckoutRole::Main,
+            false,
+            10,
+            "main",
+        );
+        let alpha_middle = add_checkout(
+            &mut state,
+            alpha,
+            "/repos/alpha",
+            "/worktrees/alpha-middle",
+            CheckoutRole::ManagedBranch,
+            true,
+            20,
+            "middle",
+        );
+        let alpha_last = add_checkout(
+            &mut state,
+            alpha,
+            "/repos/alpha",
+            "/worktrees/alpha-last",
+            CheckoutRole::ManagedBranch,
+            true,
+            30,
+            "last",
+        );
+        let beta = add_repository(&mut state, "/repos/beta");
+        let beta_child = add_checkout(
+            &mut state,
+            beta,
+            "/repos/beta",
+            "/repos/beta",
+            CheckoutRole::Main,
+            false,
+            40,
+            "main",
+        );
+        let before = project_local(&state, &HashMap::new());
+        let selected = SelectionTarget::Local(LocalRowId::Checkout(alpha_middle));
+
+        let refreshed = project_local(
+            &state,
+            &HashMap::from([(
+                alpha_middle,
+                CheckoutDecoration {
+                    runtime_id: Some(700),
+                    status: Some(Status::Waiting),
+                    waiting_for_ms: 5_000,
+                    archived: true,
+                },
+            )]),
+        );
+        assert_eq!(
+            reconcile_selection(Some(selected), &refreshed, &[81, 82]),
+            Some(selected)
+        );
+
+        let without_middle: Vec<_> = before
+            .iter()
+            .filter(|row| row.id() != LocalRowId::Checkout(alpha_middle))
+            .cloned()
+            .collect();
+        assert_eq!(
+            reconcile_after_removal(selected, &before, &without_middle),
+            Some(SelectionTarget::Local(LocalRowId::Checkout(alpha_last)))
+        );
+
+        let without_middle_or_last: Vec<_> = before
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.id(),
+                    LocalRowId::Checkout(key) if key == alpha_middle || key == alpha_last
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            reconcile_after_removal(selected, &before, &without_middle_or_last),
+            Some(SelectionTarget::Local(LocalRowId::Checkout(alpha_first)))
+        );
+
+        let without_alpha_children: Vec<_> = before
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row,
+                    LocalRow::Checkout(child) if child.repository_key == alpha
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            reconcile_after_removal(selected, &before, &without_alpha_children),
+            Some(SelectionTarget::Local(LocalRowId::Repository(alpha)))
+        );
+        assert!(without_alpha_children.iter().any(|row| {
+            matches!(row.id(), LocalRowId::Checkout(key) if key == beta_child)
+        }));
+
+        assert_eq!(
+            initial_selection(&before, &[81, 82]),
+            Some(SelectionTarget::Local(LocalRowId::Repository(alpha)))
+        );
+        assert_eq!(
+            initial_selection(&[], &[81, 82]),
+            Some(SelectionTarget::Remote(81))
+        );
+        assert_eq!(initial_selection(&[], &[]), None);
     }
 }
