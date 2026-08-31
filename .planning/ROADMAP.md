@@ -92,7 +92,7 @@ Plans:
   4. Context actions name the actual target, invalid or unsafe operations fail without partial state or lost work, applicable existing session actions remain available, and older flat daemon/session APIs remain non-destructive compatibility projections without adding daemon hierarchy.
   5. An isolated local end-to-end dogfood run passes across restart, and formatting, lint, tests, package/artifact checks, version metadata, and release documentation are ready for `v2.0.0-beta` without publishing or pushing a release.
 
-**Plans**: 4/6 plans executed
+**Plans**: 5/6 plans executed
 **UI hint**: yes
 
 Plans:
@@ -101,7 +101,7 @@ Plans:
 - [x] 07-02-PLAN.md — Dispatch capability-gated create, close, reopen, and safe-remove lifecycle actions.
 - [x] 07-03-PLAN.md — Complete exact responsive rows, hints, modals, Unicode width, focus, and preserved local actions.
 - [x] 07-04-PLAN.md — Prove isolated real-Git restart/dedup dogfood and flat daemon/session compatibility.
-- [ ] 07-05-PLAN.md — Synchronize beta Cargo/release-please metadata and add non-publishing supported-target artifact CI.
+- [x] 07-05-PLAN.md — Synchronize beta Cargo/release-please metadata and add non-publishing supported-target artifact CI.
 - [ ] 07-06-PLAN.md — Complete readiness-only docs/runbook and run the final non-publishing local readiness gate.
 
 ## Progress
@@ -114,7 +114,7 @@ Plans:
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
 | 6. Shared Lifecycle Core Refactor | v2.0 | 7/7 | In Progress | - |
-| 7. Local TUI Dogfood Release | v2.0 | 4/6 | In Progress|  |
+| 7. Local TUI Dogfood Release | v2.0 | 5/6 | In Progress|  |
 
 ## Backlog
 

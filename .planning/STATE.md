@@ -5,16 +5,16 @@ milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
 status: verification
-stopped_at: Completed 07-04-PLAN.md; manual dogfood and certification remain pending
-last_updated: "2026-08-31T09:47:45.355Z"
+stopped_at: Completed 07-05-PLAN.md; local package/artifact evidence green, certification pending
+last_updated: "2026-08-31T10:02:45.960Z"
 last_activity: 2026-08-31
-last_activity_desc: completed responsive local hierarchy UI contract and full workspace gate; dogfood and certification pending
-state_head: da493aaed38ad8e1d60d2c6e73f367fcc0cf9faa
+last_activity_desc: completed exact beta package metadata and local artifact readiness evidence; certification pending
+state_head: 9c9b69497a5930f74345aa3fb3f851db8ba8c5ba
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 16
-  completed_plans: 14
+  completed_plans: 15
   percent: 33
 ---
 
@@ -32,7 +32,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
 Plan: 06-07 local implementation complete; 06-01 through 06-06 retained as execution history
 Status: Local implementation green; Phase 6 awaits Linux/runtime certification, independent review, phase verification, and Nyquist approval
-Last activity: 2026-08-31 — completed isolated real-Git restart/dedup and flat compatibility proof; manual dogfood remains pending
+Last activity: 2026-08-31 — completed exact beta package metadata and local artifact readiness evidence; certification remains pending
 
 Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
 
@@ -40,16 +40,16 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 14
+- v2.0 plans completed: 15
 - Prior milestone: 14 plans completed across 4 phases
 - Average duration: 20 min
-- Total execution time: 280 min
+- Total execution time: 289 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
-| 7. Local TUI Dogfood Release | 4/6 | 97 min | 24 min |
+| 7. Local TUI Dogfood Release | 5/6 | 106 min | 21 min |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -68,6 +68,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 07 P02 | 34min | 2 tasks | 4 files |
 | Phase 07 P03 | 30min | 2 tasks | 2 files |
 | Phase 07 P04 | 16min | 2 tasks | 2 files |
+| Phase 07 P05 | 9min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -123,6 +124,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Real-Git dogfood runs in an exact child test process so fixture-scoped HOME/XDG isolation cannot race parallel workspace tests.
 - [Phase 07]: Restart selects the first rendered local repository parent; retained child reopening requires explicit durable CheckoutKey reselection.
 - [Phase 07]: Daemon compatibility remains a flat SessionInfo array with retained-close DELETE and no hierarchy or remove-worktree route.
+- [Phase 07]: Published history remains exactly 0.14.0 while source and proposal metadata target 2.0.0-beta.
+- [Phase 07]: Artifact readiness copies only the supported target and two-binary archive shape, with read-only contents permission and no publication authority.
 
 ### Pending Todos
 
@@ -149,6 +152,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T09:47:45.235Z
-Stopped at: Completed 07-04-PLAN.md; manual dogfood and certification remain pending
+Last session: 2026-08-31T10:02:45.850Z
+Stopped at: Completed 07-05-PLAN.md; local package/artifact evidence green, certification pending
 Resume file: None

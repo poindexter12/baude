@@ -55,7 +55,7 @@
 ### Dogfood Release Gate
 
 - [x] **REL-01**: In an isolated real repository, the local TUI completes the end-to-end default-session and branch-worktree flow—open, create or activate, close, reopen, safely remove, and restart—without duplicate parents, children, or runtimes and without losing user work.
-- [ ] **REL-02**: Formatting, lint, full tests, package checks, and supported release artifact builds pass for the intended `v2.0.0-beta` source state.
+- [x] **REL-02**: Formatting, lint, full tests, package checks, and supported release artifact builds pass for the intended `v2.0.0-beta` source state.
 - [ ] **REL-03**: Version/package metadata, changelog or release notes, and local install/dogfood documentation consistently target `v2.0.0-beta`; readiness is verified without publishing or pushing a release.
 
 ## Future Requirements
@@ -129,7 +129,7 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | SURF-02 | Phase 7 | Complete |
 | SURF-05 | Phase 7 | Complete |
 | REL-01 | Phase 7 | Complete |
-| REL-02 | Phase 7 | Pending |
+| REL-02 | Phase 7 | Complete |
 | REL-03 | Phase 7 | Pending |
 
 **Coverage:**
