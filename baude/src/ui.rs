@@ -8,10 +8,12 @@ use baude_core::meta::{
     human_tokens, human_until, now_unix_ms, short_mode, short_model, HookEvent, RateWindow,
 };
 use baude_core::pty::now_ms;
+use baude_core::repository::CheckoutRole;
 use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
+use crate::hierarchy::{LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStatus};
 use crate::remote::RemoteInfo;
 use crate::usage::human_cost;
 
@@ -139,14 +141,22 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         draw_usage_footer(frame, app, fa);
     }
 
-    let ids = app.ordered_ids();
-    if ids.is_empty() {
+    let hierarchy = app.hierarchy_rows();
+    let remote_ids: Vec<_> = app
+        .ordered_ids()
+        .into_iter()
+        .filter(|id| matches!(id, SelId::Remote(_)))
+        .collect();
+    if hierarchy.is_empty() && remote_ids.is_empty() {
         let dim = Style::default().fg(Color::DarkGray);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
-                Line::from(Span::styled("  no sessions yet", dim)),
-                Line::from(Span::styled("  press n to add one", dim)),
+                Line::from(Span::styled("  no repositories yet", dim)),
+                Line::from(Span::styled(
+                    "  press n to open a repository or c to clone one",
+                    dim,
+                )),
             ]),
             list_area,
         );
@@ -156,66 +166,191 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let width = list_area.width as usize;
     let focused = app.focus == Focus::Sidebar;
     let mut lines: Vec<Line> = Vec::new();
-    let mut remote_header_drawn = false;
-    let mut archive_header_drawn = false;
-    for id in &ids {
-        let archived = app.is_archived(*id);
-        if archived && !archive_header_drawn {
-            archive_header_drawn = true;
-            let dim = Style::default().fg(Color::DarkGray);
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("▼ archived", dim),
-            ]));
-        }
-        match id {
-            SelId::Local(lid) => {
-                let Some(s) = app.session(*lid) else { continue };
-                let selected = app.selected_id == Some(*id);
-                session_row(
-                    &mut lines,
-                    selected,
-                    focused,
-                    s.status(),
-                    &s.name,
-                    s.waiting_for_ms(),
-                    width,
-                    archived,
+    for (index, row) in hierarchy.iter().enumerate() {
+        match row {
+            LocalRow::Repository(parent) => repository_row(
+                &mut lines,
+                parent,
+                app.selected_id == Some(SelId::Repository(parent.key)),
+                focused,
+                width,
+            ),
+            LocalRow::Checkout(child) => {
+                let is_last = !matches!(
+                    hierarchy.get(index + 1),
+                    Some(LocalRow::Checkout(next)) if next.repository_key == child.repository_key
                 );
-                lines.push(meta_line(s, selected, focused, width));
-            }
-            SelId::Remote(rid) => {
-                if !remote_header_drawn && !archived {
-                    remote_header_drawn = true;
-                    lines.push(remote_header(app, width));
-                }
-                let Some(r) = app.remote_info(*rid) else {
-                    continue;
-                };
-                let selected = app.selected_id == Some(*id);
-                let status = remote_status(r);
-                let waiting_ms = r
-                    .waiting_for_ms
-                    .map(|ms| ms + now_ms().saturating_sub(app.remote_snap.fetched_ms));
-                session_row(
+                checkout_row(
                     &mut lines,
-                    selected,
+                    app,
+                    child,
+                    is_last,
+                    app.selected_id == Some(SelId::Checkout(child.key)),
                     focused,
-                    status,
-                    &r.name,
-                    waiting_ms.unwrap_or(0),
                     width,
-                    archived,
                 );
-                lines.push(remote_meta_line(r, selected, focused, width));
             }
         }
     }
-    // Remote configured but no active sessions: still show the header.
-    if app.remote.is_some() && !remote_header_drawn {
+    if app.remote.is_some() {
         lines.push(remote_header(app, width));
     }
+    for id in remote_ids {
+        let SelId::Remote(rid) = id else { continue };
+        let Some(r) = app.remote_info(rid) else {
+            continue;
+        };
+        let selected = app.selected_id == Some(id);
+        let status = remote_status(r);
+        let waiting_ms = r
+            .waiting_for_ms
+            .map(|ms| ms + now_ms().saturating_sub(app.remote_snap.fetched_ms));
+        session_row(
+            &mut lines,
+            selected,
+            focused,
+            status,
+            &r.name,
+            waiting_ms.unwrap_or(0),
+            width,
+            r.archived,
+        );
+        lines.push(remote_meta_line(r, selected, focused, width));
+    }
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+fn repository_row(
+    lines: &mut Vec<Line<'static>>,
+    row: &LocalRepositoryRow,
+    selected: bool,
+    focused: bool,
+    width: usize,
+) {
+    let name_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let aggregate = if row.waiting_count == 0 {
+        String::new()
+    } else if row.waiting_count == 1 {
+        "1 waiting".to_string()
+    } else {
+        format!("{} waiting", row.waiting_count)
+    };
+    let reserve = if aggregate.is_empty() {
+        0
+    } else {
+        aggregate.len() + 1
+    };
+    let name = truncate(&row.display_name, width.saturating_sub(4 + reserve).max(1));
+    let used = 4 + name.chars().count() + aggregate.len();
+    let mut spans = vec![
+        gutter(selected, focused),
+        Span::styled("▾ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(name, name_style),
+    ];
+    if !aggregate.is_empty() {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        spans.push(Span::styled(aggregate, Style::default().fg(Color::Yellow)));
+    } else if selected {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+    let line = Line::from(spans);
+    lines.push(if selected {
+        line.style(selection_bg())
+    } else {
+        line
+    });
+}
+
+fn checkout_row(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    row: &LocalCheckoutRow,
+    is_last: bool,
+    selected: bool,
+    focused: bool,
+    width: usize,
+) {
+    let connector = if is_last { "└─ " } else { "├─ " };
+    let (icon, icon_style, state_text) = match row.status {
+        LocalStatus::Waiting => (
+            "●",
+            Style::default().fg(if flash_on() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+            "waiting",
+        ),
+        LocalStatus::Working => (spinner(), Style::default().fg(Color::Blue), "working"),
+        LocalStatus::Completed => ("✓", Style::default().fg(Color::Green), "completed"),
+        LocalStatus::Exited => ("✗", Style::default().fg(Color::DarkGray), "exited"),
+        LocalStatus::Closed => ("○", Style::default().fg(Color::Gray), "closed"),
+        LocalStatus::Archived => ("·", Style::default().fg(Color::DarkGray), "archived"),
+        LocalStatus::Unavailable => ("!", Style::default().fg(Color::Yellow), "unavailable"),
+    };
+    let name_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if matches!(row.status, LocalStatus::Archived | LocalStatus::Exited) {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let name = truncate(&row.name, width.saturating_sub(8).max(1));
+    let used = 2 + connector.chars().count() + 2 + name.chars().count();
+    let mut spans = vec![
+        gutter(selected, focused),
+        Span::styled(connector, Style::default().fg(Color::DarkGray)),
+        Span::styled(icon.to_string(), icon_style),
+        Span::raw(" "),
+        Span::styled(name, name_style),
+    ];
+    if selected {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+    let line = Line::from(spans);
+    lines.push(if selected {
+        line.style(selection_bg())
+    } else {
+        line
+    });
+
+    let role = match row.role {
+        CheckoutRole::Main => "main",
+        CheckoutRole::PrimaryDefault => "default",
+        CheckoutRole::ManagedBranch => "worktree",
+    };
+    if let Some(runtime_id) = row.runtime_id {
+        if let Some(session) = app.session(runtime_id) {
+            let mut meta = meta_line(session, selected, focused, width);
+            meta.spans.insert(
+                2,
+                Span::styled(format!("{role} · "), Style::default().fg(Color::DarkGray)),
+            );
+            lines.push(meta);
+            return;
+        }
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut meta = Line::from(vec![
+        gutter(selected, focused),
+        Span::styled(if is_last { "   ↳ " } else { "│  ↳ " }, dim),
+        Span::styled(format!("{role} · {state_text}"), dim),
+    ]);
+    if selected {
+        let used = 7 + role.len() + 3 + state_text.len();
+        meta.spans
+            .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        meta = meta.style(selection_bg());
+    }
+    lines.push(meta);
 }
 
 /// Map a daemon status word onto the local status enum for shared styling.
@@ -1019,7 +1154,20 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         }
         Modal::ConfirmKill { id } => {
             let name = match id {
-                SelId::Local(lid) => app.session(*lid).map(|s| s.name.clone()),
+                SelId::Repository(_) => None,
+                SelId::Checkout(key) => app
+                    .selected_id
+                    .filter(|selected| selected == id)
+                    .and_then(|_| app.selected())
+                    .or_else(|| {
+                        app.hierarchy_rows().iter().find_map(|row| match row {
+                            LocalRow::Checkout(child) if child.key == *key => {
+                                child.runtime_id.and_then(|runtime| app.session(runtime))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .map(|session| session.name.clone()),
                 SelId::Remote(rid) => app
                     .remote_info(*rid)
                     .map(|r| format!("{} (remote)", r.name)),
@@ -1507,7 +1655,10 @@ mod tests {
         assert!(rendered.contains("└─ ○ repo:main"), "{rendered}");
         assert!(rendered.contains("main · closed"), "{rendered}");
         assert!(rendered.contains("default · closed"), "{rendered}");
-        assert!(buffer.content.iter().any(|cell| cell.bg == Color::Indexed(237)));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Indexed(237)));
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::Cyan));
     }
 

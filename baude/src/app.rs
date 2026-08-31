@@ -16,11 +16,12 @@ use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, State
 use baude_core::pty::{now_ms, Pty};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
-    SavedRepository, ShellOwnership, UnavailableCause,
+    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState, RuntimeGeneration,
+    SavedCheckout, SavedRepository, ShellOwnership, UnavailableCause,
 };
 use baude_core::session::{Session, Status};
 
+use crate::hierarchy::{self, CheckoutDecoration, LocalRow, LocalRowId};
 use crate::keys::encode_key;
 use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
@@ -192,10 +193,12 @@ pub enum Focus {
     Shell,
 }
 
-/// Sidebar selection: a local session or one on the remote daemon.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Sidebar selection uses durable identity for local topology and runtime
+/// identity only for the separate flat remote compatibility section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelId {
-    Local(u64),
+    Repository(RepositoryKey),
+    Checkout(CheckoutKey),
     Remote(u64),
 }
 
@@ -585,6 +588,38 @@ impl App {
 
     pub fn persistence_dirty(&self) -> bool {
         self.persistence_dirty
+    }
+
+    pub fn hierarchy_rows(&self) -> Vec<LocalRow> {
+        let decorations = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter_map(|checkout| {
+                let runtime_id = self.runtime_checkouts.get(&checkout.key).copied()?;
+                let session = self.session(runtime_id)?;
+                Some((
+                    checkout.key,
+                    CheckoutDecoration {
+                        runtime_id: Some(runtime_id),
+                        status: Some(session.status()),
+                        waiting_for_ms: session.waiting_for_ms(),
+                        archived: session.archived,
+                    },
+                ))
+            })
+            .collect();
+        hierarchy::project_local(&self.repository_state, &decorations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_hierarchy_state_for_test(
+        &mut self,
+        state: RepositoryState,
+        runtime_checkouts: HashMap<CheckoutKey, u64>,
+    ) {
+        self.repository_state = state;
+        self.runtime_checkouts = runtime_checkouts;
     }
 
     /// Freshest account rate-limit windows across all sessions (they're
@@ -1133,7 +1168,7 @@ impl App {
                     drop(_reservation);
                     return self.reopen_checkout(activation.checkout);
                 }
-                self.selected_id = Some(SelId::Local(runtime));
+                self.selected_id = Some(SelId::Checkout(activation.checkout));
                 self.focus = Focus::Claude;
                 return Ok(LifecycleOutcome::Focused {
                     checkout: activation.checkout,
@@ -1213,7 +1248,7 @@ impl App {
             runtime.archived_by_user = checkout.session.archived_by_user;
         }
         self.runtime_checkouts.insert(activation.checkout, id);
-        self.selected_id = Some(SelId::Local(id));
+        self.selected_id = Some(SelId::Checkout(activation.checkout));
         self.focus = Focus::Claude;
         Ok(activation.outcome(Some(id)))
     }
@@ -1300,7 +1335,7 @@ impl App {
 
         match plan.dispatch {
             lifecycle::ReopenDispatch::Focus { id } => {
-                self.selected_id = Some(SelId::Local(id));
+                self.selected_id = Some(SelId::Checkout(checkout_key));
                 self.focus = Focus::Claude;
                 Ok(LifecycleOutcome::Focused {
                     checkout: checkout_key,
@@ -1309,7 +1344,7 @@ impl App {
             }
             lifecycle::ReopenDispatch::Restart { id } => {
                 self.restart_session_with_mode(id, plan.mode)?;
-                self.selected_id = Some(SelId::Local(id));
+                self.selected_id = Some(SelId::Checkout(checkout_key));
                 Ok(LifecycleOutcome::Reopened {
                     checkout: checkout_key,
                     runtime: id,
@@ -1333,6 +1368,7 @@ impl App {
                     runtime.archived_by_user = session.archived_by_user;
                 }
                 self.runtime_checkouts.insert(checkout_key, id);
+                self.selected_id = Some(SelId::Checkout(checkout_key));
                 self.focus = Focus::Claude;
                 Ok(LifecycleOutcome::Reopened {
                     checkout: checkout_key,
@@ -1411,45 +1447,50 @@ impl App {
 
     // ---- session bookkeeping ----
 
-    /// Selection order: active local sessions, then the remote daemon's
-    /// active sessions, then archived sessions at the end — each group
-    /// alphabetical by name (case-insensitive) so the sidebar is predictable.
-    /// Sessions that need input flash in place instead of reordering.
+    /// Selection order: durable local parents and children in structural
+    /// hierarchy order, followed by the existing flat remote compatibility
+    /// order. Volatile local status never participates in ordering.
     pub fn ordered_ids(&self) -> Vec<SelId> {
-        let mut active_local: Vec<(String, SelId)> = Vec::new();
         let mut active_remote: Vec<(String, SelId)> = Vec::new();
-        let mut archived: Vec<(String, SelId)> = Vec::new();
-        for s in &self.sessions {
-            let entry = (s.name.to_lowercase(), SelId::Local(s.id));
-            if s.archived {
-                archived.push(entry);
-            } else {
-                active_local.push(entry);
-            }
-        }
+        let mut archived_remote: Vec<(String, SelId)> = Vec::new();
         for r in &self.remote_snap.sessions {
             let entry = (r.name.to_lowercase(), SelId::Remote(r.id));
             if r.archived {
-                archived.push(entry);
+                archived_remote.push(entry);
             } else {
                 active_remote.push(entry);
             }
         }
-        // Stable sort: equal names keep creation order.
-        for group in [&mut active_local, &mut active_remote, &mut archived] {
+        for group in [&mut active_remote, &mut archived_remote] {
             group.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        active_local
+        self.hierarchy_rows()
             .into_iter()
-            .chain(active_remote)
-            .chain(archived)
-            .map(|(_, id)| id)
+            .map(|row| match row.id() {
+                LocalRowId::Repository(key) => SelId::Repository(key),
+                LocalRowId::Checkout(key) => SelId::Checkout(key),
+            })
+            .chain(active_remote.into_iter().map(|(_, id)| id))
+            .chain(archived_remote.into_iter().map(|(_, id)| id))
             .collect()
     }
 
     pub fn is_archived(&self, id: SelId) -> bool {
         match id {
-            SelId::Local(lid) => self.session(lid).map(|s| s.archived).unwrap_or(false),
+            SelId::Repository(_) => false,
+            SelId::Checkout(key) => self
+                .runtime_checkouts
+                .get(&key)
+                .and_then(|id| self.session(*id))
+                .map(|session| session.archived)
+                .or_else(|| {
+                    self.repository_state
+                        .checkouts
+                        .iter()
+                        .find(|checkout| checkout.key == key)
+                        .map(|checkout| checkout.session.archived)
+                })
+                .unwrap_or(false),
             SelId::Remote(rid) => self.remote_info(rid).map(|r| r.archived).unwrap_or(false),
         }
     }
@@ -1475,14 +1516,20 @@ impl App {
 
     pub fn selected(&self) -> Option<&Session> {
         match self.selected_id {
-            Some(SelId::Local(id)) => self.session(id),
+            Some(SelId::Checkout(key)) => self
+                .runtime_checkouts
+                .get(&key)
+                .and_then(|id| self.session(*id)),
             _ => None,
         }
     }
 
     fn selected_mut(&mut self) -> Option<&mut Session> {
         match self.selected_id {
-            Some(SelId::Local(id)) => self.sessions.iter_mut().find(|s| s.id == id),
+            Some(SelId::Checkout(key)) => {
+                let id = self.runtime_checkouts.get(&key).copied()?;
+                self.sessions.iter_mut().find(|session| session.id == id)
+            }
             _ => None,
         }
     }
@@ -1696,7 +1743,9 @@ impl App {
             }
         }
         self.sessions.push(session);
-        self.selected_id = Some(SelId::Local(id));
+        if let Some(checkout) = checkout {
+            self.selected_id = Some(SelId::Checkout(checkout));
+        }
         Ok(id)
     }
 
@@ -1726,9 +1775,8 @@ impl App {
     fn forget_stopped_runtime(&mut self, checkout_key: CheckoutKey, id: u64) {
         self.runtime_checkouts.remove(&checkout_key);
         self.sessions.retain(|s| s.id != id);
-        if self.selected_id == Some(SelId::Local(id)) {
-            self.selected_id = self.ordered_ids().first().copied();
-        }
+        // Retained close removes only the runtime decoration; the durable
+        // checkout remains selected and visible in the hierarchy.
         self.focus = Focus::Sidebar;
     }
 
@@ -1762,7 +1810,7 @@ impl App {
         saved: RetainedSessionState,
     ) -> Result<u64> {
         if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
-            self.selected_id = Some(SelId::Local(id));
+            self.selected_id = Some(SelId::Checkout(checkout));
             self.focus = Focus::Claude;
             return Ok(id);
         }
@@ -1816,7 +1864,7 @@ impl App {
             runtime.archived_by_user = saved.archived_by_user;
         }
         self.runtime_checkouts.insert(checkout, id);
-        self.selected_id = Some(SelId::Local(id));
+        self.selected_id = Some(SelId::Checkout(checkout));
         self.focus = Focus::Claude;
         Ok(id)
     }
@@ -2119,9 +2167,6 @@ impl App {
             s.kill();
         }
         self.sessions.retain(|s| s.id != id);
-        if self.selected_id == Some(SelId::Local(id)) {
-            self.selected_id = self.ordered_ids().first().copied();
-        }
         self.focus = Focus::Sidebar;
         self.save();
     }
@@ -2247,7 +2292,7 @@ impl App {
         match self.focus {
             Focus::Claude => {
                 let alive = match self.selected_id {
-                    Some(SelId::Local(_)) => self
+                    Some(SelId::Checkout(_)) => self
                         .selected()
                         .map(|s| !s.claude.is_exited())
                         .unwrap_or(false),
@@ -2256,6 +2301,7 @@ impl App {
                         .as_ref()
                         .map(|a| a.remote_id == id && !a.is_closed())
                         .unwrap_or(false),
+                    Some(SelId::Repository(_)) => false,
                     None => false,
                 };
                 if !alive {
@@ -2503,17 +2549,18 @@ impl App {
                     id: SelId::Remote(id),
                 };
             }
-            Some(SelId::Local(_)) => {
+            Some(SelId::Checkout(key)) => {
                 if let Some(s) = self.selected() {
                     self.modal = if s.is_worktree {
                         Modal::ConfirmCloseWorktree { id: s.id }
                     } else {
                         Modal::ConfirmKill {
-                            id: SelId::Local(s.id),
+                            id: SelId::Checkout(key),
                         }
                     };
                 }
             }
+            Some(SelId::Repository(_)) => {}
             None => {}
         }
     }
@@ -2573,7 +2620,12 @@ impl App {
             }
             KeyCode::Char('a') => self.toggle_archive(),
             KeyCode::Char('r') => match self.selected_id {
-                Some(SelId::Local(id)) => self.restart_session(id),
+                Some(SelId::Checkout(key)) => {
+                    if let Some(id) = self.runtime_checkouts.get(&key).copied() {
+                        self.restart_session(id);
+                    }
+                }
+                Some(SelId::Repository(_)) => {}
                 Some(SelId::Remote(id)) => self.restart_remote(id),
                 None => {}
             },
@@ -2652,7 +2704,12 @@ impl App {
                     KeyCode::Char('y') | KeyCode::Enter => {
                         self.modal = Modal::None;
                         match id {
-                            SelId::Local(id) => self.remove_session(id),
+                            SelId::Checkout(key) => {
+                                if let Some(id) = self.runtime_checkouts.get(&key).copied() {
+                                    self.remove_session(id);
+                                }
+                            }
+                            SelId::Repository(_) => {}
                             SelId::Remote(id) => self.remove_remote(id),
                         }
                     }
@@ -2957,7 +3014,10 @@ impl App {
     /// `a` — park/unpark the selected session.
     fn toggle_archive(&mut self) {
         match self.selected_id {
-            Some(SelId::Local(id)) => {
+            Some(SelId::Checkout(key)) => {
+                let Some(id) = self.runtime_checkouts.get(&key).copied() else {
+                    return;
+                };
                 let Some(s) = self.session_mut(id) else {
                     return;
                 };
@@ -2978,6 +3038,7 @@ impl App {
                     Err(e) => self.set_message(format!("archive: {e}")),
                 }
             }
+            Some(SelId::Repository(_)) => {}
             None => {}
         }
     }
