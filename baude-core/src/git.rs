@@ -3046,8 +3046,8 @@ mod tests {
         mod removal_topology {
             use super::*;
             use crate::repository::{
-                CheckoutHealth, CheckoutRole, PersistedPath, RepositoryState, RetainedSessionState,
-                SavedCheckout,
+                CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryState,
+                RetainedSessionState, SavedCheckout,
             };
 
             pub(super) fn saved_checkout(
@@ -3066,6 +3066,7 @@ mod tests {
                     observed_path: PersistedPath::from_path(path),
                     observed_branch: Some(branch.to_owned()),
                     first_seen_order: state.allocate_first_seen_order().unwrap(),
+                    lifecycle: CheckoutLifecycle::Active,
                     active_intent: true,
                     session: RetainedSessionState {
                         name: "managed".into(),

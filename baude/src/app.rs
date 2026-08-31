@@ -15,8 +15,8 @@ use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
 use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::{now_ms, Pty};
 use baude_core::repository::{
-    CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
-    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+    CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
+    RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
 };
 use baude_core::session::{Session, Status};
 
@@ -759,6 +759,7 @@ impl App {
                 observed_path: PersistedPath::from_path(&record.path),
                 observed_branch: Some(default.local_ref.clone()),
                 first_seen_order,
+                lifecycle: CheckoutLifecycle::Active,
                 active_intent: true,
                 session: RetainedSessionState {
                     name,

@@ -13,13 +13,106 @@ use crate::repository::{
     RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateFile {
     pub schema_version: u32,
     pub state: RepositoryState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1StateFile {
+    schema_version: u32,
+    state: SchemaV1RepositoryState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1RepositoryState {
+    next_repository_key: u64,
+    next_checkout_key: u64,
+    next_first_seen_order: u64,
+    repositories: Vec<SavedRepository>,
+    checkouts: Vec<SchemaV1SavedCheckout>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1SavedCheckout {
+    key: crate::repository::CheckoutKey,
+    repository_key: crate::repository::RepositoryKey,
+    role: CheckoutRole,
+    managed_by_baude: bool,
+    observed_path: PersistedPath,
+    observed_branch: Option<String>,
+    first_seen_order: u64,
+    active_intent: bool,
+    session: RetainedSessionState,
+    health: CheckoutHealth,
+}
+
+impl SchemaV1StateFile {
+    fn migrate(self) -> std::result::Result<StateFile, String> {
+        if self.schema_version != 1 {
+            return Err(format!("expected schema 1, got {}", self.schema_version));
+        }
+        let checkouts = self
+            .state
+            .checkouts
+            .into_iter()
+            .map(|checkout| {
+                if let CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                    agent_identity,
+                    shell_identity,
+                    agent_stopped,
+                    shell_stopped,
+                    ..
+                }) = &checkout.health
+                {
+                    if (!agent_stopped && agent_identity.is_none())
+                        || (!shell_stopped && shell_identity.is_none())
+                    {
+                        return Err(format!(
+                            "checkout {} claims live teardown ownership without exact identity",
+                            checkout.key.get()
+                        ));
+                    }
+                }
+                let lifecycle = crate::repository::CheckoutLifecycle::from_legacy(
+                    checkout.active_intent,
+                    &checkout.health,
+                );
+                Ok(SavedCheckout {
+                    key: checkout.key,
+                    repository_key: checkout.repository_key,
+                    role: checkout.role,
+                    managed_by_baude: checkout.managed_by_baude,
+                    observed_path: checkout.observed_path,
+                    observed_branch: checkout.observed_branch,
+                    first_seen_order: checkout.first_seen_order,
+                    lifecycle,
+                    active_intent: checkout.active_intent,
+                    session: checkout.session,
+                    health: checkout.health,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let state = RepositoryState {
+            next_repository_key: self.state.next_repository_key,
+            next_checkout_key: self.state.next_checkout_key,
+            next_first_seen_order: self.state.next_first_seen_order,
+            repositories: self.state.repositories,
+            checkouts,
+        };
+        state.validate().map_err(|error| error.to_string())?;
+        state
+            .validate_lifecycle_views()
+            .map_err(|error| error.to_string())?;
+        Ok(StateFile::new(state))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +306,24 @@ pub fn load_for_workspace_strict_at(
             path: source_path.clone(),
             cause: "schema_version must be an unsigned integer".into(),
         })?;
+        if version == 1 && SCHEMA_VERSION == 2 {
+            let legacy: SchemaV1StateFile =
+                serde_json::from_value(value).map_err(|error| LoadError::Malformed {
+                    path: source_path.clone(),
+                    cause: error.to_string(),
+                })?;
+            let migrated = legacy.migrate().map_err(|cause| LoadError::InvalidState {
+                path: source_path.clone(),
+                cause,
+            })?;
+            save_current_at(root, &primary_file, &migrated).map_err(|error| {
+                LoadError::Persist {
+                    path: primary_path,
+                    cause: error.to_string(),
+                }
+            })?;
+            return Ok(LoadOutcome::Legacy(migrated));
+        }
         if version != u64::from(SCHEMA_VERSION) {
             return Err(LoadError::UnsupportedVersion {
                 path: source_path,
@@ -227,6 +338,13 @@ pub fn load_for_workspace_strict_at(
         current
             .state
             .validate()
+            .map_err(|error| LoadError::InvalidState {
+                path: source_path.clone(),
+                cause: error.to_string(),
+            })?;
+        current
+            .state
+            .validate_lifecycle_views()
             .map_err(|error| LoadError::InvalidState {
                 path: source_path,
                 cause: error.to_string(),
@@ -314,8 +432,14 @@ fn atomic_save_current(
     failure: Option<AtomicFailure>,
     first_temp: Option<PathBuf>,
 ) -> std::result::Result<(), SaveError> {
+    let mut state = state.clone();
+    state.state.synchronize_lifecycle_from_views();
     state.state.validate().map_err(SaveError::not_committed)?;
-    let bytes = serde_json::to_vec_pretty(state).map_err(SaveError::not_committed)?;
+    state
+        .state
+        .validate_lifecycle_views()
+        .map_err(SaveError::not_committed)?;
+    let bytes = serde_json::to_vec_pretty(&state).map_err(SaveError::not_committed)?;
     let destination = root.join(file);
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(SaveError::not_committed)?;
@@ -495,6 +619,7 @@ fn migrate_legacy(
             observed_path: checkout_path.clone(),
             observed_branch,
             first_seen_order,
+            lifecycle: crate::repository::CheckoutLifecycle::from_legacy(true, &checkout_health),
             active_intent: true,
             session: RetainedSessionState {
                 name: session.name,
@@ -729,8 +854,8 @@ fn load_named_at(
 mod tests {
     use super::*;
     use crate::repository::{
-        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RetainedSessionState,
-        SavedCheckout, SavedRepository, UnavailableCause,
+        CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, ProcessIdentity,
+        RepositoryHealth, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
     };
 
     fn isolated_root(label: &str) -> PathBuf {
@@ -767,6 +892,7 @@ mod tests {
             observed_path: PersistedPath::from_path(&checkout_path),
             observed_branch: Some("feature/retained".into()),
             first_seen_order: checkout_order,
+            lifecycle: CheckoutLifecycle::Protected(UnavailableCause::Missing),
             active_intent: true,
             session: RetainedSessionState {
                 name: format!("{prefix}-session"),
@@ -782,6 +908,123 @@ mod tests {
             health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
         });
         StateFile::new(state)
+    }
+
+    fn schema_v1_protected_fixture() -> SchemaV1StateFile {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let root = PathBuf::from("/schema-v1/repo");
+        let repository = SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(&root.join(".git")),
+            observed_main_worktree: PersistedPath::from_path(&root),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        };
+        let identity = ProcessIdentity {
+            pid: 4242,
+            start_time: 99,
+            process_group: 4242,
+            session: 4242,
+        };
+        let causes = vec![
+            (
+                false,
+                UnavailableCause::PendingActivation {
+                    branch: "feature/pending".into(),
+                    created_branch: None,
+                    preexisting_branch_owner: None,
+                },
+            ),
+            (
+                false,
+                UnavailableCause::ActivationRecovery {
+                    branch: "feature/recovery".into(),
+                    created_branch: Some(true),
+                    preexisting_branch_owner: None,
+                    verification: "verify".into(),
+                    compensation: "compensate".into(),
+                },
+            ),
+            (
+                true,
+                UnavailableCause::TeardownPending {
+                    agent_pid: Some(identity.pid),
+                    shell_pid: None,
+                    agent_identity: Some(identity),
+                    shell_identity: None,
+                    agent_stopped: false,
+                    shell_stopped: true,
+                    detail: "retry stop".into(),
+                },
+            ),
+            (
+                true,
+                UnavailableCause::RemovalTombstone("authority revoked".into()),
+            ),
+            (
+                true,
+                UnavailableCause::StoppedActiveRecovery {
+                    agent_restarted: false,
+                    shell_restarted: false,
+                    detail: "rollback pending".into(),
+                },
+            ),
+        ];
+        let mut checkouts = Vec::new();
+        for (index, (active_intent, cause)) in causes.into_iter().enumerate() {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let path = PathBuf::from(format!("/schema-v1/checkout-{index}"));
+            checkouts.push(SchemaV1SavedCheckout {
+                key,
+                repository_key,
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                observed_path: PersistedPath::from_path(&path),
+                observed_branch: Some(format!("refs/heads/feature/{index}")),
+                first_seen_order: order,
+                active_intent,
+                session: RetainedSessionState {
+                    name: format!("protected-{index}"),
+                    cwd: PersistedPath::from_path(&path),
+                    repo_root: PersistedPath::from_path(&root),
+                    branch: Some(format!("feature/{index}")),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+                health: CheckoutHealth::Unavailable(cause),
+            });
+        }
+        SchemaV1StateFile {
+            schema_version: 1,
+            state: SchemaV1RepositoryState {
+                next_repository_key: state.next_repository_key,
+                next_checkout_key: state.next_checkout_key,
+                next_first_seen_order: state.next_first_seen_order,
+                repositories: vec![repository],
+                checkouts,
+            },
+        }
+    }
+
+    fn malformed_schema_v1_ownership_fixture() -> SchemaV1StateFile {
+        let mut fixture = schema_v1_protected_fixture();
+        fixture.state.checkouts[2].health =
+            CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                agent_pid: Some(4242),
+                shell_pid: None,
+                agent_identity: None,
+                shell_identity: None,
+                agent_stopped: false,
+                shell_stopped: true,
+                detail: "missing exact identity".into(),
+            });
+        fixture
     }
 
     fn legacy_fixture(prefix: &str) -> State {
@@ -1179,7 +1422,11 @@ mod tests {
         let workspace = test_workspace("claude");
         let file = workspace.state_file("state");
         let legacy = schema_v1_protected_fixture();
-        std::fs::write(root.join(&file), serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        std::fs::write(
+            root.join(&file),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
 
         let first = load_for_workspace_strict_at(&root, "state", &workspace, |_| {
             panic!("schema-v1 migration must not use flat legacy reconciliation")
@@ -1192,15 +1439,16 @@ mod tests {
             checkout.lifecycle().is_protected() && !checkout.lifecycle().is_launchable()
         }));
         let first_bytes = std::fs::read(root.join(&file)).unwrap();
-        let second = load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!())
-            .unwrap();
+        let second =
+            load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()).unwrap();
         assert!(matches!(second, LoadOutcome::Current(_)));
         assert_eq!(std::fs::read(root.join(&file)).unwrap(), first_bytes);
 
         let malformed = malformed_schema_v1_ownership_fixture();
         std::fs::write(root.join(&file), serde_json::to_vec(&malformed).unwrap()).unwrap();
-        assert!(load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!())
-            .is_err());
+        assert!(
+            load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()).is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

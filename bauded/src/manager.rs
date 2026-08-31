@@ -18,8 +18,8 @@ use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
 use baude_core::repository::{
-    CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
-    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+    CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
+    RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
 };
 use baude_core::session::{Session, StateSource, Status};
 
@@ -973,6 +973,11 @@ impl Manager {
                 .as_ref()
                 .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
             first_seen_order,
+            lifecycle: if snapshot.is_some() {
+                CheckoutLifecycle::Active
+            } else {
+                CheckoutLifecycle::Protected(UnavailableCause::NotRepository)
+            },
             active_intent: true,
             session: RetainedSessionState {
                 name,

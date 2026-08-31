@@ -58,6 +58,35 @@ pub struct ProcessIdentity {
     pub session: i32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RuntimeGeneration(u64);
+
+impl RuntimeGeneration {
+    pub const fn initial() -> Self {
+        Self(1)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "identity")]
+pub enum ShellOwnership {
+    Closed,
+    Owned(ProcessIdentity),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedRuntime {
+    pub generation: RuntimeGeneration,
+    pub agent: ProcessIdentity,
+    pub shell: ShellOwnership,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableCause {
@@ -128,6 +157,51 @@ pub enum CheckoutHealth {
     Unavailable(UnavailableCause),
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "candidate")]
+pub enum CheckoutLifecycle {
+    Inactive,
+    Active,
+    Activating,
+    Launching(RuntimeGeneration),
+    Running(RuntimeGeneration),
+    Stopping(RuntimeGeneration),
+    RemovalCommitted,
+    Protected(UnavailableCause),
+}
+
+impl CheckoutLifecycle {
+    pub fn from_legacy(active: bool, health: &CheckoutHealth) -> Self {
+        match health {
+            CheckoutHealth::Available if active => Self::Active,
+            CheckoutHealth::Available => Self::Inactive,
+            CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { .. }) => {
+                Self::Activating
+            }
+            CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(_)) => {
+                Self::RemovalCommitted
+            }
+            CheckoutHealth::Unavailable(cause) => Self::Protected(cause.clone()),
+        }
+    }
+
+    pub fn is_protected(&self) -> bool {
+        matches!(
+            self,
+            Self::Activating
+                | Self::Launching(_)
+                | Self::Running(_)
+                | Self::Stopping(_)
+                | Self::RemovalCommitted
+                | Self::Protected(_)
+        )
+    }
+
+    pub fn is_launchable(&self) -> bool {
+        matches!(self, Self::Inactive | Self::Active)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutRole {
@@ -173,9 +247,49 @@ pub struct SavedCheckout {
     pub observed_path: PersistedPath,
     pub observed_branch: Option<String>,
     pub first_seen_order: u64,
+    pub lifecycle: CheckoutLifecycle,
+    /// Compatibility view for existing presentation code. Durable validation
+    /// requires it to agree with `lifecycle`; lifecycle protocol code updates
+    /// both through `set_lifecycle`.
     pub active_intent: bool,
     pub session: RetainedSessionState,
     pub health: CheckoutHealth,
+}
+
+impl SavedCheckout {
+    pub fn lifecycle(&self) -> &CheckoutLifecycle {
+        &self.lifecycle
+    }
+
+    pub fn set_lifecycle(&mut self, lifecycle: CheckoutLifecycle) {
+        self.active_intent = matches!(
+            lifecycle,
+            CheckoutLifecycle::Active
+                | CheckoutLifecycle::Activating
+                | CheckoutLifecycle::Launching(_)
+                | CheckoutLifecycle::Running(_)
+                | CheckoutLifecycle::Stopping(_)
+                | CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. })
+                | CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery { .. })
+        );
+        self.health = match &lifecycle {
+            CheckoutLifecycle::Inactive
+            | CheckoutLifecycle::Active
+            | CheckoutLifecycle::Launching(_)
+            | CheckoutLifecycle::Running(_)
+            | CheckoutLifecycle::Stopping(_) => CheckoutHealth::Available,
+            CheckoutLifecycle::Activating => self.health.clone(),
+            CheckoutLifecycle::RemovalCommitted => CheckoutHealth::Unavailable(
+                UnavailableCause::RemovalTombstone("removal committed".into()),
+            ),
+            CheckoutLifecycle::Protected(cause) => CheckoutHealth::Unavailable(cause.clone()),
+        };
+        self.lifecycle = lifecycle;
+    }
+
+    pub fn synchronize_lifecycle_from_views(&mut self) {
+        self.lifecycle = CheckoutLifecycle::from_legacy(self.active_intent, &self.health);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -222,6 +336,7 @@ pub enum ValidationError {
     RegressingCheckoutCounter,
     RegressingOrderCounter,
     DuplicateFirstSeenOrder(u64),
+    ContradictoryLifecycle(CheckoutKey),
     ExhaustedRepositoryCounter,
     ExhaustedCheckoutCounter,
     ExhaustedOrderCounter,
@@ -251,6 +366,23 @@ impl std::fmt::Display for AllocationError {
 impl std::error::Error for AllocationError {}
 
 impl RepositoryState {
+    pub(crate) fn synchronize_lifecycle_from_views(&mut self) {
+        for checkout in &mut self.checkouts {
+            checkout.synchronize_lifecycle_from_views();
+        }
+    }
+
+    pub(crate) fn validate_lifecycle_views(&self) -> Result<(), ValidationError> {
+        for checkout in &self.checkouts {
+            if CheckoutLifecycle::from_legacy(checkout.active_intent, &checkout.health)
+                != checkout.lifecycle
+            {
+                return Err(ValidationError::ContradictoryLifecycle(checkout.key));
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_pending_activation(&self) -> bool {
         self.checkouts.iter().any(|checkout| {
             matches!(
@@ -449,6 +581,7 @@ mod tests {
             observed_path: path("/repo-default"),
             observed_branch: Some("main".into()),
             first_seen_order: order,
+            lifecycle: CheckoutLifecycle::Protected(UnavailableCause::Missing),
             active_intent: true,
             session: RetainedSessionState {
                 name: "repo".into(),

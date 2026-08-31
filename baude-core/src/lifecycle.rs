@@ -11,10 +11,151 @@ use crate::git::{
     RepositorySnapshot, VerifiedRemoval, VerifiedRemovalTarget, WorktreeRecord,
 };
 use crate::repository::{
-    AllocationError, CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
-    RepositoryKey, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
-    UnavailableCause, ValidationError,
+    AllocationError, CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
+    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState, RuntimeGeneration,
+    SavedCheckout, SavedRepository, UnavailableCause, ValidationError,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleEvent {
+    RequestActivation,
+    ActivationVerified,
+    LaunchRegistered(RuntimeGeneration),
+    LaunchReleased,
+    RequestClose,
+    RuntimeExtinct,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleTraceEntry {
+    PersistActivation,
+    PersistActive,
+    PersistRuntime,
+    ReleaseRuntime,
+    PersistStop,
+    PersistInactive,
+}
+
+pub type LifecycleTrace = Vec<LifecycleTraceEntry>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleTransition {
+    pub state: CheckoutLifecycle,
+    pub effects: LifecycleTrace,
+}
+
+pub fn reduce_lifecycle(state: &CheckoutLifecycle, event: &LifecycleEvent) -> LifecycleTransition {
+    let transition = match (state, event) {
+        (CheckoutLifecycle::Inactive, LifecycleEvent::RequestActivation) => Some((
+            CheckoutLifecycle::Activating,
+            LifecycleTraceEntry::PersistActivation,
+        )),
+        (CheckoutLifecycle::Activating, LifecycleEvent::ActivationVerified) => Some((
+            CheckoutLifecycle::Active,
+            LifecycleTraceEntry::PersistActive,
+        )),
+        (CheckoutLifecycle::Active, LifecycleEvent::LaunchRegistered(generation)) => Some((
+            CheckoutLifecycle::Launching(*generation),
+            LifecycleTraceEntry::PersistRuntime,
+        )),
+        (CheckoutLifecycle::Launching(generation), LifecycleEvent::LaunchReleased) => Some((
+            CheckoutLifecycle::Running(*generation),
+            LifecycleTraceEntry::ReleaseRuntime,
+        )),
+        (CheckoutLifecycle::Running(generation), LifecycleEvent::RequestClose) => Some((
+            CheckoutLifecycle::Stopping(*generation),
+            LifecycleTraceEntry::PersistStop,
+        )),
+        (CheckoutLifecycle::Stopping(_), LifecycleEvent::RuntimeExtinct) => Some((
+            CheckoutLifecycle::Inactive,
+            LifecycleTraceEntry::PersistInactive,
+        )),
+        _ => None,
+    };
+    match transition {
+        Some((state, effect)) => LifecycleTransition {
+            state,
+            effects: vec![effect],
+        },
+        None => LifecycleTransition {
+            state: state.clone(),
+            effects: Vec::new(),
+        },
+    }
+}
+
+pub trait LifecycleEffects {
+    type Error;
+
+    fn persist_lifecycle(
+        &mut self,
+        checkout: CheckoutKey,
+        lifecycle: &CheckoutLifecycle,
+    ) -> Result<(), Self::Error>;
+    fn apply_lifecycle_effect(&mut self, effect: &LifecycleTraceEntry) -> Result<(), Self::Error>;
+}
+
+pub struct LifecycleEngine<E> {
+    effects: E,
+    trace: LifecycleTrace,
+}
+
+impl<E: LifecycleEffects> LifecycleEngine<E> {
+    pub fn new(effects: E) -> Self {
+        Self {
+            effects,
+            trace: Vec::new(),
+        }
+    }
+
+    pub fn drive(
+        &mut self,
+        checkout: &mut SavedCheckout,
+        event: LifecycleEvent,
+    ) -> Result<LifecycleTransition, E::Error> {
+        let transition = reduce_lifecycle(checkout.lifecycle(), &event);
+        if transition.effects.is_empty() {
+            return Ok(transition);
+        }
+        self.effects
+            .persist_lifecycle(checkout.key, &transition.state)?;
+        for effect in &transition.effects {
+            self.effects.apply_lifecycle_effect(effect)?;
+        }
+        checkout.set_lifecycle(transition.state.clone());
+        self.trace.extend(transition.effects.iter().cloned());
+        Ok(transition)
+    }
+
+    pub fn trace(&self) -> &[LifecycleTraceEntry] {
+        &self.trace
+    }
+
+    pub fn into_effects(self) -> E {
+        self.effects
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalLifecycleVector {
+    Activate,
+    Launch,
+    Close,
+    ProtectedRefusal,
+}
+
+pub fn canonical_lifecycle_contract_vectors() -> &'static [CanonicalLifecycleVector] {
+    &[
+        CanonicalLifecycleVector::Activate,
+        CanonicalLifecycleVector::Launch,
+        CanonicalLifecycleVector::Close,
+        CanonicalLifecycleVector::ProtectedRefusal,
+    ]
+}
+
+pub fn normalize_lifecycle_trace(trace: &[LifecycleTraceEntry]) -> LifecycleTrace {
+    trace.to_vec()
+}
 
 /// A literal branch activation rooted in one durable repository identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -895,6 +1036,7 @@ pub fn record_pending_activation(
         observed_path: PersistedPath::from_path(&prepared.request.managed_path),
         observed_branch: Some(expected_ref),
         first_seen_order: prepared.first_seen_order,
+        lifecycle: CheckoutLifecycle::Activating,
         active_intent: false,
         session: RetainedSessionState {
             name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1092,6 +1234,16 @@ pub fn reconcile_activation_recovery(
                         state.checkouts[existing].key.get()
                     )));
                 }
+                if let CheckoutHealth::Unavailable(cause) = &state.checkouts[existing].health {
+                    let detail = format!(
+                        "occupied checkout {} has unresolved recovery: {cause:?}",
+                        state.checkouts[existing].key.get()
+                    );
+                    return Ok(ActivationRecoveryResolution::Blocked {
+                        checkout: checkout_key,
+                        detail,
+                    });
+                }
                 let checkout = &mut state.checkouts[existing];
                 checkout.active_intent = true;
                 checkout.health = CheckoutHealth::Available;
@@ -1236,6 +1388,22 @@ fn execute_activation_with_post_git_hook(
                 observed_path: PersistedPath::from_path(&prepared.request.managed_path),
                 observed_branch: Some(full_ref),
                 first_seen_order: prepared.first_seen_order,
+                lifecycle: CheckoutLifecycle::Protected(match &error {
+                    BranchActivationError::PostAddCompensationFailed {
+                        branch,
+                        created_branch,
+                        verification,
+                        compensation,
+                        ..
+                    } => UnavailableCause::ActivationRecovery {
+                        branch: branch.clone(),
+                        created_branch: Some(*created_branch),
+                        preexisting_branch_owner: None,
+                        verification: verification.to_string(),
+                        compensation: compensation.clone(),
+                    },
+                    _ => unreachable!(),
+                }),
                 active_intent: false,
                 session: RetainedSessionState {
                     name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1323,6 +1491,12 @@ fn execute_activation_with_post_git_hook(
                     checkout.key.get()
                 )));
             }
+            if let CheckoutHealth::Unavailable(cause) = &checkout.health {
+                return Err(LifecycleError::Topology(format!(
+                    "occupied checkout {} has unresolved recovery: {cause:?}",
+                    checkout.key.get()
+                )));
+            }
             checkout.active_intent = true;
             checkout.health = CheckoutHealth::Available;
             checkout.session.cwd = PersistedPath::from_path(&record.path);
@@ -1350,6 +1524,7 @@ fn execute_activation_with_post_git_hook(
                 observed_path: PersistedPath::from_path(&record.path),
                 observed_branch: Some(full_ref),
                 first_seen_order: prepared.first_seen_order,
+                lifecycle: CheckoutLifecycle::Active,
                 active_intent: true,
                 session: RetainedSessionState {
                     name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1403,6 +1578,13 @@ fn execute_activation_with_post_git_hook(
                     observed_path: PersistedPath::from_path(&added_path),
                     observed_branch: Some(format!("refs/heads/{activation_branch}")),
                     first_seen_order: prepared.first_seen_order,
+                    lifecycle: CheckoutLifecycle::Protected(UnavailableCause::ActivationRecovery {
+                        branch: activation_branch.clone(),
+                        created_branch: Some(matches!(disposition, ActivationDisposition::Created)),
+                        preexisting_branch_owner: None,
+                        verification: error.to_string(),
+                        compensation: compensation.to_string(),
+                    }),
                     active_intent: false,
                     session: RetainedSessionState {
                         name: activation_branch.clone(),
@@ -1574,8 +1756,8 @@ mod tests {
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
     use crate::repository::{
-        CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryKey,
-        RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+        CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
+        RepositoryKey, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1674,6 +1856,7 @@ mod tests {
             observed_path: path("/repo-feature"),
             observed_branch: Some("refs/heads/feature/close".into()),
             first_seen_order: checkout_order,
+            lifecycle: CheckoutLifecycle::Active,
             active_intent: true,
             session: RetainedSessionState {
                 name: "old name".into(),
