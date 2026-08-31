@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use baude_core::lifecycle::{lifecycle_capability, LifecycleCapability};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutRole, RepositoryHealth, RepositoryKey, RepositoryState,
 };
@@ -37,6 +38,80 @@ pub enum LocalStatus {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionKind {
+    Repository,
+    Main,
+    Managed,
+    External,
+    Unavailable,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionSelection {
+    Repository {
+        available: bool,
+    },
+    Checkout {
+        role: CheckoutRole,
+        managed_by_baude: bool,
+        available: bool,
+    },
+    #[allow(dead_code)] // App remote dispatch consumes this in Task 07-02-02.
+    Remote,
+}
+
+/// Presentation-ready actions derived only from durable selection facts,
+/// optional runtime association, and explicit core lifecycle authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionView {
+    pub kind: ActionKind,
+    pub has_runtime: bool,
+    pub capability: Option<LifecycleCapability>,
+    pub can_activate_branch: bool,
+    pub can_close: bool,
+    pub can_remove: bool,
+}
+
+pub fn action_view(
+    selection: ActionSelection,
+    has_runtime: bool,
+    capability: Option<LifecycleCapability>,
+) -> ActionView {
+    let (kind, can_activate_branch, can_close, can_remove) = match selection {
+        ActionSelection::Repository { available: true } => {
+            (ActionKind::Repository, true, false, false)
+        }
+        ActionSelection::Repository { available: false }
+        | ActionSelection::Checkout {
+            available: false, ..
+        } => (ActionKind::Unavailable, false, false, false),
+        ActionSelection::Checkout {
+            role: CheckoutRole::Main,
+            available: true,
+            ..
+        } => (ActionKind::Main, true, has_runtime, false),
+        ActionSelection::Checkout {
+            managed_by_baude: true,
+            available: true,
+            ..
+        } => (ActionKind::Managed, true, has_runtime, true),
+        ActionSelection::Checkout {
+            available: true, ..
+        } => (ActionKind::External, true, has_runtime, false),
+        ActionSelection::Remote => (ActionKind::Remote, false, false, false),
+    };
+    ActionView {
+        kind,
+        has_runtime,
+        capability,
+        can_activate_branch,
+        can_close,
+        can_remove,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalRepositoryRow {
     pub key: RepositoryKey,
@@ -46,6 +121,7 @@ pub struct LocalRepositoryRow {
     pub health: RepositoryHealth,
     pub child_count: usize,
     pub waiting_count: usize,
+    pub actions: ActionView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +137,7 @@ pub struct LocalCheckoutRow {
     pub waiting_for_ms: u64,
     pub archived: bool,
     pub health: CheckoutHealth,
+    pub actions: ActionView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,6 +352,17 @@ pub fn project_local(
             .count();
         let main_path = repository.observed_main_worktree.to_path_buf();
         let name = basename(&main_path);
+        let default_capability = children
+            .iter()
+            .copied()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .or_else(|| {
+                children
+                    .iter()
+                    .copied()
+                    .find(|checkout| checkout.role == CheckoutRole::Main)
+            })
+            .and_then(|checkout| lifecycle_capability(checkout.lifecycle()));
         result.push(LocalRow::Repository(LocalRepositoryRow {
             key: repository.key,
             display_name: labels
@@ -286,6 +374,13 @@ pub fn project_local(
             health: repository.health.clone(),
             child_count: children.len(),
             waiting_count,
+            actions: action_view(
+                ActionSelection::Repository {
+                    available: matches!(repository.health, RepositoryHealth::Available),
+                },
+                false,
+                default_capability,
+            ),
         }));
         for checkout in children {
             let decoration = decorations.get(&checkout.key).copied();
@@ -305,6 +400,8 @@ pub fn project_local(
                     None => LocalStatus::Closed,
                 }
             };
+            let capability = lifecycle_capability(checkout.lifecycle());
+            let has_runtime = decoration.and_then(|value| value.runtime_id).is_some();
             result.push(LocalRow::Checkout(LocalCheckoutRow {
                 key: checkout.key,
                 repository_key: checkout.repository_key,
@@ -317,6 +414,15 @@ pub fn project_local(
                 waiting_for_ms: decoration.map(|value| value.waiting_for_ms).unwrap_or(0),
                 archived,
                 health: checkout.health().clone(),
+                actions: action_view(
+                    ActionSelection::Checkout {
+                        role: checkout.role,
+                        managed_by_baude: checkout.managed_by_baude,
+                        available: matches!(checkout.health(), CheckoutHealth::Available),
+                    },
+                    has_runtime,
+                    capability,
+                ),
             }));
         }
     }
@@ -333,6 +439,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
+    use baude_core::lifecycle::LifecycleCapability;
     use baude_core::repository::{
         CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
         RetainedSessionState, SavedCheckout, SavedRepository,
@@ -340,8 +447,9 @@ mod tests {
     use baude_core::session::Status;
 
     use super::{
-        initial_selection, project_local, reconcile_after_removal, reconcile_selection,
-        CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
+        action_view, initial_selection, project_local, reconcile_after_removal,
+        reconcile_selection, ActionKind, ActionSelection, CheckoutDecoration, LocalRow, LocalRowId,
+        SelectionTarget,
     };
 
     fn path(value: &str) -> PersistedPath {
@@ -496,7 +604,21 @@ mod tests {
                 if child.key == default
                     && child.runtime_id.is_none()
                     && child.role == CheckoutRole::PrimaryDefault
+                    && child.actions.kind == ActionKind::Managed
+                    && child.actions.capability == Some(LifecycleCapability::RetryReopen)
+                    && child.actions.can_remove
         )));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            LocalRow::Repository(parent)
+                if parent.key == project_a
+                    && parent.actions.kind == ActionKind::Repository
+                    && parent.actions.capability == Some(LifecycleCapability::RetryReopen)
+        )));
+        assert_eq!(
+            action_view(ActionSelection::Remote, true, None).kind,
+            ActionKind::Remote
+        );
 
         let duplicate_labels: Vec<_> = rows
             .iter()
@@ -613,6 +735,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+        assert!(project_local(&state, &HashMap::new()).iter().any(|row| {
+            matches!(
+                row,
+                LocalRow::Checkout(child)
+                    if child.key == second
+                        && child.actions.kind == ActionKind::Unavailable
+                        && child.actions.capability.is_none()
+            )
+        }));
     }
 
     #[test]

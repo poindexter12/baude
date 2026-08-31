@@ -377,6 +377,36 @@ pub enum RecoveryStep {
     Launch(CheckoutKey),
 }
 
+/// A manual lifecycle action that an effect adapter can dispatch for one
+/// durable checkout. Absence is authoritative: presentation must neither show
+/// nor accept a retry merely because a runtime is missing or health is yellow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleCapability {
+    RetryReopen,
+    RetryRecovery,
+}
+
+/// Project only manual actions with concrete App/Manager adapter paths. This
+/// value is UI-free and does not mutate or normalize lifecycle state.
+pub fn lifecycle_capability(lifecycle: &CheckoutLifecycle) -> Option<LifecycleCapability> {
+    match lifecycle {
+        CheckoutLifecycle::Inactive => Some(LifecycleCapability::RetryReopen),
+        CheckoutLifecycle::Activating
+        | CheckoutLifecycle::Protected(
+            UnavailableCause::PendingActivation { .. }
+            | UnavailableCause::ActivationRecovery { .. }
+            | UnavailableCause::TeardownPending { .. }
+            | UnavailableCause::StoppedActiveRecovery { .. },
+        ) => Some(LifecycleCapability::RetryRecovery),
+        CheckoutLifecycle::Active
+        | CheckoutLifecycle::Launching(_)
+        | CheckoutLifecycle::Running(_)
+        | CheckoutLifecycle::Stopping(_)
+        | CheckoutLifecycle::RemovalCommitted
+        | CheckoutLifecycle::Protected(_) => None,
+    }
+}
+
 pub fn startup_recovery_program(state: &RepositoryState) -> Vec<RecoveryStep> {
     let mut process = Vec::new();
     let mut removal = Vec::new();
@@ -2127,7 +2157,6 @@ mod tests {
                 verification: "verification failed".into(),
                 compensation: "compensation failed".into(),
             }),
-            CheckoutLifecycle::Stopping(RuntimeGeneration::initial()),
             CheckoutLifecycle::Protected(UnavailableCause::TeardownPending {
                 agent_pid: Some(identity.pid),
                 shell_pid: None,
@@ -2147,6 +2176,7 @@ mod tests {
             CheckoutLifecycle::Active,
             CheckoutLifecycle::Launching(RuntimeGeneration::initial()),
             CheckoutLifecycle::Running(RuntimeGeneration::initial()),
+            CheckoutLifecycle::Stopping(RuntimeGeneration::initial()),
             CheckoutLifecycle::RemovalCommitted,
             CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(
                 "removal committed".into(),
