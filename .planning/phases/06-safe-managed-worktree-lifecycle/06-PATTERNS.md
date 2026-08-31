@@ -1,36 +1,32 @@
-# Phase 6: Safe Managed Worktree Lifecycle - Pattern Map
+# Phase 06: Shared Lifecycle Core Refactor - Pattern Map
 
 **Mapped:** 2026-08-30
-**Files analyzed:** 11 new/modified files
-**Analogs found:** 11 / 11 (the new lifecycle module has a composite local analog)
+**Files analyzed:** 8 tracked source files
+**Analogs found:** 7 / 8 (the effect-driving engine is new and has only composite seams)
+**Corrective target:** 06-07 architecture from `06-RESEARCH.md`
+
+All proposed source paths below were verified with `git ls-files --error-unmatch` on 2026-08-30. Tests remain inline in these tracked files; do not add a parallel lifecycle module or test tree.
 
 ## File Classification
 
-| New/Modified File | Role | Data Flow | Closest Analog | Match Quality |
+| New/Modified File | Role | Data Flow | Closest Current Analog | Match Quality |
 |---|---|---|---|---|
-| `baude-core/src/lifecycle.rs` (new) | service / model | event-driven + transform | `baude/src/app.rs:30-94,739-857` plus `baude-core/src/repository.rs:141-231` | composite role/data-flow match |
-| `baude-core/src/git.rs` | service / utility | request-response + file-I/O + transform | same file, admission APIs at `8-357,421-463,770-943` | exact extension seam |
-| `baude-core/src/repository.rs` | model / store | transform | same file, durable aggregate at `81-127,191-351` | exact extension seam |
-| `baude-core/src/persist.rs` | service | file-I/O + transform | same file, commit-stage API at `89-130,310-384` | exact extension seam |
-| `baude-core/src/lib.rs` | config / module registry | transform | same file | exact |
-| `baude-core/src/backend/mod.rs` | provider | request-response + transform | same file, `SpawnPlan`/`Backend` at `46-105` | exact extension seam |
-| `baude-core/src/backend/claude.rs` | provider | process-spawn plan transform | same file, `spawn_plan` at `33-56` | exact extension seam |
-| `baude-core/src/backend/opencode.rs` | provider | process-spawn plan transform | same file, composition at `90-101,135-153` | exact extension seam |
-| `baude-core/src/pty.rs` | service | streaming + process-I/O | same file, `Pty::spawn` at `31-64` | exact extension seam |
-| `baude/src/app.rs` and `baude/src/ui.rs` | controller / store + component | event-driven + request-response | Phase 5 admission and existing worktree modal in the same files | exact extension seam |
-| `bauded/src/manager.rs` | service / store | request-response + file-I/O + process-I/O | Phase 5 Manager transaction/reconciliation methods in the same file | exact extension seam |
-
-`bauded/src/api.rs` should remain API-compatible in this phase. Its existing create/delete/restart handlers (`api.rs:146-173,251-269`) should continue delegating to Manager; modify it only if typed Manager outcomes require status mapping or tests to preserve that compatibility. Do not add Phase 8 hierarchy or worktree-removal endpoints.
-
-Tests remain inline under `#[cfg(test)]`; there is no separate Rust test tree.
+| `baude-core/src/repository.rs` | model / store | transform | same file: strict durable aggregate and exact `ProcessIdentity` | exact extension seam |
+| `baude-core/src/lifecycle.rs` | service / reducer / protocol | event-driven + request-response + transform | same file's typed plans, refusal checks, recovery, and reservations | composite role-match; no effect driver yet |
+| `baude-core/src/persist.rs` | service / migration | file-I/O + transform | same file's legacy migration, strict loader, and commit-stage save | exact extension seam |
+| `baude-core/src/session.rs` | service | process-I/O + request-response | same file's two-process teardown and exact recorded recovery | exact extension seam |
+| `baude-core/src/pty.rs` | service / process owner | streaming + process-I/O | same file's identity-at-spawn and confirmed stop/wait | exact extension seam; no owner-death guard yet |
+| `baude/src/app.rs` | controller / adapter / live-handle store | event-driven + process-I/O + file-I/O | same file's persistence and runtime-handle effects | role-match; orchestration must be removed |
+| `bauded/src/manager.rs` | service / adapter / live-handle store | request-response + process-I/O + file-I/O | same file's typed persistence boundary and runtime effects | role-match; orchestration must be removed |
+| `bauded/src/api.rs` | route / compatibility adapter | request-response | same file's `MutationError` to HTTP mapping | exact compatibility seam; modify only if serialized outcomes change |
 
 ## Pattern Assignments
 
-### `baude-core/src/lifecycle.rs` (new service/model, event-driven + transform)
+### `baude-core/src/repository.rs` (model/store, transform)
 
-**Composite analog:** pure dispatch and ordered orchestration in `baude/src/app.rs`, typed aggregate behavior in `baude-core/src/repository.rs`, and commit-stage handling in `bauded/src/manager.rs`.
+**Analog:** strict durable types in the same file.
 
-**Imports/type style** (`baude-core/src/repository.rs:3-12`):
+**Imports and durable-type style** (`repository.rs:3-12`):
 
 ```rust
 use std::collections::{HashMap, HashSet};
@@ -42,361 +38,465 @@ use serde::{Deserialize, Serialize};
 pub struct RepositoryKey(u64);
 ```
 
-Keep lifecycle requests, blockers, plans, reservations, and outcomes UI-free. Prefer inspectable enums/newtypes over booleans or formatted errors. The module should own the shared meaning and ordering of create/activate/close/reopen/remove; App and Manager own effects only.
-
-**Pure decision pattern** (`baude/src/app.rs:30-55`):
+**Exact process identity pattern** (`repository.rs:49-59`):
 
 ```rust
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrimaryDispatch {
-    Focus(u64),
-    Restart(u64),
-    Spawn,
-    Idle,
-}
-
-fn primary_dispatch(active_intent: bool, runtime: Option<(u64, bool)>) -> PrimaryDispatch {
-    match runtime {
-        Some((id, false)) => PrimaryDispatch::Focus(id),
-        Some((id, true)) => PrimaryDispatch::Restart(id),
-        None if active_intent => PrimaryDispatch::Spawn,
-        None => PrimaryDispatch::Idle,
-    }
-}
-```
-
-Generalize this to lifecycle plans/outcomes keyed by `RepositoryKey` and `CheckoutKey`. Plans should encode a fixed sequence such as reconcile, validate, save intent, stop, Git mutate, verify, spawn/focus; adapters must not reorder steps.
-
-**Reservation analogs:** `App.runtime_checkouts: HashMap<CheckoutKey, u64>` (`app.rs:343-345`) and the daemon's poison-recovering lock (`manager.rs:69-73`). Use explicit per-repository mutation reservations even though current owners are serialized. Same-checkout concurrent reopen should return/focus the reserved runtime; conflicting same-repository mutation should wait or return a typed `Busy` outcome. Release on every return path (an RAII guard is preferred).
-
-**Ordered-effect test pattern** (`app.rs:2431-2461`):
-
-```rust
-commit_then_spawn(
-    &mut (),
-    |_| { events.borrow_mut().push("save"); Ok::<_, &'static str>(()) },
-    |_| { events.borrow_mut().push("spawn"); Ok::<_, &'static str>(23) },
-).unwrap();
-assert_eq!(*events.borrow(), ["save", "spawn"]);
-```
-
-Add table-driven lifecycle vectors for all transitions and execute the same vectors through App and Manager adapters. Assert identical domain outcome, aggregate delta, planned Git effects, reservation behavior, and no-force invariant.
-
----
-
-### `baude-core/src/git.rs` (service/utility, request-response + file-I/O)
-
-**Analog:** Phase 5's typed byte-safe discovery and verified default-worktree creation in this file.
-
-**Typed subprocess boundary** (`git.rs:29-48,96-115`):
-
-```rust
-pub enum RepositoryDiscoveryError {
-    Canonicalize { path: PathBuf, source: std::io::Error },
-    CommandStart { operation: &'static str, source: std::io::Error },
-    GitCommand { operation: &'static str, status: Option<i32>, stderr: String },
-    MalformedTopology(String),
-    InvalidPathOutput(&'static str),
-    SelectedWorktreeMissing(PathBuf),
-}
-
-let output = Command::new("git")
-    .arg("-C").arg(repo).args(args).output()
-    .map_err(|source| RepositoryDiscoveryError::CommandStart { operation, source })?;
-if !output.status.success() {
-    return Err(RepositoryDiscoveryError::GitCommand { /* status + stderr */ });
-}
-```
-
-Copy argv-only execution, typed command-start/nonzero errors, status inspection, and diagnostic-only lossy stderr. Add an injectable/recording executor for lifecycle commands so malformed output, process failure, and races can be deterministic in tests.
-
-**Inventory parser/fail-closed pattern** (`git.rs:193-272`): parse NUL-delimited machine output, require explicit terminators and known fields, and reject malformed/unknown records. Extend `WorktreeRecord` rather than creating a second weaker inventory parser if lock/prunable reasons or HEAD OIDs are needed.
-
-**Rediscover/postcondition pattern** (`git.rs:916-942`):
-
-```rust
-let fresh = discover_repository(managed_path).map_err(EnsureDefaultWorktreeError::Discovery)?;
-if fresh.common_dir != snapshot.common_dir {
-    return Err(EnsureDefaultWorktreeError::Verification(
-        "repository common directory changed".into(),
-    ));
-}
-if fresh.selected_worktree.path != canonical_managed { /* typed failure */ }
-if fresh.selected_worktree.branch.as_deref() != Some(default.local_ref.as_str()) { /* failure */ }
-```
-
-Apply this after every add/remove. Creation must validate the literal with Git, classify exact `refs/heads/<name>` as new/existing-local/remote-only, reuse an occupied same-repository inventory record, and create a new branch from the freshly verified default ref/OID. Existing local activation must not reset it. Candidate paths combine durable repository/checkout identity with a bounded branch slug and are rejected if either `symlink_metadata` or fresh inventory reports ownership.
-
-**Command form:** retain exact argv and end-of-options conventions from `verify_commit` (`git.rs:589-605`) and `clone_repo` (`1097-1112`). Never use `--force`, `-B`, inferred remote checkout, branch deletion, prune/repair/clean/reset/stash, a shell string, or recursive deletion.
-
-**Unsafe seams to replace, not copy** (`git.rs:999-1023,1115-1124`):
-
-```rust
-if dir.exists() { return Ok(dir); }                 // unsafe reuse
-let new_branch = git(repo, &["worktree", "add", &dir_str, "-b", branch]);
-// ... speculative retry ...
-
-pub fn is_dirty(worktree: &Path) -> bool {
-    git(worktree, &["status", "--porcelain"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)                            // error becomes clean
-}
-```
-
-Replace with `Result<RemovalSafety, InspectionError>`. Parse `status --porcelain=v2 -z --untracked-files=all --ignore-submodules=none --ignored=matching`; classify tracked, untracked, ignored, conflict, submodule, malformed, and unknown records. Run recursive submodule status; any recorded submodule blocks non-force removal. Plain `git worktree remove -- <path>` is the only deletion authority.
-
-**Tests:** extend the existing unique-temp `GitFixture` (`git.rs:1138-1285`). Preserve its configured identity, argv helper, and `Drop` cleanup. Add nested lifecycle modules for branch classification/activation, path collision, removal preflight, remove postconditions, malformed output, injected failures, and forbidden argv. Include the complete real-Git status/submodule/topology matrix from `06-RESEARCH.md:487-509`.
-
----
-
-### `baude-core/src/repository.rs` and `baude-core/src/persist.rs` (durable model + file-I/O)
-
-**Analog:** current strict aggregate and atomic replacement contracts.
-
-**Retained child shape** (`repository.rs:81-117`):
-
-```rust
+/// Durable authority for one PTY-owned process group. A numeric PID alone is
+/// never sufficient because it can be reused after the original child exits.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RetainedSessionState {
-    pub name: String,
-    pub cwd: PersistedPath,
-    pub repo_root: PersistedPath,
-    pub branch: Option<String>,
-    pub is_worktree: bool,
-    pub shell_open: bool,
-    pub archived: bool,
-    pub archived_by_user: bool,
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    pub process_group: i32,
+    pub session: i32,
 }
+```
 
+Copy this derive/strict-serde style for `RuntimeGeneration`, `OwnedRuntime`, `ShellOwnership`, and operation-specific candidate structs. `OwnedRuntime` must always contain an exact agent identity and either `ShellOwnership::Closed` or an exact shell identity.
+
+**Schema seam to replace** (`repository.rs:166-179`):
+
+```rust
 pub struct SavedCheckout {
-    pub key: CheckoutKey,
-    pub repository_key: RepositoryKey,
-    pub role: CheckoutRole,
-    pub managed_by_baude: bool,
-    pub observed_path: PersistedPath,
-    pub observed_branch: Option<String>,
-    pub first_seen_order: u64,
+    // ...
     pub active_intent: bool,
     pub session: RetainedSessionState,
     pub health: CheckoutHealth,
 }
 ```
 
-Add an optional opaque resume/session ID to retained session state with an explicit serde compatibility default. Closing snapshots it with name, branch, shell/archive settings and order unchanged, then flips only `active_intent=false`. Successful worktree removal deletes only the exact child/runtime association; never remove the repository parent or local branch. External occupied worktrees stay `managed_by_baude=false`.
+Do not preserve this independently mutable boolean product. Replace `active_intent + CheckoutHealth` with one adjacently tagged `CheckoutLifecycle`; derive presentation health and desired activity from it. Keep `#[serde(deny_unknown_fields)]` on structs and use an explicit enum tag/content representation. Extend `RepositoryState::validate` (`repository.rs:302-421`) so impossible ownership and candidate combinations fail closed.
 
-Update validation to protect any new invariant without making path/name runtime identity. Reuse monotonic allocation and no-mutation-on-failure (`repository.rs:191-229,544-553`). Add schema round-trip, missing-field compatibility, opaque-ID preservation, retained-close, child-only removal, and parent-preservation tests. Update all fixture struct literals in repository, persistence, App, and Manager tests.
+---
 
-**Commit boundary** (`persist.rs:97-117,343-384`):
+### `baude-core/src/lifecycle.rs` (shared reducer/protocol, event-driven)
+
+**Composite analog:** typed requests/effects in this file, strict refusal in `plan_reopen`, and RAII repository reservations. There is no current analog for an engine that actually drives effects; implement that from the corrective research contract rather than copying App or Manager orchestration.
+
+**UI-free imports and typed contract style** (`lifecycle.rs:1-17`):
 
 ```rust
-pub struct SaveError {
-    replacement_committed: bool,
-    source: anyhow::Error,
+//! Shared, UI-free repository lifecycle contracts.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use crate::backend::SpawnMode;
+use crate::repository::{
+    AllocationError, CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth,
+    RepositoryKey, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+    UnavailableCause, ValidationError,
+};
+```
+
+Keep request/event/effect/acknowledgement/outcome types in core and free of App IDs, UI messages, Axum types, or live `Session` handles.
+
+**Explicit ordered-effect pattern** (`lifecycle.rs:59-73`):
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseEffect {
+    SnapshotRuntime,
+    SaveInactiveIntent,
+    StopRuntime,
 }
 
-pub fn replacement_committed(&self) -> bool {
-    self.replacement_committed
+pub struct ClosePlan {
+    pub checkout: CheckoutKey,
+    pub effects: [CloseEffect; 3],
+    pub outcome: LifecycleOutcome,
+}
+```
+
+Promote this from advisory plans to enforcement: `LifecycleEngine<E: LifecycleEffects>` repeatedly applies one exhaustive reducer transition, invokes only the emitted effect, records its acknowledgement, and re-enters the reducer. App/Manager must not manually reorder the list as they do today.
+
+**Protected-state refusal pattern** (`lifecycle.rs:550-562`):
+
+```rust
+if let CheckoutHealth::Unavailable(
+    cause @ (UnavailableCause::RemovalTombstone(_)
+    | UnavailableCause::TeardownPending { .. }
+    | UnavailableCause::PendingActivation { .. }
+    | UnavailableCause::ActivationRecovery { .. }
+    | UnavailableCause::StoppedActiveRecovery { .. }),
+) = &state.checkouts[checkout_index].health
+{
+    return Err(ReopenBlocked {
+        checkout: request.checkout,
+        cause: cause.clone(),
+    });
+}
+```
+
+Generalize this into the exhaustive legal transition table. Every unlisted `(CheckoutLifecycle, LifecycleEvent)` returns typed `IllegalTransition` with **no persist, Git, spawn, stop, focus, or forget effect**. This closes CR-01 only if occupied `Activate/Reuse` goes through the same reducer; do not retain a public setter that can force `Available`.
+
+**Current CR-01 overwrite seam—not a pattern to copy** (`lifecycle.rs:1081-1127`, also `1314-1332`): current occupied reuse checks path/ref, then assigns `active_intent = true` and `health = Available` on an existing checkout. Replace this branch with reducer admission that permits only `Inactive` or same-checkout `Running`; reject teardown, removal, activation-recovery, rollback, and other protected states unchanged.
+
+**Recovery acknowledgement pattern** (`lifecycle.rs:426-459`):
+
+```rust
+match crate::session::finish_recorded_teardown(/* exact recorded identities */) {
+    Ok(()) => {
+        checkout.active_intent = false;
+        checkout.health = CheckoutHealth::Available;
+        // validate and report Completed
+    }
+    Err(error) => {
+        // retain updated exact identities and per-process stop observations
+        checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { /* ... */ });
+        // validate and report Pending
+    }
+}
+```
+
+Retain the consume-acknowledgement-and-persist-new-evidence shape, but route both branches through the new tagged state reducer. Recovery must not mutate aggregate fields directly outside it.
+
+**RAII serialization pattern** (`lifecycle.rs:1498-1561`):
+
+```rust
+pub fn reserve_reopen(
+    &self,
+    repository: RepositoryKey,
+    checkout: CheckoutKey,
+) -> Result<RepositoryReservation, LifecycleOutcome> {
+    // same-checkout reopen => ReopenPending; other held mutation => Busy
+    // otherwise insert reservation
 }
 
+impl Drop for RepositoryReservation {
+    fn drop(&mut self) {
+        self.held.lock().unwrap_or_else(|error| error.into_inner())
+            .remove(&self.repository);
+    }
+}
+```
+
+Reuse repository serialization and checkout-specific reopen coalescing. The engine owns reservation duration across fresh inspection, candidate persistence, effect, acknowledgement, and final persistence.
+
+**Canonical test-vector style** (`lifecycle.rs:2129-2161`):
+
+```rust
+let vectors = [
+    (ReopenRuntime::Live { id: 7 }, ReopenDispatch::Focus { id: 7 }),
+    (ReopenRuntime::Exited { id: 8 }, ReopenDispatch::Restart { id: 8 }),
+    (ReopenRuntime::Absent, ReopenDispatch::Spawn),
+];
+for (runtime, expected) in vectors {
+    // construct state, drive request, assert state and ordered effect
+}
+```
+
+Extend this into `LifecycleTrace` records of `(state_before, event, persist_stage, effect, acknowledgement, state_after)`. Normalize away surface runtime IDs. Core owns the vector definitions; App and Manager run the same vectors through their real effect adapters.
+
+---
+
+### `baude-core/src/persist.rs` (schema migration, file-I/O + transform)
+
+**Analog:** existing strict load/migrate/save pipeline and atomic commit-stage reporting.
+
+**Strict loader and migration boundary** (`persist.rs:206-251`):
+
+```rust
+let value: serde_json::Value = serde_json::from_slice(&bytes)
+    .map_err(|error| LoadError::Malformed { /* ... */ })?;
+if let Some(version) = value.get("schema_version") {
+    let version = version.as_u64().ok_or_else(/* malformed */)?;
+    if version != u64::from(SCHEMA_VERSION) {
+        return Err(LoadError::UnsupportedVersion { /* ... */ });
+    }
+    let current: StateFile = serde_json::from_value(value)
+        .map_err(|error| LoadError::Malformed { /* ... */ })?;
+    current.state.validate().map_err(/* invalid */)?;
+    return Ok(LoadOutcome::Current(current));
+}
+// checked conversion, validate, atomically save migrated bytes
+```
+
+Raise `SCHEMA_VERSION` to 2 and add private DTOs that exactly mirror schema v1. Dispatch version 1 to a checked `v1 -> v2` conversion, validate v2, atomically save it, then return migrated state. Preserve the separate pre-schema legacy migration. Do not add `#[serde(default)]` to the new lifecycle field.
+
+**Migration idempotence test pattern** (`persist.rs:855-915`):
+
+```rust
+let outcome = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
+let LoadOutcome::Legacy(migrated) = outcome else { panic!("expected migrated legacy state") };
+let first_bytes = std::fs::read(&primary_path).unwrap();
+let second = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
+assert_eq!(second, LoadOutcome::Current(migrated));
+assert_eq!(std::fs::read(&primary_path).unwrap(), first_bytes);
+```
+
+Copy this fixture/idempotence structure for every schema-v1 `UnavailableCause`, both available/active combinations, malformed ownership, both App and daemon state base names, and legacy unsuffixed fallback.
+
+**Commit acknowledgement pattern** (`persist.rs:343-384`):
+
+```rust
+let mut replacement_committed = false;
+// write + flush + file sync
 std::fs::rename(&temporary, &destination)?;
 replacement_committed = true;
-// directory sync follows
+// directory sync
+attempt.map_err(|source| SaveError {
+    replacement_committed,
+    source,
+})
 ```
 
-Before replacement failure permits restoring the in-memory snapshot and keeping the runtime. After replacement failure means memory/effects must follow the replacement while reporting dirty durability. After Git removal, a final save failure cannot be represented as full rollback: retain unavailable recovery context when replacement did not commit, or follow child deletion when it did. Never recreate a removed worktree automatically.
+Expose this boundary through the effect acknowledgement. Pre-replacement failure may restore prior memory state without forgetting handles. Post-replacement failure means memory follows candidate bytes and reports degraded durability.
 
 ---
 
-### `baude-core/src/lib.rs`
+### `baude-core/src/session.rs` (exact two-process service)
 
-**Analog:** flat alphabetical module exports (`lib.rs:8-18`). Add `pub mod lifecycle;` between `hook` and `meta`; retain the crate's UI-free boundary.
+**Analog:** current agent-and-shell teardown plus PID-reuse-safe recovery.
 
----
-
-### `baude-core/src/backend/{mod,claude,opencode}.rs` and `baude-core/src/pty.rs`
-
-**Analog:** existing shared spawn-plan provider and exact command-plan tests.
-
-Replace the boolean resume argument (`backend/mod.rs:74-81`) with a typed mode such as `Fresh | ContinueLatest | ResumeId(String)`. Keep the ID opaque.
-
-**Existing provider seam** (`backend/mod.rs:46-54,74-81`):
+**Attempt and report both processes** (`session.rs:330-379`):
 
 ```rust
-pub struct SpawnPlan {
-    pub cmd: String,
-    pub server_port: Option<u16>,
-}
-
-fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, resume: bool) -> SpawnPlan;
-```
-
-Do not interpolate a persisted resume ID into `cmd`: `Pty::spawn` executes a shell command (`pty.rs:47-59`). Extend `SpawnPlan`/PTY spawning to carry a fixed environment variable or direct argv safely, following the existing `CommandBuilder::env` pattern:
-
-```rust
-let mut cmd = CommandBuilder::new(&shell);
-cmd.args(["-il", "-c", c]);
-cmd.cwd(cwd);
-cmd.env("TERM", "xterm-256color");
-cmd.env("COLORTERM", "truecolor");
-```
-
-Claude maps targeted resume to `--resume` with the opaque value; OpenCode maps it to `--session`. `ContinueLatest` retains current `--continue` behavior and is used only when no ID was ever observed. Preserve Claude's exported event URL/fallback semantics (`claude.rs:33-55`) and OpenCode's pinned port/prompt config (`opencode.rs:90-101,135-153`).
-
-Extend existing exact-string tests (`claude.rs:124-162`, `opencode.rs:301-329`) with fresh/latest/targeted modes, both backends, hostile-looking opaque IDs, and assertions that the ID is carried as data rather than shell syntax.
-
----
-
-### `baude/src/app.rs` and `baude/src/ui.rs` (local adapter and confirmation component)
-
-**Analog:** Phase 5's App aggregate/runtime adapter.
-
-**Core/App ownership pattern** (`app.rs:310-355`): App owns sessions, `RepositoryState`, checkout-to-runtime map, persistence status, focus/modal state, and test effect seams. Add repository reservations and stop/save-stage/spawn hooks here only as adapter/test machinery; shared decisions belong in core.
-
-**Reconcile before dispatch** (`app.rs:739-797`):
-
-```rust
-if !self.reconcile_primary(checkout_key) {
-    self.save_durable()?;
-    return Ok(None);
-}
-let runtime = self.runtime_checkouts.get(&checkout_key).and_then(/* live/exited */);
-match primary_dispatch(checkout.active_intent, runtime) {
-    PrimaryDispatch::Focus(id) => { /* select/focus */ }
-    PrimaryDispatch::Restart(id) => { /* targeted resume */ }
-    PrimaryDispatch::Spawn => {
-        let id = commit_then_spawn(self, |app| app.save_durable(), |app| app.add_session(/*...*/))?;
-        self.runtime_checkouts.insert(checkout_key, id);
+pub fn kill_and_wait(&mut self) -> Result<(), SessionTeardownError> {
+    let claude = self.claude.kill_and_wait().err();
+    let shell = self.shell.as_mut().and_then(|shell| shell.kill_and_wait().err());
+    match (claude, shell) {
+        (None, None) => Ok(()),
+        (claude, shell) => Err(SessionTeardownError {
+            agent_pid: self.claude.pid(),
+            shell_pid: self.shell.as_ref().and_then(Pty::pid),
+            agent_identity: Some(self.claude.process_identity().clone()),
+            shell_identity: self.shell.as_ref().map(|shell| shell.process_identity().clone()),
+            agent_stopped: claude.is_none(),
+            shell_stopped: shell.is_none(),
+            // ...
+        }),
     }
-    PrimaryDispatch::Idle => { /* no process */ }
 }
 ```
 
-Generalize `ensure_primary`/`reconcile_primary` to all retained checkouts and use core lifecycle plans. Runtime ownership remains by `CheckoutKey`, never cwd/name. Reopen: reserve, fresh reconcile, persist active intent, then focus/restart/resume/spawn exactly one runtime. Close: snapshot live metadata including `meta.session_id`, persist inactive intent, then stop/remove runtime; on precommit save failure leave the live runtime and state untouched.
+Factor a runtime snapshot/stop/restore report around this exact two-process shape. A successful `RestoreRuntime` acknowledgement requires the requested agent and shell both live and returns their exact identities; it is never a boolean-only success.
 
-**Current unsafe removal to replace** (`app.rs:1622-1647`): it calls `remove_session` before `is_dirty`, losing the running agent before inspection. New flow is preflight #1 while live, explicit confirmation, stop immediately before preflight #2, plain Git remove, verify, child-only save. If #2/Git fails, compensate by focus/resume/spawn exactly one runtime with active intent/context retained. A blocked first preflight must be byte-for-byte non-mutating.
+**Exact recorded-owner gate** (`session.rs:546-615`):
 
-Keep modal presentation local. The existing component (`ui.rs:1046-1064`) is the analog, but separate close/keep from destructive removal clearly and render typed blockers/actionable degraded results. Do not add Phase 7 hierarchy rendering. Do not route local handlers directly to `git::create_worktree`, `git::is_dirty`, or `git::remove_worktree`.
+```rust
+fn identity_still_matches(expected: &ProcessIdentity, inspect: &mut impl FnMut(/* ... */))
+    -> Result<bool, String>
+{
+    Ok(inspect(expected.pid)?.as_ref() == Some(expected))
+}
 
-**Tests:** extend `repository_admission_tests` (`app.rs:2265-2535`) and its injected persistence/spawn seams. Add close snapshot/order, pre/post-commit saves, absent/live/exited reopen, duplicate reopen, moved/branch-changed block, first/second preflight, stop failure, Git refusal compensation, post-remove degraded persistence, and modal no-mutation cancellation. Use harmless commands only.
+if !identity_still_matches(&identity, &mut inspect)? { return Ok(()); }
+// signal exact process group, reinspect, escalate, and confirm absence
+```
+
+Reuse this immediately-before-signal identity verification. Never signal by PID alone and never treat a replaced PID as the recorded child.
 
 ---
 
-### `bauded/src/manager.rs` (daemon adapter, request-response + file/process-I/O)
+### `baude-core/src/pty.rs` (process owner, streaming/process-I/O)
 
-**Analog:** current reconciliation, transaction, and process owner.
+**Analog:** identity establishment before returning a live PTY and confirmed stop/wait.
 
-**Owner and error boundary** (`manager.rs:38-67,75-99`): retain typed `MutationError`, `RepositoryState`, `runtime_checkouts`, persistence dirty/blocked reporting, and `Arc<Mutex<Manager>>` ownership. Lifecycle domain outcomes should remain inspectable through this boundary rather than being flattened to strings too early.
-
-**Reconciliation pattern** (`manager.rs:399-444`): fresh `git::reconcile_checkout`, then update checkout/repository health and refuse dispatch when facts changed. Generalize this from restart/restore to create/activate/reopen/remove.
-
-**Commit-aware rollback pattern** (`manager.rs:593-607,873-912`):
+**Identity-at-spawn pattern** (`pty.rs:79-114`):
 
 ```rust
-if let Err(error) = self.save_checked() {
-    if !error.replacement_committed() {
-        self.repository_state = state_before;
-    }
-    return Err(MutationError::Persistence(error));
-}
-let id = self.spawn(/* ... */)?;
-self.runtime_checkouts.insert(checkout_key, id);
+let mut child = pair.slave.spawn_command(cmd).context("failed to spawn command in pty")?;
+let identity = child.process_id()
+    .ok_or_else(|| anyhow::anyhow!("PTY child did not expose a process id"))
+    .and_then(|pid| crate::session::inspect_process_identity(pid) /* ... */);
+let identity = match identity {
+    Ok(identity) if identity.process_group == identity.pid as i32
+        && identity.session == identity.pid as i32 => identity,
+    Ok(identity) => { let _ = child.kill(); let _ = child.wait(); /* fail */ }
+    Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+};
 ```
 
-Reuse this distinction, but replace current `remove`: DELETE/close must retain checkout and parent with inactive intent; safe physical worktree removal is a separate lifecycle action and must never prune an unused parent. Manager create must stop calling legacy `git::create_worktree` (`manager.rs:559-565`) and consume the same core classification/allocation/transition as App. Restart/reopen must use the retained targeted resume ID instead of boolean latest-only resume.
+Spawn/restore effects should return `OwnedRuntime` assembled from identities captured here, not from later PID lookups.
 
-**Tests:** extend Manager's inline module and persistence fixtures (`manager.rs:1453-1748`). Keep unique temp roots, `sleep`/`true` stubs, explicit cleanup, and `AtomicFailure::{Rename,DirectorySync}` matrices. Add the same adapter contract vectors as App, reservation/race tests, close retention, managed/external removal authorization, double-preflight compensation, parent/branch preservation, and no duplicate runtime.
+**Confirmed cleanup pattern** (`pty.rs:286-328`):
 
-## Shared Core → App/Manager Data Flow
+```rust
+pub fn kill_and_wait(&mut self) -> Result<()> {
+    if child.try_wait()?.is_some() { return Ok(()); }
+    if let Err(kill_error) = child.kill() {
+        if child.try_wait()?.is_some() { return Ok(()); }
+        return Err(kill_error).context("failed to kill PTY child");
+    }
+    child.wait().context("failed to wait for PTY child")?;
+    Ok(())
+}
+```
+
+Do not use `kill()` or handle drop as lifecycle acknowledgement. Add the abrupt owner-death characterization test here first. No existing code proves that dropping the PTY/master kills the process group; if it does not, add a tested guard or registration handshake in this tracked file.
+
+---
+
+### `baude/src/app.rs` (thin local `LifecycleEffects` adapter)
+
+**Analog:** App's concrete persistence, PTY/session access, and surface focus behavior. Do not copy its transaction sequencing.
+
+**Persistence effect seam** (`app.rs:571-621`): App already reports `SaveError` with the commit stage and writes through `StateFile::new`. Keep that storage configuration and injected atomic-failure seam, but persist the exact engine candidate. Remove lifecycle-time overlay reconstruction from `runtime_checkouts`; the engine's candidate is authoritative.
+
+**Actual shell snapshot pattern** (`app.rs:588-602`):
+
+```rust
+checkout.session = RetainedSessionState {
+    name: session.name.clone(),
+    // ...
+    shell_open: session.shell_open,
+    archived: session.archived,
+    archived_by_user: session.archived_by_user,
+    resume_id: session.meta.session_id.clone()
+        .or_else(|| checkout.session.resume_id.clone()),
+};
+```
+
+Use the same actual shell observation in `snapshot_runtime`, but return a typed snapshot/`OwnedRuntime` acknowledgement to core.
+
+**Two-process restoration pattern** (`app.rs:2877-2910`): App restarts the agent, conditionally opens the shell, verifies both are non-exited, and succeeds only when both requested processes are live. Move that semantic contract behind `LifecycleEffects::spawn_runtime/restore_runtime` and return exact identities.
+
+**CR-03 seam—not to copy** (`app.rs:2911-2920`):
+
+```rust
+if let Some(session) = self.session_mut(id) {
+    let _ = session.kill_and_wait();
+}
+Err(RuntimeRestartFailure { agent_restarted, shell_restarted, /* ... */ })
+```
+
+Never ignore this result, remove the runtime map, or persist identity-free booleans. Before cleanup, the engine must persist `TeardownPending { owned_runtime, successor }`; retain the handle mapping until confirmed stop or a durable successor `OwnedRuntime` supersedes it.
+
+**Current startup order—not to copy** (`app.rs:535-545`): activation recovery runs before teardown recovery, then `active_restore_checkouts` launches from boolean intent. Replace the body with one engine-provided startup recovery program.
+
+**Existing adapter test seam** (`app.rs:3879-3960`): preserve real persistence injection and live PID assertions. Convert these to shared vectors and add open-shell restore failure, cleanup refusal, every commit stage, and protected occupied-reuse cases. Assert normalized engine trace plus final durable state and exact agent/shell ownership.
+
+---
+
+### `bauded/src/manager.rs` (thin daemon `LifecycleEffects` adapter)
+
+**Analog:** typed persistence/error boundary and concrete session container. Do not preserve independently selected transitions.
+
+**Commit-stage storage effect** (`manager.rs:568-598`):
+
+```rust
+let state = StateFile::new(self.state_for_save());
+let saved = persist::save_for_workspace_status(/* ... */, &state);
+match saved {
+    Ok(()) => { self.persistence_dirty = false; self.persistence_error = None; Ok(()) }
+    Err(error) => { self.persistence_dirty = true; self.persistence_error = Some(error.to_string()); Err(error) }
+}
+```
+
+Retain status reporting and test injection, but accept the exact candidate supplied by the engine. `state_for_save` must not overwrite lifecycle candidate fields.
+
+**CR-02 seams—not to copy** (`manager.rs:637-667`, `1473-1552`, `1885-1895`): Manager currently serializes `shell_open: false`, snapshots close with `shell_open: false`, and `restart_with_mode` replaces only `s.claude`. Implement the same typed two-process effect contract as App: snapshot actual `session.shell_open`; restore agent and requested shell; verify both; return exact identities. There must be no Manager-only interpretation of partial restore.
+
+**Current startup order—not to copy** (`manager.rs:357-379`): activation recovery precedes teardown and launch scans `active_intent`. Replace with the same engine startup program App executes.
+
+**Mirrored test seam** (`manager.rs:2927-3059`): preserve isolated state roots, `AtomicFailure`, live PID checks, shell failure injection, and exact retained context. Run the same canonical vectors as App and assert byte-equivalent normalized traces. Add the missing Rename failure with an open shell and assert new agent and shell identities are live.
+
+---
+
+### `bauded/src/api.rs` (route compatibility adapter)
+
+**Analog:** existing typed Manager error mapping.
+
+**Error/status pattern** (`api.rs:104-115`):
+
+```rust
+type ApiError = (StatusCode, String);
+
+fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
+    match error {
+        MutationError::Persistence(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        MutationError::Domain(error) => (fallback, error.to_string()),
+    }
+}
+```
+
+Keep API behavior as a presentation mapping over Manager outcomes. Existing create/delete/restart handlers (`api.rs:154-173,251-269`) should continue delegating. Modify this file only for compatibility assertions or typed status mapping necessitated by changed serialized behavior; do not add Phase 8/9 lifecycle endpoints.
+
+## Shared Core Ownership and Data Flow
 
 ```text
-surface request (App modal/key or existing Manager method)
-  -> resolve durable RepositoryKey / CheckoutKey
-  -> core repository reservation
-  -> fresh Git discovery/reconciliation from repository main/retained path
-  -> core typed decision/plan
-  -> adapter executes fixed effects
-       CREATE/ACTIVATE: classify exact ref -> inventory/path checks -> Git add/reuse
-                        -> postconditions -> save active child -> focus/resume/spawn
-       CLOSE:           snapshot runtime/resume ID -> save inactive intent -> stop runtime
-       REOPEN:          reconcile -> save active intent -> focus/restart/resume/spawn one
-       REMOVE:          preflight #1 -> confirmation -> stop -> preflight #2
-                        -> plain Git remove -> postconditions -> delete child/save
-                        -> compensate runtime on any pre-remove failure
-  -> typed LifecycleOutcome + adapter-specific message/runtime ID
-  -> release reservation on every path
+App request / Manager request / startup
+  -> LifecycleEngine::drive(request)
+  -> reduce(current CheckoutLifecycle, event)
+       illegal -> typed refusal and zero effects
+       legal   -> typed durable candidate + exactly one next effect
+  -> adapter performs effect only
+       Persist(candidate) / InspectGit / MutateGit
+       SnapshotRuntime / SpawnOrRestore / StopOwned / Focus / ForgetConfirmed
+  -> typed acknowledgement (including commit stage and exact process identities)
+  -> reducer consumes acknowledgement
+  -> trace record + next transition/effect, until stable outcome
+  -> adapter-only focus/message/HTTP presentation
 ```
 
-Git facts, durable intent, and runtime effects remain separate authorities. Core decides meaning/order; `git.rs` proves topology/status/ref facts; `RepositoryState` stores intent/context; App/Manager perform PTY/focus/persistence effects.
+Core owns topology decisions, legal transitions, persistence stages, rollback successor selection, exact durable runtime ownership, forget authorization, and startup ordering. App/Manager own storage location, live `Session` lookup, PTY creation, focus/notification, and surface error presentation only.
 
-## Shared Safety Patterns
+## Shared Patterns
 
-### Fail Closed on Unknown State
+### Tagged Lifecycle and Typed Provenance
 
-Every Git start/nonzero/decode/parse/topology/status/submodule error blocks mutation. Never use `.ok()`, `.unwrap_or(false)`, default-clean behavior, stale preflight results, or path existence alone to authorize add/remove.
+Apply to `repository.rs`, `lifecycle.rs`, and `persist.rs`. Use one tagged `CheckoutLifecycle` and operation-specific activation, launch, teardown, removal, committed-removal, and rollback candidates. Never reconstruct an interrupted operation from generic health, booleans, or `runtime_checkouts`.
 
-### Persist Before Runtime Effect
+### Exact Agent/Shell Ownership
 
-Reopen/create persist active intent before spawn. Close persists inactive intent before stop. Removal leaves old active intent/context as recovery state until Git removal and postconditions succeed. Use `SaveError::replacement_committed()` to decide rollback; do not claim Git + JSON are one transaction.
+Apply to `repository.rs`, `lifecycle.rs`, `session.rs`, `pty.rs`, `app.rs`, and `manager.rs`. Persist exact ownership before destructive/replacement effects. Forget a generation only after a confirmed all-stopped acknowledgement or after a durable successor `OwnedRuntime` supersedes it.
 
-### Preserve User Work and Ownership
+### Persistence Error Handling
 
-- Only exact `managed_by_baude=true`, linked, non-main, available checkout records may be physically removed.
-- External occupied worktrees can be registered/focused but remain unmanaged.
-- Tracked, staged, unstaged, deleted, untracked, ignored, conflicted, submodule, locked, prunable, malformed, and indeterminate states block removal.
-- Preserve local branch, repository parent, sibling checkouts, retained metadata, and first-seen order.
-- No force, recursive deletion, branch deletion, automatic prune/repair/unlock/stash/reset/clean, or remote-only branch activation.
+Source: `persist.rs:89-118,310-384`. Apply to every candidate save. Before replacement: disk remains prior state; memory may return to prior state without dropping handles. After replacement: memory follows candidate; report degraded durability. Never pretend JSON and Git are one transaction, and never recreate topology after Git removal.
 
-### Shell/Argument Safety
+### Startup Recovery Order
 
-Git always uses `Command` argv and exact refs/paths with an option terminator where supported. Resume IDs are opaque process data passed through environment/direct argv, never shell-interpolated. Branch slugs are display/path components only; Git validates branch grammar and durable keys provide uniqueness.
+One core-generated order for both owners:
 
-### Race/TOCTOU Safety
+1. strict load and v1-to-v2 migration;
+2. process-bearing `OwnedRuntime`/teardown recovery;
+3. committed or authority-revoked removal recovery;
+4. activation candidate recovery with protected-state refusal;
+5. ordinary topology-unavailable reconciliation;
+6. launch candidates under reservation;
+7. only then admit the App launch directory or serve mutation requests.
 
-Serialize create/activate/reopen/remove per repository, rediscover immediately before mutation, repeat removal preflight after stopping the agent, and let plain non-force Git removal be the final safeguard. Never cache the first preflight across confirmation.
+Run recovery twice in tests to prove idempotence and no duplicate/orphan runtime.
 
-## Test Pattern Map
+### Mirrored Trace Gate
 
-| Concern | Existing test analog | Phase 6 additions |
+Core defines vectors and canonical normalization. App and Manager each execute them through their real effect implementation. Compare ordered trace, final v2 bytes/state, Git facts, runtime generation, and exact agent/shell ownership. Required matrices include every legal row, protected state crossed with every request, all persistence stages, crash after every state/effect acknowledgement, migration fixtures, PID reuse, shell-only/agent-only teardown, owner death, and existing real-Git activation/removal tests.
+
+## Three Review Blockers: Required Pattern Closure
+
+| Blocker | Unsafe Current Source | Required Pattern |
 |---|---|---|
-| Pure lifecycle decisions/order | `app.rs:2417-2461` | table vectors, reservations, idempotence, identical App/Manager outcomes |
-| Real Git facts/mutations | `git.rs:1138-1645` | ref matrix, occupied branch reuse, collision matrix, status/submodule/topology blockers, postconditions |
-| Aggregate/schema | `repository.rs:354-555`; persistence inline tests | resume-ID compatibility, close retention, child-only delete, parent/branch preservation |
-| Commit-stage rollback | `manager.rs:1676-1748`; `persist.rs:265-384` | close/reopen/remove at pre/post replacement and post-Git boundaries |
-| Backend plans | `claude.rs:124-235`; `opencode.rs:301-329` | fresh/latest/targeted ID for both backends; hostile ID cannot become shell syntax |
-| Local adapter | `app.rs:2265-2535` | stop/save/spawn hooks, double preflight, compensation, modal cancellation |
-| Daemon adapter | `manager.rs:1453-1878` | same contract vectors, repeated/concurrent reopen, compatibility create/delete/restart |
+| CR-01 protected state erased by occupied reuse | `lifecycle.rs:1081-1127,1314-1332`; startup `app.rs:535-545`, `manager.rs:357-379` | reducer rejects reuse from every protected state; process recovery precedes activation; no public force-available setter |
+| CR-02 Manager loses open shell | `manager.rs:637-667,1473-1552,1885-1895` | actual two-process snapshot; restore success returns exact identities for both requested processes; same effect semantics as App |
+| CR-03 App forgets failed cleanup ownership | `app.rs:2877-2920,1768-1819` | persist exact `TeardownPending` before cleanup; consume stop acknowledgement; retain mapping on failure; no identity-free rollback booleans |
 
-Focused commands from research:
+## Patterns That Must Not Be Copied
 
-```text
-cargo test -p baude-core git::tests::lifecycle -- --nocapture
-cargo test -p baude-core lifecycle::tests -- --nocapture
-cargo test lifecycle_close
-cargo test lifecycle_reopen
-cargo test lifecycle_remove_clean
-```
-
-Phase gate: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
-
-## Patterns That Must Not Be Copied Unchanged
-
-| Source | Unsafe/obsolete behavior | Replacement |
-|---|---|---|
-| `git.rs:999-1023` | directory reuse + speculative `-b` fallback from caller checkout | exact ref class, default-base OID, inventory/disk checks, explicit add, postconditions |
-| `git.rs:1115-1119` | Git error becomes clean | result-valued fail-closed preflight |
-| `app.rs:1622-1647` | kill/forget before cleanliness check | live preflight, confirm, stop, second preflight, compensate |
-| `app.rs:1723-1748` | direct Git create then direct spawn | shared lifecycle plan and save-before-spawn |
-| `manager.rs:559-565` | daemon direct legacy worktree helper | same core create/activate semantics as App |
-| `manager.rs:873-912` | deletes checkout and now-unused repository on session close | retained inactive child; parent always preserved |
-| backend boolean `resume` | latest-directory conversation only | retained opaque targeted ID, latest fallback only when absent |
+| Current Pattern | Why It Is Obsolete |
+|---|---|
+| App/Manager call core planners then choose save/stop/spawn order themselves | Effect lists are advisory and have already diverged. |
+| `active_intent` scan at startup | It can launch protected recovery states. |
+| assigning `health = Available` during occupied reuse | It destroys teardown/removal/activation/rollback evidence. |
+| generic `state_for_save` runtime overlay | It can overwrite exact lifecycle candidates and shell state. |
+| boolean `agent_restarted` / `shell_restarted` durable recovery | Booleans are not process authority. |
+| ignored `kill_and_wait`, `kill()`, map deletion, or child-handle drop as cleanup | None confirms that the exact process is gone. |
+| separate App and Manager restoration helpers with merely similar intent | CR-02 demonstrates behavioral drift; one effect contract must define success. |
 
 ## No Analog Found
 
-No single existing file implements the full lifecycle transaction or double-preflight compensation. `baude-core/src/lifecycle.rs` must compose the established typed aggregate, Git verification, commit-stage persistence, and checkout-key runtime patterns above; use `06-RESEARCH.md` for the new state-machine details rather than inventing an App-only or Manager-only protocol.
+| File/Concern | Role | Data Flow | Reason / Planner Guidance |
+|---|---|---|---|
+| `baude-core/src/lifecycle.rs` effect-driving engine | protocol/service | event-driven | Current core emits plans while owners drive effects. Use the `LifecycleEngine<E>` design in `06-RESEARCH.md`; do not copy either owner transaction. |
+| `baude-core/src/lifecycle.rs` canonical mirrored trace | test utility | event-driven + transform | Existing table tests are the shape only; normalized cross-owner trace does not exist. |
+| `baude-core/src/pty.rs` abrupt owner-death guard | process safety | process-I/O | Current spawn establishes identity but no test proves child death on owner/handle loss. Characterize first, then implement a guard/handshake if needed. |
 
 ## Metadata
 
-**Analog search scope:** `baude-core/src`, `baude/src`, `bauded/src`, Phase 5 summaries/pattern map, and existing inline tests  
-**Primary analogs:** `baude-core/src/{git,repository,persist,backend,pty,lib}.rs`, `baude/src/{app,ui}.rs`, `bauded/src/{manager,api}.rs`  
+**Analog search scope:** `baude-core/src`, `baude/src`, `bauded/src`, corrective research, and deep review
+**Primary analogs read:** `repository.rs`, `lifecycle.rs`, `persist.rs`, `session.rs`, `pty.rs`, `app.rs`, `manager.rs`, `api.rs`
+**Tracked-path verification:** all 8 paths returned by `git ls-files --error-unmatch`
 **Pattern extraction date:** 2026-08-30
