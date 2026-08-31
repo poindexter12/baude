@@ -67,7 +67,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
   4. A crash or injected failure at any persistence/effect boundary recovers on startup or rolls back to truthful Git, durable-state, agent, and shell ownership without a duplicate or orphaned runtime.
   5. Explicit typed lifecycle candidates and provenance survive restart without a generic runtime overlay, and clean review plus phase verification find no unresolved lifecycle ownership gaps.
 
-**Plans**: 7 plans expected; 6 execution-history plans complete, corrective plan required
+**Plans**: 7/7 plans locally implemented; certification and phase completion pending
 
 Plans:
 
@@ -77,7 +77,7 @@ Plans:
 - [x] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context. (execution history)
 - [x] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime. (execution history)
 - [x] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context. (execution history)
-- [ ] 06-07-PLAN.md — Correct lifecycle ownership into one shared core state machine, close all review findings, and obtain clean review and verification.
+- [x] 06-07-PLAN.md — Correct lifecycle ownership into one shared core state machine. (local implementation complete; certification pending)
 
 ### Phase 7: Local TUI Dogfood Release
 
@@ -104,7 +104,7 @@ Plans:
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
-| 6. Shared Lifecycle Core Refactor | v2.0 | 6/7 | Planning corrective refactor | - |
+| 6. Shared Lifecycle Core Refactor | v2.0 | 7/7 | In Progress | - |
 | 7. Local TUI Dogfood Release | v2.0 | 0/TBD | Not started | - |
 
 ## Backlog

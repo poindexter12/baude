@@ -38,9 +38,9 @@ created: "2026-08-30"
 
 | Task ID | Plan | Wave | Requirements | Threat Refs | Exact Planned Tests | Files | Status |
 |---------|------|------|--------------|-------------|---------------------|-------|--------|
-| 06-07-01 | 07 | 6 | CORE-01, CORE-02, CORE-05 | T-06-01, T-06-04 | `lifecycle::tests::lifecycle_protocol_core_legal_transition_table`; `persist::tests::lifecycle_schema_v2_migrates_protected_states` | `baude-core/src/lifecycle.rs`; `baude-core/src/persist.rs` | ⬜ pending |
-| 06-07-02 | 07 | 6 | CORE-03, CORE-06 | T-06-02, T-06-03, T-06-05 | `session::tests::lifecycle_process_contract_exact_ownership`; `pty::tests::pre_exec_registration_gate_owner_death_and_release`; `lifecycle::tests::lifecycle_startup_recovery_is_idempotent` | `baude-core/src/session.rs`; `baude-core/src/pty.rs`; `baude-core/src/lifecycle.rs` | ⬜ pending |
-| 06-07-03 | 07 | 6 | CORE-01, CORE-03, CORE-04, CORE-06 | T-06-01 through T-06-06 | `app::tests::lifecycle_protocol_contract_app_vectors`; `manager::tests::lifecycle_protocol_contract_manager_vectors`; historical exact tests named in PLAN | `baude-core/src/lifecycle.rs`; `baude/src/app.rs`; `bauded/src/manager.rs` | ⬜ pending |
+| 06-07-01 | 07 | 6 | CORE-01, CORE-02, CORE-05 | T-06-01, T-06-04 | `lifecycle::tests::lifecycle_protocol_core_legal_transition_table`; `persist::tests::lifecycle_schema_v2_migrates_protected_states` | `baude-core/src/lifecycle.rs`; `baude-core/src/persist.rs` | ✅ green locally |
+| 06-07-02 | 07 | 6 | CORE-03, CORE-06 | T-06-02, T-06-03, T-06-05 | `session::tests::lifecycle_process_contract_exact_ownership`; `pty::tests::pre_exec_registration_gate_owner_death_and_release`; `lifecycle::tests::lifecycle_startup_recovery_is_idempotent` | `baude-core/src/session.rs`; `baude-core/src/pty.rs`; `baude-core/src/lifecycle.rs` | ✅ green locally |
+| 06-07-03 | 07 | 6 | CORE-01, CORE-03, CORE-04, CORE-06 | T-06-01 through T-06-06 | `app::tests::lifecycle_protocol_contract_app_vectors`; `manager::tests::lifecycle_protocol_contract_manager_vectors`; historical exact tests named in PLAN | `baude-core/src/lifecycle.rs`; `baude/src/app.rs`; `bauded/src/manager.rs` | ✅ green locally |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -100,11 +100,21 @@ created: "2026-08-30"
 
 ## Wave 6 Test Additions
 
-- [ ] `CanonicalLifecycleVector`, `canonical_lifecycle_contract_vectors()`, `normalize_lifecycle_trace()`, legal-transition tests, and startup recovery tests in `baude-core/src/lifecycle.rs`.
-- [ ] Schema-v1 protected-state fixtures in `baude-core/src/persist.rs`.
-- [ ] Exact agent/shell ownership fixtures in `baude-core/src/session.rs`.
-- [ ] Selected private-stdin pre-exec gate and negative-PGID whole-group extinction fixtures in `baude-core/src/pty.rs`.
-- [ ] Mirrored App/Manager exact-vector tests in `baude/src/app.rs` and `bauded/src/manager.rs`.
+- [x] `CanonicalLifecycleVector`, `canonical_lifecycle_contract_vectors()`, `normalize_lifecycle_trace()`, legal-transition tests, and startup recovery tests in `baude-core/src/lifecycle.rs`.
+- [x] Schema-v1 protected-state fixtures in `baude-core/src/persist.rs`.
+- [x] Exact agent/shell ownership fixtures in `baude-core/src/session.rs`.
+- [x] Selected private-stdin pre-exec gate and negative-PGID whole-group extinction fixtures in `baude-core/src/pty.rs`.
+- [x] Mirrored App/Manager exact-vector tests in `baude/src/app.rs` and `bauded/src/manager.rs`.
+
+## Observed Local Evidence (2026-08-30)
+
+- All exact list/assert/run commands for tasks 06-07-01 through 06-07-03 passed on macOS.
+- Mirrored App and Manager canonical success and injected persistence/effect failure traces passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- `cargo test` passed: 32 App tests, 212 core tests, 78 daemon tests, and 0 doc-test failures.
+- `git diff --exit-code -- Cargo.toml Cargo.lock` passed; no dependency or manifest changes.
+- This is local implementation evidence only. Linux/runtime certification and independent review remain pending.
 
 ---
 
@@ -126,8 +136,8 @@ Do not push, open a PR, publish, or mark Phase 6/CORE requirements complete as p
 - [x] Exactly tasks 06-07-01 through 06-07-03 are mapped, all in wave 6.
 - [x] Every filtered verification lists tests and `rg -x` asserts an exact planned name before Cargo runs with `--exact`.
 - [x] Every runnable PLAN command has an immediately following `<fails_when>`.
-- [ ] Exact test additions implemented and observed green.
-- [ ] Full overnight local gate observed green.
+- [x] Exact test additions implemented and observed green locally.
+- [x] Full overnight local gate observed green.
 - [ ] Linux/runtime certification observed green.
 - [ ] Independent deep review observed clean.
 - [ ] Phase verification observed clean.

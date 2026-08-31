@@ -4,16 +4,17 @@ milestone: v2.0
 milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
-status: planning
-stopped_at: Scope revised; corrective 06-07 planning required after 06-REVIEW.md
-last_updated: "2026-08-31T03:57:53Z"
+status: verification
+stopped_at: Completed local 06-07 implementation; certification and Phase 6 completion pending
+last_updated: "2026-08-31T06:27:33.933Z"
 last_activity: 2026-08-30
-state_head: 2f826db1e391b1288dd9ebe1563abf63244761b6
+last_activity_desc: completed shared lifecycle engine cutover and full local gate; certification pending
+state_head: 7dad443198c72a7a5e4fcc416b3558a36e086039
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 10
-  completed_plans: 9
+  completed_plans: 10
   percent: 33
 ---
 
@@ -29,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
-Plan: corrective 06-07 to plan; 06-01 through 06-06 retained as execution history
-Status: Planning refactor; Phase 6 is not complete until corrective execution, clean review, and clean verification
-Last activity: 2026-08-30 — active scope narrowed after explicit user decision and deep-review blockers
+Plan: 06-07 local implementation complete; 06-01 through 06-06 retained as execution history
+Status: Local implementation green; Phase 6 awaits Linux/runtime certification, independent review, phase verification, and Nyquist approval
+Last activity: 2026-08-30 — completed shared lifecycle engine cutover and full local gate
 
 Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
 
@@ -39,15 +40,15 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 9
+- v2.0 plans completed: 10
 - Prior milestone: 14 plans completed across 4 phases
-- Average duration: 13 min
-- Total execution time: 114 min
+- Average duration: 18 min
+- Total execution time: 183 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
-| 6. Shared Lifecycle Core Refactor | 6/7 expected | 76 min execution history | 13 min |
+| 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
 | 7. Local TUI Dogfood Release | 0/TBD | - | - |
 **Per-Plan Metrics:**
 
@@ -62,6 +63,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 06 P04 | 13min | 2 tasks | 6 files |
 | Phase 06 P05 | 11min | 3 tasks | 7 files |
 | Phase 06 P06 | 16min | 3 tasks | 5 files |
+| Phase 06 P07 | 69m | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -102,17 +104,19 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 6]: The first safe-removal preflight supplies target-naming confirmation data but its verified Git token is discarded; confirmation always obtains a new token after runtime stop.
 - [Phase 6]: Failures before plain Git removal restore one runtime when one was active, while postcondition or persistence failures after Git commitment never recreate topology.
 - [Phase 6]: A pre-replacement final-save failure keeps an unavailable recovery child in memory while old durable context remains on disk; a committed replacement keeps child deletion in memory.
+- [Phase 06]: LifecycleCandidate is opaque and only LifecycleEngine selects checkout lifecycle and owned-runtime candidates.
+- [Phase 06]: Pre-replacement persistence failure preserves the existing runtime; committed replacement continues the authorized effect and records dirty durability.
+- [Phase 06]: Tracked App and Manager restarts use registered lifecycle launch events before PTY release.
 
 ### Pending Todos
 
-- Plan corrective 06-07 around the shared-core lifecycle state machine and mirrored App/Manager effect contract.
+- Run Linux/runtime certification, independent deep lifecycle review, phase verification, and Nyquist validation for Phase 6.
 
 ### Blockers/Concerns
 
-- Phase 6 review CR-01: occupied reuse can overwrite protected teardown/tombstone recovery state.
-- Phase 6 review CR-02: Manager close rollback can lose an open shell, violating App/Manager parity.
-- Phase 6 review CR-03: App failed-rollback cleanup can forget exact process ownership and orphan a restarted runtime.
-- Phase 6 completion requires corrective 06-07 plus clean code review and phase verification; passing fmt/clippy/tests alone is insufficient.
+- Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
+- Linux synchronized gate/release and descendant process-group extinction remain uncertified.
+- CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
 
 ## Deferred Items
 
@@ -129,6 +133,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-30T21:37:39.969Z
-Stopped at: Revised active v2.0 scope; ready to plan corrective 06-07
+Last session: 2026-08-31T06:27:33.826Z
+Stopped at: Completed local 06-07 implementation; certification and Phase 6 completion pending
 Resume file: None
