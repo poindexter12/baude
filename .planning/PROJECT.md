@@ -14,16 +14,17 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current Milestone: v2.0 Repository Worktree Management
+## Current Milestone: v2.0 Local TUI Dogfood Release
 
-**Goal:** Make repositories persistent, navigable UI parents so the active backend can work on the default branch immediately and create isolated worktrees for parallel work.
+**Goal:** Make the local TUI safe and complete enough to dogfood repository-centered worktree sessions, with one shared lifecycle authority and release readiness for `v2.0.0-beta`.
 
 **Target features:**
-- Opening or cloning a repository creates a persistent repository parent and launches its default-branch session using the active workspace backend
-- Worktree sessions appear beneath their repository parent and can be created from named branches
-- Managed worktrees can be closed or safely removed, with removal blocked while uncommitted changes exist
-- Repository and worktree actions use context-aware shortcuts
-- Repository hierarchy and worktree metadata persist across restart
+- `baude-core` owns one enforceable lifecycle protocol/state machine for Git topology, persistence commit stages, exact agent and shell process ownership, protected recovery transitions, startup recovery, and rollback
+- The TUI App and daemon Manager are thin effect adapters over the shared lifecycle contract and prove equivalent behavior with mirrored contract tests
+- The local TUI shows persistent repository parents and default-session/worktree children in stable order with context-aware actions
+- Local users can create or activate eligible branch worktrees, close and reopen them, and safely remove only clean managed worktrees
+- CI, package metadata, and release documentation are ready for a `v2.0.0-beta` build without publishing or pushing a release
+- Dormant branch rows/deletion and daemon/remote/PWA hierarchy parity are deferred beyond this milestone
 
 ## Requirements
 
@@ -54,11 +55,11 @@ and act on it — whether you're at the terminal or on your phone.
 
 <!-- Current milestone scope. -->
 
-- [ ] Repositories are persistent parent entries with their default branch opened automatically in the active backend
-- [ ] Worktrees are created and displayed beneath their repository for parallel work
-- [ ] Managed worktrees can be closed or removed safely without discarding dirty changes
-- [ ] Open, clone, session, and worktree shortcuts behave according to repository context
-- [ ] Repository/worktree hierarchy survives restart
+- [ ] One shared core lifecycle state machine controls Git, durable commit stages, exact process ownership, recovery, and rollback across App and Manager
+- [ ] Repositories are persistent local-TUI parents with their default branch opened automatically in the active backend
+- [ ] Eligible local branch worktrees can be created or activated, displayed, closed, reopened, and safely removed without discarding dirty changes
+- [ ] Local repository and worktree rows retain stable ordering and expose context-aware actions without regressing applicable session behavior
+- [ ] The codebase, package metadata, and release documentation pass the dogfood gate for target `v2.0.0-beta` without publishing it
 
 ### Out of Scope
 
@@ -68,6 +69,8 @@ and act on it — whether you're at the terminal or on your phone.
 - Native Claude remote (claude.ai/code, `--remote-control`) as the backend — baude owns its own stack
 - Supporting coding agents other than Claude Code and OpenCode — backend support is intentionally explicit
 - Remote vt100 rendering as the primary remote UX — the message/chat model is the core; raw PTY is an escape hatch
+- Dormant local branch rows, dormant-branch activation UI, and safe branch deletion — deferred to a future milestone
+- Daemon-backed remote TUI and PWA repository hierarchy/action parity — deferred to a future milestone; existing flat APIs remain non-destructive compatibility projections
 
 ## Context
 
@@ -77,6 +80,8 @@ and act on it — whether you're at the terminal or on your phone.
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
 - The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
 - Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
+- Phase 5 repository admission is complete. Phase 6 plans 06-01 through 06-06 are retained as execution history, but deep review found lifecycle ownership gaps that require a shared-core corrective refactor before local TUI dogfooding.
+- The active v2.0 release surface is local TUI only. Remote/PWA hierarchy and dormant branch rows are future scope; `v2.0.0-beta` is a readiness target, not authorization to publish or push a release.
 
 ## Constraints
 
@@ -95,6 +100,7 @@ and act on it — whether you're at the terminal or on your phone.
 | Local hook transport via per-session event files; HTTP only in the daemon | Matches existing `meta.rs`/bridge file-tail patterns; avoids a new bind for the TUI | ✓ Good — one event model serves file-tail + daemon POST (v0.7) |
 | Permission-prompt mode is opt-in; `skip` stays default | Unattended overnight runs must not block on phone approval | ✓ Good — fail-safe default-stays-skip + deny-on-timeout, security-reviewed (v0.7) |
 | `--permission-prompt-tool` requires a stdio MCP server (not a plain command) | Pinned by v0.7 research; baude hand-rolls a 3-method JSON-RPC server in both binaries, no new deps | ⚠️ Revisit — wire contract is MEDIUM-confidence (claude-code #1175); confirm against live claude 2.1.178 before public ship |
+| Narrow v2.0 to shared lifecycle ownership plus a local-TUI dogfood release | Deep Phase 6 review exposed duplicated App/Manager ownership and unsafe recovery transitions; remote/PWA and dormant-branch breadth would compound that risk | Active — preserve Phase 5, correct Phase 6 through a new plan, then gate `v2.0.0-beta` readiness in Phase 7 without publishing |
 
 ## Evolution
 
@@ -114,4 +120,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-30 after starting v2.0 Repository Worktree Management*
+*Last updated: 2026-08-30 after narrowing v2.0 to shared lifecycle refactoring and a local-TUI dogfood release*

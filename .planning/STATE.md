@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.0
-milestone_name: Repository Worktree Management (Planned)
+milestone_name: Local TUI Dogfood Release
 current_phase: 6
-current_phase_name: safe managed worktree lifecycle
-status: verifying
-stopped_at: Completed 06-06-PLAN.md
-last_updated: "2026-08-30T21:37:40.071Z"
+current_phase_name: shared lifecycle core refactor
+status: planning
+stopped_at: Scope revised; corrective 06-07 planning required after 06-REVIEW.md
+last_updated: "2026-08-31T03:57:53Z"
 last_activity: 2026-08-30
 state_head: 2f826db1e391b1288dd9ebe1563abf63244761b6
 progress:
-  total_phases: 5
+  total_phases: 3
   completed_phases: 1
-  total_plans: 9
+  total_plans: 10
   completed_plans: 9
-  percent: 100
+  percent: 33
 ---
 
 # Project State
@@ -24,16 +24,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 6 — Safe Managed Worktree Lifecycle
+**Current focus:** Phase 6 — Shared Lifecycle Core Refactor
 
 ## Current Position
 
-Phase: 6 of 9 (safe managed worktree lifecycle)
-Plan: 6 of 6
-Status: Phase complete — ready for verification
-Last activity: 2026-08-30
+Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
+Plan: corrective 06-07 to plan; 06-01 through 06-06 retained as execution history
+Status: Planning refactor; Phase 6 is not complete until corrective execution, clean review, and clean verification
+Last activity: 2026-08-30 — active scope narrowed after explicit user decision and deep-review blockers
 
-Progress: [██████████] 100%
+Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
 
 ## Performance Metrics
 
@@ -47,10 +47,8 @@ Progress: [██████████] 100%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
-| 6. Safe Managed Worktree Lifecycle | 6/6 | 76 min | 13 min |
-| 7. Local Repository Hierarchy & Branch Control | 0/TBD | - | - |
-| 8. Daemon & Remote TUI Parity | 0/TBD | - | - |
-| 9. PWA Hierarchy & Cross-Surface Completion | 0/TBD | - | - |
+| 6. Shared Lifecycle Core Refactor | 6/7 expected | 76 min execution history | 13 min |
+| 7. Local TUI Dogfood Release | 0/TBD | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -75,7 +73,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - v2.0: If the main checkout is not on the resolved default, preserve and show it; create or reuse a separate managed default-branch worktree.
 - v2.0: Opening never silently switches branches, fetches, or guesses a default branch.
 - v2.0: Worktree removal and dormant-branch deletion fail closed on unsafe or indeterminate Git state.
-- v2.0: Full repository hierarchy and applicable actions ship in local TUI, remote TUI, and PWA.
+- v2.0 (superseded scope): Full repository hierarchy and applicable actions were originally planned for local TUI, remote TUI, and PWA.
+- v2.0 scope revision: Ship one shared lifecycle authority plus a local-TUI dogfood slice; defer dormant branch rows/deletion and remote/PWA hierarchy, and target `v2.0.0-beta` readiness without publishing.
 - [Phase 05]: Repository identity uses the canonical common directory plus Git's main-first worktree inventory; show-toplevel only selects an inventory member.
 - [Phase 05]: Default resolution prefers the main branch upstream remote, then origin, and requires exact commit-verified local remote HEAD targets.
 - [Phase 05]: Managed default creation verifies full refs, uses exact branch semantics, and rediscovery proves common directory, path, and branch.
@@ -106,13 +105,14 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 ### Pending Todos
 
-None yet.
+- Plan corrective 06-07 around the shared-core lifecycle state machine and mirrored App/Manager effect contract.
 
 ### Blockers/Concerns
 
-- Phase 5 must preserve malformed and legacy state while migrating both Claude Code and OpenCode workspace data idempotently.
-- Phase 6 must treat dirty-check errors, submodule uncertainty, locking, and topology races as removal blockers before changing session or persisted state.
-- Phases 8-9 must keep daemon IDs authoritative and prevent client-local paths or compatibility APIs from weakening lifecycle safety.
+- Phase 6 review CR-01: occupied reuse can overwrite protected teardown/tombstone recovery state.
+- Phase 6 review CR-02: Manager close rollback can lose an open shell, violating App/Manager parity.
+- Phase 6 review CR-03: App failed-rollback cleanup can forget exact process ownership and orphan a restarted runtime.
+- Phase 6 completion requires corrective 06-07 plus clean code review and phase verification; passing fmt/clippy/tests alone is insufficient.
 
 ## Deferred Items
 
@@ -130,5 +130,5 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 ## Session Continuity
 
 Last session: 2026-08-30T21:37:39.969Z
-Stopped at: Completed 06-06-PLAN.md
+Stopped at: Revised active v2.0 scope; ready to plan corrective 06-07
 Resume file: None

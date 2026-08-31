@@ -3,11 +3,11 @@
 ## Milestones
 
 - ✅ **v0.7 Native Claude Integration** — Phases 1-4 (shipped 2026-06-16, code-complete; human UATs deferred)
-- 📋 **v2.0 Repository Worktree Management** — Phases 5-9 (planned)
+- 🚧 **v2.0 Local TUI Dogfood Release** — Phases 5-7 (in progress)
 
 ## Overview
 
-v2.0 replaces the flat session list with durable repository parents and Git-reconciled checkout, worktree, and dormant-branch children. The milestone first establishes non-destructive repository admission and persistence, then adds a fail-closed managed-worktree lifecycle, and finally delivers the complete hierarchy and action contract through the local TUI, daemon-backed remote TUI, and phone PWA.
+v2.0 delivers a release-ready local-TUI dogfood slice on top of durable repository admission. After preserving the completed admission foundation, it centralizes all lifecycle ownership and recovery in one enforceable `baude-core` protocol, then exposes the safe end-to-end repository and managed-worktree flow in the local TUI for target `v2.0.0-beta`. Dormant branch rows/deletion and remote/PWA hierarchy parity remain future scope.
 
 ## Phases
 
@@ -25,15 +25,13 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 
 </details>
 
-### 📋 v2.0 Repository Worktree Management (Planned)
+### 🚧 v2.0 Local TUI Dogfood Release (In Progress)
 
-**Milestone Goal:** Make repositories persistent, navigable parents so the active backend can work on the resolved default branch immediately and create isolated worktrees for parallel work without silently mutating Git state.
+**Milestone Goal:** Make the local TUI safe and complete enough to dogfood persistent repository and managed-worktree sessions, backed by one shared lifecycle authority and release readiness for `v2.0.0-beta` without publishing it.
 
 - [x] **Phase 5: Durable Repository Admission** - Canonical repositories, the approved default-branch contract, migration, and atomic persistence work per workspace. (completed 2026-08-30)
-- [ ] **Phase 6: Safe Managed Worktree Lifecycle** - Users can create, retain, reopen, and safely remove managed worktrees under Git-verified safeguards.
-- [ ] **Phase 7: Local Repository Hierarchy & Branch Control** - The local TUI presents stable repository children, dormant branches, and context-aware actions.
-- [ ] **Phase 8: Daemon & Remote TUI Parity** - Daemon-owned repositories and the remote TUI use the same identity and lifecycle semantics without breaking flat clients.
-- [ ] **Phase 9: PWA Hierarchy & Cross-Surface Completion** - The PWA exposes the full hierarchy and action set, completing local, remote, and phone parity.
+- [ ] **Phase 6: Shared Lifecycle Core Refactor** - One enforceable core protocol owns lifecycle transitions, persistence stages, exact processes, recovery, and rollback across thin App and Manager adapters.
+- [ ] **Phase 7: Local TUI Dogfood Release** - Local users can complete the stable repository/worktree flow and verify `v2.0.0-beta` release readiness.
 
 ## Phase Details
 
@@ -56,72 +54,43 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 - [x] 05-02-PLAN.md
 - [x] 05-03-PLAN.md
 
-### Phase 6: Safe Managed Worktree Lifecycle
+### Phase 6: Shared Lifecycle Core Refactor
 
-**Goal**: Users can run parallel work in managed branch worktrees and clean them up without baude bypassing Git safeguards or discarding work.
+**Goal**: One enforceable `baude-core` lifecycle ownership protocol/state machine governs Git topology, persistence commit stages, exact agent and shell process ownership, protected recovery transitions, startup recovery, and rollback, while App and Manager remain thin effect adapters with equivalent contracts.
 **Depends on**: Phase 5
-**Requirements**: WORK-01, WORK-02, WORK-03, WORK-04, WORK-05, WORK-06
+**Requirements**: CORE-01, CORE-02, CORE-03, CORE-04, CORE-05, CORE-06
 **Success Criteria** (what must be TRUE):
 
-  1. From repository context, the user can create a valid named branch or activate an eligible existing local branch as a managed worktree with a session in the active workspace backend.
-  2. Invalid refs, managed-path collisions, and branches checked out elsewhere are refused with an actionable explanation and no partial child or session left behind.
-  3. The user can close a worktree session while retaining its checkout, then reopen that worktree or the main checkout later in the active backend.
-  4. A distinct confirmed remove action removes a clean managed worktree while retaining its branch.
-  5. Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks removal before the running session or persisted child changes, leaving the user's work and context intact.
+  1. The same lifecycle request produces the same legal transition, persistence boundary, effect order, and typed refusal through App and Manager, as demonstrated by mirrored contract tests.
+  2. Protected recovery states—including teardown-pending, removal tombstone, activation recovery, and stopped-active recovery—can move only through one explicit legal transition table; reuse or activation cannot overwrite or bypass them.
+  3. Before any destructive or replacement effect, exact agent and shell ownership is durable, and neither adapter can forget a possibly live process until teardown is confirmed or durable successor ownership exists.
+  4. A crash or injected failure at any persistence/effect boundary recovers on startup or rolls back to truthful Git, durable-state, agent, and shell ownership without a duplicate or orphaned runtime.
+  5. Explicit typed lifecycle candidates and provenance survive restart without a generic runtime overlay, and clean review plus phase verification find no unresolved lifecycle ownership gaps.
 
-**Plans**: 6/6 plans executed
+**Plans**: 7 plans expected; 6 execution-history plans complete, corrective plan required
 
 Plans:
 
-- [x] 06-01-PLAN.md — Trace valid named/local branch activation through shared Git, lifecycle, App, and Manager semantics.
-- [x] 06-02-PLAN.md — Fail closed on invalid refs, path collisions, partial failures, and concurrent creation.
-- [x] 06-03-PLAN.md — Prove result-valued dirty, conflict, topology, lock, and submodule removal blockers.
-- [x] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context.
-- [x] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime.
-- [x] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context.
+- [x] 06-01-PLAN.md — Trace valid named/local branch activation through shared Git, lifecycle, App, and Manager semantics. (execution history)
+- [x] 06-02-PLAN.md — Fail closed on invalid refs, path collisions, partial failures, and concurrent creation. (execution history)
+- [x] 06-03-PLAN.md — Prove result-valued dirty, conflict, topology, lock, and submodule removal blockers. (execution history)
+- [x] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context. (execution history)
+- [x] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime. (execution history)
+- [x] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context. (execution history)
+- [ ] 06-07-PLAN.md — Correct lifecycle ownership into one shared core state machine, close all review findings, and obtain clean review and verification.
 
-### Phase 7: Local Repository Hierarchy & Branch Control
+### Phase 7: Local TUI Dogfood Release
 
-**Goal**: Local TUI users can navigate durable repositories, their ordered checkout and branch children, and the exact actions valid for each selected target.
+**Goal**: Local TUI users can dogfood durable repository parents and default sessions, create or activate eligible local branch worktrees, close and reopen them, and safely remove them through stable context-aware UI, with the source tree ready for target `v2.0.0-beta`.
 **Depends on**: Phase 6
-**Requirements**: REPO-05, HIER-02, HIER-03, HIER-04, HIER-05, HIER-06, WORK-07, SURF-01, SURF-02
+**Requirements**: REPO-05, HIER-01, HIER-02, HIER-03, HIER-04, WORK-01, WORK-02, WORK-03, WORK-04, WORK-05, WORK-06, SURF-01, SURF-02, SURF-05, REL-01, REL-02, REL-03
 **Success Criteria** (what must be TRUE):
 
-  1. The local TUI keeps repository parents visible without running sessions and shows the existing main checkout, any separate managed default-branch worktree, other worktrees, and dormant local branches beneath the correct parent.
-  2. Repository parents are ordered by name; checkout and worktree rows remain oldest-first by persisted first-seen timestamp across restart, and status or attention changes never reorder them.
-  3. Selecting a repository, checkout, worktree, or dormant branch exposes only applicable shortcuts, hints, and confirmations, each naming the actual repository, branch, or checkout target.
-  4. The user can activate a dormant branch into a managed worktree and can delete a dormant local branch only when Git verifies it is fully merged and not checked out; unsafe deletion is refused.
-  5. Existing open, clone, shell, editor, resume, archive, attention, and session-cycle behavior remains available wherever it applies within the hierarchy.
-
-**Plans**: TBD
-**UI hint**: yes
-
-### Phase 8: Daemon & Remote TUI Parity
-
-**Goal**: Remote TUI users can manage daemon-hosted repositories with the same identity, active-backend, and fail-closed lifecycle contract as local users while older clients remain safe.
-**Depends on**: Phase 7
-**Requirements**: SURF-03, SURF-05
-**Success Criteria** (what must be TRUE):
-
-  1. From the remote TUI, the user can open or reuse daemon-hosted repositories and perform branch activation, session close or reopen, clean worktree removal, and merged dormant-branch cleanup with the same outcomes and refusals as the local TUI.
-  2. Remote actions use daemon-authoritative repository and child identity, so client-local paths cannot select or mutate a daemon-hosted checkout.
-  3. Safety failures leave the daemon session, checkout, and persisted child intact and explain why the requested action was refused.
-  4. Older flat daemon and session API clients continue to receive a non-destructive compatibility projection during the v2.0 transition.
-
-**Plans**: TBD
-**UI hint**: yes
-
-### Phase 9: PWA Hierarchy & Cross-Surface Completion
-
-**Goal**: Phone users can understand and control the same complete repository hierarchy available in both TUIs without weaker Git safety or lost session behavior.
-**Depends on**: Phase 8
-**Requirements**: HIER-01, SURF-04
-**Success Criteria** (what must be TRUE):
-
-  1. Local TUI, remote TUI, and PWA users can all view repository parents with main-checkout, managed-worktree, and dormant-branch children, including repository-name ordering and persisted oldest-first checkout/worktree ordering.
-  2. From the PWA, the user can perform each applicable open or reopen, create or activate, close, safe-remove, and Git-verified dormant-branch cleanup action.
-  3. PWA actions name the selected target, request confirmation for destructive cleanup, and display the same actionable safety refusals as both TUIs.
-  4. Repository parents and retained children remain visible on the phone without running sessions, while waiting, working, archived, and attention states continue to identify the child needing action without reordering the hierarchy.
+  1. The local TUI keeps repository parents visible without running sessions and shows the main checkout, any separate managed default-branch worktree, and other checkout/worktree children beneath the correct parent.
+  2. Repository parents remain name-ordered and checkout/worktree children remain persisted oldest-first across restart; waiting, working, archive, and attention changes identify the right child without reordering it.
+  3. From repository or eligible child context, the user can create a valid named branch or activate an eligible existing local branch, close and reopen the checkout, and distinctly confirm removal of a clean managed worktree while its branch is retained.
+  4. Context actions name the actual target, invalid or unsafe operations fail without partial state or lost work, applicable existing session actions remain available, and older flat daemon/session APIs remain non-destructive compatibility projections without adding daemon hierarchy.
+  5. An isolated local end-to-end dogfood run passes across restart, and formatting, lint, tests, package/artifact checks, version metadata, and release documentation are ready for `v2.0.0-beta` without publishing or pushing a release.
 
 **Plans**: TBD
 **UI hint**: yes
@@ -135,10 +104,8 @@ Plans:
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
-| 6. Safe Managed Worktree Lifecycle | v2.0 | 6/6 | In Progress|  |
-| 7. Local Repository Hierarchy & Branch Control | v2.0 | 0/TBD | Not started | - |
-| 8. Daemon & Remote TUI Parity | v2.0 | 0/TBD | Not started | - |
-| 9. PWA Hierarchy & Cross-Surface Completion | v2.0 | 0/TBD | Not started | - |
+| 6. Shared Lifecycle Core Refactor | v2.0 | 6/7 | Planning corrective refactor | - |
+| 7. Local TUI Dogfood Release | v2.0 | 0/TBD | Not started | - |
 
 ## Backlog
 
@@ -147,3 +114,4 @@ See `.planning/BACKLOG.md`:
 - **BL-01** — sidebar "idle"/status accuracy (addressed by v0.7 Phase 2; confirm in UAT)
 - **BL-02** — model / permission-mode / planning-mode not shown for every session (Phase 1 follow-up)
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
+- **Future v2.x scope** — dormant branch rows and safe branch deletion (HIER-05, HIER-06, WORK-07), daemon/remote hierarchy parity (SURF-03), and PWA hierarchy/actions (SURF-04)
