@@ -142,7 +142,7 @@ baude-core/src/
 ├── lifecycle.rs    # request/event/effect types, reducer, engine, canonical traces/tests
 ├── persist.rs      # schema v1 DTO -> v2 migration and strict load/save
 ├── session.rs      # exact two-process snapshot/stop/restore reports
-└── pty.rs          # process identity and owner-death/cleanup guarantees
+└── pty.rs          # pre-exec registration gate, process identity, and group cleanup guarantees
 baude/src/app.rs    # thin LifecycleEffects implementation + mirrored vectors
 bauded/src/manager.rs # thin LifecycleEffects implementation + mirrored vectors
 bauded/src/api.rs   # compatibility assertions only where serialized behavior changes
@@ -209,7 +209,7 @@ The current code captures exact identities only after `kill_and_wait` fails. Cor
 
 Spawn must return an `OwnedRuntime` containing both actual identities. The engine must persist `Running(owned)` before publishing/focusing the runtime; if that save fails, it keeps the live handles and drives the same typed teardown path rather than dropping the map. [VERIFIED: `Pty` captures identity before returning at `pty.rs:84-114`; Rust documents that dropping a child handle does not terminate the child at https://doc.rust-lang.org/std/process/struct.Child.html]
 
-For abrupt owner death between process creation and `Running` persistence, `pty.rs` must enforce an owner-death guard for the PTY process group (or an equivalent tested registration handshake) so a `LaunchPending` restart cannot coexist with an unregistered child. This is not optional under CORE-06 because standard child-handle drop does not kill the process. [CITED: https://doc.rust-lang.org/std/process/struct.Child.html; VERIFIED: CORE-06]
+For abrupt owner death between process creation and `Running` persistence, `pty.rs` must spawn a non-login `/bin/sh` gate as the PTY session/process-group leader and keep it blocked on private PTY stdin until the engine durably commits `Running(OwnedRuntime)`. The engine records the exact agent identity and optional shell identity while the gate is paused, stops the paused gate if persistence fails, and sends the private release only after the commit; the adapter may publish/focus only after release. The gate then `exec`s the intended command, preserving PID, PGID, SID, and start identity. This is required under CORE-06 because neither `portable-pty` 0.8.1 nor `std::process::Child` has kill-on-drop, and baude's detached reader retains a cloned master FD. [VERIFIED: completed macOS characterization, 2026-08-30; CITED: https://doc.rust-lang.org/std/process/struct.Child.html]
 
 ### Pattern 5: Explicit Schema v1 -> v2 Migration
 
@@ -288,7 +288,7 @@ Required vectors: [VERIFIED: CORE-01 through CORE-06 and all three review blocke
 | Persistence matrix | Every candidate save at Write, Sync, Rename, DirectorySync; assert disk bytes, memory, trace, and effects. |
 | Startup matrix | Crash/restart after every persisted state and after every effect acknowledgement; run recovery twice to prove idempotence and no duplicate spawn. |
 | Migration | v1 fixture for every `UnavailableCause` and active/available pair; v2 round trip; second load unchanged; malformed ownership rejected. |
-| Process contract | Exact PID reuse refusal, agent-only/shell-only/both teardown, owner-death during launch registration, and no child-handle drop orphan. |
+| Process contract | Exact PID reuse refusal, agent-only/shell-only/both teardown, paused pre-exec gate owner death before release, release-after-commit execution, persistence-failure stop of the paused gate, negative-PGID teardown, and whole-group extinction rather than leader exit alone. |
 | Git contract | Preserve existing Phase 6 real-Git activation/removal matrices unchanged. |
 
 Test code stays in the existing tracked files: canonical reducer/trace vectors in `baude-core/src/lifecycle.rs`, migration vectors in `persist.rs`, process vectors in `session.rs`/`pty.rs`, and mirrored adapter vectors in `app.rs` and `manager.rs`. [VERIFIED: all paths confirmed tracked]
@@ -311,7 +311,7 @@ This phase is a schema refactor/migration, so repository files alone are not the
 |----------|-------------|-----------------|
 | Stored data | Workspace state files `state-<workspace>.json` and `daemon-state-<workspace>.json` contain schema-v1 `RepositoryState`; default workspaces can also have legacy unsuffixed sources. [VERIFIED: `persist.rs:180-251,650-684`; `manager.rs:31-35`] | Add explicit v1->v2 data migration; preserve legacy flat migration; test both owners and idempotence. |
 | Live service config | No lifecycle candidate is stored in daemon UI/API configuration; daemon runtime state is in its named state file and in-process Manager. [VERIFIED: `manager.rs:76-103,285-306`] | Stop daemon before real migration verification; startup migration/recovery owns conversion. |
-| OS-registered state | Live PTY agent and shell process groups can outlive a dropped child handle; no OS service registration is used for individual sessions. [CITED: https://doc.rust-lang.org/std/process/struct.Child.html; VERIFIED: `pty.rs`] | Add owner-death/registration guarantee and abrupt-crash tests; startup reconciles exact recorded identities. |
+| OS-registered state | Live PTY agent and shell process groups can outlive a dropped child handle; baude's detached reader retains a cloned master FD, and no OS service registration is used for individual sessions. [VERIFIED: completed macOS characterization and current `pty.rs:116-159`] | Use the selected private-stdin pre-exec gate, persist exact identities before release, stop a paused gate on failed persistence, and make startup reconcile exact recorded identities. |
 | Secrets/env vars | `BAUDE_RESUME_ID` carries opaque targeted resume data but is not durable lifecycle authority. [VERIFIED: Phase 06-05 summary] | No key rename; retain opaque transport. |
 | Build artifacts | Rust `target/` may contain stale test binaries after the type/schema refactor. [VERIFIED: Cargo workspace behavior observed during test run] | Normal `cargo test` rebuild is sufficient; no package reinstall. |
 
@@ -337,9 +337,9 @@ This phase is a schema refactor/migration, so repository files alone are not the
 **What goes wrong:** even a correct close snapshot is overwritten by `state_for_save` setting `shell_open=false`. [VERIFIED: `manager.rs:637-667`; `06-REVIEW-FIX.md:35-39`]
 **How to avoid:** the engine persists its exact candidate state; generic save code must not overlay runtime fields during a lifecycle transaction.
 
-### Pitfall 6: Dropping a Child Handle as Cleanup
-**What goes wrong:** the process can continue after its handle is dropped. [CITED: https://doc.rust-lang.org/std/process/struct.Child.html]
-**How to avoid:** exact stop/wait acknowledgement or a tested owner-death guard; never remove the map first.
+### Pitfall 6: Dropping Handles or Trusting PTY Hangup as Cleanup
+**What goes wrong:** `portable-pty` 0.8.1/`std::process::Child` has no kill-on-drop; dropping a child or individual PTY handles leaves the process alive, dropping every handle or abruptly exiting the owner kills a default process but a SIGHUP-ignoring process survives, and baude's detached reader keeps a cloned master FD alive. [VERIFIED: completed macOS characterization, 2026-08-30]
+**How to avoid:** keep launch blocked in the selected non-login `/bin/sh` pre-exec gate until exact ownership is durable, and require negative-PGID signal plus whole-group extinction for teardown; never remove the map first or treat leader exit as group extinction.
 
 ## Code Examples
 
@@ -407,12 +407,14 @@ pub enum ShellOwnership {
 
 All implementation claims are grounded in current repository code, planning requirements/review artifacts, or cited official Rust/Serde documentation; no `[ASSUMED]` package or platform claim is used.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Which owner-death mechanism will satisfy the abrupt launch crash case on both supported Unix targets?**
-   - What we know: dropping a child handle does not terminate it, and CORE-06 forbids orphaned runtimes. [CITED: https://doc.rust-lang.org/std/process/struct.Child.html; VERIFIED: CORE-06]
-   - What's unclear: current `portable-pty` master-close behavior has not been proven as a cross-platform kill guarantee in this research session. [VERIFIED: no such test exists in `pty.rs`]
-   - Recommendation: 06-07 must start with an abrupt-owner-death characterization test and implement a guard/registration handshake in existing `pty.rs` if master-close alone is insufficient; do not declare CORE-06 complete on injected `Result` failures alone. [VERIFIED: requirement implication]
+1. **Selected owner-death mechanism:** a non-login `/bin/sh` pre-exec registration gate spawned as the PTY session/process-group leader, blocked on private PTY stdin until durable registration. [VERIFIED: completed macOS characterization, 2026-08-30]
+   - `portable-pty` 0.8.1 and `std::process::Child` provide no kill-on-drop. Dropping the child or individual handles leaves the process alive. Dropping all handles or abruptly exiting the owner kills a default process, but a process that ignores SIGHUP survives; current baude `Pty` also remains alive because its detached reader retains a cloned master FD.
+   - A minimal gate paused before release exits when its owner dies even when the intended command would ignore SIGHUP, and after release executes normally. The gate must remain private to lifecycle registration rather than sharing user PTY input.
+   - The engine persists the exact agent identity and optional shell identity as `Running(OwnedRuntime)` before release. Persistence failure stops the still-paused gate. Only a successful durable commit permits release, followed by adapter publication/focus. Shell `exec` preserves PID, PGID, SID, and process start identity, so the persisted identity continues to name the running agent.
+   - Normal teardown signals the negative PGID and confirms whole-group extinction, not leader exit alone. No new dependency is required.
+   - The synchronized Linux owner-death/release matrix and descendant process-group extinction test remain morning certification work. They are no longer design questions and do not block implementing or locally maturing the selected mechanism tonight; they do block marking CORE-03/CORE-06 or Phase 6 complete.
 
 ## Environment Availability
 
@@ -422,9 +424,9 @@ All implementation claims are grounded in current repository code, planning requ
 | Cargo | workspace tests/lint | ✓ | 1.98.0 | — |
 | Git | real worktree contract tests | ✓ | 2.50.1 Apple Git-155 | — |
 | Context7 CLI | library documentation lookup | ✗ | — | Official Rust/Serde docs fetched directly. |
-| Linux Rust target | Linux process-identity verification | not verified in this session | — | CI/Linux runner required for phase gate. |
+| Linux Rust target | synchronized pre-exec gate and descendant group-extinction certification | not verified in this session | — | Run the normal Linux job in the morning before phase completion. |
 
-**Missing dependencies with no fallback:** Linux runtime verification is required before claiming cross-platform process recovery complete. [VERIFIED: prior review inspected Linux only and reported no Linux target]
+**Pending certification with no local fallback:** the synchronized Linux runtime matrix and descendant process-group extinction check are required before claiming cross-platform process recovery complete. The mechanism is selected and locally implementable; this is validation debt, not unresolved design. [VERIFIED: prior review inspected Linux only and reported no Linux target]
 
 ## Validation Architecture
 
@@ -434,26 +436,26 @@ All implementation claims are grounded in current repository code, planning requ
 |----------|-------|
 | Framework | Rust built-in test harness via Cargo 1.98.0 [VERIFIED: environment and current tests] |
 | Config file | Workspace `Cargo.toml`; inline unit/contract tests in tracked source files [VERIFIED: codebase inspection] |
-| Quick run command | `cargo test lifecycle_protocol_contract -- --nocapture` |
+| Quick run command | List the exact expected test, assert it with `rg -x`, then run it with Cargo `--exact` as specified in 06-07-PLAN.md. |
 | Full suite command | `cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test` |
 
 ### Phase Requirements -> Test Map
 
 | Req ID | Behavior | Test Type | Automated Command | File Exists? |
 |--------|----------|-----------|-------------------|-------------|
-| CORE-01 | Engine is sole transition/effect-order authority | core + mirrored contract | `cargo test lifecycle_protocol_contract -- --nocapture` | ❌ Wave 0 additions inside tracked `lifecycle.rs`, `app.rs`, `manager.rs` |
-| CORE-02 | exhaustive legal/illegal transition table | table-driven unit | `cargo test -p baude-core lifecycle::tests::legal_transition_table -- --nocapture` | ❌ Wave 0 |
-| CORE-03 | exact agent/shell write-ahead ownership and forget gate | process integration | `cargo test -p baude-core lifecycle::tests::process_ownership -- --nocapture` | ❌ Wave 0 |
-| CORE-04 | identical App/Manager traces at every boundary | mirrored integration | `cargo test lifecycle_protocol_contract -- --nocapture` | ❌ Wave 0 |
-| CORE-05 | typed candidate round trip and v1 migration | serialization | `cargo test -p baude-core persist::tests::lifecycle_schema_v2 -- --nocapture` | ❌ Wave 0 |
-| CORE-06 | idempotent startup/rollback and abrupt owner death | crash/recovery integration | `cargo test lifecycle_startup_recovery -- --nocapture` | ❌ Wave 0 |
+| CORE-01 | Engine is sole transition/effect-order authority | core + mirrored contract | exact tests `lifecycle::tests::lifecycle_protocol_core_legal_transition_table`, `app::tests::lifecycle_protocol_contract_app_vectors`, and `manager::tests::lifecycle_protocol_contract_manager_vectors` | ❌ Wave 6 additions inside tracked `lifecycle.rs`, `app.rs`, `manager.rs` |
+| CORE-02 | exhaustive legal/illegal transition table | table-driven unit | exact test `lifecycle::tests::lifecycle_protocol_core_legal_transition_table` | ❌ Wave 6 |
+| CORE-03 | exact agent/shell write-ahead ownership, gate, and forget rule | process integration | exact tests `session::tests::lifecycle_process_contract_exact_ownership` and `pty::tests::pre_exec_registration_gate_owner_death_and_release` | ❌ Wave 6 |
+| CORE-04 | identical App/Manager traces at every boundary | mirrored integration | exact tests `app::tests::lifecycle_protocol_contract_app_vectors` and `manager::tests::lifecycle_protocol_contract_manager_vectors` | ❌ Wave 6 |
+| CORE-05 | typed candidate round trip and v1 migration | serialization | exact test `persist::tests::lifecycle_schema_v2_migrates_protected_states` | ❌ Wave 6 |
+| CORE-06 | idempotent startup/rollback and registered launch | crash/recovery integration | exact test `lifecycle::tests::lifecycle_startup_recovery_is_idempotent` plus the PTY gate test above | ❌ Wave 6 |
 
 ### Sampling Rate
-- **Per task commit:** `cargo test lifecycle_protocol_contract -- --nocapture`
-- **Per wave merge:** `cargo test -p baude-core lifecycle::tests -- --nocapture && cargo test lifecycle_ -- --nocapture`
-- **Phase gate:** full fmt, Clippy, and workspace tests green; then rerun deep code review and phase verification with zero lifecycle blockers.
+- **Per task commit:** Use the exact list/assert/run command pair in the matching 06-07 task; a filtered Cargo command may never stand alone because zero matched tests exits successfully.
+- **Overnight implementation gate:** Full formatting, Clippy, and workspace tests green. This makes the local source executable and mature enough to summarize, but does not certify Phase 6.
+- **Morning certification gates:** Synchronized Linux/runtime matrix including descendant group extinction, independent deep review, phase verification, Nyquist approval, and phase completion. Keep all pending overnight; they do not block implementation or `06-07-SUMMARY.md` creation.
 
-### Wave 0 Gaps
+### Wave 6 Test Additions
 - [ ] Canonical legal-transition and trace fixtures in `baude-core/src/lifecycle.rs`.
 - [ ] Schema-v1 protected-state fixtures in `baude-core/src/persist.rs`.
 - [ ] Agent/shell and abrupt-owner-death fixtures in `baude-core/src/session.rs` and `baude-core/src/pty.rs`.
@@ -481,7 +483,7 @@ All implementation claims are grounded in current repository code, planning requ
 | PID reuse signals an unrelated process | Spoofing / Tampering | PID + start time + process group + session reinspection immediately before signal. [VERIFIED: current `ProcessIdentity`] |
 | Agent or shell orphaned after failed rollback | Repudiation / DoS | Durable `OwnedRuntime`/`TeardownPending`, exact stop acknowledgement, forget gate. [VERIFIED: CR-02/CR-03] |
 | State bytes and memory disagree after rename | Tampering | Interpret `replacement_committed`; never generic rollback after committed replacement. [VERIFIED: `persist.rs`] |
-| Crash after spawn but before registration | DoS / orphaned authority | Tested owner-death guard or registration handshake. [CITED: Rust `Child` docs; VERIFIED: CORE-06] |
+| Crash after spawn but before registration | DoS / orphaned authority | Non-login `/bin/sh` pre-exec gate blocked on private PTY stdin until durable `Running(OwnedRuntime)`, with stop-on-persist-failure and release-before-publish. [VERIFIED: completed macOS characterization; CORE-06] |
 
 ## Sources
 
@@ -505,7 +507,7 @@ All implementation claims are grounded in current repository code, planning requ
 - Standard stack: HIGH — unchanged and verified from manifests/environment.
 - Architecture: HIGH — derived directly from requirements, duplicated production control flow, and concrete review failures.
 - Migration: HIGH — current serialized schema and exact-version loader inspected.
-- Owner-death implementation detail: MEDIUM — necessity is verified, but the current PTY master-close behavior still needs the prescribed characterization test.
+- Owner-death implementation detail: HIGH — portable-pty/handle behavior and the private-stdin pre-exec gate were characterized on macOS; Linux synchronization and descendant group-extinction remain pending certification rather than design selection.
 - Pitfalls: HIGH — each is exhibited by current source or the deep review.
 
 **Research date:** 2026-08-30
