@@ -92,8 +92,16 @@ Plans:
   4. Context actions name the actual target, invalid or unsafe operations fail without partial state or lost work, applicable existing session actions remain available, and older flat daemon/session APIs remain non-destructive compatibility projections without adding daemon hierarchy.
   5. An isolated local end-to-end dogfood run passes across restart, and formatting, lint, tests, package/artifact checks, version metadata, and release documentation are ready for `v2.0.0-beta` without publishing or pushing a release.
 
-**Plans**: TBD
+**Plans**: 5 plans
 **UI hint**: yes
+
+Plans:
+
+- [ ] 07-01-PLAN.md — Trace durable repository/checkout hierarchy and selection through real App data into Ratatui.
+- [ ] 07-02-PLAN.md — Dispatch capability-gated create, close, reopen, and safe-remove lifecycle actions.
+- [ ] 07-03-PLAN.md — Complete exact responsive rows, hints, modals, Unicode width, focus, and preserved local actions.
+- [ ] 07-04-PLAN.md — Prove isolated real-Git restart/dedup dogfood and flat daemon/session compatibility.
+- [ ] 07-05-PLAN.md — Synchronize beta readiness metadata/docs/CI and run the full non-publishing local gate.
 
 ## Progress
 
