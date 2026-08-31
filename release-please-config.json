@@ -7,7 +7,10 @@
       "include-component-in-tag": false,
       "bump-minor-pre-major": false,
       "draft": false,
-      "prerelease": false,
+      "release-as": "2.0.0-beta",
+      "versioning": "prerelease",
+      "prerelease": true,
+      "prerelease-type": "beta",
       "extra-files": [
         { "type": "toml", "path": "baude-core/Cargo.toml", "jsonpath": "$.package.version" },
         { "type": "toml", "path": "baude/Cargo.toml", "jsonpath": "$.package.version" },
