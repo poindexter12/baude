@@ -743,7 +743,105 @@ mod tests {
 
     #[tokio::test]
     async fn flat_session_api_remains_a_non_hierarchical_compatibility_projection() {
-        panic!("flat retained-close API compatibility proof is not implemented");
+        let root = std::env::temp_dir().join(format!(
+            "bauded-flat-api-compatibility-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = initialized_repo(&root, "repo").canonicalize().unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        crate::manager::lock(&state).persist_at_for_test(&root, &workspace, None);
+        let app = super::router(Arc::clone(&state));
+
+        let create = app
+            .clone()
+            .oneshot(post_json(
+                "/sessions",
+                &serde_json::json!({ "repo": repo, "name": "flat-main" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created = body_json(create).await;
+        let id = created["id"].as_u64().unwrap();
+
+        let listed = app.clone().oneshot(get("/sessions")).await.unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = body_json(listed).await;
+        let rows = listed.as_array().expect("flat SessionInfo array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], id);
+        for forbidden in [
+            "repository",
+            "repository_key",
+            "checkout",
+            "checkout_key",
+            "parent",
+            "children",
+            "hierarchy",
+            "worktrees",
+        ] {
+            assert!(rows[0].get(forbidden).is_none(), "unexpected {forbidden}");
+        }
+
+        for request in [
+            get("/repositories"),
+            get(&format!("/sessions/{id}/children")),
+            Request::delete(format!("/sessions/{id}/remove-worktree"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::delete(format!("/worktrees/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(crate::manager::lock(&state).info(id).is_some());
+        }
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await,
+            serde_json::json!([])
+        );
+
+        let retained =
+            baude_core::persist::load_current_at(&root, &workspace.state_file("daemon-state"))
+                .unwrap()
+                .state;
+        assert_eq!(retained.repositories.len(), 1);
+        assert_eq!(retained.checkouts.len(), 1);
+        assert!(!retained.checkouts[0].active_intent());
+        assert_eq!(retained.checkouts[0].observed_path.to_path_buf(), repo);
+        assert!(repo.join("file").is_file());
+        let inventory = baude_core::git::discover_repository(&repo).unwrap();
+        assert_eq!(inventory.worktrees.len(), 1);
+        assert_eq!(inventory.worktrees[0].path, repo);
+        assert!(Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "--", "refs/heads/main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        crate::manager::lock(&state).kill_all();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

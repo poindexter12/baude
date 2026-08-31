@@ -4853,7 +4853,117 @@ mod tests {
 
     #[test]
     fn hierarchy_flat_remote_compatibility_has_no_local_parent_or_remove_action() {
-        panic!("flat remote compatibility proof is not implemented");
+        use super::{SelId, SidebarAction};
+        use crate::hierarchy::ActionKind;
+
+        let remote = |id: u64, name: &str, archived: bool| {
+            serde_json::from_value::<crate::remote::RemoteInfo>(serde_json::json!({
+                "id": id,
+                "name": name,
+                "title": null,
+                "status": "busy",
+                "waiting_for_ms": null,
+                "model": null,
+                "permission_mode": null,
+                "context_used_pct": null,
+                "branch": "main",
+                "session_cost_usd": null,
+                "archived": archived
+            }))
+            .unwrap()
+        };
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.remote_snap = crate::remote::RemoteSnapshot {
+            sessions: vec![
+                remote(72, "archived-alpha", true),
+                remote(41, "active-zeta", false),
+            ],
+            fetched_ms: 1,
+            ok: true,
+        };
+
+        assert!(app.repository_state.repositories.is_empty());
+        assert!(app.repository_state.checkouts.is_empty());
+        assert!(app.hierarchy_rows().is_empty());
+        assert_eq!(
+            app.ordered_ids(),
+            vec![SelId::Remote(41), SelId::Remote(72)]
+        );
+        app.selected_id = Some(SelId::Remote(41));
+        assert!(app.selected_repository().is_none());
+        assert!(app.selected_checkout().is_none());
+        let view = app.selected_action_view().unwrap();
+        assert_eq!(view.kind, ActionKind::Remote);
+        assert!(!view.can_activate_branch);
+        assert!(!view.can_close);
+        assert!(!view.can_remove);
+
+        let cases = [
+            (
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                SidebarAction::RemoteOpen,
+            ),
+            (
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                SidebarAction::RemoteClose,
+            ),
+            (
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                SidebarAction::RemoteRestart,
+            ),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                SidebarAction::RemoteArchive,
+            ),
+            (KeyCode::Char('w'), KeyModifiers::NONE, SidebarAction::None),
+            (KeyCode::Char('X'), KeyModifiers::SHIFT, SidebarAction::None),
+        ];
+        for (code, modifiers, expected) in cases {
+            assert_eq!(
+                super::sidebar_action(view, KeyEvent::new(code, modifiers)),
+                expected
+            );
+        }
+
+        let before_order = app.ordered_ids();
+        let before_snapshot = app
+            .remote_snap
+            .sessions
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        for key in [
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+        ] {
+            app.handle_sidebar_key(key);
+            assert!(matches!(app.modal, Modal::None));
+            assert!(app.repository_state.repositories.is_empty());
+            assert!(app.repository_state.checkouts.is_empty());
+            assert!(app.runtime_checkouts.is_empty());
+            assert_eq!(app.ordered_ids(), before_order);
+            assert_eq!(
+                app.remote_snap
+                    .sessions
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>(),
+                before_snapshot
+            );
+            assert_eq!(app.selected_id, Some(SelId::Remote(41)));
+        }
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.modal,
+            Modal::ConfirmKill {
+                id: SelId::Remote(41)
+            }
+        ));
     }
 
     #[test]
