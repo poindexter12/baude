@@ -221,9 +221,9 @@ fn local_rows(state: &RepositoryState) -> Vec<LocalRow> {
 
 **Recommended first-cut mapping:** `Inactive -> RetryReopen`; activation recovery and teardown/stopped-active recovery -> `RetryRecovery`; removal tombstones and generic unavailable topology -> no retry until an App manual dispatch exists. [VERIFIED: `baude/src/app.rs:992-1055`; `baude-core/src/lifecycle.rs:380-409`]
 
-### Pattern 3: Stable selection reconciliation
+### Pattern 3: Stable in-process selection reconciliation and deterministic restart initialization
 
-**What:** Preserve selected durable key after refresh. On successful child removal choose next sibling, else previous sibling, else parent. Never fall through to another repository because status changed. [VERIFIED: `07-UI-SPEC.md`]
+**What:** Preserve the selected durable key after every in-process refresh/status transition. On successful child removal choose next sibling, else previous sibling, else parent. Selection is not part of persisted `RepositoryState`, so do not expand the schema or claim restart restoration: a newly restored process selects the first local repository parent in rendered name/path/key order; if there is no local repository, it selects the first flat remote row in existing compatibility order; if no row exists, selection is empty. [VERIFIED: `07-UI-SPEC.md` rendered order; current `App` selection is in-memory]
 
 **When to use:** Tick refresh, close/reopen/archive, admission, activation, remote refresh, and removal success. [VERIFIED: UI behavioral matrix]
 
@@ -235,7 +235,7 @@ fn local_rows(state: &RepositoryState) -> Vec<LocalRow> {
 
 **What:** Build, package, extract, version-check, and document locally/CI. Never invoke the release-please action, `gh release`, push, or tag creation. [VERIFIED: scope; `.github/workflows/release*.yml`]
 
-**Metadata rule:** set the three package versions and exact versioned path dependency to `2.0.0-beta`; set release-please's `release-as` to the exact beta and `prerelease`/`prerelease-type` appropriately; leave `.release-please-manifest.json` at `0.14.0` because it records the last released version and official docs say manual edits are appropriate only for bootstrap. [CITED: https://github.com/googleapis/release-please/blob/main/docs/manifest-releaser.md]
+**Metadata rule:** set the three package versions and exact versioned path dependency to `2.0.0-beta`. Preserve the project's single root package, `release-type: simple`, changelog/tag/bump/draft fields, and three TOML `extra-files`; set exactly `release-as: 2.0.0-beta`, `versioning: prerelease`, `prerelease: true`, and `prerelease-type: beta`. The official current schema defines all four fields, and the current versioning documentation requires `versioning: prerelease` together with `prerelease: true` to create prerelease versions. Leave `.release-please-manifest.json` exactly `{ ".": "0.14.0" }` because it records the last released version and official docs permit manual manifest edits only for bootstrap. Do not run release-please. [VERIFIED: current `release-please-config.json`; CITED: official config schema, customizing, and manifest-releaser docs]
 
 ### Anti-Patterns to Avoid
 
@@ -267,7 +267,7 @@ Phase 7 refactors local selection/presentation and changes source package versio
 
 | Category | Items Found | Action Required |
 |----------|-------------|-----------------|
-| Stored data | Workspace repository state already stores repositories, checkouts, lifecycle, and runtime ownership; `selected_id` is an App field and is not part of `RepositoryState`. [VERIFIED: `baude-core/src/repository.rs`; `baude/src/app.rs`] | No data migration. Load existing schema-v2 bytes unchanged and derive hierarchy/selection in memory; add restart coverage. |
+| Stored data | Workspace repository state already stores repositories, checkouts, lifecycle, and runtime ownership; `selected_id` is an App field and is not part of `RepositoryState`. [VERIFIED: `baude-core/src/repository.rs`; `baude/src/app.rs`] | No data migration. Retain durable-key selection through in-process refreshes; after restart choose first local repository parent in rendered order, else first flat remote row, else none. |
 | Live service config | Flat daemon state and API remain external to the local hierarchy; no hierarchy configuration lives in a service UI/database. [VERIFIED: daemon source and locked scope] | No live-service migration. Run compatibility tests only. |
 | OS-registered state | Existing globally/mise-installed `baude` binaries may remain 0.14.0; the phase does not register launchd/systemd tasks. [VERIFIED: README install model and repository scan] | Dogfood the explicitly built local binary or isolated `cargo install --root`; do not overwrite or claim the user's installed release. |
 | Secrets/env vars | No secret key or environment-variable name is renamed. Dogfood isolation changes `HOME` only for the launched fixture process and requires no credential. [VERIFIED: phase scope/runbook recommendation] | No secret migration; do not add or print credentials. |
@@ -414,7 +414,9 @@ The CI readiness job should reuse the four existing release targets (`aarch64-ap
 | `app::tests::hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus` | `baude/src/app.rs` | Responsive resize/focus contract. |
 | `app::tests::local_tui_dogfood_real_git_flow_survives_restart_without_duplicates` | `baude/src/app.rs` | REL-01 end-to-end real Git. |
 | `ui::tests::hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics` | `baude/src/ui.rs` | Required 160×40, 100×30, 79×24, 59×20, 40×12 matrix. |
+| `ui::tests::hierarchy_tracer_renders_real_app_parent_and_child` | `baude/src/ui.rs` | First production tracer reaches real App state and renders parent/main/default durable rows. |
 | `ui::tests::hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove` | `baude/src/ui.rs` | Exact copy, target/path/ref, red remove vs non-red close. |
+| `ui::tests::hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints` | `baude/src/ui.rs` | All remaining exact empty, persistence, pending, success, no-runtime, full-hint, and narrow-hint strings. |
 | `ui::tests::hierarchy_unicode_width_scroll_and_selection_band_are_cell_correct` | `baude/src/ui.rs` | Wide/combining labels, viewport scroll, two-line background. |
 | `api::tests::flat_session_api_remains_a_non_hierarchical_compatibility_projection` | `bauded/src/api.rs` | SURF-05 route shape and no hierarchy/remove-worktree endpoint. |
 
@@ -468,7 +470,7 @@ For `baude-core`, substitute `-p baude-core`; for daemon tests, use `-p bauded`.
 - [ ] `baude/src/hierarchy.rs` projection fixtures/tests.
 - [ ] Core lifecycle capability test.
 - [ ] App action/resize/real-Git dogfood tests.
-- [ ] Ratatui viewport/modal/Unicode tests.
+- [ ] Ratatui tracer/viewport/modal/copy-contract/Unicode tests.
 - [ ] Flat daemon compatibility test.
 - [ ] CI artifact-readiness job and package dependency fix.
 - [ ] Isolated manual dogfood runbook.
@@ -532,17 +534,13 @@ OWASP describes ASVS as a web-application verification standard; this phase is a
 
 No recommendation depends on an unverified third-party package. [VERIFIED: no-install stack]
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **When will deferred platform/runtime certification run?**
-   - What we know: local macOS implementation evidence exists for Phase 6, and CI already defines macOS/Linux runners plus four release targets. [VERIFIED: Phase 6 summary; workflows]
-   - What's unclear: the orchestrator has not scheduled final Linux/runtime certification or independent lifecycle review. [VERIFIED: user-provided boundary]
-   - Recommendation: do not block Phase 7 source tasks; make these explicit end-of-phase certification checkpoints before claiming release readiness. [VERIFIED: user constraint]
+   - Resolution: certification runs in the morning, after implementation/local automated evidence exists. Until then Linux/runtime certification, independent deep review, phase verification, Nyquist/UI approval, requirement completion, phase completion, and publication remain pending. [VERIFIED: user decision]
 
 2. **Where should manual screenshots/evidence be recorded?**
-   - What we know: the UI spec requires wide and narrow screenshots during the isolated flow. [VERIFIED: `07-UI-SPEC.md`]
-   - What's unclear: no existing phase evidence file is present. [VERIFIED: phase directory scan]
-   - Recommendation: have the planner create `07-UAT-EVIDENCE.md` as a verification artifact, not production source, during the final manual checkpoint. [VERIFIED: phase artifact convention]
+   - Resolution: record observed manual wide/narrow screenshots, commands, and certification outcomes in `.planning/phases/07-local-tui-dogfood-release/07-UAT-EVIDENCE.md`. Create that file only when evidence actually exists; planning and implementation must not create an empty or anticipatory evidence artifact. [VERIFIED: user decision]
 
 ## Sources
 
