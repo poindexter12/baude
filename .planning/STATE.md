@@ -5,16 +5,16 @@ milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
 status: verification
-stopped_at: Completed 07-05-PLAN.md; local package/artifact evidence green, certification pending
-last_updated: "2026-08-31T10:02:45.960Z"
+stopped_at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
+last_updated: "2026-08-31T10:21:35.110Z"
 last_activity: 2026-08-31
-last_activity_desc: completed exact beta package metadata and local artifact readiness evidence; certification pending
-state_head: 9c9b69497a5930f74345aa3fb3f851db8ba8c5ba
+last_activity_desc: completed readiness-only docs and final local package/archive/install gate; certification pending
+state_head: 872f52443aa5aade4e9fb4f66d68ad29823c3871
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 16
-  completed_plans: 15
+  completed_plans: 16
   percent: 33
 ---
 
@@ -32,7 +32,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
 Plan: 06-07 local implementation complete; 06-01 through 06-06 retained as execution history
 Status: Local implementation green; Phase 6 awaits Linux/runtime certification, independent review, phase verification, and Nyquist approval
-Last activity: 2026-08-31 — completed exact beta package metadata and local artifact readiness evidence; certification remains pending
+Last activity: 2026-08-31 — completed readiness-only docs and the final local package/archive/install gate; certification remains pending
 
 Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
 
@@ -40,16 +40,16 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 15
+- v2.0 plans completed: 16
 - Prior milestone: 14 plans completed across 4 phases
-- Average duration: 20 min
-- Total execution time: 289 min
+- Average duration: 19 min
+- Total execution time: 301 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
-| 7. Local TUI Dogfood Release | 5/6 | 106 min | 21 min |
+| 7. Local TUI Dogfood Release | 6/6 locally implemented | 118 min | 20 min |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -69,6 +69,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 07 P03 | 30min | 2 tasks | 2 files |
 | Phase 07 P04 | 16min | 2 tasks | 2 files |
 | Phase 07 P05 | 9min | 3 tasks | 7 files |
+| Phase 07 P06 | 12min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -126,16 +127,20 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Daemon compatibility remains a flat SessionInfo array with retained-close DELETE and no hierarchy or remove-worktree route.
 - [Phase 07]: Published history remains exactly 0.14.0 while source and proposal metadata target 2.0.0-beta.
 - [Phase 07]: Artifact readiness copies only the supported target and two-binary archive shape, with read-only contents permission and no publication authority.
+- [Phase 07]: The beta is described only as a local source-readiness target; stable remote install guidance remains at v0.14.0.
+- [Phase 07]: Morning UAT evidence is created only from observed commands, screenshots, and certification outcomes; implementation creates no placeholder evidence file.
 
 ### Pending Todos
 
 - Run Linux/runtime certification, independent deep lifecycle review, phase verification, and Nyquist validation for Phase 6.
+- Run manual wide/narrow TUI dogfood, supported CI/Linux/runtime certification, independent review, Phase 7 verification, Nyquist/UI-SPEC approval, requirement/phase completion, audit/cleanup, and publication decision.
 
 ### Blockers/Concerns
 
 - Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
 - Linux synchronized gate/release and descendant process-group extinction remain uncertified.
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
+- REL-03 and remaining Phase 7 requirement/phase completion remain blocked on morning dogfood, certification, review, verification, and approvals.
 
 ## Deferred Items
 
@@ -152,6 +157,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T10:02:45.850Z
-Stopped at: Completed 07-05-PLAN.md; local package/artifact evidence green, certification pending
+Last session: 2026-08-31T10:21:35.011Z
+Stopped at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
 Resume file: None
