@@ -50,11 +50,11 @@
 
 - [x] **SURF-01**: Local TUI repository, checkout, and worktree selections expose context-aware actions, hints, and confirmations naming the actual target.
 - [x] **SURF-02**: Existing open, clone, shell, editor, resume, archive, attention, and session-cycle behavior remains available for applicable hierarchy children.
-- [ ] **SURF-05**: Older flat daemon and session APIs remain non-destructive compatibility projections during the v2.0 transition.
+- [x] **SURF-05**: Older flat daemon and session APIs remain non-destructive compatibility projections during the v2.0 transition.
 
 ### Dogfood Release Gate
 
-- [ ] **REL-01**: In an isolated real repository, the local TUI completes the end-to-end default-session and branch-worktree flow—open, create or activate, close, reopen, safely remove, and restart—without duplicate parents, children, or runtimes and without losing user work.
+- [x] **REL-01**: In an isolated real repository, the local TUI completes the end-to-end default-session and branch-worktree flow—open, create or activate, close, reopen, safely remove, and restart—without duplicate parents, children, or runtimes and without losing user work.
 - [ ] **REL-02**: Formatting, lint, full tests, package checks, and supported release artifact builds pass for the intended `v2.0.0-beta` source state.
 - [ ] **REL-03**: Version/package metadata, changelog or release notes, and local install/dogfood documentation consistently target `v2.0.0-beta`; readiness is verified without publishing or pushing a release.
 
@@ -127,8 +127,8 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | WORK-06 | Phase 7 | Pending |
 | SURF-01 | Phase 7 | Complete |
 | SURF-02 | Phase 7 | Complete |
-| SURF-05 | Phase 7 | Pending |
-| REL-01 | Phase 7 | Pending |
+| SURF-05 | Phase 7 | Complete |
+| REL-01 | Phase 7 | Complete |
 | REL-02 | Phase 7 | Pending |
 | REL-03 | Phase 7 | Pending |
 

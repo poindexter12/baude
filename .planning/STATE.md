@@ -5,16 +5,16 @@ milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
 status: verification
-stopped_at: Completed 07-03-PLAN.md; manual dogfood and certification remain pending
-last_updated: "2026-08-31T09:24:48.827Z"
+stopped_at: Completed 07-04-PLAN.md; manual dogfood and certification remain pending
+last_updated: "2026-08-31T09:47:45.355Z"
 last_activity: 2026-08-31
 last_activity_desc: completed responsive local hierarchy UI contract and full workspace gate; dogfood and certification pending
-state_head: 2fa1769134a41d7bd74cfe9dd6d6abd7bda103b1
+state_head: da493aaed38ad8e1d60d2c6e73f367fcc0cf9faa
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 16
-  completed_plans: 13
+  completed_plans: 14
   percent: 33
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 6 — Shared Lifecycle Core Refactor
+**Current focus:** Phase 6 certification and Phase 7 release readiness
 
 ## Current Position
 
 Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
 Plan: 06-07 local implementation complete; 06-01 through 06-06 retained as execution history
 Status: Local implementation green; Phase 6 awaits Linux/runtime certification, independent review, phase verification, and Nyquist approval
-Last activity: 2026-08-30 — completed shared lifecycle engine cutover and full local gate
+Last activity: 2026-08-31 — completed isolated real-Git restart/dedup and flat compatibility proof; manual dogfood remains pending
 
 Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
 
@@ -40,16 +40,16 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 13
+- v2.0 plans completed: 14
 - Prior milestone: 14 plans completed across 4 phases
 - Average duration: 20 min
-- Total execution time: 264 min
+- Total execution time: 280 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
-| 7. Local TUI Dogfood Release | 3/6 | 81 min | 27 min |
+| 7. Local TUI Dogfood Release | 4/6 | 97 min | 24 min |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -67,6 +67,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 07 P01 | 17min | 2 tasks | 5 files |
 | Phase 07 P02 | 34min | 2 tasks | 4 files |
 | Phase 07 P03 | 30min | 2 tasks | 2 files |
+| Phase 07 P04 | 16min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -119,6 +120,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Hierarchy strings are clipped by terminal cell clusters with branch/path tails preserved and no new dependency.
 - [Phase 07]: Responsive layout exposes explicit pane visibility so hidden single-pane content is never resized or used as an input target.
 - [Phase 07]: Full and narrow hierarchy hints derive only from ActionView lifecycle capability.
+- [Phase 07]: Real-Git dogfood runs in an exact child test process so fixture-scoped HOME/XDG isolation cannot race parallel workspace tests.
+- [Phase 07]: Restart selects the first rendered local repository parent; retained child reopening requires explicit durable CheckoutKey reselection.
+- [Phase 07]: Daemon compatibility remains a flat SessionInfo array with retained-close DELETE and no hierarchy or remove-worktree route.
 
 ### Pending Todos
 
@@ -145,6 +149,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T09:24:47.564Z
-Stopped at: Completed 07-03-PLAN.md; manual dogfood and certification remain pending
+Last session: 2026-08-31T09:47:45.235Z
+Stopped at: Completed 07-04-PLAN.md; manual dogfood and certification remain pending
 Resume file: None
