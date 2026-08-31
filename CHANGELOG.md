@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.0-beta readiness
+
+This source state targets `v2.0.0-beta` for local validation. It has no date,
+tag, compare link, or remote availability claim; morning certification and the
+publication decision remain pending.
+
+### Features
+
+* durable repository parents with persisted oldest-first checkout children and deterministic restart initialization
+* context-aware local TUI create-or-activate, retained close, explicit reopen, and separately confirmed clean managed-worktree removal with branch retention
+* responsive wide and narrow hierarchy presentation while older remote session rows remain flat and non-destructive
+
+### Safety and readiness
+
+* shared lifecycle authority, exact durable repository/checkout identity, and fail-closed Git reconciliation across local actions
+* exact `2.0.0-beta` workspace metadata, locked package checks, and two-binary supported-target artifact readiness
+* isolated local source installation and manual dogfood instructions that do not replace an existing installation or authorize remote distribution
+
 ## [0.14.0](https://github.com/poindexter12/baude/compare/v0.13.0...v0.14.0) (2026-08-17)
 
 
