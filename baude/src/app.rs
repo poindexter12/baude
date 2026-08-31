@@ -4118,7 +4118,7 @@ mod tests {
         UnavailableCause,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -4196,8 +4196,11 @@ mod tests {
     }
 
     fn admission_repo(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()));
+        let root = std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
+            });
         let _ = std::fs::remove_dir_all(&root);
         let origin = root.join("origin.git");
         let repo = root.join("repo");
@@ -5717,7 +5720,294 @@ mod tests {
 
     #[test]
     fn local_tui_dogfood_real_git_flow_survives_restart_without_duplicates() {
-        panic!("isolated real-Git restart/dedup dogfood harness is not implemented");
+        const CHILD: &str = "BAUDE_REAL_GIT_DOGFOOD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root =
+                std::env::temp_dir().join(format!("baude-real-git-dogfood-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("home")).unwrap();
+            std::fs::create_dir_all(root.join("data")).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::local_tui_dogfood_real_git_flow_survives_restart_without_duplicates",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("BAUDE_TEST_FIXTURE_ROOT", &root)
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("HOME", root.join("home"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("BAUDE_DAEMON_URL")
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(status.success(), "isolated dogfood subprocess failed");
+            return;
+        }
+
+        fn app_for_dogfood(launch: PathBuf, state_root: &Path) -> App {
+            let mut app = App::new(launch);
+            app.remote = None;
+            app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+            app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+            app.persistence_root_for_test = Some(state_root.to_path_buf());
+            app
+        }
+
+        fn assert_inventory(repo: &Path, root: &Path, expected: &[PathBuf]) {
+            let snapshot = baude_core::git::discover_repository(repo).unwrap();
+            let actual: HashSet<_> = snapshot
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.clone())
+                .collect();
+            let expected: HashSet<_> = expected.iter().cloned().collect();
+            assert_eq!(actual, expected);
+            assert!(actual.iter().all(|path| path.starts_with(root)));
+        }
+
+        fn assert_structure(
+            app: &App,
+            repository: baude_core::repository::RepositoryKey,
+            expected: &[(CheckoutKey, u64)],
+            runtime_keys: &[CheckoutKey],
+        ) {
+            assert_eq!(app.repository_state.repositories.len(), 1);
+            assert_eq!(app.repository_state.repositories[0].key, repository);
+            let checkout_keys: HashSet<_> = app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .collect();
+            assert_eq!(checkout_keys.len(), app.repository_state.checkouts.len());
+            assert_eq!(
+                app.repository_state
+                    .checkouts
+                    .iter()
+                    .map(|checkout| (checkout.key, checkout.first_seen_order))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let runtime_values: HashSet<_> = app.runtime_checkouts.values().copied().collect();
+            assert_eq!(runtime_values.len(), app.runtime_checkouts.len());
+            assert_eq!(
+                app.runtime_checkouts
+                    .keys()
+                    .copied()
+                    .collect::<HashSet<_>>(),
+                runtime_keys.iter().copied().collect()
+            );
+            assert!(app.runtime_checkouts.iter().all(|(checkout, runtime)| {
+                checkout_keys.contains(checkout) && app.session(*runtime).is_some()
+            }));
+            assert_eq!(
+                app.ordered_ids()
+                    .into_iter()
+                    .filter(|id| !matches!(id, super::SelId::Remote(_)))
+                    .collect::<Vec<_>>(),
+                std::iter::once(super::SelId::Repository(repository))
+                    .chain(expected.iter().map(|(key, _)| super::SelId::Checkout(*key)))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        fn branch_exists(repo: &Path, branch_ref: &str) -> bool {
+            Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", "--", branch_ref])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success()
+        }
+
+        let configured_root = PathBuf::from(std::env::var_os("BAUDE_TEST_FIXTURE_ROOT").unwrap());
+        assert_eq!(
+            std::env::var_os("XDG_DATA_HOME"),
+            Some(configured_root.join("data").into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("HOME"),
+            Some(configured_root.join("home").into_os_string())
+        );
+        let repo = admission_repo("restart-dedup").canonicalize().unwrap();
+        let root = configured_root.canonicalize().unwrap();
+        assert_eq!(repo.parent(), Some(root.as_path()));
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let state_file = baude_core::workspace::active().state_file("state");
+        let branch = "feature/restart-dedup-dogfood";
+        let branch_ref = format!("refs/heads/{branch}");
+        let mut current = Some(app_for_dogfood(root.join("not-a-repository"), &state_root));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let app = current.as_mut().unwrap();
+            app.repository_state.next_repository_key = u64::from(std::process::id()) + 190_000;
+            let primary_runtime = app
+                .admit_repository(&repo)
+                .unwrap()
+                .expect("default checkout runtime");
+            let repository = app.repository_state.repositories[0].key;
+            let primary = app.repository_state.checkouts[0].key;
+            let primary_order = app.repository_state.checkouts[0].first_seen_order;
+            assert_eq!(
+                app.repository_state.checkouts[0].role,
+                CheckoutRole::PrimaryDefault
+            );
+            assert_eq!(
+                app.repository_state.checkouts[0]
+                    .observed_path
+                    .to_path_buf(),
+                repo
+            );
+            assert_structure(app, repository, &[(primary, primary_order)], &[primary]);
+            assert_eq!(app.runtime_checkouts.get(&primary), Some(&primary_runtime));
+            assert_inventory(&repo, &root, std::slice::from_ref(&repo));
+
+            let created = app.activate_branch_worktree(&repo, branch).unwrap();
+            let (checkout, runtime) = match created {
+                LifecycleOutcome::Created {
+                    checkout,
+                    runtime: Some(runtime),
+                } => (checkout, runtime),
+                other => panic!("unexpected activation outcome: {other:?}"),
+            };
+            let retained = app
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout)
+                .unwrap();
+            let checkout_order = retained.first_seen_order;
+            let checkout_path = retained.observed_path.to_path_buf();
+            assert_ne!(checkout_path, repo);
+            assert!(checkout_path.starts_with(&root));
+            let expected = [(primary, primary_order), (checkout, checkout_order)];
+            assert_structure(app, repository, &expected, &[primary, checkout]);
+            assert_inventory(&repo, &root, &[repo.clone(), checkout_path.clone()]);
+            assert!(branch_exists(&repo, &branch_ref));
+            assert_eq!(
+                app.activate_branch_worktree(&repo, branch).unwrap(),
+                LifecycleOutcome::Focused { checkout, runtime }
+            );
+            assert_structure(app, repository, &expected, &[primary, checkout]);
+
+            let user_file = checkout_path.join("dogfood-user-work");
+            std::fs::write(&user_file, b"keep this work\n").unwrap();
+            assert_eq!(
+                app.close_retained_session(runtime).unwrap(),
+                LifecycleOutcome::Closed { checkout }
+            );
+            assert_eq!(std::fs::read(&user_file).unwrap(), b"keep this work\n");
+            assert_structure(app, repository, &expected, &[primary]);
+            assert_inventory(&repo, &root, &[repo.clone(), checkout_path.clone()]);
+            assert!(branch_exists(&repo, &branch_ref));
+            assert_eq!(
+                app.close_retained_session(primary_runtime).unwrap(),
+                LifecycleOutcome::Closed { checkout: primary }
+            );
+            assert_structure(app, repository, &expected, &[]);
+            let persisted_before_restart = app.repository_state.clone();
+            assert_eq!(
+                baude_core::persist::load_current_at(&state_root, &state_file)
+                    .unwrap()
+                    .state,
+                persisted_before_restart
+            );
+
+            current.take().unwrap().kill_all();
+            let mut restarted = app_for_dogfood(root.join("not-a-repository"), &state_root);
+            restarted.restore();
+            current = Some(restarted);
+            let app = current.as_mut().unwrap();
+            assert_eq!(app.repository_state, persisted_before_restart);
+            assert_structure(app, repository, &expected, &[]);
+            assert_eq!(
+                app.selected_id,
+                Some(super::SelId::Repository(repository)),
+                "restart must select the first rendered local parent"
+            );
+            assert_eq!(std::fs::read(&user_file).unwrap(), b"keep this work\n");
+            assert_inventory(&repo, &root, &[repo.clone(), checkout_path.clone()]);
+
+            app.selected_id = Some(super::SelId::Checkout(checkout));
+            let attempts = app.spawn_attempts_for_test;
+            let reopened_runtime = match app.reopen_checkout(checkout).unwrap() {
+                LifecycleOutcome::Reopened {
+                    checkout: key,
+                    runtime,
+                } if key == checkout => runtime,
+                other => panic!("unexpected reopen outcome: {other:?}"),
+            };
+            assert_eq!(app.spawn_attempts_for_test, attempts + 1);
+            assert_eq!(
+                app.reopen_checkout(checkout).unwrap(),
+                LifecycleOutcome::Focused {
+                    checkout,
+                    runtime: reopened_runtime,
+                }
+            );
+            assert_eq!(app.spawn_attempts_for_test, attempts + 1);
+            assert_structure(app, repository, &expected, &[checkout]);
+            assert_eq!(std::fs::read(&user_file).unwrap(), b"keep this work\n");
+
+            let blocked = app
+                .prepare_remove_worktree(checkout)
+                .unwrap_err()
+                .to_string();
+            assert!(blocked.contains("Untracked"), "got: {blocked}");
+            assert_eq!(std::fs::read(&user_file).unwrap(), b"keep this work\n");
+            assert_structure(app, repository, &expected, &[checkout]);
+            assert_inventory(&repo, &root, &[repo.clone(), checkout_path.clone()]);
+            std::fs::remove_file(&user_file).unwrap();
+
+            let before_preflight = app.repository_state.clone();
+            let confirmation = app.prepare_remove_worktree(checkout).unwrap();
+            assert_eq!(app.repository_state, before_preflight);
+            let removed = app.confirm_remove_worktree(confirmation).unwrap();
+            assert!(matches!(
+                removed,
+                LifecycleOutcome::Removed {
+                    checkout: key,
+                    repository: parent,
+                    branch_ref: ref retained_ref,
+                } if key == checkout && parent == repository && retained_ref == &branch_ref
+            ));
+            assert_structure(app, repository, &[(primary, primary_order)], &[]);
+            assert_eq!(app.selected_id, Some(super::SelId::Checkout(primary)));
+            assert_inventory(&repo, &root, std::slice::from_ref(&repo));
+            assert!(!checkout_path.exists());
+            assert!(branch_exists(&repo, &branch_ref));
+            assert_eq!(
+                baude_core::persist::load_current_at(&state_root, &state_file)
+                    .unwrap()
+                    .state,
+                app.repository_state
+            );
+            assert!(state_root.starts_with(&root));
+        }));
+
+        if let Some(mut app) = current {
+            app.kill_all();
+        }
+        if let Err(panic) = result {
+            if repo.exists() {
+                if let Ok(snapshot) = baude_core::git::discover_repository(&repo) {
+                    for worktree in snapshot.worktrees {
+                        if worktree.path != repo && worktree.path.starts_with(&root) {
+                            let _ = Command::new("git")
+                                .args(["worktree", "remove", "--force", "--"])
+                                .arg(&worktree.path)
+                                .current_dir(&repo)
+                                .status();
+                        }
+                    }
+                }
+            }
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
