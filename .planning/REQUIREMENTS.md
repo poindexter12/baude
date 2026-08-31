@@ -48,8 +48,8 @@
 
 ### Interaction and Surface Parity
 
-- [ ] **SURF-01**: Local TUI repository, checkout, and worktree selections expose context-aware actions, hints, and confirmations naming the actual target.
-- [ ] **SURF-02**: Existing open, clone, shell, editor, resume, archive, attention, and session-cycle behavior remains available for applicable hierarchy children.
+- [x] **SURF-01**: Local TUI repository, checkout, and worktree selections expose context-aware actions, hints, and confirmations naming the actual target.
+- [x] **SURF-02**: Existing open, clone, shell, editor, resume, archive, attention, and session-cycle behavior remains available for applicable hierarchy children.
 - [ ] **SURF-05**: Older flat daemon and session APIs remain non-destructive compatibility projections during the v2.0 transition.
 
 ### Dogfood Release Gate
@@ -125,8 +125,8 @@ Every v2.0 requirement maps to exactly one roadmap phase.
 | WORK-04 | Phase 7 | Pending |
 | WORK-05 | Phase 7 | Pending |
 | WORK-06 | Phase 7 | Pending |
-| SURF-01 | Phase 7 | Pending |
-| SURF-02 | Phase 7 | Pending |
+| SURF-01 | Phase 7 | Complete |
+| SURF-02 | Phase 7 | Complete |
 | SURF-05 | Phase 7 | Pending |
 | REL-01 | Phase 7 | Pending |
 | REL-02 | Phase 7 | Pending |
