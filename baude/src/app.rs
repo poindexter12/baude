@@ -4788,6 +4788,75 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus() {
+        let mut paused = App::new(PathBuf::from("/not-a-repository"));
+        paused.remote = None;
+        paused.focus = super::Focus::Shell;
+        paused.sync_sizes(ratatui::layout::Rect::new(0, 0, 40, 12));
+        assert!(paused.focus == super::Focus::Sidebar);
+        assert_eq!(
+            paused.message.as_ref().map(|message| message.0.as_str()),
+            Some("shell hidden at this terminal height — resize to 13+ rows; session input is paused")
+        );
+
+        let (mut app, repo, root, _checkout, runtime, worktree_path) =
+            removal_app("tiny-resize", 185_000);
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        let before = app
+            .session(runtime)
+            .unwrap()
+            .claude
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .size();
+        app.focus = super::Focus::Sidebar;
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, 40, 12));
+        let hidden = app
+            .session(runtime)
+            .unwrap()
+            .claude
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .size();
+        assert_eq!(
+            hidden, before,
+            "hidden PTY must retain its last visible dimensions"
+        );
+
+        app.focus = super::Focus::Shell;
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, 40, 12));
+        assert!(app.focus == super::Focus::Claude);
+        assert_eq!(
+            app.message.as_ref().map(|message| message.0.as_str()),
+            Some("shell hidden at this terminal height — resize to 13+ rows or press ctrl+\\ to close it")
+        );
+        let visible = app
+            .session(runtime)
+            .unwrap()
+            .claude
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .size();
+        assert!(
+            visible.0 >= 2 && visible.1 >= 10,
+            "PTY minimum regressed: {visible:?}"
+        );
+
+        app.session_mut(runtime).unwrap().kill();
+        git(
+            &repo,
+            &["worktree", "remove", "--", worktree_path.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_checkout_ownership_cannot_move_to_an_external_path() {
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();

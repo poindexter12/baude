@@ -1581,12 +1581,183 @@ mod tests {
     use ratatui::style::{Color, Style};
     use ratatui::Terminal;
 
-    use crate::app::{App, SelId};
+    use crate::app::{App, Focus, Modal, SelId};
 
     use super::{rate_5h_chip, remove_confirmation_lines};
 
     fn persisted_path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
+    }
+
+    fn hierarchy_fixture() -> (App, baude_core::repository::RepositoryKey) {
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/viewport/repository/.git"),
+            observed_main_worktree: persisted_path("/tmp/viewport/repository"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        for (index, (name, branch, role, managed, lifecycle, archived)) in [
+            (
+                "repository:develop",
+                "develop",
+                CheckoutRole::Main,
+                false,
+                CheckoutLifecycle::Inactive,
+                false,
+            ),
+            (
+                "repository:feature/界e\u{301}-leaf",
+                "feature/界e\u{301}-leaf",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Inactive,
+                false,
+            ),
+            (
+                "repository:archived",
+                "archived",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Inactive,
+                true,
+            ),
+            (
+                "repository:missing",
+                "missing",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Protected(baude_core::repository::UnavailableCause::Missing),
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let path = format!("/tmp/viewport/repository worktrees/{index}-{branch}");
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                role,
+                managed,
+                persisted_path(&path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                lifecycle,
+                RetainedSessionState {
+                    name: name.into(),
+                    cwd: persisted_path(&path),
+                    repo_root: persisted_path("/tmp/viewport/repository"),
+                    branch: Some(branch.into()),
+                    is_worktree: role != CheckoutRole::Main,
+                    shell_open: false,
+                    archived,
+                    archived_by_user: archived,
+                    resume_id: None,
+                },
+            ));
+        }
+        let selected = state.checkouts[3].key;
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Checkout(selected));
+        (app, repository)
+    }
+
+    fn render(app: &App, width: u16, height: u16) -> (String, ratatui::buffer::Buffer) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (rendered, buffer)
+    }
+
+    #[test]
+    fn hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics() {
+        let (mut app, repository) = hierarchy_fixture();
+        for (width, height) in [(160, 40), (100, 30), (79, 24), (59, 20), (40, 12)] {
+            app.focus = Focus::Sidebar;
+            let (rendered, buffer) = render(&app, width, height);
+            assert!(
+                rendered.contains("▾ repository"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(rendered.contains("└─ !"), "{width}x{height}: {rendered}");
+            assert!(
+                rendered.contains("? more") || width >= 80,
+                "{width}x{height}: {rendered}"
+            );
+            assert!(buffer
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Indexed(237)));
+            let expected_sidebar_right = match width {
+                120.. => 41,
+                80..=119 => (width / 3).clamp(28, 38) - 1,
+                60..=79 => 25,
+                _ => width - 1,
+            };
+            assert_eq!(
+                buffer[(expected_sidebar_right, 0)].symbol(),
+                "╮",
+                "{width}x{height}"
+            );
+        }
+
+        app.selected_id = Some(SelId::Repository(repository));
+        app.focus = Focus::Claude;
+        let (rendered, buffer) = render(&app, 59, 20);
+        assert!(
+            !rendered.contains("▾ repository"),
+            "single content pane leaked sidebar"
+        );
+        assert_eq!(buffer[(58, 0)].symbol(), "╮");
+
+        app.focus = Focus::Sidebar;
+        app.modal = Modal::Help;
+        let (rendered, _) = render(&app, 40, 12);
+        assert!(rendered.contains("repository or checkout"), "{rendered}");
+        assert!(rendered.contains("X removes"), "{rendered}");
+    }
+
+    #[test]
+    fn hierarchy_unicode_width_scroll_and_selection_band_are_cell_correct() {
+        use ratatui::text::Line;
+
+        let clipped = super::truncate("feature/界e\u{301}", 6);
+        assert!(Line::raw(clipped.clone()).width() <= 6, "{clipped:?}");
+        assert!(clipped.ends_with("界e\u{301}"), "{clipped:?}");
+
+        let (app, _) = hierarchy_fixture();
+        let (rendered, buffer) = render(&app, 26, 13);
+        assert!(
+            rendered.contains("repository:missing"),
+            "selected row was not scrolled into view: {rendered}"
+        );
+        for y in 1..12 {
+            assert_ne!(
+                buffer[(25, y)].bg,
+                Color::Indexed(237),
+                "selection overwrote border at row {y}"
+            );
+        }
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Indexed(237)));
     }
 
     #[test]
