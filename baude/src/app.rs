@@ -3110,6 +3110,26 @@ mod clipboard_tests {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::App;
+    use baude_core::lifecycle::{
+        canonical_lifecycle_contract_vectors, canonical_lifecycle_trace,
+        normalize_lifecycle_trace,
+    };
+
+    #[test]
+    fn lifecycle_protocol_contract_app_vectors() {
+        for vector in canonical_lifecycle_contract_vectors() {
+            let actual = App::lifecycle_contract_trace(*vector);
+            assert_eq!(
+                normalize_lifecycle_trace(&actual),
+                canonical_lifecycle_trace(*vector)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod repository_admission_tests {
     use super::{
         active_restore_checkouts, checkout_for_runtime, local_admission_route,

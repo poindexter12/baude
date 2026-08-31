@@ -2246,6 +2246,17 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn lifecycle_protocol_contract_manager_vectors() {
+        for vector in baude_core::lifecycle::canonical_lifecycle_contract_vectors() {
+            let actual = Manager::lifecycle_contract_trace(*vector);
+            assert_eq!(
+                baude_core::lifecycle::normalize_lifecycle_trace(&actual),
+                baude_core::lifecycle::canonical_lifecycle_trace(*vector)
+            );
+        }
+    }
+
     fn mgr() -> Manager {
         Manager::new("sleep 30".into(), false)
     }
