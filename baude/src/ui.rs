@@ -1420,8 +1420,96 @@ fn remove_confirmation_lines(path: &std::path::Path, branch_ref: &str) -> Vec<St
 
 #[cfg(test)]
 mod tests {
-    use super::{rate_5h_chip, remove_confirmation_lines};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use baude_core::repository::{
+        CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+        RetainedSessionState, SavedCheckout, SavedRepository,
+    };
+    use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Style};
+    use ratatui::Terminal;
+
+    use crate::app::{App, SelId};
+
+    use super::{rate_5h_chip, remove_confirmation_lines};
+
+    fn persisted_path(value: &str) -> PersistedPath {
+        PersistedPath::from_path(Path::new(value))
+    }
+
+    #[test]
+    fn hierarchy_tracer_renders_real_app_parent_and_child() {
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/tracer/repo/.git"),
+            observed_main_worktree: persisted_path("/tmp/tracer/repo"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        for (role, managed, checkout_path, branch) in [
+            (CheckoutRole::Main, false, "/tmp/tracer/repo", "develop"),
+            (
+                CheckoutRole::PrimaryDefault,
+                true,
+                "/tmp/tracer/default",
+                "main",
+            ),
+        ] {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                role,
+                managed,
+                persisted_path(checkout_path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("repo:{branch}"),
+                    cwd: persisted_path(checkout_path),
+                    repo_root: persisted_path("/tmp/tracer/repo"),
+                    branch: Some(branch.into()),
+                    is_worktree: checkout_path != "/tmp/tracer/repo",
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+        }
+
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Repository(repository));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("▌ ▾ repo"), "{rendered}");
+        assert!(rendered.contains("├─ ○ repo:develop"), "{rendered}");
+        assert!(rendered.contains("└─ ○ repo:main"), "{rendered}");
+        assert!(rendered.contains("main · closed"), "{rendered}");
+        assert!(rendered.contains("default · closed"), "{rendered}");
+        assert!(buffer.content.iter().any(|cell| cell.bg == Color::Indexed(237)));
+        assert!(buffer.content.iter().any(|cell| cell.fg == Color::Cyan));
+    }
 
     #[test]
     fn rate_5h_chip_formats_and_colors() {

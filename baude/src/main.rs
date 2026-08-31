@@ -1,4 +1,5 @@
 mod app;
+mod hierarchy;
 mod keys;
 mod notify_desktop;
 mod remote;
