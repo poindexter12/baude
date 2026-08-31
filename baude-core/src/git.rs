@@ -3067,6 +3067,7 @@ mod tests {
                     observed_branch: Some(branch.to_owned()),
                     first_seen_order: state.allocate_first_seen_order().unwrap(),
                     lifecycle: CheckoutLifecycle::Active,
+                    owned_runtime: None,
                     active_intent: true,
                     session: RetainedSessionState {
                         name: "managed".into(),

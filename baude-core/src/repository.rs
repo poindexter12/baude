@@ -70,6 +70,10 @@ impl RuntimeGeneration {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    pub fn successor(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,25 +251,68 @@ pub struct SavedCheckout {
     pub observed_path: PersistedPath,
     pub observed_branch: Option<String>,
     pub first_seen_order: u64,
-    pub lifecycle: CheckoutLifecycle,
+    pub(crate) lifecycle: CheckoutLifecycle,
+    #[serde(default)]
+    pub(crate) owned_runtime: Option<OwnedRuntime>,
     /// Compatibility view for existing presentation code. Durable validation
     /// requires it to agree with `lifecycle`; lifecycle protocol code updates
     /// both through `set_lifecycle`.
-    pub active_intent: bool,
+    pub(crate) active_intent: bool,
     pub session: RetainedSessionState,
-    pub health: CheckoutHealth,
+    pub(crate) health: CheckoutHealth,
 }
 
 impl SavedCheckout {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        key: CheckoutKey,
+        repository_key: RepositoryKey,
+        role: CheckoutRole,
+        managed_by_baude: bool,
+        observed_path: PersistedPath,
+        observed_branch: Option<String>,
+        first_seen_order: u64,
+        lifecycle: CheckoutLifecycle,
+        session: RetainedSessionState,
+    ) -> Self {
+        let mut checkout = Self {
+            key,
+            repository_key,
+            role,
+            managed_by_baude,
+            observed_path,
+            observed_branch,
+            first_seen_order,
+            lifecycle: CheckoutLifecycle::Inactive,
+            owned_runtime: None,
+            active_intent: false,
+            session,
+            health: CheckoutHealth::Available,
+        };
+        checkout.set_lifecycle(lifecycle);
+        checkout
+    }
+
     pub fn lifecycle(&self) -> &CheckoutLifecycle {
         &self.lifecycle
     }
 
-    pub fn set_lifecycle(&mut self, lifecycle: CheckoutLifecycle) {
+    pub fn owned_runtime(&self) -> Option<&OwnedRuntime> {
+        self.owned_runtime.as_ref()
+    }
+
+    pub fn active_intent(&self) -> bool {
+        self.active_intent
+    }
+
+    pub fn health(&self) -> &CheckoutHealth {
+        &self.health
+    }
+
+    pub(crate) fn set_lifecycle(&mut self, lifecycle: CheckoutLifecycle) {
         self.active_intent = matches!(
             lifecycle,
             CheckoutLifecycle::Active
-                | CheckoutLifecycle::Activating
                 | CheckoutLifecycle::Launching(_)
                 | CheckoutLifecycle::Running(_)
                 | CheckoutLifecycle::Stopping(_)
@@ -278,7 +325,14 @@ impl SavedCheckout {
             | CheckoutLifecycle::Launching(_)
             | CheckoutLifecycle::Running(_)
             | CheckoutLifecycle::Stopping(_) => CheckoutHealth::Available,
-            CheckoutLifecycle::Activating => self.health.clone(),
+            CheckoutLifecycle::Activating => match &self.health {
+                CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { .. }) => {
+                    self.health.clone()
+                }
+                _ => CheckoutHealth::Unavailable(UnavailableCause::Other(
+                    "activation pending".into(),
+                )),
+            },
             CheckoutLifecycle::RemovalCommitted => CheckoutHealth::Unavailable(
                 UnavailableCause::RemovalTombstone("removal committed".into()),
             ),
@@ -287,8 +341,8 @@ impl SavedCheckout {
         self.lifecycle = lifecycle;
     }
 
-    pub fn synchronize_lifecycle_from_views(&mut self) {
-        self.lifecycle = CheckoutLifecycle::from_legacy(self.active_intent, &self.health);
+    pub(crate) fn set_owned_runtime(&mut self, runtime: Option<OwnedRuntime>) {
+        self.owned_runtime = runtime;
     }
 }
 
@@ -319,6 +373,7 @@ pub enum ValidationError {
     DuplicateRepositoryKey(RepositoryKey),
     DuplicateRepositoryIdentity(PersistedPath),
     DuplicateCheckoutKey(CheckoutKey),
+    MissingCheckout(CheckoutKey),
     DuplicateCheckoutOwnership {
         path: PersistedPath,
         first_repository: RepositoryKey,
@@ -366,18 +421,56 @@ impl std::fmt::Display for AllocationError {
 impl std::error::Error for AllocationError {}
 
 impl RepositoryState {
-    pub(crate) fn synchronize_lifecycle_from_views(&mut self) {
-        for checkout in &mut self.checkouts {
-            checkout.synchronize_lifecycle_from_views();
-        }
-    }
-
     pub(crate) fn validate_lifecycle_views(&self) -> Result<(), ValidationError> {
         for checkout in &self.checkouts {
-            if CheckoutLifecycle::from_legacy(checkout.active_intent, &checkout.health)
-                != checkout.lifecycle
-            {
+            let views_agree = match &checkout.lifecycle {
+                CheckoutLifecycle::Inactive => {
+                    !checkout.active_intent && checkout.health == CheckoutHealth::Available
+                }
+                CheckoutLifecycle::Active
+                | CheckoutLifecycle::Launching(_)
+                | CheckoutLifecycle::Running(_)
+                | CheckoutLifecycle::Stopping(_) => {
+                    checkout.active_intent && checkout.health == CheckoutHealth::Available
+                }
+                CheckoutLifecycle::Activating => {
+                    !checkout.active_intent
+                        && matches!(checkout.health, CheckoutHealth::Unavailable(_))
+                }
+                CheckoutLifecycle::RemovalCommitted => {
+                    !checkout.active_intent
+                        && matches!(
+                            checkout.health,
+                            CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(_))
+                        )
+                }
+                CheckoutLifecycle::Protected(cause) => {
+                    checkout.active_intent
+                        == matches!(
+                            cause,
+                            UnavailableCause::TeardownPending { .. }
+                                | UnavailableCause::StoppedActiveRecovery { .. }
+                        )
+                        && checkout.health == CheckoutHealth::Unavailable(cause.clone())
+                }
+            };
+            if !views_agree {
                 return Err(ValidationError::ContradictoryLifecycle(checkout.key));
+            }
+            match (&checkout.lifecycle, &checkout.owned_runtime) {
+                (
+                    CheckoutLifecycle::Launching(expected)
+                    | CheckoutLifecycle::Running(expected)
+                    | CheckoutLifecycle::Stopping(expected),
+                    Some(runtime),
+                ) if *expected == runtime.generation => {}
+                (
+                    CheckoutLifecycle::Launching(_)
+                    | CheckoutLifecycle::Running(_)
+                    | CheckoutLifecycle::Stopping(_),
+                    _,
+                ) => return Err(ValidationError::ContradictoryLifecycle(checkout.key)),
+                _ => {}
             }
         }
         Ok(())
@@ -582,6 +675,7 @@ mod tests {
             observed_branch: Some("main".into()),
             first_seen_order: order,
             lifecycle: CheckoutLifecycle::Protected(UnavailableCause::Missing),
+            owned_runtime: None,
             active_intent: true,
             session: RetainedSessionState {
                 name: "repo".into(),

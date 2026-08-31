@@ -858,7 +858,7 @@ mod tests {
                     .state;
             assert_eq!(retained.repositories.len(), 1);
             assert_eq!(retained.checkouts.len(), 1);
-            assert_eq!(retained.checkouts[0].active_intent, !committed);
+            assert_eq!(retained.checkouts[0].active_intent(), !committed);
 
             let archive_root = std::env::temp_dir().join(format!("bauded-api-archive-{suffix}"));
             let _ = std::fs::remove_dir_all(&archive_root);

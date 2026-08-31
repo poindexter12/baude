@@ -85,19 +85,17 @@ impl SchemaV1StateFile {
                     checkout.active_intent,
                     &checkout.health,
                 );
-                Ok(SavedCheckout {
-                    key: checkout.key,
-                    repository_key: checkout.repository_key,
-                    role: checkout.role,
-                    managed_by_baude: checkout.managed_by_baude,
-                    observed_path: checkout.observed_path,
-                    observed_branch: checkout.observed_branch,
-                    first_seen_order: checkout.first_seen_order,
+                Ok(SavedCheckout::new(
+                    checkout.key,
+                    checkout.repository_key,
+                    checkout.role,
+                    checkout.managed_by_baude,
+                    checkout.observed_path,
+                    checkout.observed_branch,
+                    checkout.first_seen_order,
                     lifecycle,
-                    active_intent: checkout.active_intent,
-                    session: checkout.session,
-                    health: checkout.health,
-                })
+                    checkout.session,
+                ))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let state = RepositoryState {
@@ -203,6 +201,13 @@ impl SaveError {
 
     pub fn before_replacement(source: impl Into<anyhow::Error>) -> Self {
         Self::not_committed(source)
+    }
+
+    pub fn after_replacement(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            replacement_committed: true,
+            source: source.into(),
+        }
     }
 
     pub fn replacement_committed(&self) -> bool {
@@ -432,8 +437,7 @@ fn atomic_save_current(
     failure: Option<AtomicFailure>,
     first_temp: Option<PathBuf>,
 ) -> std::result::Result<(), SaveError> {
-    let mut state = state.clone();
-    state.state.synchronize_lifecycle_from_views();
+    let state = state.clone();
     state.state.validate().map_err(SaveError::not_committed)?;
     state
         .state
@@ -611,17 +615,17 @@ fn migrate_legacy(
         let checkout_key = state.allocate_checkout_key()?;
         let first_seen_order = state.allocate_first_seen_order()?;
         let is_worktree = checkout_path != main_worktree;
-        state.checkouts.push(SavedCheckout {
-            key: checkout_key,
+        let lifecycle = crate::repository::CheckoutLifecycle::from_legacy(true, &checkout_health);
+        state.checkouts.push(SavedCheckout::new(
+            checkout_key,
             repository_key,
-            role: checkout_role,
+            checkout_role,
             managed_by_baude,
-            observed_path: checkout_path.clone(),
+            checkout_path.clone(),
             observed_branch,
             first_seen_order,
-            lifecycle: crate::repository::CheckoutLifecycle::from_legacy(true, &checkout_health),
-            active_intent: true,
-            session: RetainedSessionState {
+            lifecycle,
+            RetainedSessionState {
                 name: session.name,
                 cwd: checkout_path,
                 repo_root: main_worktree,
@@ -632,8 +636,7 @@ fn migrate_legacy(
                 archived_by_user: session.archived_by_user,
                 resume_id: None,
             },
-            health: checkout_health,
-        });
+        ));
     }
 
     state.validate()?;
@@ -884,17 +887,16 @@ mod tests {
             first_seen_order: repository_order,
             health: RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged),
         });
-        state.checkouts.push(SavedCheckout {
-            key: checkout_key,
+        state.checkouts.push(SavedCheckout::new(
+            checkout_key,
             repository_key,
-            role: CheckoutRole::PrimaryDefault,
-            managed_by_baude: true,
-            observed_path: PersistedPath::from_path(&checkout_path),
-            observed_branch: Some("feature/retained".into()),
-            first_seen_order: checkout_order,
-            lifecycle: CheckoutLifecycle::Protected(UnavailableCause::Missing),
-            active_intent: true,
-            session: RetainedSessionState {
+            CheckoutRole::PrimaryDefault,
+            true,
+            PersistedPath::from_path(&checkout_path),
+            Some("feature/retained".into()),
+            checkout_order,
+            CheckoutLifecycle::Protected(UnavailableCause::Missing),
+            RetainedSessionState {
                 name: format!("{prefix}-session"),
                 cwd: PersistedPath::from_path(&checkout_path),
                 repo_root: PersistedPath::from_path(&main),
@@ -905,8 +907,7 @@ mod tests {
                 archived_by_user: true,
                 resume_id: Some("opaque-retained-id".into()),
             },
-            health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
-        });
+        ));
         StateFile::new(state)
     }
 
@@ -1188,11 +1189,8 @@ mod tests {
                 .count(),
             1
         );
-        assert!(migrated
-            .checkouts
-            .iter()
-            .all(|checkout| checkout.active_intent));
         migrated.validate().unwrap();
+        migrated.validate_lifecycle_views().unwrap();
     }
 
     #[test]

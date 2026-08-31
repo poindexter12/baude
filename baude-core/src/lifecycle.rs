@@ -20,10 +20,11 @@ use crate::repository::{
 pub enum LifecycleEvent {
     RequestActivation,
     ActivationVerified,
-    LaunchRegistered(RuntimeGeneration),
+    LaunchRegistered(crate::repository::OwnedRuntime),
     LaunchReleased,
     RequestClose,
     RuntimeExtinct,
+    RestoreRemovalAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,8 +55,8 @@ pub fn reduce_lifecycle(state: &CheckoutLifecycle, event: &LifecycleEvent) -> Li
             CheckoutLifecycle::Active,
             LifecycleTraceEntry::PersistActive,
         )),
-        (CheckoutLifecycle::Active, LifecycleEvent::LaunchRegistered(generation)) => Some((
-            CheckoutLifecycle::Launching(*generation),
+        (CheckoutLifecycle::Active, LifecycleEvent::LaunchRegistered(runtime)) => Some((
+            CheckoutLifecycle::Launching(runtime.generation),
             LifecycleTraceEntry::PersistRuntime,
         )),
         (CheckoutLifecycle::Launching(generation), LifecycleEvent::LaunchReleased) => Some((
@@ -69,6 +70,20 @@ pub fn reduce_lifecycle(state: &CheckoutLifecycle, event: &LifecycleEvent) -> Li
         (CheckoutLifecycle::Stopping(_), LifecycleEvent::RuntimeExtinct) => Some((
             CheckoutLifecycle::Inactive,
             LifecycleTraceEntry::PersistInactive,
+        )),
+        (
+            CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. }),
+            LifecycleEvent::RuntimeExtinct,
+        ) => Some((
+            CheckoutLifecycle::Inactive,
+            LifecycleTraceEntry::PersistInactive,
+        )),
+        (
+            CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)),
+            LifecycleEvent::RestoreRemovalAuthority,
+        ) => Some((
+            CheckoutLifecycle::Active,
+            LifecycleTraceEntry::PersistActive,
         )),
         _ => None,
     };
@@ -87,12 +102,49 @@ pub fn reduce_lifecycle(state: &CheckoutLifecycle, event: &LifecycleEvent) -> Li
 pub trait LifecycleEffects {
     type Error;
 
-    fn persist_lifecycle(
-        &mut self,
-        checkout: CheckoutKey,
-        lifecycle: &CheckoutLifecycle,
-    ) -> Result<(), Self::Error>;
+    fn persist_lifecycle(&mut self, candidate: &LifecycleCandidate) -> Result<(), Self::Error>;
     fn apply_lifecycle_effect(&mut self, effect: &LifecycleTraceEntry) -> Result<(), Self::Error>;
+}
+
+/// Opaque engine-selected durable candidate. Adapters can persist and apply it
+/// but cannot construct an arbitrary lifecycle mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleCandidate {
+    checkout: CheckoutKey,
+    lifecycle: CheckoutLifecycle,
+    runtime: RuntimeCandidate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeCandidate {
+    Keep,
+    Set(crate::repository::OwnedRuntime),
+    Clear,
+}
+
+impl LifecycleCandidate {
+    pub fn checkout(&self) -> CheckoutKey {
+        self.checkout
+    }
+
+    pub fn lifecycle(&self) -> &CheckoutLifecycle {
+        &self.lifecycle
+    }
+
+    pub fn apply(&self, state: &mut RepositoryState) -> Result<(), ValidationError> {
+        let checkout = state
+            .checkouts
+            .iter_mut()
+            .find(|checkout| checkout.key == self.checkout)
+            .ok_or(ValidationError::MissingCheckout(self.checkout))?;
+        checkout.set_lifecycle(self.lifecycle.clone());
+        match &self.runtime {
+            RuntimeCandidate::Keep => {}
+            RuntimeCandidate::Set(runtime) => checkout.set_owned_runtime(Some(runtime.clone())),
+            RuntimeCandidate::Clear => checkout.set_owned_runtime(None),
+        }
+        Ok(())
+    }
 }
 
 pub struct LifecycleEngine<E> {
@@ -117,13 +169,24 @@ impl<E: LifecycleEffects> LifecycleEngine<E> {
         if transition.effects.is_empty() {
             return Ok(transition);
         }
-        self.effects
-            .persist_lifecycle(checkout.key, &transition.state)?;
+        let candidate = LifecycleCandidate {
+            checkout: checkout.key,
+            lifecycle: transition.state.clone(),
+            runtime: match &event {
+                LifecycleEvent::LaunchRegistered(runtime) => RuntimeCandidate::Set(runtime.clone()),
+                LifecycleEvent::RuntimeExtinct => RuntimeCandidate::Clear,
+                _ => RuntimeCandidate::Keep,
+            },
+        };
+        self.effects.persist_lifecycle(&candidate)?;
+        // The replacement is durable before the external effect is attempted.
+        // Keep memory aligned with that commit boundary even when the effect
+        // fails; recovery must see the candidate that authorized the effect.
+        checkout.set_lifecycle(transition.state.clone());
+        self.trace.extend(transition.effects.iter().cloned());
         for effect in &transition.effects {
             self.effects.apply_lifecycle_effect(effect)?;
         }
-        checkout.set_lifecycle(transition.state.clone());
-        self.trace.extend(transition.effects.iter().cloned());
         Ok(transition)
     }
 
@@ -144,6 +207,20 @@ pub enum CanonicalLifecycleVector {
     ProtectedRefusal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterFailureScript {
+    None,
+    Persist(usize),
+    Effect(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleContractResult {
+    pub trace: LifecycleTrace,
+    pub final_lifecycle: CheckoutLifecycle,
+    pub failed: bool,
+}
+
 pub fn canonical_lifecycle_contract_vectors() -> &'static [CanonicalLifecycleVector] {
     &[
         CanonicalLifecycleVector::Activate,
@@ -153,8 +230,10 @@ pub fn canonical_lifecycle_contract_vectors() -> &'static [CanonicalLifecycleVec
     ]
 }
 
-pub fn canonical_lifecycle_trace(vector: CanonicalLifecycleVector) -> LifecycleTrace {
-    let (mut state, events) = match vector {
+pub fn canonical_lifecycle_events(
+    vector: CanonicalLifecycleVector,
+) -> (CheckoutLifecycle, Vec<LifecycleEvent>) {
+    let (state, events) = match vector {
         CanonicalLifecycleVector::Activate => (
             CheckoutLifecycle::Inactive,
             vec![
@@ -165,7 +244,7 @@ pub fn canonical_lifecycle_trace(vector: CanonicalLifecycleVector) -> LifecycleT
         CanonicalLifecycleVector::Launch => (
             CheckoutLifecycle::Active,
             vec![
-                LifecycleEvent::LaunchRegistered(RuntimeGeneration::initial()),
+                LifecycleEvent::LaunchRegistered(contract_owned_runtime()),
                 LifecycleEvent::LaunchReleased,
             ],
         ),
@@ -178,13 +257,111 @@ pub fn canonical_lifecycle_trace(vector: CanonicalLifecycleVector) -> LifecycleT
             vec![LifecycleEvent::RequestActivation],
         ),
     };
-    let mut trace = Vec::new();
-    for event in events {
-        let transition = reduce_lifecycle(&state, &event);
-        state = transition.state;
-        trace.extend(transition.effects);
+    (state, events)
+}
+
+fn contract_owned_runtime() -> crate::repository::OwnedRuntime {
+    let identity = crate::repository::ProcessIdentity {
+        pid: 41,
+        start_time: 42,
+        process_group: 41,
+        session: 41,
+    };
+    crate::repository::OwnedRuntime {
+        generation: RuntimeGeneration::initial(),
+        agent: identity,
+        shell: crate::repository::ShellOwnership::Closed,
     }
-    trace
+}
+
+#[derive(Default)]
+struct CanonicalContractEffects {
+    script: Option<AdapterFailureScript>,
+    persists: usize,
+    effects: usize,
+}
+
+impl LifecycleEffects for CanonicalContractEffects {
+    type Error = ();
+
+    fn persist_lifecycle(&mut self, _candidate: &LifecycleCandidate) -> Result<(), Self::Error> {
+        self.persists += 1;
+        if self.script == Some(AdapterFailureScript::Persist(self.persists)) {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn apply_lifecycle_effect(&mut self, _effect: &LifecycleTraceEntry) -> Result<(), Self::Error> {
+        self.effects += 1;
+        if self.script == Some(AdapterFailureScript::Effect(self.effects)) {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+fn contract_checkout(lifecycle: CheckoutLifecycle) -> SavedCheckout {
+    let mut keys = RepositoryState::default();
+    let repository_key = keys.allocate_repository_key().expect("repository key");
+    let key = keys.allocate_checkout_key().expect("checkout key");
+    SavedCheckout {
+        key,
+        repository_key,
+        role: CheckoutRole::ManagedBranch,
+        managed_by_baude: true,
+        observed_path: PersistedPath::from_path(std::path::Path::new("/contract")),
+        observed_branch: Some("refs/heads/contract".into()),
+        first_seen_order: 1,
+        lifecycle: lifecycle.clone(),
+        owned_runtime: None,
+        active_intent: matches!(
+            lifecycle,
+            CheckoutLifecycle::Active | CheckoutLifecycle::Running(_)
+        ),
+        session: RetainedSessionState {
+            name: "contract".into(),
+            cwd: PersistedPath::from_path(std::path::Path::new("/contract")),
+            repo_root: PersistedPath::from_path(std::path::Path::new("/contract")),
+            branch: Some("contract".into()),
+            is_worktree: true,
+            shell_open: false,
+            archived: false,
+            archived_by_user: false,
+            resume_id: None,
+        },
+        health: CheckoutHealth::Available,
+    }
+}
+
+pub fn run_canonical_lifecycle_contract(
+    vector: CanonicalLifecycleVector,
+    script: AdapterFailureScript,
+) -> LifecycleContractResult {
+    let (initial, events) = canonical_lifecycle_events(vector);
+    let mut checkout = contract_checkout(initial);
+    checkout.set_lifecycle(checkout.lifecycle().clone());
+    let effects = CanonicalContractEffects {
+        script: Some(script),
+        ..CanonicalContractEffects::default()
+    };
+    let mut engine = LifecycleEngine::new(effects);
+    let mut failed = false;
+    for event in events {
+        if engine.drive(&mut checkout, event).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    LifecycleContractResult {
+        trace: engine.trace().to_vec(),
+        final_lifecycle: checkout.lifecycle().clone(),
+        failed,
+    }
+}
+
+pub fn canonical_lifecycle_trace(vector: CanonicalLifecycleVector) -> LifecycleContractResult {
+    run_canonical_lifecycle_contract(vector, AdapterFailureScript::None)
 }
 
 pub fn normalize_lifecycle_trace(trace: &[LifecycleTraceEntry]) -> LifecycleTrace {
@@ -238,6 +415,54 @@ pub fn startup_recovery_program(state: &RepositoryState) -> Vec<RecoveryStep> {
         .chain(topology)
         .chain(launch)
         .collect()
+}
+
+/// Record a freshly verified active checkout without allowing ordinary owner
+/// code to overwrite a protected transaction or recovery state.
+pub fn mark_checkout_active(
+    state: &mut RepositoryState,
+    checkout: CheckoutKey,
+) -> Result<(), ValidationError> {
+    let saved = state
+        .checkouts
+        .iter_mut()
+        .find(|saved| saved.key == checkout)
+        .ok_or(ValidationError::MissingCheckout(checkout))?;
+    if saved.lifecycle().is_protected() {
+        return Err(ValidationError::ContradictoryLifecycle(checkout));
+    }
+    saved.set_lifecycle(CheckoutLifecycle::Active);
+    Ok(())
+}
+
+/// Update topology availability through core lifecycle authority. Successful
+/// reconciliation never clears a protected lifecycle; failed reconciliation
+/// records protection once and preserves any stronger existing evidence.
+pub fn record_checkout_reconciliation(
+    state: &mut RepositoryState,
+    checkout: CheckoutKey,
+    unavailable: Option<UnavailableCause>,
+) -> Result<(), ValidationError> {
+    let saved = state
+        .checkouts
+        .iter_mut()
+        .find(|saved| saved.key == checkout)
+        .ok_or(ValidationError::MissingCheckout(checkout))?;
+    match unavailable {
+        None if !saved.lifecycle().is_protected() => {
+            let active = saved.active_intent();
+            saved.set_lifecycle(if active {
+                CheckoutLifecycle::Active
+            } else {
+                CheckoutLifecycle::Inactive
+            });
+        }
+        Some(cause) if !saved.lifecycle().is_protected() => {
+            saved.set_lifecycle(CheckoutLifecycle::Protected(cause));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A literal branch activation rooted in one durable repository identity.
@@ -464,10 +689,10 @@ pub fn mark_removed_checkout_unavailable(
         .iter_mut()
         .find(|checkout| checkout.key == checkout_key)
     {
-        checkout.active_intent = true;
         checkout.managed_by_baude = false;
-        checkout.health =
-            CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(detail.into()));
+        checkout.set_lifecycle(CheckoutLifecycle::Protected(
+            UnavailableCause::RemovalTombstone(detail.into()),
+        ));
     }
 }
 
@@ -484,8 +709,8 @@ pub fn revoke_removal_authority(
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
     checkout.managed_by_baude = false;
-    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::RemovalTombstone(
-        "removal authority revoked before Git mutation".into(),
+    checkout.set_lifecycle(CheckoutLifecycle::Protected(
+        UnavailableCause::RemovalTombstone("removal authority revoked before Git mutation".into()),
     ));
     state.validate()?;
     Ok(())
@@ -504,9 +729,8 @@ pub fn plan_close(
         .find(|checkout| checkout.key == request.checkout)
         .ok_or(LifecycleError::CheckoutMissing(request.checkout))?;
     checkout.session = request.runtime;
-    checkout.active_intent = false;
-    checkout.health = CheckoutHealth::Available;
-    checkout.lifecycle = CheckoutLifecycle::Inactive;
+    checkout.set_lifecycle(CheckoutLifecycle::Inactive);
+    checkout.set_owned_runtime(None);
     next.validate()?;
     *state = next;
     Ok(ClosePlan {
@@ -541,10 +765,8 @@ pub fn mark_teardown_pending(
         shell_stopped: error.shell_stopped,
         detail: error.detail.clone(),
     };
-    checkout.active_intent = true;
     checkout.session.shell_open = error.shell_pid.is_some();
-    checkout.health = CheckoutHealth::Unavailable(cause.clone());
-    checkout.lifecycle = CheckoutLifecycle::Protected(cause);
+    checkout.set_lifecycle(CheckoutLifecycle::Protected(cause));
     state.validate()?;
     Ok(())
 }
@@ -561,12 +783,13 @@ pub fn mark_stopped_active_recovery(
         .iter_mut()
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
-    checkout.active_intent = true;
-    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::StoppedActiveRecovery {
-        agent_restarted,
-        shell_restarted,
-        detail,
-    });
+    checkout.set_lifecycle(CheckoutLifecycle::Protected(
+        UnavailableCause::StoppedActiveRecovery {
+            agent_restarted,
+            shell_restarted,
+            detail,
+        },
+    ));
     state.validate()?;
     Ok(())
 }
@@ -660,8 +883,8 @@ pub fn reconcile_teardown_recovery(
         shell_stopped,
     ) {
         Ok(()) => {
-            checkout.active_intent = false;
-            checkout.health = CheckoutHealth::Available;
+            checkout.set_lifecycle(CheckoutLifecycle::Inactive);
+            checkout.set_owned_runtime(None);
             state.validate()?;
             Ok(TeardownRecoveryResolution::Completed {
                 checkout: checkout_key,
@@ -669,16 +892,17 @@ pub fn reconcile_teardown_recovery(
         }
         Err(error) => {
             let detail = error.to_string();
-            checkout.active_intent = true;
-            checkout.health = CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
-                agent_pid: error.agent_pid,
-                shell_pid: error.shell_pid,
-                agent_identity: error.agent_identity,
-                shell_identity: error.shell_identity,
-                agent_stopped: error.agent_stopped,
-                shell_stopped: error.shell_stopped,
-                detail: error.detail,
-            });
+            checkout.set_lifecycle(CheckoutLifecycle::Protected(
+                UnavailableCause::TeardownPending {
+                    agent_pid: error.agent_pid,
+                    shell_pid: error.shell_pid,
+                    agent_identity: error.agent_identity,
+                    shell_identity: error.shell_identity,
+                    agent_stopped: error.agent_stopped,
+                    shell_stopped: error.shell_stopped,
+                    detail: error.detail,
+                },
+            ));
             state.validate()?;
             Ok(TeardownRecoveryResolution::Pending {
                 checkout: checkout_key,
@@ -775,23 +999,22 @@ pub fn plan_reopen(
         .iter()
         .position(|candidate| candidate.key == repository);
 
-    if let CheckoutHealth::Unavailable(
-        cause @ (UnavailableCause::RemovalTombstone(_)
-        | UnavailableCause::TeardownPending { .. }
-        | UnavailableCause::PendingActivation { .. }
-        | UnavailableCause::ActivationRecovery { .. }
-        | UnavailableCause::StoppedActiveRecovery { .. }),
-    ) = &state.checkouts[checkout_index].health
-    {
+    if let Some(cause) = match state.checkouts[checkout_index].lifecycle() {
+        CheckoutLifecycle::Protected(cause) => Some(cause.clone()),
+        CheckoutLifecycle::RemovalCommitted => Some(UnavailableCause::RemovalTombstone(
+            "removal committed".into(),
+        )),
+        _ => None,
+    } {
         return Err(ReopenBlocked {
             checkout: request.checkout,
-            cause: cause.clone(),
+            cause,
         });
     }
 
     if let Err(error) = request.reconciliation {
         let cause = unavailable_cause(&error);
-        state.checkouts[checkout_index].health = CheckoutHealth::Unavailable(cause.clone());
+        state.checkouts[checkout_index].set_lifecycle(CheckoutLifecycle::Protected(cause.clone()));
         if let Some(index) = repository_index {
             state.repositories[index].health = RepositoryHealth::Unavailable(cause.clone());
         }
@@ -808,8 +1031,16 @@ pub fn plan_reopen(
         .map(SpawnMode::ResumeId)
         .unwrap_or(SpawnMode::ContinueLatest);
     let mut next = state.clone();
-    next.checkouts[checkout_index].active_intent = true;
-    next.checkouts[checkout_index].health = CheckoutHealth::Available;
+    if matches!(request.runtime, ReopenRuntime::Live { .. }) {
+        let lifecycle = next.checkouts[checkout_index]
+            .owned_runtime()
+            .map(|runtime| CheckoutLifecycle::Running(runtime.generation))
+            .unwrap_or(CheckoutLifecycle::Active);
+        next.checkouts[checkout_index].set_lifecycle(lifecycle);
+    } else {
+        next.checkouts[checkout_index].set_lifecycle(CheckoutLifecycle::Active);
+        next.checkouts[checkout_index].set_owned_runtime(None);
+    }
     if let Some(index) = repository_index {
         next.repositories[index].health = RepositoryHealth::Available;
     }
@@ -1124,6 +1355,7 @@ pub fn record_pending_activation(
         observed_branch: Some(expected_ref),
         first_seen_order: prepared.first_seen_order,
         lifecycle: CheckoutLifecycle::Activating,
+        owned_runtime: None,
         active_intent: false,
         session: RetainedSessionState {
             name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1285,8 +1517,7 @@ pub fn reconcile_activation_recovery(
                 && !path_record.prunable =>
         {
             let checkout = &mut state.checkouts[index];
-            checkout.active_intent = true;
-            checkout.health = CheckoutHealth::Available;
+            checkout.set_lifecycle(CheckoutLifecycle::Active);
             checkout.observed_branch = Some(expected_ref);
             checkout.session.cwd = PersistedPath::from_path(&expected_path);
             checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
@@ -1332,8 +1563,14 @@ pub fn reconcile_activation_recovery(
                     });
                 }
                 let checkout = &mut state.checkouts[existing];
-                checkout.active_intent = true;
-                checkout.health = CheckoutHealth::Available;
+                if !matches!(
+                    checkout.lifecycle(),
+                    CheckoutLifecycle::Launching(_)
+                        | CheckoutLifecycle::Running(_)
+                        | CheckoutLifecycle::Stopping(_)
+                ) {
+                    checkout.set_lifecycle(CheckoutLifecycle::Active);
+                }
                 checkout.session.cwd = PersistedPath::from_path(&reused_path);
                 checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
                 checkout.session.branch = Some(branch.clone());
@@ -1349,8 +1586,7 @@ pub fn reconcile_activation_recovery(
                 } else {
                     CheckoutRole::ManagedBranch
                 };
-                checkout.active_intent = true;
-                checkout.health = CheckoutHealth::Available;
+                checkout.set_lifecycle(CheckoutLifecycle::Active);
                 checkout.session.cwd = PersistedPath::from_path(&reused_path);
                 checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
                 checkout.session.branch = Some(branch);
@@ -1411,14 +1647,15 @@ pub fn mark_activation_recovery(
         }) => preexisting_branch_owner.clone(),
         _ => None,
     };
-    checkout.active_intent = false;
-    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
-        branch,
-        created_branch,
-        preexisting_branch_owner,
-        verification,
-        compensation,
-    });
+    checkout.set_lifecycle(CheckoutLifecycle::Protected(
+        UnavailableCause::ActivationRecovery {
+            branch,
+            created_branch,
+            preexisting_branch_owner,
+            verification,
+            compensation,
+        },
+    ));
     state.validate()?;
     Ok(())
 }
@@ -1491,6 +1728,7 @@ fn execute_activation_with_post_git_hook(
                     },
                     _ => unreachable!(),
                 }),
+                owned_runtime: None,
                 active_intent: false,
                 session: RetainedSessionState {
                     name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1594,9 +1832,9 @@ fn execute_activation_with_post_git_hook(
                     checkout.key.get()
                 )));
             }
-            checkout.active_intent = true;
-            checkout.health = CheckoutHealth::Available;
-            checkout.lifecycle = CheckoutLifecycle::Active;
+            if checkout.key == prepared.checkout {
+                checkout.set_lifecycle(CheckoutLifecycle::Active);
+            }
             checkout.session.cwd = PersistedPath::from_path(&record.path);
             checkout.session.repo_root = PersistedPath::from_path(&fresh.main_worktree);
             checkout.session.branch = Some(prepared.request.branch.clone());
@@ -1623,6 +1861,7 @@ fn execute_activation_with_post_git_hook(
                 observed_branch: Some(full_ref),
                 first_seen_order: prepared.first_seen_order,
                 lifecycle: CheckoutLifecycle::Active,
+                owned_runtime: None,
                 active_intent: true,
                 session: RetainedSessionState {
                     name: format!("{repository_name}:{}", prepared.request.branch),
@@ -1683,6 +1922,7 @@ fn execute_activation_with_post_git_hook(
                         verification: error.to_string(),
                         compensation: compensation.to_string(),
                     }),
+                    owned_runtime: None,
                     active_intent: false,
                     session: RetainedSessionState {
                         name: activation_branch.clone(),
@@ -1881,7 +2121,7 @@ mod tests {
             ),
             (
                 CheckoutLifecycle::Active,
-                LifecycleEvent::LaunchRegistered(RuntimeGeneration::initial()),
+                LifecycleEvent::LaunchRegistered(super::contract_owned_runtime()),
                 CheckoutLifecycle::Launching(RuntimeGeneration::initial()),
                 LifecycleTraceEntry::PersistRuntime,
             ),
@@ -1963,9 +2203,8 @@ mod tests {
             ]
         );
         for checkout in &mut state.checkouts {
-            checkout.lifecycle = CheckoutLifecycle::Inactive;
-            checkout.active_intent = false;
-            checkout.health = CheckoutHealth::Available;
+            checkout.set_lifecycle(CheckoutLifecycle::Inactive);
+            checkout.set_owned_runtime(None);
         }
         assert!(startup_recovery_program(&state).is_empty());
         assert!(startup_recovery_program(&state).is_empty());
@@ -2003,6 +2242,7 @@ mod tests {
             observed_branch: Some("refs/heads/feature/close".into()),
             first_seen_order: checkout_order,
             lifecycle: CheckoutLifecycle::Active,
+            owned_runtime: None,
             active_intent: true,
             session: RetainedSessionState {
                 name: "old name".into(),
@@ -2430,7 +2670,7 @@ mod tests {
 
         for topology in unavailable {
             let mut state = close_state();
-            state.checkouts[0].active_intent = false;
+            state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
             let checkout = state.checkouts[0].key;
             let error = plan_reopen(
                 &mut state,
@@ -2485,8 +2725,8 @@ mod tests {
     fn teardown_pending_cannot_reopen_and_completes_inactive_before_explicit_reopen() {
         let mut state = close_state();
         let checkout = state.checkouts[0].key;
-        state.checkouts[0].health =
-            CheckoutHealth::Unavailable(crate::repository::UnavailableCause::TeardownPending {
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Protected(
+            crate::repository::UnavailableCause::TeardownPending {
                 agent_pid: Some(u32::MAX),
                 shell_pid: None,
                 agent_identity: None,
@@ -2494,7 +2734,8 @@ mod tests {
                 agent_stopped: true,
                 shell_stopped: true,
                 detail: "owner crashed after teardown".into(),
-            });
+            },
+        ));
 
         let blocked = plan_reopen(
             &mut state,
@@ -2534,7 +2775,7 @@ mod tests {
 
         for (runtime, expected) in vectors {
             let mut state = close_state();
-            state.checkouts[0].active_intent = false;
+            state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
             state.checkouts[0].session.resume_id = Some("conversation-42".into());
             let checkout = state.checkouts[0].key;
             let plan = plan_reopen(
@@ -2554,7 +2795,7 @@ mod tests {
         }
 
         let mut state = close_state();
-        state.checkouts[0].active_intent = false;
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
         let checkout = state.checkouts[0].key;
         let plan = plan_reopen(
             &mut state,

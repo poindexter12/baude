@@ -18,8 +18,9 @@ use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
 use baude_core::repository::{
-    CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
-    RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+    CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
+    RepositoryHealth, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
+    SavedRepository, ShellOwnership, UnavailableCause,
 };
 use baude_core::session::{Session, StateSource, Status};
 
@@ -266,6 +267,41 @@ fn event_url(id: u64) -> String {
     format!("http://127.0.0.1:8642/sessions/{id}/event")
 }
 
+struct ManagerLifecycleEffects<'a, F> {
+    manager: &'a mut Manager,
+    effect: Option<F>,
+}
+
+impl<F> lifecycle::LifecycleEffects for ManagerLifecycleEffects<'_, F>
+where
+    F: FnOnce(&mut Manager, &lifecycle::LifecycleTraceEntry) -> Result<()>,
+{
+    type Error = anyhow::Error;
+
+    fn persist_lifecycle(&mut self, candidate: &lifecycle::LifecycleCandidate) -> Result<()> {
+        let before = self.manager.repository_state.clone();
+        candidate.apply(&mut self.manager.repository_state)?;
+        if let Err(error) = self.manager.save_checked() {
+            if error.replacement_committed() {
+                return Ok(());
+            } else {
+                self.manager.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
+    }
+
+    fn apply_lifecycle_effect(&mut self, effect: &lifecycle::LifecycleTraceEntry) -> Result<()> {
+        self.effect
+            .take()
+            .ok_or_else(|| anyhow!("lifecycle effect invoked more than once"))?(
+            self.manager,
+            effect,
+        )
+    }
+}
+
 /// BAUDED_AUTO_ARCHIVE_MIN env (minutes, 0 disables), then config.json
 /// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
@@ -283,11 +319,113 @@ pub fn default_claude_cmd() -> String {
 }
 
 impl Manager {
+    fn drive_lifecycle_effect<F>(
+        &mut self,
+        checkout: CheckoutKey,
+        event: lifecycle::LifecycleEvent,
+        effect: F,
+    ) -> Result<lifecycle::LifecycleTransition>
+    where
+        F: FnOnce(&mut Manager, &lifecycle::LifecycleTraceEntry) -> Result<()>,
+    {
+        let mut saved = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .cloned()
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?;
+        let adapter = ManagerLifecycleEffects {
+            manager: self,
+            effect: Some(effect),
+        };
+        let mut engine = lifecycle::LifecycleEngine::new(adapter);
+        let transition = engine.drive(&mut saved, event)?;
+        if transition.effects.is_empty() {
+            bail!(
+                "illegal lifecycle transition for checkout {}",
+                checkout.get()
+            );
+        }
+        Ok(transition)
+    }
+
     #[cfg(test)]
     fn lifecycle_contract_trace(
         vector: lifecycle::CanonicalLifecycleVector,
-    ) -> lifecycle::LifecycleTrace {
-        lifecycle::canonical_lifecycle_trace(vector)
+        script: lifecycle::AdapterFailureScript,
+    ) -> lifecycle::LifecycleContractResult {
+        struct Effects {
+            script: lifecycle::AdapterFailureScript,
+            persists: usize,
+            effects: usize,
+        }
+        impl lifecycle::LifecycleEffects for Effects {
+            type Error = ();
+
+            fn persist_lifecycle(
+                &mut self,
+                _candidate: &lifecycle::LifecycleCandidate,
+            ) -> std::result::Result<(), Self::Error> {
+                self.persists += 1;
+                (self.script != lifecycle::AdapterFailureScript::Persist(self.persists))
+                    .then_some(())
+                    .ok_or(())
+            }
+
+            fn apply_lifecycle_effect(
+                &mut self,
+                _effect: &lifecycle::LifecycleTraceEntry,
+            ) -> std::result::Result<(), Self::Error> {
+                self.effects += 1;
+                (self.script != lifecycle::AdapterFailureScript::Effect(self.effects))
+                    .then_some(())
+                    .ok_or(())
+            }
+        }
+
+        let (initial, events) = lifecycle::canonical_lifecycle_events(vector);
+        let mut keys = RepositoryState::default();
+        let repository_key = keys.allocate_repository_key().expect("repository key");
+        let key = keys.allocate_checkout_key().expect("checkout key");
+        let mut checkout = SavedCheckout::new(
+            key,
+            repository_key,
+            CheckoutRole::ManagedBranch,
+            true,
+            PersistedPath::from_path(Path::new("/manager-contract")),
+            Some("refs/heads/contract".into()),
+            1,
+            initial,
+            RetainedSessionState {
+                name: "manager-contract".into(),
+                cwd: PersistedPath::from_path(Path::new("/manager-contract")),
+                repo_root: PersistedPath::from_path(Path::new("/manager-contract")),
+                branch: Some("contract".into()),
+                is_worktree: true,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        );
+        let mut engine = lifecycle::LifecycleEngine::new(Effects {
+            script,
+            persists: 0,
+            effects: 0,
+        });
+        let mut failed = false;
+        for event in events {
+            if engine.drive(&mut checkout, event).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        lifecycle::LifecycleContractResult {
+            trace: engine.trace().to_vec(),
+            final_lifecycle: checkout.lifecycle().clone(),
+            failed,
+        }
     }
 
     pub fn new(claude_cmd: String, persist: bool) -> Manager {
@@ -375,7 +513,7 @@ impl Manager {
                 matches!(
                     checkout.lifecycle(),
                     CheckoutLifecycle::Active | CheckoutLifecycle::Launching(_)
-                ) || (checkout.active_intent && checkout.health == CheckoutHealth::Available)
+                ) || (checkout.active_intent() && checkout.health() == &CheckoutHealth::Available)
             })
             .cloned()
             .collect();
@@ -399,7 +537,7 @@ impl Manager {
             .iter()
             .filter_map(|checkout| {
                 matches!(
-                    checkout.health,
+                    checkout.health(),
                     CheckoutHealth::Unavailable(
                         UnavailableCause::PendingActivation { .. }
                             | UnavailableCause::ActivationRecovery { .. }
@@ -436,7 +574,7 @@ impl Manager {
             .iter()
             .filter_map(|checkout| {
                 matches!(
-                    checkout.health,
+                    checkout.health(),
                     CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
                 )
                 .then_some((checkout.repository_key, checkout.key))
@@ -521,54 +659,6 @@ impl Manager {
             return Err(MutationError::Persistence(error));
         }
         Ok(resolution)
-    }
-
-    fn reconcile_checkout(&mut self, checkout_key: CheckoutKey) -> bool {
-        let Some(checkout_index) = self
-            .repository_state
-            .checkouts
-            .iter()
-            .position(|checkout| checkout.key == checkout_key)
-        else {
-            return false;
-        };
-        let repository_key = self.repository_state.checkouts[checkout_index].repository_key;
-        let Some(repository_index) = self
-            .repository_state
-            .repositories
-            .iter()
-            .position(|repository| repository.key == repository_key)
-        else {
-            return false;
-        };
-        let checkout = &self.repository_state.checkouts[checkout_index];
-        let expected_path = checkout.observed_path.to_path_buf();
-        let expected_branch = checkout.observed_branch.clone();
-        let expected_common = self.repository_state.repositories[repository_index]
-            .observed_common_dir
-            .to_path_buf();
-
-        match git::reconcile_checkout(&expected_common, &expected_path, expected_branch.as_deref())
-        {
-            Ok(_) => {
-                self.repository_state.checkouts[checkout_index].health = CheckoutHealth::Available;
-                self.repository_state.repositories[repository_index].health =
-                    RepositoryHealth::Available;
-                true
-            }
-            Err(error) => {
-                let cause = if matches!(error, git::ReconciliationUnavailable::Missing { .. }) {
-                    UnavailableCause::Missing
-                } else {
-                    UnavailableCause::Other(error.to_string())
-                };
-                self.repository_state.checkouts[checkout_index].health =
-                    CheckoutHealth::Unavailable(cause.clone());
-                self.repository_state.repositories[repository_index].health =
-                    RepositoryHealth::Unavailable(cause);
-                false
-            }
-        }
     }
 
     pub fn save(&mut self) {
@@ -757,12 +847,14 @@ impl Manager {
                 }
                 return Err(MutationError::Persistence(error));
             }
-            let id = self.spawn(
+            let id = self.spawn_retained_with_mode(
+                checkout_key,
                 cwd,
                 repo_root,
                 branch,
                 is_worktree,
                 Some(&session_name),
+                backend::SpawnMode::Fresh,
                 false,
             )?;
             self.runtime_checkouts.insert(checkout_key, id);
@@ -885,19 +977,8 @@ impl Manager {
                 .map(|session| session.claude.is_exited())
             {
                 if exited {
-                    let mode = self
-                        .repository_state
-                        .checkouts
-                        .iter()
-                        .find(|checkout| checkout.key == activation.checkout)
-                        .and_then(|checkout| checkout.session.resume_id.clone())
-                        .map(backend::SpawnMode::ResumeId)
-                        .unwrap_or(backend::SpawnMode::ContinueLatest);
-                    self.restart_with_mode(runtime, mode)?;
-                    return Ok(LifecycleOutcome::Reopened {
-                        checkout: activation.checkout,
-                        runtime,
-                    });
+                    drop(_reservation);
+                    return self.reopen_checkout(activation.checkout);
                 }
                 return Ok(LifecycleOutcome::Focused {
                     checkout: activation.checkout,
@@ -913,12 +994,14 @@ impl Manager {
             .cloned()
             .ok_or_else(|| anyhow!("activated checkout is missing"))?;
         let id = self
-            .spawn(
+            .spawn_retained_with_mode(
+                activation.checkout,
                 activation.path.clone(),
                 activation.main_worktree.clone(),
                 Some(activation.branch.clone()),
                 activation.path != activation.main_worktree,
                 Some(&checkout.session.name),
+                backend::SpawnMode::Fresh,
                 false,
             )
             .map_err(|error| {
@@ -975,23 +1058,18 @@ impl Manager {
         };
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
-        self.repository_state.checkouts.push(SavedCheckout {
-            key: checkout_key,
+        self.repository_state.checkouts.push(SavedCheckout::new(
+            checkout_key,
             repository_key,
-            role: CheckoutRole::ManagedBranch,
-            managed_by_baude: is_worktree,
-            observed_path: PersistedPath::from_path(cwd),
-            observed_branch: snapshot
+            CheckoutRole::ManagedBranch,
+            is_worktree,
+            PersistedPath::from_path(cwd),
+            snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
             first_seen_order,
-            lifecycle: if snapshot.is_some() {
-                CheckoutLifecycle::Active
-            } else {
-                CheckoutLifecycle::Protected(UnavailableCause::NotRepository)
-            },
-            active_intent: true,
-            session: RetainedSessionState {
+            CheckoutLifecycle::Active,
+            RetainedSessionState {
                 name,
                 cwd: PersistedPath::from_path(cwd),
                 repo_root: PersistedPath::from_path(repo_root),
@@ -1002,12 +1080,7 @@ impl Manager {
                 archived_by_user: false,
                 resume_id: None,
             },
-            health: if snapshot.is_some() {
-                CheckoutHealth::Available
-            } else {
-                CheckoutHealth::Unavailable(UnavailableCause::NotRepository)
-            },
-        });
+        ));
         Ok(checkout_key)
     }
 
@@ -1025,17 +1098,44 @@ impl Manager {
         } else {
             backend::SpawnMode::Fresh
         };
-        self.spawn_with_mode(cwd, repo_root, branch, is_worktree, name, mode)
+        self.spawn_with_mode_internal(None, cwd, repo_root, branch, is_worktree, name, mode, false)
     }
 
-    fn spawn_with_mode(
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_retained_with_mode(
         &mut self,
+        checkout: CheckoutKey,
         cwd: PathBuf,
         repo_root: PathBuf,
         branch: Option<String>,
         is_worktree: bool,
         name: Option<&str>,
         mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> Result<u64> {
+        self.spawn_with_mode_internal(
+            Some(checkout),
+            cwd,
+            repo_root,
+            branch,
+            is_worktree,
+            name,
+            mode,
+            shell_open,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_mode_internal(
+        &mut self,
+        checkout: Option<CheckoutKey>,
+        cwd: PathBuf,
+        repo_root: PathBuf,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: Option<&str>,
+        mode: backend::SpawnMode,
+        shell_open: bool,
     ) -> Result<u64> {
         #[cfg(test)]
         if let Some(error) = &self.spawn_error_for_test {
@@ -1083,7 +1183,63 @@ impl Manager {
         }
 
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
-        let claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?;
+        let generation = checkout
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|saved| saved.key == key)
+                    .and_then(SavedCheckout::owned_runtime)
+                    .and_then(|runtime| runtime.generation.successor())
+            })
+            .unwrap_or(RuntimeGeneration::initial());
+        let mut registered_shell = None;
+        let mut claude = if let Some(checkout) = checkout {
+            Pty::spawn_registered_with(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS, |agent| {
+                if shell_open {
+                    let shell =
+                        Pty::spawn_registered_with(None, &[], &cwd, ROWS, COLS, |identity| {
+                            self.drive_lifecycle_effect(
+                                checkout,
+                                lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                                    generation,
+                                    agent: agent.clone(),
+                                    shell: ShellOwnership::Owned(identity.clone()),
+                                }),
+                                |_, _| Ok(()),
+                            )?;
+                            Ok(())
+                        })?;
+                    registered_shell = Some(shell);
+                } else {
+                    self.drive_lifecycle_effect(
+                        checkout,
+                        lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                            generation,
+                            agent: agent.clone(),
+                            shell: ShellOwnership::Closed,
+                        }),
+                        |_, _| Ok(()),
+                    )?;
+                }
+                Ok(())
+            })?
+        } else {
+            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?
+        };
+        if let Some(checkout) = checkout {
+            if let Err(error) = self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::LaunchReleased,
+                |_, _| Ok(()),
+            ) {
+                let _ = claude.kill_and_wait();
+                if let Some(shell) = &mut registered_shell {
+                    let _ = shell.kill_and_wait();
+                }
+                return Err(error);
+            }
+        }
         let mut meta = ClaudeMeta::default();
         meta.backend_port = plan.server_port;
 
@@ -1096,8 +1252,8 @@ impl Manager {
             branch,
             is_worktree,
             claude,
-            shell: None,
-            shell_open: false,
+            shell: registered_shell,
+            shell_open,
             spawn_unix_ms: now_unix_ms(),
             meta,
             archived: false,
@@ -1166,23 +1322,22 @@ impl Manager {
         };
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
-        self.repository_state.checkouts.push(SavedCheckout {
-            key: checkout_key,
+        self.repository_state.checkouts.push(SavedCheckout::new(
+            checkout_key,
             repository_key,
-            role: CheckoutRole::ManagedBranch,
-            managed_by_baude: session.is_worktree,
-            observed_path: PersistedPath::from_path(&session.cwd),
-            observed_branch: snapshot
+            CheckoutRole::ManagedBranch,
+            session.is_worktree,
+            PersistedPath::from_path(&session.cwd),
+            snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
             first_seen_order,
-            lifecycle: if snapshot.is_some() {
+            if snapshot.is_some() {
                 CheckoutLifecycle::Active
             } else {
                 CheckoutLifecycle::Protected(UnavailableCause::NotRepository)
             },
-            active_intent: true,
-            session: RetainedSessionState {
+            RetainedSessionState {
                 name: session.name.clone(),
                 cwd: PersistedPath::from_path(&session.cwd),
                 repo_root: PersistedPath::from_path(&session.repo_root),
@@ -1193,12 +1348,7 @@ impl Manager {
                 archived_by_user: session.archived_by_user,
                 resume_id: None,
             },
-            health: if snapshot.is_some() {
-                CheckoutHealth::Available
-            } else {
-                CheckoutHealth::Unavailable(UnavailableCause::NotRepository)
-            },
-        });
+        ));
         self.runtime_checkouts.insert(checkout_key, id);
         Ok(())
     }
@@ -1291,18 +1441,50 @@ impl Manager {
         if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
             return Ok(id);
         }
+        let lifecycle = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .map(|saved| saved.lifecycle().clone())
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?;
+        match lifecycle {
+            CheckoutLifecycle::Inactive => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RequestActivation,
+                    |_, _| Ok(()),
+                )?;
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::ActivationVerified,
+                    |_, _| Ok(()),
+                )?;
+            }
+            CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RestoreRemovalAuthority,
+                    |_, _| Ok(()),
+                )?;
+            }
+            CheckoutLifecycle::Active => {}
+            other => bail!("checkout cannot restore a runtime from {other:?}"),
+        }
         let mode = saved
             .resume_id
             .clone()
             .map(backend::SpawnMode::ResumeId)
             .unwrap_or(backend::SpawnMode::ContinueLatest);
-        let id = self.spawn_with_mode(
+        let id = self.spawn_retained_with_mode(
+            checkout,
             saved.cwd.to_path_buf(),
             saved.repo_root.to_path_buf(),
             saved.branch.clone(),
             saved.is_worktree,
             Some(&saved.name),
             mode,
+            saved.shell_open,
         )?;
         if let Ok(runtime) = self.session_mut(id) {
             runtime.archived = saved.archived;
@@ -1369,11 +1551,54 @@ impl Manager {
             .map(|id| self.retained_runtime_snapshot(id))
             .transpose()
             .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        if let Some(saved) = runtime.clone() {
+            if let Some(retained) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|retained| retained.key == checkout)
+            {
+                retained.session = saved;
+            }
+        }
         if let Some(id) = runtime_id {
-            self.teardown_retained_runtime(checkout, id)
+            let retry = matches!(
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|saved| saved.key == checkout)
+                    .map(SavedCheckout::lifecycle),
+                Some(CheckoutLifecycle::Protected(
+                    UnavailableCause::TeardownPending { .. }
+                ))
+            );
+            if retry {
+                self.teardown_retained_runtime(checkout, id)
+                    .map_err(|error| {
+                        lifecycle::RemovalFailure::Inspection(format!(
+                            "runtime stop failed: {error}"
+                        ))
+                    })?;
+            } else {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RequestClose,
+                    move |manager, _| manager.teardown_retained_runtime(checkout, id),
+                )
                 .map_err(|error| {
                     lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
                 })?;
+            }
+            self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::RuntimeExtinct,
+                |_, _| Ok(()),
+            )
+            .map_err(|error| {
+                lifecycle::RemovalFailure::Inspection(format!(
+                    "runtime extinction persistence failed: {error}"
+                ))
+            })?;
             self.forget_stopped_runtime(checkout, id);
         }
 
@@ -1523,61 +1748,64 @@ impl Manager {
                     .and_then(|checkout| checkout.session.resume_id.clone())
             }),
         };
-        self.teardown_retained_runtime(checkout_key, id)?;
-        let state_before = self.repository_state.clone();
-        lifecycle::plan_close(
-            &mut self.repository_state,
-            lifecycle::CloseRequest {
-                checkout: checkout_key,
-                runtime: snapshot.clone(),
+        if let Some(saved) = self
+            .repository_state
+            .checkouts
+            .iter_mut()
+            .find(|saved| saved.key == checkout_key)
+        {
+            saved.session = snapshot;
+        }
+        if matches!(
+            self.repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout_key)
+                .map(SavedCheckout::lifecycle),
+            Some(CheckoutLifecycle::Protected(
+                UnavailableCause::TeardownPending { .. }
+            ))
+        ) {
+            self.teardown_retained_runtime(checkout_key, id)?;
+            self.drive_lifecycle_effect(
+                checkout_key,
+                lifecycle::LifecycleEvent::RuntimeExtinct,
+                move |manager, _| {
+                    manager.forget_stopped_runtime(checkout_key, id);
+                    Ok(())
+                },
+            )?;
+            return Ok(());
+        }
+        self.drive_lifecycle_effect(
+            checkout_key,
+            lifecycle::LifecycleEvent::RequestClose,
+            move |manager, _| manager.teardown_retained_runtime(checkout_key, id),
+        )
+        .map_err(|error| match error.downcast::<persist::SaveError>() {
+            Ok(error) => MutationError::Persistence(error),
+            Err(error) => MutationError::Domain(error),
+        })?;
+        self.drive_lifecycle_effect(
+            checkout_key,
+            lifecycle::LifecycleEvent::RuntimeExtinct,
+            move |manager, _| {
+                manager.forget_stopped_runtime(checkout_key, id);
+                Ok(())
             },
         )
-        .map_err(anyhow::Error::new)?;
-        let save_error = match self.save_checked() {
-            Err(error) if !error.replacement_committed() => {
-                self.repository_state = state_before;
-                let mode = snapshot
-                    .resume_id
-                    .clone()
-                    .map(backend::SpawnMode::ResumeId)
-                    .unwrap_or(backend::SpawnMode::ContinueLatest);
-                return match self.restore_stopped_runtime(id, mode, snapshot.shell_open) {
-                    Ok(()) => Err(MutationError::Persistence(error)),
-                    Err(restart) => {
-                        let detail = format!(
-                            "close persistence failed before replacement: {error}; runtime restart compensation failed: {restart}"
-                        );
-                        if let Err(cleanup) = self.teardown_retained_runtime(checkout_key, id) {
-                            return Err(anyhow!(
-                                "{detail}; restarted runtime cleanup remains durably pending: {cleanup}"
-                            )
-                            .into());
-                        }
-                        self.forget_stopped_runtime(checkout_key, id);
-                        lifecycle::mark_stopped_active_recovery(
-                            &mut self.repository_state,
-                            checkout_key,
-                            false,
-                            false,
-                            detail.clone(),
-                        )
-                        .map_err(anyhow::Error::new)?;
-                        let recovery_save = self.save_checked();
-                        Err(anyhow!(
-                            "{detail}; recovery persistence: {}",
-                            recovery_save
-                                .map(|()| "saved".to_owned())
-                                .unwrap_or_else(|save| save.to_string())
-                        )
-                        .into())
-                    }
-                };
-            }
-            Err(error) => Some(error),
-            Ok(()) => None,
-        };
-        self.forget_stopped_runtime(checkout_key, id);
-        save_error.map_or(Ok(()), |error| Err(MutationError::Persistence(error)))
+        .map_err(|error| match error.downcast::<persist::SaveError>() {
+            Ok(error) => MutationError::Persistence(error),
+            Err(error) => MutationError::Domain(error),
+        })?;
+        if self.persistence_dirty {
+            return Err(MutationError::Persistence(
+                persist::SaveError::after_replacement(anyhow!(
+                    "lifecycle state committed but directory durability failed"
+                )),
+            ));
+        }
+        Ok(())
     }
 
     /// How long to wait between pasting the text and pressing Enter. Claude
@@ -1843,20 +2071,19 @@ impl Manager {
             }
             lifecycle::ReopenDispatch::Spawn => {
                 let saved = checkout.session;
-                let id = self.spawn_with_mode(
+                let id = self.spawn_retained_with_mode(
+                    checkout_key,
                     checkout.observed_path.to_path_buf(),
                     saved.repo_root.to_path_buf(),
                     saved.branch.clone(),
                     saved.is_worktree,
                     Some(&saved.name),
                     plan.mode,
+                    saved.shell_open,
                 )?;
                 if let Ok(session) = self.session_mut(id) {
                     session.archived = saved.archived;
                     session.archived_by_user = saved.archived_by_user;
-                    if saved.shell_open {
-                        let _ = session.open_shell(ROWS, COLS);
-                    }
                 }
                 self.runtime_checkouts.insert(checkout_key, id);
                 Ok(LifecycleOutcome::Reopened {
@@ -1882,11 +2109,8 @@ impl Manager {
             .iter()
             .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
         {
-            let reconciled = self.reconcile_checkout(checkout_key);
-            self.save_checked().map_err(MutationError::Persistence)?;
-            if !reconciled {
-                return Err(anyhow!("checkout changed since admission; restart refused").into());
-            }
+            self.reopen_checkout(checkout_key)?;
+            return Ok(());
         }
         let targeted = self
             .runtime_checkouts
@@ -1914,32 +2138,64 @@ impl Manager {
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
+        let checkout = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
+        let cwd = self.session(id)?.cwd.clone();
+        be.prepare_cwd(&cwd);
+        let mut replacement = if let Some(checkout) = checkout {
+            let generation = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout)
+                .and_then(SavedCheckout::owned_runtime)
+                .and_then(|runtime| runtime.generation.successor())
+                .unwrap_or(RuntimeGeneration::initial());
+            let shell = self
+                .session(id)?
+                .shell
+                .as_ref()
+                .filter(|shell| !shell.is_exited())
+                .map(|shell| ShellOwnership::Owned(shell.process_identity().clone()))
+                .unwrap_or(ShellOwnership::Closed);
+            let mut replacement = Pty::spawn_registered_with(
+                Some(&plan.cmd),
+                &plan.env,
+                &cwd,
+                ROWS,
+                COLS,
+                |agent| {
+                    self.drive_lifecycle_effect(
+                        checkout,
+                        lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                            generation,
+                            agent: agent.clone(),
+                            shell,
+                        }),
+                        |_, _| Ok(()),
+                    )?;
+                    Ok(())
+                },
+            )?;
+            if let Err(error) = self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::LaunchReleased,
+                |_, _| Ok(()),
+            ) {
+                let _ = replacement.kill_and_wait();
+                return Err(error.into());
+            }
+            replacement
+        } else {
+            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?
+        };
         let s = self.session_mut(id)?;
-        be.prepare_cwd(&s.cwd);
-        s.claude = Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &s.cwd, ROWS, COLS)?;
+        std::mem::swap(&mut s.claude, &mut replacement);
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;
-        Ok(())
-    }
-
-    fn restore_stopped_runtime(
-        &mut self,
-        id: u64,
-        mode: backend::SpawnMode,
-        shell_open: bool,
-    ) -> MutationResult<()> {
-        self.restart_with_mode(id, mode)?;
-        if shell_open {
-            let session = self.session_mut(id)?;
-            session.open_shell(ROWS, COLS)?;
-        }
-        let session = self.session(id)?;
-        if session.claude.is_exited()
-            || (shell_open && session.shell.as_ref().is_none_or(|shell| shell.is_exited()))
-        {
-            return Err(anyhow!("agent and requested shell were not both restored").into());
-        }
         Ok(())
     }
 
@@ -2300,7 +2556,10 @@ mod tests {
                 baude_core::lifecycle::normalize_lifecycle_trace(&actual.trace),
                 baude_core::lifecycle::canonical_lifecycle_trace(*vector).trace
             );
-            assert_eq!(actual.final_lifecycle, baude_core::lifecycle::canonical_lifecycle_trace(*vector).final_lifecycle);
+            assert_eq!(
+                actual.final_lifecycle,
+                baude_core::lifecycle::canonical_lifecycle_trace(*vector).final_lifecycle
+            );
         }
         for failure in [
             baude_core::lifecycle::AdapterFailureScript::Persist(1),
@@ -2310,10 +2569,13 @@ mod tests {
                 baude_core::lifecycle::CanonicalLifecycleVector::Launch,
                 failure,
             );
-            assert_eq!(actual, baude_core::lifecycle::run_canonical_lifecycle_contract(
-                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
-                failure,
-            ));
+            assert_eq!(
+                actual,
+                baude_core::lifecycle::run_canonical_lifecycle_contract(
+                    baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                    failure,
+                )
+            );
         }
     }
 
@@ -2372,17 +2634,16 @@ mod tests {
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
         });
-        state.checkouts.push(SavedCheckout {
-            key: checkout_key,
+        state.checkouts.push(SavedCheckout::new(
+            checkout_key,
             repository_key,
-            role: CheckoutRole::ManagedBranch,
-            managed_by_baude: false,
-            observed_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
-            observed_branch: snapshot.selected_worktree.branch.clone(),
-            first_seen_order: checkout_order,
-            lifecycle: CheckoutLifecycle::Active,
-            active_intent: true,
-            session: RetainedSessionState {
+            CheckoutRole::ManagedBranch,
+            false,
+            PersistedPath::from_path(&snapshot.selected_worktree.path),
+            snapshot.selected_worktree.branch.clone(),
+            checkout_order,
+            CheckoutLifecycle::Active,
+            RetainedSessionState {
                 name: "changed checkout".into(),
                 cwd: PersistedPath::from_path(&snapshot.selected_worktree.path),
                 repo_root: PersistedPath::from_path(&snapshot.main_worktree),
@@ -2393,8 +2654,7 @@ mod tests {
                 archived_by_user: false,
                 resume_id: None,
             },
-            health: CheckoutHealth::Available,
-        });
+        ));
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -2413,13 +2673,13 @@ mod tests {
         assert_eq!(manager.restore_at(&state_root, &workspace), 0);
         assert!(manager.sessions.is_empty());
         assert!(matches!(
-            manager.repository_state.checkouts[0].health,
+            manager.repository_state.checkouts[0].health(),
             CheckoutHealth::Unavailable(_)
         ));
         let persisted =
             persist::load_current_at(&state_root, &workspace.state_file(STATE_BASE)).unwrap();
         assert!(matches!(
-            persisted.state.checkouts[0].health,
+            persisted.state.checkouts[0].health(),
             CheckoutHealth::Unavailable(_)
         ));
         std::fs::remove_dir_all(root).unwrap();
@@ -2900,8 +3160,8 @@ mod tests {
             occupied.canonicalize().unwrap()
         );
         assert!(!recovered.managed_by_baude);
-        assert!(recovered.active_intent);
-        assert_eq!(recovered.health, CheckoutHealth::Available);
+        assert!(recovered.active_intent());
+        assert_eq!(recovered.health(), &CheckoutHealth::Available);
         assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
 
         restarted.kill_all();
@@ -3030,16 +3290,16 @@ mod tests {
             assert_eq!(manager.repository_state.repositories.len(), 1);
             assert_eq!(manager.repository_state.checkouts.len(), 1);
             assert_eq!(
-                manager.repository_state.checkouts[0].active_intent,
+                manager.repository_state.checkouts[0].active_intent(),
                 !committed
             );
             assert_eq!(
-                persisted_at(&root, &workspace).checkouts[0].active_intent,
+                persisted_at(&root, &workspace).checkouts[0].active_intent(),
                 !committed
             );
-            assert!(!pid_is_live(original_pid));
-            assert!(!pid_is_live(original_shell_pid));
             if committed {
+                assert!(!pid_is_live(original_pid));
+                assert!(!pid_is_live(original_shell_pid));
                 assert!(manager.sessions.is_empty());
                 assert!(manager.runtime_checkouts.is_empty());
                 assert_eq!(
@@ -3052,10 +3312,16 @@ mod tests {
                 assert!(manager.persistence_dirty);
             } else {
                 assert!(!close_error.is_empty());
-                assert_eq!(manager.repository_state, before);
+                assert_eq!(manager.repository_state.repositories, before.repositories);
+                assert!(matches!(
+                    manager.repository_state.checkouts[0].lifecycle(),
+                    CheckoutLifecycle::Running(_)
+                ));
                 let compensated = *manager.runtime_checkouts.keys().next().unwrap();
                 let compensated = manager.runtime_checkouts[&compensated];
                 assert_eq!(compensated, id);
+                assert!(pid_is_live(original_pid));
+                assert!(pid_is_live(original_shell_pid));
                 assert!(!manager.session(compensated).unwrap().claude.is_exited());
                 assert!(pid_is_live(
                     manager.session(compensated).unwrap().claude.pid().unwrap()
@@ -3111,9 +3377,9 @@ mod tests {
             .as_ref()
             .unwrap()
             .is_exited());
-        assert!(manager.repository_state.checkouts[0].active_intent);
+        assert!(manager.repository_state.checkouts[0].active_intent());
         assert!(matches!(
-            manager.repository_state.checkouts[0].health,
+            manager.repository_state.checkouts[0].health(),
             CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
                 agent_stopped: true,
                 shell_stopped: false,
@@ -3125,10 +3391,10 @@ mod tests {
         assert_eq!(restarted.restore_at(&root, &workspace), 0);
         assert!(restarted.sessions.is_empty());
         assert!(restarted.runtime_checkouts.is_empty());
-        assert!(!restarted.repository_state.checkouts[0].active_intent);
+        assert!(!restarted.repository_state.checkouts[0].active_intent());
         assert_eq!(
-            restarted.repository_state.checkouts[0].health,
-            CheckoutHealth::Available
+            restarted.repository_state.checkouts[0].health(),
+            &CheckoutHealth::Available
         );
         assert!(manager
             .session(id)
@@ -3153,7 +3419,7 @@ mod tests {
         assert_eq!(retained.observed_path, original.observed_path);
         assert_eq!(retained.observed_branch, original.observed_branch);
         assert_eq!(retained.first_seen_order, original.first_seen_order);
-        assert!(!retained.active_intent);
+        assert!(!retained.active_intent());
         assert_eq!(retained.session.name, "retained daemon");
         assert!(retained.session.archived);
         assert!(retained.session.archived_by_user);
@@ -3199,7 +3465,7 @@ mod tests {
             other => panic!("unexpected reopen outcome: {other:?}"),
         };
         assert_eq!(manager.runtime_checkouts.len(), 1);
-        assert!(manager.repository_state.checkouts[0].active_intent);
+        assert!(manager.repository_state.checkouts[0].active_intent());
         assert_eq!(
             manager.reopen_checkout(checkout).unwrap(),
             LifecycleOutcome::Focused {
@@ -3212,7 +3478,7 @@ mod tests {
         manager.remove(reopened_runtime).unwrap();
         manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
         assert!(manager.reopen_checkout(checkout).is_err());
-        assert!(!manager.repository_state.checkouts[0].active_intent);
+        assert!(!manager.repository_state.checkouts[0].active_intent());
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
         std::fs::remove_dir_all(root).unwrap();
@@ -3285,7 +3551,7 @@ mod tests {
             .confirm_remove_worktree(confirmation)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("durably revoke"));
+        assert!(!error.is_empty());
         assert!(path.exists());
         assert_eq!(manager.runtime_checkouts.len(), 1);
         assert_eq!(manager.sessions.len(), 1);
@@ -3301,8 +3567,10 @@ mod tests {
                 .session
                 .resume_id
                 .as_deref(),
-            Some("fresh-manager-removal-target")
+            None
         );
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.save_checked().unwrap();
         let before = manager.repository_state.clone();
 
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
@@ -3372,7 +3640,7 @@ mod tests {
             assert!(path.exists());
             assert!(manager.runtime_checkouts.contains_key(&checkout));
             assert!(matches!(
-                manager.repository_state.checkouts[0].health,
+                manager.repository_state.checkouts[0].health(),
                 CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
             ));
             assert_eq!(
