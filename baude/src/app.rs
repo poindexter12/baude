@@ -4852,6 +4852,11 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_flat_remote_compatibility_has_no_local_parent_or_remove_action() {
+        panic!("flat remote compatibility proof is not implemented");
+    }
+
+    #[test]
     fn hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus() {
         let mut paused = App::new(PathBuf::from("/not-a-repository"));
         paused.remote = None;

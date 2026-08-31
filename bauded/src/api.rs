@@ -742,6 +742,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flat_session_api_remains_a_non_hierarchical_compatibility_projection() {
+        panic!("flat retained-close API compatibility proof is not implemented");
+    }
+
+    #[tokio::test]
     async fn unknown_session_is_404() {
         let app = app();
         for req in [
