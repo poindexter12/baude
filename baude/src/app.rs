@@ -5716,6 +5716,11 @@ mod tests {
     }
 
     #[test]
+    fn local_tui_dogfood_real_git_flow_survives_restart_without_duplicates() {
+        panic!("isolated real-Git restart/dedup dogfood harness is not implemented");
+    }
+
+    #[test]
     fn lifecycle_remove_clean_local_rechecks_after_stop_and_compensates_a_race() {
         let repo = admission_repo("safe-remove-local");
         let root = repo.parent().unwrap().to_path_buf();
