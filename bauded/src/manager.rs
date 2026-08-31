@@ -21,9 +21,7 @@ use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
     RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
 };
-use baude_core::session::{
-    verify_runtime_restoration, RuntimeRestorationFailure, Session, StateSource, Status,
-};
+use baude_core::session::{Session, StateSource, Status};
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
 /// that Claude Code's TUI lays out sanely in the transcript-driving sense.
@@ -1225,7 +1223,7 @@ impl Manager {
             repo_root: PersistedPath::from_path(&session.repo_root),
             branch: session.branch.clone(),
             is_worktree: session.is_worktree,
-            shell_open: session.shell_open,
+            shell_open: false,
             archived: session.archived,
             archived_by_user: session.archived_by_user,
             resume_id: session.meta.session_id.clone().or(durable_resume_id),
@@ -1260,55 +1258,6 @@ impl Manager {
         if let Some(notify) = self.permission_notify.remove(&id) {
             notify.notify_waiters();
         }
-    }
-
-    fn restore_stopped_runtime(
-        &mut self,
-        id: u64,
-        mode: backend::SpawnMode,
-        shell_open: bool,
-    ) -> std::result::Result<(), RuntimeRestorationFailure> {
-        if let Err(error) = self.restart_with_mode(id, mode) {
-            return verify_runtime_restoration(
-                false,
-                shell_open,
-                false,
-                format!("agent restoration failed: {error}"),
-            );
-        }
-        let agent_live = self
-            .session(id)
-            .is_ok_and(|session| !session.claude.is_exited());
-        let mut shell_detail = None;
-        let shell_live = if shell_open {
-            match self.session_mut(id) {
-                Ok(session) => match session.open_shell(ROWS, COLS) {
-                    Ok(()) => session
-                        .shell
-                        .as_ref()
-                        .is_some_and(|shell| !shell.is_exited()),
-                    Err(error) => {
-                        shell_detail = Some(error.to_string());
-                        false
-                    }
-                },
-                Err(error) => {
-                    shell_detail = Some(error.to_string());
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        verify_runtime_restoration(
-            agent_live,
-            shell_open,
-            shell_live,
-            shell_detail.map_or_else(
-                || format!("agent live: {agent_live}; shell live/restored: {shell_live}"),
-                |error| format!("agent live: {agent_live}; shell restoration failed: {error}"),
-            ),
-        )
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1522,7 +1471,7 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> MutationResult<()> {
-        self.session(id)?;
+        let session = self.session(id)?;
         let checkout_key = self
             .runtime_checkouts
             .iter()
@@ -1535,7 +1484,23 @@ impl Manager {
             }
             return Ok(());
         };
-        let snapshot = self.retained_runtime_snapshot(id)?;
+        let snapshot = RetainedSessionState {
+            name: session.name.clone(),
+            cwd: PersistedPath::from_path(&session.cwd),
+            repo_root: PersistedPath::from_path(&session.repo_root),
+            branch: session.branch.clone(),
+            is_worktree: session.is_worktree,
+            shell_open: false,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session.meta.session_id.clone().or_else(|| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == checkout_key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            }),
+        };
         self.teardown_retained_runtime(checkout_key, id)?;
         let state_before = self.repository_state.clone();
         lifecycle::plan_close(
@@ -1554,7 +1519,7 @@ impl Manager {
                     .clone()
                     .map(backend::SpawnMode::ResumeId)
                     .unwrap_or(backend::SpawnMode::ContinueLatest);
-                return match self.restore_stopped_runtime(id, mode, snapshot.shell_open) {
+                return match self.restart_with_mode(id, mode) {
                     Ok(()) => Err(MutationError::Persistence(error)),
                     Err(restart) => {
                         self.forget_stopped_runtime(checkout_key, id);
@@ -1564,8 +1529,8 @@ impl Manager {
                         lifecycle::mark_stopped_active_recovery(
                             &mut self.repository_state,
                             checkout_key,
-                            restart.agent_restarted,
-                            restart.shell_restarted,
+                            false,
+                            true,
                             detail.clone(),
                         )
                         .map_err(anyhow::Error::new)?;
@@ -2971,17 +2936,7 @@ mod tests {
             manager.session_id_for_test(id, &format!("opaque-{label}"));
             let before = manager.repository_state.clone();
             let original_pid = manager.session(id).unwrap().claude.pid().unwrap();
-            manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
-            let original_shell_pid = manager
-                .session(id)
-                .unwrap()
-                .shell
-                .as_ref()
-                .unwrap()
-                .pid()
-                .unwrap();
             assert!(pid_is_live(original_pid));
-            assert!(pid_is_live(original_shell_pid));
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
             let close_error = manager.remove(id).unwrap_err().to_string();
@@ -2996,7 +2951,6 @@ mod tests {
                 !committed
             );
             assert!(!pid_is_live(original_pid));
-            assert!(!pid_is_live(original_shell_pid));
             if committed {
                 assert!(manager.sessions.is_empty());
                 assert!(manager.runtime_checkouts.is_empty());
@@ -3018,13 +2972,6 @@ mod tests {
                 assert!(pid_is_live(
                     manager.session(compensated).unwrap().claude.pid().unwrap()
                 ));
-                let restored = manager.session(compensated).unwrap();
-                assert!(restored.shell_open);
-                assert!(restored
-                    .shell
-                    .as_ref()
-                    .is_some_and(|shell| !shell.is_exited()));
-                assert!(pid_is_live(restored.shell.as_ref().unwrap().pid().unwrap()));
                 manager.kill_all();
             }
             std::fs::remove_dir_all(root).unwrap();
