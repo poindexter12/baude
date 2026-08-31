@@ -5,16 +5,16 @@ milestone_name: Local TUI Dogfood Release
 current_phase: 6
 current_phase_name: shared lifecycle core refactor
 status: verification
-stopped_at: Completed local 06-07 implementation; certification and Phase 6 completion pending
-last_updated: "2026-08-31T06:27:33.933Z"
+stopped_at: Completed 07-01-PLAN.md; Phase 6 certification and Phase 7 UAT remain pending
+last_updated: "2026-08-31T08:03:21.185Z"
 last_activity: 2026-08-30
 last_activity_desc: completed shared lifecycle engine cutover and full local gate; certification pending
-state_head: 7dad443198c72a7a5e4fcc416b3558a36e086039
+state_head: 5252f4f099320b8ffbb0f11b04d1cf08198b69ab
 progress:
   total_phases: 3
   completed_phases: 1
-  total_plans: 10
-  completed_plans: 10
+  total_plans: 16
+  completed_plans: 11
   percent: 33
 ---
 
@@ -40,16 +40,16 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 
 **Velocity:**
 
-- v2.0 plans completed: 10
+- v2.0 plans completed: 11
 - Prior milestone: 14 plans completed across 4 phases
 - Average duration: 18 min
-- Total execution time: 183 min
+- Total execution time: 200 min
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
-| 7. Local TUI Dogfood Release | 0/TBD | - | - |
+| 7. Local TUI Dogfood Release | 1/6 | 17 min | 17 min |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -64,6 +64,7 @@ Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete
 | Phase 06 P05 | 11min | 3 tasks | 7 files |
 | Phase 06 P06 | 16min | 3 tasks | 5 files |
 | Phase 06 P07 | 69m | 3 tasks | 10 files |
+| Phase 07 P01 | 17min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -107,6 +108,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 06]: LifecycleCandidate is opaque and only LifecycleEngine selects checkout lifecycle and owned-runtime candidates.
 - [Phase 06]: Pre-replacement persistence failure preserves the existing runtime; committed replacement continues the authorized effect and records dirty durability.
 - [Phase 06]: Tracked App and Manager restarts use registered lifecycle launch events before PTY release.
+- [Phase 07]: Structural hierarchy and ordering come only from persisted repository state; runtime, status, and archive facts are decoration joins. — Prevents volatile process churn from changing structural identity or order.
+- [Phase 07]: Normal navigation visits repository parents while cycle navigation visits only actionable checkout and remote rows. — Parents remain discoverable without becoming action targets.
+- [Phase 07]: Invalid local selection falls back within its repository before its parent; restart prefers the first local parent before remote rows. — Keeps local context deterministic across refresh, removal, and restart.
 
 ### Pending Todos
 
@@ -133,6 +137,6 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T06:27:33.826Z
-Stopped at: Completed local 06-07 implementation; certification and Phase 6 completion pending
+Last session: 2026-08-31T08:03:21.091Z
+Stopped at: Completed 07-01-PLAN.md; Phase 6 certification and Phase 7 UAT remain pending
 Resume file: None

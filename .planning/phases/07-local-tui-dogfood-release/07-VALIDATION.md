@@ -107,3 +107,19 @@ Certification runs in the morning. Record evidence in `.planning/phases/07-local
 - [ ] `nyquist_compliant: true` is set only from observed evidence.
 
 **Approval:** pending
+
+## Observed Local Evidence
+
+### Plan 07-01: Durable hierarchy projection and navigation
+
+- `cargo fmt --all -- --check` — passed 2026-08-31.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed 2026-08-31.
+- `cargo test --workspace` — passed 2026-08-31: 37 `baude`, 212 `baude-core`, and 78 `bauded` tests.
+- Guarded exact hierarchy tests passed:
+  - `hierarchy::tests::local_hierarchy_orders_parents_and_children_by_durable_identity`
+  - `hierarchy::tests::local_hierarchy_order_ignores_runtime_and_session_status`
+  - `hierarchy::tests::local_hierarchy_selection_survives_refresh_and_removal_falls_back_locally`
+  - `ui::tests::hierarchy_tracer_renders_real_app_parent_and_child`
+  - `app::tests::hierarchy_navigation_visits_parents_cycles_children_and_retains_selection_on_ctrl_q`
+
+This is implementation evidence only. Human dogfood/UAT and release certification remain pending in Plans 07-04 and 07-05.
