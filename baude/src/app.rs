@@ -285,6 +285,19 @@ impl Selection {
     }
 }
 
+#[derive(Debug)]
+struct RuntimeRestartFailure {
+    agent_restarted: bool,
+    shell_restarted: bool,
+    detail: String,
+}
+
+impl std::fmt::Display for RuntimeRestartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     pub selected_id: Option<SelId>,
@@ -1779,9 +1792,9 @@ impl App {
                     .clone()
                     .map(backend::SpawnMode::ResumeId)
                     .unwrap_or(backend::SpawnMode::ContinueLatest);
-                match self.restart_session_with_mode(id, mode) {
+                match self.restore_stopped_runtime(id, mode, snapshot.shell_open) {
                     Ok(()) => Err(anyhow::anyhow!(
-                        "{error}; close persistence rolled back and retained runtime {id} restarted"
+                        "{error}; close persistence rolled back and retained runtime {id} restarted (agent and shell restored)"
                     )),
                     Err(restart) => {
                         self.forget_stopped_runtime(checkout_key, id);
@@ -1791,6 +1804,8 @@ impl App {
                         lifecycle::mark_stopped_active_recovery(
                             &mut self.repository_state,
                             checkout_key,
+                            restart.agent_restarted,
+                            restart.shell_restarted,
                             detail.clone(),
                         )?;
                         let recovery_save = self.save_durable_status();
@@ -2859,6 +2874,52 @@ impl App {
         Ok(())
     }
 
+    fn restore_stopped_runtime(
+        &mut self,
+        id: u64,
+        mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> std::result::Result<(), RuntimeRestartFailure> {
+        if let Err(error) = self.restart_session_with_mode(id, mode) {
+            return Err(RuntimeRestartFailure {
+                agent_restarted: false,
+                shell_restarted: !shell_open,
+                detail: format!("agent: {error}"),
+            });
+        }
+        let agent_restarted = self
+            .session(id)
+            .is_some_and(|session| !session.claude.is_exited());
+        let shell_restarted = if shell_open {
+            let (_, shell_rect) = pane_rects(self.content_rect, true);
+            let rect = shell_rect.map(inner).unwrap_or(Rect::new(0, 0, 80, 10));
+            match self.session_mut(id) {
+                Some(session) => session.open_shell(rect.height, rect.width).is_ok_and(|()| {
+                    session
+                        .shell
+                        .as_ref()
+                        .is_some_and(|shell| !shell.is_exited())
+                }),
+                None => false,
+            }
+        } else {
+            true
+        };
+        if agent_restarted && shell_restarted {
+            return Ok(());
+        }
+        if let Some(session) = self.session_mut(id) {
+            let _ = session.kill_and_wait();
+        }
+        Err(RuntimeRestartFailure {
+            agent_restarted,
+            shell_restarted,
+            detail: format!(
+                "agent live: {agent_restarted}; shell live/restored: {shell_restarted}"
+            ),
+        })
+    }
+
     // ---- mouse handling ----
 
     fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -3850,8 +3911,18 @@ mod repository_admission_tests {
                 other => panic!("unexpected activation outcome: {other:?}"),
             };
             app.session_mut(runtime).unwrap().meta.session_id = Some(format!("resume-{label}"));
+            app.session_mut(runtime).unwrap().open_shell(5, 40).unwrap();
             let original_pid = app.session(runtime).unwrap().claude.pid().unwrap();
+            let original_shell_pid = app
+                .session(runtime)
+                .unwrap()
+                .shell
+                .as_ref()
+                .unwrap()
+                .pid()
+                .unwrap();
             assert!(pid_is_live(original_pid));
+            assert!(pid_is_live(original_shell_pid));
             let before = app.repository_state.clone();
             app.atomic_failure_for_test = Some(failure);
 
@@ -3860,6 +3931,7 @@ mod repository_admission_tests {
             assert_eq!(app.repository_state.repositories.len(), 1);
             assert_eq!(app.repository_state.checkouts[0].active_intent, !committed);
             assert!(!pid_is_live(original_pid));
+            assert!(!pid_is_live(original_shell_pid));
             if committed {
                 assert!(app.sessions.is_empty());
                 assert!(app.runtime_checkouts.is_empty());
@@ -3880,6 +3952,12 @@ mod repository_admission_tests {
                 assert!(pid_is_live(
                     app.session(compensated).unwrap().claude.pid().unwrap()
                 ));
+                let restored = app.session(compensated).unwrap();
+                assert!(restored.shell_open);
+                let restored_shell = restored.shell.as_ref().unwrap();
+                assert!(!restored_shell.is_exited());
+                assert!(pid_is_live(restored_shell.pid().unwrap()));
+                assert_eq!(app.runtime_checkouts.get(&checkout), Some(&compensated));
                 app.session_mut(compensated).unwrap().kill();
             }
             let path = app.repository_state.checkouts[0]

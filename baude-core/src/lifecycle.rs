@@ -324,6 +324,8 @@ pub fn mark_teardown_pending(
 pub fn mark_stopped_active_recovery(
     state: &mut RepositoryState,
     checkout_key: CheckoutKey,
+    agent_restarted: bool,
+    shell_restarted: bool,
     detail: String,
 ) -> Result<(), LifecycleError> {
     let checkout = state
@@ -332,8 +334,11 @@ pub fn mark_stopped_active_recovery(
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
     checkout.active_intent = true;
-    checkout.health =
-        CheckoutHealth::Unavailable(UnavailableCause::StoppedActiveRecovery { detail });
+    checkout.health = CheckoutHealth::Unavailable(UnavailableCause::StoppedActiveRecovery {
+        agent_restarted,
+        shell_restarted,
+        detail,
+    });
     state.validate()?;
     Ok(())
 }

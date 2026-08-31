@@ -1529,6 +1529,8 @@ impl Manager {
                         lifecycle::mark_stopped_active_recovery(
                             &mut self.repository_state,
                             checkout_key,
+                            false,
+                            true,
                             detail.clone(),
                         )
                         .map_err(anyhow::Error::new)?;

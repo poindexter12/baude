@@ -98,6 +98,8 @@ pub enum UnavailableCause {
     /// Close stopped the retained runtime, persistence rolled back active
     /// intent, and exact runtime restart compensation also failed.
     StoppedActiveRecovery {
+        agent_restarted: bool,
+        shell_restarted: bool,
         detail: String,
     },
     Io(String),
