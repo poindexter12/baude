@@ -157,6 +157,55 @@ pub fn normalize_lifecycle_trace(trace: &[LifecycleTraceEntry]) -> LifecycleTrac
     trace.to_vec()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryStep {
+    StopOwned(CheckoutKey),
+    FinishRemoval(CheckoutKey),
+    RecoverActivation(CheckoutKey),
+    ReconcileTopology(CheckoutKey),
+    Launch(CheckoutKey),
+}
+
+pub fn startup_recovery_program(state: &RepositoryState) -> Vec<RecoveryStep> {
+    let mut process = Vec::new();
+    let mut removal = Vec::new();
+    let mut activation = Vec::new();
+    let mut topology = Vec::new();
+    let mut launch = Vec::new();
+    for checkout in &state.checkouts {
+        match checkout.lifecycle() {
+            CheckoutLifecycle::Stopping(_)
+            | CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. })
+            | CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery { .. }) => {
+                process.push(RecoveryStep::StopOwned(checkout.key));
+            }
+            CheckoutLifecycle::RemovalCommitted
+            | CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)) => {
+                removal.push(RecoveryStep::FinishRemoval(checkout.key));
+            }
+            CheckoutLifecycle::Activating
+            | CheckoutLifecycle::Protected(UnavailableCause::PendingActivation { .. })
+            | CheckoutLifecycle::Protected(UnavailableCause::ActivationRecovery { .. }) => {
+                activation.push(RecoveryStep::RecoverActivation(checkout.key));
+            }
+            CheckoutLifecycle::Protected(_) => {
+                topology.push(RecoveryStep::ReconcileTopology(checkout.key));
+            }
+            CheckoutLifecycle::Active | CheckoutLifecycle::Launching(_) => {
+                launch.push(RecoveryStep::Launch(checkout.key));
+            }
+            CheckoutLifecycle::Inactive | CheckoutLifecycle::Running(_) => {}
+        }
+    }
+    process
+        .into_iter()
+        .chain(removal)
+        .chain(activation)
+        .chain(topology)
+        .chain(launch)
+        .collect()
+}
+
 /// A literal branch activation rooted in one durable repository identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationRequest {
@@ -1757,7 +1806,8 @@ mod tests {
     use crate::git::ReconciliationUnavailable;
     use crate::repository::{
         CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
-        RepositoryKey, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
+        RepositoryKey, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
+        SavedRepository,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;

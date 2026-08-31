@@ -327,6 +327,18 @@ impl Session {
         }
     }
 
+    pub fn runtime_snapshot(&self) -> std::result::Result<RuntimeSnapshot, String> {
+        let snapshot = RuntimeSnapshot::new(
+            self.claude.process_identity().clone(),
+            self.shell
+                .as_ref()
+                .filter(|_| self.shell_open)
+                .map(|shell| shell.process_identity().clone()),
+        );
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Stop and reap every process owned by this session. The agent is waited
     /// first so callers never begin destructive worktree inspection while it
     /// may still be writing into the checkout.
@@ -376,6 +388,92 @@ pub struct SessionTeardownError {
     pub agent_stopped: bool,
     pub shell_stopped: bool,
     pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSnapshot {
+    agent: ProcessIdentity,
+    shell: Option<ProcessIdentity>,
+}
+
+impl RuntimeSnapshot {
+    pub fn new(agent: ProcessIdentity, shell: Option<ProcessIdentity>) -> Self {
+        Self { agent, shell }
+    }
+
+    pub fn agent(&self) -> &ProcessIdentity {
+        &self.agent
+    }
+
+    pub fn shell(&self) -> Option<&ProcessIdentity> {
+        self.shell.as_ref()
+    }
+
+    pub fn shell_requested(&self) -> bool {
+        self.shell.is_some()
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (kind, identity) in std::iter::once(("agent", &self.agent))
+            .chain(self.shell.as_ref().map(|identity| ("shell", identity)))
+        {
+            if identity.process_group != identity.pid as i32
+                || identity.session != identity.pid as i32
+            {
+                return Err(format!(
+                    "{kind} {} does not own its process group/session",
+                    identity.pid
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StopReport {
+    agent: Option<ProcessIdentity>,
+    shell: Option<ProcessIdentity>,
+    agent_stopped: bool,
+    shell_stopped: bool,
+    detail: String,
+}
+
+impl StopReport {
+    pub fn from_observations(
+        agent: Option<ProcessIdentity>,
+        shell: Option<ProcessIdentity>,
+        agent_stopped: bool,
+        shell_stopped: bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent,
+            shell,
+            agent_stopped,
+            shell_stopped,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn all_extinct(&self) -> bool {
+        self.agent_stopped && self.shell_stopped
+    }
+
+    pub fn remaining(&self) -> Vec<ProcessIdentity> {
+        let mut remaining = Vec::new();
+        if !self.agent_stopped {
+            remaining.extend(self.agent.iter().cloned());
+        }
+        if !self.shell_stopped {
+            remaining.extend(self.shell.iter().cloned());
+        }
+        remaining
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 impl std::fmt::Display for SessionTeardownError {
