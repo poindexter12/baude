@@ -496,8 +496,10 @@ pub struct App {
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
 pub fn pane_rects(content: Rect, shell_open: bool) -> (Rect, Option<Rect>) {
-    if shell_open && content.height >= 14 {
-        let shell_h = (content.height * 30 / 100).clamp(8, content.height.saturating_sub(6));
+    if shell_open && content.height >= 12 {
+        let shell_h = (content.height * 30 / 100)
+            .max(4)
+            .min(content.height.saturating_sub(4));
         let claude = Rect {
             height: content.height - shell_h,
             ..content
@@ -758,7 +760,7 @@ impl App {
         hierarchy::project_local(&self.repository_state, &decorations)
     }
 
-    fn selected_action_view(&self) -> Option<ActionView> {
+    pub(crate) fn selected_action_view(&self) -> Option<ActionView> {
         match self.selected_id? {
             SelId::Repository(key) => self.hierarchy_rows().into_iter().find_map(|row| match row {
                 LocalRow::Repository(parent) if parent.key == key => Some(parent.actions),
@@ -2741,22 +2743,55 @@ impl App {
 
     /// Resize every session's PTYs to match the geometry they would render at.
     pub fn sync_sizes(&mut self, area: Rect) {
-        let rects = crate::ui::layout(area);
+        if area.height < 13 && self.focus == Focus::Shell {
+            let live_agent = self
+                .selected()
+                .is_some_and(|session| !session.claude.is_exited());
+            if live_agent {
+                self.focus = Focus::Claude;
+                self.set_message(
+                    "shell hidden at this terminal height — resize to 13+ rows or press ctrl+\\ to close it"
+                        .into(),
+                );
+            } else {
+                self.focus = Focus::Sidebar;
+                self.set_message(
+                    "shell hidden at this terminal height — resize to 13+ rows; session input is paused"
+                        .into(),
+                );
+            }
+        }
+        let rects = crate::ui::layout(area, self.focus);
         let content = rects.content;
+        if !rects.content_visible {
+            return;
+        }
+        let content_inner = inner(content);
+        if content_inner.height == 0 || content_inner.width == 0 {
+            return;
+        }
         self.content_rect = content;
         for s in &mut self.sessions {
             let (claude_rect, shell_rect) = pane_rects(content, s.shell_open);
             let c = inner(claude_rect);
-            s.claude.resize(c.height, c.width);
-            if let (Some(sr), Some(shell)) = (shell_rect, s.shell.as_mut()) {
-                let r = inner(sr);
-                shell.resize(r.height, r.width);
+            if c.height > 0 && c.width > 0 {
+                s.claude.resize(c.height, c.width);
+            }
+            if rects.shell_visible {
+                if let (Some(sr), Some(shell)) = (shell_rect, s.shell.as_mut()) {
+                    let r = inner(sr);
+                    if r.height > 0 && r.width > 0 {
+                        shell.resize(r.height, r.width);
+                    }
+                }
             }
         }
         if let Some(a) = &mut self.attach {
             let (claude_rect, _) = pane_rects(content, false);
             let r = inner(claude_rect);
-            a.resize(r.height, r.width);
+            if r.height > 0 && r.width > 0 {
+                a.resize(r.height.max(2), r.width.max(10));
+            }
         }
     }
 

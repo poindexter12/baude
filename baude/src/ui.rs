@@ -13,48 +13,99 @@ use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
-use crate::hierarchy::{LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStatus};
+use crate::hierarchy::{ActionKind, LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStatus};
 use crate::remote::RemoteInfo;
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 42;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponsiveMode {
+    Wide,
+    Medium,
+    Compact,
+    SinglePane,
+}
+
 pub struct LayoutRects {
     pub sidebar: Rect,
     pub content: Rect,
     pub status: Rect,
+    pub mode: ResponsiveMode,
+    pub sidebar_visible: bool,
+    pub content_visible: bool,
+    pub shell_visible: bool,
 }
 
-pub fn layout(area: Rect) -> LayoutRects {
+pub fn layout(area: Rect, focus: Focus) -> LayoutRects {
     let status = Rect {
-        y: area.y + area.height.saturating_sub(1),
-        height: 1,
+        y: area.y.saturating_add(area.height.saturating_sub(1)),
+        height: u16::from(area.height > 0),
         ..area
     };
     let body_h = area.height.saturating_sub(1);
-    let sidebar = Rect {
-        width: SIDEBAR_WIDTH.min(area.width / 3),
-        height: body_h,
-        ..area
+    let (mode, sidebar_width) = match area.width {
+        120.. => (ResponsiveMode::Wide, SIDEBAR_WIDTH.min(area.width)),
+        80..=119 => (ResponsiveMode::Medium, (area.width / 3).clamp(28, 38)),
+        60..=79 => (ResponsiveMode::Compact, 26.min(area.width)),
+        _ => (ResponsiveMode::SinglePane, area.width),
     };
-    let content = Rect {
-        x: area.x + sidebar.width,
-        width: area.width.saturating_sub(sidebar.width),
-        height: body_h,
-        ..area
+    let single_sidebar = mode == ResponsiveMode::SinglePane && focus == Focus::Sidebar;
+    let single_content = mode == ResponsiveMode::SinglePane && focus != Focus::Sidebar;
+    let sidebar_visible = area.width > 0 && body_h > 0 && !single_content;
+    let content_visible = area.width > 0 && body_h > 0 && !single_sidebar;
+    let sidebar = if sidebar_visible {
+        Rect::new(area.x, area.y, sidebar_width, body_h)
+    } else {
+        Rect::new(area.x, area.y, 0, 0)
+    };
+    let content = if content_visible {
+        let x = if mode == ResponsiveMode::SinglePane {
+            area.x
+        } else {
+            area.x.saturating_add(sidebar_width)
+        };
+        Rect::new(
+            x,
+            area.y,
+            if mode == ResponsiveMode::SinglePane {
+                area.width
+            } else {
+                area.width.saturating_sub(sidebar_width)
+            },
+            body_h,
+        )
+    } else {
+        Rect::new(area.x, area.y, 0, 0)
     };
     LayoutRects {
         sidebar,
         content,
         status,
+        mode,
+        sidebar_visible,
+        content_visible,
+        shell_visible: content_visible && area.height >= 13,
     }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let rects = layout(frame.area());
-    draw_sidebar(frame, app, rects.sidebar);
-    draw_content(frame, app, rects.content);
-    draw_status_bar(frame, app, rects.status);
+    let area = frame.area();
+    let rects = layout(area, app.focus);
+    if rects.sidebar_visible {
+        draw_sidebar(
+            frame,
+            app,
+            rects.sidebar,
+            area.height < 20 || (rects.mode == ResponsiveMode::Compact && area.height < 24),
+        );
+    }
+    if rects.content_visible {
+        draw_content(frame, app, rects.content);
+    }
+    if rects.status.height > 0 {
+        draw_status_bar(frame, app, rects.status);
+    }
     draw_modal(frame, app);
 }
 
@@ -102,17 +153,62 @@ fn selection_bg() -> Style {
     Style::default().bg(Color::Indexed(237))
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    s.chars().take(max - 1).collect::<String>() + "…"
+fn cell_width(s: &str) -> usize {
+    Line::raw(s).width()
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+fn cell_clusters(s: &str) -> Vec<String> {
+    let mut clusters: Vec<String> = Vec::new();
+    for ch in s.chars() {
+        let text = ch.to_string();
+        if cell_width(&text) == 0 {
+            if let Some(cluster) = clusters.last_mut() {
+                cluster.push(ch);
+            } else {
+                clusters.push(text);
+            }
+        } else {
+            clusters.push(text);
+        }
+    }
+    clusters
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if cell_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let clusters = cell_clusters(s);
+    let leaf_start = clusters
+        .iter()
+        .rposition(|cluster| cluster == "/")
+        .unwrap_or(0);
+    let preferred = &clusters[leaf_start..];
+    let mut suffix: Vec<&str> = Vec::new();
+    let mut used = 1;
+    for cluster in preferred
+        .iter()
+        .rev()
+        .chain(clusters[..leaf_start].iter().rev())
+    {
+        let width = cell_width(cluster);
+        if used + width > max {
+            break;
+        }
+        suffix.push(cluster);
+        used += width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.concat())
+}
+
+fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -123,7 +219,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Carve a usage footer off the bottom of the sidebar when there's room.
     const FOOTER_H: u16 = 6;
-    let (list_area, footer_area) = if list_area.height >= FOOTER_H + 4 {
+    let (list_area, footer_area) = if area.height >= 19 && list_area.height >= FOOTER_H + 4 {
         let footer = Rect {
             y: list_area.y + list_area.height - FOOTER_H,
             height: FOOTER_H,
@@ -166,29 +262,41 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let width = list_area.width as usize;
     let focused = app.focus == Focus::Sidebar;
     let mut lines: Vec<Line> = Vec::new();
+    let mut selected_line = None;
+    let mut selected_parent_line = None;
+    let mut current_parent_line = None;
     for (index, row) in hierarchy.iter().enumerate() {
         match row {
-            LocalRow::Repository(parent) => repository_row(
-                &mut lines,
-                parent,
-                app.selected_id == Some(SelId::Repository(parent.key)),
-                focused,
-                width,
-            ),
+            LocalRow::Repository(parent) => {
+                current_parent_line = Some(lines.len());
+                let selected = app.selected_id == Some(SelId::Repository(parent.key));
+                if selected {
+                    selected_line = Some((lines.len(), lines.len()));
+                    selected_parent_line = current_parent_line;
+                }
+                repository_row(&mut lines, parent, selected, focused, width)
+            }
             LocalRow::Checkout(child) => {
                 let is_last = !matches!(
                     hierarchy.get(index + 1),
                     Some(LocalRow::Checkout(next)) if next.repository_key == child.repository_key
                 );
+                let selected = app.selected_id == Some(SelId::Checkout(child.key));
+                let start = lines.len();
                 checkout_row(
                     &mut lines,
                     app,
                     child,
                     is_last,
-                    app.selected_id == Some(SelId::Checkout(child.key)),
+                    selected,
                     focused,
                     width,
+                    compact_rows,
                 );
+                if selected {
+                    selected_line = Some((start, lines.len().saturating_sub(1)));
+                    selected_parent_line = current_parent_line;
+                }
             }
         }
     }
@@ -217,7 +325,20 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         );
         lines.push(remote_meta_line(r, selected, focused, width));
     }
-    frame.render_widget(Paragraph::new(lines), list_area);
+    let visible = list_area.height as usize;
+    let scroll = selected_line
+        .filter(|_| lines.len() > visible && visible > 0)
+        .map(|(_start, end)| {
+            let mut offset = end.saturating_add(2).saturating_sub(visible);
+            if let Some(parent) = selected_parent_line {
+                if end.saturating_sub(parent) < visible {
+                    offset = offset.min(parent);
+                }
+            }
+            offset.min(lines.len().saturating_sub(visible)) as u16
+        })
+        .unwrap_or(0);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
 }
 
 fn repository_row(
@@ -244,15 +365,15 @@ fn repository_row(
     let reserve = if aggregate.is_empty() {
         0
     } else {
-        aggregate.len() + 1
+        cell_width(&aggregate) + 1
     };
     let name = truncate(&row.display_name, width.saturating_sub(4 + reserve).max(1));
-    let used = 4 + name.chars().count() + aggregate.len();
     let mut spans = vec![
         gutter(selected, focused),
         Span::styled("▾ ", Style::default().fg(Color::DarkGray)),
         Span::styled(name, name_style),
     ];
+    let used = Line::from(spans.clone()).width() + cell_width(&aggregate);
     if !aggregate.is_empty() {
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
         spans.push(Span::styled(aggregate, Style::default().fg(Color::Yellow)));
@@ -267,6 +388,7 @@ fn repository_row(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkout_row(
     lines: &mut Vec<Line<'static>>,
     app: &App,
@@ -275,6 +397,7 @@ fn checkout_row(
     selected: bool,
     focused: bool,
     width: usize,
+    compact: bool,
 ) {
     let connector = if is_last { "└─ " } else { "├─ " };
     let (icon, icon_style, state_text) = match row.status {
@@ -304,7 +427,6 @@ fn checkout_row(
         Style::default().fg(Color::Gray)
     };
     let name = truncate(&row.name, width.saturating_sub(8).max(1));
-    let used = 2 + connector.chars().count() + 2 + name.chars().count();
     let mut spans = vec![
         gutter(selected, focused),
         Span::styled(connector, Style::default().fg(Color::DarkGray)),
@@ -312,6 +434,7 @@ fn checkout_row(
         Span::raw(" "),
         Span::styled(name, name_style),
     ];
+    let used = Line::from(spans.clone()).width();
     if selected {
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     }
@@ -322,6 +445,9 @@ fn checkout_row(
         line
     });
 
+    if compact {
+        return;
+    }
     let role = match row.role {
         CheckoutRole::Main => "main",
         CheckoutRole::PrimaryDefault => "default",
@@ -345,7 +471,7 @@ fn checkout_row(
         Span::styled(format!("{role} · {state_text}"), dim),
     ]);
     if selected {
-        let used = 7 + role.len() + 3 + state_text.len();
+        let used = Line::from(meta.spans.clone()).width();
         meta.spans
             .push(Span::raw(" ".repeat(width.saturating_sub(used))));
         meta = meta.style(selection_bg());
@@ -395,7 +521,7 @@ fn chips_line(
             spans.push(Span::styled(" · ", sep));
             used += 3;
         }
-        used += text.chars().count();
+        used += cell_width(&text);
         spans.push(Span::styled(text, style));
     }
     if selected {
@@ -527,11 +653,11 @@ fn session_row(
     } else {
         String::new()
     };
-    let suffix_w = suffix.chars().count();
+    let suffix_w = cell_width(&suffix);
     // gutter(2) + icon(1) + space(1) = 4; reserve a space before the timer.
     let reserve = if suffix.is_empty() { 0 } else { suffix_w + 1 };
     let name = truncate(name, width.saturating_sub(4 + reserve).max(1));
-    let used = 4 + name.chars().count() + suffix_w;
+    let used = 4 + cell_width(&name) + suffix_w;
     let pad = width.saturating_sub(used);
 
     let mut spans = vec![
@@ -953,14 +1079,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let val = Style::default().fg(Color::Gray);
     let width = area.width as usize;
 
-    let hints = match app.focus {
-        Focus::Sidebar => " enter attach · n new · t shell · e edit · ? help",
-        Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
-        Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
-    };
+    let hints = status_hint(app, width);
 
-    let mut spans: Vec<Span> = vec![Span::styled(hints.to_string(), dim)];
-    let mut used = hints.chars().count();
+    let mut spans: Vec<Span> = vec![Span::styled(format!(" {hints}"), dim)];
+    let mut used = cell_width(hints) + 1;
 
     // Selected session's full path + branch — too wide for the sidebar.
     if let Some(s) = app.selected() {
@@ -968,8 +1090,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(b) = s.branch.as_deref().or(s.meta.git_branch.as_deref()) {
             loc.push_str(&format!(" ⎇ {b}"));
         }
-        if used + loc.chars().count() <= width {
-            used += loc.chars().count();
+        if used + cell_width(&loc) <= width {
+            used += cell_width(&loc);
             spans.push(Span::styled(loc, val));
         }
     }
@@ -1004,13 +1126,67 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         right.push(format!("wk {}", human_until(t)));
     }
     let right = right.join(" · ");
-    if !right.is_empty() && used + right.chars().count() + 2 <= width {
-        let pad = width - used - right.chars().count() - 1;
+    if !right.is_empty() && used + cell_width(&right) + 2 <= width {
+        let pad = width - used - cell_width(&right) - 1;
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, dim));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn status_hint(app: &App, width: usize) -> &'static str {
+    match app.focus {
+        Focus::Claude => "ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
+        Focus::Shell => "ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
+        Focus::Sidebar => {
+            let Some(view) = app.selected_action_view() else {
+                return "n open · c clone · ? help";
+            };
+            if view.kind == ActionKind::Remote {
+                return "enter attach · r restart · x close · ? help";
+            }
+            if width < 80 {
+                return match view.kind {
+                    ActionKind::Repository => "enter open · w branch · ? more",
+                    ActionKind::Unavailable => match view.capability {
+                        Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
+                            "i details · r reopen · ? more"
+                        }
+                        Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
+                            "i details · r recovery · ? more"
+                        }
+                        None => "i details · ? help",
+                    },
+                    _ if view.has_runtime => "enter attach · x close · ? more",
+                    _ if view.can_remove => "enter reopen · X remove · ? more",
+                    _ => "enter reopen · e edit · ? more",
+                };
+            }
+            match view.kind {
+                ActionKind::Repository => {
+                    "enter open default · w branch · e edit · i info · ? help"
+                }
+                ActionKind::Unavailable => match view.capability {
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
+                        "i details · r recheck and reopen · ? help"
+                    }
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
+                        "i details · r continue recovery · ? help"
+                    }
+                    None => "i details · ? help",
+                },
+                _ if view.has_runtime && view.can_remove => {
+                    "enter attach · x close · X remove* · t shell · e edit · a archive · ? help"
+                }
+                _ if view.has_runtime => {
+                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                }
+                _ if view.can_remove => "enter reopen · X remove* · e edit · i info · ? help",
+                _ => "enter reopen · e edit · i info · ? help",
+            }
+        }
+    }
 }
 
 /// Left-truncate an input buffer so its tail — where the cursor sits — stays
@@ -1507,11 +1683,14 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "sidebar (control mode)",
+                    "select repository or checkout",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::raw("  j/k ↑/↓     select session"),
-                Line::raw("  enter       attach to selected session"),
+                Line::raw("  j/k ↑/↓     select repository or checkout"),
+                Line::raw("  enter       open, attach, or reopen"),
+                Line::raw("  x           close session; keep checkout"),
+                Line::raw("  X removes verified clean managed worktree"),
+                Line::raw("              local branch is retained"),
                 Line::raw("  t           open shell pane (focuses it)"),
                 Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
@@ -1522,7 +1701,6 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
                 Line::raw("  a           archive/unarchive (auto after idle timeout)"),
-                Line::raw("  x           close session"),
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),
                 Line::from(Span::styled(
@@ -1662,7 +1840,7 @@ mod tests {
                 },
             ));
         }
-        let selected = state.checkouts[3].key;
+        let selected = state.checkouts[1].key;
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Checkout(selected));
@@ -1741,10 +1919,18 @@ mod tests {
         assert!(Line::raw(clipped.clone()).width() <= 6, "{clipped:?}");
         assert!(clipped.ends_with("界e\u{301}"), "{clipped:?}");
 
-        let (app, _) = hierarchy_fixture();
+        let (mut app, _) = hierarchy_fixture();
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child)
+                if child.status == crate::hierarchy::LocalStatus::Unavailable =>
+            {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
         let (rendered, buffer) = render(&app, 26, 13);
         assert!(
-            rendered.contains("repository:missing"),
+            rendered.contains(":missing"),
             "selected row was not scrolled into view: {rendered}"
         );
         for y in 1..12 {
