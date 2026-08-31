@@ -3141,11 +3141,28 @@ mod tests {
     #[test]
     fn lifecycle_protocol_contract_app_vectors() {
         for vector in canonical_lifecycle_contract_vectors() {
-            let actual = App::lifecycle_contract_trace(*vector);
-            assert_eq!(
-                normalize_lifecycle_trace(&actual),
-                canonical_lifecycle_trace(*vector)
+            let actual = App::lifecycle_contract_trace(
+                *vector,
+                baude_core::lifecycle::AdapterFailureScript::None,
             );
+            assert_eq!(
+                normalize_lifecycle_trace(&actual.trace),
+                canonical_lifecycle_trace(*vector).trace
+            );
+            assert_eq!(actual.final_lifecycle, canonical_lifecycle_trace(*vector).final_lifecycle);
+        }
+        for failure in [
+            baude_core::lifecycle::AdapterFailureScript::Persist(1),
+            baude_core::lifecycle::AdapterFailureScript::Effect(1),
+        ] {
+            let actual = App::lifecycle_contract_trace(
+                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                failure,
+            );
+            assert_eq!(actual, baude_core::lifecycle::run_canonical_lifecycle_contract(
+                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                failure,
+            ));
         }
     }
 

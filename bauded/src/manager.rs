@@ -2292,11 +2292,28 @@ mod tests {
     #[test]
     fn lifecycle_protocol_contract_manager_vectors() {
         for vector in baude_core::lifecycle::canonical_lifecycle_contract_vectors() {
-            let actual = Manager::lifecycle_contract_trace(*vector);
-            assert_eq!(
-                baude_core::lifecycle::normalize_lifecycle_trace(&actual),
-                baude_core::lifecycle::canonical_lifecycle_trace(*vector)
+            let actual = Manager::lifecycle_contract_trace(
+                *vector,
+                baude_core::lifecycle::AdapterFailureScript::None,
             );
+            assert_eq!(
+                baude_core::lifecycle::normalize_lifecycle_trace(&actual.trace),
+                baude_core::lifecycle::canonical_lifecycle_trace(*vector).trace
+            );
+            assert_eq!(actual.final_lifecycle, baude_core::lifecycle::canonical_lifecycle_trace(*vector).final_lifecycle);
+        }
+        for failure in [
+            baude_core::lifecycle::AdapterFailureScript::Persist(1),
+            baude_core::lifecycle::AdapterFailureScript::Effect(1),
+        ] {
+            let actual = Manager::lifecycle_contract_trace(
+                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                failure,
+            );
+            assert_eq!(actual, baude_core::lifecycle::run_canonical_lifecycle_contract(
+                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                failure,
+            ));
         }
     }
 
