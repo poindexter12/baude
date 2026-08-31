@@ -2102,6 +2102,85 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn lifecycle_capabilities_expose_only_dispatchable_reopen_and_recovery_actions() {
+        use super::{lifecycle_capability, LifecycleCapability};
+        use crate::repository::{ProcessIdentity, UnavailableCause};
+
+        let identity = ProcessIdentity {
+            pid: 41,
+            start_time: 42,
+            process_group: 41,
+            session: 41,
+        };
+        let retry_reopen = [CheckoutLifecycle::Inactive];
+        let retry_recovery = [
+            CheckoutLifecycle::Activating,
+            CheckoutLifecycle::Protected(UnavailableCause::PendingActivation {
+                branch: "feature/capability".into(),
+                created_branch: None,
+                preexisting_branch_owner: None,
+            }),
+            CheckoutLifecycle::Protected(UnavailableCause::ActivationRecovery {
+                branch: "feature/capability".into(),
+                created_branch: Some(true),
+                preexisting_branch_owner: None,
+                verification: "verification failed".into(),
+                compensation: "compensation failed".into(),
+            }),
+            CheckoutLifecycle::Stopping(RuntimeGeneration::initial()),
+            CheckoutLifecycle::Protected(UnavailableCause::TeardownPending {
+                agent_pid: Some(identity.pid),
+                shell_pid: None,
+                agent_identity: Some(identity.clone()),
+                shell_identity: None,
+                agent_stopped: false,
+                shell_stopped: true,
+                detail: "agent still owns the runtime".into(),
+            }),
+            CheckoutLifecycle::Protected(UnavailableCause::StoppedActiveRecovery {
+                agent_restarted: false,
+                shell_restarted: true,
+                detail: "runtime restart compensation failed".into(),
+            }),
+        ];
+        let unavailable = [
+            CheckoutLifecycle::Active,
+            CheckoutLifecycle::Launching(RuntimeGeneration::initial()),
+            CheckoutLifecycle::Running(RuntimeGeneration::initial()),
+            CheckoutLifecycle::RemovalCommitted,
+            CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(
+                "removal committed".into(),
+            )),
+            CheckoutLifecycle::Protected(UnavailableCause::Missing),
+            CheckoutLifecycle::Protected(UnavailableCause::Other(
+                "generic unavailable topology".into(),
+            )),
+        ];
+
+        for lifecycle in retry_reopen {
+            assert_eq!(
+                lifecycle_capability(&lifecycle),
+                Some(LifecycleCapability::RetryReopen),
+                "retained lifecycle {lifecycle:?}"
+            );
+        }
+        for lifecycle in retry_recovery {
+            assert_eq!(
+                lifecycle_capability(&lifecycle),
+                Some(LifecycleCapability::RetryRecovery),
+                "recoverable lifecycle {lifecycle:?}"
+            );
+        }
+        for lifecycle in unavailable {
+            assert_eq!(
+                lifecycle_capability(&lifecycle),
+                None,
+                "non-dispatchable lifecycle {lifecycle:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_protocol_core_legal_transition_table() {
         use super::{reduce_lifecycle, LifecycleEvent, LifecycleTraceEntry};
         use crate::repository::{CheckoutLifecycle, RuntimeGeneration};
