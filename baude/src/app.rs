@@ -3533,6 +3533,76 @@ mod repository_admission_tests {
     }
 
     #[test]
+    fn activation_recovery_reuses_unchanged_preexisting_worktree_after_pending_save_crash() {
+        let repo = admission_repo("occupied-pending-recovery");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["branch", "occupied-before-crash"]);
+        let occupied = root.join("occupied-before-crash");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                occupied.to_str().unwrap(),
+                "occupied-before-crash",
+            ],
+        );
+
+        let snapshot = baude_core::git::discover_repository(&repo).unwrap();
+        let mut crashed = App::new(repo.clone());
+        crashed.remote = None;
+        crashed.persistence_root_for_test = Some(state_root.clone());
+        let prepared = baude_core::lifecycle::prepare_activation(
+            &mut crashed.repository_state,
+            &snapshot,
+            "occupied-before-crash",
+        )
+        .unwrap();
+        baude_core::lifecycle::record_pending_activation(
+            &mut crashed.repository_state,
+            &snapshot,
+            &prepared,
+        )
+        .unwrap();
+        crashed.save_durable_status().unwrap();
+
+        let mut restarted = App::new(root.join("not-a-repository"));
+        restarted.remote = None;
+        restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        restarted.persistence_root_for_test = Some(state_root);
+        restarted.restore();
+
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        let recovered = &restarted.repository_state.checkouts[0];
+        assert_eq!(
+            recovered.observed_path.to_path_buf(),
+            occupied.canonicalize().unwrap()
+        );
+        assert!(!recovered.managed_by_baude);
+        assert!(recovered.active_intent);
+        assert_eq!(recovered.health, CheckoutHealth::Available);
+        assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
+
+        restarted
+            .sessions
+            .iter_mut()
+            .for_each(|session| session.kill());
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                occupied.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lifecycle_creation_rollback_local_committed_save_and_spawn_failures_retain_retry_child() {
         for (label, failure, spawn_error, expected_stage) in [
             (

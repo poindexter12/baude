@@ -66,10 +66,16 @@ pub enum UnavailableCause {
     },
     PendingActivation {
         branch: String,
+        /// Exact checkout that owned this branch before activation began.
+        /// Recovery may reuse it only while Git still reports this same owner.
+        #[serde(default)]
+        preexisting_branch_owner: Option<PersistedPath>,
     },
     ActivationRecovery {
         branch: String,
         created_branch: bool,
+        #[serde(default)]
+        preexisting_branch_owner: Option<PersistedPath>,
         verification: String,
         compensation: String,
     },

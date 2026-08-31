@@ -2766,6 +2766,80 @@ mod tests {
     }
 
     #[test]
+    fn activation_recovery_manager_reuses_occupied_owner_after_pending_save_crash() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-occupied-pending-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["branch", "occupied-before-crash"]);
+        let occupied = root.join("occupied-before-crash");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                occupied.to_str().unwrap(),
+                "occupied-before-crash",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let snapshot = git::discover_repository(&repo).unwrap();
+        let mut crashed = Manager::new("sleep 30".into(), true);
+        crashed.persist_at_for_test(&state_root, &workspace, None);
+        let prepared = lifecycle::prepare_activation(
+            &mut crashed.repository_state,
+            &snapshot,
+            "occupied-before-crash",
+        )
+        .unwrap();
+        lifecycle::record_pending_activation(&mut crashed.repository_state, &snapshot, &prepared)
+            .unwrap();
+        crashed.save_checked().unwrap();
+
+        let mut restarted = Manager::new("sleep 30".into(), true);
+        assert_eq!(restarted.restore_at(&state_root, &workspace), 1);
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        let recovered = &restarted.repository_state.checkouts[0];
+        assert_eq!(
+            recovered.observed_path.to_path_buf(),
+            occupied.canonicalize().unwrap()
+        );
+        assert!(!recovered.managed_by_baude);
+        assert!(recovered.active_intent);
+        assert_eq!(recovered.health, CheckoutHealth::Available);
+        assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
+
+        restarted.kill_all();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                occupied.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lifecycle_creation_rollback_manager_committed_save_and_spawn_failures_retain_retry_child() {
         let root = std::env::temp_dir().join(format!(
             "bauded-lifecycle-create-stages-{}",

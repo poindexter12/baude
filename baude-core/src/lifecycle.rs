@@ -860,13 +860,19 @@ pub fn record_pending_activation(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| snapshot.main_worktree.display().to_string());
+    let expected_ref = format!("refs/heads/{}", prepared.request.branch);
+    let preexisting_branch_owner = snapshot
+        .worktrees
+        .iter()
+        .find(|record| record.branch.as_deref() == Some(expected_ref.as_str()))
+        .map(|record| PersistedPath::from_path(&record.path));
     state.checkouts.push(SavedCheckout {
         key: prepared.checkout,
         repository_key: prepared.request.repository,
         role: CheckoutRole::ManagedBranch,
         managed_by_baude: true,
         observed_path: PersistedPath::from_path(&prepared.request.managed_path),
-        observed_branch: Some(format!("refs/heads/{}", prepared.request.branch)),
+        observed_branch: Some(expected_ref),
         first_seen_order: prepared.first_seen_order,
         active_intent: false,
         session: RetainedSessionState {
@@ -882,6 +888,7 @@ pub fn record_pending_activation(
         },
         health: CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
             branch: prepared.request.branch.clone(),
+            preexisting_branch_owner,
         }),
     });
     state.validate()?;
@@ -919,25 +926,36 @@ pub fn reconcile_activation_recovery(
         .iter()
         .position(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
-    let (branch, prior_verification, prior_compensation) = match &state.checkouts[index].health {
-        CheckoutHealth::Unavailable(UnavailableCause::PendingActivation { branch }) => (
-            branch.clone(),
-            "activation interrupted before finalization".into(),
-            String::new(),
-        ),
-        CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
-            branch,
-            verification,
-            compensation,
-            ..
-        }) => (branch.clone(), verification.clone(), compensation.clone()),
-        _ => {
-            return Err(LifecycleError::Topology(format!(
-                "checkout {} is not activation recovery",
-                checkout_key.get()
-            )))
-        }
-    };
+    let (branch, preexisting_branch_owner, prior_verification, prior_compensation) =
+        match &state.checkouts[index].health {
+            CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
+                branch,
+                preexisting_branch_owner,
+            }) => (
+                branch.clone(),
+                preexisting_branch_owner.clone(),
+                "activation interrupted before finalization".into(),
+                String::new(),
+            ),
+            CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+                branch,
+                preexisting_branch_owner,
+                verification,
+                compensation,
+                ..
+            }) => (
+                branch.clone(),
+                preexisting_branch_owner.clone(),
+                verification.clone(),
+                compensation.clone(),
+            ),
+            _ => {
+                return Err(LifecycleError::Topology(format!(
+                    "checkout {} is not activation recovery",
+                    checkout_key.get()
+                )))
+            }
+        };
     let repository_key = state.checkouts[index].repository_key;
     let repository = state
         .repositories
@@ -1021,6 +1039,64 @@ pub fn reconcile_activation_recovery(
                 checkout: checkout_key,
             })
         }
+        (None, Some(ref_record))
+            if preexisting_branch_owner
+                .as_ref()
+                .is_some_and(|owner| owner.to_path_buf() == ref_record.path)
+                && !expected_path.exists()
+                && !ref_record.detached
+                && !ref_record.locked
+                && !ref_record.prunable =>
+        {
+            let reused_path = ref_record.path.clone();
+            let existing = state.checkouts.iter().position(|checkout| {
+                checkout.key != checkout_key
+                    && checkout.repository_key == repository_key
+                    && checkout.observed_path.to_path_buf() == reused_path
+            });
+            let finalized_checkout = if let Some(existing) = existing {
+                if state.checkouts[existing].observed_branch.as_deref()
+                    != Some(expected_ref.as_str())
+                {
+                    return Err(LifecycleError::Topology(format!(
+                        "checkout {} changed branch identity",
+                        state.checkouts[existing].key.get()
+                    )));
+                }
+                let checkout = &mut state.checkouts[existing];
+                checkout.active_intent = true;
+                checkout.health = CheckoutHealth::Available;
+                checkout.session.cwd = PersistedPath::from_path(&reused_path);
+                checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
+                checkout.session.branch = Some(branch.clone());
+                checkout.session.is_worktree = reused_path != snapshot.main_worktree;
+                checkout.key
+            } else {
+                let checkout = &mut state.checkouts[index];
+                checkout.observed_path = PersistedPath::from_path(&reused_path);
+                checkout.observed_branch = Some(expected_ref);
+                checkout.managed_by_baude = false;
+                checkout.role = if reused_path == snapshot.main_worktree {
+                    CheckoutRole::Main
+                } else {
+                    CheckoutRole::ManagedBranch
+                };
+                checkout.active_intent = true;
+                checkout.health = CheckoutHealth::Available;
+                checkout.session.cwd = PersistedPath::from_path(&reused_path);
+                checkout.session.repo_root = PersistedPath::from_path(&snapshot.main_worktree);
+                checkout.session.branch = Some(branch);
+                checkout.session.is_worktree = reused_path != snapshot.main_worktree;
+                checkout.key
+            };
+            if finalized_checkout != checkout_key {
+                clear_pending_activation(state, checkout_key);
+            }
+            state.validate()?;
+            Ok(ActivationRecoveryResolution::Finalized {
+                checkout: finalized_checkout,
+            })
+        }
         _ => {
             let detail = format!(
                 "pending activation conflicts with Git facts (path owner: {:?}, ref owner: {:?}); prior verification: {prior_verification}",
@@ -1056,10 +1132,22 @@ pub fn mark_activation_recovery(
         .iter_mut()
         .find(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
+    let preexisting_branch_owner = match &checkout.health {
+        CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
+            preexisting_branch_owner,
+            ..
+        })
+        | CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
+            preexisting_branch_owner,
+            ..
+        }) => preexisting_branch_owner.clone(),
+        _ => None,
+    };
     checkout.active_intent = false;
     checkout.health = CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
         branch,
         created_branch,
+        preexisting_branch_owner,
         verification,
         compensation,
     });
@@ -1141,6 +1229,7 @@ fn execute_activation_with_post_git_hook(
                     } => CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
                         branch: branch.clone(),
                         created_branch: *created_branch,
+                        preexisting_branch_owner: None,
                         verification: verification.to_string(),
                         compensation: compensation.clone(),
                     }),
@@ -1300,6 +1389,7 @@ fn execute_activation_with_post_git_hook(
                     health: CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
                         branch: activation_branch.clone(),
                         created_branch: matches!(disposition, ActivationDisposition::Created),
+                        preexisting_branch_owner: None,
                         verification: error.to_string(),
                         compensation: compensation.to_string(),
                     }),
