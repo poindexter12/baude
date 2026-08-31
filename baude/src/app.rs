@@ -31,6 +31,7 @@ use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
+const PERSISTENCE_ACTION_REFUSAL: &str = "State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalAdmissionRoute {
@@ -778,7 +779,7 @@ impl App {
         }
     }
 
-    fn selected_repository(&self) -> Option<&SavedRepository> {
+    pub(crate) fn selected_repository(&self) -> Option<&SavedRepository> {
         let key = match self.selected_id? {
             SelId::Repository(key) => key,
             SelId::Checkout(key) => {
@@ -796,7 +797,7 @@ impl App {
             .find(|repository| repository.key == key)
     }
 
-    fn selected_checkout(&self) -> Option<&SavedCheckout> {
+    pub(crate) fn selected_checkout(&self) -> Option<&SavedCheckout> {
         let SelId::Checkout(key) = self.selected_id? else {
             return None;
         };
@@ -821,7 +822,7 @@ impl App {
             })
     }
 
-    fn selected_target_label(&self) -> String {
+    pub(crate) fn selected_target_label(&self) -> String {
         self.selected_checkout()
             .map(|checkout| checkout.session.name.clone())
             .or_else(|| self.selected_repository().map(Self::repository_label))
@@ -3073,6 +3074,8 @@ impl App {
             }
             return;
         }
+        let target = self.selected_target_label();
+        self.set_message(format!("reopening “{target}”…"));
         if let Err(error) = self.reopen_checkout(checkout) {
             self.set_message(format!("reopen blocked: {error}"));
         }
@@ -3212,7 +3215,20 @@ impl App {
                 let Some(view) = self.selected_action_view() else {
                     return;
                 };
-                match sidebar_action(view, key) {
+                let action = sidebar_action(view, key);
+                if (self.persistence_blocked || self.persistence_dirty)
+                    && matches!(
+                        action,
+                        SidebarAction::Branch
+                            | SidebarAction::Close
+                            | SidebarAction::RetryReopen
+                            | SidebarAction::Remove
+                    )
+                {
+                    self.set_message(PERSISTENCE_ACTION_REFUSAL.into());
+                    return;
+                }
+                match action {
                     SidebarAction::None => {}
                     SidebarAction::Open => self.open_local_target(),
                     SidebarAction::Branch => self.open_branch_modal(),
@@ -4632,6 +4648,16 @@ mod tests {
         std::fs::create_dir_all(&action_state_root).unwrap();
         app.persistence_root_for_test = Some(action_state_root.clone());
         app.install_hierarchy_state_for_test(state, HashMap::new());
+
+        app.selected_id = Some(super::SelId::Repository(repository));
+        app.persistence_dirty = true;
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            "State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started."
+        );
+        assert!(matches!(app.modal, Modal::None));
+        app.persistence_dirty = false;
 
         let exact_refusals = [
             (
