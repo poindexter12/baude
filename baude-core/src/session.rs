@@ -378,6 +378,42 @@ pub struct SessionTeardownError {
     pub detail: String,
 }
 
+/// Typed result of attempting to restore a retained agent/shell pair after a
+/// rolled-back close. Owners supply process observations; this pure decision
+/// keeps their definition of a complete restoration identical.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeRestorationFailure {
+    pub agent_restarted: bool,
+    pub shell_restarted: bool,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RuntimeRestorationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for RuntimeRestorationFailure {}
+
+pub fn verify_runtime_restoration(
+    agent_live: bool,
+    shell_required: bool,
+    shell_live: bool,
+    detail: impl Into<String>,
+) -> std::result::Result<(), RuntimeRestorationFailure> {
+    let shell_restarted = !shell_required || shell_live;
+    if agent_live && shell_restarted {
+        Ok(())
+    } else {
+        Err(RuntimeRestorationFailure {
+            agent_restarted: agent_live,
+            shell_restarted,
+            detail: detail.into(),
+        })
+    }
+}
+
 impl std::fmt::Display for SessionTeardownError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
