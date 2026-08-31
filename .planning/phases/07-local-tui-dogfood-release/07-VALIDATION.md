@@ -90,9 +90,11 @@ cargo test -p baude "$name" -- --exact --nocapture
 | Gate | Status | Morning action |
 |------|--------|----------------|
 | Manual wide/narrow local TUI dogfood | pending | Execute the isolated runbook and record evidence. |
-| Linux/runtime certification | pending | Run supported CI/runtime matrix, including Phase 6 process registration checks. |
+| Linux/runtime certification | pending | Run the supported CI/Linux/runtime matrix, including Phase 6 process registration and descendant process-group extinction checks. |
 | Independent deep review | pending | Review Phase 6 and Phase 7 changed source. |
 | Phase verification and Nyquist approval | pending | Run verification only after the above evidence is available. |
+| UI-SPEC checker sign-off | pending | Review all six checker dimensions against observed wide/narrow dogfood evidence. |
+| Requirement and phase completion | pending | Do not check REL-03 or other pending Phase 6/7 requirements and do not complete either phase before certification and verification. |
 | Release publication decision | pending | Readiness only; do not publish or push a release without explicit authorization. |
 
 Certification runs in the morning. Record evidence in `.planning/phases/07-local-tui-dogfood-release/07-UAT-EVIDENCE.md`, creating that file only when screenshots, commands, and observed outcomes actually exist.
@@ -123,3 +125,67 @@ Certification runs in the morning. Record evidence in `.planning/phases/07-local
   - `app::tests::hierarchy_navigation_visits_parents_cycles_children_and_retains_selection_on_ctrl_q`
 
 This is implementation evidence only. Human dogfood/UAT and release certification remain pending in Plans 07-04 and 07-05.
+
+### Plans 07-02 through 07-05: previously observed implementation evidence
+
+- The final workspace suite below re-observed the action, responsive-render,
+  real-Git restart/dedup, flat compatibility, lifecycle, package metadata, and
+  artifact-readiness tests implemented by Plans 07-02 through 07-05.
+- Plan-specific evidence and commits remain in `07-02-SUMMARY.md` through
+  `07-05-SUMMARY.md`. This validation does not convert those local observations
+  into manual dogfood, platform certification, review, or approval.
+
+### Plan 07-06: documentation and final local gate
+
+Observed on 2026-08-31 against source commit `81fbf88` on
+`Darwin 25.6.0 arm64`, with `rustc 1.98.0 (88d9e12ae 2026-08-18)` and
+`cargo 1.98.0 (797e8a9bc 2026-08-05)`:
+
+- Exact README/changelog/runbook assertions passed. All three documents name
+  `v2.0.0-beta`; the runbook contains uppercase `X`, branch-retention evidence,
+  `40x12` coverage, and the exact `07-UAT-EVIDENCE.md` destination. The
+  readiness section makes no remote-availability claim and the forbidden
+  distribution-command scan returned no match.
+- `cargo fmt --all -- --check` — passed with no output.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed; Cargo
+  reported the dev profile finished in 0.61 seconds and emitted no Clippy
+  warning or error.
+- `cargo test --workspace` — passed: 45 `baude`, 213 `baude-core`, and 79
+  `bauded` tests (337 workspace tests total), plus 0 doc tests. The isolated
+  real-Git dogfood child reported 1 pass inside its parent test; no test failed,
+  was ignored, or was measured. Negative-path fixtures emitted expected local
+  Git diagnostics (including deliberately invalid worktree-removal targets)
+  while their assertions and the containing tests passed.
+- `cargo package -p baude-core --locked` — passed with pristine verification:
+  `baude-core v2.0.0-beta`, 19 files, 602.4 KiB uncompressed and 130.6 KiB
+  compressed. The verification compile finished successfully.
+- `cargo package --workspace --locked --no-verify` — passed and assembled all
+  workspace packages: `baude-core v2.0.0-beta` (19 files, 602.4 KiB / 130.6
+  KiB compressed), `baude v2.0.0-beta` (12 files, 497.0 KiB / 102.3 KiB), and
+  `bauded v2.0.0-beta` (21 files, 378.3 KiB / 88.9 KiB). Cargo refreshed its
+  local registry index; no dependency or lockfile changed.
+- `cargo build --workspace --release --locked` — passed. The host binaries
+  printed exactly `baude 2.0.0-beta` and `bauded 2.0.0-beta`.
+- The temporary host archive contained exactly `baude` and `bauded`; extraction
+  passed and both extracted binaries printed their exact `2.0.0-beta` versions.
+  The archive and extracted directory were removed by the command trap.
+- `cargo install --path baude --root <temporary>/install --locked` — passed and
+  installed only the isolated `baude` executable. It printed exactly
+  `baude 2.0.0-beta`; the temporary root was removed by the command trap. Cargo
+  emitted informational warnings about the environment-selected 1.98.0
+  toolchain and the temporary bin directory not being on PATH.
+- `git diff --check` — passed. `git ls-files --error-unmatch` confirmed all 17
+  existing source, configuration, documentation, history, and workflow paths
+  prescribed by the plan are tracked.
+- `git status --short` after the gate showed only the pre-existing unrelated
+  untracked `graphify-out/` and `opencode.json`. Neither path was modified or
+  staged.
+- `.planning/phases/07-local-tui-dogfood-release/07-UAT-EVIDENCE.md` remains
+  absent because no manual screenshot or morning certification evidence was
+  observed during implementation.
+
+This is a passing non-publishing **local implementation gate only**. Manual
+wide/narrow local TUI dogfood, supported CI/Linux/runtime certification,
+independent deep review, phase verification and Nyquist approval, UI-SPEC
+checker sign-off, requirement/phase completion, and the release publication
+decision remain pending for morning.
