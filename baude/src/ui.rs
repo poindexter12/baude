@@ -1947,6 +1947,126 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove() {
+        let (mut app, _) = hierarchy_fixture();
+        app.modal = Modal::ConfirmCloseWorktree { id: u64::MAX };
+        let (wide, wide_buffer) = render(&app, 100, 30);
+        assert!(wide.contains("close checkout session"), "{wide}");
+        assert!(
+            wide.contains("Close session “repository:feature/界e\u{301}-leaf” and keep its checkout for reopening?"),
+            "{wide}"
+        );
+        assert!(
+            wide.contains("y/enter close · n/esc keep session open"),
+            "{wide}"
+        );
+        assert!(wide_buffer
+            .content
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan));
+        assert!(!wide_buffer
+            .content
+            .iter()
+            .any(|cell| { cell.fg == Color::Red && cell.symbol().contains("close checkout") }));
+
+        let lines = remove_confirmation_lines(
+            std::path::Path::new("/tmp/repository worktrees/safe-remove"),
+            "refs/heads/feature/safe-remove",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Remove this clean baude-managed linked worktree?",
+                "target: repository:feature/safe-remove",
+                "branch: refs/heads/feature/safe-remove",
+                "path: /tmp/repository worktrees/safe-remove",
+                "The local branch is retained. The repository parent and siblings are unchanged.",
+                "y/enter remove · n/esc keep worktree",
+            ]
+        );
+    }
+
+    #[test]
+    fn hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints() {
+        let mut empty = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        empty.remote = None;
+        let (rendered, _) = render(&empty, 100, 30);
+        assert!(rendered.contains("no repositories yet"), "{rendered}");
+        assert!(
+            rendered.contains("press n to open a repository or c to clone one"),
+            "{rendered}"
+        );
+
+        let (mut app, repository) = hierarchy_fixture();
+        app.selected_id = Some(SelId::Repository(repository));
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "enter open default · w branch · e edit · i info · ? help"
+        );
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child) if child.managed_by_baude => {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "enter reopen · X remove* · e edit · i info · ? help"
+        );
+        assert_eq!(
+            super::status_hint(&app, 59),
+            "enter reopen · X remove · ? more"
+        );
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child) if !child.managed_by_baude => {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            super::status_hint(&app, 59),
+            "enter reopen · e edit · ? more"
+        );
+        app.focus = Focus::Claude;
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle"
+        );
+        app.focus = Focus::Shell;
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle"
+        );
+
+        let source = include_str!("app.rs");
+        for literal in [
+            "State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started.",
+            "reopening “{target}”…",
+            "session closed — checkout kept",
+            "created worktree for {value}",
+            "activated {value}",
+            "focused existing {value}",
+            "worktree removed — local branch {branch_ref} retained",
+            "{count} checkouts · none running",
+            "no running sessions",
+        ] {
+            assert!(source.contains(literal), "missing exact copy: {literal}");
+        }
+
+        for literal in [
+            "enter attach · x close · X remove* · t shell · e edit · a archive · ? help",
+            "i details · r recheck and reopen · ? help",
+            "i details · r continue recovery · ? help",
+            "i details · ? help",
+        ] {
+            assert!(
+                include_str!("ui.rs").contains(literal),
+                "missing exact hint: {literal}"
+            );
+        }
+    }
+
+    #[test]
     fn hierarchy_tracer_renders_real_app_parent_and_child() {
         let mut state = RepositoryState::default();
         let repository = state.allocate_repository_key().unwrap();
