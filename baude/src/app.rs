@@ -21,7 +21,7 @@ use baude_core::repository::{
 };
 use baude_core::session::{Session, Status};
 
-use crate::hierarchy::{self, CheckoutDecoration, LocalRow, LocalRowId};
+use crate::hierarchy::{self, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget};
 use crate::keys::encode_key;
 use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
@@ -610,6 +610,22 @@ impl App {
             })
             .collect();
         hierarchy::project_local(&self.repository_state, &decorations)
+    }
+
+    fn selection_target(&self) -> Option<SelectionTarget> {
+        self.selected_id.map(|selected| match selected {
+            SelId::Repository(key) => SelectionTarget::Local(LocalRowId::Repository(key)),
+            SelId::Checkout(key) => SelectionTarget::Local(LocalRowId::Checkout(key)),
+            SelId::Remote(id) => SelectionTarget::Remote(id),
+        })
+    }
+
+    fn set_selection_target(&mut self, selected: Option<SelectionTarget>) {
+        self.selected_id = selected.map(|selected| match selected {
+            SelectionTarget::Local(LocalRowId::Repository(key)) => SelId::Repository(key),
+            SelectionTarget::Local(LocalRowId::Checkout(key)) => SelId::Checkout(key),
+            SelectionTarget::Remote(id) => SelId::Remote(id),
+        });
     }
 
     #[cfg(test)]
@@ -1913,6 +1929,7 @@ impl App {
         &mut self,
         confirmation: lifecycle::RemovalConfirmation,
     ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
+        let rows_before_removal = self.hierarchy_rows();
         let _reservation = self
             .repository_reservations
             .reserve(confirmation.repository())
@@ -2072,7 +2089,7 @@ impl App {
             lifecycle::commit_removed_checkout(&mut self.repository_state, &confirmation, &removal)
                 .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
         self.runtime_checkouts.remove(&checkout);
-        match self.save_durable_status() {
+        let result = match self.save_durable_status() {
             Ok(()) => {
                 self.persistence_dirty = false;
                 Ok(outcome)
@@ -2097,7 +2114,24 @@ impl App {
                     detail: error.to_string(),
                 })
             }
+        };
+        if !self
+            .repository_state
+            .checkouts
+            .iter()
+            .any(|saved| saved.key == checkout)
+        {
+            let rows_after_removal = self.hierarchy_rows();
+            if let Some(selected) = self.selection_target() {
+                let fallback = hierarchy::reconcile_after_removal(
+                    selected,
+                    &rows_before_removal,
+                    &rows_after_removal,
+                );
+                self.set_selection_target(fallback);
+            }
         }
+        result
     }
 
     fn close_retained_session(&mut self, id: u64) -> Result<LifecycleOutcome> {
@@ -2271,6 +2305,23 @@ impl App {
         // selection something to land on.
         if self.selected_id.is_none() {
             self.selected_id = self.ordered_ids().first().copied();
+        }
+        if matches!(
+            self.selected_id,
+            Some(SelId::Repository(_) | SelId::Checkout(_))
+        ) {
+            let rows = self.hierarchy_rows();
+            let remote_ids: Vec<_> = self
+                .ordered_ids()
+                .into_iter()
+                .filter_map(|id| match id {
+                    SelId::Remote(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            let selected =
+                hierarchy::reconcile_selection(self.selection_target(), &rows, &remote_ids);
+            self.set_selection_target(selected);
         }
         // Drop a dead attach; if the attached remote session vanished from a
         // healthy listing, it was deleted elsewhere.
@@ -3051,7 +3102,8 @@ impl App {
         let cur = self
             .selected_id
             .and_then(|id| ids.iter().position(|&x| x == id))
-            .unwrap_or(0) as i64;
+            .map(|index| index as i64)
+            .unwrap_or_else(|| if delta < 0 { 0 } else { -1 });
         let next = (cur + delta).clamp(0, ids.len() as i64 - 1) as usize;
         if self.selected_id != Some(ids[next]) {
             self.claude_scroll = 0;
@@ -3068,7 +3120,11 @@ impl App {
         // Cycling reaches the archive too — sending input into an archived
         // session auto-unarchives it, so landing there and typing resurfaces
         // it without an explicit `a`.
-        let ids = self.ordered_ids();
+        let ids: Vec<_> = self
+            .ordered_ids()
+            .into_iter()
+            .filter(|id| !matches!(id, SelId::Repository(_)))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -3076,7 +3132,8 @@ impl App {
         let cur = self
             .selected_id
             .and_then(|id| ids.iter().position(|&x| x == id))
-            .unwrap_or(0) as i64;
+            .map(|index| index as i64)
+            .unwrap_or_else(|| if delta < 0 { 0 } else { -1 });
         let next = (((cur + delta) % len) + len) % len;
         self.claude_scroll = 0;
         self.shell_scroll = 0;
@@ -3628,6 +3685,54 @@ mod tests {
         add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
 
         assert_eq!(active_restore_checkouts(&state).len(), 3);
+    }
+
+    #[test]
+    fn hierarchy_navigation_visits_parents_cycles_children_and_retains_selection_on_ctrl_q() {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        let path = PersistedPath::from_path(Path::new("/repo"));
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(Path::new("/repo/.git")),
+            observed_main_worktree: path,
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+        state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/repo/one"));
+        state.checkouts[0].session.cwd = PersistedPath::from_path(Path::new("/repo/one"));
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+        state.checkouts[1].observed_path = PersistedPath::from_path(Path::new("/repo/two"));
+        state.checkouts[1].session.cwd = PersistedPath::from_path(Path::new("/repo/two"));
+        let first = state.checkouts[0].key;
+        let second = state.checkouts[1].key;
+
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(super::SelId::Repository(repository_key));
+
+        app.move_selection(1);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
+        app.move_selection(-1);
+        assert_eq!(
+            app.selected_id,
+            Some(super::SelId::Repository(repository_key))
+        );
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(second)));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
+
+        app.focus = super::Focus::Claude;
+        let selected = app.selected_id;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(matches!(app.focus, super::Focus::Sidebar));
+        assert_eq!(app.selected_id, selected);
     }
 
     #[test]

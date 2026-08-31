@@ -13,6 +13,12 @@ pub enum LocalRowId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionTarget {
+    Local(LocalRowId),
+    Remote(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckoutDecoration {
     pub runtime_id: Option<u64>,
     pub status: Option<Status>,
@@ -70,6 +76,92 @@ impl LocalRow {
             Self::Checkout(row) => LocalRowId::Checkout(row.key),
         }
     }
+}
+
+pub fn initial_selection(rows: &[LocalRow], remote_ids: &[u64]) -> Option<SelectionTarget> {
+    rows.iter()
+        .find_map(|row| match row {
+            LocalRow::Repository(parent) => {
+                Some(SelectionTarget::Local(LocalRowId::Repository(parent.key)))
+            }
+            LocalRow::Checkout(_) => None,
+        })
+        .or_else(|| remote_ids.first().copied().map(SelectionTarget::Remote))
+}
+
+pub fn reconcile_selection(
+    selected: Option<SelectionTarget>,
+    rows: &[LocalRow],
+    remote_ids: &[u64],
+) -> Option<SelectionTarget> {
+    match selected {
+        Some(SelectionTarget::Local(id)) if rows.iter().any(|row| row.id() == id) => {
+            Some(SelectionTarget::Local(id))
+        }
+        Some(SelectionTarget::Remote(id)) if remote_ids.contains(&id) => {
+            Some(SelectionTarget::Remote(id))
+        }
+        _ => initial_selection(rows, remote_ids),
+    }
+}
+
+pub fn reconcile_after_removal(
+    selected: SelectionTarget,
+    before: &[LocalRow],
+    after: &[LocalRow],
+) -> Option<SelectionTarget> {
+    if let SelectionTarget::Local(id) = selected {
+        if after.iter().any(|row| row.id() == id) {
+            return Some(selected);
+        }
+    }
+    let SelectionTarget::Local(LocalRowId::Checkout(removed)) = selected else {
+        return Some(selected);
+    };
+    let (removed_index, repository_key) =
+        before
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| match row {
+                LocalRow::Checkout(child) if child.key == removed => {
+                    Some((index, child.repository_key))
+                }
+                _ => None,
+            })?;
+    let available: HashSet<_> = after.iter().map(LocalRow::id).collect();
+    let sibling = before
+        .iter()
+        .skip(removed_index + 1)
+        .find_map(|row| match row {
+            LocalRow::Checkout(child)
+                if child.repository_key == repository_key
+                    && available.contains(&LocalRowId::Checkout(child.key)) =>
+            {
+                Some(LocalRowId::Checkout(child.key))
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            before[..removed_index]
+                .iter()
+                .rev()
+                .find_map(|row| match row {
+                    LocalRow::Checkout(child)
+                        if child.repository_key == repository_key
+                            && available.contains(&LocalRowId::Checkout(child.key)) =>
+                    {
+                        Some(LocalRowId::Checkout(child.key))
+                    }
+                    _ => None,
+                })
+        });
+    sibling
+        .or_else(|| {
+            available
+                .contains(&LocalRowId::Repository(repository_key))
+                .then_some(LocalRowId::Repository(repository_key))
+        })
+        .map(SelectionTarget::Local)
 }
 
 fn basename(path: &Path) -> String {
@@ -272,6 +364,7 @@ mod tests {
         key
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_checkout(
         state: &mut RepositoryState,
         repository_key: baude_core::repository::RepositoryKey,
@@ -626,9 +719,9 @@ mod tests {
             reconcile_after_removal(selected, &before, &without_alpha_children),
             Some(SelectionTarget::Local(LocalRowId::Repository(alpha)))
         );
-        assert!(without_alpha_children.iter().any(|row| {
-            matches!(row.id(), LocalRowId::Checkout(key) if key == beta_child)
-        }));
+        assert!(without_alpha_children
+            .iter()
+            .any(|row| { matches!(row.id(), LocalRowId::Checkout(key) if key == beta_child) }));
 
         assert_eq!(
             initial_selection(&before, &[81, 82]),
