@@ -909,6 +909,7 @@ pub fn record_pending_activation(
         },
         health: CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
             branch: prepared.request.branch.clone(),
+            created_branch: None,
             preexisting_branch_owner,
         }),
     });
@@ -947,25 +948,29 @@ pub fn reconcile_activation_recovery(
         .iter()
         .position(|checkout| checkout.key == checkout_key)
         .ok_or(LifecycleError::CheckoutMissing(checkout_key))?;
-    let (branch, preexisting_branch_owner, prior_verification, prior_compensation) =
+    let (branch, created_branch, preexisting_branch_owner, prior_verification, prior_compensation) =
         match &state.checkouts[index].health {
             CheckoutHealth::Unavailable(UnavailableCause::PendingActivation {
                 branch,
+                created_branch,
                 preexisting_branch_owner,
             }) => (
                 branch.clone(),
+                *created_branch,
                 preexisting_branch_owner.clone(),
                 "activation interrupted before finalization".into(),
                 String::new(),
             ),
             CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
                 branch,
+                created_branch,
                 preexisting_branch_owner,
                 verification,
                 compensation,
                 ..
             }) => (
                 branch.clone(),
+                *created_branch,
                 preexisting_branch_owner.clone(),
                 verification.clone(),
                 compensation.clone(),
@@ -991,16 +996,17 @@ pub fn reconcile_activation_recovery(
             snapshot
         }
         Ok(snapshot) => {
-            let detail = format!(
+            let observation = format!(
                 "repository identity conflicts with pending activation: expected {}, observed {}",
                 repository.observed_common_dir.to_path_buf().display(),
                 snapshot.common_dir.display()
             );
+            let detail = format!("{observation}; prior verification: {prior_verification}");
             mark_activation_recovery(
                 state,
                 checkout_key,
                 branch,
-                false,
+                created_branch,
                 detail.clone(),
                 prior_compensation,
             )?;
@@ -1010,12 +1016,14 @@ pub fn reconcile_activation_recovery(
             });
         }
         Err(error) => {
-            let detail = format!("could not inspect pending activation: {error}");
+            let detail = format!(
+                "could not inspect pending activation: {error}; prior verification: {prior_verification}"
+            );
             mark_activation_recovery(
                 state,
                 checkout_key,
                 branch,
-                false,
+                created_branch,
                 detail.clone(),
                 prior_compensation,
             )?;
@@ -1128,7 +1136,7 @@ pub fn reconcile_activation_recovery(
                 state,
                 checkout_key,
                 branch,
-                false,
+                created_branch,
                 detail.clone(),
                 prior_compensation,
             )?;
@@ -1144,7 +1152,7 @@ pub fn mark_activation_recovery(
     state: &mut RepositoryState,
     checkout_key: CheckoutKey,
     branch: String,
-    created_branch: bool,
+    created_branch: Option<bool>,
     verification: String,
     compensation: String,
 ) -> Result<(), LifecycleError> {
@@ -1249,7 +1257,7 @@ fn execute_activation_with_post_git_hook(
                         ..
                     } => CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
                         branch: branch.clone(),
-                        created_branch: *created_branch,
+                        created_branch: Some(*created_branch),
                         preexisting_branch_owner: None,
                         verification: verification.to_string(),
                         compensation: compensation.clone(),
@@ -1409,7 +1417,7 @@ fn execute_activation_with_post_git_hook(
                     },
                     health: CheckoutHealth::Unavailable(UnavailableCause::ActivationRecovery {
                         branch: activation_branch.clone(),
-                        created_branch: matches!(disposition, ActivationDisposition::Created),
+                        created_branch: Some(matches!(disposition, ActivationDisposition::Created)),
                         preexisting_branch_owner: None,
                         verification: error.to_string(),
                         compensation: compensation.to_string(),
@@ -1556,11 +1564,12 @@ impl Drop for RepositoryReservation {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_activation_with_post_git_hook, plan_close, plan_reopen, prepare_activation,
-        reconcile_activation_recovery, reconcile_teardown_recovery, record_pending_activation,
-        revoke_removal_authority, ActivationRecoveryResolution, ActivationRequest, CloseEffect,
-        CloseRequest, LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest,
-        ReopenRuntime, RepositoryReservations, TeardownRecoveryResolution,
+        execute_activation_with_post_git_hook, mark_activation_recovery, plan_close, plan_reopen,
+        prepare_activation, reconcile_activation_recovery, reconcile_teardown_recovery,
+        record_pending_activation, revoke_removal_authority, ActivationRecoveryResolution,
+        ActivationRequest, CloseEffect, CloseRequest, LifecycleError, LifecycleOutcome,
+        ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
+        TeardownRecoveryResolution,
     };
     use crate::backend::SpawnMode;
     use crate::git::ReconciliationUnavailable;
@@ -1781,6 +1790,142 @@ mod tests {
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force", "--"])
             .arg(&exact.request.managed_path)
+            .current_dir(&root)
+            .status();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_activation_retry_round_trips_all_provenance() {
+        let root = std::env::temp_dir().join(format!(
+            "baude-lifecycle-activation-evidence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(root.join("tracked"), b"one\n").unwrap();
+        for args in [vec!["add", "tracked"], vec!["commit", "-m", "initial"]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new("git")
+            .args(["branch", "feature/evidence"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let original_owner = root.join("original-owner");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--"])
+            .arg(&original_owner)
+            .arg("feature/evidence")
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let snapshot = crate::git::discover_repository(&root).unwrap();
+        let mut state = RepositoryState::default();
+        let prepared = prepare_activation(&mut state, &snapshot, "feature/evidence").unwrap();
+        let checkout = prepared.checkout;
+        record_pending_activation(&mut state, &snapshot, &prepared).unwrap();
+        assert!(matches!(
+            state.checkouts[0].health,
+            CheckoutHealth::Unavailable(crate::repository::UnavailableCause::PendingActivation {
+                created_branch: None,
+                ..
+            })
+        ));
+        mark_activation_recovery(
+            &mut state,
+            checkout,
+            "feature/evidence".into(),
+            Some(true),
+            "original verification".into(),
+            "original compensation".into(),
+        )
+        .unwrap();
+
+        assert!(Command::new("git")
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(&original_owner)
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let conflicting_owner = root.join("conflicting-owner");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--"])
+            .arg(&conflicting_owner)
+            .arg("feature/evidence")
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(matches!(
+            reconcile_activation_recovery(&mut state, checkout).unwrap(),
+            ActivationRecoveryResolution::Blocked { .. }
+        ));
+        let round_trip: RepositoryState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let first = round_trip.checkouts[0].health.clone();
+        state = round_trip;
+        assert!(matches!(
+            reconcile_activation_recovery(&mut state, checkout).unwrap(),
+            ActivationRecoveryResolution::Blocked { .. }
+        ));
+        match (&first, &state.checkouts[0].health) {
+            (
+                CheckoutHealth::Unavailable(
+                    crate::repository::UnavailableCause::ActivationRecovery {
+                        branch: first_branch,
+                        created_branch: first_created,
+                        preexisting_branch_owner: first_owner,
+                        verification: first_verification,
+                        compensation: first_compensation,
+                    },
+                ),
+                CheckoutHealth::Unavailable(
+                    crate::repository::UnavailableCause::ActivationRecovery {
+                        branch,
+                        created_branch,
+                        preexisting_branch_owner,
+                        verification,
+                        compensation,
+                    },
+                ),
+            ) => {
+                assert_eq!(branch, first_branch);
+                assert_eq!(created_branch, first_created);
+                assert_eq!(*created_branch, Some(true));
+                assert_eq!(preexisting_branch_owner, first_owner);
+                assert_eq!(compensation, first_compensation);
+                assert_eq!(compensation, "original compensation");
+                assert!(verification.contains(first_verification));
+                assert!(verification.contains("original verification"));
+            }
+            evidence => panic!("unexpected recovery evidence: {evidence:?}"),
+        }
+
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(&conflicting_owner)
             .current_dir(&root)
             .status();
         std::fs::remove_dir_all(root).unwrap();

@@ -835,10 +835,10 @@ impl Manager {
                         &mut self.repository_state,
                         activation.checkout,
                         activation.branch.clone(),
-                        matches!(
+                        Some(matches!(
                             activation.disposition,
                             lifecycle::ActivationDisposition::Created
-                        ),
+                        )),
                         error.to_string(),
                         compensation.to_string(),
                     )

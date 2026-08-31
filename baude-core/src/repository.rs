@@ -82,6 +82,9 @@ pub enum UnavailableCause {
     },
     PendingActivation {
         branch: String,
+        /// Unknown until Git classifies and executes the activation.
+        #[serde(default)]
+        created_branch: Option<bool>,
         /// Exact checkout that owned this branch before activation began.
         /// Recovery may reuse it only while Git still reports this same owner.
         #[serde(default)]
@@ -89,7 +92,10 @@ pub enum UnavailableCause {
     },
     ActivationRecovery {
         branch: String,
-        created_branch: bool,
+        /// `None` means recovery began before Git execution; known outcomes
+        /// remain `Some` across every blocked retry.
+        #[serde(default)]
+        created_branch: Option<bool>,
         #[serde(default)]
         preexisting_branch_owner: Option<PersistedPath>,
         verification: String,
@@ -98,7 +104,9 @@ pub enum UnavailableCause {
     /// Close stopped the retained runtime, persistence rolled back active
     /// intent, and exact runtime restart compensation also failed.
     StoppedActiveRecovery {
+        #[serde(default)]
         agent_restarted: bool,
+        #[serde(default)]
         shell_restarted: bool,
         detail: String,
     },
