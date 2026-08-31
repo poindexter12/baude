@@ -3736,6 +3736,224 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_action_matrix_dispatches_only_authorized_local_actions() {
+        use super::{SidebarAction, SidebarRefusal};
+        use crate::hierarchy::{action_view, ActionSelection};
+        use baude_core::lifecycle::LifecycleCapability;
+
+        let keys = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ];
+        let cases = [
+            (
+                "repository",
+                action_view(
+                    ActionSelection::Repository { available: true },
+                    false,
+                    Some(LifecycleCapability::RetryReopen),
+                ),
+                [
+                    SidebarAction::Open,
+                    SidebarAction::Branch,
+                    SidebarAction::Refuse(SidebarRefusal::RepositoryClose),
+                    SidebarAction::RetryReopen,
+                    SidebarAction::Refuse(SidebarRefusal::RepositoryRemove),
+                    SidebarAction::Refuse(SidebarRefusal::RepositoryShell),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::None,
+                    SidebarAction::Gsd,
+                    SidebarAction::Refuse(SidebarRefusal::RepositoryArchive),
+                ],
+            ),
+            (
+                "main",
+                action_view(
+                    ActionSelection::Checkout {
+                        role: CheckoutRole::Main,
+                        managed_by_baude: false,
+                        available: true,
+                    },
+                    false,
+                    Some(LifecycleCapability::RetryReopen),
+                ),
+                [
+                    SidebarAction::Open,
+                    SidebarAction::Branch,
+                    SidebarAction::Refuse(SidebarRefusal::AlreadyClosed),
+                    SidebarAction::RetryReopen,
+                    SidebarAction::Refuse(SidebarRefusal::MainRemove),
+                    SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Gsd,
+                    SidebarAction::Archive,
+                ],
+            ),
+            (
+                "managed",
+                action_view(
+                    ActionSelection::Checkout {
+                        role: CheckoutRole::ManagedBranch,
+                        managed_by_baude: true,
+                        available: true,
+                    },
+                    false,
+                    Some(LifecycleCapability::RetryReopen),
+                ),
+                [
+                    SidebarAction::Open,
+                    SidebarAction::Branch,
+                    SidebarAction::Refuse(SidebarRefusal::AlreadyClosed),
+                    SidebarAction::RetryReopen,
+                    SidebarAction::Remove,
+                    SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Gsd,
+                    SidebarAction::Archive,
+                ],
+            ),
+            (
+                "external",
+                action_view(
+                    ActionSelection::Checkout {
+                        role: CheckoutRole::ManagedBranch,
+                        managed_by_baude: false,
+                        available: true,
+                    },
+                    false,
+                    Some(LifecycleCapability::RetryReopen),
+                ),
+                [
+                    SidebarAction::Open,
+                    SidebarAction::Branch,
+                    SidebarAction::Refuse(SidebarRefusal::AlreadyClosed),
+                    SidebarAction::RetryReopen,
+                    SidebarAction::Refuse(SidebarRefusal::UnmanagedRemove),
+                    SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Gsd,
+                    SidebarAction::Archive,
+                ],
+            ),
+            (
+                "unavailable",
+                action_view(
+                    ActionSelection::Checkout {
+                        role: CheckoutRole::ManagedBranch,
+                        managed_by_baude: true,
+                        available: false,
+                    },
+                    false,
+                    None,
+                ),
+                [
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableReopen),
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableBranch),
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableClose),
+                    SidebarAction::Refuse(SidebarRefusal::RetryNotAuthorized),
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableRemove),
+                    SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Gsd,
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableArchive),
+                ],
+            ),
+            (
+                "recovery",
+                action_view(
+                    ActionSelection::Checkout {
+                        role: CheckoutRole::ManagedBranch,
+                        managed_by_baude: true,
+                        available: false,
+                    },
+                    false,
+                    Some(LifecycleCapability::RetryRecovery),
+                ),
+                [
+                    SidebarAction::Refuse(SidebarRefusal::RecoveryReopen),
+                    SidebarAction::Refuse(SidebarRefusal::RecoveryBranch),
+                    SidebarAction::Refuse(SidebarRefusal::RecoveryClose),
+                    SidebarAction::RetryRecovery,
+                    SidebarAction::Refuse(SidebarRefusal::RecoveryRemove),
+                    SidebarAction::Refuse(SidebarRefusal::NoLiveRuntime),
+                    SidebarAction::Editor,
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Gsd,
+                    SidebarAction::Refuse(SidebarRefusal::UnavailableArchive),
+                ],
+            ),
+            (
+                "remote",
+                action_view(ActionSelection::Remote, true, None),
+                [
+                    SidebarAction::RemoteOpen,
+                    SidebarAction::None,
+                    SidebarAction::RemoteClose,
+                    SidebarAction::RemoteRestart,
+                    SidebarAction::None,
+                    SidebarAction::Refuse(SidebarRefusal::RemoteShell),
+                    SidebarAction::Refuse(SidebarRefusal::RemoteEditor),
+                    SidebarAction::Info,
+                    SidebarAction::Activity,
+                    SidebarAction::Refuse(SidebarRefusal::RemoteGsd),
+                    SidebarAction::RemoteArchive,
+                ],
+            ),
+        ];
+
+        for (selection, view, expected) in cases {
+            for (index, key) in keys.iter().copied().enumerate() {
+                assert_eq!(
+                    super::sidebar_action(view, key),
+                    expected[index],
+                    "{selection} × {key:?}"
+                );
+            }
+        }
+
+        // Defensive refusals are pure: stale hidden-key dispatch cannot alter
+        // durable state, process association, row order, or selection.
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        let before_state = app.repository_state.clone();
+        let before_runtimes = app.runtime_checkouts.clone();
+        let before_rows = app.ordered_ids();
+        let before_selection = app.selected_id;
+        for refusal in [
+            SidebarRefusal::RepositoryClose,
+            SidebarRefusal::RepositoryRemove,
+            SidebarRefusal::RetryNotAuthorized,
+            SidebarRefusal::UnmanagedRemove,
+            SidebarRefusal::UnavailableRemove,
+        ] {
+            app.refuse_sidebar_action(refusal);
+            assert_eq!(app.repository_state, before_state);
+            assert_eq!(app.runtime_checkouts, before_runtimes);
+            assert_eq!(app.ordered_ids(), before_rows);
+            assert_eq!(app.selected_id, before_selection);
+        }
+    }
+
+    #[test]
     fn managed_checkout_ownership_cannot_move_to_an_external_path() {
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();
