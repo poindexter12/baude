@@ -1678,8 +1678,87 @@ impl App {
                 },
             ));
         }
+        self.admit_existing_worktrees(repository_key, &fresh)?;
         self.repository_state.validate()?;
         self.ensure_primary(checkout_key)
+    }
+
+    /// Admit every usable existing worktree from the discovered inventory as a
+    /// durable checkout row, so a repository opens showing its full local
+    /// topology rather than only the primary default. Additive only: paths
+    /// already owned by any checkout or standalone session keep their recorded
+    /// identity, and records Git reports as bare, detached, locked, or
+    /// prunable are skipped rather than guessed at. Rows are admitted
+    /// inactive with no runtime; `enter` launches them.
+    fn admit_existing_worktrees(
+        &mut self,
+        repository_key: RepositoryKey,
+        snapshot: &git::RepositorySnapshot,
+    ) -> Result<()> {
+        let main_worktree = PersistedPath::from_path(&snapshot.main_worktree);
+        let repository_name = snapshot
+            .main_worktree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| snapshot.main_worktree.display().to_string());
+        for record in &snapshot.worktrees {
+            if record.bare || record.detached || record.locked || record.prunable {
+                continue;
+            }
+            let Some(branch_ref) = record.branch.as_deref() else {
+                continue;
+            };
+            let path = PersistedPath::from_path(&record.path);
+            let owned = self
+                .repository_state
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.observed_path == path)
+                || self
+                    .repository_state
+                    .standalone_sessions
+                    .iter()
+                    .any(|standalone| standalone.canonical_path == path);
+            if owned {
+                continue;
+            }
+            let main_role_taken = self.repository_state.checkouts.iter().any(|checkout| {
+                checkout.repository_key == repository_key && checkout.role == CheckoutRole::Main
+            });
+            let role = if path == main_worktree && !main_role_taken {
+                CheckoutRole::Main
+            } else {
+                CheckoutRole::ManagedBranch
+            };
+            let branch = branch_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch_ref)
+                .to_string();
+            let key = self.repository_state.allocate_checkout_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.checkouts.push(SavedCheckout::new(
+                key,
+                repository_key,
+                role,
+                false,
+                path.clone(),
+                Some(branch_ref.to_string()),
+                first_seen_order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("{repository_name}:{branch}"),
+                    cwd: path,
+                    repo_root: main_worktree.clone(),
+                    branch: Some(branch),
+                    is_worktree: record.path != snapshot.main_worktree,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+        }
+        Ok(())
     }
 
     fn reconcile_activation_recoveries(&mut self) -> Result<()> {
@@ -5930,6 +6009,131 @@ mod tests {
         assert!(restarted.message.is_none(), "got: {:?}", restarted.message);
         restarted.repository_state.validate().unwrap();
         restarted.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admit_repository_populates_existing_worktrees_as_inactive_rows() {
+        let repo = admission_repo("worktree-autopopulate");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let linked = root.join("wt-existing");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/existing",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let detached = root.join("wt-detached");
+        git(
+            &repo,
+            &["worktree", "add", "--detach", detached.to_str().unwrap()],
+        );
+
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+
+        // Primary plus the linked branch worktree; the detached one is skipped.
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        let row = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::ManagedBranch)
+            .expect("auto-populated worktree row");
+        assert_eq!(
+            row.observed_path,
+            PersistedPath::from_path(&linked.canonicalize().unwrap())
+        );
+        assert_eq!(
+            row.observed_branch.as_deref(),
+            Some("refs/heads/feature/existing")
+        );
+        assert!(!row.managed_by_baude);
+        assert!(!row.active_intent());
+        assert_eq!(row.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert_eq!(row.session.name, "repo:feature/existing");
+        assert_eq!(row.session.branch.as_deref(), Some("feature/existing"));
+        assert!(row.session.is_worktree);
+        assert_eq!(app.runtime_checkouts.len(), 1, "no runtime for auto rows");
+        app.repository_state.validate().unwrap();
+
+        // Re-admission is idempotent: known paths keep their identity.
+        let row_key = row.key;
+        app.admit_repository(&repo).unwrap();
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert!(app
+            .repository_state
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.key == row_key));
+        app.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admit_repository_assigns_main_role_to_unselected_main_worktree() {
+        let repo = admission_repo("worktree-main-role");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        // Default branch main lives in a linked worktree; the main worktree
+        // sits on a feature branch, mirroring a checked-out working branch.
+        let main_linked = root.join("wt-main");
+        git(&repo, &["switch", "-c", "feature/work"]);
+        git(
+            &repo,
+            &["worktree", "add", main_linked.to_str().unwrap(), "main"],
+        );
+
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        let primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .expect("primary default row");
+        assert_eq!(
+            primary.observed_path,
+            PersistedPath::from_path(&main_linked.canonicalize().unwrap())
+        );
+        let main_row = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::Main)
+            .expect("main worktree row");
+        assert_eq!(
+            main_row.observed_path,
+            PersistedPath::from_path(&repo.canonicalize().unwrap())
+        );
+        assert_eq!(
+            main_row.observed_branch.as_deref(),
+            Some("refs/heads/feature/work")
+        );
+        assert!(!main_row.managed_by_baude);
+        assert_eq!(main_row.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert!(!main_row.session.is_worktree);
+        app.repository_state.validate().unwrap();
+        app.kill_all();
         std::fs::remove_dir_all(root).unwrap();
     }
 
