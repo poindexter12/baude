@@ -173,16 +173,18 @@ python3 -c 'import json,os; p=os.path.join(os.environ["XDG_CONFIG_HOME"],"baude"
 ## 9. Prove clean managed removal and branch survival
 
 The Claude backend seeds `.claude/settings.local.json` in every launched
-checkout. Removal preflight deliberately treats ignored files as blockers too,
-so remove only that known generated file from this isolated fixture before the
-physical worktree action. Resolve the path from durable state rather than
-guessing it, then save the exact inventory:
+checkout. Removal preflight still treats every untracked or ignored file as a
+blocker, with exactly one carve-out: a file baude itself seeded whose content
+is provably still the pure seed. Verified removal deletes those pure seeds
+itself before the plain non-force `git worktree remove`, so no manual file
+deletion happens in this fixture — observing removal succeed with the seeded
+file present IS part of the evidence. Confirm the seed exists, then save the
+exact inventory:
 
 ```sh
 export MANAGED_WORKTREE="$(python3 -c 'import json,os; p=os.path.join(os.environ["XDG_CONFIG_HOME"],"baude","state-dogfood.json"); s=json.load(open(p))["state"]; c=next(c for c in s["checkouts"] if c.get("observed_branch")=="refs/heads/feature/dogfood-beta"); print(bytes(c["observed_path"]).decode())')"
 case "$MANAGED_WORKTREE" in "$DOGFOOD_ROOT"/*) ;; *) printf 'refusing unexpected path: %s\n' "$MANAGED_WORKTREE" >&2; exit 1;; esac
-rm "$MANAGED_WORKTREE/.claude/settings.local.json"
-rmdir "$MANAGED_WORKTREE/.claude"
+test -f "$MANAGED_WORKTREE/.claude/settings.local.json"
 git -C "$REPO" worktree list --porcelain | tee "$EVIDENCE_DIR/worktrees-before-remove.txt"
 ```
 

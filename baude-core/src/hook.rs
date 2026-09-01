@@ -120,6 +120,58 @@ pub fn merge_hook_settings(existing: &Value, command: &str) -> Value {
     root
 }
 
+/// True iff a `settings.local.json` value is PURELY baude's own hook seed —
+/// exactly the shape [`merge_hook_settings`] writes into an empty file, with
+/// nothing a user could have added. Multiple seed groups per event are
+/// accepted (the TUI and the daemon seed distinct `current_exe()` commands),
+/// and a subset of [`EVENTS`] keys is accepted (a seed from an older binary).
+/// Any other key, group shape, or command form means the file may carry user
+/// content and must keep blocking removal.
+pub fn is_pure_seed_settings(root: &Value) -> bool {
+    let Some(obj) = root.as_object() else {
+        return false;
+    };
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some(hooks) = obj.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    if hooks.is_empty() {
+        return false;
+    }
+    hooks.iter().all(|(event, groups)| {
+        EVENTS.contains(&event.as_str())
+            && groups
+                .as_array()
+                .is_some_and(|groups| !groups.is_empty() && groups.iter().all(is_pure_seed_group))
+    })
+}
+
+fn is_pure_seed_group(group: &Value) -> bool {
+    let Some(obj) = group.as_object() else {
+        return false;
+    };
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some(inner) = obj.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+    let [entry] = inner.as_slice() else {
+        return false;
+    };
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    entry.len() == 2
+        && entry.get("type").and_then(Value::as_str) == Some("command")
+        && entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.ends_with(" hook"))
+}
+
 /// Append one event line to the per-session `/tmp` file (O_APPEND).
 ///
 /// Mirrors the best-effort posture of [`crate::bridge::run`]; concurrent hook
@@ -493,6 +545,49 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("local append wrote the file");
         assert!(contents.contains("Stop"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- is_pure_seed_settings ------------------------------------------
+
+    #[test]
+    fn pure_seed_settings_predicate_accepts_only_baude_seeds() {
+        // The exact value seeding an empty file produces is pure, including a
+        // re-seed by the second binary (distinct current_exe() command) and
+        // the bare fallback command.
+        let seed = merge_hook_settings(&json!({}), "/opt/baude hook");
+        assert!(is_pure_seed_settings(&seed));
+        assert!(is_pure_seed_settings(&merge_hook_settings(
+            &seed,
+            "/opt/bauded hook"
+        )));
+        assert!(is_pure_seed_settings(&merge_hook_settings(
+            &json!({}),
+            "baude hook"
+        )));
+
+        // An older binary's seed carries fewer events; still pure.
+        let mut subset = seed.clone();
+        subset["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostToolUse");
+        assert!(is_pure_seed_settings(&subset));
+
+        // Anything a user could have added regains blocking authority.
+        assert!(!is_pure_seed_settings(&json!({})));
+        assert!(!is_pure_seed_settings(&json!({ "hooks": {} })));
+        let mut sibling_key = seed.clone();
+        sibling_key["statusLine"] = json!({ "type": "command" });
+        assert!(!is_pure_seed_settings(&sibling_key));
+        let user_command = merge_hook_settings(&seed, "notify-send done");
+        assert!(!is_pure_seed_settings(&user_command));
+        let mut unknown_event = seed.clone();
+        unknown_event["hooks"]["PreToolUse"] =
+            json!([{ "hooks": [{ "type": "command", "command": "/opt/baude hook" }] }]);
+        assert!(!is_pure_seed_settings(&unknown_event));
+        let mut extra_field = seed.clone();
+        extra_field["hooks"]["Stop"][0]["hooks"][0]["timeout"] = json!(5);
+        assert!(!is_pure_seed_settings(&extra_field));
     }
 
     // ---- seed_settings -------------------------------------------------

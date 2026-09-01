@@ -2060,10 +2060,65 @@ fn inspect_removal_status_with_program(
     parse_removal_status(&output.stdout)
 }
 
+/// A pure-content predicate for one baude-seeded file.
+type SeedPredicate = fn(&serde_json::Value) -> bool;
+
+/// The checkout-relative files baude itself seeds at session spawn, paired
+/// with the predicate proving on-disk content is still PURELY that seed.
+/// Only these exact paths are ever eligible for removal-preflight exemption;
+/// a user-modified seed fails its predicate and keeps blocking.
+const SEED_ARTIFACTS: [(&str, SeedPredicate); 2] = [
+    (
+        ".claude/settings.local.json",
+        crate::hook::is_pure_seed_settings,
+    ),
+    (".mcp.json", crate::permission::is_pure_seed_mcp),
+];
+
+/// True iff `relative` names a baude-seeded file whose current content is
+/// purely baude's own seed. Reads the file fresh on every call so preflight
+/// and deletion each judge the content in front of them, never a cached view.
+fn is_pure_seed_artifact(worktree: &Path, relative: &[u8]) -> bool {
+    SEED_ARTIFACTS.iter().any(|(path, is_pure)| {
+        relative == path.as_bytes()
+            && std::fs::read_to_string(worktree.join(path))
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .is_some_and(|value| is_pure(&value))
+    })
+}
+
+/// Delete baude's own seed artifacts (and a then-empty `.claude` dir) so the
+/// plain non-force `git worktree remove` below sees a clean tree. Each file
+/// is re-proven pure immediately before deletion; anything else — a user-
+/// modified seed, an unreadable file, a failed delete — is left in place for
+/// Git's own refusal to fail closed on.
+fn remove_seed_artifacts(worktree: &Path) {
+    for (relative, _) in SEED_ARTIFACTS {
+        if is_pure_seed_artifact(worktree, relative.as_bytes()) {
+            let _ = std::fs::remove_file(worktree.join(relative));
+        }
+    }
+    // Only ever an empty directory: remove_dir refuses non-empty ones.
+    let _ = std::fs::remove_dir(worktree.join(".claude"));
+}
+
 fn inspect_removal_status(
     worktree: &Path,
 ) -> std::result::Result<Vec<RemovalBlocker>, InspectionError> {
-    inspect_removal_status_with_program(worktree, OsStr::new("git"))
+    let blockers = inspect_removal_status_with_program(worktree, OsStr::new("git"))?;
+    // Baude's own spawn-time seeds are not user work: an untracked or ignored
+    // report for one of them stops blocking while its content is provably the
+    // pure seed. Every other status record keeps its fail-closed authority.
+    Ok(blockers
+        .into_iter()
+        .filter(|blocker| match blocker {
+            RemovalBlocker::Untracked { path } | RemovalBlocker::Ignored { path } => {
+                !is_pure_seed_artifact(worktree, path)
+            }
+            _ => true,
+        })
+        .collect())
 }
 
 fn parse_submodule_status(
@@ -2357,6 +2412,10 @@ fn remove_verified_worktree_with_post_remove_hook(
     target: &VerifiedRemovalTarget,
     after_remove: impl FnOnce(),
 ) -> std::result::Result<VerifiedRemoval, RemoveVerifiedError> {
+    // Preflight exempted pure seed artifacts, but plain `git worktree remove`
+    // still refuses any untracked file — clear baude's own seeds first so the
+    // non-force removal below stays the fail-closed authority for the rest.
+    remove_seed_artifacts(&target.path);
     let arguments = verified_remove_arguments();
     let output = Command::new("git")
         .arg("-C")
@@ -3352,6 +3411,63 @@ mod tests {
                 let linked = target.path().to_path_buf();
                 let oid = target.branch_oid().to_owned();
                 (repo, linked, branch, oid, target)
+            }
+
+            #[test]
+            fn baude_seeded_artifacts_are_exempt_and_cleared_by_plain_removal() {
+                let fixture = GitFixture::new();
+                let repo = fixture.repo("seed exemption repo");
+                let linked =
+                    fixture.linked_worktree(&repo, "seed exemption linked", "seed-exemption");
+                crate::hook::seed_settings(&linked);
+                std::fs::write(
+                    linked.join(".mcp.json"),
+                    crate::permission::mcp_server_config("/opt/baude").to_string(),
+                )
+                .unwrap();
+                let snapshot = discover_repository(&linked).unwrap();
+                let branch = snapshot.selected_worktree.branch.clone().unwrap();
+                let checkout = removal_topology::saved_checkout(&linked, &branch, true);
+
+                // A user file blocks even while both pure seeds sit beside it,
+                // and the seeds themselves contribute no blocker.
+                std::fs::write(linked.join("user-work"), b"unsaved\n").unwrap();
+                match inspect_removal(&snapshot.common_dir, &checkout).unwrap() {
+                    RemovalSafety::Blocked(blockers) => {
+                        assert_eq!(blockers.len(), 1, "got: {blockers:?}");
+                        assert!(matches!(
+                            &blockers[0],
+                            RemovalBlocker::Untracked { path } if path == b"user-work"
+                        ));
+                    }
+                    RemovalSafety::Safe(_) => panic!("a user file must block removal"),
+                }
+                std::fs::remove_file(linked.join("user-work")).unwrap();
+
+                // A user-modified seed regains its blocking authority.
+                let settings = linked.join(".claude").join("settings.local.json");
+                let pure = std::fs::read_to_string(&settings).unwrap();
+                let mut edited: serde_json::Value = serde_json::from_str(&pure).unwrap();
+                edited["statusLine"] = serde_json::json!({ "type": "command" });
+                std::fs::write(&settings, edited.to_string()).unwrap();
+                assert!(matches!(
+                    inspect_removal(&snapshot.common_dir, &checkout).unwrap(),
+                    RemovalSafety::Blocked(_)
+                ));
+                std::fs::write(&settings, pure).unwrap();
+
+                // Pure seeds alone verify as safe, and plain non-force removal
+                // clears them itself — no manual deletion step.
+                let target = match inspect_removal(&snapshot.common_dir, &checkout).unwrap() {
+                    RemovalSafety::Safe(target) => target,
+                    RemovalSafety::Blocked(blockers) => {
+                        panic!("pure seeds blocked removal: {blockers:?}")
+                    }
+                };
+                let outcome = remove_verified_worktree(&target).unwrap();
+                assert_eq!(outcome.removed_path(), target.path());
+                assert!(!target.path().exists());
+                assert!(repo.is_dir());
             }
 
             #[test]
