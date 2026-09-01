@@ -39,10 +39,11 @@ jobs:
       - if: ${{ steps.rp.outputs.pr }}
         uses: actions/checkout@v6
 
-      # The generic toml updaters bump the member Cargo.toml versions but
-      # cannot target Cargo.lock's [[package]] entries, so refresh the lock
-      # on the release branch. Idempotent: skips the commit when in sync.
-      - name: sync Cargo.lock on release branch
+      # The generic toml updaters cannot target Cargo.lock's [[package]]
+      # entries, so refresh the lock on the release branch. The release-as
+      # override only bootstraps beta.1; removing it here lets the prerelease
+      # strategy increment beta.2, beta.3, and later builds automatically.
+      - name: finalize release branch metadata
         if: ${{ steps.rp.outputs.pr }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -52,12 +53,15 @@ jobs:
           git clone --depth=1 --branch "$branch" \
             "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" /tmp/rp-branch
           cd /tmp/rp-branch
+          jq 'del(.packages["."]."release-as")' release-please-config.json \
+            > release-please-config.json.tmp
+          mv release-please-config.json.tmp release-please-config.json
           cargo update --workspace
-          if ! git diff --quiet -- Cargo.lock; then
+          if ! git diff --quiet -- Cargo.lock release-please-config.json; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "chore: sync Cargo.lock with release version"
+            git add Cargo.lock release-please-config.json
+            git commit -m "chore: finalize release metadata"
             git push origin "$branch"
           fi
 
