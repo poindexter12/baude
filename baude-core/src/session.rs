@@ -530,16 +530,27 @@ pub(crate) fn inspect_process_identity(
     if fields[0] == "Z" {
         return Ok(None);
     }
-    let parse = |index: usize, name: &str| {
+    // A generic fn rather than a closure: the fields span three parse target
+    // types (i32 process group/session, u64 start time), and a closure would
+    // pin its inferred type to the first use.
+    fn parse<T: std::str::FromStr>(
+        fields: &[&str],
+        index: usize,
+        name: &str,
+        pid: u32,
+    ) -> std::result::Result<T, String>
+    where
+        T::Err: std::fmt::Display,
+    {
         fields[index]
             .parse()
             .map_err(|error| format!("invalid {name} for pid {pid}: {error}"))
-    };
+    }
     Ok(Some(ProcessIdentity {
         pid,
-        process_group: parse(2, "process group")?,
-        session: parse(3, "session")?,
-        start_time: parse(19, "start time")?,
+        process_group: parse(&fields, 2, "process group", pid)?,
+        session: parse(&fields, 3, "session", pid)?,
+        start_time: parse(&fields, 19, "start time", pid)?,
     }))
 }
 
