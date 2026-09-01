@@ -47,20 +47,19 @@ assets (its tarball includes both `baude` and `bauded`):
 mise use -g github:poindexter12/baude
 ```
 
-The `v2.0.0-beta` tree is a local readiness target, not an available remote
-asset. To evaluate an explicitly checked-out source tree without replacing an
-existing `baude`, build it locked and install it under an isolated root:
+Beta builds are published as GitHub prereleases. Pin an exact beta in a
+project's `.mise.toml` so entering that project activates both `baude` and
+`bauded` from the matching release archive:
 
-```sh
-cd /path/to/explicitly-checked-out/baude
-cargo build --workspace --release --locked
-mkdir -p "$HOME/.local/baude-beta"
-cargo install --path baude --root "$HOME/.local/baude-beta" --locked
-"$HOME/.local/baude-beta/bin/baude" --version
+```toml
+[tools]
+"github:poindexter12/baude" = { version = "2.0.0-beta.1", prerelease = true }
 ```
 
-The expected final line for this source state is `baude 2.0.0-beta`. For a
-fully temporary HOME, repository, backend, state, and install root, follow the
+Run `mise install`, then verify the active project version with
+`mise exec -- baude --version`. Replace the pinned version deliberately when a
+later beta is available; prereleases are not selected by the stable global
+install above. For an isolated source build and test environment, follow the
 [local TUI dogfood runbook](docs/local-tui-dogfood.md).
 
 ## Usage
