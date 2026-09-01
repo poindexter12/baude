@@ -16,8 +16,9 @@ use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, State
 use baude_core::pty::{now_ms, Pty};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState, RuntimeGeneration,
-    SavedCheckout, SavedRepository, ShellOwnership, UnavailableCause,
+    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState,
+    RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout, SavedRepository,
+    SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
 };
 use baude_core::session::{Session, Status};
 
@@ -38,6 +39,12 @@ enum LocalAdmissionRoute {
     LaunchDirectory,
     Open,
     CloneCompletion,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeOwner {
+    Checkout(CheckoutKey),
+    Standalone(StandaloneKey),
 }
 
 fn local_admission_route(_route: LocalAdmissionRoute, remote_configured: bool) -> bool {
@@ -202,6 +209,7 @@ pub enum Focus {
 pub enum SelId {
     Repository(RepositoryKey),
     Checkout(CheckoutKey),
+    Standalone(StandaloneKey),
     Remote(u64),
 }
 
@@ -214,6 +222,8 @@ enum SidebarRefusal {
     AlreadyClosed,
     MainRemove,
     UnmanagedRemove,
+    StandaloneRemove,
+    StandaloneBranch,
     NoLiveRuntime,
     UnavailableReopen,
     UnavailableBranch,
@@ -269,6 +279,7 @@ fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
             ActionKind::Main => SidebarAction::Refuse(SidebarRefusal::MainRemove),
             ActionKind::Managed if view.can_remove => SidebarAction::Remove,
             ActionKind::External => SidebarAction::Refuse(SidebarRefusal::UnmanagedRemove),
+            ActionKind::Standalone => SidebarAction::Refuse(SidebarRefusal::StandaloneRemove),
             ActionKind::Unavailable
                 if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
             {
@@ -292,6 +303,7 @@ fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
         },
         KeyCode::Char('w') => match view.kind {
             ActionKind::Remote => SidebarAction::None,
+            ActionKind::Standalone => SidebarAction::Refuse(SidebarRefusal::StandaloneBranch),
             ActionKind::Unavailable
                 if view.capability == Some(lifecycle::LifecycleCapability::RetryRecovery) =>
             {
@@ -476,6 +488,7 @@ pub struct App {
     desktop_notify_enabled: bool,
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
+    runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
     persistence_blocked: bool,
     persistence_dirty: bool,
@@ -710,6 +723,7 @@ impl App {
                 .unwrap_or(true),
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
+            runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
             persistence_blocked: false,
             persistence_dirty: false,
@@ -758,7 +772,29 @@ impl App {
                 ))
             })
             .collect();
-        hierarchy::project_local(&self.repository_state, &decorations)
+        let standalone_decorations = self
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .filter_map(|standalone| {
+                let runtime_id = self.runtime_standalones.get(&standalone.key).copied()?;
+                let session = self.session(runtime_id)?;
+                Some((
+                    standalone.key,
+                    CheckoutDecoration {
+                        runtime_id: Some(runtime_id),
+                        status: Some(session.status()),
+                        waiting_for_ms: session.waiting_for_ms(),
+                        archived: session.archived,
+                    },
+                ))
+            })
+            .collect();
+        hierarchy::project_local_with_standalones(
+            &self.repository_state,
+            &decorations,
+            &standalone_decorations,
+        )
     }
 
     pub(crate) fn selected_action_view(&self) -> Option<ActionView> {
@@ -769,6 +805,12 @@ impl App {
             }),
             SelId::Checkout(key) => self.hierarchy_rows().into_iter().find_map(|row| match row {
                 LocalRow::Checkout(checkout) if checkout.key == key => Some(checkout.actions),
+                _ => None,
+            }),
+            SelId::Standalone(key) => self.hierarchy_rows().into_iter().find_map(|row| match row {
+                LocalRow::Standalone(standalone) if standalone.key == key => {
+                    Some(standalone.actions)
+                }
                 _ => None,
             }),
             SelId::Remote(_) => Some(hierarchy::action_view(
@@ -789,7 +831,7 @@ impl App {
                     .find(|checkout| checkout.key == key)?
                     .repository_key
             }
-            SelId::Remote(_) => return None,
+            SelId::Standalone(_) | SelId::Remote(_) => return None,
         };
         self.repository_state
             .repositories
@@ -805,6 +847,13 @@ impl App {
             .checkouts
             .iter()
             .find(|checkout| checkout.key == key)
+    }
+
+    pub(crate) fn selected_standalone(&self) -> Option<&SavedStandaloneSession> {
+        let SelId::Standalone(key) = self.selected_id? else {
+            return None;
+        };
+        self.repository_state.standalone_session(key)
     }
 
     fn repository_label(repository: &SavedRepository) -> String {
@@ -825,6 +874,10 @@ impl App {
     pub(crate) fn selected_target_label(&self) -> String {
         self.selected_checkout()
             .map(|checkout| checkout.session.name.clone())
+            .or_else(|| {
+                self.selected_standalone()
+                    .map(|saved| saved.session.name.clone())
+            })
             .or_else(|| self.selected_repository().map(Self::repository_label))
             .or_else(|| self.selected_remote().map(|remote| remote.name.clone()))
             .unwrap_or_else(|| "selected target".into())
@@ -915,6 +968,12 @@ impl App {
             SidebarRefusal::UnmanagedRemove => format!(
                 "Cannot remove “{target}”: it is not a baude-managed linked worktree. Keep it unchanged or remove it manually with Git if intended; nothing was removed."
             ),
+            SidebarRefusal::StandaloneRemove => format!(
+                "Cannot remove “{target}”: standalone sessions have no branch or worktree removal authority. The folder is unchanged."
+            ),
+            SidebarRefusal::StandaloneBranch => format!(
+                "Cannot create a branch for “{target}”: this is a standalone folder, not a Git checkout."
+            ),
             SidebarRefusal::NoLiveRuntime => format!(
                 "Cannot open a shell for “{target}”: no live local runtime is associated with this checkout. Press enter to reopen it first."
             ),
@@ -982,6 +1041,7 @@ impl App {
         self.selected_id.map(|selected| match selected {
             SelId::Repository(key) => SelectionTarget::Local(LocalRowId::Repository(key)),
             SelId::Checkout(key) => SelectionTarget::Local(LocalRowId::Checkout(key)),
+            SelId::Standalone(key) => SelectionTarget::Local(LocalRowId::Standalone(key)),
             SelId::Remote(id) => SelectionTarget::Remote(id),
         })
     }
@@ -990,6 +1050,7 @@ impl App {
         self.selected_id = selected.map(|selected| match selected {
             SelectionTarget::Local(LocalRowId::Repository(key)) => SelId::Repository(key),
             SelectionTarget::Local(LocalRowId::Checkout(key)) => SelId::Checkout(key),
+            SelectionTarget::Local(LocalRowId::Standalone(key)) => SelId::Standalone(key),
             SelectionTarget::Remote(id) => SelId::Remote(id),
         });
     }
@@ -1093,20 +1154,19 @@ impl App {
         if let Err(error) = self.reconcile_activation_recoveries() {
             self.set_message(format!("activation recovery: {error}"));
         }
+        if let Err(error) = self.restore_standalones() {
+            self.set_message(format!("standalone recovery: {error}"));
+        }
         let active = active_restore_checkouts(&self.repository_state);
         for key in active {
             if let Err(error) = self.ensure_primary(key) {
                 self.set_message(format!("restore primary: {error}"));
             }
         }
-        // Premise: baude is started from a repo folder. Auto-add it if new.
+        // Admit the launch directory through the same Git/non-Git classifier as `n`.
         let launch = self.launch_dir.clone();
-        if local_admission_route(LocalAdmissionRoute::LaunchDirectory, self.remote.is_some())
-            && git::discover_repository(&launch).is_ok()
-        {
-            if let Err(e) = self.admit_repository(&launch) {
-                self.set_message(format!("start session: {e}"));
-            }
+        if launch.is_dir() {
+            self.open_repo_session_via(launch, LocalAdmissionRoute::LaunchDirectory);
         }
         self.selected_id = self.ordered_ids().first().copied();
     }
@@ -1156,6 +1216,26 @@ impl App {
                     .or_else(|| checkout.session.resume_id.clone()),
             };
         }
+        for standalone in &mut state.standalone_sessions {
+            let Some(runtime_id) = self.runtime_standalones.get(&standalone.key) else {
+                continue;
+            };
+            let Some(session) = self.session(*runtime_id) else {
+                continue;
+            };
+            standalone.session = RetainedStandaloneSessionState {
+                name: session.name.clone(),
+                shell_open: session.shell_open,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+                resume_id: session
+                    .meta
+                    .session_id
+                    .clone()
+                    .or_else(|| standalone.session.resume_id.clone()),
+                ever_launched: standalone.session.ever_launched,
+            };
+        }
         state
             .validate()
             .map_err(persist::SaveError::before_replacement)?;
@@ -1189,6 +1269,277 @@ impl App {
 
     fn save_durable(&self) -> Result<()> {
         self.save_durable_status().map_err(anyhow::Error::new)
+    }
+
+    fn persist_standalone_change(&mut self, before: RepositoryState) -> Result<()> {
+        if let Err(error) = self.save_durable_status() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        self.persistence_dirty = false;
+        Ok(())
+    }
+
+    pub fn admit_standalone(&mut self, path: &Path) -> Result<Option<u64>> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("folder unavailable: {error}"))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("not a directory: {}", canonical.display());
+        }
+        let persisted = PersistedPath::from_path(&canonical);
+        let (key, fresh) =
+            if let Some(saved) = self.repository_state.standalone_session_by_path(&persisted) {
+                (saved.key, false)
+            } else {
+                let before = self.repository_state.clone();
+                let key = self.repository_state.allocate_standalone_key()?;
+                let order = self.repository_state.allocate_first_seen_order()?;
+                let name = canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| canonical.display().to_string());
+                self.repository_state
+                    .standalone_sessions
+                    .push(SavedStandaloneSession::new(
+                        key,
+                        persisted,
+                        order,
+                        StandaloneLifecycle::Active,
+                        None,
+                        RetainedStandaloneSessionState {
+                            name,
+                            shell_open: false,
+                            archived: false,
+                            archived_by_user: false,
+                            resume_id: None,
+                            ever_launched: false,
+                        },
+                    ));
+                self.persist_standalone_change(before)?;
+                (key, true)
+            };
+        self.reopen_standalone_with_mode(key, fresh.then_some(backend::SpawnMode::Fresh))
+            .map(Some)
+    }
+
+    fn add_standalone_session_with_mode(
+        &mut self,
+        key: StandaloneKey,
+        path: PathBuf,
+        mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> Result<u64> {
+        self.add_session_with_mode_internal(
+            RuntimeOwner::Standalone(key),
+            path.clone(),
+            Some(path),
+            None,
+            false,
+            mode,
+            shell_open,
+        )
+    }
+
+    pub fn reopen_standalone(&mut self, key: StandaloneKey) -> Result<u64> {
+        self.reopen_standalone_with_mode(key, None)
+    }
+
+    fn recover_standalone_ownership(
+        &mut self,
+        key: StandaloneKey,
+        successor: StandaloneLifecycle,
+    ) -> Result<()> {
+        let Some(runtime) = self
+            .repository_state
+            .standalone_session(key)
+            .and_then(SavedStandaloneSession::owned_runtime)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let generation = runtime.generation;
+        let shell = match runtime.shell {
+            ShellOwnership::Closed => None,
+            ShellOwnership::Owned(identity) => Some(identity),
+        };
+        if let Err(error) = baude_core::session::finish_recorded_teardown(
+            Some(runtime.agent.pid),
+            shell.as_ref().map(|identity| identity.pid),
+            Some(runtime.agent),
+            shell,
+            false,
+            false,
+        ) {
+            let before = self.repository_state.clone();
+            self.repository_state
+                .standalone_session_mut(key)
+                .ok_or_else(|| anyhow::anyhow!("standalone {} is missing", key.get()))?
+                .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(generation));
+            self.persist_standalone_change(before)?;
+            return Err(anyhow::Error::new(error));
+        }
+        let before = self.repository_state.clone();
+        self.repository_state
+            .standalone_session_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("standalone {} is missing", key.get()))?
+            .set_runtime_state(successor, None);
+        self.persist_standalone_change(before)
+    }
+
+    fn reopen_standalone_with_mode(
+        &mut self,
+        key: StandaloneKey,
+        requested_mode: Option<backend::SpawnMode>,
+    ) -> Result<u64> {
+        if let Some(id) = self.runtime_standalones.get(&key).copied() {
+            if self
+                .session(id)
+                .is_some_and(|session| !session.claude.is_exited())
+            {
+                self.selected_id = Some(SelId::Standalone(key));
+                self.focus = Focus::Claude;
+                return Ok(id);
+            }
+            self.close_standalone(key)?;
+        }
+        let saved = self
+            .repository_state
+            .standalone_session(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("standalone {} is missing", key.get()))?;
+        if saved.owned_runtime().is_some() {
+            self.recover_standalone_ownership(key, StandaloneLifecycle::Active)?;
+        }
+        let saved = self
+            .repository_state
+            .standalone_session(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("standalone {} is missing", key.get()))?;
+        let path = saved.canonical_path.to_path_buf();
+        let canonical = match path.canonicalize() {
+            Ok(canonical) if canonical.is_dir() && canonical == path => canonical,
+            _ => {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone cloned above")
+                    .set_runtime_state(StandaloneLifecycle::Missing, None);
+                self.persist_standalone_change(before)?;
+                anyhow::bail!("folder is missing: {}", path.display());
+            }
+        };
+        let before = self.repository_state.clone();
+        self.repository_state
+            .standalone_session_mut(key)
+            .expect("standalone cloned above")
+            .set_runtime_state(StandaloneLifecycle::Active, None);
+        self.persist_standalone_change(before)?;
+        let mode = requested_mode.unwrap_or_else(|| {
+            if !saved.session.ever_launched {
+                return backend::SpawnMode::Fresh;
+            }
+            saved
+                .session
+                .resume_id
+                .clone()
+                .map(backend::SpawnMode::ResumeId)
+                .unwrap_or(backend::SpawnMode::ContinueLatest)
+        });
+        let id =
+            self.add_standalone_session_with_mode(key, canonical, mode, saved.session.shell_open)?;
+        if let Some(runtime) = self.session_mut(id) {
+            runtime.name = saved.session.name;
+            runtime.archived = saved.session.archived;
+            runtime.archived_by_user = saved.session.archived_by_user;
+        }
+        self.runtime_standalones.insert(key, id);
+        self.selected_id = Some(SelId::Standalone(key));
+        self.focus = Focus::Claude;
+        Ok(id)
+    }
+
+    fn restore_standalones(&mut self) -> Result<()> {
+        let entries: Vec<_> = self
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .filter_map(|saved| {
+                let reopen = matches!(
+                    saved.lifecycle(),
+                    StandaloneLifecycle::Active
+                        | StandaloneLifecycle::Launching(_)
+                        | StandaloneLifecycle::Running(_)
+                );
+                (reopen
+                    || matches!(
+                        saved.lifecycle(),
+                        StandaloneLifecycle::Stopping(_)
+                            | StandaloneLifecycle::ProtectedTeardown(_)
+                    ))
+                .then_some((saved.key, reopen))
+            })
+            .collect();
+        let mut failures = Vec::new();
+        for (key, reopen) in entries {
+            let result = (|| -> Result<()> {
+                let owned = self
+                    .repository_state
+                    .standalone_session(key)
+                    .and_then(SavedStandaloneSession::owned_runtime)
+                    .cloned();
+                if let Some(runtime) = owned {
+                    let generation = runtime.generation;
+                    let shell = match runtime.shell {
+                        ShellOwnership::Closed => None,
+                        ShellOwnership::Owned(identity) => Some(identity),
+                    };
+                    if let Err(error) = baude_core::session::finish_recorded_teardown(
+                        Some(runtime.agent.pid),
+                        shell.as_ref().map(|identity| identity.pid),
+                        Some(runtime.agent),
+                        shell,
+                        false,
+                        false,
+                    ) {
+                        let before = self.repository_state.clone();
+                        self.repository_state
+                            .standalone_session_mut(key)
+                            .expect("standalone key collected above")
+                            .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(generation));
+                        self.persist_standalone_change(before)?;
+                        return Err(anyhow::Error::new(error));
+                    }
+                }
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone key collected above")
+                    .set_runtime_state(
+                        if reopen {
+                            StandaloneLifecycle::Active
+                        } else {
+                            StandaloneLifecycle::Inactive
+                        },
+                        None,
+                    );
+                self.persist_standalone_change(before)?;
+                if reopen {
+                    self.reopen_standalone(key)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                failures.push(format!("{}: {error}", key.get()));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(failures.join("; "));
+        }
+        Ok(())
     }
 
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
@@ -1298,7 +1649,6 @@ impl App {
             checkout.session.cwd = PersistedPath::from_path(&record.path);
             checkout.session.branch = Some(default.local_branch.clone());
             checkout.session.is_worktree = is_worktree;
-            lifecycle::mark_checkout_active(&mut self.repository_state, checkout_key)?;
         } else {
             let first_seen_order = self.repository_state.allocate_first_seen_order()?;
             let name = snapshot
@@ -1846,11 +2196,13 @@ impl App {
         for group in [&mut active_remote, &mut archived_remote] {
             group.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        self.hierarchy_rows()
+        let hierarchy = self.hierarchy_rows();
+        hierarchy::selectable_local_ids(&hierarchy)
             .into_iter()
-            .map(|row| match row.id() {
+            .map(|id| match id {
                 LocalRowId::Repository(key) => SelId::Repository(key),
                 LocalRowId::Checkout(key) => SelId::Checkout(key),
+                LocalRowId::Standalone(key) => SelId::Standalone(key),
             })
             .chain(active_remote.into_iter().map(|(_, id)| id))
             .chain(archived_remote.into_iter().map(|(_, id)| id))
@@ -1871,6 +2223,17 @@ impl App {
                         .iter()
                         .find(|checkout| checkout.key == key)
                         .map(|checkout| checkout.session.archived)
+                })
+                .unwrap_or(false),
+            SelId::Standalone(key) => self
+                .runtime_standalones
+                .get(&key)
+                .and_then(|id| self.session(*id))
+                .map(|session| session.archived)
+                .or_else(|| {
+                    self.repository_state
+                        .standalone_session(key)
+                        .map(|saved| saved.session.archived)
                 })
                 .unwrap_or(false),
             SelId::Remote(rid) => self.remote_info(rid).map(|r| r.archived).unwrap_or(false),
@@ -1902,6 +2265,10 @@ impl App {
                 .runtime_checkouts
                 .get(&key)
                 .and_then(|id| self.session(*id)),
+            Some(SelId::Standalone(key)) => self
+                .runtime_standalones
+                .get(&key)
+                .and_then(|id| self.session(*id)),
             _ => None,
         }
     }
@@ -1910,6 +2277,10 @@ impl App {
         match self.selected_id {
             Some(SelId::Checkout(key)) => {
                 let id = self.runtime_checkouts.get(&key).copied()?;
+                self.sessions.iter_mut().find(|session| session.id == id)
+            }
+            Some(SelId::Standalone(key)) => {
+                let id = self.runtime_standalones.get(&key).copied()?;
                 self.sessions.iter_mut().find(|session| session.id == id)
             }
             _ => None,
@@ -1948,7 +2319,7 @@ impl App {
         shell_open: bool,
     ) -> Result<u64> {
         self.add_session_with_mode_internal(
-            Some(checkout),
+            RuntimeOwner::Checkout(checkout),
             cwd,
             repo_root,
             branch,
@@ -1961,7 +2332,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn add_session_with_mode_internal(
         &mut self,
-        checkout: Option<CheckoutKey>,
+        owner: RuntimeOwner,
         cwd: PathBuf,
         repo_root: Option<PathBuf>,
         branch: Option<String>,
@@ -2028,18 +2399,22 @@ impl App {
         let (rows, cols) = self.claude_spawn_size(shell_open);
         let (_, shell_rect) = pane_rects(self.content_rect, shell_open);
         let shell_size = shell_rect.map(inner).map(|rect| (rect.height, rect.width));
-        let generation = checkout
-            .and_then(|key| {
-                self.repository_state
-                    .checkouts
-                    .iter()
-                    .find(|saved| saved.key == key)
-                    .and_then(SavedCheckout::owned_runtime)
-                    .and_then(|runtime| runtime.generation.successor())
-            })
-            .unwrap_or(RuntimeGeneration::initial());
+        let generation = match owner {
+            RuntimeOwner::Checkout(key) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == key)
+                .and_then(SavedCheckout::owned_runtime),
+            RuntimeOwner::Standalone(key) => self
+                .repository_state
+                .standalone_session(key)
+                .and_then(SavedStandaloneSession::owned_runtime),
+        }
+        .and_then(|runtime| runtime.generation.successor())
+        .unwrap_or(RuntimeGeneration::initial());
         let mut registered_shell = None;
-        let mut claude = if let Some(checkout) = checkout {
+        let claude_result =
             Pty::spawn_registered_with(Some(&plan.cmd), &plan.env, &cwd, rows, cols, |agent| {
                 if let Some((shell_rows, shell_cols)) = shell_size {
                     let shell = Pty::spawn_registered_with(
@@ -2054,11 +2429,7 @@ impl App {
                                 agent: agent.clone(),
                                 shell: ShellOwnership::Owned(identity.clone()),
                             };
-                            self.drive_lifecycle_effect(
-                                checkout,
-                                lifecycle::LifecycleEvent::LaunchRegistered(runtime),
-                                |_, _| Ok(()),
-                            )?;
+                            self.register_runtime(owner, runtime)?;
                             Ok(())
                         },
                     )?;
@@ -2069,36 +2440,41 @@ impl App {
                         agent: agent.clone(),
                         shell: ShellOwnership::Closed,
                     };
-                    self.drive_lifecycle_effect(
-                        checkout,
-                        lifecycle::LifecycleEvent::LaunchRegistered(runtime),
-                        |_, _| Ok(()),
-                    )?;
+                    self.register_runtime(owner, runtime)?;
                 }
                 Ok(())
-            })?
-        } else {
-            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, rows, cols)?
-        };
-        if let Some(checkout) = checkout {
-            if let Err(error) = self.drive_lifecycle_effect(
-                checkout,
-                lifecycle::LifecycleEvent::LaunchReleased,
-                |_, _| Ok(()),
-            ) {
-                let _ = claude.kill_and_wait();
+            });
+        let mut claude = match claude_result {
+            Ok(claude) => claude,
+            Err(error) => {
                 if let Some(shell) = &mut registered_shell {
                     let _ = shell.kill_and_wait();
                 }
+                if let RuntimeOwner::Standalone(key) = owner {
+                    if let Err(recovery) =
+                        self.recover_standalone_ownership(key, StandaloneLifecycle::Active)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "{error}; standalone launch cleanup failed: {recovery}"
+                        ));
+                    }
+                }
                 return Err(error);
             }
+        };
+        if let Err(error) = self.release_runtime(owner) {
+            let _ = claude.kill_and_wait();
+            if let Some(shell) = &mut registered_shell {
+                let _ = shell.kill_and_wait();
+            }
+            return Err(error);
         }
         let mut meta = ClaudeMeta::default();
         meta.backend_port = plan.server_port;
 
         let id = self.next_id;
         self.next_id += 1;
-        let mut session = Session {
+        let session = Session {
             id,
             name,
             cwd,
@@ -2117,18 +2493,82 @@ impl App {
             pending_permission: None,
             permission_decision: None,
         };
-        if shell_open && checkout.is_none() {
-            let (_, shell_rect) = pane_rects(self.content_rect, true);
-            if let Some(sr) = shell_rect {
-                let r = inner(sr);
-                let _ = session.open_shell(r.height, r.width);
+        self.sessions.push(session);
+        match owner {
+            RuntimeOwner::Checkout(checkout) => {
+                self.selected_id = Some(SelId::Checkout(checkout));
+            }
+            RuntimeOwner::Standalone(standalone) => {
+                self.selected_id = Some(SelId::Standalone(standalone));
             }
         }
-        self.sessions.push(session);
-        if let Some(checkout) = checkout {
-            self.selected_id = Some(SelId::Checkout(checkout));
-        }
         Ok(id)
+    }
+
+    fn register_runtime(&mut self, owner: RuntimeOwner, runtime: OwnedRuntime) -> Result<()> {
+        match owner {
+            RuntimeOwner::Checkout(checkout) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::LaunchRegistered(runtime),
+                    |_, _| Ok(()),
+                )?;
+            }
+            RuntimeOwner::Standalone(key) => {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .ok_or_else(|| anyhow::anyhow!("standalone {} is missing", key.get()))?
+                    .set_runtime_state(
+                        StandaloneLifecycle::Launching(runtime.generation),
+                        Some(runtime),
+                    );
+                if let Err(error) = self.save_durable_status() {
+                    if !error.replacement_committed() {
+                        self.repository_state = before;
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn release_runtime(&mut self, owner: RuntimeOwner) -> Result<()> {
+        match owner {
+            RuntimeOwner::Checkout(checkout) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::LaunchReleased,
+                    |_, _| Ok(()),
+                )?;
+            }
+            RuntimeOwner::Standalone(key) => {
+                let before = self.repository_state.clone();
+                let generation = self
+                    .repository_state
+                    .standalone_session(key)
+                    .and_then(SavedStandaloneSession::owned_runtime)
+                    .map(|runtime| runtime.generation)
+                    .ok_or_else(|| anyhow::anyhow!("standalone launch has no owned runtime"))?;
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone checked above")
+                    .set_lifecycle(StandaloneLifecycle::Running(generation));
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone checked above")
+                    .session
+                    .ever_launched = true;
+                if let Err(error) = self.save_durable_status() {
+                    if !error.replacement_committed() {
+                        self.repository_state = before;
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn teardown_retained_runtime(&mut self, checkout_key: CheckoutKey, id: u64) -> Result<()> {
@@ -2556,7 +2996,120 @@ impl App {
         })
     }
 
+    fn close_standalone(&mut self, key: StandaloneKey) -> Result<()> {
+        let id = self
+            .runtime_standalones
+            .get(&key)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("standalone session is already closed"))?;
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow::anyhow!("standalone runtime {id} is missing"))?;
+        let owned = self
+            .repository_state
+            .standalone_session(key)
+            .and_then(SavedStandaloneSession::owned_runtime)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("standalone runtime has no durable ownership"))?;
+        let session = &self.sessions[index];
+        let shell_matches = match (&owned.shell, &session.shell) {
+            (ShellOwnership::Closed, None) => true,
+            (ShellOwnership::Owned(expected), Some(shell)) => shell.process_identity() == expected,
+            _ => false,
+        };
+        if session.claude.process_identity() != &owned.agent || !shell_matches {
+            let before = self.repository_state.clone();
+            self.repository_state
+                .standalone_session_mut(key)
+                .expect("standalone resolved above")
+                .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(owned.generation));
+            self.persist_standalone_change(before)?;
+            anyhow::bail!("standalone runtime identity no longer matches durable ownership");
+        }
+        let before = self.repository_state.clone();
+        let durable = &mut self
+            .repository_state
+            .standalone_session_mut(key)
+            .unwrap()
+            .session;
+        durable.name = session.name.clone();
+        durable.shell_open = session.shell_open;
+        durable.archived = session.archived;
+        durable.archived_by_user = session.archived_by_user;
+        durable.resume_id = session
+            .meta
+            .session_id
+            .clone()
+            .or_else(|| durable.resume_id.clone());
+        self.repository_state
+            .standalone_session_mut(key)
+            .unwrap()
+            .set_lifecycle(StandaloneLifecycle::Stopping(owned.generation));
+        self.persist_standalone_change(before)?;
+
+        let session = &mut self.sessions[index];
+        if let Some(shell) = &mut session.shell {
+            if let Err(error) = shell.kill_and_wait() {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .unwrap()
+                    .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(owned.generation));
+                self.persist_standalone_change(before)?;
+                return Err(error.context("standalone shell teardown"));
+            }
+        }
+        if let Err(error) = session.claude.kill_and_wait() {
+            let before = self.repository_state.clone();
+            self.repository_state
+                .standalone_session_mut(key)
+                .unwrap()
+                .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(owned.generation));
+            self.persist_standalone_change(before)?;
+            return Err(error.context("standalone agent teardown"));
+        }
+        let before = self.repository_state.clone();
+        self.repository_state
+            .standalone_session_mut(key)
+            .unwrap()
+            .set_runtime_state(StandaloneLifecycle::Inactive, None);
+        let final_save = self.save_durable_status();
+        match final_save {
+            Ok(()) => self.persistence_dirty = false,
+            Err(error) if error.replacement_committed() => {
+                self.persistence_dirty = true;
+                self.runtime_standalones.remove(&key);
+                self.sessions.retain(|session| session.id != id);
+                self.selected_id = Some(SelId::Standalone(key));
+                self.focus = Focus::Sidebar;
+                return Err(anyhow::Error::new(error));
+            }
+            Err(error) => {
+                self.repository_state = before;
+                self.persistence_dirty = true;
+                return Err(anyhow::Error::new(error));
+            }
+        }
+        self.runtime_standalones.remove(&key);
+        self.sessions.retain(|session| session.id != id);
+        self.selected_id = Some(SelId::Standalone(key));
+        self.focus = Focus::Sidebar;
+        Ok(())
+    }
+
     fn remove_session(&mut self, id: u64) {
+        if let Some(key) = self
+            .runtime_standalones
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+        {
+            if let Err(error) = self.close_standalone(key) {
+                self.set_message(format!("standalone close blocked: {error}"));
+            }
+            return;
+        }
         if checkout_for_runtime(&self.runtime_checkouts, id).is_some() {
             if let Err(error) = self.close_retained_session(id) {
                 self.set_message(format!("session close degraded or blocked: {error}"));
@@ -2674,7 +3227,7 @@ impl App {
         }
         if matches!(
             self.selected_id,
-            Some(SelId::Repository(_) | SelId::Checkout(_))
+            Some(SelId::Repository(_) | SelId::Checkout(_) | SelId::Standalone(_))
         ) {
             let rows = self.hierarchy_rows();
             let remote_ids: Vec<_> = self
@@ -2709,7 +3262,7 @@ impl App {
         match self.focus {
             Focus::Claude => {
                 let alive = match self.selected_id {
-                    Some(SelId::Checkout(_)) => self
+                    Some(SelId::Checkout(_) | SelId::Standalone(_)) => self
                         .selected()
                         .map(|s| !s.claude.is_exited())
                         .unwrap_or(false),
@@ -3004,6 +3557,11 @@ impl App {
                     self.modal = Modal::ConfirmCloseWorktree { id };
                 }
             }
+            Some(SelId::Standalone(key)) => {
+                if let Some(id) = self.runtime_standalones.get(&key).copied() {
+                    self.modal = Modal::ConfirmCloseWorktree { id };
+                }
+            }
             Some(SelId::Repository(_)) => {}
             None => {}
         }
@@ -3035,11 +3593,21 @@ impl App {
         match self.selected_id? {
             SelId::Checkout(key) => Some(key),
             SelId::Repository(repository) => self.default_checkout(repository),
+            SelId::Standalone(_) => None,
             SelId::Remote(_) => None,
         }
     }
 
     fn open_local_target(&mut self) {
+        if let Some(SelId::Standalone(key)) = self.selected_id {
+            let target = self.selected_target_label();
+            if let Err(error) = self.reopen_standalone(key) {
+                self.set_message(format!(
+                    "Cannot reopen “{target}”: {error}; no runtime was started."
+                ));
+            }
+            return;
+        }
         let Some(checkout) = self.action_checkout() else {
             let repository = self.selected_target_label();
             self.set_message(format!(
@@ -3216,6 +3784,14 @@ impl App {
                     return;
                 };
                 let action = sidebar_action(view, key);
+                let standalone_close_retry = matches!(action, SidebarAction::Close)
+                    && self.selected_standalone().is_some_and(|saved| {
+                        matches!(
+                            saved.lifecycle(),
+                            StandaloneLifecycle::Stopping(_)
+                                | StandaloneLifecycle::ProtectedTeardown(_)
+                        )
+                    });
                 if (self.persistence_blocked || self.persistence_dirty)
                     && matches!(
                         action,
@@ -3224,6 +3800,7 @@ impl App {
                             | SidebarAction::RetryReopen
                             | SidebarAction::Remove
                     )
+                    && !standalone_close_retry
                 {
                     self.set_message(PERSISTENCE_ACTION_REFUSAL.into());
                     return;
@@ -3312,6 +3889,11 @@ impl App {
                                     self.remove_session(id);
                                 }
                             }
+                            SelId::Standalone(key) => {
+                                if let Err(error) = self.close_standalone(key) {
+                                    self.set_message(format!("standalone close blocked: {error}"));
+                                }
+                            }
                             SelId::Repository(_) => {}
                             SelId::Remote(id) => self.remove_remote(id),
                         }
@@ -3325,10 +3907,24 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
                         self.modal = Modal::None;
-                        match self.close_retained_session(id) {
-                            Ok(_) => self.set_message("session closed — checkout kept".into()),
-                            Err(error) => self
-                                .set_message(format!("session close degraded or blocked: {error}")),
+                        if let Some(key) = self
+                            .runtime_standalones
+                            .iter()
+                            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+                        {
+                            match self.close_standalone(key) {
+                                Ok(()) => self.set_message("session closed — folder kept".into()),
+                                Err(error) => {
+                                    self.set_message(format!("standalone close blocked: {error}"))
+                                }
+                            }
+                        } else {
+                            match self.close_retained_session(id) {
+                                Ok(_) => self.set_message("session closed — checkout kept".into()),
+                                Err(error) => self.set_message(format!(
+                                    "session close degraded or blocked: {error}"
+                                )),
+                            }
                         }
                     }
                     KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
@@ -3539,20 +4135,47 @@ impl App {
     }
 
     fn open_repo_session_via(&mut self, path: PathBuf, route: LocalAdmissionRoute) {
-        if let Some(remote) = &self.remote {
-            match remote.create(&path.to_string_lossy(), None, None) {
-                Ok(()) => self.set_message("session queued on daemon".into()),
-                Err(e) => self.set_message(format!("daemon: {e}")),
+        if let Ok(canonical) = path.canonicalize() {
+            let persisted = PersistedPath::from_path(&canonical);
+            if self
+                .repository_state
+                .standalone_session_by_path(&persisted)
+                .is_some()
+            {
+                match self.admit_standalone(&canonical) {
+                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(None) => {}
+                    Err(error) => self.set_message(format!("folder admission failed: {error}")),
+                }
+                return;
             }
-            return;
         }
-        debug_assert!(local_admission_route(route, false));
-        match self.admit_repository(&path) {
-            Ok(Some(_)) => {
-                self.focus = Focus::Claude;
+        match git::discover_repository(&path) {
+            Ok(_) => {
+                if let Some(remote) = &self.remote {
+                    match remote.create(&path.to_string_lossy(), None, None) {
+                        Ok(()) => self.set_message("session queued on daemon".into()),
+                        Err(e) => self.set_message(format!("daemon: {e}")),
+                    }
+                    return;
+                }
+                debug_assert!(local_admission_route(route, false));
+                match self.admit_repository(&path) {
+                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(None) => {}
+                    Err(e) => self.set_message(format!("repository admission failed: {e}")),
+                }
             }
-            Ok(None) => {}
-            Err(e) => self.set_message(format!("repository admission failed: {e}")),
+            Err(git::RepositoryDiscoveryError::NotRepository(_)) => {
+                match self.admit_standalone(&path) {
+                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(None) => {}
+                    Err(error) => self.set_message(format!("folder admission failed: {error}")),
+                }
+            }
+            Err(error) => {
+                self.set_message(format!("repository discovery failed: {error}"));
+            }
         }
     }
 
@@ -3697,6 +4320,25 @@ impl App {
                     "unarchived".into()
                 });
             }
+            Some(SelId::Standalone(key)) => {
+                if let Some(id) = self.runtime_standalones.get(&key).copied() {
+                    let Some(s) = self.session_mut(id) else {
+                        return;
+                    };
+                    s.set_archived(!s.archived);
+                    self.save();
+                    return;
+                }
+                let before = self.repository_state.clone();
+                let Some(saved) = self.repository_state.standalone_session_mut(key) else {
+                    return;
+                };
+                saved.session.archived = !saved.session.archived;
+                saved.session.archived_by_user = saved.session.archived;
+                if let Err(error) = self.persist_standalone_change(before) {
+                    self.set_message(format!("archive state not saved: {error}"));
+                }
+            }
             Some(SelId::Remote(id)) => {
                 let archived = self.is_archived(SelId::Remote(id));
                 let Some(r) = &self.remote else { return };
@@ -3787,6 +4429,10 @@ impl App {
                 .iter()
                 .find(|checkout| checkout.key == key)
                 .map(|checkout| checkout.observed_path.to_path_buf()),
+            Some(SelId::Standalone(key)) => self
+                .repository_state
+                .standalone_session(key)
+                .map(|saved| saved.canonical_path.to_path_buf()),
             _ => None,
         };
         let Some(cwd) = cwd else {
@@ -3813,6 +4459,12 @@ impl App {
     }
 
     fn toggle_shell(&mut self, focus_it: bool) {
+        if let Some(SelId::Standalone(key)) = self.selected_id {
+            if let Err(error) = self.toggle_standalone_shell(key, focus_it) {
+                self.set_message(format!("shell: {error}"));
+            }
+            return;
+        }
         let content = self.content_rect;
         let Some(s) = self.selected_mut() else {
             return;
@@ -3837,7 +4489,109 @@ impl App {
         self.save();
     }
 
+    fn toggle_standalone_shell(&mut self, key: StandaloneKey, focus_it: bool) -> Result<()> {
+        let id = self
+            .runtime_standalones
+            .get(&key)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("reopen the folder session first"))?;
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow::anyhow!("standalone runtime is missing"))?;
+        if self.sessions[index].shell_open {
+            self.sessions[index].shell_open = false;
+            if self.focus == Focus::Shell {
+                self.focus = Focus::Claude;
+            }
+            self.save();
+            return Ok(());
+        }
+        if self.sessions[index]
+            .shell
+            .as_ref()
+            .is_some_and(|shell| !shell.is_exited())
+        {
+            self.sessions[index].shell_open = true;
+            if focus_it {
+                self.focus = Focus::Shell;
+            }
+            self.save();
+            return Ok(());
+        }
+        let (_, shell_rect) = pane_rects(self.content_rect, true);
+        let rect = shell_rect.map(inner).unwrap_or(Rect::new(0, 0, 80, 10));
+        let cwd = self.sessions[index].cwd.clone();
+        let owned = self
+            .repository_state
+            .standalone_session(key)
+            .and_then(SavedStandaloneSession::owned_runtime)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("standalone runtime has no durable ownership"))?;
+        let ownership_before = self.repository_state.clone();
+        let shell_result =
+            Pty::spawn_registered_with(None, &[], &cwd, rect.height, rect.width, |identity| {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone resolved above")
+                    .set_runtime_state(
+                        StandaloneLifecycle::Running(owned.generation),
+                        Some(OwnedRuntime {
+                            generation: owned.generation,
+                            agent: owned.agent.clone(),
+                            shell: ShellOwnership::Owned(identity.clone()),
+                        }),
+                    );
+                self.persist_standalone_change(before)
+            });
+        let mut shell = match shell_result {
+            Ok(shell) => shell,
+            Err(error) => {
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone resolved above")
+                    .set_runtime_state(
+                        StandaloneLifecycle::Running(owned.generation),
+                        Some(owned.clone()),
+                    );
+                if let Err(save_error) = self.save_durable_status() {
+                    self.persistence_dirty = true;
+                    if !save_error.replacement_committed() {
+                        self.repository_state = ownership_before;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "{error}; shell ownership rollback was not durable: {save_error}"
+                    ));
+                }
+                self.persistence_dirty = false;
+                return Err(error);
+            }
+        };
+        if self.sessions[index].claude.process_identity() != &owned.agent {
+            let _ = shell.kill_and_wait();
+            anyhow::bail!("agent identity changed while opening shell");
+        }
+        self.sessions[index].shell = Some(shell);
+        self.sessions[index].shell_open = true;
+        if focus_it {
+            self.focus = Focus::Shell;
+        }
+        self.save();
+        Ok(())
+    }
+
     fn restart_session_with_mode(&mut self, id: u64, mode: backend::SpawnMode) -> Result<()> {
+        if let Some(key) = self
+            .runtime_standalones
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+        {
+            self.close_standalone(key)?;
+            self.reopen_standalone(key)?;
+            return Ok(());
+        }
         let (rows, cols) = {
             let Some(s) = self.session(id) else {
                 anyhow::bail!("session {id} is missing");
@@ -3902,7 +4656,7 @@ impl App {
             }
             replacement
         } else {
-            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, rows, cols)?
+            anyhow::bail!("runtime {id} has no durable owner")
         };
         if let Some(s) = self.session_mut(id) {
             std::mem::swap(&mut s.claude, &mut pty);
@@ -4106,16 +4860,18 @@ mod clipboard_tests {
 mod tests {
     use super::{
         active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, LocalAdmissionRoute, Modal,
+        require_same_checkout_path, App, LocalAdmissionRoute, Modal, SelId,
     };
+    use crate::hierarchy::LocalRow;
     use baude_core::lifecycle::{
         canonical_lifecycle_contract_vectors, canonical_lifecycle_trace, normalize_lifecycle_trace,
         LifecycleOutcome, RepositoryReservations,
     };
+    use baude_core::persist;
     use baude_core::repository::{
         CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
         RepositoryHealth, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
-        UnavailableCause,
+        StandaloneLifecycle, UnavailableCause,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -4313,7 +5069,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_navigation_visits_parents_cycles_children_and_retains_selection_on_ctrl_q() {
+    fn hierarchy_navigation_skips_parent_with_available_checkout_and_retains_selection() {
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();
         let order = state.allocate_first_seen_order().unwrap();
@@ -4342,16 +5098,13 @@ mod tests {
         app.move_selection(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
         app.move_selection(-1);
-        assert_eq!(
-            app.selected_id,
-            Some(super::SelId::Repository(repository_key))
-        );
-        app.cycle_session(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
         app.cycle_session(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(second)));
         app.cycle_session(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(super::SelId::Checkout(second)));
 
         app.focus = super::Focus::Claude;
         let selected = app.selected_id;
@@ -5146,6 +5899,41 @@ mod tests {
     }
 
     #[test]
+    fn active_launch_repository_restart_focuses_restored_runtime_without_duplicate_spawn() {
+        let repo = admission_repo("active-launch-restart");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        app.kill_all();
+
+        let mut restarted = App::new(repo.clone());
+        restarted.remote = None;
+        restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        restarted.persistence_root_for_test = Some(state_root);
+        restarted.restore();
+
+        let checkout = restarted.repository_state.checkouts[0].key;
+        assert_eq!(restarted.repository_state.repositories.len(), 1);
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        assert_eq!(restarted.runtime_checkouts.len(), 1);
+        assert_eq!(restarted.sessions.len(), 1);
+        assert_eq!(restarted.spawn_attempts_for_test, 1);
+        assert_eq!(restarted.selected_id, Some(SelId::Checkout(checkout)));
+        assert!(matches!(restarted.focus, super::Focus::Claude));
+        assert!(restarted.message.is_none(), "got: {:?}", restarted.message);
+        restarted.repository_state.validate().unwrap();
+        restarted.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn admission_routes_share_one_local_entrypoint_and_preserve_remote_routing() {
         for route in [
             LocalAdmissionRoute::LaunchDirectory,
@@ -5923,8 +6711,9 @@ mod tests {
                     .into_iter()
                     .filter(|id| !matches!(id, super::SelId::Remote(_)))
                     .collect::<Vec<_>>(),
-                std::iter::once(super::SelId::Repository(repository))
-                    .chain(expected.iter().map(|(key, _)| super::SelId::Checkout(*key)))
+                expected
+                    .iter()
+                    .map(|(key, _)| super::SelId::Checkout(*key))
                     .collect::<Vec<_>>()
             );
         }
@@ -6041,8 +6830,8 @@ mod tests {
             assert_structure(app, repository, &expected, &[]);
             assert_eq!(
                 app.selected_id,
-                Some(super::SelId::Repository(repository)),
-                "restart must select the first rendered local parent"
+                Some(super::SelId::Checkout(expected[0].0)),
+                "restart must select the first available checkout"
             );
             assert_eq!(std::fs::read(&user_file).unwrap(), b"keep this work\n");
             assert_inventory(&repo, &root, &[repo.clone(), checkout_path.clone()]);
@@ -6467,6 +7256,199 @@ mod tests {
             &repo,
             &["worktree", "remove", "--", target_path.to_str().unwrap()],
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_admission_dedup_close_reopen_and_missing_are_durable() {
+        let root =
+            std::env::temp_dir().join(format!("baude-standalone-lifecycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join("plain folder");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(folder.clone());
+        app.remote = Some(crate::remote::RemotePoller::start(
+            "http://127.0.0.1:9".into(),
+        ));
+        app.config.claude_cmd = Some("sleep 30".into());
+        app.config.opencode_cmd = Some("sleep 30".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+
+        app.open_repo_session_via(folder.clone(), LocalAdmissionRoute::Open);
+        let key = match app.selected_id {
+            Some(SelId::Standalone(key)) => key,
+            other => panic!("unexpected selection: {other:?}"),
+        };
+        let first = app.runtime_standalones[&key];
+        app.remote = None;
+        assert!(matches!(
+            app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .lifecycle(),
+            StandaloneLifecycle::Running(_)
+        ));
+        assert!(app
+            .repository_state
+            .standalone_session(key)
+            .unwrap()
+            .owned_runtime()
+            .is_some());
+        assert!(app.repository_state.repositories.is_empty());
+        assert!(app.repository_state.checkouts.is_empty());
+        assert_eq!(app.admit_standalone(&folder).unwrap(), Some(first));
+        assert_eq!(app.repository_state.standalone_sessions.len(), 1);
+        git(&folder, &["init"]);
+        app.open_repo_session_via(folder.clone(), LocalAdmissionRoute::Open);
+        assert!(app.repository_state.repositories.is_empty());
+        assert!(app.repository_state.checkouts.is_empty());
+
+        app.session_mut(first).unwrap().meta.session_id = Some("resume-plain".into());
+        app.atomic_failure_for_test = Some(persist::AtomicFailure::DirectorySync);
+        assert!(app.close_standalone(key).is_err());
+        assert!(app.runtime_standalones.contains_key(&key));
+        app.atomic_failure_for_test = None;
+        app.close_standalone(key).unwrap();
+        let saved = app.repository_state.standalone_session(key).unwrap();
+        assert_eq!(saved.session.resume_id.as_deref(), Some("resume-plain"));
+        assert!(matches!(saved.lifecycle(), StandaloneLifecycle::Inactive));
+        assert!(saved.owned_runtime().is_none());
+        assert!(app.hierarchy_rows().iter().any(|row| matches!(
+            row,
+            LocalRow::Standalone(row) if row.key == key && row.runtime_id.is_none()
+        )));
+
+        let reopened = app.reopen_standalone(key).unwrap();
+        assert_ne!(reopened, first);
+        app.close_standalone(key).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+        let attempts = app.spawn_attempts_for_test;
+        assert!(app.reopen_standalone(key).is_err());
+        assert_eq!(app.spawn_attempts_for_test, attempts);
+        assert!(matches!(
+            app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .lifecycle(),
+            StandaloneLifecycle::Missing
+        ));
+        app.selected_id = Some(SelId::Standalone(key));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("no branch or worktree removal authority"));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("not a Git checkout"));
+        let loaded = persist::load_current_at(
+            &state_root,
+            &baude_core::workspace::active().state_file("state"),
+        )
+        .unwrap();
+        assert!(matches!(
+            loaded.state.standalone_session(key).unwrap().lifecycle(),
+            StandaloneLifecycle::Missing
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_failed_first_spawn_retries_fresh_intent() {
+        let root = std::env::temp_dir().join(format!(
+            "baude-standalone-first-spawn-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join("folder");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(folder.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sleep 30".into());
+        app.config.opencode_cmd = Some("sleep 30".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.spawn_error_for_test = Some("first spawn blocked".into());
+
+        assert!(app.admit_standalone(&folder).is_err());
+        let key = app.repository_state.standalone_sessions[0].key;
+        assert!(
+            !app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .session
+                .ever_launched
+        );
+        assert!(app
+            .repository_state
+            .standalone_session(key)
+            .unwrap()
+            .owned_runtime()
+            .is_none());
+
+        app.spawn_error_for_test = None;
+        let runtime = app.admit_standalone(&folder).unwrap().unwrap();
+        assert_eq!(app.runtime_standalones[&key], runtime);
+        assert!(
+            app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .session
+                .ever_launched
+        );
+        app.close_standalone(key).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_active_runtime_is_restored_with_exact_recorded_teardown() {
+        let root =
+            std::env::temp_dir().join(format!("baude-standalone-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join("folder");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut crashed = App::new(folder.clone());
+        crashed.remote = None;
+        crashed.config.claude_cmd = Some("sleep 30".into());
+        crashed.config.opencode_cmd = Some("sleep 30".into());
+        crashed.persistence_root_for_test = Some(state_root.clone());
+        let old_runtime = crashed.admit_standalone(&folder).unwrap().unwrap();
+        let key = match crashed.selected_id.unwrap() {
+            SelId::Standalone(key) => key,
+            other => panic!("unexpected selection: {other:?}"),
+        };
+        let old_pid = crashed.session(old_runtime).unwrap().claude.pid().unwrap();
+
+        let mut restarted = App::new(folder.clone());
+        restarted.remote = None;
+        restarted.config.claude_cmd = Some("sleep 30".into());
+        restarted.config.opencode_cmd = Some("sleep 30".into());
+        restarted.persistence_root_for_test = Some(state_root);
+        restarted.restore();
+        assert!(!pid_is_live(old_pid));
+        let new_runtime = restarted.runtime_standalones[&key];
+        assert!(restarted.session(new_runtime).is_some());
+        assert!(matches!(
+            restarted
+                .repository_state
+                .standalone_session(key)
+                .unwrap()
+                .lifecycle(),
+            StandaloneLifecycle::Running(_)
+        ));
+        restarted.close_standalone(key).unwrap();
+        std::mem::forget(crashed);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

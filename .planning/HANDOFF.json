@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-08-31T11:33:58.557Z",
+  "timestamp": "2026-08-31T18:32:38Z",
   "phase": "07",
   "phase_name": "Local TUI Dogfood Release",
   "phase_dir": ".planning/phases/07-local-tui-dogfood-release",
@@ -26,6 +26,12 @@
       "name": "Pass local formatting, lint, 337 tests, packaging, artifact, and isolated install gates",
       "status": "done",
       "commit": "872f524"
+    },
+    {
+      "id": 9,
+      "name": "Implement BL-05 first-class persisted standalone sessions for non-Git folders",
+      "status": "done",
+      "commit": "uncommitted"
     }
   ],
   "remaining_tasks": [
@@ -100,12 +106,24 @@
       "decision": "Keep the published-history manifest at 0.14.0 while source and proposal metadata target 2.0.0-beta.",
       "rationale": "The beta is not published yet and historical release metadata must remain truthful.",
       "phase": "07"
+    },
+    {
+      "decision": "Prefer checkout/worktree rows in navigation and retain repository parents only as visible context or no-available-checkout fallback.",
+      "rationale": "Dogfood showed duplicate parent/checkout stops obscured the actionable worktree.",
+      "phase": "07"
+    },
+    {
+      "decision": "Model non-Git folders as durable standalone sessions rather than fake repositories.",
+      "rationale": "A folder that will never become a repository still needs agent/session persistence but has no valid Git lifecycle authority.",
+      "phase": "07"
     }
   ],
   "uncommitted_files": [
+    "baude-core/src/{repository,persist,git}.rs and baude/src/{hierarchy,app,ui}.rs (checkout-first navigation plus schema-v3 standalone sessions)",
+    "README.md, docs/local-tui-dogfood.md, and Phase 7 planning/evidence updates",
     "graphify-out/ (pre-existing unrelated untracked directory)",
     "opencode.json (pre-existing unrelated untracked file)"
   ],
-  "next_action": "Run docs/local-tui-dogfood.md from the repository root, create 07-UAT-EVIDENCE.md only from observed output/screenshots, then run Phase 6 and Phase 7 certification workflows.",
-  "context_notes": "All 16 milestone plans are implemented. Local gate passes with 337 tests and beta package/artifact/install checks. STATE intentionally remains at 33% because only Phase 5 is formally complete; Phases 6 and 7 await certification."
+  "next_action": "Inspect and commit the checkout-first and standalone dogfood correction when requested, then run Phase 6 and Phase 7 certification workflows.",
+  "context_notes": "All 16 milestone plans are implemented. Isolated live TUI dogfood found and fixed active positional-repository restart duplication, then covered wide/narrow hierarchy, standalone persistence/actions/recovery, and safe managed removal. Formatting, Clippy, and all 345 workspace tests pass; focused follow-up review found no high/medium issues. ANSI terminal captures and exact state/Git evidence are recorded in 07-UAT-EVIDENCE.md; image screenshots, Linux/runtime certification, and formal Phase 6/7 certification remain pending. STATE intentionally remains at 33% because only Phase 5 is formally complete."
 }

@@ -114,8 +114,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 06]: Pre-replacement persistence failure preserves the existing runtime; committed replacement continues the authorized effect and records dirty durability.
 - [Phase 06]: Tracked App and Manager restarts use registered lifecycle launch events before PTY release.
 - [Phase 07]: Structural hierarchy and ordering come only from persisted repository state; runtime, status, and archive facts are decoration joins. — Prevents volatile process churn from changing structural identity or order.
-- [Phase 07]: Normal navigation visits repository parents while cycle navigation visits only actionable checkout and remote rows. — Parents remain discoverable without becoming action targets.
-- [Phase 07]: Invalid local selection falls back within its repository before its parent; restart prefers the first local parent before remote rows. — Keeps local context deterministic across refresh, removal, and restart.
+- [Phase 07 dogfood]: Normal navigation prefers checkout/worktree rows and visits a repository parent only when that repository has no available checkout. — Keeps repository context visible without making duplicate parent/checkout stops the common path.
+- [Phase 07 dogfood]: Invalid local selection and restart prefer the first available checkout, then a repository parent with no available checkout, then flat remote rows. — Keeps local context deterministic while making the worktree the primary item.
+- [Phase 07 dogfood]: Existing non-Git folders are schema-v3 standalone root rows with a separate durable key/runtime map and no Git authority. — Preserves exact runtime ownership without weakening repository/checkout invariants or inventing fake topology.
 - [Phase 07]: Only eligible inactive retained checkouts expose RetryReopen; only implemented activation, teardown, and stopped-active paths expose RetryRecovery. — Keeps every presented retry capability paired with a concrete safe App dispatcher.
 - [Phase 07]: Lowercase x is retained close only; Shift+X alone enters separately confirmed, freshly rechecked managed-worktree removal. — Prevents ordinary close intent from escalating into physical Git topology removal.
 - [Phase 07]: Local action authority resolves durable RepositoryKey and CheckoutKey rather than presentation or runtime absence. — Keeps stale glyphs, labels, status, and volatile runtime decoration non-authoritative.
@@ -134,6 +135,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 - Run Linux/runtime certification, independent deep lifecycle review, phase verification, and Nyquist validation for Phase 6.
 - Run manual wide/narrow TUI dogfood, supported CI/Linux/runtime certification, independent review, Phase 7 verification, Nyquist/UI-SPEC approval, requirement/phase completion, audit/cleanup, and publication decision.
+- Live-dogfood schema-v3 standalone non-Git admission, canonical deduplication, close/reopen, missing-folder recovery, and Git-action refusals.
 
 ### Blockers/Concerns
 

@@ -13,7 +13,7 @@ use crate::repository::{
     RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
 };
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +52,23 @@ struct SchemaV1SavedCheckout {
     active_intent: bool,
     session: RetainedSessionState,
     health: CheckoutHealth,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV2StateFile {
+    schema_version: u32,
+    state: SchemaV2RepositoryState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV2RepositoryState {
+    next_repository_key: u64,
+    next_checkout_key: u64,
+    next_first_seen_order: u64,
+    repositories: Vec<SavedRepository>,
+    checkouts: Vec<SavedCheckout>,
 }
 
 impl SchemaV1StateFile {
@@ -101,9 +118,33 @@ impl SchemaV1StateFile {
         let state = RepositoryState {
             next_repository_key: self.state.next_repository_key,
             next_checkout_key: self.state.next_checkout_key,
+            next_standalone_key: 1,
             next_first_seen_order: self.state.next_first_seen_order,
             repositories: self.state.repositories,
             checkouts,
+            standalone_sessions: Vec::new(),
+        };
+        state.validate().map_err(|error| error.to_string())?;
+        state
+            .validate_lifecycle_views()
+            .map_err(|error| error.to_string())?;
+        Ok(StateFile::new(state))
+    }
+}
+
+impl SchemaV2StateFile {
+    fn migrate(self) -> std::result::Result<StateFile, String> {
+        if self.schema_version != 2 {
+            return Err(format!("expected schema 2, got {}", self.schema_version));
+        }
+        let state = RepositoryState {
+            next_repository_key: self.state.next_repository_key,
+            next_checkout_key: self.state.next_checkout_key,
+            next_standalone_key: 1,
+            next_first_seen_order: self.state.next_first_seen_order,
+            repositories: self.state.repositories,
+            checkouts: self.state.checkouts,
+            standalone_sessions: Vec::new(),
         };
         state.validate().map_err(|error| error.to_string())?;
         state
@@ -311,13 +352,23 @@ pub fn load_for_workspace_strict_at(
             path: source_path.clone(),
             cause: "schema_version must be an unsigned integer".into(),
         })?;
-        if version == 1 && SCHEMA_VERSION == 2 {
-            let legacy: SchemaV1StateFile =
-                serde_json::from_value(value).map_err(|error| LoadError::Malformed {
-                    path: source_path.clone(),
-                    cause: error.to_string(),
-                })?;
-            let migrated = legacy.migrate().map_err(|cause| LoadError::InvalidState {
+        if version == 1 || version == 2 {
+            let migrated = if version == 1 {
+                serde_json::from_value::<SchemaV1StateFile>(value)
+                    .map_err(|error| LoadError::Malformed {
+                        path: source_path.clone(),
+                        cause: error.to_string(),
+                    })?
+                    .migrate()
+            } else {
+                serde_json::from_value::<SchemaV2StateFile>(value)
+                    .map_err(|error| LoadError::Malformed {
+                        path: source_path.clone(),
+                        cause: error.to_string(),
+                    })?
+                    .migrate()
+            }
+            .map_err(|cause| LoadError::InvalidState {
                 path: source_path.clone(),
                 cause,
             })?;
@@ -847,6 +898,13 @@ fn load_named_at(
         .state
         .validate()
         .map_err(|error| LoadError::InvalidState {
+            path: path.clone(),
+            cause: error.to_string(),
+        })?;
+    current
+        .state
+        .validate_lifecycle_views()
+        .map_err(|error| LoadError::InvalidState {
             path,
             cause: error.to_string(),
         })?;
@@ -857,8 +915,10 @@ fn load_named_at(
 mod tests {
     use super::*;
     use crate::repository::{
-        CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, ProcessIdentity,
-        RepositoryHealth, RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+        CheckoutHealth, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
+        ProcessIdentity, RepositoryHealth, RetainedSessionState, RetainedStandaloneSessionState,
+        RuntimeGeneration, SavedCheckout, SavedRepository, SavedStandaloneSession, ShellOwnership,
+        StandaloneLifecycle, UnavailableCause,
     };
 
     fn isolated_root(label: &str) -> PathBuf {
@@ -876,8 +936,10 @@ mod tests {
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();
         let checkout_key = state.allocate_checkout_key().unwrap();
+        let standalone_key = state.allocate_standalone_key().unwrap();
         let repository_order = state.allocate_first_seen_order().unwrap();
         let checkout_order = state.allocate_first_seen_order().unwrap();
+        let standalone_order = state.allocate_first_seen_order().unwrap();
         let main = PathBuf::from(format!("/{prefix}/repo"));
         let checkout_path = PathBuf::from(format!("/{prefix}/repo-default"));
         state.repositories.push(SavedRepository {
@@ -908,7 +970,46 @@ mod tests {
                 resume_id: Some("opaque-retained-id".into()),
             },
         ));
+        let generation = RuntimeGeneration::initial();
+        state.standalone_sessions.push(SavedStandaloneSession::new(
+            standalone_key,
+            PersistedPath::from_path(&PathBuf::from(format!("/{prefix}/standalone"))),
+            standalone_order,
+            StandaloneLifecycle::Running(generation),
+            Some(OwnedRuntime {
+                generation,
+                agent: ProcessIdentity {
+                    pid: 9001,
+                    start_time: 1234,
+                    process_group: 9001,
+                    session: 9001,
+                },
+                shell: ShellOwnership::Closed,
+            }),
+            RetainedStandaloneSessionState {
+                name: format!("{prefix}-standalone"),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: Some("opaque-standalone-id".into()),
+                ever_launched: true,
+            },
+        ));
         StateFile::new(state)
+    }
+
+    fn schema_v2_fixture() -> SchemaV2StateFile {
+        let current = current_fixture("schema-v2");
+        SchemaV2StateFile {
+            schema_version: 2,
+            state: SchemaV2RepositoryState {
+                next_repository_key: current.state.next_repository_key,
+                next_checkout_key: current.state.next_checkout_key,
+                next_first_seen_order: current.state.next_first_seen_order,
+                repositories: current.state.repositories,
+                checkouts: current.state.checkouts,
+            },
+        }
     }
 
     fn schema_v1_protected_fixture() -> SchemaV1StateFile {
@@ -1239,6 +1340,14 @@ mod tests {
             Err(LoadError::InvalidState { ref path, .. }) if path == &primary
         ));
 
+        let mut unknown_current = serde_json::to_value(current_fixture("strict-v3")).unwrap();
+        unknown_current["state"]["unexpected"] = serde_json::json!(true);
+        std::fs::write(&primary, serde_json::to_vec(&unknown_current).unwrap()).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
+            Err(LoadError::Malformed { ref path, .. }) if path == &primary
+        ));
+
         std::fs::remove_file(&primary).unwrap();
         std::fs::create_dir(&primary).unwrap();
         assert!(matches!(
@@ -1368,6 +1477,17 @@ mod tests {
             claude.state.repositories[0].observed_main_worktree,
             opencode.state.repositories[0].observed_main_worktree
         );
+        assert_eq!(
+            claude.state.standalone_sessions[0].session.name,
+            "claude-standalone"
+        );
+        assert!(matches!(
+            claude.state.standalone_sessions[0].lifecycle(),
+            StandaloneLifecycle::Running(_)
+        ));
+        assert!(claude.state.standalone_sessions[0]
+            .owned_runtime()
+            .is_some());
         std::fs::remove_dir_all(claude_root).unwrap();
         std::fs::remove_dir_all(opencode_root).unwrap();
     }
@@ -1414,8 +1534,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_schema_v2_migrates_protected_states() {
-        assert_eq!(SCHEMA_VERSION, 2);
+    fn lifecycle_schema_v1_migrates_protected_states_to_v3() {
+        assert_eq!(SCHEMA_VERSION, 3);
         let root = isolated_root("lifecycle-schema-v2");
         let workspace = test_workspace("claude");
         let file = workspace.state_file("state");
@@ -1447,6 +1567,60 @@ mod tests {
         assert!(
             load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()).is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_v2_migrates_strictly_to_v3() {
+        let root = isolated_root("schema-v2-to-v3");
+        let workspace = test_workspace("claude");
+        let file = workspace.state_file("state");
+        let legacy = schema_v2_fixture();
+        std::fs::write(
+            root.join(&file),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = load_for_workspace_strict_at(&root, "state", &workspace, |_| {
+            panic!("schema-v2 migration must not use flat legacy reconciliation")
+        })
+        .unwrap();
+        let LoadOutcome::Legacy(migrated) = outcome else {
+            panic!("schema-v2 input was not migrated")
+        };
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.state.next_standalone_key, 1);
+        assert!(migrated.state.standalone_sessions.is_empty());
+        assert_eq!(migrated.state.checkouts, legacy.state.checkouts);
+
+        let second =
+            load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()).unwrap();
+        assert_eq!(second, LoadOutcome::Current(migrated));
+
+        let mut malformed = serde_json::to_value(schema_v2_fixture()).unwrap();
+        malformed["state"]["unexpected"] = serde_json::json!(true);
+        std::fs::write(root.join(&file), serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()),
+            Err(LoadError::Malformed { .. })
+        ));
+
+        let mut contradictory = schema_v2_fixture();
+        let runtime = current_fixture("invalid-owner").state.standalone_sessions[0]
+            .owned_runtime()
+            .unwrap()
+            .clone();
+        contradictory.state.checkouts[0].set_owned_runtime(Some(runtime));
+        std::fs::write(
+            root.join(&file),
+            serde_json::to_vec(&contradictory).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()),
+            Err(LoadError::InvalidState { .. })
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

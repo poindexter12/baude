@@ -4,6 +4,7 @@ use std::path::Path;
 use baude_core::lifecycle::{lifecycle_capability, LifecycleCapability};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutRole, RepositoryHealth, RepositoryKey, RepositoryState,
+    StandaloneKey, StandaloneLifecycle,
 };
 use baude_core::session::Status;
 
@@ -11,6 +12,7 @@ use baude_core::session::Status;
 pub enum LocalRowId {
     Repository(RepositoryKey),
     Checkout(CheckoutKey),
+    Standalone(StandaloneKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +47,7 @@ pub enum ActionKind {
     Managed,
     External,
     Unavailable,
+    Standalone,
     Remote,
 }
 
@@ -56,6 +59,9 @@ pub enum ActionSelection {
     Checkout {
         role: CheckoutRole,
         managed_by_baude: bool,
+        available: bool,
+    },
+    Standalone {
         available: bool,
     },
     #[allow(dead_code)] // App remote dispatch consumes this in Task 07-02-02.
@@ -100,6 +106,12 @@ pub fn action_view(
         ActionSelection::Checkout {
             available: true, ..
         } => (ActionKind::External, true, has_runtime, false),
+        ActionSelection::Standalone { available: true } => {
+            (ActionKind::Standalone, false, has_runtime, false)
+        }
+        ActionSelection::Standalone { available: false } => {
+            (ActionKind::Unavailable, false, false, false)
+        }
         ActionSelection::Remote => (ActionKind::Remote, false, false, false),
     };
     ActionView {
@@ -141,9 +153,23 @@ pub struct LocalCheckoutRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStandaloneRow {
+    pub key: StandaloneKey,
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub runtime_id: Option<u64>,
+    pub status: LocalStatus,
+    pub waiting_for_ms: u64,
+    pub archived: bool,
+    pub lifecycle: StandaloneLifecycle,
+    pub actions: ActionView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalRow {
     Repository(LocalRepositoryRow),
     Checkout(LocalCheckoutRow),
+    Standalone(LocalStandaloneRow),
 }
 
 impl LocalRow {
@@ -151,19 +177,46 @@ impl LocalRow {
         match self {
             Self::Repository(row) => LocalRowId::Repository(row.key),
             Self::Checkout(row) => LocalRowId::Checkout(row.key),
+            Self::Standalone(row) => LocalRowId::Standalone(row.key),
         }
     }
 }
 
 pub fn initial_selection(rows: &[LocalRow], remote_ids: &[u64]) -> Option<SelectionTarget> {
-    rows.iter()
-        .find_map(|row| match row {
-            LocalRow::Repository(parent) => {
-                Some(SelectionTarget::Local(LocalRowId::Repository(parent.key)))
-            }
-            LocalRow::Checkout(_) => None,
-        })
+    selectable_local_ids(rows)
+        .into_iter()
+        .next()
+        .map(SelectionTarget::Local)
         .or_else(|| remote_ids.first().copied().map(SelectionTarget::Remote))
+}
+
+/// Sidebar navigation prefers concrete checkouts. A repository parent remains
+/// reachable only when it has no available checkout to act on instead.
+pub fn selectable_local_ids(rows: &[LocalRow]) -> Vec<LocalRowId> {
+    let repositories_with_available_checkout: HashSet<_> = rows
+        .iter()
+        .filter_map(|row| match row {
+            LocalRow::Checkout(checkout)
+                if matches!(checkout.health, CheckoutHealth::Available) =>
+            {
+                Some(checkout.repository_key)
+            }
+            _ => None,
+        })
+        .collect();
+
+    rows.iter()
+        .filter_map(|row| match row {
+            LocalRow::Repository(repository)
+                if !repositories_with_available_checkout.contains(&repository.key) =>
+            {
+                Some(LocalRowId::Repository(repository.key))
+            }
+            LocalRow::Repository(_) => None,
+            LocalRow::Checkout(checkout) => Some(LocalRowId::Checkout(checkout.key)),
+            LocalRow::Standalone(standalone) => Some(LocalRowId::Standalone(standalone.key)),
+        })
+        .collect()
 }
 
 pub fn reconcile_selection(
@@ -171,8 +224,9 @@ pub fn reconcile_selection(
     rows: &[LocalRow],
     remote_ids: &[u64],
 ) -> Option<SelectionTarget> {
+    let selectable = selectable_local_ids(rows);
     match selected {
-        Some(SelectionTarget::Local(id)) if rows.iter().any(|row| row.id() == id) => {
+        Some(SelectionTarget::Local(id)) if selectable.contains(&id) => {
             Some(SelectionTarget::Local(id))
         }
         Some(SelectionTarget::Remote(id)) if remote_ids.contains(&id) => {
@@ -303,9 +357,18 @@ fn display_names(
     result
 }
 
+#[cfg(test)]
 pub fn project_local(
     state: &RepositoryState,
     decorations: &HashMap<CheckoutKey, CheckoutDecoration>,
+) -> Vec<LocalRow> {
+    project_local_with_standalones(state, decorations, &HashMap::new())
+}
+
+pub fn project_local_with_standalones(
+    state: &RepositoryState,
+    decorations: &HashMap<CheckoutKey, CheckoutDecoration>,
+    standalone_decorations: &HashMap<StandaloneKey, CheckoutDecoration>,
 ) -> Vec<LocalRow> {
     let mut repositories: Vec<_> = state.repositories.iter().collect();
     repositories.sort_by(|left, right| {
@@ -333,7 +396,9 @@ pub fn project_local(
         .iter()
         .map(|repository| repository.key)
         .collect();
-    let mut result = Vec::with_capacity(state.repositories.len() + state.checkouts.len());
+    let mut result = Vec::with_capacity(
+        state.repositories.len() + state.checkouts.len() + state.standalone_sessions.len(),
+    );
 
     for repository in repositories {
         let mut children: Vec<_> = state
@@ -431,6 +496,71 @@ pub fn project_local(
         .checkouts
         .iter()
         .all(|checkout| known_repositories.contains(&checkout.repository_key)));
+
+    for standalone in &state.standalone_sessions {
+        let decoration = standalone_decorations.get(&standalone.key).copied();
+        let archived = decoration
+            .map(|value| value.archived)
+            .unwrap_or(standalone.session.archived);
+        let available = !matches!(
+            standalone.lifecycle(),
+            StandaloneLifecycle::Missing
+                | StandaloneLifecycle::Io(_)
+                | StandaloneLifecycle::ProtectedTeardown(_)
+                | StandaloneLifecycle::Stopping(_)
+        );
+        let status = if !available {
+            LocalStatus::Unavailable
+        } else if archived {
+            LocalStatus::Archived
+        } else {
+            match decoration.and_then(|value| value.status) {
+                Some(Status::Waiting) => LocalStatus::Waiting,
+                Some(Status::Busy) => LocalStatus::Working,
+                Some(Status::Completed) => LocalStatus::Completed,
+                Some(Status::Exited) => LocalStatus::Exited,
+                None => LocalStatus::Closed,
+            }
+        };
+        let path = standalone.canonical_path.to_path_buf();
+        result.push(LocalRow::Standalone(LocalStandaloneRow {
+            key: standalone.key,
+            name: standalone.session.name.clone(),
+            path,
+            runtime_id: decoration.and_then(|value| value.runtime_id),
+            status,
+            waiting_for_ms: decoration.map(|value| value.waiting_for_ms).unwrap_or(0),
+            archived,
+            lifecycle: standalone.lifecycle().clone(),
+            actions: action_view(
+                // Missing folders remain actionable so enter can recheck the
+                // canonical path and either reopen or durably retain Missing.
+                ActionSelection::Standalone { available: true },
+                decoration.and_then(|value| value.runtime_id).is_some(),
+                None,
+            ),
+        }));
+    }
+    result.sort_by(|left, right| {
+        let top = |row: &LocalRow| match row {
+            LocalRow::Repository(row) => row.main_path.clone(),
+            LocalRow::Checkout(row) => state
+                .repositories
+                .iter()
+                .find(|repository| repository.key == row.repository_key)
+                .map(|repository| repository.observed_main_worktree.to_path_buf())
+                .unwrap_or_default(),
+            LocalRow::Standalone(row) => row.path.clone(),
+        };
+        let left_path = top(left);
+        let right_path = top(right);
+        basename(&left_path)
+            .to_lowercase()
+            .cmp(&basename(&right_path).to_lowercase())
+            .then_with(|| left_path.cmp(&right_path))
+        // Stable sort preserves each repository's pre-projected parent and
+        // first-seen child order when their top-level path is identical.
+    });
     result
 }
 
@@ -441,15 +571,16 @@ mod tests {
 
     use baude_core::lifecycle::LifecycleCapability;
     use baude_core::repository::{
-        CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
-        RetainedSessionState, SavedCheckout, SavedRepository,
+        CheckoutHealth, CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth,
+        RepositoryState, RetainedSessionState, RetainedStandaloneSessionState, SavedCheckout,
+        SavedRepository, SavedStandaloneSession, StandaloneLifecycle,
     };
     use baude_core::session::Status;
 
     use super::{
         action_view, initial_selection, project_local, reconcile_after_removal,
-        reconcile_selection, ActionKind, ActionSelection, CheckoutDecoration, LocalRow, LocalRowId,
-        SelectionTarget,
+        reconcile_selection, selectable_local_ids, ActionKind, ActionSelection, CheckoutDecoration,
+        LocalRow, LocalRowId, SelectionTarget,
     };
 
     fn path(value: &str) -> PersistedPath {
@@ -856,12 +987,96 @@ mod tests {
 
         assert_eq!(
             initial_selection(&before, &[81, 82]),
-            Some(SelectionTarget::Local(LocalRowId::Repository(alpha)))
+            Some(SelectionTarget::Local(LocalRowId::Checkout(alpha_first)))
+        );
+        assert_eq!(
+            selectable_local_ids(&before),
+            vec![
+                LocalRowId::Checkout(alpha_first),
+                LocalRowId::Checkout(alpha_middle),
+                LocalRowId::Checkout(alpha_last),
+                LocalRowId::Checkout(beta_child),
+            ]
+        );
+        assert_eq!(
+            reconcile_selection(
+                Some(SelectionTarget::Local(LocalRowId::Repository(alpha))),
+                &before,
+                &[81, 82],
+            ),
+            Some(SelectionTarget::Local(LocalRowId::Checkout(alpha_first)))
+        );
+
+        let unavailable_only: Vec<_> = project_local(&state, &HashMap::new())
+            .into_iter()
+            .filter(|row| match row {
+                LocalRow::Repository(parent) => parent.key == alpha,
+                LocalRow::Checkout(child) => child.repository_key == alpha,
+                LocalRow::Standalone(_) => false,
+            })
+            .map(|row| match row {
+                LocalRow::Repository(parent) => LocalRow::Repository(parent),
+                LocalRow::Checkout(mut child) => {
+                    child.health = CheckoutHealth::Unavailable(
+                        baude_core::repository::UnavailableCause::Missing,
+                    );
+                    LocalRow::Checkout(child)
+                }
+                LocalRow::Standalone(standalone) => LocalRow::Standalone(standalone),
+            })
+            .collect();
+        assert_eq!(
+            selectable_local_ids(&unavailable_only).first().copied(),
+            Some(LocalRowId::Repository(alpha))
         );
         assert_eq!(
             initial_selection(&[], &[81, 82]),
             Some(SelectionTarget::Remote(81))
         );
         assert_eq!(initial_selection(&[], &[]), None);
+    }
+
+    #[test]
+    fn standalone_rows_are_deterministic_top_level_sessions_without_git_authority() {
+        let mut state = RepositoryState::default();
+        let repository = add_repository(&mut state, "/work/beta");
+        add_checkout(
+            &mut state,
+            repository,
+            "/work/beta",
+            "/work/beta",
+            CheckoutRole::Main,
+            false,
+            20,
+            "main",
+        );
+        let key = state.allocate_standalone_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.standalone_sessions.push(SavedStandaloneSession::new(
+            key,
+            path("/work/alpha"),
+            order,
+            StandaloneLifecycle::Inactive,
+            None,
+            RetainedStandaloneSessionState {
+                name: "alpha".into(),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: Some("resume-alpha".into()),
+                ever_launched: true,
+            },
+        ));
+
+        let rows = super::project_local_with_standalones(&state, &HashMap::new(), &HashMap::new());
+        assert_eq!(rows[0].id(), LocalRowId::Standalone(key));
+        let LocalRow::Standalone(row) = &rows[0] else {
+            panic!("expected root-level standalone row");
+        };
+        assert_eq!(row.path, Path::new("/work/alpha"));
+        assert_eq!(row.actions.kind, ActionKind::Standalone);
+        assert!(!row.actions.can_activate_branch);
+        assert!(!row.actions.can_remove);
+        assert_eq!(selectable_local_ids(&rows)[0], LocalRowId::Standalone(key));
     }
 }

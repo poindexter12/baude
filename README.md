@@ -4,16 +4,24 @@ A TUI for running multiple AI coding sessions in one terminal — Claude Code
 by default, [opencode](https://opencode.ai) as an alternative backend, each
 in its own hard-separated [workspace](#workspaces).
 
-Start it from any git repo and baude admits one durable repository parent with
+Start it from any existing folder. A Git folder admits one durable repository parent with
 its main checkout and managed worktrees as children. Repository parents sort
 by name; each parent's children retain their persisted oldest-first order
 across restarts. Runtime status, attention, and archive changes decorate those
-rows without moving them. Selection follows durable `RepositoryKey` and
-`CheckoutKey` identities while baude is running; after restart it initializes
-deterministically at the first local repository parent rather than persisting
-the prior selection. A shell pane at the selected checkout is one keystroke
-away. On macOS, a [desktop banner](#configuration) also names the session that
-blocked.
+rows without moving them. Checkout/worktree rows are the primary visual and
+navigation level; their repository context remains visible as a muted indented
+label. Selection follows durable `RepositoryKey` and `CheckoutKey` identities
+while baude is running. After restart it initializes at the first available
+checkout, using a repository parent only when that repository has no available
+checkout, rather than persisting the prior selection. A shell pane at the
+selected checkout is one keystroke away. On macOS, a [desktop banner](#configuration)
+also names the session that blocked.
+
+A non-Git folder is admitted as a durable standalone session at the top level.
+It supports the same coding-agent, shell, editor, resume, archive, close, info,
+activity, and GSD flows without inventing repository identity. Branch creation
+and managed-worktree removal stay unavailable. Canonical paths deduplicate
+aliases, and schema-v3 state retains standalone sessions across restarts.
 
 Each session surfaces live metadata — model, token counts, cost, GSD project
 state, and (Claude Code) context usage and permission mode.
@@ -65,9 +73,10 @@ baude            # or: baude /path/to/repo
 Repository parents, checkout children, their durable keys and oldest-first
 order, retained conversation context, and shell-pane state persist across
 restarts per workspace (`~/.config/baude/state-<workspace>.json`). Selection
-is not persisted: relaunch starts at the first local repository parent (or the
-first flat remote row when no local parent exists). Eligible active children
-resume through the backend's resume form (`claude --continue` /
+is not persisted: relaunch starts at the first available local checkout, falls
+back to its repository parent when no checkout is available, then uses the first
+flat remote row when no local target exists. Eligible active children resume
+through the backend's resume form (`claude --continue` /
 `opencode --continue`); retained closed children wait for an explicit reopen.
 
 ## How it works

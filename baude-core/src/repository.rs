@@ -26,6 +26,15 @@ impl CheckoutKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StandaloneKey(u64);
+
+impl StandaloneKey {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Lossless durable pathname bytes for the supported Unix targets.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct PersistedPath(Vec<u8>);
@@ -78,6 +87,7 @@ impl RuntimeGeneration {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "identity")]
+#[serde(deny_unknown_fields)]
 pub enum ShellOwnership {
     Closed,
     Owned(ProcessIdentity),
@@ -93,6 +103,7 @@ pub struct OwnedRuntime {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum UnavailableCause {
     Missing,
     NotRepository,
@@ -149,6 +160,7 @@ pub enum UnavailableCause {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status", content = "cause")]
+#[serde(deny_unknown_fields)]
 pub enum RepositoryHealth {
     Available,
     Unavailable(UnavailableCause),
@@ -156,6 +168,7 @@ pub enum RepositoryHealth {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status", content = "cause")]
+#[serde(deny_unknown_fields)]
 pub enum CheckoutHealth {
     Available,
     Unavailable(UnavailableCause),
@@ -163,6 +176,7 @@ pub enum CheckoutHealth {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "candidate")]
+#[serde(deny_unknown_fields)]
 pub enum CheckoutLifecycle {
     Inactive,
     Active,
@@ -172,6 +186,47 @@ pub enum CheckoutLifecycle {
     Stopping(RuntimeGeneration),
     RemovalCommitted,
     Protected(UnavailableCause),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "detail")]
+pub enum StandaloneLifecycle {
+    Inactive,
+    Active,
+    Launching(RuntimeGeneration),
+    Running(RuntimeGeneration),
+    Stopping(RuntimeGeneration),
+    ProtectedTeardown(RuntimeGeneration),
+    Missing,
+    Io(String),
+}
+
+impl StandaloneLifecycle {
+    pub fn is_protected(&self) -> bool {
+        matches!(
+            self,
+            Self::Launching(_)
+                | Self::Running(_)
+                | Self::Stopping(_)
+                | Self::ProtectedTeardown(_)
+                | Self::Missing
+                | Self::Io(_)
+        )
+    }
+
+    pub fn is_launchable(&self) -> bool {
+        matches!(self, Self::Inactive | Self::Active)
+    }
+
+    pub fn runtime_generation(&self) -> Option<RuntimeGeneration> {
+        match self {
+            Self::Launching(generation)
+            | Self::Running(generation)
+            | Self::Stopping(generation)
+            | Self::ProtectedTeardown(generation) => Some(*generation),
+            Self::Inactive | Self::Active | Self::Missing | Self::Io(_) => None,
+        }
+    }
 }
 
 impl CheckoutLifecycle {
@@ -229,6 +284,23 @@ pub struct RetainedSessionState {
     /// pathname or repository/session ownership key.
     #[serde(default)]
     pub resume_id: Option<String>,
+}
+
+/// Durable presentation state for a session that is not owned by a Git
+/// checkout. Its canonical path is stored by `SavedStandaloneSession`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedStandaloneSessionState {
+    pub name: String,
+    pub shell_open: bool,
+    pub archived: bool,
+    pub archived_by_user: bool,
+    #[serde(default)]
+    pub resume_id: Option<String>,
+    /// Distinguishes a never-started durable admission from a closed session
+    /// that has no backend conversation identifier.
+    #[serde(default)]
+    pub ever_launched: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -348,12 +420,71 @@ impl SavedCheckout {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SavedStandaloneSession {
+    pub key: StandaloneKey,
+    pub canonical_path: PersistedPath,
+    pub first_seen_order: u64,
+    lifecycle: StandaloneLifecycle,
+    #[serde(default)]
+    owned_runtime: Option<OwnedRuntime>,
+    pub session: RetainedStandaloneSessionState,
+}
+
+impl SavedStandaloneSession {
+    pub fn new(
+        key: StandaloneKey,
+        canonical_path: PersistedPath,
+        first_seen_order: u64,
+        lifecycle: StandaloneLifecycle,
+        owned_runtime: Option<OwnedRuntime>,
+        session: RetainedStandaloneSessionState,
+    ) -> Self {
+        Self {
+            key,
+            canonical_path,
+            first_seen_order,
+            lifecycle,
+            owned_runtime,
+            session,
+        }
+    }
+
+    pub fn lifecycle(&self) -> &StandaloneLifecycle {
+        &self.lifecycle
+    }
+
+    pub fn owned_runtime(&self) -> Option<&OwnedRuntime> {
+        self.owned_runtime.as_ref()
+    }
+
+    pub fn set_lifecycle(&mut self, lifecycle: StandaloneLifecycle) {
+        self.lifecycle = lifecycle;
+    }
+
+    pub fn set_owned_runtime(&mut self, runtime: Option<OwnedRuntime>) {
+        self.owned_runtime = runtime;
+    }
+
+    pub fn set_runtime_state(
+        &mut self,
+        lifecycle: StandaloneLifecycle,
+        runtime: Option<OwnedRuntime>,
+    ) {
+        self.lifecycle = lifecycle;
+        self.owned_runtime = runtime;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryState {
     pub next_repository_key: u64,
     pub next_checkout_key: u64,
+    pub next_standalone_key: u64,
     pub next_first_seen_order: u64,
     pub repositories: Vec<SavedRepository>,
     pub checkouts: Vec<SavedCheckout>,
+    pub standalone_sessions: Vec<SavedStandaloneSession>,
 }
 
 impl Default for RepositoryState {
@@ -361,9 +492,11 @@ impl Default for RepositoryState {
         Self {
             next_repository_key: 1,
             next_checkout_key: 1,
+            next_standalone_key: 1,
             next_first_seen_order: 1,
             repositories: Vec::new(),
             checkouts: Vec::new(),
+            standalone_sessions: Vec::new(),
         }
     }
 }
@@ -373,6 +506,9 @@ pub enum ValidationError {
     DuplicateRepositoryKey(RepositoryKey),
     DuplicateRepositoryIdentity(PersistedPath),
     DuplicateCheckoutKey(CheckoutKey),
+    DuplicateStandaloneKey(StandaloneKey),
+    DuplicateStandalonePath(PersistedPath),
+    StandaloneCheckoutPathConflict(PersistedPath),
     MissingCheckout(CheckoutKey),
     DuplicateCheckoutOwnership {
         path: PersistedPath,
@@ -389,11 +525,14 @@ pub enum ValidationError {
     },
     RegressingRepositoryCounter,
     RegressingCheckoutCounter,
+    RegressingStandaloneCounter,
     RegressingOrderCounter,
     DuplicateFirstSeenOrder(u64),
     ContradictoryLifecycle(CheckoutKey),
+    ContradictoryStandaloneLifecycle(StandaloneKey),
     ExhaustedRepositoryCounter,
     ExhaustedCheckoutCounter,
+    ExhaustedStandaloneCounter,
     ExhaustedOrderCounter,
 }
 
@@ -409,6 +548,7 @@ impl std::error::Error for ValidationError {}
 pub enum AllocationError {
     RepositoryKeysExhausted,
     CheckoutKeysExhausted,
+    StandaloneKeysExhausted,
     FirstSeenOrderExhausted,
 }
 
@@ -470,7 +610,32 @@ impl RepositoryState {
                     | CheckoutLifecycle::Stopping(_),
                     _,
                 ) => return Err(ValidationError::ContradictoryLifecycle(checkout.key)),
-                _ => {}
+                (
+                    CheckoutLifecycle::Protected(UnavailableCause::TeardownPending { .. }),
+                    Some(_),
+                ) => {}
+                (_, Some(_)) => {
+                    return Err(ValidationError::ContradictoryLifecycle(checkout.key));
+                }
+                (_, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_standalone_lifecycles(&self) -> Result<(), ValidationError> {
+        for standalone in &self.standalone_sessions {
+            match (
+                standalone.lifecycle.runtime_generation(),
+                &standalone.owned_runtime,
+            ) {
+                (Some(expected), Some(runtime)) if expected == runtime.generation => {}
+                (None, None) => {}
+                _ => {
+                    return Err(ValidationError::ContradictoryStandaloneLifecycle(
+                        standalone.key,
+                    ));
+                }
             }
         }
         Ok(())
@@ -511,6 +676,63 @@ impl RepositoryState {
         Ok(key)
     }
 
+    pub fn allocate_standalone_key(&mut self) -> Result<StandaloneKey, AllocationError> {
+        let key = StandaloneKey(self.next_standalone_key);
+        let next = self
+            .next_standalone_key
+            .checked_add(1)
+            .ok_or(AllocationError::StandaloneKeysExhausted)?;
+        if next == u64::MAX {
+            return Err(AllocationError::StandaloneKeysExhausted);
+        }
+        self.next_standalone_key = next;
+        Ok(key)
+    }
+
+    pub fn standalone_session(&self, key: StandaloneKey) -> Option<&SavedStandaloneSession> {
+        self.standalone_sessions
+            .iter()
+            .find(|session| session.key == key)
+    }
+
+    pub fn standalone_session_mut(
+        &mut self,
+        key: StandaloneKey,
+    ) -> Option<&mut SavedStandaloneSession> {
+        self.standalone_sessions
+            .iter_mut()
+            .find(|session| session.key == key)
+    }
+
+    pub fn standalone_session_by_path(
+        &self,
+        canonical_path: &PersistedPath,
+    ) -> Option<&SavedStandaloneSession> {
+        self.standalone_sessions
+            .iter()
+            .find(|session| &session.canonical_path == canonical_path)
+    }
+
+    pub fn standalone_session_by_path_mut(
+        &mut self,
+        canonical_path: &PersistedPath,
+    ) -> Option<&mut SavedStandaloneSession> {
+        self.standalone_sessions
+            .iter_mut()
+            .find(|session| &session.canonical_path == canonical_path)
+    }
+
+    pub fn remove_standalone_session(
+        &mut self,
+        key: StandaloneKey,
+    ) -> Option<SavedStandaloneSession> {
+        let index = self
+            .standalone_sessions
+            .iter()
+            .position(|session| session.key == key)?;
+        Some(self.standalone_sessions.remove(index))
+    }
+
     pub fn allocate_first_seen_order(&mut self) -> Result<u64, AllocationError> {
         let order = self.next_first_seen_order;
         let next = self
@@ -531,6 +753,9 @@ impl RepositoryState {
         if self.next_checkout_key == u64::MAX {
             return Err(ValidationError::ExhaustedCheckoutCounter);
         }
+        if self.next_standalone_key == u64::MAX {
+            return Err(ValidationError::ExhaustedStandaloneCounter);
+        }
         if self.next_first_seen_order == u64::MAX {
             return Err(ValidationError::ExhaustedOrderCounter);
         }
@@ -538,6 +763,8 @@ impl RepositoryState {
         let mut repository_identities = HashSet::new();
         let mut checkout_keys = HashSet::new();
         let mut checkout_owners = HashMap::new();
+        let mut standalone_keys = HashSet::new();
+        let mut standalone_paths = HashSet::new();
         let repositories_by_key: HashMap<_, _> = self
             .repositories
             .iter()
@@ -613,6 +840,36 @@ impl RepositoryState {
             }
         }
 
+        for standalone in &self.standalone_sessions {
+            if !standalone_keys.insert(standalone.key) {
+                return Err(ValidationError::DuplicateStandaloneKey(standalone.key));
+            }
+            if !standalone_paths.insert(&standalone.canonical_path) {
+                return Err(ValidationError::DuplicateStandalonePath(
+                    standalone.canonical_path.clone(),
+                ));
+            }
+            if checkout_owners.contains_key(&standalone.canonical_path) {
+                return Err(ValidationError::StandaloneCheckoutPathConflict(
+                    standalone.canonical_path.clone(),
+                ));
+            }
+            if self
+                .repositories
+                .iter()
+                .any(|repository| repository.observed_main_worktree == standalone.canonical_path)
+            {
+                return Err(ValidationError::StandaloneCheckoutPathConflict(
+                    standalone.canonical_path.clone(),
+                ));
+            }
+            if !orders.insert(standalone.first_seen_order) {
+                return Err(ValidationError::DuplicateFirstSeenOrder(
+                    standalone.first_seen_order,
+                ));
+            }
+        }
+
         if self.next_repository_key == 0
             || self
                 .repositories
@@ -629,6 +886,14 @@ impl RepositoryState {
         {
             return Err(ValidationError::RegressingCheckoutCounter);
         }
+        if self.next_standalone_key == 0
+            || self
+                .standalone_sessions
+                .iter()
+                .any(|standalone| standalone.key.get() >= self.next_standalone_key)
+        {
+            return Err(ValidationError::RegressingStandaloneCounter);
+        }
         if self.next_first_seen_order == 0
             || self
                 .repositories
@@ -639,11 +904,16 @@ impl RepositoryState {
                         .iter()
                         .map(|checkout| checkout.first_seen_order),
                 )
+                .chain(
+                    self.standalone_sessions
+                        .iter()
+                        .map(|standalone| standalone.first_seen_order),
+                )
                 .any(|order| order >= self.next_first_seen_order)
         {
             return Err(ValidationError::RegressingOrderCounter);
         }
-        Ok(())
+        self.validate_standalone_lifecycles()
     }
 }
 
@@ -690,6 +960,172 @@ mod tests {
             },
             health: CheckoutHealth::Unavailable(UnavailableCause::Missing),
         }
+    }
+
+    fn owned_runtime(generation: RuntimeGeneration) -> OwnedRuntime {
+        OwnedRuntime {
+            generation,
+            agent: ProcessIdentity {
+                pid: 100,
+                start_time: 200,
+                process_group: 100,
+                session: 100,
+            },
+            shell: ShellOwnership::Closed,
+        }
+    }
+
+    fn standalone(key: StandaloneKey, canonical_path: &str, order: u64) -> SavedStandaloneSession {
+        SavedStandaloneSession::new(
+            key,
+            path(canonical_path),
+            order,
+            StandaloneLifecycle::Inactive,
+            None,
+            RetainedStandaloneSessionState {
+                name: "standalone".into(),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+                ever_launched: false,
+            },
+        )
+    }
+
+    #[test]
+    fn standalone_allocation_paths_ordering_and_lifecycle_are_validated() {
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let checkout_key = state.allocate_checkout_key().unwrap();
+        let standalone_key = state.allocate_standalone_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
+        let standalone_order = state.allocate_first_seen_order().unwrap();
+        state
+            .repositories
+            .push(repository(repository_key, repository_order));
+        state
+            .checkouts
+            .push(checkout(checkout_key, repository_key, checkout_order));
+        state
+            .standalone_sessions
+            .push(standalone(standalone_key, "/standalone", standalone_order));
+
+        assert_eq!(standalone_key.get(), 1);
+        assert_eq!(
+            state
+                .standalone_session_by_path(&path("/standalone"))
+                .map(|session| session.key),
+            Some(standalone_key)
+        );
+        assert!(state.validate().is_ok());
+
+        let generation = RuntimeGeneration::initial();
+        state
+            .standalone_session_mut(standalone_key)
+            .unwrap()
+            .set_runtime_state(
+                StandaloneLifecycle::ProtectedTeardown(generation),
+                Some(owned_runtime(generation)),
+            );
+        assert!(state.validate().is_ok());
+
+        for lifecycle in [
+            StandaloneLifecycle::Launching(generation),
+            StandaloneLifecycle::Running(generation),
+            StandaloneLifecycle::Stopping(generation),
+            StandaloneLifecycle::ProtectedTeardown(generation),
+        ] {
+            let mut candidate = state.clone();
+            candidate.standalone_sessions[0]
+                .set_runtime_state(lifecycle, Some(owned_runtime(generation)));
+            assert!(candidate.validate().is_ok());
+        }
+        for lifecycle in [
+            StandaloneLifecycle::Inactive,
+            StandaloneLifecycle::Active,
+            StandaloneLifecycle::Missing,
+            StandaloneLifecycle::Io("read failed".into()),
+        ] {
+            let mut candidate = state.clone();
+            candidate.standalone_sessions[0].set_runtime_state(lifecycle, None);
+            assert!(candidate.validate().is_ok());
+        }
+
+        let mut wrong_generation = state.clone();
+        wrong_generation.standalone_sessions[0]
+            .set_owned_runtime(Some(owned_runtime(generation.successor().unwrap())));
+        assert_eq!(
+            wrong_generation.validate(),
+            Err(ValidationError::ContradictoryStandaloneLifecycle(
+                standalone_key
+            ))
+        );
+
+        let mut runtime_without_owner = state.clone();
+        runtime_without_owner.standalone_sessions[0]
+            .set_runtime_state(StandaloneLifecycle::Active, Some(owned_runtime(generation)));
+        assert_eq!(
+            runtime_without_owner.validate(),
+            Err(ValidationError::ContradictoryStandaloneLifecycle(
+                standalone_key
+            ))
+        );
+
+        let mut duplicate_path = state.clone();
+        let duplicate_key = duplicate_path.allocate_standalone_key().unwrap();
+        let duplicate_order = duplicate_path.allocate_first_seen_order().unwrap();
+        duplicate_path.standalone_sessions.push(standalone(
+            duplicate_key,
+            "/standalone",
+            duplicate_order,
+        ));
+        assert!(matches!(
+            duplicate_path.validate(),
+            Err(ValidationError::DuplicateStandalonePath(_))
+        ));
+
+        let mut duplicate_key = state.clone();
+        let duplicate_order = duplicate_key.allocate_first_seen_order().unwrap();
+        duplicate_key.standalone_sessions.push(standalone(
+            standalone_key,
+            "/other-standalone",
+            duplicate_order,
+        ));
+        assert_eq!(
+            duplicate_key.validate(),
+            Err(ValidationError::DuplicateStandaloneKey(standalone_key))
+        );
+
+        let mut checkout_conflict = state.clone();
+        checkout_conflict.standalone_sessions[0].canonical_path = path("/repo-default");
+        assert!(matches!(
+            checkout_conflict.validate(),
+            Err(ValidationError::StandaloneCheckoutPathConflict(_))
+        ));
+
+        let mut main_worktree_conflict = state.clone();
+        main_worktree_conflict.standalone_sessions[0].canonical_path = path("/repo");
+        assert!(matches!(
+            main_worktree_conflict.validate(),
+            Err(ValidationError::StandaloneCheckoutPathConflict(_))
+        ));
+
+        let mut duplicate_order = state.clone();
+        duplicate_order.standalone_sessions[0].first_seen_order = checkout_order;
+        assert_eq!(
+            duplicate_order.validate(),
+            Err(ValidationError::DuplicateFirstSeenOrder(checkout_order))
+        );
+
+        assert_eq!(
+            state
+                .remove_standalone_session(standalone_key)
+                .map(|saved| saved.key),
+            Some(standalone_key)
+        );
+        assert!(state.validate().is_ok());
     }
 
     #[test]
@@ -803,9 +1239,11 @@ mod tests {
         let zeroed = RepositoryState {
             next_repository_key: 0,
             next_checkout_key: 0,
+            next_standalone_key: 0,
             next_first_seen_order: 0,
             repositories: Vec::new(),
             checkouts: Vec::new(),
+            standalone_sessions: Vec::new(),
         };
         assert_eq!(
             zeroed.validate(),
@@ -816,12 +1254,14 @@ mod tests {
         for (field, expected) in [
             ("repository", ValidationError::ExhaustedRepositoryCounter),
             ("checkout", ValidationError::ExhaustedCheckoutCounter),
+            ("standalone", ValidationError::ExhaustedStandaloneCounter),
             ("order", ValidationError::ExhaustedOrderCounter),
         ] {
             let mut exhausted = RepositoryState::default();
             match field {
                 "repository" => exhausted.next_repository_key = u64::MAX,
                 "checkout" => exhausted.next_checkout_key = u64::MAX,
+                "standalone" => exhausted.next_standalone_key = u64::MAX,
                 "order" => exhausted.next_first_seen_order = u64::MAX,
                 _ => unreachable!(),
             }
@@ -831,12 +1271,14 @@ mod tests {
         for (counter, expected) in [
             ("repository", AllocationError::RepositoryKeysExhausted),
             ("checkout", AllocationError::CheckoutKeysExhausted),
+            ("standalone", AllocationError::StandaloneKeysExhausted),
             ("order", AllocationError::FirstSeenOrderExhausted),
         ] {
             let mut exhausted = RepositoryState::default();
             match counter {
                 "repository" => exhausted.next_repository_key = u64::MAX - 1,
                 "checkout" => exhausted.next_checkout_key = u64::MAX - 1,
+                "standalone" => exhausted.next_standalone_key = u64::MAX - 1,
                 "order" => exhausted.next_first_seen_order = u64::MAX - 1,
                 _ => unreachable!(),
             }
@@ -844,6 +1286,7 @@ mod tests {
             let result = match counter {
                 "repository" => exhausted.allocate_repository_key().map(|_| ()),
                 "checkout" => exhausted.allocate_checkout_key().map(|_| ()),
+                "standalone" => exhausted.allocate_standalone_key().map(|_| ()),
                 "order" => exhausted.allocate_first_seen_order().map(|_| ()),
                 _ => unreachable!(),
             };

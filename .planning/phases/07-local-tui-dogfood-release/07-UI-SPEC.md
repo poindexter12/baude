@@ -88,8 +88,11 @@ Allowed weights: regular and bold only. Do not add italic-only distinctions, tin
 | Accent (10%) | `Cyan` | Focused border, focused selection gutter, input cursor, non-destructive modal border |
 | Destructive | `Red` | Safe-remove confirmation border and destructive title only |
 | Attention | `Yellow` | Waiting pulse/timer and transient actionable message background |
-| Working | `Blue` | Animated working spinner only |
+| Working | `Cyan` | Animated working spinner and active checkout name |
 | Completed | `Green` | Calm completed check and existing GSD-positive title only |
+| Managed worktree role | `Magenta` | Topology role chip only |
+| Default checkout role | `Cyan` | Topology role chip only |
+| Main checkout role | `Blue` | Topology role chip only |
 
 Accent is reserved for focused pane borders, the focused selected-row gutter, input cursor, and informational/input modal borders. It must not color every action or every repository parent.
 
@@ -103,11 +106,11 @@ Status may never be communicated by color alone. Every state has a glyph and/or 
 
 Render in this order:
 
-1. Local repository hierarchy.
+1. Local durable targets: repository blocks and standalone non-Git folder rows interleaved by stable top-level path order.
 2. Existing flat remote section, when configured, headed `⇄ remote` or `⇄ remote (offline)`.
 3. Usage footer when vertical space allows.
 
-Do not create a separate local `archived` section. Archive is a child state and must not move the child out of its repository. Remote rows may retain their current flat compatibility ordering until daemon hierarchy work is explicitly scoped.
+Do not create a separate local `archived` section. Archive must not move a checkout out of its repository or move a standalone folder from its top-level position. Remote rows may retain their current flat compatibility ordering until daemon hierarchy work is explicitly scoped.
 
 ### Stable sort contract
 
@@ -115,9 +118,10 @@ Do not create a separate local `archived` section. Archive is a child state and 
 |------------|--------------|-------------------------|-----------------------|
 | Repository parents | Case-insensitive display name ascending | Canonical main-worktree path ascending, then `RepositoryKey` | Runtime presence, status, attention, archive, health |
 | Children within one parent | Persisted `first_seen_order` ascending | `CheckoutKey` ascending | Name, branch, role, runtime presence, status, attention, archive, health |
+| Standalone folder rows | Case-insensitive display name ascending | Canonical path ascending, then `StandaloneKey` | Runtime presence, status, attention, archive, lifecycle |
 | Flat remote compatibility rows | Preserve existing active/remote/archive compatibility behavior | Existing stable name ordering | Local repository state |
 
-Selection follows stable durable identity, not row index. After any refresh or state transition, keep the same selected repository/checkout key if it still exists. After successful worktree removal, select the next sibling; if none, the previous sibling; if none, the parent. Never jump to another repository because a row changed status.
+Selection follows stable durable identity, not row index. After any refresh or state transition, keep the same selected repository, checkout, or standalone key if it still exists. After successful worktree removal, select the next sibling; if none, the previous sibling; if none, the parent. Never jump to another target because a row changed status.
 
 ---
 
@@ -125,9 +129,10 @@ Selection follows stable durable identity, not row index. After any refresh or s
 
 | Component | Purpose | Selectable | Height | Required states |
 |-----------|---------|------------|--------|-----------------|
-| `RepositoryRow` | Durable parent and action context | Yes | 1 row | available, unavailable, selected focused/unfocused, aggregate waiting count, no-runtime |
+| `RepositoryRow` | Muted indented repository context and fallback action target | Only when no available child exists | 1 row | available, unavailable, selected fallback, aggregate waiting count, no-runtime |
 | `CheckoutRow` | Main checkout or retained/active worktree identity | Yes | 2 rows normally; 1 compact row | running, waiting, working, completed, exited, retained/closed, archived, unavailable/recovery, selected focused/unfocused |
-| `HierarchyConnector` | Parent/child relationship independent of color | No | Inline | `├─` for non-last child, `└─` for last child; ASCII `|-`/`\-` fallback only if glyph width is unsafe |
+| `StandaloneRow` | Durable existing non-Git folder session | Yes | 2 rows normally; 1 compact row | running, waiting, working, completed, exited, retained/closed, archived, missing/recovery, selected focused/unfocused |
+| `HierarchyConnector` | Repository context relationship independent of color | No | Inline | Indented `repo ·` context label and child metadata `↳` marker |
 | `RoleChip` | Clarifies topology | No | Inline | `main`, `default`, `worktree`, `external` as applicable |
 | `StatusGlyph` | At-a-glance runtime state | No | Inline | existing `●`, animated `◐/◓/◑/◒`, `✓`, `✗`; add `○` retained and `!` unavailable |
 | `ActionHintBar` | Context-aware discoverability | No | 1 row | repository, live child, retained child, managed worktree, unavailable child, narrow overflow |
@@ -144,37 +149,36 @@ Selection follows stable durable identity, not row index. After any refresh or s
 ### Repository parent
 
 ```text
-▌ ▾ repository-name                         2 waiting
+    repo · repository-name                  2 waiting
 ```
 
-1. Two-cell selection gutter (`▌ ` or two spaces).
-2. One-cell hierarchy marker: `▾` because collapse is out of scope and all parents are expanded.
-3. Repository display name: basename of canonical main worktree. If duplicate basenames exist, append the shortest unique parent-path suffix in dim text; identity never depends on this label.
+1. Two-cell selection gutter (`▌ ` or two spaces), normally blank because an available checkout is preferred.
+2. Indented dim `repo ·` context label; repository rows are visually subordinate to checkouts.
+3. Repository display name: italic/dim basename of canonical main worktree. If duplicate basenames exist, append the shortest unique parent-path suffix in dim text; identity never depends on this label.
 4. Optional right-aligned aggregate text: `1 waiting`, `2 waiting`, or `unavailable`. Do not aggregate working/completed counts into the parent.
-5. Parent text is bold only while selected. A parent with no runtime children remains normal-weight gray/white, not hidden or disabled.
+5. Parent text becomes bold cyan only when selected as the no-available-checkout fallback. It remains visible but muted while an available checkout exists.
 
 ### Checkout/worktree child, normal density
 
 ```text
-  ├─ ● repo:main                         4m
-  │  ↳ main · default · running · fable-5 · 63%
+▌ ● repo:main                            4m
+    ↳ main · running · fable-5 · 63%
 ```
 
 1. Two-cell selection gutter.
-2. Two-cell connector plus one separating space.
-3. Existing status glyph.
+2. Existing status glyph at the primary visual level; no parent-to-child tree indentation precedes it.
 4. Target name: preserve the established `repo:branch` session naming where available. For a non-default main checkout, use `repo:<branch>`; detached/unavailable branch displays `repo:<checkout-leaf>` plus the unavailable chip.
 5. Existing wait/completed duration remains right aligned when width permits.
-6. Metadata line starts under the child, with a dim connector. Topology chips precede volatile session metadata: role, ownership/state, then model/context/permission/GSD.
+6. Metadata line starts under the child with a dim `↳`. Colored topology chips precede volatile session metadata: role, ownership/state, then model/context/permission/GSD.
 7. The selected background spans both child lines and includes connector cells. Selection must not erase status colors.
 
 ### Compact child
 
 ```text
-▌ └─ ● repo:feature/a 4m
+▌ ● repo:feature/a 4m
 ```
 
-At constrained height or width, omit the metadata line first. Never omit hierarchy connector, status glyph, target name, or selected gutter. Truncate the middle/least-important suffix before truncating the branch leaf. End truncation uses `…`; never allow text to overwrite the duration or border.
+At constrained height or width, omit the metadata line first. Never omit the status glyph, target name, or selected gutter. Truncate the middle/least-important suffix before truncating the branch leaf. End truncation uses `…`; never allow text to overwrite the duration or border.
 
 ### State glyph and text matrix
 
@@ -194,7 +198,7 @@ Protected recovery and unavailable states must look blocked, not dead or removab
 
 ## Selection, Focus, and Navigation Contract
 
-- `j`/`k` and `↑`/`↓` move through every visible selectable row in rendered order: parent, then its children, then next parent. Movement clamps at the ends.
+- `j`/`k` and `↑`/`↓` move through checkout/worktree rows in rendered order. A repository row is included only when that repository has no available checkout. Movement clamps at the ends.
 - `alt+←/→` cycles checkout/session children only and wraps, preserving existing session-cycle behavior. Repository parents are skipped because they cannot receive PTY input. Closed or unavailable children remain reachable; attempting to attach produces the correct reopen/refusal behavior.
 - `enter`, `l`, or `→` on a repository parent selects/focuses its default child: focus a live runtime, reopen an eligible retained default child, or show an actionable unavailable message. It must not create a duplicate.
 - `enter`, `l`, or `→` on a live child focuses its agent pane. On an eligible retained child it performs Reopen Checkout. On an unavailable/protected child it refuses without mutation and names a repair path; it names `r` only when the lifecycle projection explicitly authorizes `RetryReopen` or `RetryRecovery`.
@@ -224,6 +228,15 @@ Protected recovery and unavailable states must look blocked, not dead or removab
 | New/open `n`, clone `c`, help `?`, quit `q` | Global sidebar behavior | Global sidebar behavior | Global sidebar behavior | Global sidebar behavior | Global sidebar behavior |
 
 `X` is intentionally distinct from `x`. Close retains the checkout; remove physically removes only a verified clean baude-managed linked worktree and retains its branch. Do not combine these into one ambiguous “close/remove” choice.
+
+### Standalone folder action contract
+
+A standalone folder is a top-level session row with no repository parent. It
+supports attach/reopen, close, shell, editor, info, activity, GSD, and archive
+using its canonical folder as the working/project root. `w` always refuses
+because no Git branch authority exists. `X` always refuses and never removes the
+folder. A missing folder remains visible and `enter` rechecks the exact canonical
+path before reopening; identity is never transferred to a different path.
 
 ### Exact selection × lifecycle-action contract
 

@@ -5,7 +5,7 @@ explicitly checked-out `v2.0.0-beta` source tree. It isolates HOME, config,
 data, state, install output, Git repositories, and the harmless fake backend.
 It does not replace an installed `baude` or authorize any remote distribution.
 
-Manual dogfood and screenshots are pending. Record only observed outcomes in
+Manual dogfood and image screenshots are pending. Record only observed outcomes in
 `.planning/phases/07-local-tui-dogfood-release/07-UAT-EVIDENCE.md`; create that
 file only when evidence exists. Do not create an empty anticipatory file.
 
@@ -89,9 +89,10 @@ Start at a wide terminal size, ideally `160x40`:
 "$INSTALL_ROOT/bin/baude" "$REPO"
 ```
 
-Observe one repository parent and its main-checkout child. The parent remains
-visible independently of runtime state. Capture a wide screenshot, then quit
-with `q` and inspect the observed state:
+Observe one primary main-checkout row with its repository shown as muted,
+indented context. The repository remains visible independently of runtime state
+but navigation skips it while an available checkout exists. Capture a wide
+screenshot, then quit with `q` and inspect the observed state:
 
 ```sh
 cp "$XDG_CONFIG_HOME/baude/state-dogfood.json" "$EVIDENCE_DIR/state-after-open.json"
@@ -103,14 +104,14 @@ the morning evidence. Keys, not labels or runtime IDs, are the identities.
 
 ## 6. Create or activate, close, and prove retained state
 
-Restart the same command at `160x40`, select the repository parent, then:
+Restart the same command at `160x40`, select the main checkout, then:
 
 1. Press `w`, enter `feature/dogfood-beta`, and submit.
 2. Observe one managed child beneath the same parent, after the older main
    child. Repeating `w` with that branch must focus the existing child rather
    than add another.
-3. Record a wide screenshot showing the parent, main child, managed child,
-   connectors, selection band, status glyphs, and action hints.
+3. Record a wide screenshot showing muted repository context, primary main and
+   managed checkout rows, selection band, status glyphs, and action hints.
 4. Press lowercase `x`, verify that the confirmation says the checkout is
    kept, then confirm. Observe the same child in place as closed.
 5. Quit with `q`.
@@ -133,9 +134,10 @@ order while its active intent becomes false.
 "$INSTALL_ROOT/bin/baude" "$REPO"
 ```
 
-On restart, assert that selection initializes at the **first local repository parent**.
-Selection is not persisted across processes. Parent name order and
-child persisted oldest-first order must match the prior state. Explicitly
+On restart, assert that selection initializes at the **first available local checkout**.
+If a repository has no available checkout, its repository context row is the
+fallback target. Selection is not persisted across processes. Parent name order
+and child persisted oldest-first order must match the prior state. Explicitly
 reselect the managed child with `j`/`k`, press `enter` to reopen it, and verify
 that exactly one child and one fake-backend runtime represent it.
 
@@ -145,11 +147,42 @@ selected target, status, hierarchy context, and distinct `enter reopen` /
 back to wide and confirm the durable selection still names the same
 `CheckoutKey`; in-process selection survives rendering and status changes.
 
-## 8. Prove clean managed removal and branch survival
+## 8. Prove standalone non-Git persistence
 
-Before the physical worktree action, save the exact inventory:
+Create an existing folder that is not a Git repository, then press `n`, press
+`ctrl+u` to clear the launch-directory prefill, and open it. Verify that it
+appears once as a root-level `folder` row with no synthetic
+repository/checkout parent. Reopen the same folder through a relative or symlink
+alias and verify that no duplicate durable row or runtime appears.
+
+Verify agent, shell, editor, info, activity, GSD, archive, lowercase `x` close,
+and `enter` reopen behavior. Press `w` and uppercase `X`; both must refuse with
+folder-specific copy and must not invoke Git or remove the folder. Quit and
+restart, then verify the same `StandaloneKey`, canonical path, first-seen order,
+resume identity, and archive state. Temporarily rename the folder and verify a
+durable missing state with no spawn; restore the exact path and press `enter` to
+reconcile and reopen it.
+
+Capture the schema-v3 state before and after restart:
 
 ```sh
+cp "$XDG_CONFIG_HOME/baude/state-dogfood.json" "$EVIDENCE_DIR/state-standalone.json"
+python3 -c 'import json,os; p=os.path.join(os.environ["XDG_CONFIG_HOME"],"baude","state-dogfood.json"); s=json.load(open(p)); print("schema:",s["schema_version"]); print("standalone:",[(x["key"],x["first_seen_order"],x["canonical_path"],x["lifecycle"]) for x in s["state"]["standalone_sessions"]])'
+```
+
+## 9. Prove clean managed removal and branch survival
+
+The Claude backend seeds `.claude/settings.local.json` in every launched
+checkout. Removal preflight deliberately treats ignored files as blockers too,
+so remove only that known generated file from this isolated fixture before the
+physical worktree action. Resolve the path from durable state rather than
+guessing it, then save the exact inventory:
+
+```sh
+export MANAGED_WORKTREE="$(python3 -c 'import json,os; p=os.path.join(os.environ["XDG_CONFIG_HOME"],"baude","state-dogfood.json"); s=json.load(open(p))["state"]; c=next(c for c in s["checkouts"] if c.get("observed_branch")=="refs/heads/feature/dogfood-beta"); print(bytes(c["observed_path"]).decode())')"
+case "$MANAGED_WORKTREE" in "$DOGFOOD_ROOT"/*) ;; *) printf 'refusing unexpected path: %s\n' "$MANAGED_WORKTREE" >&2; exit 1;; esac
+rm "$MANAGED_WORKTREE/.claude/settings.local.json"
+rmdir "$MANAGED_WORKTREE/.claude"
 git -C "$REPO" worktree list --porcelain | tee "$EVIDENCE_DIR/worktrees-before-remove.txt"
 ```
 
@@ -171,7 +204,7 @@ Compare before/after inventory and state. The linked worktree and its
 `CheckoutKey` must be absent afterward; the branch ref, repository parent, and
 main child must survive.
 
-## 9. Optional flat remote compatibility observation
+## 10. Optional flat remote compatibility observation
 
 If an already isolated test daemon is available for morning certification,
 record that its rows appear in a separate flat remote section and retain only
@@ -179,7 +212,7 @@ their existing non-destructive compatibility actions. Do not synthesize local
 parents or expose uppercase `X` for remote rows. Skip this observation when no
 isolated daemon exists; do not substitute an unobserved claim.
 
-## 10. Morning evidence checklist
+## 11. Morning evidence checklist
 
 Create `07-UAT-EVIDENCE.md` only when the corresponding evidence exists. Label
 every omitted or failed item honestly.
@@ -194,17 +227,20 @@ every omitted or failed item honestly.
       versus remove hints.
 - [ ] Observed `RepositoryKey`, each `CheckoutKey`, persisted oldest-first
       order, and unchanged identities through close/restart/reopen.
-- [ ] First local repository parent restart initialization and explicit child
-      reselection; no persisted-selection claim.
+- [ ] First available local checkout restart initialization, repository fallback
+      only when no checkout is available, and explicit managed-child reselection;
+      no persisted-selection claim.
 - [ ] Before/after `git worktree list --porcelain` output and exact branch-ref
       survival after managed worktree removal.
 - [ ] Manual no-duplicate parent, child, or runtime observations.
+- [ ] Schema-v3 standalone key/path/order evidence, alias deduplication,
+      close/reopen/restart/missing-folder behavior, and `w`/`X` refusals.
 - [ ] Supported CI and Linux/runtime certification, including Phase 6 process
       registration and descendant process-group extinction checks.
 - [ ] Independent deep review, phase verification, Nyquist approval, UI-SPEC
       checker sign-off, requirement/phase completion, and publication decision.
 
-## 11. Cleanup
+## 12. Cleanup
 
 First ensure baude has exited normally with `q`. From the original shell:
 

@@ -9,7 +9,8 @@ created: "2026-08-31"
 
 # Phase 07 - Validation Strategy
 
-> Implementation evidence can mature overnight; certification and human dogfood remain pending until morning.
+> Isolated human dogfood is recorded; certification remains pending on the
+> supported runtime matrix and independent quality gates.
 
 ## Test Infrastructure
 
@@ -44,11 +45,13 @@ cargo test -p baude "$name" -- --exact --nocapture
 | REPO-05, HIER-01, HIER-02, HIER-03 | `hierarchy::tests::local_hierarchy_orders_parents_and_children_by_durable_identity` |
 | REPO-05, HIER-01, HIER-02 | `ui::tests::hierarchy_tracer_renders_real_app_parent_and_child` |
 | HIER-04 | `hierarchy::tests::local_hierarchy_order_ignores_runtime_and_session_status` |
-| HIER-01, HIER-02, HIER-03 | `hierarchy::tests::local_hierarchy_selection_survives_refresh_and_removal_falls_back_locally` — same durable key across in-process refresh/status transitions; after restart first local parent, else first flat remote row, else none; no persisted selection claim |
+| HIER-01, HIER-02, HIER-03 | `hierarchy::tests::local_hierarchy_selection_survives_refresh_and_removal_falls_back_locally` — same durable key across in-process refresh/status transitions; after restart first available checkout, else repository parent without an available checkout, else first flat remote row; no persisted selection claim |
+| Standalone non-Git dogfood gap | `repository::tests::standalone_allocation_paths_ordering_and_lifecycle_are_validated`; `persist::tests::schema_v2_migrates_strictly_to_v3`; `app::tests::standalone_admission_dedup_close_reopen_and_missing_are_durable`; `app::tests::standalone_failed_first_spawn_retries_fresh_intent`; `app::tests::standalone_active_runtime_is_restored_with_exact_recorded_teardown`; `hierarchy::tests::standalone_rows_are_deterministic_top_level_sessions_without_git_authority`; `ui::tests::standalone_root_row_and_overlays_use_folder_language` |
 | WORK-01 through WORK-06, SURF-01, SURF-02 | `app::tests::hierarchy_action_matrix_dispatches_only_authorized_local_actions` |
 | SURF-05 | `app::tests::hierarchy_flat_remote_compatibility_has_no_local_parent_or_remove_action` |
 | HIER-01, SURF-01 | `app::tests::hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus` |
 | REL-01 | `app::tests::local_tui_dogfood_real_git_flow_survives_restart_without_duplicates` |
+| REL-01 active positional restart | `app::tests::active_launch_repository_restart_focuses_restored_runtime_without_duplicate_spawn` |
 | HIER-01 through HIER-04, SURF-01 | `ui::tests::hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics` |
 | WORK-03, WORK-05, SURF-01 | `ui::tests::hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove` |
 | SURF-01, SURF-02 | `ui::tests::hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints` — literal empty heading/body, persistence error, reopening pending, close success, three branch-success variants, remove success, both repository no-runtime variants, all full-width hints, and both narrow retained-child hints |
@@ -89,7 +92,7 @@ cargo test -p baude "$name" -- --exact --nocapture
 
 | Gate | Status | Morning action |
 |------|--------|----------------|
-| Manual wide/narrow local TUI dogfood | pending | Execute the isolated runbook and record evidence. |
+| Manual wide/narrow local TUI dogfood | observed | ANSI captures, exact state, and Git inventory are recorded in `07-UAT-EVIDENCE.md`; image screenshots remain pending for visual sign-off. |
 | Linux/runtime certification | pending | Run the supported CI/Linux/runtime matrix, including Phase 6 process registration and descendant process-group extinction checks. |
 | Independent deep review | pending | Review Phase 6 and Phase 7 changed source. |
 | Phase verification and Nyquist approval | pending | Run verification only after the above evidence is available. |

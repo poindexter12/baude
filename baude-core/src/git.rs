@@ -31,6 +31,7 @@ pub struct RepositorySnapshot {
 /// Fail-closed repository discovery failures, kept typed for admission callers.
 #[derive(Debug)]
 pub enum RepositoryDiscoveryError {
+    NotRepository(PathBuf),
     Canonicalize {
         path: PathBuf,
         source: std::io::Error,
@@ -52,6 +53,9 @@ pub enum RepositoryDiscoveryError {
 impl fmt::Display for RepositoryDiscoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotRepository(path) => {
+                write!(f, "not a Git repository: {}", path.display())
+            }
             Self::Canonicalize { path, source } => {
                 write!(
                     f,
@@ -101,6 +105,16 @@ fn git_bytes(
     operation: &'static str,
 ) -> std::result::Result<Output, RepositoryDiscoveryError> {
     let output = Command::new("git")
+        .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_remove("GIT_NAMESPACE")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -285,7 +299,7 @@ pub fn discover_repository(
                 source,
             })?;
 
-    let common_output = git_bytes(
+    let common_output = match git_bytes(
         &canonical_input,
         &[
             OsStr::new("rev-parse"),
@@ -293,7 +307,14 @@ pub fn discover_repository(
             OsStr::new("--git-common-dir"),
         ],
         "rev-parse common directory",
-    )?;
+    ) {
+        Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
+            if stderr.starts_with("fatal: not a git repository") =>
+        {
+            return Err(RepositoryDiscoveryError::NotRepository(canonical_input));
+        }
+        result => result?,
+    };
     let common_dir = path_from_git_stdout(common_output.stdout, "rev-parse common directory")?
         .canonicalize()
         .map_err(|source| RepositoryDiscoveryError::Canonicalize {
@@ -2396,7 +2417,7 @@ mod tests {
         verified_remove_arguments, BranchActivation, BranchActivationError,
         BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
         ReconciliationUnavailable, RemovalBlocker, RemovalPostconditionFailure, RemovalSafety,
-        RemoveVerifiedError,
+        RemoveVerifiedError, RepositoryDiscoveryError,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -2629,7 +2650,13 @@ mod tests {
             std::fs::create_dir(&ordinary).unwrap();
             let missing = fixture.root.join("missing");
 
-            let ordinary_error = discover_repository(&ordinary).unwrap_err().to_string();
+            let ordinary_error = discover_repository(&ordinary).unwrap_err();
+            assert!(matches!(
+                ordinary_error,
+                RepositoryDiscoveryError::NotRepository(ref path)
+                    if path == &ordinary.canonicalize().unwrap()
+            ));
+            let ordinary_error = ordinary_error.to_string();
             assert!(ordinary_error.contains("Git") || ordinary_error.contains("repository"));
             let missing_error = discover_repository(&missing).unwrap_err().to_string();
             assert!(missing_error.contains("canonicalize"));
