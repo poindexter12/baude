@@ -1,8 +1,8 @@
 ---
 phase: "07"
 slug: "local-tui-dogfood-release"
-status: draft
-nyquist_compliant: false
+status: validated
+nyquist_compliant: true
 wave_0_complete: false
 created: "2026-08-31"
 ---
@@ -192,3 +192,31 @@ wide/narrow local TUI dogfood, supported CI/Linux/runtime certification,
 independent deep review, phase verification and Nyquist approval, UI-SPEC
 checker sign-off, requirement/phase completion, and the release publication
 decision remain pending for morning.
+
+## Post-plan coverage additions (2026-09-01/02)
+
+| Behavior | Exact test |
+|----------|------------|
+| Existing-worktree auto-population (rows, skips, idempotence) | `app::tests::admit_repository_populates_existing_worktrees_as_inactive_rows` |
+| Main-role assignment for unselected main worktree | `app::tests::admit_repository_assigns_main_role_to_unselected_main_worktree` |
+| Seed-exempt removal preflight and seed cleanup | `git::tests::lifecycle::remove_postconditions::baude_seeded_artifacts_are_exempt_and_cleared_by_plain_removal`; `hook::tests::pure_seed_settings_predicate_accepts_only_baude_seeds`; `permission::tests::pure_seed_mcp_predicate_accepts_only_baude_seed` |
+| Occupied-protected activation guards (execute + recovery) | `lifecycle::tests::occupied_protected_checkout_refuses_activation_overwrite`; `lifecycle::tests::occupied_protected_checkout_blocks_activation_recovery_merge` |
+| Checkout-first restart selection over standalone rows | `hierarchy::tests::standalone_rows_are_deterministic_top_level_sessions_without_git_authority` (extended) |
+
+## Validation Audit 2026-09-02
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+All 21 exact requirement-mapped tests re-executed green against commit
+`82b12b4` using the list-prove-then-exact-run contract. One transient:
+`app::tests::standalone_admission_dedup_close_reopen_and_missing_are_durable`
+failed once inside the sequential audit batch, then passed 3/3 isolated
+re-runs and passed in every full-suite run today (local macOS plus the
+ubuntu-22.04 and macos-14 CI checks in PR #56 run 33641979151) — recorded as
+an unreproduced flake, not a coverage gap. REL-02's package/release/CI
+assertions are evidenced by the green four-target artifact-readiness matrix
+and the published v2.0.0-beta assets (07-UAT-EVIDENCE.md, 2026-09-02).
