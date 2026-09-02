@@ -182,10 +182,18 @@ impl LocalRow {
     }
 }
 
+/// Restart initialization prefers the first local CHECKOUT even when a
+/// standalone row sorts above the repository group: the documented contract
+/// is "first available local checkout", with repository parents and
+/// standalone sessions reachable by explicit navigation. Display order still
+/// decides among the remaining rows when no checkout exists at all.
 pub fn initial_selection(rows: &[LocalRow], remote_ids: &[u64]) -> Option<SelectionTarget> {
-    selectable_local_ids(rows)
-        .into_iter()
-        .next()
+    let selectable = selectable_local_ids(rows);
+    selectable
+        .iter()
+        .find(|id| matches!(id, LocalRowId::Checkout(_)))
+        .or_else(|| selectable.first())
+        .copied()
         .map(SelectionTarget::Local)
         .or_else(|| remote_ids.first().copied().map(SelectionTarget::Remote))
 }
@@ -1040,7 +1048,7 @@ mod tests {
     fn standalone_rows_are_deterministic_top_level_sessions_without_git_authority() {
         let mut state = RepositoryState::default();
         let repository = add_repository(&mut state, "/work/beta");
-        add_checkout(
+        let checkout = add_checkout(
             &mut state,
             repository,
             "/work/beta",
@@ -1078,5 +1086,23 @@ mod tests {
         assert!(!row.actions.can_activate_branch);
         assert!(!row.actions.can_remove);
         assert_eq!(selectable_local_ids(&rows)[0], LocalRowId::Standalone(key));
+
+        // The standalone row sorts and navigates first, but restart
+        // initialization still lands on the first checkout — the documented
+        // "first available local checkout" contract. Only when no checkout
+        // row exists at all does display order decide.
+        assert_eq!(
+            initial_selection(&rows, &[81]),
+            Some(SelectionTarget::Local(LocalRowId::Checkout(checkout)))
+        );
+        let without_checkouts: Vec<_> = rows
+            .iter()
+            .filter(|row| !matches!(row, LocalRow::Checkout(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            initial_selection(&without_checkouts, &[81]),
+            Some(SelectionTarget::Local(LocalRowId::Standalone(key)))
+        );
     }
 }

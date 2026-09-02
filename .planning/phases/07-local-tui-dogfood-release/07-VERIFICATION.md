@@ -164,3 +164,17 @@ No blocking gaps. Every roadmap success criterion is achieved in the current cod
 
 _Verified: 2026-09-02T02:40:24Z_
 _Verifier: Claude (gsd-verifier)_
+
+---
+
+## Addendum — 2026-09-02 selection-contract decision
+
+The escalated selection-initialization question was decided by the owner:
+checkouts win. `initial_selection` (baude/src/hierarchy.rs) now prefers the
+first checkout among selectable rows regardless of a standalone row sorting
+above the repository group, falling back to display order only when no
+checkout row exists; the standalone hierarchy test pins both halves. The
+documented "first available local checkout" contract in README and runbook
+§7 is now literally true again with standalone rows present. The other two
+human-routed items (README beta pin example, stale CHANGELOG sentence) were
+closed on 2026-09-01 in 57b7c1c.
