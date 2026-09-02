@@ -5671,7 +5671,13 @@ mod tests {
         std::fs::remove_dir_all(&collision).unwrap();
         git(
             &repo,
-            &["worktree", "remove", "--", worktree_path.to_str().unwrap()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                worktree_path.to_str().unwrap(),
+            ],
         );
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(checkout, baseline_state.checkouts[0].key);
@@ -5856,7 +5862,13 @@ mod tests {
         app.session_mut(runtime).unwrap().kill();
         git(
             &repo,
-            &["worktree", "remove", "--", worktree_path.to_str().unwrap()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                worktree_path.to_str().unwrap(),
+            ],
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6300,7 +6312,7 @@ mod tests {
             .collect();
         for path in linked {
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
@@ -6340,7 +6352,7 @@ mod tests {
             .collect();
         for path in &partial {
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
@@ -6519,7 +6531,7 @@ mod tests {
                     .is_ok());
             }
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
@@ -6645,7 +6657,16 @@ mod tests {
             app.repository_state
         );
         let path = retained.observed_path.to_path_buf();
-        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                path.to_str().unwrap(),
+            ],
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6750,7 +6771,16 @@ mod tests {
             let path = app.repository_state.checkouts[0]
                 .observed_path
                 .to_path_buf();
-            git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--",
+                    path.to_str().unwrap(),
+                ],
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -6815,7 +6845,16 @@ mod tests {
         let path = app.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
-        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                path.to_str().unwrap(),
+            ],
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7316,7 +7355,16 @@ mod tests {
         assert!(confirmation.to_string().contains("Untracked"));
         app.session_mut(compensated_runtime).unwrap().kill();
         std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
-        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                path.to_str().unwrap(),
+            ],
+        );
         std::fs::remove_dir_all(root).unwrap();
 
         let (mut app, repo, root, checkout, _, path) =
@@ -7335,7 +7383,16 @@ mod tests {
         assert!(app.runtime_checkouts.is_empty());
         assert!(app.sessions.is_empty());
         std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
-        git(&repo, &["worktree", "remove", "--", path.to_str().unwrap()]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                path.to_str().unwrap(),
+            ],
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7452,7 +7509,13 @@ mod tests {
         std::fs::remove_file(target_path.join("blocked")).unwrap();
         git(
             &repo,
-            &["worktree", "remove", "--", target_path.to_str().unwrap()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                target_path.to_str().unwrap(),
+            ],
         );
         std::fs::remove_dir_all(root).unwrap();
     }

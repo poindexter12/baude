@@ -3009,7 +3009,7 @@ mod tests {
             .collect();
         for path in linked {
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
@@ -3077,7 +3077,7 @@ mod tests {
             .collect();
         for path in &partial {
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
@@ -3252,7 +3252,7 @@ mod tests {
             .collect();
         for path in linked {
             let _ = Command::new("git")
-                .args(["worktree", "remove", "--"])
+                .args(["worktree", "remove", "--force", "--"])
                 .arg(path)
                 .current_dir(&repo)
                 .status();
