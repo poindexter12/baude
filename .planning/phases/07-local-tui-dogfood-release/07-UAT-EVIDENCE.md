@@ -219,3 +219,44 @@ terminal emulator. These are terminal captures, not image screenshots. The
 - Image screenshots, supported Linux/runtime certification, independent
   phase verification/Nyquist/UI sign-off, and requirement completion remain
   pending.
+
+## 2026-09-02 - Linux and CI matrix certification (PR #56)
+
+**Source:** commit `da1b7f2` on `gsd/phase-07-local-tui-dogfood-release` (the
+commit the re-cut `v2.0.0-beta` prerelease targets), after merging main
+(v0.14.1 + ctrl-x passthrough) into the branch — required because the draft
+PR was CONFLICTING and GitHub does not run `pull_request` workflows without a
+merge ref, which is why no CI had ever executed for this branch.
+
+**Evidence (GitHub Actions, PR #56, run 33641979151):**
+
+- `check (ubuntu-22.04)`: PASS — `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, and the full `cargo test` executed on Linux:
+  53 (baude, including the isolated real-Git dogfood subprocess) + 220
+  (baude-core) + 79 (bauded) tests, zero failures. This is the first Linux
+  execution of the phase-6 `cfg(linux)` process-identity path (compile fixed
+  in `0c24995`), the pre-exec registration gate, and descendant
+  process-group teardown tests — the Linux/runtime certification gate.
+- `check (macos-14)`: PASS (same steps).
+- `artifact-readiness` on all four supported targets (both Linux and both
+  macOS): PASS — locked release builds, versioned `baude`/`bauded` archive
+  verification.
+- `docker`: PASS. CodeQL analyses: PASS.
+
+**Findings fixed en route (each verified on a subsequent green run):**
+
+- Seven baude tests failed only on ubuntu because git 2.34 refuses non-force
+  `git worktree remove` over untracked files (the Claude-seeded
+  `.claude/settings.local.json`) while git 2.50 on the dev machine permits
+  it — verified empirically. All raw test-fixture worktree removals now pass
+  `--force` (`f00c316`); the fail-closed removal contract remains pinned by
+  the preflight and verified-removal product tests. Design note recorded: on
+  modern git the status-based preflight is the ONLY untracked-file gate for
+  removal; git's own refusal is a backstop only on older git.
+- Restart selection initialization now prefers checkouts over standalone
+  rows (`da1b7f2`), closing the selection-contract question per the owner's
+  decision.
+
+The `v2.0.0-beta` prerelease was re-cut at `da1b7f2` with all four tarballs
+and checksums; the local mise prerelease lane was refreshed and reports
+`baude 2.0.0-beta`.
