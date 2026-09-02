@@ -1,8 +1,8 @@
 ---
 phase: "06"
 slug: "safe-managed-worktree-lifecycle"
-status: draft
-nyquist_compliant: false
+status: validated
+nyquist_compliant: true
 wave_0_complete: false
 created: "2026-08-30"
 ---
@@ -38,7 +38,7 @@ created: "2026-08-30"
 
 | Task ID | Plan | Wave | Requirements | Threat Refs | Exact Planned Tests | Files | Status |
 |---------|------|------|--------------|-------------|---------------------|-------|--------|
-| 06-07-01 | 07 | 6 | CORE-01, CORE-02, CORE-05 | T-06-01, T-06-04 | `lifecycle::tests::lifecycle_protocol_core_legal_transition_table`; `persist::tests::lifecycle_schema_v2_migrates_protected_states` | `baude-core/src/lifecycle.rs`; `baude-core/src/persist.rs` | ✅ green locally |
+| 06-07-01 | 07 | 6 | CORE-01, CORE-02, CORE-05 | T-06-01, T-06-04 | `lifecycle::tests::lifecycle_protocol_core_legal_transition_table`; `persist::tests::lifecycle_schema_v1_migrates_protected_states_to_v3`; `persist::tests::schema_v2_migrates_strictly_to_v3` | `baude-core/src/lifecycle.rs`; `baude-core/src/persist.rs` | ✅ green locally |
 | 06-07-02 | 07 | 6 | CORE-03, CORE-06 | T-06-02, T-06-03, T-06-05 | `session::tests::lifecycle_process_contract_exact_ownership`; `pty::tests::pre_exec_registration_gate_owner_death_and_release`; `lifecycle::tests::lifecycle_startup_recovery_is_idempotent` | `baude-core/src/session.rs`; `baude-core/src/pty.rs`; `baude-core/src/lifecycle.rs` | ✅ green locally |
 | 06-07-03 | 07 | 6 | CORE-01, CORE-03, CORE-04, CORE-06 | T-06-01 through T-06-06 | `app::tests::lifecycle_protocol_contract_app_vectors`; `manager::tests::lifecycle_protocol_contract_manager_vectors`; historical exact tests named in PLAN | `baude-core/src/lifecycle.rs`; `baude/src/app.rs`; `bauded/src/manager.rs` | ✅ green locally |
 
@@ -53,7 +53,7 @@ created: "2026-08-30"
 <automated>cargo test -p baude-core -- --list | rg -x 'lifecycle::tests::lifecycle_protocol_core_legal_transition_table: test' &amp;&amp; cargo test -p baude-core lifecycle::tests::lifecycle_protocol_core_legal_transition_table -- --exact --nocapture</automated>
 <fails_when>The exact reducer test is absent, `rg -x` matches zero tests, or the exact test exits nonzero.</fails_when>
 
-<automated>cargo test -p baude-core -- --list | rg -x 'persist::tests::lifecycle_schema_v2_migrates_protected_states: test' &amp;&amp; cargo test -p baude-core persist::tests::lifecycle_schema_v2_migrates_protected_states -- --exact --nocapture</automated>
+<automated>cargo test -p baude-core -- --list | rg -x 'persist::tests::lifecycle_schema_v1_migrates_protected_states_to_v3: test' &amp;&amp; cargo test -p baude-core persist::tests::lifecycle_schema_v1_migrates_protected_states_to_v3 -- --exact --nocapture &amp;&amp; cargo test -p baude-core -- --list | rg -x 'persist::tests::schema_v2_migrates_strictly_to_v3: test' &amp;&amp; cargo test -p baude-core persist::tests::schema_v2_migrates_strictly_to_v3 -- --exact --nocapture</automated>
 <fails_when>The exact migration test is absent, `rg -x` matches zero tests, or the exact test exits nonzero.</fails_when>
 
 ### 06-07-02
@@ -144,3 +144,20 @@ Do not push, open a PR, publish, or mark Phase 6/CORE requirements complete as p
 - [ ] `nyquist_compliant: true` set only after the morning evidence exists.
 
 **Approval:** pending
+
+## Validation Audit 2026-09-02
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 1 |
+| Resolved | 1 |
+| Escalated | 0 |
+
+Every exact per-task command re-executed green against commit `f3766c3`. The
+one gap was nominal, not behavioral: the phase-07 schema-v3 bump renamed
+`lifecycle_schema_v2_migrates_protected_states` into
+`lifecycle_schema_v1_migrates_protected_states_to_v3` plus
+`schema_v2_migrates_strictly_to_v3`, both green; the map and exact commands
+above now name them. `cargo fmt --check` and the manifest/lockfile gate also
+pass. Linux certification for these same suites is recorded in PR #56 run
+33641979151 (see 07-UAT-EVIDENCE.md, 2026-09-02 section).
