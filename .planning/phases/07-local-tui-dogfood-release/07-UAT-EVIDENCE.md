@@ -126,3 +126,96 @@ temporarily so the recorded files can be inspected; it is not source-controlled.
 - Focused follow-up review found no high/medium issues. The regression was
   tightened to assert checkout selection, Claude focus, and absence of an
   admission error in addition to one checkout/runtime/session/spawn.
+
+## 2026-09-01 - Clean-commit runbook re-certification (scripted PTY)
+
+**Source:** clean working tree at exact commit
+`6014b63a0c6103ca65f3671bede41980134545dc` (the commit the published
+`v2.0.0-beta` prerelease tag points at; only pre-existing untracked
+`opencode.json` present). This run re-certifies the runbook against an exact
+commit, upgrading the 2026-08-31 dirty-tree evidence, and covers the two
+behavior changes landed since: existing-worktree auto-population (`59e67b6`)
+and seed-exempt safe removal (`6014b63`).
+
+**Host/toolchain:** Darwin 25.6.0 arm64; `rustc 1.98.0`; `cargo 1.98.0`.
+`cargo build --workspace --release --locked` and
+`cargo install --path baude --root "$INSTALL_ROOT" --locked` passed; source,
+workspace, and isolated installed binaries all reported `baude 2.0.0-beta` /
+`bauded 2.0.0-beta`.
+
+**Isolation root (retained):**
+`/var/folders/q1/335pbzl13sz825k87q4ywl300000gq/T/baude-beta-dogfood.tOV3o8`
+holding isolated HOME, XDG config/data/state, bare origin, clone, install
+root, standalone folder, and 18 evidence files (ANSI captures, schema-v3
+state snapshots, worktree inventories, branch refs).
+
+**Method:** the TUI was driven by scripted keystrokes over a `script(1)` PTY
+with fixed delays, and frames were re-rendered from the raw captures with a
+terminal emulator. These are terminal captures, not image screenshots. The
+`40x12` observation is a fresh launch at that size, not a mid-session resize.
+
+### Observed passes
+
+- Step 5 (wide `160x40` open): one primary main-checkout row (`● repository`,
+  `↳ default · bypass`) under muted `repo · repository` context.
+  RepositoryKey 1 / order 1; CheckoutKey 1 / order 2 on `refs/heads/main`.
+- Step 6: `w feature/dogfood-beta` created exactly one managed child
+  (key 2, order 3) after the older main child; repeating `w` with the same
+  branch did not add a row (worktree inventory stayed at two). The lowercase
+  `x` modal read "Close session “repository:feature/dogfood-beta” and keep
+  its checkout"; after confirm the child persisted with `active_intent`
+  false and unchanged key/order, and `refs/heads/feature/dogfood-beta`
+  resolved to the seed commit.
+- Step 7: restart initialized selection at the first available local
+  checkout (band on the primary; child rendered `○ … · closed`). Explicit
+  `j` + `enter` reopened the child: one child row, one runtime, band on the
+  child, pane titled `repository:feature/dogfood-beta`. Fresh `40x12`
+  launch rendered hierarchy context, both rows with status glyphs, selection
+  band, and the `enter attach · x close · ? more` footer without panic; both
+  retained sessions respawned with no duplicates.
+- Step 8 (standalone): `n` + `ctrl+u` + absolute path opened the plain
+  folder as a root-level row sorted before the repository group. Schema 3;
+  StandaloneKey 1, order 5, canonical `/private/...` path. Opening a symlink
+  alias kept exactly one durable row. `w` refused with "this is a standalone
+  folder, not a Git checkout"; uppercase `X` refused with "standalone
+  sessions have no branch or worktree removal authority. The folder is
+  unchanged." — and the folder's content was verified unchanged. Renaming
+  the folder produced a durable `missing` row with no spawn; restoring the
+  exact path and pressing `enter` reconciled the SAME key/order back to
+  running.
+- Step 9 (seed-exempt removal — NEW semantics): the managed worktree
+  contained the Claude-seeded `.claude/settings.local.json` (verified with
+  `test -f` immediately before removal) and NO manual deletion was
+  performed. Uppercase `X` on the primary was refused ("not a baude-managed
+  linked worktree") — the unmanaged guard held. On the managed child the red
+  confirmation read "Remove this clean baude-managed linked worktree?",
+  named `branch: refs/heads/feature/dogfood-beta`, and stated the local
+  branch is retained and parent/siblings unchanged. After `enter`:
+  "worktree removed — local branch refs/heads/feature/dogfood-beta
+  retained"; inventory dropped to exactly one worktree; the branch ref
+  survived at the seed commit; durable state retained only checkout key 1
+  and standalone key 1.
+- Step 10: skipped — no isolated daemon existed; no remote observation is
+  claimed.
+
+### Honest gaps and notes
+
+- Standalone editor/info/activity/GSD/archive/close/reopen sub-actions were
+  not re-exercised in this run; they remain covered by the 2026-08-31 live
+  evidence and automated tests.
+- Two scripted navigation misfires occurred before step 9 succeeded (a `j`
+  that landed on the primary produced the genuine unmanaged-removal refusal
+  recorded above; an earlier `j j` reopened the child instead of the
+  standalone row). Both were harmless and re-run with corrected navigation.
+- The isolated-HOME `.zshrc` include warning inside spawned PTYs recurred;
+  fixture-only, not attributed to baude.
+- Selection-contract observation for verification: before the standalone row
+  existed (step 7), restart selection initialized on the repository's first
+  available checkout as documented. Once the standalone row existed and was
+  available (step 9), restart selection initialized on the standalone row,
+  which sorts above the repository group. Phase verification should decide
+  whether "first available local checkout" is meant to cover standalone rows
+  or whether checkouts should win initialization over standalone sessions.
+- Image screenshots, supported Linux/runtime certification, independent
+  phase verification/Nyquist/UI sign-off, and requirement completion remain
+  pending.
