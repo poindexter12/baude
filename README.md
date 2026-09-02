@@ -39,7 +39,7 @@ state, and (Claude Code) context usage and permission mode.
 
 ## Install
 
-The latest available stable build remains v0.14.0. Via
+The latest available stable build remains v0.14.1. Via
 [mise](https://mise.jdx.dev), install that build from the existing GitHub
 assets (its tarball includes both `baude` and `bauded`):
 
@@ -128,7 +128,6 @@ through to Claude.
 | `ctrl+\` | anywhere | toggle shell pane (opening focuses it) |
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
-| `ctrl+x` | anywhere | close session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps) |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
@@ -146,11 +145,14 @@ through to Claude.
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
 
+To close from a pane, press `ctrl+q` to return to the sidebar, then `x`.
+`ctrl+x` passes through unchanged for opencode, nano, and other terminal apps.
+
 `alt+←/→` needs your terminal to send Option/Alt as a modifier — on macOS
 Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
 this chord shadows Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
-`ctrl+n`, and `ctrl+x` are intercepted everywhere, so they never reach the
-shell pane's readline (end-of-line, next-history, `ctrl+x` prefix) or Claude.
+and `ctrl+n` are intercepted everywhere, so they never reach the shell pane's
+readline (end-of-line, next-history) or the AI CLI.
 
 ## Status icons
 

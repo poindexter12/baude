@@ -21,6 +21,15 @@ tracked in `.planning/phases/07-local-tui-dogfood-release/`.
 * exact `2.0.0-beta` workspace metadata, locked package checks, and two-binary supported-target artifact readiness
 * isolated local source installation and manual dogfood instructions that do not replace an existing installation or authorize remote distribution
 
+
+## [0.14.1](https://github.com/poindexter12/baude/compare/v0.14.0...v0.14.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* pass ctrl-x through to terminal apps ([d06f047](https://github.com/poindexter12/baude/commit/d06f0479a7dda9d1d37b468a9ccac1323180f349))
+* pass ctrl-x through to terminal apps ([8dcf016](https://github.com/poindexter12/baude/commit/8dcf0161fe04823b0c85651277f16c135c0c7576))
+
 ## [0.14.0](https://github.com/poindexter12/baude/compare/v0.13.0...v0.14.0) (2026-08-17)
 
 
