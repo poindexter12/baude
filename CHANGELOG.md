@@ -2,9 +2,12 @@
 
 ## 2.0.0-beta readiness
 
-This source state targets `v2.0.0-beta` for local validation. It has no date,
-tag, compare link, or remote availability claim; morning certification and the
-publication decision remain pending.
+This source state ships as the `v2.0.0-beta` prerelease, published 2026-09-01
+as a manually cut bootstrap of the beta channel (4-platform tarballs bundling
+`baude` and `bauded`, plus `ghcr.io` images on the `beta` channel). Later
+betas (`2.0.0-beta.1` and onward) will be cut by release-please. Formal phase
+certification gates (Linux runtime certification, verification sign-off) are
+tracked in `.planning/phases/07-local-tui-dogfood-release/`.
 
 ### Features
 

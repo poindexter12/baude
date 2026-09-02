@@ -2493,6 +2493,129 @@ mod tests {
     }
 
     #[test]
+    fn occupied_protected_checkout_refuses_activation_overwrite() {
+        // SC2 "activation cannot overwrite": when Git reuses an existing
+        // worktree for the requested branch and durable state records that
+        // exact path under a DIFFERENT, protected checkout, finalization must
+        // refuse with OccupiedProtected and leave the occupant untouched.
+        let root = std::env::temp_dir().join(format!(
+            "baude-lifecycle-occupied-protected-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("tracked"), b"one\n").unwrap();
+        for args in [
+            vec!["add", "tracked"],
+            vec!["commit", "-m", "initial"],
+            vec!["branch", "feature/occupied"],
+            vec!["worktree", "add", "../occupied", "feature/occupied"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let snapshot = crate::git::discover_repository(&repo).unwrap();
+        let mut state = RepositoryState::default();
+        let prepared = prepare_activation(&mut state, &snapshot, "feature/occupied").unwrap();
+        let pending = prepared.checkout;
+        let repository = prepared.request.repository;
+        record_pending_activation(&mut state, &snapshot, &prepared).unwrap();
+
+        // Durable state already owns the occupied path under a protected
+        // (removal-tombstoned) checkout distinct from the pending child.
+        let occupied = root.join("occupied").canonicalize().unwrap();
+        let main_worktree = state
+            .repositories
+            .iter()
+            .find(|saved| saved.key == repository)
+            .unwrap()
+            .observed_main_worktree
+            .clone();
+        let protected_key = state.allocate_checkout_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.checkouts.push(SavedCheckout {
+            key: protected_key,
+            repository_key: repository,
+            role: CheckoutRole::ManagedBranch,
+            managed_by_baude: true,
+            observed_path: PersistedPath::from_path(&occupied),
+            observed_branch: Some("refs/heads/feature/occupied".into()),
+            first_seen_order: order,
+            lifecycle: CheckoutLifecycle::RemovalCommitted,
+            owned_runtime: None,
+            active_intent: false,
+            session: RetainedSessionState {
+                name: "repo:feature/occupied".into(),
+                cwd: PersistedPath::from_path(&occupied),
+                repo_root: main_worktree,
+                branch: Some("feature/occupied".into()),
+                is_worktree: true,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+            health: CheckoutHealth::Unavailable(
+                crate::repository::UnavailableCause::RemovalTombstone(
+                    "destructive authority revoked".into(),
+                ),
+            ),
+        });
+        state.validate().unwrap();
+
+        let error = super::execute_activation(&mut state, &repo, prepared).unwrap_err();
+        match error {
+            LifecycleError::OccupiedProtected { checkout, cause } => {
+                assert_eq!(checkout, protected_key);
+                assert_ne!(checkout, pending);
+                assert!(matches!(
+                    cause,
+                    crate::repository::UnavailableCause::RemovalTombstone(_)
+                ));
+            }
+            other => panic!("unexpected activation error: {other}"),
+        }
+
+        // The protected occupant survives byte-intact: tombstone health,
+        // RemovalCommitted lifecycle, no active intent, worktree still on disk.
+        let occupant = state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == protected_key)
+            .unwrap();
+        assert!(matches!(
+            occupant.health,
+            CheckoutHealth::Unavailable(crate::repository::UnavailableCause::RemovalTombstone(_))
+        ));
+        assert_eq!(occupant.lifecycle(), &CheckoutLifecycle::RemovalCommitted);
+        assert!(!occupant.active_intent());
+        assert!(occupied.is_dir());
+
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", "--", "../occupied"])
+            .current_dir(&repo)
+            .status();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_activation_recovery_distinguishes_absent_and_exact_git_facts() {
         let root = std::env::temp_dir().join(format!(
             "baude-lifecycle-pending-recovery-{}",

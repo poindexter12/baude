@@ -53,7 +53,7 @@ project's `.mise.toml` so entering that project activates both `baude` and
 
 ```toml
 [tools]
-"github:poindexter12/baude" = { version = "2.0.0-beta.1", prerelease = true }
+"github:poindexter12/baude" = { version = "2.0.0-beta", prerelease = true }
 ```
 
 Run `mise install`, then verify the active project version with
