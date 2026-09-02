@@ -15,7 +15,8 @@ findings:
   warning: 0
   info: 0
   total: 3
-status: issues_found
+status: resolved
+adjudicated: 2026-09-02
 ---
 
 # Phase 6: Code Review Report
@@ -103,3 +104,75 @@ if !(agent_restarted && shell_restarted) {
 _Reviewed: 2026-08-31T00:50:41Z_  
 _Reviewer: the agent (gsd-code-reviewer)_  
 _Depth: deep_
+
+---
+
+## Adjudication — 2026-09-02
+
+Owner-directed adjudication of the three standing Criticals against the
+current tree (`57b7c1c` plus the two guard tests added by this adjudication).
+Each disposition below was verified by reading the current code and executing
+the named tests in-process, not by trusting summaries. The 06-REVIEW-FIX.md
+`none_fixed` record remains accurate for its own 2026-08-31T02:41Z attempt;
+every fix below landed AFTER that attempt, chiefly through plan 06-07's
+lifecycle-engine cutover.
+
+### CR-01 — RESOLVED (fixed post-review, now test-pinned on both paths)
+
+The unchecked occupied-owner merge no longer exists on either flagged path:
+
+- `execute_activation` finalization refuses an occupied owner carrying any
+  `CheckoutHealth::Unavailable` cause with the typed
+  `LifecycleError::OccupiedProtected` (baude-core/src/lifecycle.rs:1867 area),
+  introduced by `b661784` (2026-08-31 01:42, after the review).
+- `reconcile_activation_recovery`'s preexisting-owner reuse arm returns
+  `ActivationRecoveryResolution::Blocked` with "occupied checkout N has
+  unresolved recovery" for the same condition
+  (baude-core/src/lifecycle.rs:1600 area), introduced by `06c2076`
+  (2026-08-30 22:21, after the review).
+- The review's demanded tests now exist and pass:
+  `occupied_protected_checkout_refuses_activation_overwrite` (`57b7c1c`) and
+  `occupied_protected_checkout_blocks_activation_recovery_merge` (this
+  adjudication), both asserting a RemovalTombstone occupant survives
+  byte-intact and the pending child is not merged.
+
+### CR-02 — RESOLVED (point-fix reverted, then superseded by the engine cutover)
+
+Timeline: fix `1dec466` (19:35) was indeed reverted by `3e66c52` (19:40) —
+the fix log is truthful for that attempt — but plan 06-07 then re-landed
+agent-and-shell close-rollback parity through the shared `LifecycleEngine`
+(`c97bbaf` 22:37 and `7dad443` 23:24, both after the review). In the current
+tree Manager's retained snapshot carries the real `session.shell_open`
+(bauded/src/manager.rs:1398), and the exact test the review prescribed —
+`lifecycle_close_manager_persistence_failure_retains_child_and_parent`, a
+pre-replacement close-save failure with an open shell — passes, asserting
+both the agent and shell PIDs are live on the compensated runtime with
+`shell_open` intact. The App mirror
+(`lifecycle_close_local_obeys_persistence_commit_boundary`) passes with the
+same both-process assertions, restoring the owner parity the finding
+demanded.
+
+### CR-03 — RESOLVED (path redesigned at the typed teardown boundary)
+
+The flagged `restore_stopped_runtime` cleanup path no longer exists; the
+engine cutover replaced it with the single typed stop boundary
+`lifecycle::destructive_teardown` (baude-core/src/lifecycle.rs:855 area),
+which never ignores `kill_and_wait`: a partial stop is transferred into
+`UnavailableCause::TeardownPending` carrying exact agent/shell PIDs,
+identities, and per-process stopped flags before the error returns to either
+owner. `StoppedActiveRecovery` deliberately remains identity-free because it
+is now recorded only for processes that were verifiably stopped with restart
+compensation also failed — restart outcomes, not liveness claims about
+unowned processes; its reopen/recovery dispatch is pinned by the lifecycle
+capability tests. The remaining `let _ = kill_and_wait()` sites in
+baude/src/app.rs (2530/2545/4652/4733 area) are all fresh-spawn abort paths —
+best-effort kills of a replacement PTY spawned by the very call that is
+erroring, before any durable ownership was granted — which is a different
+category from the retained-runtime orphaning the finding described and
+cannot strand durable state.
+
+**Disposition:** all three Criticals closed as fixed-in-tree. Review status
+updated to `resolved`; SC5's clean-review requirement is satisfied by this
+adjudication record.
+
+_Adjudicated: 2026-09-02 by Claude, directed by the owner._
