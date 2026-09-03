@@ -11,24 +11,24 @@
 - [x] **REPO-02**: Opening or cloning a repository ensures exactly one usable default-branch session using the active workspace backend.
 - [x] **REPO-03**: Reopening an already registered repository focuses or reopens its existing default-branch child instead of creating a duplicate parent or session.
 - [x] **REPO-04**: If the main checkout is not on the resolved default branch, baude preserves it and creates or reuses a separate managed default-branch worktree.
-- [ ] **REPO-05**: User can see both the existing main checkout and the managed default-branch worktree beneath the repository.
+- [x] **REPO-05**: User can see both the existing main checkout and the managed default-branch worktree beneath the repository.
 - [x] **REPO-06**: If the default branch cannot be resolved safely from local Git data, baude reports an actionable state without switching branches, fetching, or guessing.
 
 ### Hierarchy and Branches
 
-- [ ] **HIER-01**: User can view repository parents with main-checkout and worktree children in the local TUI.
-- [ ] **HIER-02**: Repository parents remain visible when none of their children has a running agent session.
-- [ ] **HIER-03**: Repository parents are ordered by name, while checkout and worktree children are ordered oldest-first by a persisted first-seen timestamp.
-- [ ] **HIER-04**: Waiting, working, archive, and other session status changes do not reorder children or hide which session needs attention.
+- [x] **HIER-01**: User can view repository parents with main-checkout and worktree children in the local TUI.
+- [x] **HIER-02**: Repository parents remain visible when none of their children has a running agent session.
+- [x] **HIER-03**: Repository parents are ordered by name, while checkout and worktree children are ordered oldest-first by a persisted first-seen timestamp.
+- [x] **HIER-04**: Waiting, working, archive, and other session status changes do not reorder children or hide which session needs attention.
 
 ### Worktree Lifecycle
 
-- [ ] **WORK-01**: User can create a valid named branch or activate an eligible existing local branch as a managed worktree from repository context.
-- [ ] **WORK-02**: Baude refuses invalid refs, path collisions, and branches already checked out elsewhere without bypassing Git safeguards.
-- [ ] **WORK-03**: User can close a worktree session while retaining its checkout and hierarchy child for later reopening.
-- [ ] **WORK-04**: User can reopen a retained main-checkout or worktree child in the active workspace backend.
-- [ ] **WORK-05**: User can remove a clean managed worktree through a distinct confirmed action without deleting its branch.
-- [ ] **WORK-06**: Dirty, conflicted, locked, submodule-unsafe, or indeterminate worktree state blocks removal before the running session or persisted child is changed.
+- [x] **WORK-01**: User can create a valid named branch or activate an eligible existing local branch as a managed worktree from repository context.
+- [x] **WORK-02**: Baude refuses invalid refs, path collisions, and branches already checked out elsewhere without bypassing Git safeguards.
+- [x] **WORK-03**: User can close a worktree session while retaining its checkout and hierarchy child for later reopening.
+- [x] **WORK-04**: User can reopen a retained main-checkout or worktree child in the active workspace backend.
+- [x] **WORK-05**: User can remove a clean managed worktree through a distinct confirmed action without deleting its branch.
+- [x] **WORK-06**: Dirty, conflicted, locked, submodule-unsafe, or indeterminate worktree state blocks removal before the running session or persisted child is changed.
 
 ### Persistence and Reconciliation
 
@@ -39,12 +39,12 @@
 
 ### Shared Lifecycle Core
 
-- [ ] **CORE-01**: One `baude-core` lifecycle protocol/state machine is authoritative for Git topology decisions, persistence commit stages, and agent and shell effects; App and Manager do not independently decide lifecycle transitions.
-- [ ] **CORE-02**: One explicit legal transition table governs all protected lifecycle and recovery states, and every illegal transition is rejected without changing Git, durable state, or owned processes.
-- [ ] **CORE-03**: Before a destructive or replacement effect, baude durably writes ahead the exact agent and shell process ownership needed for recovery and never forgets either process until teardown is confirmed or durable successor ownership exists.
-- [ ] **CORE-04**: App and Manager implement the same shared lifecycle effect contract and pass mirrored contract tests for success, every persistence boundary, effect failure, rollback, and restart recovery.
-- [ ] **CORE-05**: Explicit typed lifecycle candidates and their provenance are saved durably; no generic runtime overlay is used to reconstruct activation, teardown, removal, or rollback intent.
-- [ ] **CORE-06**: Startup recovery and rollback execute only legal shared-core transitions and converge to truthful Git, persistence, agent, and shell ownership without duplicate or orphaned runtimes.
+- [x] **CORE-01**: One `baude-core` lifecycle protocol/state machine is authoritative for Git topology decisions, persistence commit stages, and agent and shell effects; App and Manager do not independently decide lifecycle transitions.
+- [x] **CORE-02**: One explicit legal transition table governs all protected lifecycle and recovery states, and every illegal transition is rejected without changing Git, durable state, or owned processes.
+- [x] **CORE-03**: Before a destructive or replacement effect, baude durably writes ahead the exact agent and shell process ownership needed for recovery and never forgets either process until teardown is confirmed or durable successor ownership exists.
+- [x] **CORE-04**: App and Manager implement the same shared lifecycle effect contract and pass mirrored contract tests for success, every persistence boundary, effect failure, rollback, and restart recovery.
+- [x] **CORE-05**: Explicit typed lifecycle candidates and their provenance are saved durably; no generic runtime overlay is used to reconstruct activation, teardown, removal, or rollback intent.
+- [x] **CORE-06**: Startup recovery and rollback execute only legal shared-core transitions and converge to truthful Git, persistence, agent, and shell ownership without duplicate or orphaned runtimes.
 
 ### Interaction and Surface Parity
 
@@ -56,7 +56,7 @@
 
 - [x] **REL-01**: In an isolated real repository, the local TUI completes the end-to-end default-session and branch-worktree flow—open, create or activate, close, reopen, safely remove, and restart—without duplicate parents, children, or runtimes and without losing user work.
 - [x] **REL-02**: Formatting, lint, full tests, package checks, and supported release artifact builds pass for the intended `v2.0.0-beta` source state.
-- [ ] **REL-03**: Version/package metadata, changelog or release notes, and local install/dogfood documentation consistently target `v2.0.0-beta`; readiness is verified without publishing or pushing a release.
+- [x] **REL-03**: Version/package metadata, changelog or release notes, and local install/dogfood documentation consistently target `v2.0.0-beta`; readiness is verified without publishing or pushing a release.
 
 ## Future Requirements
 

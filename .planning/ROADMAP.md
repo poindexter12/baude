@@ -30,8 +30,8 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
 **Milestone Goal:** Make the local TUI safe and complete enough to dogfood persistent repository and managed-worktree sessions, backed by one shared lifecycle authority and release readiness for `v2.0.0-beta` without publishing it.
 
 - [x] **Phase 5: Durable Repository Admission** - Canonical repositories, the approved default-branch contract, migration, and atomic persistence work per workspace. (completed 2026-08-30)
-- [ ] **Phase 6: Shared Lifecycle Core Refactor** - One enforceable core protocol owns lifecycle transitions, persistence stages, exact processes, recovery, and rollback across thin App and Manager adapters.
-- [ ] **Phase 7: Local TUI Dogfood Release** - Local users can complete the stable repository/worktree flow and verify `v2.0.0-beta` release readiness.
+- [x] **Phase 6: Shared Lifecycle Core Refactor** - One enforceable core protocol owns lifecycle transitions, persistence stages, exact processes, recovery, and rollback across thin App and Manager adapters.
+- [x] **Phase 7: Local TUI Dogfood Release** - Local users can complete the stable repository/worktree flow and verify `v2.0.0-beta` release readiness.
 
 ## Phase Details
 
@@ -67,7 +67,7 @@ Full detail: `milestones/v0.7-ROADMAP.md` · Audit: `milestones/v0.7-MILESTONE-A
   4. A crash or injected failure at any persistence/effect boundary recovers on startup or rolls back to truthful Git, durable-state, agent, and shell ownership without a duplicate or orphaned runtime.
   5. Explicit typed lifecycle candidates and provenance survive restart without a generic runtime overlay, and clean review plus phase verification find no unresolved lifecycle ownership gaps.
 
-**Plans**: 7/7 plans locally implemented; certification and phase completion pending
+**Plans**: 7/7 plans complete — certified 2026-09-02/03 (verification, adjudicated review, Nyquist, Linux CI)
 
 Plans:
 
@@ -77,7 +77,7 @@ Plans:
 - [x] 06-04-PLAN.md — Close sessions only after retaining complete durable checkout and conversation context. (execution history)
 - [x] 06-05-PLAN.md — Reconcile and reopen retained checkouts with secure targeted backend resume and one runtime. (execution history)
 - [x] 06-06-PLAN.md — Confirm and execute double-preflight clean removal while preserving branch, parent, and recovery context. (execution history)
-- [x] 06-07-PLAN.md — Correct lifecycle ownership into one shared core state machine. (local implementation complete; certification pending)
+- [x] 06-07-PLAN.md — Correct lifecycle ownership into one shared core state machine.
 
 ### Phase 7: Local TUI Dogfood Release
 
@@ -113,8 +113,8 @@ Plans:
 | 3. Tool-Activity Timeline | v0.7 | 4/4 | Complete | 2026-06-15 |
 | 4. Remote Permission Approval | v0.7 | 4/4 | Complete | 2026-06-16 |
 | 5. Durable Repository Admission | v2.0 | 3/3 | Complete    | 2026-08-30 |
-| 6. Shared Lifecycle Core Refactor | v2.0 | 7/7 | In Progress | - |
-| 7. Local TUI Dogfood Release | v2.0 | 6/6 | In Progress|  |
+| 6. Shared Lifecycle Core Refactor | v2.0 | 7/7 | Complete | 2026-09-02 |
+| 7. Local TUI Dogfood Release | v2.0 | 6/6 | Complete | 2026-09-03 |
 
 ## Backlog
 

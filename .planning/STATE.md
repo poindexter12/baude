@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Local TUI Dogfood Release
-current_phase: 6
-current_phase_name: shared lifecycle core refactor
-status: verification
-stopped_at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
-last_updated: "2026-08-31T10:21:35.110Z"
-last_activity: 2026-08-31
-last_activity_desc: completed readiness-only docs and final local package/archive/install gate; certification pending
+current_phase: 7
+current_phase_name: local tui dogfood release
+status: complete
+stopped_at: Phases 6 and 7 certified and completed; PR #56 merge to main in progress
+last_updated: "2026-09-03T17:00:00.000Z"
+last_activity: 2026-09-03
+last_activity_desc: certified phases 6/7 (verification, adjudicated review, Nyquist, Linux CI, UI audit + fixes); v2.0.0-beta published
 state_head: 872f52443aa5aade4e9fb4f66d68ad29823c3871
 progress:
   total_phases: 3
-  completed_phases: 1
+  completed_phases: 3
   total_plans: 16
   completed_plans: 16
-  percent: 33
+  percent: 100
 ---
 
 # Project State
@@ -25,16 +25,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 6 certification and Phase 7 release readiness
+**Current focus:** v2.0 milestone complete; beta channel handoff to release-please via PR #56
 
 ## Current Position
 
-Phase: 6 (2 of 3 v2.0 phases) — shared lifecycle core refactor
-Plan: 06-07 local implementation complete; 06-01 through 06-06 retained as execution history
-Status: Local implementation green; Phase 6 awaits Linux/runtime certification, independent review, phase verification, and Nyquist approval
-Last activity: 2026-08-31 — completed readiness-only docs and the final local package/archive/install gate; certification remains pending
+Phase: 7 (3 of 3 v2.0 phases) — local TUI dogfood release — COMPLETE
+Plan: all 16 v2.0 plans executed and certified
+Status: Phases 5, 6, and 7 complete. Certification evidence: goal-backward verification (06/07-VERIFICATION.md), adjudicated clean review, Nyquist-compliant validation, Linux/runtime CI certification (PR #56 run 33641979151), UI audit 20/24 with priority fixes applied, three live dogfood passes. v2.0.0-beta published at ad37088.
+Last activity: 2026-09-03 — phases certified and completed; PR #56 merging to main to hand the beta channel to release-please
 
-Progress: [███░░░░░░░] 33% (1 of 3 milestone phases complete)
+Progress: [██████████] 100% (3 of 3 milestone phases complete)
 
 ## Performance Metrics
 
