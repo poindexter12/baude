@@ -124,3 +124,28 @@ Registry audit: skipped — no `components.json`; UI-SPEC Registry Safety table 
 - `.planning/phases/07-local-tui-dogfood-release/07-UI-SPEC.md` (baseline)
 - `07-01…07-06` PLAN.md and SUMMARY.md, `07-UAT-EVIDENCE.md` (evidence base)
 - Post-plan commits inspected: `59e67b6`, `6014b63`, `da1b7f2`
+
+---
+
+## Priority fixes applied — 2026-09-03
+
+All three WARNING priority fixes are implemented (same commit as this note):
+
+1. The contracted with-retry reopen refusal literal now replaces the generic
+   `reopen blocked: {error}` fallback: an unavailable-topology failure with
+   `RetryReopen` names the cause and exact path and offers `r`; any other
+   post-gate failure gets the structured `Cannot reopen “<target>”: <error>.
+   Open details with i…` form. Cause, next step, and retry authorization are
+   always named.
+2. The `↳` connector renders at the 4-cell anatomy indent on all three
+   second-line variants (live chips, runtime-less meta, standalone metadata) —
+   no more 2-cell jump on close/reopen.
+3. Copy contract reconciled by amending 07-UI-SPEC.md to the shipped,
+   test-pinned literals (`no sessions yet`, folder-inclusive empty body,
+   `close local session` title) with dated amendment notes — the shipped
+   strings are the deliberate standalone-scope adaptations. The
+   repository-row prefix reserve is corrected to 11 cells so right-aligned
+   aggregates never clip.
+
+The nine minor recommendations and the remote-modal red-border decision
+remain open.

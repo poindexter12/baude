@@ -308,7 +308,7 @@ The UI receives retry capability as a derived lifecycle value. It must not deriv
 ### Close checkout session
 
 - `x` opens a non-destructive confirmation only when a runtime exists.
-- Title: `close checkout session`.
+- Title: `close local session`. *(Amended 2026-09-03: the modal serves both checkout and standalone sessions after the approved standalone scope; originally `close checkout session`.)*
 - Body: `Close session “<target>” and keep its checkout for reopening?`
 - Hints: `y/enter close · n/esc keep session open`.
 - Success: `session closed — checkout kept`.
@@ -438,8 +438,8 @@ Additional rules:
 | Element | Exact copy/pattern |
 |---------|--------------------|
 | Primary CTA | `Create or activate branch` |
-| Empty state heading | `no repositories yet` |
-| Empty state body | `press n to open a repository or c to clone one` |
+| Empty state heading | `no sessions yet` *(amended 2026-09-03 for approved standalone scope; originally `no repositories yet`)* |
+| Empty state body | `press n to open a repository or folder, or c to clone` *(amended 2026-09-03 for approved standalone scope; originally `press n to open a repository or c to clone one`)* |
 | Repository with no running child | `<N> checkouts · none running` or `no running sessions` when space is constrained |
 | Generic action error | `Cannot <action> “<target>”: <cause>. <safe next step>.` |
 | Persistence error | `State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started.` |

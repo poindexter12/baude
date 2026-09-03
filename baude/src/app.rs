@@ -3718,7 +3718,32 @@ impl App {
         let target = self.selected_target_label();
         self.set_message(format!("reopening “{target}”…"));
         if let Err(error) = self.reopen_checkout(checkout) {
-            self.set_message(format!("reopen blocked: {error}"));
+            // Contracted refusal (UI-SPEC): a post-gate reopen failure names
+            // the cause, the exact path to repair, and whether r retries.
+            let saved = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout);
+            let retryable = saved
+                .and_then(|saved| lifecycle::lifecycle_capability(saved.lifecycle()))
+                == Some(lifecycle::LifecycleCapability::RetryReopen);
+            let unavailable = saved.and_then(|saved| match saved.health() {
+                CheckoutHealth::Unavailable(cause) => {
+                    Some(Self::unavailable_cause_label(Some(cause)))
+                }
+                CheckoutHealth::Available => None,
+            });
+            let message = match (saved, unavailable) {
+                (Some(saved), Some(cause)) if retryable => format!(
+                    "Cannot reopen “{target}”: Git topology is still unavailable ({cause}). Repair the checkout at “{}”, then press r to recheck and reopen.",
+                    saved.observed_path.to_path_buf().display()
+                ),
+                _ => format!(
+                    "Cannot reopen “{target}”: {error}. Open details with i and repair the reported state; press r only if retry is shown."
+                ),
+            };
+            self.set_message(message);
         }
     }
 

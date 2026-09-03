@@ -387,7 +387,10 @@ fn repository_row(
     } else {
         cell_width(&aggregate) + 1
     };
-    let name = truncate(&row.display_name, width.saturating_sub(9 + reserve).max(1));
+    // The actual prefix is 11 cells: 2-cell gutter plus the 9-cell
+    // "  repo · " label. Reserving less lets a maximal name push the
+    // right-aligned aggregate past the row width at narrow sidebars.
+    let name = truncate(&row.display_name, width.saturating_sub(11 + reserve).max(1));
     let mut spans = vec![
         gutter(selected, focused),
         Span::styled("  repo · ", Style::default().fg(Color::DarkGray)),
@@ -588,8 +591,8 @@ fn standalone_row(
     let metadata = format!("folder · {} · {state}", tilde_path(&row.path));
     let mut second = Line::from(vec![
         gutter(selected, focused),
-        Span::styled("↳ ", dim),
-        Span::styled(truncate(&metadata, width.saturating_sub(4)), dim),
+        Span::styled("  ↳ ", dim),
+        Span::styled(truncate(&metadata, width.saturating_sub(6)), dim),
     ]);
     if selected {
         let used = second.width();
@@ -636,8 +639,10 @@ fn chips_line(
     width: usize,
 ) -> Line<'static> {
     let sep = Style::default().fg(Color::DarkGray);
-    let mut spans: Vec<Span> = vec![gutter(selected, focused), Span::styled("↳ ", sep)];
-    let mut used = 4usize;
+    // Same 4-cell connector indent as the runtime-less meta line: the row
+    // anatomy must not shift when a runtime appears or goes away.
+    let mut spans: Vec<Span> = vec![gutter(selected, focused), Span::styled("  ↳ ", sep)];
+    let mut used = 6usize;
     for (i, (text, style)) in chips.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", sep));
@@ -2603,7 +2608,7 @@ mod tests {
         let order = state.allocate_first_seen_order().unwrap();
         state.standalone_sessions.push(SavedStandaloneSession::new(
             key,
-            persisted_path("/tmp/plain folder"),
+            persisted_path("/t/plain folder"),
             order,
             StandaloneLifecycle::Missing,
             None,
@@ -2623,7 +2628,7 @@ mod tests {
         let (sidebar, _) = render(&app, 120, 30);
         assert!(sidebar.contains("plain folder"), "{sidebar}");
         assert!(
-            sidebar.contains("folder · /tmp/plain folder · missing"),
+            sidebar.contains("folder · /t/plain folder · missing"),
             "{sidebar}"
         );
         assert!(
