@@ -5,9 +5,14 @@ status: human_needed
 score: 4/4 must-haves verified
 overrides_applied: 0
 human_verification:
+
   - test: "Run baude, select a local session whose bridge file has effort/thinking/pr present (or seed /tmp/baude-usage-<sid>.json with those fields), press `i`."
     expected: "The local info overlay shows `effort`, `thinking` (on/off), and `pr (#N (state))` rows; rows are OMITTED (not shown as `—`) when those fields are absent; no `vim mode` row appears."
     why_human: "No headless ratatui render harness exists in-repo (per plans' human_verify_mode: end-of-phase). The code path is statically verified and wired (ui.rs:871-884 → ClaudeMeta → poll → read_bridge_file), but the on-screen render of a ratatui Paragraph cannot be asserted programmatically without launching the TUI."
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  status: human_needed
 ---
 
 # Phase 1: Full Status-Line Capture Verification Report

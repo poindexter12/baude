@@ -4,6 +4,10 @@ phase: 04-remote-permission-approval
 source: [04-VERIFICATION.md]
 started: 2026-06-15T23:30:00Z
 updated: 2026-06-15T23:30:00Z
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  gap_snapshot: "testing::scenarios=0"
 ---
 
 ## Current Test
@@ -20,13 +24,16 @@ awaiting: user response
 ## Tests
 
 ### 1. Live --permission-prompt-tool wire-contract confirmation (04-02 CONTRACT gate)
+
 expected: A live claude 2.1.178 invoking mcp__baude__approve confirms the framing + tools/call field names + accepted response envelope. If divergent, only parse_frame / parse_tool_call / build_approve_result need correcting (deliberately isolated).
 steps: |
+
   1. cargo build --workspace.
   2. Temporarily log raw stdin frames + return hardcoded allow in run_permission_mcp (research §F).
   3. Run: claude -p --permission-prompt-tool mcp__baude__approve --mcp-config .mcp.json "create hello.txt"
   4. Confirm framing, tools/call field names (tool_name/input/tool_use_id), and that the result envelope unblocks the tool.
   5. If divergent, correct the 3 isolated baude-core functions; re-run cargo test -p baude-core permission::; revert the hack.
+
 why_human: Exact 2.1.178 wire shape is MEDIUM-confidence (no complete official example, claude-code #1175). Only a live CLI confirms it.
 result: [passed — 2026-06-23, Claude-driven against live claude 2.1.187; 1 ship-blocking bug found + fixed]
 
@@ -75,6 +82,7 @@ result: [passed — 2026-06-23, Claude-driven against live claude 2.1.187; 1 shi
   human-only.
 
 ### 2. PWA approve/deny card + distinct push, live prompt-mode session (04-04 UAT)
+
 expected: prompt-mode session → (a) distinct push fires ("<name> needs permission"), separate from the generic waiting push; (b) approve/deny card above the composer with the tool + esc()'d input; (c) Approve runs the tool, card clears; (d) Deny denies only that tool call (session survives), card clears; (e) timeout past BAUDE_PERMISSION_TIMEOUT_S denies (never auto-allows). Web Push phone-verification noted (separate deferred milestone).
 why_human: Vanilla-JS PWA (no test runner) + real Web Push needs a device.
 result: [partial — 2026-06-23, on-device (iPhone 16 Pro, prompt-mode daemon over a tailnet raw-TCP serve at http://100.76.8.47:8642). CONFIRMED live: (b) the approve/deny card renders above the composer for a real pending permission, (c) Approve runs the tool, and (d) Deny denies only that tool call — the session SURVIVED (server-verified: status stayed `waiting`, not `exited`) and the file was NOT created (server-verified: `deny-test.txt` absent). The full bridge→daemon→PWA→approve/deny round-trip works end-to-end against live claude 2.1.187 (this is the path the §F framing fix unblocked; before the fix the permission-mcp server never connected so no card could ever appear). PENDING: (a) distinct permission push, and (e) timeout-denies — (a) needs the HTTPS/secure-context path (Web Push requires it; the raw-IP HTTP path used here can't subscribe). Carry the first-real-phone Web Push verification with (a).]
@@ -83,6 +91,7 @@ result: [partial — 2026-06-23, on-device (iPhone 16 Pro, prompt-mode daemon ov
 
 The full prompt-mode bridge↔daemon data path was validated live end-to-end against a
 real `bauded` (without real claude — the irreducible residual above):
+
 - `bauded permission-mcp` does NOT daemonize (the Phase-2 bauded-hook trap fix holds);
   it speaks JSON-RPC, `initialize` → MCP handshake (protocol 2024-11-05).
 - Fail-closed: a `tools/call` with NO daemon URL returns `{behavior:"deny"}` (never allow).

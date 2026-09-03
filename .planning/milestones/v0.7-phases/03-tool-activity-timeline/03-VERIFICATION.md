@@ -6,12 +6,17 @@ score: 4/4 must-haves implemented (2 automated-verified, 2 pending live-render U
 overrides_applied: 0
 uat_note: "Data feed (ACT-01 ring + ACT-02 daemon GET /activity + SSE /activity-stream + SessionInfo.activity) FULLY validated live by Claude against a real daemon (stood up a scratch CLAUDE_CONFIG_DIR + fake session file to resolve meta.session_id): POST->ingest->poll->ring->GET returns events in order, ?limit clamps, unknown id 404s, SSE delivers live events end-to-end, /sessions bundles SessionInfo.activity. Only the two VISUAL render surfaces remain — ACT-03 PWA strip (browser) and ACT-04 TUI v overlay (terminal) — which render the already-validated feed. Code review found 0 critical / 2 warnings / 2 info, all 4 fixed (WR-01 snapshot dedup, WR-02 SSE-404 teardown, IN-01/02 PWA/TUI mirror consistency)."
 human_verification:
+
   - test: "PWA activity strip live-render (ACT-03 / SC3)"
     expected: "Strip present below chat / above composer, COLLAPSED by default; expands to show recent tool sequence (icon + tool/type + relative time), newest at bottom, scrollable; new rows append live with no page reload and no gap/duplicate at the snapshot↔live seam; HTML-ish tool/notification strings render as literal text; no stale EventSource after navigating away and back."
     why_human: "Vanilla-JS PWA embedded via include_bytes! — no JS test runner, no build step. Live render, SSE append behavior, SW cache eviction, and XSS-escaped display are visually/behaviorally observable only in a real browser against a live bauded session."
   - test: "TUI `v` activity overlay live-render (ACT-04 / SC4)"
     expected: "Pressing `v` on a selected session (local OR remote) opens the Modal::Activity overlay; it renders the recent tool sequence newest-at-bottom mirroring the `i` Info overlay; any key dismisses back to Modal::None; the overlay refreshes live on the existing draw tick (local ~1s, remote ~3s); local reads s.meta.activity(), remote reads RemoteInfo.activity with no extra round-trip."
     why_human: "No app.rs key-dispatch/render test seam exists (per 03-VALIDATION.md). Open/dismiss key flow and live in-terminal rendering can only be confirmed by driving the TUI against a session producing tool events."
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  status: human_needed
 ---
 
 # Phase 3: Tool-Activity Timeline Verification Report
