@@ -74,8 +74,13 @@ jobs:
         working-directory: /tmp/digests
         run: |
           IMAGE=ghcr.io/${{ github.repository_owner }}/bauded
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            channel=beta
+          else
+            channel=latest
+          fi
           docker buildx imagetools create \
-            -t "$IMAGE:${{ github.ref_name }}" -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ github.ref_name }}" -t "$IMAGE:$channel" \
             $(printf "$IMAGE@sha256:%s " *)
 
   build:
@@ -94,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
       - name: package
         # Both binaries: the TUI and the daemon. bauded historically shipped
         # only via the ghcr image, so mise/tarball installs couldn't satisfy

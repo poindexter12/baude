@@ -195,6 +195,18 @@ pub fn merge_mcp_config(existing: &serde_json::Value, exe: &str) -> serde_json::
     root
 }
 
+/// True iff a `.mcp.json` value is PURELY baude's own permission-mcp seed —
+/// exactly what [`merge_mcp_config`] writes into an empty file for SOME exe
+/// path, with nothing a user could have added. The command string is read
+/// from the file itself and the whole document must equal the seed rebuilt
+/// from it, so any sibling server, extra key, or altered args still blocks.
+pub fn is_pure_seed_mcp(root: &serde_json::Value) -> bool {
+    let Some(command) = root["mcpServers"]["baude"]["command"].as_str() else {
+        return false;
+    };
+    *root == mcp_server_config(command)
+}
+
 /// The seeded `.mcp.json` location for a session cwd. Both spawn sites agree on
 /// this so the daemon (which re-spawns on `restore`) and the TUI write the same
 /// file.
@@ -593,6 +605,33 @@ mod tests {
     /// `BAUDE_PERMISSION_MODE` is process-global; serialize the env-mutating
     /// tests so parallel cases never race the same var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // ---- is_pure_seed_mcp -----------------------------------------------
+
+    #[test]
+    fn pure_seed_mcp_predicate_accepts_only_baude_seed() {
+        // The exact seed for any exe path is pure — the command is read from
+        // the document itself, so both binaries' seeds qualify.
+        assert!(is_pure_seed_mcp(&mcp_server_config("/opt/baude")));
+        assert!(is_pure_seed_mcp(&merge_mcp_config(
+            &serde_json::json!({}),
+            "/opt/bauded"
+        )));
+
+        // Any user contribution regains blocking authority.
+        assert!(!is_pure_seed_mcp(&serde_json::json!({})));
+        assert!(!is_pure_seed_mcp(&merge_mcp_config(
+            &serde_json::json!({ "mcpServers": { "other": { "command": "x" } } }),
+            "/opt/baude"
+        )));
+        let mut extra_key = mcp_server_config("/opt/baude");
+        extra_key["extra"] = serde_json::json!(true);
+        assert!(!is_pure_seed_mcp(&extra_key));
+        let mut altered_args = mcp_server_config("/opt/baude");
+        altered_args["mcpServers"]["baude"]["args"] =
+            serde_json::json!(["permission-mcp", "--extra"]);
+        assert!(!is_pure_seed_mcp(&altered_args));
+    }
 
     // ---- resolve_claude_cmd: pure mode resolution (no env mutation) -----
     // Branch coverage uses the env-free seam so it never races concurrent

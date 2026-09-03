@@ -43,10 +43,33 @@ use std::path::Path;
 use crate::meta::ClaudeMeta;
 use crate::permission::ResolvedCmd;
 
+pub const RESUME_ID_ENV: &str = "BAUDE_RESUME_ID";
+
+/// How a backend should enter a conversation. Targeted IDs are untrusted,
+/// opaque process data and must never be interpolated into a shell command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SpawnMode {
+    Fresh,
+    ContinueLatest,
+    ResumeId(String),
+}
+
+impl SpawnMode {
+    pub fn environment(&self) -> Vec<(String, String)> {
+        match self {
+            Self::ResumeId(id) => vec![(RESUME_ID_ENV.to_string(), id.clone())],
+            Self::Fresh | Self::ContinueLatest => Vec::new(),
+        }
+    }
+}
+
 /// What a backend hands the spawn site for one session.
 pub struct SpawnPlan {
     /// The full shell command for [`crate::pty::Pty::spawn`].
     pub cmd: String,
+    /// Opaque process environment applied by the PTY boundary. Values here
+    /// are never parsed by the login shell.
+    pub env: Vec<(String, String)>,
     /// Local port of the per-session backend server baked into `cmd`
     /// (opencode `--port`); `None` for backends without one (claude).
     /// The spawn site stores it in [`ClaudeMeta::backend_port`].
@@ -74,11 +97,12 @@ pub trait Backend: Send + Sync {
     /// Build the spawn command (and allocate the backend server port, if any)
     /// for one session.
     ///
-    /// `resume` selects the backend's resume form. `event_url` (daemon spawns
+    /// `mode` selects the backend's resume form. `event_url` (daemon spawns
     /// only) is claude's hook transport — exported, not assignment-prefixed,
     /// so it survives the resume fallback (WR-01); backends without hooks
     /// ignore it. The TUI passes `None`.
-    fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, resume: bool) -> SpawnPlan;
+    fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, mode: SpawnMode)
+        -> SpawnPlan;
 
     /// Best-effort per-cwd wiring so a spawned session reports back to baude.
     /// Idempotent and non-clobbering — re-run on every restore-driven

@@ -96,6 +96,35 @@ with user before planning.
 
 ---
 
+## Captured 2026-08-31
+
+### BL-05 — First-class standalone sessions for non-Git folders — RESOLVED 2026-08-31
+
+**Observation (user):** Sometimes a folder is opened for coding-agent work but it
+is not a Git repository and never will be. The v2.0 beta currently ignores a
+non-Git launch directory and the `n` flow refuses it as repository admission.
+
+**Decision:** A real standalone local session should be a top-level row, not a
+synthetic repository parent or invalid checkout. It retains normal agent, shell,
+editor, resume, archive, info, activity, GSD, close, and reopen behavior. Git-only
+branch/worktree actions (`w`, `X`) are unavailable.
+
+**Implementation boundary:** Add a durable `StandaloneKey`/record and runtime map,
+strict schema migration, standalone selection/projection/action semantics, canonical
+path deduplication, restart/close/reopen persistence, and missing-folder recovery.
+Do not weaken repository/checkouts invariants or persist an unowned runtime.
+
+**Resolution:** Implemented schema-v3 standalone keys/records and strict v2
+migration, canonical-path admission/deduplication, exact registered runtime and
+shell ownership, restart/close/reopen/missing-folder recovery, root-level TUI
+projection, normal local session actions, and explicit Git-action refusals. Full
+formatting, Clippy, and 345 workspace tests pass. Isolated live UAT covered alias
+deduplication, all local actions, close/reopen/restart, archive retention,
+missing-folder recovery, and Git-action refusals; image screenshots and formal
+phase certification remain pending.
+
+---
+
 ## Captured 2026-06-23
 
 ### BL-04 — `BAUDE_PERMISSION_MODE=prompt` silently suppressed when `claude_cmd` already contains `--dangerously-skip-permissions` — ✅ RESOLVED 2026-06-24

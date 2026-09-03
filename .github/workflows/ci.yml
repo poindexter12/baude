@@ -55,3 +55,47 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8642/sessions | grep '"status":"waiting"'
           docker rm -f smoke
+
+  artifact-readiness:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: artifact-readiness-${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - name: resolve package version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "baude") | .version')
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: build locked release binaries
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: archive and verify both binaries
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          mkdir -p dist verify
+          archive="dist/baude-v${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" baude bauded
+          tar -C verify -xzf "$archive"
+          test "$(verify/baude --version)" = "baude ${VERSION}"
+          test "$(verify/bauded --version)" = "bauded ${VERSION}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: baude-v${{ steps.version.outputs.value }}-${{ matrix.target }}
+          path: dist/*.tar.gz

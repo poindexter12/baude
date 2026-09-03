@@ -5,6 +5,7 @@ use anyhow::Result;
 
 use crate::meta::{now_unix_ms, ClaudeMeta};
 use crate::pty::{now_ms, Pty};
+use crate::repository::ProcessIdentity;
 
 /// Output silence longer than this means Claude is waiting on the user.
 /// While working, Claude Code streams spinner/progress output continuously.
@@ -325,6 +326,435 @@ impl Session {
             shell.kill();
         }
     }
+
+    pub fn runtime_snapshot(&self) -> std::result::Result<RuntimeSnapshot, String> {
+        let snapshot = RuntimeSnapshot::new(
+            self.claude.process_identity().clone(),
+            self.shell
+                .as_ref()
+                .filter(|_| self.shell_open)
+                .map(|shell| shell.process_identity().clone()),
+        );
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Stop and reap every process owned by this session. The agent is waited
+    /// first so callers never begin destructive worktree inspection while it
+    /// may still be writing into the checkout.
+    pub fn kill_and_wait(&mut self) -> std::result::Result<(), SessionTeardownError> {
+        // Attempt each owned process independently. A partially successful
+        // stop remains retryable because Pty::kill_and_wait is idempotent.
+        let claude = self.claude.kill_and_wait().err();
+        let shell = self
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.kill_and_wait().err());
+        match (claude, shell) {
+            (None, None) => Ok(()),
+            (claude, shell) => {
+                let agent_stopped = claude.is_none();
+                let shell_stopped = shell.is_none();
+                let mut failures = Vec::new();
+                if let Some(error) = claude {
+                    failures.push(format!("agent: {error}"));
+                }
+                if let Some(error) = shell {
+                    failures.push(format!("shell: {error}"));
+                }
+                Err(SessionTeardownError {
+                    agent_pid: self.claude.pid(),
+                    shell_pid: self.shell.as_ref().and_then(Pty::pid),
+                    agent_identity: Some(self.claude.process_identity().clone()),
+                    shell_identity: self
+                        .shell
+                        .as_ref()
+                        .map(|shell| shell.process_identity().clone()),
+                    agent_stopped,
+                    shell_stopped,
+                    detail: failures.join("; "),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionTeardownError {
+    pub agent_pid: Option<u32>,
+    pub shell_pid: Option<u32>,
+    pub agent_identity: Option<ProcessIdentity>,
+    pub shell_identity: Option<ProcessIdentity>,
+    pub agent_stopped: bool,
+    pub shell_stopped: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSnapshot {
+    agent: ProcessIdentity,
+    shell: Option<ProcessIdentity>,
+}
+
+impl RuntimeSnapshot {
+    pub fn new(agent: ProcessIdentity, shell: Option<ProcessIdentity>) -> Self {
+        Self { agent, shell }
+    }
+
+    pub fn agent(&self) -> &ProcessIdentity {
+        &self.agent
+    }
+
+    pub fn shell(&self) -> Option<&ProcessIdentity> {
+        self.shell.as_ref()
+    }
+
+    pub fn shell_requested(&self) -> bool {
+        self.shell.is_some()
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (kind, identity) in std::iter::once(("agent", &self.agent))
+            .chain(self.shell.as_ref().map(|identity| ("shell", identity)))
+        {
+            if identity.process_group != identity.pid as i32
+                || identity.session != identity.pid as i32
+            {
+                return Err(format!(
+                    "{kind} {} does not own its process group/session",
+                    identity.pid
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StopReport {
+    agent: Option<ProcessIdentity>,
+    shell: Option<ProcessIdentity>,
+    agent_stopped: bool,
+    shell_stopped: bool,
+    detail: String,
+}
+
+impl StopReport {
+    pub fn from_observations(
+        agent: Option<ProcessIdentity>,
+        shell: Option<ProcessIdentity>,
+        agent_stopped: bool,
+        shell_stopped: bool,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent,
+            shell,
+            agent_stopped,
+            shell_stopped,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn all_extinct(&self) -> bool {
+        self.agent_stopped && self.shell_stopped
+    }
+
+    pub fn remaining(&self) -> Vec<ProcessIdentity> {
+        let mut remaining = Vec::new();
+        if !self.agent_stopped {
+            remaining.extend(self.agent.iter().cloned());
+        }
+        if !self.shell_stopped {
+            remaining.extend(self.shell.iter().cloned());
+        }
+        remaining
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for SessionTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session process teardown incomplete (agent stopped: {}, shell stopped: {}; {})",
+            self.agent_stopped, self.shell_stopped, self.detail
+        )
+    }
+}
+
+impl std::error::Error for SessionTeardownError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedTeardownError {
+    pub agent_pid: Option<u32>,
+    pub shell_pid: Option<u32>,
+    pub agent_identity: Option<ProcessIdentity>,
+    pub shell_identity: Option<ProcessIdentity>,
+    pub agent_stopped: bool,
+    pub shell_stopped: bool,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RecordedTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "recorded process teardown remains unresolved: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for RecordedTeardownError {}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_process_identity(
+    pid: u32,
+) -> std::result::Result<Option<ProcessIdentity>, String> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect pid {pid}: {error}")),
+    };
+    let end = stat
+        .rfind(')')
+        .ok_or_else(|| format!("malformed process stat for pid {pid}"))?;
+    let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
+    if fields.len() < 20 {
+        return Err(format!("incomplete process stat for pid {pid}"));
+    }
+    if fields[0] == "Z" {
+        return Ok(None);
+    }
+    // A generic fn rather than a closure: the fields span three parse target
+    // types (i32 process group/session, u64 start time), and a closure would
+    // pin its inferred type to the first use.
+    fn parse<T: std::str::FromStr>(
+        fields: &[&str],
+        index: usize,
+        name: &str,
+        pid: u32,
+    ) -> std::result::Result<T, String>
+    where
+        T::Err: std::fmt::Display,
+    {
+        fields[index]
+            .parse()
+            .map_err(|error| format!("invalid {name} for pid {pid}: {error}"))
+    }
+    Ok(Some(ProcessIdentity {
+        pid,
+        process_group: parse(&fields, 2, "process group", pid)?,
+        session: parse(&fields, 3, "session", pid)?,
+        start_time: parse(&fields, 19, "start time", pid)?,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect_process_identity(
+    pid: u32,
+) -> std::result::Result<Option<ProcessIdentity>, String> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcBsdInfo {
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+        svgid: u32,
+        rfu_1: u32,
+        comm: [u8; 16],
+        name: [u8; 32],
+        nfiles: u32,
+        pgid: u32,
+        pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        nice: i32,
+        start_tvsec: u64,
+        start_tvusec: u64,
+    }
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+    const PROC_PIDTBSDINFO: i32 = 3;
+    let mut info = ProcBsdInfo::default();
+    let size = std::mem::size_of::<ProcBsdInfo>();
+    // SAFETY: `info` is writable for exactly `size` bytes and proc_pidinfo
+    // initializes PROC_PIDTBSDINFO on success.
+    let read = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdInfo).cast(),
+            size as i32,
+        )
+    };
+    if read == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(format!("could not inspect pid {pid}: {error}")),
+        };
+    }
+    if read as usize != size || info.pid != pid {
+        return Err(format!("incomplete process identity for pid {pid}"));
+    }
+    // SAFETY: getsid only reads kernel process metadata for the supplied pid.
+    let session = unsafe { libc::getsid(pid as i32) };
+    if session < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(format!("could not inspect session for pid {pid}: {error}")),
+        };
+    }
+    Ok(Some(ProcessIdentity {
+        pid,
+        start_time: info
+            .start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.start_tvusec),
+        process_group: info.pgid as i32,
+        session,
+    }))
+}
+
+fn signal_process_group(
+    identity: &ProcessIdentity,
+    signal: i32,
+) -> std::result::Result<(), String> {
+    // SAFETY: a negative pgid addresses the exact process group. The caller
+    // verifies the durable leader identity immediately before every signal.
+    let result = unsafe { libc::kill(-identity.process_group, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+fn identity_still_matches(
+    expected: &ProcessIdentity,
+    inspect: &mut impl FnMut(u32) -> std::result::Result<Option<ProcessIdentity>, String>,
+) -> std::result::Result<bool, String> {
+    Ok(inspect(expected.pid)?.as_ref() == Some(expected))
+}
+
+fn finish_recorded_process(
+    identity: Option<ProcessIdentity>,
+    already_stopped: bool,
+) -> std::result::Result<(), String> {
+    finish_recorded_process_with(
+        identity,
+        already_stopped,
+        inspect_process_identity,
+        signal_process_group,
+    )
+}
+
+fn finish_recorded_process_with(
+    identity: Option<ProcessIdentity>,
+    already_stopped: bool,
+    mut inspect: impl FnMut(u32) -> std::result::Result<Option<ProcessIdentity>, String>,
+    mut signal: impl FnMut(&ProcessIdentity, i32) -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    if already_stopped || identity.is_none() {
+        return Ok(());
+    }
+    let identity = identity.expect("checked above");
+    if !identity_still_matches(&identity, &mut inspect)? {
+        return Ok(());
+    }
+    if let Err(error) = signal(&identity, libc::SIGTERM) {
+        if identity_still_matches(&identity, &mut inspect)? {
+            return Err(format!(
+                "process group {} refused termination: {error}",
+                identity.process_group
+            ));
+        }
+        return Ok(());
+    }
+    for _ in 0..25 {
+        if !identity_still_matches(&identity, &mut inspect)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !identity_still_matches(&identity, &mut inspect)? {
+        return Ok(());
+    }
+    if let Err(error) = signal(&identity, libc::SIGKILL) {
+        if identity_still_matches(&identity, &mut inspect)? {
+            return Err(format!(
+                "process group {} refused forced termination: {error}",
+                identity.process_group
+            ));
+        }
+        return Ok(());
+    }
+    for _ in 0..25 {
+        if !identity_still_matches(&identity, &mut inspect)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(format!(
+        "process group {} remained live after termination",
+        identity.process_group
+    ))
+}
+
+/// Idempotently finish teardown recorded before an owner crash. Already
+/// stopped or absent children are accepted; live recorded children must be
+/// confirmed gone before recovery can transition to inactive.
+pub fn finish_recorded_teardown(
+    agent_pid: Option<u32>,
+    shell_pid: Option<u32>,
+    agent_identity: Option<ProcessIdentity>,
+    shell_identity: Option<ProcessIdentity>,
+    agent_stopped: bool,
+    shell_stopped: bool,
+) -> std::result::Result<(), RecordedTeardownError> {
+    let agent = finish_recorded_process(agent_identity.clone(), agent_stopped).err();
+    let shell = finish_recorded_process(shell_identity.clone(), shell_stopped).err();
+    if agent.is_none() && shell.is_none() {
+        return Ok(());
+    }
+    let mut details = Vec::new();
+    if let Some(error) = agent.as_ref() {
+        details.push(format!("agent: {error}"));
+    }
+    if let Some(error) = shell.as_ref() {
+        details.push(format!("shell: {error}"));
+    }
+    Err(RecordedTeardownError {
+        agent_pid,
+        shell_pid,
+        agent_identity,
+        shell_identity,
+        agent_stopped: agent.is_none(),
+        shell_stopped: shell.is_none(),
+        detail: details.join("; "),
+    })
 }
 
 pub fn human_duration(ms: u64) -> String {
@@ -341,12 +771,94 @@ pub fn human_duration(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn lifecycle_process_contract_exact_ownership() {
+        let agent = ProcessIdentity {
+            pid: 41,
+            start_time: 100,
+            process_group: 41,
+            session: 41,
+        };
+        let shell = ProcessIdentity {
+            pid: 42,
+            start_time: 101,
+            process_group: 42,
+            session: 42,
+        };
+        for snapshot in [
+            RuntimeSnapshot::new(agent.clone(), None),
+            RuntimeSnapshot::new(agent.clone(), Some(shell.clone())),
+        ] {
+            assert_eq!(snapshot.agent(), &agent);
+            assert_eq!(snapshot.shell().is_some(), snapshot.shell_requested());
+            assert!(snapshot.validate().is_ok());
+        }
+
+        let report = StopReport::from_observations(
+            Some(agent.clone()),
+            Some(shell.clone()),
+            true,
+            false,
+            "shell refused",
+        );
+        assert!(!report.all_extinct());
+        assert_eq!(report.remaining(), vec![shell.clone()]);
+
+        let reused = ProcessIdentity {
+            start_time: 999,
+            ..agent.clone()
+        };
+        let signals = AtomicUsize::new(0);
+        finish_recorded_process_with(
+            Some(agent.clone()),
+            false,
+            |_| Ok(Some(reused.clone())),
+            |identity, signal| {
+                assert_eq!(identity.process_group, identity.pid as i32);
+                assert!(signal == libc::SIGTERM || signal == libc::SIGKILL);
+                signals.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(signals.load(AtomicOrdering::Relaxed), 0);
+    }
 
     #[test]
     fn human_duration_buckets() {
         assert_eq!(human_duration(5_000), "5s");
         assert_eq!(human_duration(120_000), "2m");
         assert_eq!(human_duration(3_660_000), "1h1m");
+    }
+
+    #[test]
+    fn recorded_teardown_pid_reuse_never_signals_new_occupant() {
+        let recorded = ProcessIdentity {
+            pid: 4242,
+            start_time: 100,
+            process_group: 4242,
+            session: 4242,
+        };
+        let reused = ProcessIdentity {
+            start_time: 200,
+            ..recorded.clone()
+        };
+        let signals = AtomicUsize::new(0);
+
+        finish_recorded_process_with(
+            Some(recorded),
+            false,
+            |_| Ok(Some(reused.clone())),
+            |_, _| {
+                signals.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(signals.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]

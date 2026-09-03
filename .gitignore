@@ -2,3 +2,11 @@
 
 # GSD intel — regeneratable API-surface tooling output
 .planning/intel/
+
+# GSD machine-readable state projection (regenerated from planning artifacts)
+.planning/state.json
+
+# Graphify portable outputs; caches and machine-local intermediates are rebuilt.
+/graphify-out/*
+!/graphify-out/GRAPH_REPORT.md
+!/graphify-out/graph.json

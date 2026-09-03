@@ -4,14 +4,24 @@ A TUI for running multiple AI coding sessions in one terminal — Claude Code
 by default, [opencode](https://opencode.ai) as an alternative backend, each
 in its own hard-separated [workspace](#workspaces).
 
-Start it from any git repo and it spawns a session there. Add more repos, or
-spin up isolated git-worktree sessions for parallel work in the same repo. A
-shell pane at the session's folder is one keystroke away. The sidebar sorts
-sessions alphabetically by name — when one is **waiting for your input** it
-flashes in place (with a wait timer) instead of jumping around, so the list
-stays where your eye expects it while still telling you who needs you next.
-On macOS, a [desktop banner](#configuration) also names the session that
-blocked.
+Start it from any existing folder. A Git folder admits one durable repository parent with
+its main checkout and managed worktrees as children. Repository parents sort
+by name; each parent's children retain their persisted oldest-first order
+across restarts. Runtime status, attention, and archive changes decorate those
+rows without moving them. Checkout/worktree rows are the primary visual and
+navigation level; their repository context remains visible as a muted indented
+label. Selection follows durable `RepositoryKey` and `CheckoutKey` identities
+while baude is running. After restart it initializes at the first available
+checkout, using a repository parent only when that repository has no available
+checkout, rather than persisting the prior selection. A shell pane at the
+selected checkout is one keystroke away. On macOS, a [desktop banner](#configuration)
+also names the session that blocked.
+
+A non-Git folder is admitted as a durable standalone session at the top level.
+It supports the same coding-agent, shell, editor, resume, archive, close, info,
+activity, and GSD flows without inventing repository identity. Branch creation
+and managed-worktree removal stay unavailable. Canonical paths deduplicate
+aliases, and schema-v3 state retains standalone sessions across restarts.
 
 Each session surfaces live metadata — model, token counts, cost, GSD project
 state, and (Claude Code) context usage and permission mode.
@@ -29,19 +39,28 @@ state, and (Claude Code) context usage and permission mode.
 
 ## Install
 
-Via [mise](https://mise.jdx.dev) (pulls the prebuilt binaries from GitHub
-releases; since v0.14.0 the tarball ships both `baude` and `bauded`, so
-`auto_daemon` works out of the box):
+The latest available stable build remains v0.14.1. Via
+[mise](https://mise.jdx.dev), install that build from the existing GitHub
+assets (its tarball includes both `baude` and `bauded`):
 
 ```sh
 mise use -g github:poindexter12/baude
 ```
 
-Or from source:
+Beta builds are published as GitHub prereleases. Pin an exact beta in a
+project's `.mise.toml` so entering that project activates both `baude` and
+`bauded` from the matching release archive:
 
-```sh
-cargo install --path baude
+```toml
+[tools]
+"github:poindexter12/baude" = { version = "2.0.0-beta", prerelease = true }
 ```
+
+Run `mise install`, then verify the active project version with
+`mise exec -- baude --version`. Replace the pinned version deliberately when a
+later beta is available; prereleases are not selected by the stable global
+install above. For an isolated source build and test environment, follow the
+[local TUI dogfood runbook](docs/local-tui-dogfood.md).
 
 ## Usage
 
@@ -50,10 +69,14 @@ cd ~/code/some-repo
 baude            # or: baude /path/to/repo
 ```
 
-Sessions, worktrees, and shell-pane state persist across restarts, per
-workspace (`~/.config/baude/state-<workspace>.json`). On relaunch each
-session resumes its most recent conversation via the backend's resume form
-(`claude --continue` / `opencode --continue`).
+Repository parents, checkout children, their durable keys and oldest-first
+order, retained conversation context, and shell-pane state persist across
+restarts per workspace (`~/.config/baude/state-<workspace>.json`). Selection
+is not persisted: relaunch starts at the first available local checkout, falls
+back to its repository parent when no checkout is available, then uses the first
+flat remote row when no local target exists. Eligible active children resume
+through the backend's resume form (`claude --continue` /
+`opencode --continue`); retained closed children wait for an explicit reopen.
 
 ## How it works
 
@@ -105,19 +128,20 @@ through to Claude.
 | `ctrl+\` | anywhere | toggle shell pane (opening focuses it) |
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
-| `alt+←/→` | anywhere | cycle to the prev/next session (wraps) |
-| `enter` | sidebar | attach to selected session |
-| `j/k` `↑/↓` | sidebar | select session |
+| `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps) |
+| `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
+| `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
 | `t` | sidebar | open shell pane (focuses it) |
 | `e` | sidebar | open the session folder in your editor (`editor_cmd`, default `code`) |
-| `i` | sidebar | session info — model, tokens, context, permission mode |
+| `i` | sidebar | repository or checkout/session details |
 | `g` | sidebar | GSD project state (`.planning/STATE.md`) |
 | `n` | sidebar | new session (enter a repo path; `tab` completes, `ctrl+u` clears; not-yet-cloned repos fall through to `c`) |
 | `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
-| `w` | sidebar | new worktree session for selected repo |
-| `r` | sidebar | restart an exited claude |
-| `a` | sidebar | archive/unarchive — parked at the bottom, quiet until re-engaged |
-| `x` | sidebar | close session (worktree sessions ask keep/remove) |
+| `w` | local repository/child | create a valid branch or activate an eligible existing local branch as a managed worktree |
+| `r` | eligible child | retry only the reopen/recovery action authorized for that durable checkout |
+| `a` | applicable child | archive/unarchive in place under its repository |
+| `x` | running child | close the runtime and retain its checkout for reopening |
+| `X` | managed worktree child | after a fresh clean-state check and distinct confirmation, remove the worktree while retaining its branch |
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
 
@@ -156,12 +180,12 @@ stateDiagram-v2
 
 Sessions waiting unattended past the idle timeout auto-archive (default 30
 minutes; `auto_archive_minutes` in config or `BAUDED_AUTO_ARCHIVE_MIN`, 0
-disables): they sink to a dimmed `▼ archived` section at the bottom and stop
-flashing and counting. `alt+←/→` cycling and `j/k` both still reach them —
-sending an archived session any input lifts an auto-archive, so cycling in
-and typing resurfaces it. A manual archive (`a`) sticks until you unarchive
-or re-engage. The daemon applies the same rules, and archived sessions never
-send push notifications.
+disables). A local archived child stays in its persisted position beneath its
+repository and becomes quiet; it does not move into a separate group.
+`alt+←/→` cycling and `j/k` still reach applicable children. Sending an
+auto-archived session input re-engages it; a manual archive (`a`) sticks until
+you unarchive or re-engage. The daemon applies the same archive rules to its
+separate flat rows, and archived sessions never send push notifications.
 
 ## Cloning
 
@@ -183,10 +207,22 @@ destination with the path you typed. No need to back out and re-enter via
 
 ## Worktrees
 
-`w` creates a worktree under `~/.local/share/baude/worktrees/<repo>/<branch>`
-(new branch, or checks out an existing one) and starts a claude session in it.
-Closing a worktree session asks whether to keep or remove the worktree;
-worktrees with uncommitted changes are never removed.
+Each admitted repository remains visible as a parent even when none of its
+children has a running backend. Its main checkout, any separate managed
+default checkout, and retained linked worktrees remain visible as durable
+children in persisted oldest-first order.
+
+From a local parent or child, `w` creates a valid local branch or activates an
+eligible existing local branch in a managed path beneath
+`~/.local/share/baude/worktrees/`, then starts the active workspace backend.
+baude does not fetch, guess a branch, or switch the main checkout. Lowercase
+`x` closes only the runtime and keeps the checkout row for later reopening.
+Uppercase `X` is a separate action: it is available only for a baude-managed
+linked worktree, performs fresh topology and clean-state checks around an
+exact-target confirmation, and uses ordinary non-destructive Git removal.
+Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks the
+operation. A successful `X` removes only that worktree and child; its local
+branch, repository parent, and siblings remain.
 
 ## Usage panel
 
@@ -367,13 +403,13 @@ so the prompt can actually fire.
 
 ## Remote sessions in the TUI
 
-With `daemon_url` set, the daemon's sessions list in the sidebar below your
-local ones — same status dots, waiting timers, and metadata. `enter`
-attaches: the pane becomes a live raw terminal on the remote session (full
-keystroke passthrough over a websocket, resizes follow your pane), so a
-session running on your server is indistinguishable from a local one while
-attached. `x` kills and `r` restarts remote sessions through the API; shell
-panes, worktrees, and the editor key stay local-only.
+With `daemon_url` set, the daemon's sessions remain separate flat rows beneath
+the local repository hierarchy — no local repository parent, durable checkout
+key, or managed-worktree action is inferred for them. `enter` attaches a live
+raw terminal over a websocket, with full keystroke passthrough and pane resize.
+The existing remote `x` close and `r` restart/reopen compatibility actions are
+non-destructive to Git topology; uppercase `X` is never available remotely.
+Shell panes, local worktree lifecycle, and the editor key stay local-only.
 
 ## bauded (experimental)
 
@@ -439,7 +475,8 @@ cost, context %, and account rate limits flow into the API out of the box.
 
 Sessions run as `claude --dangerously-skip-permissions` (set per-deploy via
 `BAUDE_CLAUDE_CMD`) so permission prompts never block unattended work. For
-unattended git pushes, uncomment the ssh volume in `compose.yaml` and put an
+unattended authenticated repository writes, uncomment the ssh volume in
+`compose.yaml` and put an
 automation key + config in `./ssh/`.
 
 Note: the container image installs only the claude CLI, so a containerized

@@ -13,9 +13,15 @@ use tokio::sync::Notify;
 
 use baude_core::backend;
 use baude_core::git;
+use baude_core::lifecycle::{self, LifecycleOutcome, RepositoryReservations};
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
-use baude_core::persist::{self, SavedSession, State};
+use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
+use baude_core::repository::{
+    CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
+    RepositoryHealth, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
+    SavedRepository, ShellOwnership, UnavailableCause,
+};
 use baude_core::session::{Session, StateSource, Status};
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
@@ -30,6 +36,37 @@ const COLS: u16 = 120;
 const STATE_BASE: &str = "daemon-state";
 
 pub type Shared = Arc<Mutex<Manager>>;
+
+#[derive(Debug)]
+pub enum MutationError {
+    Domain(anyhow::Error),
+    Persistence(persist::SaveError),
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Domain(error) => error.fmt(f),
+            Self::Persistence(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for MutationError {}
+
+impl From<anyhow::Error> for MutationError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Domain(error)
+    }
+}
+
+impl From<persist::SaveError> for MutationError {
+    fn from(error: persist::SaveError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+type MutationResult<T> = std::result::Result<T, MutationError>;
 
 /// Lock the manager, recovering from poisoning (a panicked handler must not
 /// take the whole daemon's session list with it).
@@ -51,6 +88,52 @@ pub struct Manager {
     /// permission never stalls other sessions (Pitfall 4 — "decide under the
     /// lock, act outside it"). `resolve_pending` fires `notify_waiters()`.
     permission_notify: HashMap<u64, Arc<Notify>>,
+    repository_state: RepositoryState,
+    runtime_checkouts: HashMap<CheckoutKey, u64>,
+    repository_reservations: RepositoryReservations,
+    persistence_blocked: bool,
+    /// True after a failed save so API owners can surface degraded durability.
+    pub persistence_dirty: bool,
+    persistence_error: Option<String>,
+    #[cfg(test)]
+    persistence_target_for_test: Option<(PathBuf, String)>,
+    #[cfg(test)]
+    atomic_failure_for_test: Option<persist::AtomicFailure>,
+    #[cfg(test)]
+    spawn_error_for_test: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PersistenceStatus {
+    pub enabled: bool,
+    pub blocked: bool,
+    pub dirty: bool,
+    pub error: Option<String>,
+}
+
+fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliation {
+    match git::discover_repository(&saved.cwd) {
+        Ok(snapshot) => LegacyReconciliation::Available {
+            common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            checkout_path: PersistedPath::from_path(&snapshot.selected_worktree.path),
+            observed_branch: snapshot.selected_worktree.branch.clone(),
+            checkout_role: if snapshot.selected_worktree.path == snapshot.main_worktree {
+                CheckoutRole::Main
+            } else {
+                CheckoutRole::ManagedBranch
+            },
+            managed_by_baude: false,
+        },
+        Err(error) => LegacyReconciliation::Unavailable {
+            repository_cause: UnavailableCause::Other(error.to_string()),
+            checkout_cause: if saved.cwd.exists() {
+                UnavailableCause::NotRepository
+            } else {
+                UnavailableCause::Missing
+            },
+        },
+    }
 }
 
 /// One row of `GET /sessions`.
@@ -184,6 +267,41 @@ fn event_url(id: u64) -> String {
     format!("http://127.0.0.1:8642/sessions/{id}/event")
 }
 
+struct ManagerLifecycleEffects<'a, F> {
+    manager: &'a mut Manager,
+    effect: Option<F>,
+}
+
+impl<F> lifecycle::LifecycleEffects for ManagerLifecycleEffects<'_, F>
+where
+    F: FnOnce(&mut Manager, &lifecycle::LifecycleTraceEntry) -> Result<()>,
+{
+    type Error = anyhow::Error;
+
+    fn persist_lifecycle(&mut self, candidate: &lifecycle::LifecycleCandidate) -> Result<()> {
+        let before = self.manager.repository_state.clone();
+        candidate.apply(&mut self.manager.repository_state)?;
+        if let Err(error) = self.manager.save_checked() {
+            if error.replacement_committed() {
+                return Ok(());
+            } else {
+                self.manager.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
+    }
+
+    fn apply_lifecycle_effect(&mut self, effect: &lifecycle::LifecycleTraceEntry) -> Result<()> {
+        self.effect
+            .take()
+            .ok_or_else(|| anyhow!("lifecycle effect invoked more than once"))?(
+            self.manager,
+            effect,
+        )
+    }
+}
+
 /// BAUDED_AUTO_ARCHIVE_MIN env (minutes, 0 disables), then config.json
 /// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
@@ -201,6 +319,115 @@ pub fn default_claude_cmd() -> String {
 }
 
 impl Manager {
+    fn drive_lifecycle_effect<F>(
+        &mut self,
+        checkout: CheckoutKey,
+        event: lifecycle::LifecycleEvent,
+        effect: F,
+    ) -> Result<lifecycle::LifecycleTransition>
+    where
+        F: FnOnce(&mut Manager, &lifecycle::LifecycleTraceEntry) -> Result<()>,
+    {
+        let mut saved = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .cloned()
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?;
+        let adapter = ManagerLifecycleEffects {
+            manager: self,
+            effect: Some(effect),
+        };
+        let mut engine = lifecycle::LifecycleEngine::new(adapter);
+        let transition = engine.drive(&mut saved, event)?;
+        if transition.effects.is_empty() {
+            bail!(
+                "illegal lifecycle transition for checkout {}",
+                checkout.get()
+            );
+        }
+        Ok(transition)
+    }
+
+    #[cfg(test)]
+    fn lifecycle_contract_trace(
+        vector: lifecycle::CanonicalLifecycleVector,
+        script: lifecycle::AdapterFailureScript,
+    ) -> lifecycle::LifecycleContractResult {
+        struct Effects {
+            script: lifecycle::AdapterFailureScript,
+            persists: usize,
+            effects: usize,
+        }
+        impl lifecycle::LifecycleEffects for Effects {
+            type Error = ();
+
+            fn persist_lifecycle(
+                &mut self,
+                _candidate: &lifecycle::LifecycleCandidate,
+            ) -> std::result::Result<(), Self::Error> {
+                self.persists += 1;
+                (self.script != lifecycle::AdapterFailureScript::Persist(self.persists))
+                    .then_some(())
+                    .ok_or(())
+            }
+
+            fn apply_lifecycle_effect(
+                &mut self,
+                _effect: &lifecycle::LifecycleTraceEntry,
+            ) -> std::result::Result<(), Self::Error> {
+                self.effects += 1;
+                (self.script != lifecycle::AdapterFailureScript::Effect(self.effects))
+                    .then_some(())
+                    .ok_or(())
+            }
+        }
+
+        let (initial, events) = lifecycle::canonical_lifecycle_events(vector);
+        let mut keys = RepositoryState::default();
+        let repository_key = keys.allocate_repository_key().expect("repository key");
+        let key = keys.allocate_checkout_key().expect("checkout key");
+        let mut checkout = SavedCheckout::new(
+            key,
+            repository_key,
+            CheckoutRole::ManagedBranch,
+            true,
+            PersistedPath::from_path(Path::new("/manager-contract")),
+            Some("refs/heads/contract".into()),
+            1,
+            initial,
+            RetainedSessionState {
+                name: "manager-contract".into(),
+                cwd: PersistedPath::from_path(Path::new("/manager-contract")),
+                repo_root: PersistedPath::from_path(Path::new("/manager-contract")),
+                branch: Some("contract".into()),
+                is_worktree: true,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        );
+        let mut engine = lifecycle::LifecycleEngine::new(Effects {
+            script,
+            persists: 0,
+            effects: 0,
+        });
+        let mut failed = false;
+        for event in events {
+            if engine.drive(&mut checkout, event).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        lifecycle::LifecycleContractResult {
+            trace: engine.trace().to_vec(),
+            final_lifecycle: checkout.lifecycle().clone(),
+            failed,
+        }
+    }
+
     pub fn new(claude_cmd: String, persist: bool) -> Manager {
         Manager {
             sessions: Vec::new(),
@@ -209,67 +436,336 @@ impl Manager {
             persist,
             auto_archive_ms: default_auto_archive_ms(),
             permission_notify: HashMap::new(),
+            repository_state: RepositoryState::default(),
+            runtime_checkouts: HashMap::new(),
+            repository_reservations: RepositoryReservations::default(),
+            persistence_blocked: false,
+            persistence_dirty: false,
+            persistence_error: None,
+            #[cfg(test)]
+            persistence_target_for_test: None,
+            #[cfg(test)]
+            atomic_failure_for_test: None,
+            #[cfg(test)]
+            spawn_error_for_test: None,
         }
     }
 
     /// Respawn every saved session with `claude --continue`. Returns how many
     /// came back.
     pub fn restore(&mut self) -> usize {
-        let state = persist::load_for_workspace(STATE_BASE, baude_core::workspace::active());
-        let mut restored = 0;
-        for saved in &state.sessions {
-            if !saved.cwd.exists() {
-                continue;
-            }
-            match self.spawn(
-                saved.cwd.clone(),
-                saved.repo_root.clone(),
-                saved.branch.clone(),
-                saved.is_worktree,
-                Some(&saved.name),
-                true,
-            ) {
-                Ok(id) => {
-                    restored += 1;
-                    if saved.archived {
-                        if let Ok(s) = self.session_mut(id) {
-                            s.archived = true;
-                            s.archived_by_user = saved.archived_by_user;
-                        }
-                    }
-                }
-                Err(e) => eprintln!("restore {}: {e}", saved.name),
-            }
+        if !self.persist {
+            return 0;
         }
+        let loaded = persist::load_for_workspace(
+            STATE_BASE,
+            baude_core::workspace::active(),
+            reconcile_legacy_session,
+        );
+        let restored = self.restore_loaded(loaded);
         self.save();
         restored
     }
 
-    pub fn save(&self) {
+    #[cfg(test)]
+    fn restore_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) -> usize {
         if !self.persist {
+            return 0;
+        }
+        let loaded = persist::load_for_workspace_strict_at(
+            root,
+            STATE_BASE,
+            workspace,
+            reconcile_legacy_session,
+        );
+        let restored = self.restore_loaded(loaded);
+        self.save_at(root, workspace);
+        restored
+    }
+
+    fn restore_loaded(
+        &mut self,
+        loaded: std::result::Result<LoadOutcome, persist::LoadError>,
+    ) -> usize {
+        self.repository_state = match loaded {
+            Ok(LoadOutcome::Missing) => RepositoryState::default(),
+            Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
+            Err(error) => {
+                self.persistence_blocked = true;
+                self.persistence_error = Some(error.to_string());
+                eprintln!(
+                    "daemon persistence blocked: {error}; repair or move the named state file, then restart"
+                );
+                return 0;
+            }
+        };
+        if let Err(error) = self.reconcile_teardown_recoveries() {
+            eprintln!("teardown recovery: {error}");
+        }
+        if let Err(error) = self.reconcile_activation_recoveries() {
+            eprintln!("activation recovery: {error}");
+        }
+        let checkouts: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| {
+                matches!(
+                    checkout.lifecycle(),
+                    CheckoutLifecycle::Active | CheckoutLifecycle::Launching(_)
+                ) || (checkout.active_intent() && checkout.health() == &CheckoutHealth::Available)
+            })
+            .cloned()
+            .collect();
+        let mut restored = 0;
+        for checkout in checkouts {
+            match self.reopen_checkout(checkout.key) {
+                Ok(LifecycleOutcome::Reopened { .. } | LifecycleOutcome::Focused { .. }) => {
+                    restored += 1;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("restore {}: {e}", checkout.session.name),
+            }
+        }
+        restored
+    }
+
+    fn reconcile_activation_recoveries(&mut self) -> MutationResult<()> {
+        let recoveries: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter_map(|checkout| {
+                matches!(
+                    checkout.health(),
+                    CheckoutHealth::Unavailable(
+                        UnavailableCause::PendingActivation { .. }
+                            | UnavailableCause::ActivationRecovery { .. }
+                    )
+                )
+                .then_some((checkout.repository_key, checkout.key))
+            })
+            .collect();
+        if recoveries.is_empty() {
+            return Ok(());
+        }
+        let before = self.repository_state.clone();
+        for (repository, checkout) in recoveries {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_activation_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?;
+        }
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(())
+    }
+
+    fn reconcile_teardown_recoveries(&mut self) -> MutationResult<()> {
+        let recoveries: Vec<_> = self
+            .repository_state
+            .checkouts
+            .iter()
+            .filter_map(|checkout| {
+                matches!(
+                    checkout.health(),
+                    CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
+                )
+                .then_some((checkout.repository_key, checkout.key))
+            })
+            .collect();
+        if recoveries.is_empty() {
+            return Ok(());
+        }
+        let before = self.repository_state.clone();
+        for (repository, checkout) in recoveries {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_teardown_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?;
+        }
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn retry_teardown_recovery(
+        &mut self,
+        checkout: CheckoutKey,
+    ) -> MutationResult<lifecycle::TeardownRecoveryResolution> {
+        let repository = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?
+            .repository_key;
+        let before = self.repository_state.clone();
+        let resolution = {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_teardown_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?
+        };
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(resolution)
+    }
+
+    #[allow(dead_code)]
+    pub fn retry_activation_recovery(
+        &mut self,
+        checkout: CheckoutKey,
+    ) -> MutationResult<lifecycle::ActivationRecoveryResolution> {
+        let repository = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?
+            .repository_key;
+        let before = self.repository_state.clone();
+        let resolution = {
+            let _reservation = self
+                .repository_reservations
+                .reserve(repository)
+                .map_err(|busy| anyhow!("{busy:?}"))?;
+            lifecycle::reconcile_activation_recovery(&mut self.repository_state, checkout)
+                .map_err(anyhow::Error::new)?
+        };
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(resolution)
+    }
+
+    pub fn save(&mut self) {
+        if let Err(error) = self.save_checked() {
+            eprintln!("save state: {error}");
+        }
+    }
+
+    fn save_checked(&mut self) -> std::result::Result<(), persist::SaveError> {
+        if !self.persist {
+            return Ok(());
+        }
+        if self.persistence_blocked {
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "persistence is blocked after a state load failure"
+            )));
+        }
+        let state = StateFile::new(self.state_for_save());
+        #[cfg(test)]
+        let saved = if let Some((root, file)) = &self.persistence_target_for_test {
+            persist::save_current_at_test(root, file, &state, self.atomic_failure_for_test, None)
+        } else {
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state)
+        };
+        #[cfg(not(test))]
+        let saved =
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state);
+        match saved {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                self.persistence_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.persistence_dirty = true;
+                self.persistence_error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn save_removal_revocation(&mut self) -> std::result::Result<(), persist::SaveError> {
+        let result = self.save_checked();
+        #[cfg(test)]
+        if result.is_err() {
+            self.atomic_failure_for_test = None;
+        }
+        result
+    }
+
+    pub fn persistence_status(&self) -> PersistenceStatus {
+        PersistenceStatus {
+            enabled: self.persist,
+            blocked: self.persistence_blocked,
+            dirty: self.persistence_dirty,
+            error: self.persistence_error.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn save_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) {
+        if !self.persist || self.persistence_blocked {
             return;
         }
-        let state = State {
-            sessions: self
+        let file = workspace.state_file(STATE_BASE);
+        if let Err(error) =
+            persist::save_current_at(root, &file, &StateFile::new(self.state_for_save()))
+        {
+            self.persistence_dirty = true;
+            self.persistence_error = Some(error.to_string());
+            eprintln!("save state: {error}");
+        } else {
+            self.persistence_dirty = false;
+            self.persistence_error = None;
+        }
+    }
+
+    fn state_for_save(&self) -> RepositoryState {
+        let mut state = self.repository_state.clone();
+        for checkout in &mut state.checkouts {
+            let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
+                continue;
+            };
+            let Some(session) = self
                 .sessions
                 .iter()
-                .map(|s| SavedSession {
-                    name: s.name.clone(),
-                    cwd: s.cwd.clone(),
-                    repo_root: s.repo_root.clone(),
-                    branch: s.branch.clone(),
-                    is_worktree: s.is_worktree,
-                    shell_open: false,
-                    archived: s.archived,
-                    archived_by_user: s.archived_by_user,
-                })
-                .collect(),
-        };
-        if let Err(e) =
-            persist::save_for_workspace(STATE_BASE, baude_core::workspace::active(), &state)
-        {
-            eprintln!("save state: {e}");
+                .find(|session| session.id == *runtime_id)
+            else {
+                continue;
+            };
+            checkout.session = RetainedSessionState {
+                name: session.name.clone(),
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch.clone(),
+                is_worktree: session.is_worktree,
+                shell_open: session.shell_open,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+                resume_id: session
+                    .meta
+                    .session_id
+                    .clone()
+                    .or_else(|| checkout.session.resume_id.clone()),
+            };
         }
+        state
     }
 
     /// `POST /sessions` — spawn a fresh session in `repo`, optionally in a
@@ -279,27 +775,313 @@ impl Manager {
         repo: &str,
         worktree: Option<&str>,
         name: Option<&str>,
-    ) -> Result<SessionInfo> {
+    ) -> MutationResult<SessionInfo> {
+        if self.persistence_blocked {
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
+        }
         let repo = expand_tilde(repo);
         let repo = repo.canonicalize().unwrap_or(repo);
         if !repo.is_dir() {
-            bail!("not a directory: {}", repo.display());
+            return Err(anyhow!("not a directory: {}", repo.display()).into());
+        }
+        if let Some(branch) = worktree {
+            let outcome = self.activate_branch_worktree(&repo, branch, name)?;
+            let runtime = match outcome {
+                LifecycleOutcome::Created {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Activated {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Reused {
+                    runtime: Some(runtime),
+                    ..
+                }
+                | LifecycleOutcome::Focused { runtime, .. } => runtime,
+                LifecycleOutcome::Busy { .. } => {
+                    return Err(anyhow!("repository lifecycle is busy; retry the action").into())
+                }
+                _ => return Err(anyhow!("activation produced no runtime").into()),
+            };
+            return Ok(self
+                .info(runtime)
+                .expect("activation runtime just resolved"));
         }
         let (cwd, repo_root, branch, is_worktree) = match worktree {
-            Some(branch) => {
-                let root = git::repo_root(&repo)
-                    .ok_or_else(|| anyhow!("not a git repo: {}", repo.display()))?;
-                let dir = git::create_worktree(&root, branch)?;
-                (dir, root, Some(branch.to_string()), true)
-            }
+            Some(_) => unreachable!("worktree activation returned above"),
             None => {
                 let root = git::repo_root(&repo).unwrap_or_else(|| repo.clone());
                 (repo, root, None, false)
             }
         };
+        if self.persist {
+            self.ensure_runtime_capacity(&cwd, &repo_root)?;
+        }
+        if self.persist {
+            let state_before = self.repository_state.clone();
+            let dir_name = |path: &Path| {
+                path.file_name()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            let base = name.map(str::to_owned).unwrap_or_else(|| match &branch {
+                Some(branch) => format!("{}:{branch}", dir_name(&repo_root)),
+                None => dir_name(&cwd),
+            });
+            let session_name = self.unique_name(&base);
+            let checkout_key = self.record_checkout_intent(
+                &cwd,
+                &repo_root,
+                branch.clone(),
+                is_worktree,
+                session_name.clone(),
+            )?;
+            if let Err(error) = self.save_checked() {
+                if !error.replacement_committed() {
+                    self.repository_state = state_before;
+                }
+                return Err(MutationError::Persistence(error));
+            }
+            let id = self.spawn_retained_with_mode(
+                checkout_key,
+                cwd,
+                repo_root,
+                branch,
+                is_worktree,
+                Some(&session_name),
+                backend::SpawnMode::Fresh,
+                false,
+            )?;
+            self.runtime_checkouts.insert(checkout_key, id);
+            return Ok(self.info(id).expect("session just spawned"));
+        }
         let id = self.spawn(cwd, repo_root, branch, is_worktree, name, false)?;
-        self.save();
         Ok(self.info(id).expect("session just spawned"))
+    }
+
+    fn activate_branch_worktree(
+        &mut self,
+        repository_child: &Path,
+        branch: &str,
+        name: Option<&str>,
+    ) -> MutationResult<LifecycleOutcome> {
+        if self.persistence_dirty || self.repository_state.has_pending_activation() {
+            return Err(anyhow!(
+                "repository lifecycle is blocked while pending ownership is not durable; repair persistence and save before retrying"
+            )
+            .into());
+        }
+        let snapshot = git::discover_repository(repository_child).map_err(anyhow::Error::new)?;
+        let state_before = self.repository_state.clone();
+        let mut next = self.repository_state.clone();
+        let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)
+            .map_err(anyhow::Error::new)?;
+        let pending_checkout = prepared.checkout;
+        lifecycle::record_pending_activation(&mut next, &snapshot, &prepared)
+            .map_err(anyhow::Error::new)?;
+        let repository = prepared.request.repository;
+        let _reservation = match self.repository_reservations.reserve(repository) {
+            Ok(reservation) => reservation,
+            Err(busy) => return Ok(busy),
+        };
+        self.repository_state = next.clone();
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        let activation = match lifecycle::execute_activation(&mut next, repository_child, prepared)
+        {
+            Ok(activation) => activation,
+            Err(error) if error.recovery_child_recorded() => {
+                self.repository_state = next;
+                if let Err(save_error) = self.save_checked() {
+                    return Err(anyhow!(
+                        "{error}; recovery ownership persistence failed: {save_error}"
+                    )
+                    .into());
+                }
+                return Err(anyhow::Error::new(error).into());
+            }
+            Err(error) => {
+                lifecycle::clear_pending_activation(&mut next, pending_checkout);
+                self.repository_state = next;
+                if let Err(save_error) = self.save_checked() {
+                    return Err(anyhow!(
+                        "{error}; clearing pending activation ownership failed: {save_error}"
+                    )
+                    .into());
+                }
+                return Err(anyhow::Error::new(error).into());
+            }
+        };
+        if let Some(name) = name {
+            if let Some(checkout) = next
+                .checkouts
+                .iter_mut()
+                .find(|checkout| checkout.key == activation.checkout)
+            {
+                checkout.session.name = name.to_owned();
+            }
+        }
+        self.repository_state = next;
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                if let Err(compensation) = lifecycle::compensate_uncommitted_activation(&activation)
+                {
+                    lifecycle::mark_activation_recovery(
+                        &mut self.repository_state,
+                        activation.checkout,
+                        activation.branch.clone(),
+                        Some(matches!(
+                            activation.disposition,
+                            lifecycle::ActivationDisposition::Created
+                        )),
+                        error.to_string(),
+                        compensation.to_string(),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                    let recovery_save = self.save_checked();
+                    return Err(anyhow!(
+                        "{} failed: {error}; {} failed: {compensation}; recovery persistence: {}",
+                        lifecycle::CreationFailureStage::PersistenceBeforeReplacement,
+                        lifecycle::CreationFailureStage::Compensation,
+                        recovery_save
+                            .map(|()| "saved".to_owned())
+                            .unwrap_or_else(|save| save.to_string())
+                    )
+                    .into());
+                }
+                self.repository_state = state_before;
+                if let Err(clear_error) = self.save_checked() {
+                    return Err(anyhow!(
+                        "activation persistence failed: {error}; activation compensated but pending ownership cleanup failed: {clear_error}"
+                    )
+                    .into());
+                }
+            }
+            return Err(MutationError::Persistence(error));
+        }
+
+        if let Some(runtime) = self.runtime_checkouts.get(&activation.checkout).copied() {
+            if let Some(exited) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == runtime)
+                .map(|session| session.claude.is_exited())
+            {
+                if exited {
+                    drop(_reservation);
+                    return self.reopen_checkout(activation.checkout);
+                }
+                return Ok(LifecycleOutcome::Focused {
+                    checkout: activation.checkout,
+                    runtime,
+                });
+            }
+        }
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == activation.checkout)
+            .cloned()
+            .ok_or_else(|| anyhow!("activated checkout is missing"))?;
+        let id = self
+            .spawn_retained_with_mode(
+                activation.checkout,
+                activation.path.clone(),
+                activation.main_worktree.clone(),
+                Some(activation.branch.clone()),
+                activation.path != activation.main_worktree,
+                Some(&checkout.session.name),
+                backend::SpawnMode::Fresh,
+                false,
+            )
+            .map_err(|error| {
+                anyhow!(
+                    "{} failed after durable activation: {error}",
+                    lifecycle::CreationFailureStage::Spawn
+                )
+            })?;
+        self.runtime_checkouts.insert(activation.checkout, id);
+        Ok(activation.outcome(Some(id)))
+    }
+
+    fn record_checkout_intent(
+        &mut self,
+        cwd: &Path,
+        repo_root: &Path,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: String,
+    ) -> Result<CheckoutKey> {
+        let snapshot = git::discover_repository(cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(repo_root));
+        let repository_key = if let Some(key) = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.observed_common_dir == common)
+            .map(|repository| repository.key)
+        {
+            key
+        } else {
+            let key = self.repository_state.allocate_repository_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: common,
+                observed_main_worktree: PersistedPath::from_path(
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.main_worktree.as_path())
+                        .unwrap_or(repo_root),
+                ),
+                first_seen_order,
+                health: if snapshot.is_some() {
+                    RepositoryHealth::Available
+                } else {
+                    RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
+                },
+            });
+            key
+        };
+        let checkout_key = self.repository_state.allocate_checkout_key()?;
+        let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+        self.repository_state.checkouts.push(SavedCheckout::new(
+            checkout_key,
+            repository_key,
+            CheckoutRole::ManagedBranch,
+            is_worktree,
+            PersistedPath::from_path(cwd),
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
+            first_seen_order,
+            CheckoutLifecycle::Active,
+            RetainedSessionState {
+                name,
+                cwd: PersistedPath::from_path(cwd),
+                repo_root: PersistedPath::from_path(repo_root),
+                branch,
+                is_worktree,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        ));
+        Ok(checkout_key)
     }
 
     fn spawn(
@@ -311,6 +1093,54 @@ impl Manager {
         name: Option<&str>,
         resume: bool,
     ) -> Result<u64> {
+        let mode = if resume {
+            backend::SpawnMode::ContinueLatest
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        self.spawn_with_mode_internal(None, cwd, repo_root, branch, is_worktree, name, mode, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_retained_with_mode(
+        &mut self,
+        checkout: CheckoutKey,
+        cwd: PathBuf,
+        repo_root: PathBuf,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: Option<&str>,
+        mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> Result<u64> {
+        self.spawn_with_mode_internal(
+            Some(checkout),
+            cwd,
+            repo_root,
+            branch,
+            is_worktree,
+            name,
+            mode,
+            shell_open,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_mode_internal(
+        &mut self,
+        checkout: Option<CheckoutKey>,
+        cwd: PathBuf,
+        repo_root: PathBuf,
+        branch: Option<String>,
+        is_worktree: bool,
+        name: Option<&str>,
+        mode: backend::SpawnMode,
+        shell_open: bool,
+    ) -> Result<u64> {
+        #[cfg(test)]
+        if let Some(error) = &self.spawn_error_for_test {
+            bail!("test spawn failure: {error}");
+        }
         let dir_name = |p: &Path| {
             p.file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -352,8 +1182,64 @@ impl Manager {
             );
         }
 
-        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), resume);
-        let claude = Pty::spawn(Some(&plan.cmd), &cwd, ROWS, COLS)?;
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
+        let generation = checkout
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|saved| saved.key == key)
+                    .and_then(SavedCheckout::owned_runtime)
+                    .and_then(|runtime| runtime.generation.successor())
+            })
+            .unwrap_or(RuntimeGeneration::initial());
+        let mut registered_shell = None;
+        let mut claude = if let Some(checkout) = checkout {
+            Pty::spawn_registered_with(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS, |agent| {
+                if shell_open {
+                    let shell =
+                        Pty::spawn_registered_with(None, &[], &cwd, ROWS, COLS, |identity| {
+                            self.drive_lifecycle_effect(
+                                checkout,
+                                lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                                    generation,
+                                    agent: agent.clone(),
+                                    shell: ShellOwnership::Owned(identity.clone()),
+                                }),
+                                |_, _| Ok(()),
+                            )?;
+                            Ok(())
+                        })?;
+                    registered_shell = Some(shell);
+                } else {
+                    self.drive_lifecycle_effect(
+                        checkout,
+                        lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                            generation,
+                            agent: agent.clone(),
+                            shell: ShellOwnership::Closed,
+                        }),
+                        |_, _| Ok(()),
+                    )?;
+                }
+                Ok(())
+            })?
+        } else {
+            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?
+        };
+        if let Some(checkout) = checkout {
+            if let Err(error) = self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::LaunchReleased,
+                |_, _| Ok(()),
+            ) {
+                let _ = claude.kill_and_wait();
+                if let Some(shell) = &mut registered_shell {
+                    let _ = shell.kill_and_wait();
+                }
+                return Err(error);
+            }
+        }
         let mut meta = ClaudeMeta::default();
         meta.backend_port = plan.server_port;
 
@@ -366,8 +1252,8 @@ impl Manager {
             branch,
             is_worktree,
             claude,
-            shell: None,
-            shell_open: false,
+            shell: registered_shell,
+            shell_open,
             spawn_unix_ms: now_unix_ms(),
             meta,
             archived: false,
@@ -394,16 +1280,531 @@ impl Manager {
         }
     }
 
-    pub fn remove(&mut self, id: u64) -> Result<()> {
-        let s = self.session_mut(id)?;
-        s.kill();
-        self.sessions.retain(|s| s.id != id);
-        // Wake any lingering permission waiter (it will re-check, find the
-        // session gone, and bail) and drop its handle so the map doesn't leak.
-        if let Some(n) = self.permission_notify.remove(&id) {
-            n.notify_waiters();
+    #[cfg(test)]
+    fn record_runtime(&mut self, id: u64) -> Result<()> {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+            return Ok(());
+        };
+        let snapshot = git::discover_repository(&session.cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(&session.repo_root));
+        let existing_repository_key = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.observed_common_dir == common)
+            .map(|repository| repository.key);
+        let repository_key = match existing_repository_key {
+            Some(key) => key,
+            None => {
+                let key = self.repository_state.allocate_repository_key()?;
+                let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+                self.repository_state.repositories.push(SavedRepository {
+                    key,
+                    observed_common_dir: common,
+                    observed_main_worktree: PersistedPath::from_path(
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.main_worktree.as_path())
+                            .unwrap_or(&session.repo_root),
+                    ),
+                    first_seen_order,
+                    health: if snapshot.is_some() {
+                        RepositoryHealth::Available
+                    } else {
+                        RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
+                    },
+                });
+                key
+            }
+        };
+        let checkout_key = self.repository_state.allocate_checkout_key()?;
+        let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+        self.repository_state.checkouts.push(SavedCheckout::new(
+            checkout_key,
+            repository_key,
+            CheckoutRole::ManagedBranch,
+            session.is_worktree,
+            PersistedPath::from_path(&session.cwd),
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.selected_worktree.branch.clone()),
+            first_seen_order,
+            if snapshot.is_some() {
+                CheckoutLifecycle::Active
+            } else {
+                CheckoutLifecycle::Protected(UnavailableCause::NotRepository)
+            },
+            RetainedSessionState {
+                name: session.name.clone(),
+                cwd: PersistedPath::from_path(&session.cwd),
+                repo_root: PersistedPath::from_path(&session.repo_root),
+                branch: session.branch.clone(),
+                is_worktree: session.is_worktree,
+                shell_open: session.shell_open,
+                archived: session.archived,
+                archived_by_user: session.archived_by_user,
+                resume_id: None,
+            },
+        ));
+        self.runtime_checkouts.insert(checkout_key, id);
+        Ok(())
+    }
+
+    fn ensure_runtime_capacity(&self, cwd: &Path, repo_root: &Path) -> Result<()> {
+        let mut state = self.repository_state.clone();
+        let snapshot = git::discover_repository(cwd).ok();
+        let common = snapshot
+            .as_ref()
+            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
+            .unwrap_or_else(|| PersistedPath::from_path(repo_root));
+        if !state
+            .repositories
+            .iter()
+            .any(|repository| repository.observed_common_dir == common)
+        {
+            state.allocate_repository_key()?;
+            state.allocate_first_seen_order()?;
         }
-        self.save();
+        state.allocate_checkout_key()?;
+        state.allocate_first_seen_order()?;
+        Ok(())
+    }
+
+    // Phase 6 establishes daemon-owner parity internally; the network entrypoint
+    // is deliberately deferred to Phase 8.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn retained_runtime_snapshot(&self, id: u64) -> Result<RetainedSessionState> {
+        let session = self.session(id)?;
+        let durable_resume_id = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            });
+        Ok(RetainedSessionState {
+            name: session.name.clone(),
+            cwd: PersistedPath::from_path(&session.cwd),
+            repo_root: PersistedPath::from_path(&session.repo_root),
+            branch: session.branch.clone(),
+            is_worktree: session.is_worktree,
+            shell_open: session.shell_open,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session.meta.session_id.clone().or(durable_resume_id),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn teardown_retained_runtime(&mut self, checkout: CheckoutKey, id: u64) -> Result<()> {
+        let session_index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow!("session {id} not found"))?;
+        if let Err(error) = lifecycle::destructive_teardown(
+            &mut self.repository_state,
+            checkout,
+            &mut self.sessions[session_index],
+        ) {
+            if let Err(save_error) = self.save_checked() {
+                return Err(anyhow!(
+                    "{error}; could not persist pending teardown recovery: {save_error}"
+                ));
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
+    }
+
+    fn forget_stopped_runtime(&mut self, checkout: CheckoutKey, id: u64) {
+        self.sessions.retain(|session| session.id != id);
+        self.runtime_checkouts.remove(&checkout);
+        if let Some(notify) = self.permission_notify.remove(&id) {
+            notify.notify_waiters();
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restore_removed_runtime(
+        &mut self,
+        checkout: CheckoutKey,
+        saved: RetainedSessionState,
+    ) -> Result<u64> {
+        if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
+            return Ok(id);
+        }
+        let lifecycle = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .map(|saved| saved.lifecycle().clone())
+            .ok_or_else(|| anyhow!("checkout {} is missing", checkout.get()))?;
+        match lifecycle {
+            CheckoutLifecycle::Inactive => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RequestActivation,
+                    |_, _| Ok(()),
+                )?;
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::ActivationVerified,
+                    |_, _| Ok(()),
+                )?;
+            }
+            CheckoutLifecycle::Protected(UnavailableCause::RemovalTombstone(_)) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RestoreRemovalAuthority,
+                    |_, _| Ok(()),
+                )?;
+            }
+            CheckoutLifecycle::Active => {}
+            other => bail!("checkout cannot restore a runtime from {other:?}"),
+        }
+        let mode = saved
+            .resume_id
+            .clone()
+            .map(backend::SpawnMode::ResumeId)
+            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        let id = self.spawn_retained_with_mode(
+            checkout,
+            saved.cwd.to_path_buf(),
+            saved.repo_root.to_path_buf(),
+            saved.branch.clone(),
+            saved.is_worktree,
+            Some(&saved.name),
+            mode,
+            saved.shell_open,
+        )?;
+        if let Ok(runtime) = self.session_mut(id) {
+            runtime.archived = saved.archived;
+            runtime.archived_by_user = saved.archived_by_user;
+        }
+        self.runtime_checkouts.insert(checkout, id);
+        Ok(id)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn compensate_failed_removal(
+        &mut self,
+        checkout: CheckoutKey,
+        runtime: Option<RetainedSessionState>,
+        failure: lifecycle::RemovalFailure,
+    ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
+        let original = failure.to_string();
+        if let Some(saved) = runtime {
+            if let Err(error) = self.restore_removed_runtime(checkout, saved) {
+                return Err(lifecycle::RemovalFailure::Compensation {
+                    original,
+                    recovery: error.to_string(),
+                });
+            }
+        }
+        Err(failure)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn prepare_remove_worktree(
+        &self,
+        checkout: CheckoutKey,
+    ) -> std::result::Result<lifecycle::RemovalConfirmation, lifecycle::RemovalFailure> {
+        if self.persistence_dirty || self.repository_state.has_pending_activation() {
+            return Err(lifecycle::RemovalFailure::Inspection(
+                "repository lifecycle is blocked by unresolved persistence recovery".into(),
+            ));
+        }
+        let saved = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|saved| saved.key == checkout)
+            .ok_or(lifecycle::RemovalFailure::CheckoutMissing(checkout))?;
+        let _reservation = self
+            .repository_reservations
+            .reserve(saved.repository_key)
+            .map_err(|outcome| lifecycle::RemovalFailure::Inspection(format!("{outcome:?}")))?;
+        lifecycle::prepare_removal(&self.repository_state, checkout)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn confirm_remove_worktree(
+        &mut self,
+        confirmation: lifecycle::RemovalConfirmation,
+    ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
+        let _reservation = self
+            .repository_reservations
+            .reserve(confirmation.repository())
+            .map_err(|outcome| lifecycle::RemovalFailure::Inspection(format!("{outcome:?}")))?;
+        let checkout = confirmation.checkout();
+        let runtime_id = self.runtime_checkouts.get(&checkout).copied();
+        let runtime = runtime_id
+            .map(|id| self.retained_runtime_snapshot(id))
+            .transpose()
+            .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        if let Some(saved) = runtime.clone() {
+            if let Some(retained) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|retained| retained.key == checkout)
+            {
+                retained.session = saved;
+            }
+        }
+        if let Some(id) = runtime_id {
+            let retry = matches!(
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|saved| saved.key == checkout)
+                    .map(SavedCheckout::lifecycle),
+                Some(CheckoutLifecycle::Protected(
+                    UnavailableCause::TeardownPending { .. }
+                ))
+            );
+            if retry {
+                self.teardown_retained_runtime(checkout, id)
+                    .map_err(|error| {
+                        lifecycle::RemovalFailure::Inspection(format!(
+                            "runtime stop failed: {error}"
+                        ))
+                    })?;
+            } else {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::RequestClose,
+                    move |manager, _| manager.teardown_retained_runtime(checkout, id),
+                )
+                .map_err(|error| {
+                    lifecycle::RemovalFailure::Inspection(format!("runtime stop failed: {error}"))
+                })?;
+            }
+            self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::RuntimeExtinct,
+                |_, _| Ok(()),
+            )
+            .map_err(|error| {
+                lifecycle::RemovalFailure::Inspection(format!(
+                    "runtime extinction persistence failed: {error}"
+                ))
+            })?;
+            self.forget_stopped_runtime(checkout, id);
+        }
+
+        let target =
+            match lifecycle::inspect_confirmed_removal(&self.repository_state, &confirmation) {
+                Ok(target) => target,
+                Err(failure) => {
+                    return self.compensate_failed_removal(checkout, runtime, failure);
+                }
+            };
+        if let Some(saved) = runtime.clone() {
+            if let Some(retained) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|retained| retained.key == checkout)
+            {
+                retained.session = saved;
+            }
+        }
+        // Rollback may restore management authority, but must never roll back
+        // the freshly captured conversation and shell context.
+        let before_revocation = self.repository_state.clone();
+        lifecycle::revoke_removal_authority(&mut self.repository_state, checkout)
+            .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        if let Err(error) = self.save_removal_revocation() {
+            self.persistence_dirty = true;
+            let original = format!("could not durably revoke removal authority: {error}");
+            self.repository_state = before_revocation;
+            if let Err(restoration) = self.save_removal_revocation() {
+                self.persistence_dirty = true;
+                return Err(lifecycle::RemovalFailure::Compensation {
+                    original,
+                    recovery: format!(
+                        "authority restoration persistence failed before runtime compensation: {restoration}"
+                    ),
+                });
+            }
+            self.persistence_dirty = false;
+            return self.compensate_failed_removal(
+                checkout,
+                runtime,
+                lifecycle::RemovalFailure::Inspection(original),
+            );
+        }
+        let revoked_state = self.repository_state.clone();
+        let removal = match lifecycle::execute_verified_removal(&target) {
+            Ok(removal) => removal,
+            Err(git::RemoveVerifiedError::Postcondition(failure)) => {
+                if let Some(saved) = runtime {
+                    if let Some(retained) = self
+                        .repository_state
+                        .checkouts
+                        .iter_mut()
+                        .find(|retained| retained.key == checkout)
+                    {
+                        retained.session = saved;
+                    }
+                }
+                let detail =
+                    format!("Git topology committed but postconditions degraded: {failure:?}");
+                lifecycle::mark_removed_checkout_unavailable(
+                    &mut self.repository_state,
+                    checkout,
+                    detail.clone(),
+                );
+                if self.save_checked().is_err() {
+                    self.persistence_dirty = true;
+                }
+                return Ok(LifecycleOutcome::TopologyCommittedStateDegraded { checkout, detail });
+            }
+            Err(error) => {
+                self.repository_state = before_revocation;
+                if self.save_removal_revocation().is_err() {
+                    self.repository_state = revoked_state;
+                    self.persistence_dirty = true;
+                }
+                return self.compensate_failed_removal(
+                    checkout,
+                    runtime,
+                    lifecycle::RemovalFailure::GitRefused(error.to_string()),
+                );
+            }
+        };
+
+        let before_deletion = self.repository_state.clone();
+        let outcome =
+            lifecycle::commit_removed_checkout(&mut self.repository_state, &confirmation, &removal)
+                .map_err(|error| lifecycle::RemovalFailure::Inspection(error.to_string()))?;
+        self.runtime_checkouts.remove(&checkout);
+        match self.save_checked() {
+            Ok(()) => {
+                self.persistence_dirty = false;
+                Ok(outcome)
+            }
+            Err(error) if !error.replacement_committed() => {
+                self.repository_state = before_deletion;
+                lifecycle::mark_removed_checkout_unavailable(
+                    &mut self.repository_state,
+                    checkout,
+                    format!("Git removal committed before persistence replacement: {error}"),
+                );
+                self.persistence_dirty = true;
+                Ok(LifecycleOutcome::TopologyCommittedStateDegraded {
+                    checkout,
+                    detail: error.to_string(),
+                })
+            }
+            Err(error) => {
+                self.persistence_dirty = true;
+                Ok(LifecycleOutcome::TopologyCommittedStateDegraded {
+                    checkout,
+                    detail: error.to_string(),
+                })
+            }
+        }
+    }
+
+    pub fn remove(&mut self, id: u64) -> MutationResult<()> {
+        let session = self.session(id)?;
+        let checkout_key = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
+        let Some(checkout_key) = checkout_key else {
+            self.session_mut(id)?.kill();
+            self.sessions.retain(|session| session.id != id);
+            if let Some(notify) = self.permission_notify.remove(&id) {
+                notify.notify_waiters();
+            }
+            return Ok(());
+        };
+        let snapshot = RetainedSessionState {
+            name: session.name.clone(),
+            cwd: PersistedPath::from_path(&session.cwd),
+            repo_root: PersistedPath::from_path(&session.repo_root),
+            branch: session.branch.clone(),
+            is_worktree: session.is_worktree,
+            shell_open: session.shell_open,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session.meta.session_id.clone().or_else(|| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == checkout_key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            }),
+        };
+        if let Some(saved) = self
+            .repository_state
+            .checkouts
+            .iter_mut()
+            .find(|saved| saved.key == checkout_key)
+        {
+            saved.session = snapshot;
+        }
+        if matches!(
+            self.repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout_key)
+                .map(SavedCheckout::lifecycle),
+            Some(CheckoutLifecycle::Protected(
+                UnavailableCause::TeardownPending { .. }
+            ))
+        ) {
+            self.teardown_retained_runtime(checkout_key, id)?;
+            self.drive_lifecycle_effect(
+                checkout_key,
+                lifecycle::LifecycleEvent::RuntimeExtinct,
+                move |manager, _| {
+                    manager.forget_stopped_runtime(checkout_key, id);
+                    Ok(())
+                },
+            )?;
+            return Ok(());
+        }
+        self.drive_lifecycle_effect(
+            checkout_key,
+            lifecycle::LifecycleEvent::RequestClose,
+            move |manager, _| manager.teardown_retained_runtime(checkout_key, id),
+        )
+        .map_err(|error| match error.downcast::<persist::SaveError>() {
+            Ok(error) => MutationError::Persistence(error),
+            Err(error) => MutationError::Domain(error),
+        })?;
+        self.drive_lifecycle_effect(
+            checkout_key,
+            lifecycle::LifecycleEvent::RuntimeExtinct,
+            move |manager, _| {
+                manager.forget_stopped_runtime(checkout_key, id);
+                Ok(())
+            },
+        )
+        .map_err(|error| match error.downcast::<persist::SaveError>() {
+            Ok(error) => MutationError::Persistence(error),
+            Err(error) => MutationError::Domain(error),
+        })?;
+        if self.persistence_dirty {
+            return Err(MutationError::Persistence(
+                persist::SaveError::after_replacement(anyhow!(
+                    "lifecycle state committed but directory durability failed"
+                )),
+            ));
+        }
         Ok(())
     }
 
@@ -447,7 +1848,7 @@ impl Manager {
         std::thread::sleep(Self::SUBMIT_DELAY);
         s.claude.write_input(b"\r");
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -573,20 +1974,234 @@ impl Manager {
     /// `$BAUDE_EVENT_URL` export (hook events regressed to the /tmp file
     /// path with no daemon POST). Now a restart is spawn-equivalent, and for
     /// opencode it re-rolls the pinned server port.
-    pub fn restart(&mut self, id: u64) -> Result<()> {
+    pub fn reopen_checkout(
+        &mut self,
+        checkout_key: CheckoutKey,
+    ) -> MutationResult<LifecycleOutcome> {
+        if self.persistence_blocked {
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
+        }
+        let checkout = self
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == checkout_key)
+            .cloned()
+            .ok_or_else(|| anyhow!("retained checkout {} is missing", checkout_key.get()))?;
+        let _reservation = match self
+            .repository_reservations
+            .reserve_reopen(checkout.repository_key, checkout_key)
+        {
+            Ok(reservation) => reservation,
+            Err(outcome) => return Ok(outcome),
+        };
+        let runtime = self.runtime_checkouts.get(&checkout_key).and_then(|id| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == *id)
+                .map(|session| (*id, session.claude.is_exited()))
+        });
+        let runtime_fact = match runtime {
+            Some((id, false)) => lifecycle::ReopenRuntime::Live { id },
+            Some((id, true)) => lifecycle::ReopenRuntime::Exited { id },
+            None => lifecycle::ReopenRuntime::Absent,
+        };
+        let repository = self
+            .repository_state
+            .repositories
+            .iter()
+            .find(|repository| repository.key == checkout.repository_key)
+            .ok_or_else(|| anyhow!("retained checkout repository is missing"))?;
+        let reconciliation = git::reconcile_checkout(
+            &repository.observed_common_dir.to_path_buf(),
+            &checkout.observed_path.to_path_buf(),
+            checkout.observed_branch.as_deref(),
+        )
+        .map(|_| ());
+        let state_before = self.repository_state.clone();
+        let plan = match lifecycle::plan_reopen(
+            &mut self.repository_state,
+            lifecycle::ReopenRequest {
+                checkout: checkout_key,
+                reconciliation,
+                runtime: runtime_fact,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(blocked) => {
+                if let Err(error) = self.save_checked() {
+                    self.persistence_dirty = true;
+                    if !error.replacement_committed() {
+                        self.repository_state = state_before;
+                    }
+                    return Err(MutationError::Persistence(error));
+                }
+                self.persistence_dirty = false;
+                return Err(anyhow!(
+                    "retained checkout {} is unavailable: {:?}",
+                    blocked.checkout().get(),
+                    blocked.cause
+                )
+                .into());
+            }
+        };
+        if let Err(error) = self.save_checked() {
+            self.persistence_dirty = true;
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        self.persistence_dirty = false;
+
+        match plan.dispatch {
+            lifecycle::ReopenDispatch::Focus { id } => Ok(LifecycleOutcome::Focused {
+                checkout: checkout_key,
+                runtime: id,
+            }),
+            lifecycle::ReopenDispatch::Restart { id } => {
+                self.restart_with_mode(id, plan.mode)?;
+                Ok(LifecycleOutcome::Reopened {
+                    checkout: checkout_key,
+                    runtime: id,
+                })
+            }
+            lifecycle::ReopenDispatch::Spawn => {
+                let saved = checkout.session;
+                let id = self.spawn_retained_with_mode(
+                    checkout_key,
+                    checkout.observed_path.to_path_buf(),
+                    saved.repo_root.to_path_buf(),
+                    saved.branch.clone(),
+                    saved.is_worktree,
+                    Some(&saved.name),
+                    plan.mode,
+                    saved.shell_open,
+                )?;
+                if let Ok(session) = self.session_mut(id) {
+                    session.archived = saved.archived;
+                    session.archived_by_user = saved.archived_by_user;
+                }
+                self.runtime_checkouts.insert(checkout_key, id);
+                Ok(LifecycleOutcome::Reopened {
+                    checkout: checkout_key,
+                    runtime: id,
+                })
+            }
+        }
+    }
+
+    pub fn restart(&mut self, id: u64) -> MutationResult<()> {
+        if self.persistence_blocked {
+            return Err(persist::SaveError::before_replacement(anyhow!(
+                "daemon persistence is blocked after a state load failure"
+            ))
+            .into());
+        }
+        if !self.session(id)?.claude.is_exited() {
+            return Err(anyhow!("claude is still running").into());
+        }
+        if let Some(checkout_key) = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+        {
+            self.reopen_checkout(checkout_key)?;
+            return Ok(());
+        }
+        let targeted = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+            .and_then(|key| {
+                self.repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)
+                    .and_then(|checkout| checkout.session.resume_id.clone())
+            })
+            .or_else(|| {
+                self.session(id)
+                    .ok()
+                    .and_then(|session| session.meta.session_id.clone())
+            });
+        let mode = targeted
+            .map(backend::SpawnMode::ResumeId)
+            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        self.restart_with_mode(id, mode)
+    }
+
+    fn restart_with_mode(&mut self, id: u64, mode: backend::SpawnMode) -> MutationResult<()> {
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
-        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), true);
+        let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
+        let checkout = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
+        let cwd = self.session(id)?.cwd.clone();
+        be.prepare_cwd(&cwd);
+        let mut replacement = if let Some(checkout) = checkout {
+            let generation = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout)
+                .and_then(SavedCheckout::owned_runtime)
+                .and_then(|runtime| runtime.generation.successor())
+                .unwrap_or(RuntimeGeneration::initial());
+            let shell = self
+                .session(id)?
+                .shell
+                .as_ref()
+                .filter(|shell| !shell.is_exited())
+                .map(|shell| ShellOwnership::Owned(shell.process_identity().clone()))
+                .unwrap_or(ShellOwnership::Closed);
+            let mut replacement = Pty::spawn_registered_with(
+                Some(&plan.cmd),
+                &plan.env,
+                &cwd,
+                ROWS,
+                COLS,
+                |agent| {
+                    self.drive_lifecycle_effect(
+                        checkout,
+                        lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                            generation,
+                            agent: agent.clone(),
+                            shell,
+                        }),
+                        |_, _| Ok(()),
+                    )?;
+                    Ok(())
+                },
+            )?;
+            if let Err(error) = self.drive_lifecycle_effect(
+                checkout,
+                lifecycle::LifecycleEvent::LaunchReleased,
+                |_, _| Ok(()),
+            ) {
+                let _ = replacement.kill_and_wait();
+                return Err(error.into());
+            }
+            replacement
+        } else {
+            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?
+        };
         let s = self.session_mut(id)?;
-        if !s.claude.is_exited() {
-            bail!("claude is still running");
-        }
-        be.prepare_cwd(&s.cwd);
-        s.claude = Pty::spawn(Some(&plan.cmd), &s.cwd, ROWS, COLS)?;
+        std::mem::swap(&mut s.claude, &mut replacement);
         s.spawn_unix_ms = now_unix_ms();
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_runtime_for_test(&mut self, id: u64) {
+        self.record_runtime(id).unwrap();
     }
 
     /// Local port of the session's backend server (opencode), if it runs one.
@@ -613,7 +2228,7 @@ impl Manager {
         }
         s.claude.write_input(bytes);
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -705,7 +2320,7 @@ impl Manager {
             s.claude.write_input(&key_bytes(key, app_cursor));
         }
         if s.unarchive_on_input() {
-            self.save();
+            self.save_checked()?;
         }
         Ok(())
     }
@@ -733,11 +2348,20 @@ impl Manager {
     /// Park or unpark a session. Archived sessions sort last in clients and
     /// stop sending notifications. A manual archive sticks until unarchived
     /// or re-engaged; an automatic one also lifts when a new turn starts.
-    pub fn set_archived(&mut self, id: u64, archived: bool) -> Result<()> {
+    pub fn set_archived(&mut self, id: u64, archived: bool) -> MutationResult<()> {
         let s = self.session_mut(id)?;
+        let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
-        self.save();
-        Ok(())
+        match self.save_checked() {
+            Ok(()) => Ok(()),
+            Err(error) if error.replacement_committed() => Err(MutationError::Persistence(error)),
+            Err(error) => {
+                let s = self.session_mut(id)?;
+                s.archived = archived_before.0;
+                s.archived_by_user = archived_before.1;
+                Err(MutationError::Persistence(error))
+            }
+        }
     }
 
     /// Test-only: pin a session's resolved Claude `session_id` so handlers
@@ -747,6 +2371,37 @@ impl Manager {
     pub fn session_id_for_test(&mut self, id: u64, sid: &str) {
         if let Ok(s) = self.session_mut(id) {
             s.meta.session_id = Some(sid.to_string());
+            // Keep unrelated real Claude session files for the test cwd from
+            // replacing the explicitly pinned id during the next metadata poll.
+            s.spawn_unix_ms = u64::MAX;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_at_for_test(
+        &mut self,
+        root: &Path,
+        workspace: &baude_core::workspace::Workspace,
+        failure: Option<persist::AtomicFailure>,
+    ) {
+        self.persistence_target_for_test =
+            Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
+        self.atomic_failure_for_test = failure;
+    }
+
+    /// Test-only deterministic Claude metadata poll. The process running the
+    /// suite may itself select the OpenCode workspace, which must not redirect
+    /// fixtures that explicitly seed Claude hook-event files.
+    #[cfg(test)]
+    pub fn poll_claude_meta_for_test(&mut self, id: u64) {
+        if let Ok(session) = self.session_mut(id) {
+            let pid = session.claude.pid();
+            let (cwd, spawn, root) = (
+                session.cwd.clone(),
+                session.spawn_unix_ms,
+                session.repo_root.clone(),
+            );
+            session.meta.poll(&cwd, pid, spawn, &root);
         }
     }
 
@@ -886,10 +2541,222 @@ fn session_info(s: &Session) -> SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baude_core::lifecycle::LifecycleOutcome;
+    use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn lifecycle_protocol_contract_manager_vectors() {
+        for vector in baude_core::lifecycle::canonical_lifecycle_contract_vectors() {
+            let actual = Manager::lifecycle_contract_trace(
+                *vector,
+                baude_core::lifecycle::AdapterFailureScript::None,
+            );
+            assert_eq!(
+                baude_core::lifecycle::normalize_lifecycle_trace(&actual.trace),
+                baude_core::lifecycle::canonical_lifecycle_trace(*vector).trace
+            );
+            assert_eq!(
+                actual.final_lifecycle,
+                baude_core::lifecycle::canonical_lifecycle_trace(*vector).final_lifecycle
+            );
+        }
+        for failure in [
+            baude_core::lifecycle::AdapterFailureScript::Persist(1),
+            baude_core::lifecycle::AdapterFailureScript::Effect(1),
+        ] {
+            let actual = Manager::lifecycle_contract_trace(
+                baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                failure,
+            );
+            assert_eq!(
+                actual,
+                baude_core::lifecycle::run_canonical_lifecycle_contract(
+                    baude_core::lifecycle::CanonicalLifecycleVector::Launch,
+                    failure,
+                )
+            );
+        }
+    }
 
     fn mgr() -> Manager {
         Manager::new("sleep 30".into(), false)
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn pid_is_live(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|state| !state.starts_with('Z'))
+            })
+    }
+
+    #[test]
+    fn manager_restore_reconciles_current_git_before_spawn_and_persists_failure() {
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-reconcile-{}", std::process::id()));
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let snapshot = git::discover_repository(&repo).unwrap();
+
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let checkout_key = state.allocate_checkout_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        let checkout_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(&snapshot.common_dir),
+            observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        state.checkouts.push(SavedCheckout::new(
+            checkout_key,
+            repository_key,
+            CheckoutRole::ManagedBranch,
+            false,
+            PersistedPath::from_path(&snapshot.selected_worktree.path),
+            snapshot.selected_worktree.branch.clone(),
+            checkout_order,
+            CheckoutLifecycle::Active,
+            RetainedSessionState {
+                name: "changed checkout".into(),
+                cwd: PersistedPath::from_path(&snapshot.selected_worktree.path),
+                repo_root: PersistedPath::from_path(&snapshot.main_worktree),
+                branch: Some("main".into()),
+                is_worktree: false,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        ));
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        persist::save_current_at(
+            &state_root,
+            &workspace.state_file(STATE_BASE),
+            &StateFile::new(state),
+        )
+        .unwrap();
+        git(&repo, &["checkout", "-b", "changed"]);
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&state_root, &workspace), 0);
+        assert!(manager.sessions.is_empty());
+        assert!(matches!(
+            manager.repository_state.checkouts[0].health(),
+            CheckoutHealth::Unavailable(_)
+        ));
+        let persisted =
+            persist::load_current_at(&state_root, &workspace.state_file(STATE_BASE)).unwrap();
+        assert!(matches!(
+            persisted.state.checkouts[0].health(),
+            CheckoutHealth::Unavailable(_)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manager_persistence_blocks_malformed_state_and_later_saves() {
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-persistence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let path = root.join(workspace.state_file(STATE_BASE));
+        let original = b"{truncated";
+        std::fs::write(&path, original).unwrap();
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert!(manager.persistence_blocked);
+        manager.save_at(&root, &workspace);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(manager.create("/tmp", None, None).is_err());
+        assert!(manager.sessions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manager_persistence_migrates_selected_legacy_once_without_field_loss() {
+        let root =
+            std::env::temp_dir().join(format!("bauded-manager-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let legacy_path = root.join(workspace.legacy_state_file(STATE_BASE).unwrap());
+        let legacy = baude_core::persist::State {
+            sessions: vec![baude_core::persist::SavedSession {
+                name: "retained daemon".into(),
+                cwd: PathBuf::from("/missing/checkout"),
+                repo_root: PathBuf::from("/missing/repository"),
+                branch: Some("feature/retained".into()),
+                is_worktree: true,
+                shell_open: true,
+                archived: true,
+                archived_by_user: true,
+            }],
+        };
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let mut manager = Manager::new("true".into(), true);
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert!(!manager.persistence_blocked);
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        let retained = &manager.repository_state.checkouts[0].session;
+        assert_eq!(retained.name, "retained daemon");
+        assert_eq!(retained.branch.as_deref(), Some("feature/retained"));
+        assert!(retained.is_worktree);
+        assert!(retained.shell_open);
+        assert!(retained.archived);
+        assert!(retained.archived_by_user);
+        let first = manager.repository_state.clone();
+        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert_eq!(manager.repository_state, first);
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            serde_json::to_vec_pretty(&legacy).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -904,6 +2771,917 @@ mod tests {
         m.remove(info.id).unwrap();
         assert!(m.list().is_empty());
         assert!(m.remove(info.id).is_err());
+    }
+
+    #[test]
+    fn exhausted_durable_counter_rejects_create_before_spawn() {
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.repository_state.next_repository_key = u64::MAX - 1;
+
+        let error = match manager.create("/tmp", None, None) {
+            Ok(_) => panic!("counter exhaustion unexpectedly spawned a session"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("RepositoryKeysExhausted"), "got: {error}");
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(manager.next_id, 1);
+    }
+
+    fn persistence_fixture(label: &str) -> (PathBuf, baude_core::workspace::Workspace) {
+        let root =
+            std::env::temp_dir().join(format!("bauded-transaction-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        (root, workspace)
+    }
+
+    fn removal_manager(
+        label: &str,
+        offset: u64,
+    ) -> (
+        Manager,
+        PathBuf,
+        PathBuf,
+        baude_core::workspace::Workspace,
+        PathBuf,
+        CheckoutKey,
+        u64,
+        PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("bauded-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + offset;
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        let created = manager
+            .activate_branch_worktree(&repo, &format!("feature/{label}"), None)
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        let path = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        (
+            manager, state_root, root, workspace, repo, checkout, runtime, path,
+        )
+    }
+
+    fn persisted_at(root: &Path, workspace: &baude_core::workspace::Workspace) -> RepositoryState {
+        persist::load_current_at(root, &workspace.state_file(STATE_BASE))
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn create_persistence_failure_keeps_memory_process_and_disk_consistent() {
+        let (root, workspace) = persistence_fixture("create");
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+
+        assert!(manager.create("/tmp", None, Some("pre")).is_err());
+        assert!(manager.repository_state.checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert!(!root.join(workspace.state_file(STATE_BASE)).exists());
+
+        manager.persist_at_for_test(
+            &root,
+            &workspace,
+            Some(persist::AtomicFailure::DirectorySync),
+        );
+        assert!(manager.create("/tmp", None, Some("post")).is_err());
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_create_activate_manager_persists_once_and_reuses_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-activate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id());
+        manager.persist_at_for_test(&state_root, &workspace, None);
+
+        let created = manager
+            .activate_branch_worktree(&repo, "feature/manager-contract", None)
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert!(manager.repository_state.checkouts[0].managed_by_baude);
+        assert_eq!(
+            manager.runtime_checkouts,
+            HashMap::from([(checkout, runtime)])
+        );
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+
+        assert_eq!(
+            manager
+                .activate_branch_worktree(&repo, "feature/manager-contract", None)
+                .unwrap(),
+            LifecycleOutcome::Focused { checkout, runtime }
+        );
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+
+        manager
+            .session_mut(runtime)
+            .unwrap()
+            .kill_and_wait()
+            .unwrap();
+        assert_eq!(
+            manager
+                .activate_branch_worktree(&repo, "feature/manager-contract", None)
+                .unwrap(),
+            LifecycleOutcome::Reopened { checkout, runtime }
+        );
+        assert!(!manager.session(runtime).unwrap().claude.is_exited());
+
+        let different = manager
+            .activate_branch_worktree(&repo, "feature/manager-distinct", None)
+            .unwrap();
+        assert!(matches!(
+            different,
+            LifecycleOutcome::Created {
+                checkout: other_checkout,
+                runtime: Some(other_runtime),
+            } if other_checkout != checkout && other_runtime != runtime
+        ));
+        assert_eq!(manager.repository_state.checkouts.len(), 2);
+        assert_eq!(manager.runtime_checkouts.len(), 2);
+        manager.kill_all();
+        let linked: Vec<_> = manager
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.observed_path.to_path_buf())
+            .filter(|path| path != &repo)
+            .collect();
+        for path in linked {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_rollback_manager_precommit_save_failure_has_no_partial_child() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("true".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 20_000;
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::Rename),
+        );
+        let before = manager.repository_state.clone();
+
+        let result = manager.activate_branch_worktree(&repo, "feature/manager-rollback", None);
+        let after = git::discover_repository(&repo).unwrap();
+        let partial: Vec<_> = after
+            .worktrees
+            .iter()
+            .filter(|record| {
+                record.branch.as_deref() == Some("refs/heads/feature/manager-rollback")
+            })
+            .map(|record| record.path.clone())
+            .collect();
+        for path in &partial {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
+        let branch_retained = Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/feature/manager-rollback",
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success();
+
+        assert!(result.is_err());
+        assert!(partial.is_empty(), "save failure left a linked worktree");
+        assert_eq!(manager.repository_state, before);
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert!(!branch_retained);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activation_recovery_manager_reuses_occupied_owner_after_pending_save_crash() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-occupied-pending-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["branch", "occupied-before-crash"]);
+        let occupied = root.join("occupied-before-crash");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                occupied.to_str().unwrap(),
+                "occupied-before-crash",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let snapshot = git::discover_repository(&repo).unwrap();
+        let mut crashed = Manager::new("sleep 30".into(), true);
+        crashed.persist_at_for_test(&state_root, &workspace, None);
+        let prepared = lifecycle::prepare_activation(
+            &mut crashed.repository_state,
+            &snapshot,
+            "occupied-before-crash",
+        )
+        .unwrap();
+        lifecycle::record_pending_activation(&mut crashed.repository_state, &snapshot, &prepared)
+            .unwrap();
+        crashed.save_checked().unwrap();
+
+        let mut restarted = Manager::new("sleep 30".into(), true);
+        assert_eq!(restarted.restore_at(&state_root, &workspace), 1);
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        let recovered = &restarted.repository_state.checkouts[0];
+        assert_eq!(
+            recovered.observed_path.to_path_buf(),
+            occupied.canonicalize().unwrap()
+        );
+        assert!(!recovered.managed_by_baude);
+        assert!(recovered.active_intent());
+        assert_eq!(recovered.health(), &CheckoutHealth::Available);
+        assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
+
+        restarted.kill_all();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                occupied.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_creation_rollback_manager_committed_save_and_spawn_failures_retain_retry_child() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-create-stages-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("true".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 40_000;
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::DirectorySync),
+        );
+
+        assert!(manager
+            .activate_branch_worktree(&repo, "feature/manager-postcommit", None)
+            .is_err());
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.repository_state.has_pending_activation());
+
+        let mut reloaded = Manager::new("true".into(), true);
+        assert_eq!(reloaded.restore_at(&state_root, &workspace), 0);
+        assert!(!reloaded.repository_state.has_pending_activation());
+        assert!(reloaded.repository_state.checkouts.is_empty());
+        assert!(reloaded
+            .activate_branch_worktree(&repo, "feature/manager-spawn", None)
+            .is_ok());
+
+        let linked: Vec<_> = manager
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.observed_path.to_path_buf())
+            .collect();
+        for path in linked {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(path)
+                .current_dir(&repo)
+                .status();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_close_manager_persistence_failure_retains_child_and_parent() {
+        for (label, failure, committed) in [
+            ("remove-pre", persist::AtomicFailure::Rename, false),
+            ("remove-post", persist::AtomicFailure::DirectorySync, true),
+        ] {
+            let (root, workspace) = persistence_fixture(label);
+            let mut manager = Manager::new("sleep 30".into(), true);
+            manager.persist_at_for_test(&root, &workspace, None);
+            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            manager.session_id_for_test(id, &format!("opaque-{label}"));
+            manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
+            let before = manager.repository_state.clone();
+            let original_pid = manager.session(id).unwrap().claude.pid().unwrap();
+            let original_shell_pid = manager
+                .session(id)
+                .unwrap()
+                .shell
+                .as_ref()
+                .unwrap()
+                .pid()
+                .unwrap();
+            assert!(pid_is_live(original_pid));
+            assert!(pid_is_live(original_shell_pid));
+            manager.persist_at_for_test(&root, &workspace, Some(failure));
+
+            let close_error = manager.remove(id).unwrap_err().to_string();
+            assert_eq!(manager.repository_state.repositories.len(), 1);
+            assert_eq!(manager.repository_state.checkouts.len(), 1);
+            assert_eq!(
+                manager.repository_state.checkouts[0].active_intent(),
+                !committed
+            );
+            assert_eq!(
+                persisted_at(&root, &workspace).checkouts[0].active_intent(),
+                !committed
+            );
+            if committed {
+                assert!(!pid_is_live(original_pid));
+                assert!(!pid_is_live(original_shell_pid));
+                assert!(manager.sessions.is_empty());
+                assert!(manager.runtime_checkouts.is_empty());
+                assert_eq!(
+                    manager.repository_state.checkouts[0]
+                        .session
+                        .resume_id
+                        .as_deref(),
+                    Some(format!("opaque-{label}").as_str())
+                );
+                assert!(manager.persistence_dirty);
+            } else {
+                assert!(!close_error.is_empty());
+                assert_eq!(manager.repository_state.repositories, before.repositories);
+                assert!(matches!(
+                    manager.repository_state.checkouts[0].lifecycle(),
+                    CheckoutLifecycle::Running(_)
+                ));
+                let compensated = *manager.runtime_checkouts.keys().next().unwrap();
+                let compensated = manager.runtime_checkouts[&compensated];
+                assert_eq!(compensated, id);
+                assert!(pid_is_live(original_pid));
+                assert!(pid_is_live(original_shell_pid));
+                assert!(!manager.session(compensated).unwrap().claude.is_exited());
+                assert!(pid_is_live(
+                    manager.session(compensated).unwrap().claude.pid().unwrap()
+                ));
+                assert!(manager.session(compensated).unwrap().shell_open);
+                assert!(pid_is_live(
+                    manager
+                        .session(compensated)
+                        .unwrap()
+                        .shell
+                        .as_ref()
+                        .unwrap()
+                        .pid()
+                        .unwrap()
+                ));
+                manager.kill_all();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn lifecycle_close_manager_success_retains_exact_child_context() {
+        let (root, workspace) = persistence_fixture("close-success");
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, None);
+        let id = manager
+            .create("/tmp", None, Some("retained daemon"))
+            .unwrap()
+            .id;
+        manager.repository_state.checkouts[0].session.resume_id =
+            Some("opaque-daemon-before-poll".into());
+        manager.session_mut(id).unwrap().meta.session_id = None;
+        manager.session_mut(id).unwrap().archived = true;
+        manager.session_mut(id).unwrap().archived_by_user = true;
+        manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
+        manager
+            .session_mut(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .fail_next_teardown_for_test("shell stop refused once");
+        let before = manager.repository_state.clone();
+
+        let partial = manager.remove(id).unwrap_err().to_string();
+        assert!(partial.contains("shell stopped: false"), "got: {partial}");
+        assert!(manager.session(id).unwrap().claude.is_exited());
+        assert!(!manager
+            .session(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
+        assert!(manager.repository_state.checkouts[0].active_intent());
+        assert!(matches!(
+            manager.repository_state.checkouts[0].health(),
+            CheckoutHealth::Unavailable(UnavailableCause::TeardownPending {
+                agent_stopped: true,
+                shell_stopped: false,
+                ..
+            })
+        ));
+
+        let mut restarted = Manager::new("sleep 30".into(), true);
+        assert_eq!(restarted.restore_at(&root, &workspace), 0);
+        assert!(restarted.sessions.is_empty());
+        assert!(restarted.runtime_checkouts.is_empty());
+        assert!(!restarted.repository_state.checkouts[0].active_intent());
+        assert_eq!(
+            restarted.repository_state.checkouts[0].health(),
+            &CheckoutHealth::Available
+        );
+        assert!(manager
+            .session(id)
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap()
+            .is_exited());
+
+        manager.remove(id).unwrap();
+
+        assert!(manager.sessions.is_empty());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert_eq!(manager.repository_state.repositories, before.repositories);
+        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        let retained = &manager.repository_state.checkouts[0];
+        let original = &before.checkouts[0];
+        assert_eq!(retained.key, original.key);
+        assert_eq!(retained.repository_key, original.repository_key);
+        assert_eq!(retained.role, original.role);
+        assert_eq!(retained.managed_by_baude, original.managed_by_baude);
+        assert_eq!(retained.observed_path, original.observed_path);
+        assert_eq!(retained.observed_branch, original.observed_branch);
+        assert_eq!(retained.first_seen_order, original.first_seen_order);
+        assert!(!retained.active_intent());
+        assert_eq!(retained.session.name, "retained daemon");
+        assert!(retained.session.archived);
+        assert!(retained.session.archived_by_user);
+        assert_eq!(
+            retained.session.resume_id.as_deref(),
+            Some("opaque-daemon-before-poll")
+        );
+        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_reopen_manager_reuses_one_runtime_and_preserves_failed_save() {
+        let (root, workspace) = persistence_fixture("reopen-manager");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let mut manager = Manager::new("sleep 30".into(), true);
+        manager.persist_at_for_test(&root, &workspace, None);
+        let runtime = manager
+            .create(repo.to_str().unwrap(), None, Some("retained daemon"))
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        manager.session_id_for_test(runtime, "opaque-daemon-target");
+        manager.remove(runtime).unwrap();
+
+        let outcome = manager.reopen_checkout(checkout).unwrap();
+        let reopened_runtime = match outcome {
+            LifecycleOutcome::Reopened {
+                checkout: key,
+                runtime,
+            } if key == checkout => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+        assert!(manager.repository_state.checkouts[0].active_intent());
+        assert_eq!(
+            manager.reopen_checkout(checkout).unwrap(),
+            LifecycleOutcome::Focused {
+                checkout,
+                runtime: reopened_runtime,
+            }
+        );
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+
+        manager.remove(reopened_runtime).unwrap();
+        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+        assert!(manager.reopen_checkout(checkout).is_err());
+        assert!(!manager.repository_state.checkouts[0].active_intent());
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_remove_clean_manager_uses_the_shared_child_only_transaction() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-lifecycle-safe-remove-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.repository_state.next_repository_key = u64::from(std::process::id()) + 110_000;
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        let created = manager
+            .activate_branch_worktree(&repo, "feature/safe-remove-manager", None)
+            .unwrap();
+        let (checkout, runtime) = match created {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        manager.session_id_for_test(runtime, "fresh-manager-removal-target");
+        let path = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+
+        manager.persist_at_for_test(
+            &state_root,
+            &workspace,
+            Some(persist::AtomicFailure::Rename),
+        );
+        let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+        let error = manager
+            .confirm_remove_worktree(confirmation)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.is_empty());
+        assert!(path.exists());
+        assert_eq!(manager.runtime_checkouts.len(), 1);
+        assert_eq!(manager.sessions.len(), 1);
+        assert_eq!(
+            manager.repository_state.checkouts[0]
+                .session
+                .resume_id
+                .as_deref(),
+            Some("fresh-manager-removal-target")
+        );
+        assert_eq!(
+            persisted_at(&state_root, &workspace).checkouts[0]
+                .session
+                .resume_id
+                .as_deref(),
+            None
+        );
+        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.save_checked().unwrap();
+        let before = manager.repository_state.clone();
+
+        let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+        let removed = manager.confirm_remove_worktree(confirmation).unwrap();
+
+        assert!(
+            matches!(removed, LifecycleOutcome::Removed { checkout: key, .. } if key == checkout)
+        );
+        assert!(manager.repository_state.checkouts.is_empty());
+        assert_eq!(manager.repository_state.repositories, before.repositories);
+        assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.sessions.is_empty());
+        assert_eq!(
+            persisted_at(&state_root, &workspace),
+            manager.repository_state
+        );
+        assert!(Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "--",
+                "refs/heads/feature/safe-remove-manager"
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_remove_manager_partial_teardown_is_durable_and_retryable() {
+        for (label, fail_agent, offset) in [
+            ("remove-agent-partial", true, 120_000),
+            ("remove-shell-partial", false, 130_000),
+        ] {
+            let (mut manager, state_root, root, workspace, _repo, checkout, runtime, path) =
+                removal_manager(label, offset);
+            manager
+                .session_mut(runtime)
+                .unwrap()
+                .open_shell(5, 40)
+                .unwrap();
+            if fail_agent {
+                manager
+                    .session(runtime)
+                    .unwrap()
+                    .claude
+                    .fail_next_teardown_for_test("agent stop refused once");
+            } else {
+                manager
+                    .session(runtime)
+                    .unwrap()
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .fail_next_teardown_for_test("shell stop refused once");
+            }
+            let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
+
+            let error = manager
+                .confirm_remove_worktree(confirmation.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("runtime stop failed"), "got: {error}");
+            assert!(path.exists());
+            assert!(manager.runtime_checkouts.contains_key(&checkout));
+            assert!(matches!(
+                manager.repository_state.checkouts[0].health(),
+                CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
+            ));
+            assert_eq!(
+                persisted_at(&state_root, &workspace),
+                manager.repository_state
+            );
+
+            assert!(matches!(
+                manager.confirm_remove_worktree(confirmation).unwrap(),
+                LifecycleOutcome::Removed { checkout: key, .. } if key == checkout
+            ));
+            assert!(!path.exists());
+            assert!(manager.sessions.is_empty());
+            assert!(manager.runtime_checkouts.is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn archive_persistence_failure_rolls_back_or_keeps_the_replacement() {
+        for (label, failure, committed) in [
+            ("archive-pre", persist::AtomicFailure::Rename, false),
+            ("archive-post", persist::AtomicFailure::DirectorySync, true),
+        ] {
+            let (root, workspace) = persistence_fixture(label);
+            let mut manager = Manager::new("sleep 30".into(), true);
+            manager.persist_at_for_test(&root, &workspace, None);
+            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            manager.persist_at_for_test(&root, &workspace, Some(failure));
+
+            assert!(manager.set_archived(id, true).is_err());
+            assert_eq!(manager.info(id).unwrap().archived, committed);
+            assert_eq!(
+                persisted_at(&root, &workspace).checkouts[0]
+                    .session
+                    .archived,
+                committed
+            );
+            manager.kill_all();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -946,7 +3724,7 @@ mod tests {
         .unwrap();
         m.session_id_for_test(id, &sid);
         // Drive read_event_tail so the ring fills from the on-disk file.
-        m.poll();
+        m.poll_claude_meta_for_test(id);
 
         // The last 2 events, newest at back.
         let recent = m.activity(id, 2).unwrap();

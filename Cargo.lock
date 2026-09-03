@@ -197,7 +197,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "baude"
-version = "0.14.1"
+version = "2.0.0-beta"
 dependencies = [
  "anyhow",
  "baude-core",
@@ -211,10 +211,11 @@ dependencies = [
 
 [[package]]
 name = "baude-core"
-version = "0.14.1"
+version = "2.0.0-beta"
 dependencies = [
  "anyhow",
  "dirs",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
@@ -224,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "bauded"
-version = "0.14.1"
+version = "2.0.0-beta"
 dependencies = [
  "aes-gcm",
  "anyhow",

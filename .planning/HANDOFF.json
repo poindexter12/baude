@@ -1,0 +1,129 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-08-31T18:32:38Z",
+  "phase": "07",
+  "phase_name": "Local TUI Dogfood Release",
+  "phase_dir": ".planning/phases/07-local-tui-dogfood-release",
+  "plan": 6,
+  "task": 2,
+  "total_tasks": 2,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": 1,
+      "name": "Implement Phase 6 shared lifecycle core and thin App/Manager adapters",
+      "status": "done",
+      "commit": "3c9d152"
+    },
+    {
+      "id": 2,
+      "name": "Implement all six Phase 7 local TUI dogfood plans",
+      "status": "done",
+      "commit": "fc41a02"
+    },
+    {
+      "id": 3,
+      "name": "Pass local formatting, lint, 337 tests, packaging, artifact, and isolated install gates",
+      "status": "done",
+      "commit": "872f524"
+    },
+    {
+      "id": 9,
+      "name": "Implement BL-05 first-class persisted standalone sessions for non-Git folders",
+      "status": "done",
+      "commit": "uncommitted"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": 4,
+      "name": "Run the isolated wide/narrow local TUI dogfood runbook and record observed evidence",
+      "status": "not_started"
+    },
+    {
+      "id": 5,
+      "name": "Run Linux/runtime certification for the pre-exec gate and descendant process-group extinction",
+      "status": "not_started"
+    },
+    {
+      "id": 6,
+      "name": "Run independent deep review, Phase 6 and 7 verification, Nyquist validation, and UI sign-off",
+      "status": "not_started"
+    },
+    {
+      "id": 7,
+      "name": "Check off verified requirements, complete phases, audit milestone, and clean up planning artifacts",
+      "status": "not_started"
+    },
+    {
+      "id": 8,
+      "name": "Make an explicit publication decision; do not publish or push a release implicitly",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "Phase 6 and Phase 7 are locally green but not certified or complete.",
+      "type": "human_action",
+      "workaround": "Follow docs/local-tui-dogfood.md, then run the pending review and verification gates."
+    },
+    {
+      "description": "Linux process registration and descendant process-group extinction remain unobserved.",
+      "type": "external",
+      "workaround": "Run the supported Linux CI/runtime matrix before making cross-platform or completion claims."
+    }
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [
+    {
+      "action": "Run docs/local-tui-dogfood.md and capture wide/narrow screenshots plus state and Git inventory evidence.",
+      "context": "REL-01/REL-03 and UI certification require observed behavior, not implementation claims.",
+      "blocking": true
+    },
+    {
+      "action": "Decide whether v2.0.0-beta should be published only after all certification gates pass.",
+      "context": "Current metadata is readiness-only and no remote beta asset exists.",
+      "blocking": true
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Use one baude-core lifecycle engine with exact durable agent and shell ownership.",
+      "rationale": "Duplicated App/Manager orchestration produced unsafe recovery drift.",
+      "phase": "06"
+    },
+    {
+      "decision": "Use a pre-exec PTY registration gate and release only after durable runtime ownership commits.",
+      "rationale": "Dropping portable-pty handles does not reliably terminate a SIGHUP-ignoring process.",
+      "phase": "06"
+    },
+    {
+      "decision": "Ship a local-TUI-only dogfood slice and defer dormant branches, remote hierarchy, and PWA hierarchy.",
+      "rationale": "Narrowing scope allows lifecycle safety and local usability to mature before surface expansion.",
+      "phase": "07"
+    },
+    {
+      "decision": "Keep the published-history manifest at 0.14.0 while source and proposal metadata target 2.0.0-beta.",
+      "rationale": "The beta is not published yet and historical release metadata must remain truthful.",
+      "phase": "07"
+    },
+    {
+      "decision": "Prefer checkout/worktree rows in navigation and retain repository parents only as visible context or no-available-checkout fallback.",
+      "rationale": "Dogfood showed duplicate parent/checkout stops obscured the actionable worktree.",
+      "phase": "07"
+    },
+    {
+      "decision": "Model non-Git folders as durable standalone sessions rather than fake repositories.",
+      "rationale": "A folder that will never become a repository still needs agent/session persistence but has no valid Git lifecycle authority.",
+      "phase": "07"
+    }
+  ],
+  "uncommitted_files": [
+    "baude-core/src/{repository,persist,git}.rs and baude/src/{hierarchy,app,ui}.rs (checkout-first navigation plus schema-v3 standalone sessions)",
+    "README.md, docs/local-tui-dogfood.md, and Phase 7 planning/evidence updates",
+    "graphify-out/ (pre-existing unrelated untracked directory)",
+    "opencode.json (pre-existing unrelated untracked file)"
+  ],
+  "next_action": "Inspect and commit the checkout-first and standalone dogfood correction when requested, then run Phase 6 and Phase 7 certification workflows.",
+  "context_notes": "All 16 milestone plans are implemented. Isolated live TUI dogfood found and fixed active positional-repository restart duplication, then covered wide/narrow hierarchy, standalone persistence/actions/recovery, and safe managed removal. Formatting, Clippy, and all 345 workspace tests pass; focused follow-up review found no high/medium issues. ANSI terminal captures and exact state/Git evidence are recorded in 07-UAT-EVIDENCE.md; image screenshots, Linux/runtime certification, and formal Phase 6/7 certification remain pending. STATE intentionally remains at 33% because only Phase 5 is formally complete."
+}

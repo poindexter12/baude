@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 
-use crate::manager::{lock, PermissionView, SessionInfo, Shared};
+use crate::manager::{lock, MutationError, PermissionView, SessionInfo, Shared};
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
 pub fn router(state: Shared) -> Router {
@@ -107,16 +107,25 @@ fn not_found(e: anyhow::Error) -> ApiError {
     (StatusCode::NOT_FOUND, e.to_string())
 }
 
+fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
+    match error {
+        MutationError::Persistence(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        MutationError::Domain(error) => (fallback, error.to_string()),
+    }
+}
+
 /// `GET /info` — daemon identity: which workspace (and thus backend) this
 /// daemon serves, so clients can refuse to route sessions into the wrong
 /// pool (the TUI's cross-workspace guard). Daemons predating workspaces
 /// 404 here; clients treat that as "claude workspace, old version".
-async fn info() -> Json<serde_json::Value> {
+async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
     let ws = baude_core::workspace::active();
+    let persistence = lock(&state).persistence_status();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
         "version": env!("CARGO_PKG_VERSION"),
+        "persistence": persistence,
     }))
 }
 
@@ -148,7 +157,7 @@ async fn create_session(
 ) -> Result<(StatusCode, Json<SessionInfo>), ApiError> {
     let info = lock(&state)
         .create(&body.repo, body.worktree.as_deref(), body.name.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|error| mutation_error(error, StatusCode::BAD_REQUEST))?;
     crate::permission_bridge::watch_if_needed(&state, info.id);
     Ok((StatusCode::CREATED, Json(info)))
 }
@@ -157,7 +166,9 @@ async fn delete_session(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).remove(id).map_err(not_found)?;
+    lock(&state)
+        .remove(id)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -238,12 +249,19 @@ async fn interrupt(
 }
 
 async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
-    lock(&state).restart(id).map_err(|e| {
-        let msg = e.to_string();
-        if msg.starts_with("no session") {
-            (StatusCode::NOT_FOUND, msg)
-        } else {
-            (StatusCode::CONFLICT, msg) // still running
+    lock(&state).restart(id).map_err(|error| {
+        match error {
+            MutationError::Persistence(error) => {
+                (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
+            MutationError::Domain(error) => {
+                let message = error.to_string();
+                if message.starts_with("no session") {
+                    (StatusCode::NOT_FOUND, message)
+                } else {
+                    (StatusCode::CONFLICT, message) // still running
+                }
+            }
         }
     })?;
     // A restart re-rolls the opencode server port — wire a fresh watcher.
@@ -252,7 +270,9 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
 }
 
 async fn archive(State(state): State<Shared>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
-    lock(&state).set_archived(id, true).map_err(not_found)?;
+    lock(&state)
+        .set_archived(id, true)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -260,7 +280,9 @@ async fn unarchive(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).set_archived(id, false).map_err(not_found)?;
+    lock(&state)
+        .set_archived(id, false)
+        .map_err(|error| mutation_error(error, StatusCode::NOT_FOUND))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -644,7 +666,10 @@ async fn activity_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
@@ -673,11 +698,150 @@ mod tests {
             .unwrap()
     }
 
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn initialized_repo(root: &Path, name: &str) -> std::path::PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
+    fn exited_tracked_manager(repo: &Path) -> (crate::manager::Shared, u64) {
+        let state = Arc::new(Mutex::new(Manager::new("true".into(), false)));
+        let id = crate::manager::lock(&state)
+            .create(repo.to_str().unwrap(), None, None)
+            .unwrap()
+            .id;
+        crate::manager::lock(&state).track_runtime_for_test(id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::manager::lock(&state).info(id).unwrap().status != "exited" {
+            assert!(Instant::now() < deadline, "stub never exited");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (state, id)
+    }
+
     #[tokio::test]
     async fn list_starts_empty() {
         let res = app().oneshot(get("/sessions")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn flat_session_api_remains_a_non_hierarchical_compatibility_projection() {
+        let root = std::env::temp_dir().join(format!(
+            "bauded-flat-api-compatibility-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = initialized_repo(&root, "repo").canonicalize().unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        crate::manager::lock(&state).persist_at_for_test(&root, &workspace, None);
+        let app = super::router(Arc::clone(&state));
+
+        let create = app
+            .clone()
+            .oneshot(post_json(
+                "/sessions",
+                &serde_json::json!({ "repo": repo, "name": "flat-main" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created = body_json(create).await;
+        let id = created["id"].as_u64().unwrap();
+
+        let listed = app.clone().oneshot(get("/sessions")).await.unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = body_json(listed).await;
+        let rows = listed.as_array().expect("flat SessionInfo array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], id);
+        for forbidden in [
+            "repository",
+            "repository_key",
+            "checkout",
+            "checkout_key",
+            "parent",
+            "children",
+            "hierarchy",
+            "worktrees",
+        ] {
+            assert!(rows[0].get(forbidden).is_none(), "unexpected {forbidden}");
+        }
+
+        for request in [
+            get("/repositories"),
+            get(&format!("/sessions/{id}/children")),
+            Request::delete(format!("/sessions/{id}/remove-worktree"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::delete(format!("/worktrees/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(crate::manager::lock(&state).info(id).is_some());
+        }
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await,
+            serde_json::json!([])
+        );
+
+        let retained =
+            baude_core::persist::load_current_at(&root, &workspace.state_file("daemon-state"))
+                .unwrap()
+                .state;
+        assert_eq!(retained.repositories.len(), 1);
+        assert_eq!(retained.checkouts.len(), 1);
+        assert!(!retained.checkouts[0].active_intent());
+        assert_eq!(retained.checkouts[0].observed_path.to_path_buf(), repo);
+        assert!(repo.join("file").is_file());
+        let inventory = baude_core::git::discover_repository(&repo).unwrap();
+        assert_eq!(inventory.worktrees.len(), 1);
+        assert_eq!(inventory.worktrees[0].path, repo);
+        assert!(Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "--", "refs/heads/main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        crate::manager::lock(&state).kill_all();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -689,6 +853,9 @@ mod tests {
             get("/sessions/9/screen"),
             Request::delete("/sessions/9").body(Body::empty()).unwrap(),
             post_json("/sessions/9/interrupt", ""),
+            post_json("/sessions/9/restart", ""),
+            post_json("/sessions/9/archive", ""),
+            post_json("/sessions/9/unarchive", ""),
             post_json("/sessions/9/keys", r#"{"keys":["enter"]}"#),
         ] {
             let res = app.clone().oneshot(req).await.unwrap();
@@ -716,6 +883,216 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn real_atomic_persistence_failures_are_503_for_every_mutation() {
+        use baude_core::persist::{self, AtomicFailure};
+
+        for (failure, committed) in [
+            (AtomicFailure::Rename, false),
+            (AtomicFailure::DirectorySync, true),
+        ] {
+            let suffix = format!("{:?}-{}", failure, std::process::id());
+            let workspace = baude_core::workspace::resolve(
+                Some("claude"),
+                None,
+                &persist::Config::default(),
+                |_| {},
+            );
+
+            let create_root = std::env::temp_dir().join(format!("bauded-api-create-{suffix}"));
+            let _ = std::fs::remove_dir_all(&create_root);
+            std::fs::create_dir_all(&create_root).unwrap();
+            let create_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            crate::manager::lock(&create_state).persist_at_for_test(
+                &create_root,
+                &workspace,
+                Some(failure),
+            );
+            let response = super::router(Arc::clone(&create_state))
+                .oneshot(post_json("/sessions", r#"{"repo":"/tmp"}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(crate::manager::lock(&create_state).list().is_empty());
+            let create_file = create_root.join(workspace.state_file("daemon-state"));
+            assert_eq!(create_file.exists(), committed);
+            if committed {
+                assert_eq!(
+                    persist::load_current_at(&create_root, &workspace.state_file("daemon-state"))
+                        .unwrap()
+                        .state
+                        .checkouts
+                        .len(),
+                    1
+                );
+            }
+
+            let delete_root = std::env::temp_dir().join(format!("bauded-api-delete-{suffix}"));
+            let _ = std::fs::remove_dir_all(&delete_root);
+            std::fs::create_dir_all(&delete_root).unwrap();
+            let delete_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            let delete_id = {
+                let mut manager = crate::manager::lock(&delete_state);
+                manager.persist_at_for_test(&delete_root, &workspace, None);
+                let id = manager.create("/tmp", None, None).unwrap().id;
+                manager.persist_at_for_test(&delete_root, &workspace, Some(failure));
+                id
+            };
+            let response = super::router(Arc::clone(&delete_state))
+                .oneshot(
+                    Request::delete(format!("/sessions/{delete_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                crate::manager::lock(&delete_state)
+                    .info(delete_id)
+                    .is_none(),
+                committed
+            );
+            let retained =
+                persist::load_current_at(&delete_root, &workspace.state_file("daemon-state"))
+                    .unwrap()
+                    .state;
+            assert_eq!(retained.repositories.len(), 1);
+            assert_eq!(retained.checkouts.len(), 1);
+            assert_eq!(retained.checkouts[0].active_intent(), !committed);
+
+            let archive_root = std::env::temp_dir().join(format!("bauded-api-archive-{suffix}"));
+            let _ = std::fs::remove_dir_all(&archive_root);
+            std::fs::create_dir_all(&archive_root).unwrap();
+            let archive_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            let archive_id = {
+                let mut manager = crate::manager::lock(&archive_state);
+                manager.persist_at_for_test(&archive_root, &workspace, None);
+                let id = manager.create("/tmp", None, None).unwrap().id;
+                manager.persist_at_for_test(&archive_root, &workspace, Some(failure));
+                id
+            };
+            let response = super::router(Arc::clone(&archive_state))
+                .oneshot(post_json(&format!("/sessions/{archive_id}/archive"), ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                crate::manager::lock(&archive_state)
+                    .info(archive_id)
+                    .unwrap()
+                    .archived,
+                committed
+            );
+            assert_eq!(
+                persist::load_current_at(&archive_root, &workspace.state_file("daemon-state"))
+                    .unwrap()
+                    .state
+                    .checkouts[0]
+                    .session
+                    .archived,
+                committed
+            );
+
+            let restart_root = std::env::temp_dir().join(format!("bauded-api-restart-{suffix}"));
+            let _ = std::fs::remove_dir_all(&restart_root);
+            std::fs::create_dir_all(&restart_root).unwrap();
+            let repo = initialized_repo(&restart_root, "repo");
+            let restart_state = Arc::new(Mutex::new(Manager::new("true".into(), true)));
+            let restart_id = {
+                let mut manager = crate::manager::lock(&restart_state);
+                manager.persist_at_for_test(&restart_root, &workspace, None);
+                manager
+                    .create(repo.to_str().unwrap(), None, None)
+                    .unwrap()
+                    .id
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while crate::manager::lock(&restart_state)
+                .info(restart_id)
+                .unwrap()
+                .status
+                != "exited"
+            {
+                assert!(Instant::now() < deadline, "stub never exited");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            crate::manager::lock(&restart_state).persist_at_for_test(
+                &restart_root,
+                &workspace,
+                Some(failure),
+            );
+            let response = super::router(Arc::clone(&restart_state))
+                .oneshot(post_json(&format!("/sessions/{restart_id}/restart"), ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                crate::manager::lock(&restart_state)
+                    .info(restart_id)
+                    .unwrap()
+                    .status,
+                "exited"
+            );
+
+            for state in [&create_state, &delete_state, &archive_state, &restart_state] {
+                crate::manager::lock(state).kill_all();
+            }
+            for root in [create_root, delete_root, archive_root, restart_root] {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_api_refuses_checkout_branch_change() {
+        let root =
+            std::env::temp_dir().join(format!("bauded-api-restart-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = initialized_repo(&root, "repo");
+        let (state, id) = exited_tracked_manager(&repo);
+        git(&repo, &["checkout", "-b", "changed"]);
+
+        let response = super::router(Arc::clone(&state))
+            .oneshot(post_json(&format!("/sessions/{id}/restart"), ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            crate::manager::lock(&state).info(id).unwrap().status,
+            "exited"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_api_refuses_replaced_repository_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "bauded-api-restart-replaced-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = initialized_repo(&root, "repo");
+        let replacement = initialized_repo(&root, "replacement");
+        let (state, id) = exited_tracked_manager(&repo);
+        std::fs::rename(&repo, root.join("original")).unwrap();
+        symlink(&replacement, &repo).unwrap();
+
+        let response = super::router(Arc::clone(&state))
+            .oneshot(post_json(&format!("/sessions/{id}/restart"), ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            crate::manager::lock(&state).info(id).unwrap().status,
+            "exited"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -788,7 +1165,7 @@ mod tests {
         {
             let mut m = lock(&state);
             m.session_id_for_test(id, &sid);
-            m.poll();
+            m.poll_claude_meta_for_test(id);
         }
         let app = super::router(Arc::clone(&state));
 

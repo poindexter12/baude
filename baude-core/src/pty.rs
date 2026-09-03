@@ -7,6 +7,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::repository::ProcessIdentity;
+
 /// Milliseconds since program start. Monotonic clock shared by all sessions.
 pub fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -21,6 +23,7 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    identity: ProcessIdentity,
     pub last_output_ms: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     size: (u16, u16), // (rows, cols)
@@ -32,6 +35,33 @@ impl Pty {
     /// Spawn `command` under the user's shell (interactive login, so PATH from
     /// .zshrc/.zprofile — mise, homebrew — is available) inside a new PTY.
     pub fn spawn(command: Option<&str>, cwd: &Path, rows: u16, cols: u16) -> Result<Pty> {
+        Self::spawn_with_env(command, &[], cwd, rows, cols)
+    }
+
+    /// Spawn with opaque environment values attached directly to the child
+    /// process rather than interpolated into the shell command text.
+    pub fn spawn_with_env(
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Pty> {
+        Self::spawn_registered_with(command, env, cwd, rows, cols, |_| Ok(()))
+    }
+
+    /// Spawn a PTY session leader behind a private stdin registration gate.
+    /// `register` observes the exact paused identity and must durably record it
+    /// before the intended command is released. Any registration failure stops
+    /// and reaps the gate, so no unowned command can escape.
+    pub fn spawn_registered_with(
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        register: impl FnOnce(&ProcessIdentity) -> Result<()>,
+    ) -> Result<Pty> {
         let rows = rows.max(2);
         let cols = cols.max(10);
         let pty_system = native_pty_system();
@@ -44,34 +74,87 @@ impl Pty {
             })
             .context("failed to open pty")?;
 
+        const GATE_TOKEN: &str = "baude-runtime-registered";
+        const GATE_SCRIPT: &str = "IFS= read -r gate || exit 125; [ \"$gate\" = \"$BAUDE_GATE_TOKEN\" ] || exit 126; if [ \"$BAUDE_GATE_MODE\" = command ]; then exec \"$BAUDE_GATE_SHELL\" -il -c \"$BAUDE_GATE_COMMAND\"; else exec \"$BAUDE_GATE_SHELL\" -il; fi";
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
-        match command {
-            Some(c) => {
-                cmd.args(["-il", "-c", c]);
-            }
-            None => {
-                cmd.args(["-il"]);
-            }
-        }
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", GATE_SCRIPT]);
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("BAUDE_GATE_TOKEN", GATE_TOKEN);
+        cmd.env("BAUDE_GATE_SHELL", &shell);
+        cmd.env(
+            "BAUDE_GATE_MODE",
+            if command.is_some() {
+                "command"
+            } else {
+                "interactive"
+            },
+        );
+        cmd.env("BAUDE_GATE_COMMAND", command.unwrap_or_default());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("failed to spawn command in pty")?;
         drop(pair.slave);
+        let identity = child
+            .process_id()
+            .ok_or_else(|| anyhow::anyhow!("PTY child did not expose a process id"))
+            .and_then(|pid| {
+                crate::session::inspect_process_identity(pid)
+                    .map_err(anyhow::Error::msg)?
+                    .ok_or_else(|| anyhow::anyhow!("PTY child {pid} exited before identification"))
+            });
+        let identity = match identity {
+            Ok(identity)
+                if identity.process_group == identity.pid as i32
+                    && identity.session == identity.pid as i32 =>
+            {
+                identity
+            }
+            Ok(identity) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "PTY child {} does not own its process group/session ({}/{})",
+                    identity.pid,
+                    identity.process_group,
+                    identity.session
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to establish PTY process identity"));
+            }
+        };
 
         let mut reader = pair
             .master
             .try_clone_reader()
             .context("failed to clone pty reader")?;
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .context("failed to take pty writer")?;
+        if let Err(error) = register(&identity) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.context("failed to register paused PTY identity"));
+        }
+        if let Err(error) = writer
+            .write_all(format!("{GATE_TOKEN}\n").as_bytes())
+            .and_then(|_| writer.flush())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("failed to release registered PTY gate");
+        }
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
         let last_output_ms = Arc::new(AtomicU64::new(now_ms()));
@@ -114,6 +197,7 @@ impl Pty {
             master: pair.master,
             writer,
             child: Arc::new(Mutex::new(child)),
+            identity,
             last_output_ms,
             exited,
             size: (rows, cols),
@@ -209,6 +293,10 @@ impl Pty {
         self.child.lock().ok().and_then(|c| c.process_id())
     }
 
+    pub fn process_identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+
     pub fn is_exited(&self) -> bool {
         if self.exited.load(Ordering::Relaxed) {
             return true;
@@ -228,12 +316,158 @@ impl Pty {
         }
         self.exited.store(true, Ordering::Relaxed);
     }
+
+    /// Stop the child and confirm that it has exited before reporting success.
+    /// Safety-sensitive callers must use this instead of the best-effort
+    /// `kill`, because a signal attempt alone is not a process-stop boundary.
+    pub fn kill_and_wait(&mut self) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if let Some(pid) = self.pid() {
+            if let Some(detail) = teardown_failures_for_test()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&pid)
+            {
+                anyhow::bail!("injected PTY teardown failure: {detail}");
+            }
+        }
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
+        if child
+            .try_wait()
+            .context("failed to inspect PTY child before stop")?
+            .is_some()
+        {
+            self.exited.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let observed = crate::session::inspect_process_identity(self.identity.pid)
+            .map_err(anyhow::Error::msg)?;
+        if observed.as_ref() != Some(&self.identity) {
+            self.exited.store(true, Ordering::Release);
+            return Ok(());
+        }
+        signal_group(self.identity.process_group, libc::SIGTERM)
+            .context("failed to terminate exact PTY process group")?;
+        if !wait_for_group_extinction(self.identity.process_group, child.as_mut()) {
+            signal_group(self.identity.process_group, libc::SIGKILL)
+                .context("failed to force exact PTY process group")?;
+            if !wait_for_group_extinction(self.identity.process_group, child.as_mut()) {
+                anyhow::bail!(
+                    "PTY process group {} remained live after forced termination",
+                    self.identity.process_group
+                );
+            }
+        }
+        if child
+            .try_wait()
+            .context("failed to inspect PTY child after group extinction")?
+            .is_none()
+        {
+            child.wait().context("failed to wait for PTY child")?;
+        }
+        self.exited.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn fail_next_teardown_for_test(&self, detail: impl Into<String>) {
+        if let Some(pid) = self.pid() {
+            teardown_failures_for_test()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(pid, detail.into());
+        }
+    }
+}
+
+fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: negative pid selects the process group captured from the exact
+    // PTY leader identity and rechecked immediately before the first signal.
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+fn process_group_exists(process_group: i32) -> bool {
+    // SAFETY: signal zero performs a liveness/permission probe only.
+    let result = unsafe { libc::kill(-process_group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn wait_for_group_extinction(process_group: i32, child: &mut dyn Child) -> bool {
+    for _ in 0..50 {
+        let _ = child.try_wait();
+        if !process_group_exists(process_group) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    !process_group_exists(process_group)
+}
+
+#[cfg(debug_assertions)]
+fn teardown_failures_for_test() -> &'static std::sync::Mutex<std::collections::HashMap<u32, String>>
+{
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn pre_exec_registration_gate_owner_death_and_release() {
+        let root =
+            std::env::temp_dir().join(format!("baude-registration-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("released");
+        let command = format!(
+            "trap '' HUP; printf released > {}; sleep 30",
+            marker.display()
+        );
+
+        let failed = Pty::spawn_registered_with(Some(&command), &[], &root, 5, 40, |_| {
+            anyhow::bail!("persistence refused")
+        });
+        assert!(failed.is_err());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "failed registration released command");
+
+        let mut pty = Pty::spawn_registered_with(Some(&command), &[], &root, 5, 40, |identity| {
+            assert_eq!(identity.pid as i32, identity.process_group);
+            assert_eq!(identity.pid as i32, identity.session);
+            Ok(())
+        })
+        .unwrap();
+        let identity = pty.process_identity().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gate was not released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pty.process_identity(), &identity);
+        pty.kill_and_wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn subscribe_snapshot_then_live_bytes() {
@@ -280,6 +514,26 @@ mod tests {
             "snapshot bytes duplicated on channel"
         );
         pty.kill();
+    }
+
+    #[test]
+    fn kill_and_wait_confirms_child_exit() {
+        let mut pty = Pty::spawn(Some("sleep 30"), Path::new("/tmp"), 5, 40).unwrap();
+        assert!(!pty.is_exited());
+        pty.kill_and_wait().unwrap();
+        assert!(pty.is_exited());
+    }
+
+    #[test]
+    fn kill_and_wait_accepts_and_retries_naturally_exited_child() {
+        let mut pty = Pty::spawn(Some("exit 0"), Path::new("/tmp"), 5, 40).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pty.is_exited() {
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pty.kill_and_wait().unwrap();
+        pty.kill_and_wait().unwrap();
     }
 
     #[test]

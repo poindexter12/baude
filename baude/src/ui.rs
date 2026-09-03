@@ -1,58 +1,118 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use baude_core::meta::{
     human_tokens, human_until, now_unix_ms, short_mode, short_model, HookEvent, RateWindow,
 };
 use baude_core::pty::now_ms;
+use baude_core::repository::{
+    CheckoutHealth, CheckoutRole, RepositoryHealth, StandaloneLifecycle, UnavailableCause,
+};
 use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
 use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
+use crate::hierarchy::{
+    ActionKind, ActionView, LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStandaloneRow,
+    LocalStatus,
+};
 use crate::remote::RemoteInfo;
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 42;
+const EMPTY_HEADING: &str = "no sessions yet";
+const EMPTY_BODY: &str = "press n to open a repository or folder, or c to clone";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponsiveMode {
+    Wide,
+    Medium,
+    Compact,
+    SinglePane,
+}
 
 pub struct LayoutRects {
     pub sidebar: Rect,
     pub content: Rect,
     pub status: Rect,
+    pub mode: ResponsiveMode,
+    pub sidebar_visible: bool,
+    pub content_visible: bool,
+    pub shell_visible: bool,
 }
 
-pub fn layout(area: Rect) -> LayoutRects {
+pub fn layout(area: Rect, focus: Focus) -> LayoutRects {
     let status = Rect {
-        y: area.y + area.height.saturating_sub(1),
-        height: 1,
+        y: area.y.saturating_add(area.height.saturating_sub(1)),
+        height: u16::from(area.height > 0),
         ..area
     };
     let body_h = area.height.saturating_sub(1);
-    let sidebar = Rect {
-        width: SIDEBAR_WIDTH.min(area.width / 3),
-        height: body_h,
-        ..area
+    let (mode, sidebar_width) = match area.width {
+        120.. => (ResponsiveMode::Wide, SIDEBAR_WIDTH.min(area.width)),
+        80..=119 => (ResponsiveMode::Medium, (area.width / 3).clamp(28, 38)),
+        60..=79 => (ResponsiveMode::Compact, 26.min(area.width)),
+        _ => (ResponsiveMode::SinglePane, area.width),
     };
-    let content = Rect {
-        x: area.x + sidebar.width,
-        width: area.width.saturating_sub(sidebar.width),
-        height: body_h,
-        ..area
+    let single_sidebar = mode == ResponsiveMode::SinglePane && focus == Focus::Sidebar;
+    let single_content = mode == ResponsiveMode::SinglePane && focus != Focus::Sidebar;
+    let sidebar_visible = area.width > 0 && body_h > 0 && !single_content;
+    let content_visible = area.width > 0 && body_h > 0 && !single_sidebar;
+    let sidebar = if sidebar_visible {
+        Rect::new(area.x, area.y, sidebar_width, body_h)
+    } else {
+        Rect::new(area.x, area.y, 0, 0)
+    };
+    let content = if content_visible {
+        let x = if mode == ResponsiveMode::SinglePane {
+            area.x
+        } else {
+            area.x.saturating_add(sidebar_width)
+        };
+        Rect::new(
+            x,
+            area.y,
+            if mode == ResponsiveMode::SinglePane {
+                area.width
+            } else {
+                area.width.saturating_sub(sidebar_width)
+            },
+            body_h,
+        )
+    } else {
+        Rect::new(area.x, area.y, 0, 0)
     };
     LayoutRects {
         sidebar,
         content,
         status,
+        mode,
+        sidebar_visible,
+        content_visible,
+        shell_visible: content_visible && area.height >= 13,
     }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let rects = layout(frame.area());
-    draw_sidebar(frame, app, rects.sidebar);
-    draw_content(frame, app, rects.content);
-    draw_status_bar(frame, app, rects.status);
+    let area = frame.area();
+    let rects = layout(area, app.focus);
+    if rects.sidebar_visible {
+        draw_sidebar(
+            frame,
+            app,
+            rects.sidebar,
+            area.height < 20 || (rects.mode == ResponsiveMode::Compact && area.height < 24),
+        );
+    }
+    if rects.content_visible {
+        draw_content(frame, app, rects.content);
+    }
+    if rects.status.height > 0 {
+        draw_status_bar(frame, app, rects.status);
+    }
     draw_modal(frame, app);
 }
 
@@ -100,17 +160,62 @@ fn selection_bg() -> Style {
     Style::default().bg(Color::Indexed(237))
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "…".into();
-    }
-    s.chars().take(max - 1).collect::<String>() + "…"
+fn cell_width(s: &str) -> usize {
+    Line::raw(s).width()
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+fn cell_clusters(s: &str) -> Vec<String> {
+    let mut clusters: Vec<String> = Vec::new();
+    for ch in s.chars() {
+        let text = ch.to_string();
+        if cell_width(&text) == 0 {
+            if let Some(cluster) = clusters.last_mut() {
+                cluster.push(ch);
+            } else {
+                clusters.push(text);
+            }
+        } else {
+            clusters.push(text);
+        }
+    }
+    clusters
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if cell_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let clusters = cell_clusters(s);
+    let leaf_start = clusters
+        .iter()
+        .rposition(|cluster| cluster == "/")
+        .unwrap_or(0);
+    let preferred = &clusters[leaf_start..];
+    let mut suffix: Vec<&str> = Vec::new();
+    let mut used = 1;
+    for cluster in preferred
+        .iter()
+        .rev()
+        .chain(clusters[..leaf_start].iter().rev())
+    {
+        let width = cell_width(cluster);
+        if used + width > max {
+            break;
+        }
+        suffix.push(cluster);
+        used += width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.concat())
+}
+
+fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -121,7 +226,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Carve a usage footer off the bottom of the sidebar when there's room.
     const FOOTER_H: u16 = 6;
-    let (list_area, footer_area) = if list_area.height >= FOOTER_H + 4 {
+    let (list_area, footer_area) = if area.height >= 19 && list_area.height >= FOOTER_H + 4 {
         let footer = Rect {
             y: list_area.y + list_area.height - FOOTER_H,
             height: FOOTER_H,
@@ -139,14 +244,19 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         draw_usage_footer(frame, app, fa);
     }
 
-    let ids = app.ordered_ids();
-    if ids.is_empty() {
+    let hierarchy = app.hierarchy_rows();
+    let remote_ids: Vec<_> = app
+        .ordered_ids()
+        .into_iter()
+        .filter(|id| matches!(id, SelId::Remote(_)))
+        .collect();
+    if hierarchy.is_empty() && remote_ids.is_empty() {
         let dim = Style::default().fg(Color::DarkGray);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
-                Line::from(Span::styled("  no sessions yet", dim)),
-                Line::from(Span::styled("  press n to add one", dim)),
+                Line::from(Span::styled(format!("  {EMPTY_HEADING}"), dim)),
+                Line::from(Span::styled(format!("  {EMPTY_BODY}"), dim)),
             ]),
             list_area,
         );
@@ -156,66 +266,342 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let width = list_area.width as usize;
     let focused = app.focus == Focus::Sidebar;
     let mut lines: Vec<Line> = Vec::new();
-    let mut remote_header_drawn = false;
-    let mut archive_header_drawn = false;
-    for id in &ids {
-        let archived = app.is_archived(*id);
-        if archived && !archive_header_drawn {
-            archive_header_drawn = true;
-            let dim = Style::default().fg(Color::DarkGray);
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("▼ archived", dim),
-            ]));
-        }
-        match id {
-            SelId::Local(lid) => {
-                let Some(s) = app.session(*lid) else { continue };
-                let selected = app.selected_id == Some(*id);
-                session_row(
-                    &mut lines,
-                    selected,
-                    focused,
-                    s.status(),
-                    &s.name,
-                    s.waiting_for_ms(),
-                    width,
-                    archived,
-                );
-                lines.push(meta_line(s, selected, focused, width));
-            }
-            SelId::Remote(rid) => {
-                if !remote_header_drawn && !archived {
-                    remote_header_drawn = true;
-                    lines.push(remote_header(app, width));
+    let mut selected_line = None;
+    let mut selected_parent_line = None;
+    let mut current_parent_line = None;
+    for row in &hierarchy {
+        match row {
+            LocalRow::Repository(parent) => {
+                current_parent_line = Some(lines.len());
+                let selected = app.selected_id == Some(SelId::Repository(parent.key));
+                if selected {
+                    selected_line = Some((lines.len(), lines.len()));
+                    selected_parent_line = current_parent_line;
                 }
-                let Some(r) = app.remote_info(*rid) else {
-                    continue;
-                };
-                let selected = app.selected_id == Some(*id);
-                let status = remote_status(r);
-                let waiting_ms = r
-                    .waiting_for_ms
-                    .map(|ms| ms + now_ms().saturating_sub(app.remote_snap.fetched_ms));
-                session_row(
+                repository_row(&mut lines, parent, selected, focused, width)
+            }
+            LocalRow::Checkout(child) => {
+                let selected = app.selected_id == Some(SelId::Checkout(child.key));
+                let start = lines.len();
+                checkout_row(
                     &mut lines,
+                    app,
+                    child,
                     selected,
                     focused,
-                    status,
-                    &r.name,
-                    waiting_ms.unwrap_or(0),
                     width,
-                    archived,
+                    compact_rows,
                 );
-                lines.push(remote_meta_line(r, selected, focused, width));
+                if selected {
+                    selected_line = Some((start, lines.len().saturating_sub(1)));
+                    selected_parent_line = current_parent_line;
+                }
+            }
+            LocalRow::Standalone(standalone) => {
+                current_parent_line = None;
+                let selected = app.selected_id == Some(SelId::Standalone(standalone.key));
+                let start = lines.len();
+                standalone_row(
+                    &mut lines,
+                    standalone,
+                    selected,
+                    focused,
+                    width,
+                    compact_rows,
+                );
+                if selected {
+                    selected_line = Some((start, lines.len().saturating_sub(1)));
+                    selected_parent_line = None;
+                }
             }
         }
     }
-    // Remote configured but no active sessions: still show the header.
-    if app.remote.is_some() && !remote_header_drawn {
+    if app.remote.is_some() {
         lines.push(remote_header(app, width));
     }
-    frame.render_widget(Paragraph::new(lines), list_area);
+    for id in remote_ids {
+        let SelId::Remote(rid) = id else { continue };
+        let Some(r) = app.remote_info(rid) else {
+            continue;
+        };
+        let selected = app.selected_id == Some(id);
+        let status = remote_status(r);
+        let waiting_ms = r
+            .waiting_for_ms
+            .map(|ms| ms + now_ms().saturating_sub(app.remote_snap.fetched_ms));
+        session_row(
+            &mut lines,
+            selected,
+            focused,
+            status,
+            &r.name,
+            waiting_ms.unwrap_or(0),
+            width,
+            r.archived,
+        );
+        lines.push(remote_meta_line(r, selected, focused, width));
+    }
+    let visible = list_area.height as usize;
+    let scroll = selected_line
+        .filter(|_| lines.len() > visible && visible > 0)
+        .map(|(_start, end)| {
+            let mut offset = end.saturating_add(2).saturating_sub(visible);
+            if let Some(parent) = selected_parent_line {
+                if end.saturating_sub(parent) < visible {
+                    offset = offset.min(parent);
+                }
+            }
+            offset.min(lines.len().saturating_sub(visible)) as u16
+        })
+        .unwrap_or(0);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
+}
+
+fn repository_row(
+    lines: &mut Vec<Line<'static>>,
+    row: &LocalRepositoryRow,
+    selected: bool,
+    focused: bool,
+    width: usize,
+) {
+    let name_style = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
+    };
+    let aggregate = if !matches!(row.health, RepositoryHealth::Available) {
+        "unavailable".to_string()
+    } else if row.waiting_count == 0 {
+        String::new()
+    } else if row.waiting_count == 1 {
+        "1 waiting".to_string()
+    } else {
+        format!("{} waiting", row.waiting_count)
+    };
+    let reserve = if aggregate.is_empty() {
+        0
+    } else {
+        cell_width(&aggregate) + 1
+    };
+    // The actual prefix is 11 cells: 2-cell gutter plus the 9-cell
+    // "  repo · " label. Reserving less lets a maximal name push the
+    // right-aligned aggregate past the row width at narrow sidebars.
+    let name = truncate(&row.display_name, width.saturating_sub(11 + reserve).max(1));
+    let mut spans = vec![
+        gutter(selected, focused),
+        Span::styled("  repo · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(name, name_style),
+    ];
+    let used = Line::from(spans.clone()).width() + cell_width(&aggregate);
+    if !aggregate.is_empty() {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        let aggregate_style = if matches!(row.health, RepositoryHealth::Available) {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        spans.push(Span::styled(aggregate, aggregate_style));
+    } else if selected {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+    let line = Line::from(spans);
+    lines.push(if selected {
+        line.style(selection_bg())
+    } else {
+        line
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkout_row(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    row: &LocalCheckoutRow,
+    selected: bool,
+    focused: bool,
+    width: usize,
+    compact: bool,
+) {
+    let (icon, icon_style, default_state_text) = match row.status {
+        LocalStatus::Waiting => (
+            "●",
+            Style::default().fg(if flash_on() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+            "waiting",
+        ),
+        LocalStatus::Working => (spinner(), Style::default().fg(Color::Blue), "working"),
+        LocalStatus::Completed => ("✓", Style::default().fg(Color::Green), "completed"),
+        LocalStatus::Exited => ("✗", Style::default().fg(Color::DarkGray), "exited"),
+        LocalStatus::Closed => ("○", Style::default().fg(Color::Gray), "closed"),
+        LocalStatus::Archived => ("·", Style::default().fg(Color::DarkGray), "archived"),
+        LocalStatus::Unavailable => ("!", Style::default().fg(Color::Yellow), "unavailable"),
+    };
+    let state_text = match (&row.health, row.actions.capability) {
+        (_, Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery)) => "recovery",
+        (CheckoutHealth::Unavailable(UnavailableCause::Missing), _) => "missing",
+        (CheckoutHealth::Unavailable(UnavailableCause::IdentityChanged), _) => "changed",
+        (CheckoutHealth::Unavailable(_), _) => "unavailable",
+        _ => default_state_text,
+    };
+    let name_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        match row.status {
+            LocalStatus::Waiting => Style::default().fg(Color::White),
+            LocalStatus::Working => Style::default().fg(Color::Cyan),
+            LocalStatus::Completed => Style::default().fg(Color::Green),
+            LocalStatus::Unavailable => Style::default().fg(Color::Yellow),
+            LocalStatus::Closed => Style::default().fg(Color::Gray),
+            LocalStatus::Archived | LocalStatus::Exited => Style::default().fg(Color::DarkGray),
+        }
+    };
+    let suffix = if matches!(row.status, LocalStatus::Waiting | LocalStatus::Completed) {
+        human_duration(row.waiting_for_ms)
+    } else {
+        String::new()
+    };
+    let reserve = if suffix.is_empty() {
+        0
+    } else {
+        cell_width(&suffix) + 1
+    };
+    let has_suffix = !suffix.is_empty();
+    let name = truncate(&row.name, width.saturating_sub(5 + reserve).max(1));
+    let mut spans = vec![
+        gutter(selected, focused),
+        Span::styled(icon.to_string(), icon_style),
+        Span::raw(" "),
+        Span::styled(name, name_style),
+    ];
+    let used = Line::from(spans.clone()).width() + cell_width(&suffix);
+    if has_suffix {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+    }
+    if selected && !has_suffix {
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+    let line = Line::from(spans);
+    lines.push(if selected {
+        line.style(selection_bg())
+    } else {
+        line
+    });
+
+    if compact {
+        return;
+    }
+    let role = match row.role {
+        CheckoutRole::Main => "main",
+        CheckoutRole::PrimaryDefault => "default",
+        CheckoutRole::ManagedBranch => "worktree",
+    };
+    let role_style = match row.role {
+        CheckoutRole::Main => Style::default().fg(Color::Blue),
+        CheckoutRole::PrimaryDefault => Style::default().fg(Color::Cyan),
+        CheckoutRole::ManagedBranch => Style::default().fg(Color::Magenta),
+    };
+    if let Some(runtime_id) = row.runtime_id {
+        if let Some(session) = app.session(runtime_id) {
+            let mut meta = meta_line(session, selected, focused, width);
+            meta.spans
+                .insert(2, Span::styled(format!("{role} · "), role_style));
+            lines.push(meta);
+            return;
+        }
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut meta = Line::from(vec![
+        gutter(selected, focused),
+        Span::styled("  ↳ ", dim),
+        Span::styled(format!("{role} · "), role_style),
+        Span::styled(state_text.to_string(), dim),
+    ]);
+    if selected {
+        let used = Line::from(meta.spans.clone()).width();
+        meta.spans
+            .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        meta = meta.style(selection_bg());
+    }
+    lines.push(meta);
+}
+
+fn standalone_row(
+    lines: &mut Vec<Line<'static>>,
+    row: &LocalStandaloneRow,
+    selected: bool,
+    focused: bool,
+    width: usize,
+    compact: bool,
+) {
+    let (icon, style, state) = match row.status {
+        LocalStatus::Waiting => ("●", Style::default().fg(Color::Yellow), "waiting"),
+        LocalStatus::Working => (spinner(), Style::default().fg(Color::Blue), "working"),
+        LocalStatus::Completed => ("✓", Style::default().fg(Color::Green), "completed"),
+        LocalStatus::Exited => ("✗", Style::default().fg(Color::DarkGray), "exited"),
+        LocalStatus::Closed => ("○", Style::default().fg(Color::Gray), "closed"),
+        LocalStatus::Archived => ("·", Style::default().fg(Color::DarkGray), "archived"),
+        LocalStatus::Unavailable => (
+            "!",
+            Style::default().fg(Color::Yellow),
+            match row.lifecycle {
+                StandaloneLifecycle::Missing => "missing",
+                StandaloneLifecycle::ProtectedTeardown(_) => "teardown protected",
+                _ => "unavailable",
+            },
+        ),
+    };
+    let name_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if matches!(row.status, LocalStatus::Unavailable) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let name = truncate(&row.name, width.saturating_sub(4).max(1));
+    let mut first = Line::from(vec![
+        gutter(selected, focused),
+        Span::styled(icon.to_string(), style),
+        Span::raw(" "),
+        Span::styled(name, name_style),
+    ]);
+    if selected {
+        let used = first.width();
+        first
+            .spans
+            .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        first = first.style(selection_bg());
+    }
+    lines.push(first);
+    if compact {
+        return;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let metadata = format!("folder · {} · {state}", tilde_path(&row.path));
+    let mut second = Line::from(vec![
+        gutter(selected, focused),
+        Span::styled("  ↳ ", dim),
+        Span::styled(truncate(&metadata, width.saturating_sub(6)), dim),
+    ]);
+    if selected {
+        let used = second.width();
+        second
+            .spans
+            .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        second = second.style(selection_bg());
+    }
+    lines.push(second);
 }
 
 /// Map a daemon status word onto the local status enum for shared styling.
@@ -253,14 +639,16 @@ fn chips_line(
     width: usize,
 ) -> Line<'static> {
     let sep = Style::default().fg(Color::DarkGray);
-    let mut spans: Vec<Span> = vec![gutter(selected, focused), Span::styled("↳ ", sep)];
-    let mut used = 4usize;
+    // Same 4-cell connector indent as the runtime-less meta line: the row
+    // anatomy must not shift when a runtime appears or goes away.
+    let mut spans: Vec<Span> = vec![gutter(selected, focused), Span::styled("  ↳ ", sep)];
+    let mut used = 6usize;
     for (i, (text, style)) in chips.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", sep));
             used += 3;
         }
-        used += text.chars().count();
+        used += cell_width(&text);
         spans.push(Span::styled(text, style));
     }
     if selected {
@@ -392,11 +780,11 @@ fn session_row(
     } else {
         String::new()
     };
-    let suffix_w = suffix.chars().count();
+    let suffix_w = cell_width(&suffix);
     // gutter(2) + icon(1) + space(1) = 4; reserve a space before the timer.
     let reserve = if suffix.is_empty() { 0 } else { suffix_w + 1 };
     let name = truncate(name, width.saturating_sub(4 + reserve).max(1));
-    let used = 4 + name.chars().count() + suffix_w;
+    let used = 4 + cell_width(&name) + suffix_w;
     let pad = width.saturating_sub(used);
 
     let mut spans = vec![
@@ -818,14 +1206,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let val = Style::default().fg(Color::Gray);
     let width = area.width as usize;
 
-    let hints = match app.focus {
-        Focus::Sidebar => " enter attach · n new · t shell · e edit · ? help",
-        Focus::Claude => " ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
-        Focus::Shell => " ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
-    };
+    let hints = status_hint(app, width);
 
-    let mut spans: Vec<Span> = vec![Span::styled(hints.to_string(), dim)];
-    let mut used = hints.chars().count();
+    let mut spans: Vec<Span> = vec![Span::styled(format!(" {hints}"), dim)];
+    let mut used = cell_width(hints) + 1;
 
     // Selected session's full path + branch — too wide for the sidebar.
     if let Some(s) = app.selected() {
@@ -833,8 +1217,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(b) = s.branch.as_deref().or(s.meta.git_branch.as_deref()) {
             loc.push_str(&format!(" ⎇ {b}"));
         }
-        if used + loc.chars().count() <= width {
-            used += loc.chars().count();
+        if used + cell_width(&loc) <= width {
+            used += cell_width(&loc);
+            spans.push(Span::styled(loc, val));
+        }
+    } else if let Some(saved) = app.selected_standalone() {
+        let loc = format!(" │ {}", tilde_path(&saved.canonical_path.to_path_buf()));
+        if used + cell_width(&loc) <= width {
+            used += cell_width(&loc);
             spans.push(Span::styled(loc, val));
         }
     }
@@ -849,6 +1239,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         "⬢ {}",
         baude_core::workspace::active().display_label()
     ));
+    if app.persistence_dirty() {
+        right.push("⚠ state unsaved".into());
+    }
     if waiting > 0 {
         right.push(format!("● {waiting} waiting"));
     }
@@ -866,13 +1259,90 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         right.push(format!("wk {}", human_until(t)));
     }
     let right = right.join(" · ");
-    if !right.is_empty() && used + right.chars().count() + 2 <= width {
-        let pad = width - used - right.chars().count() - 1;
+    if !right.is_empty() && used + cell_width(&right) + 2 <= width {
+        let pad = width - used - cell_width(&right) - 1;
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, dim));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn status_hint(app: &App, width: usize) -> &'static str {
+    action_status_hint(app.focus, app.selected_action_view(), width)
+}
+
+fn action_status_hint(focus: Focus, view: Option<ActionView>, width: usize) -> &'static str {
+    match focus {
+        Focus::Claude => "ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
+        Focus::Shell => "ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
+        Focus::Sidebar => {
+            let Some(view) = view else {
+                return "n open · c clone · ? help";
+            };
+            if view.kind == ActionKind::Remote {
+                return "enter attach · r restart · x close · ? help";
+            }
+            if width < 80 {
+                return match view.kind {
+                    ActionKind::Repository => "enter open · w branch · ? more",
+                    ActionKind::Unavailable => match view.capability {
+                        Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
+                            "i details · r reopen · ? more"
+                        }
+                        Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
+                            "i details · r recovery · ? more"
+                        }
+                        None => "i details · ? help",
+                    },
+                    ActionKind::Standalone => {
+                        if view.has_runtime {
+                            "enter attach · x close · ? more"
+                        } else {
+                            "enter reopen · e edit · ? more"
+                        }
+                    }
+                    _ if view.has_runtime => "enter attach · x close · ? more",
+                    _ if view.can_remove => "enter reopen · X remove · ? more",
+                    _ => "enter reopen · e edit · ? more",
+                };
+            }
+            match view.kind {
+                ActionKind::Repository => {
+                    "enter open default · w branch · e edit · i info · ? help"
+                }
+                ActionKind::Unavailable => match view.capability {
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
+                        "i details · r recheck and reopen · ? help"
+                    }
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
+                        "i details · r continue recovery · ? help"
+                    }
+                    None => "i details · ? help",
+                },
+                ActionKind::Standalone if view.has_runtime => {
+                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                }
+                ActionKind::Standalone => "enter reopen · e edit · i info · g gsd · ? help",
+                _ if view.has_runtime && view.can_remove => {
+                    "enter attach · x close · X remove* · t shell · e edit · a archive · ? help"
+                }
+                _ if view.has_runtime => {
+                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                }
+                _ if view.can_remove => "enter reopen · X remove* · e edit · i info · ? help",
+                _ => "enter reopen · e edit · i info · ? help",
+            }
+        }
+    }
+}
+
+fn repository_runtime_summary(count: usize, width: usize) -> String {
+    if width >= 28 {
+        format!("{count} checkouts · none running")
+    } else {
+        "no running sessions".into()
+    }
 }
 
 /// Left-truncate an input buffer so its tail — where the cursor sits — stays
@@ -1016,7 +1486,24 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         }
         Modal::ConfirmKill { id } => {
             let name = match id {
-                SelId::Local(lid) => app.session(*lid).map(|s| s.name.clone()),
+                SelId::Repository(_) => None,
+                SelId::Checkout(key) => app
+                    .selected_id
+                    .filter(|selected| selected == id)
+                    .and_then(|_| app.selected())
+                    .or_else(|| {
+                        app.hierarchy_rows().iter().find_map(|row| match row {
+                            LocalRow::Checkout(child) if child.key == *key => {
+                                child.runtime_id.and_then(|runtime| app.session(runtime))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .map(|session| session.name.clone()),
+                SelId::Standalone(key) => app.hierarchy_rows().iter().find_map(|row| match row {
+                    LocalRow::Standalone(row) if row.key == *key => Some(row.name.clone()),
+                    _ => None,
+                }),
                 SelId::Remote(rid) => app
                     .remote_info(*rid)
                     .map(|r| format!("{} (remote)", r.name)),
@@ -1041,23 +1528,65 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::ConfirmCloseWorktree { id } => {
-            let name = app.session(*id).map(|s| s.name.clone()).unwrap_or_default();
-            let rect = centered(area, 56, 4);
+            let name = app
+                .session(*id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| app.selected_target_label());
+            let lines = if app.selected_standalone().is_some() {
+                [
+                    format!("Close session “{name}” and keep its folder for reopening?"),
+                    "y/enter close · n/esc keep session open".into(),
+                ]
+            } else {
+                close_confirmation_lines(&name)
+            };
+            let rect = centered(area, 76, 7);
             frame.render_widget(Clear, rect);
             let p = Paragraph::new(vec![
-                Line::raw(format!("close worktree session \"{name}\"?")),
+                Line::raw(lines[0].clone()),
                 Line::from(Span::styled(
-                    "k keep worktree · r remove worktree · esc cancel",
+                    lines[1].clone(),
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(" close worktree session "),
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" close local session "),
             );
+            frame.render_widget(p, rect);
+        }
+        Modal::ConfirmRemoveWorktree { confirmation } => {
+            let target = app
+                .hierarchy_rows()
+                .into_iter()
+                .find_map(|row| match row {
+                    LocalRow::Checkout(child) if child.key == confirmation.checkout() => {
+                        Some(child.name)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| app.selected_target_label());
+            let rect = centered(area, 76, 8);
+            let inner_width = rect.width.saturating_sub(2) as usize;
+            let lines = remove_confirmation_lines(
+                &target,
+                confirmation.path(),
+                confirmation.branch_ref(),
+                inner_width,
+            );
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(" remove managed worktree "),
+                );
             frame.render_widget(p, rect);
         }
         Modal::Info => {
@@ -1124,7 +1653,169 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 frame.render_widget(p, rect);
                 return;
             }
-            let Some(s) = app.selected() else { return };
+            if let Some(repository) = app.selected_repository() {
+                let dim = Style::default().fg(Color::DarkGray);
+                let val = Style::default().fg(Color::White);
+                let row = |label: &str, value: String| {
+                    Line::from(vec![
+                        Span::styled(format!("  {label:<16}"), dim),
+                        Span::styled(value, val),
+                    ])
+                };
+                let parent = app
+                    .hierarchy_rows()
+                    .into_iter()
+                    .find_map(|item| match item {
+                        LocalRow::Repository(parent) if parent.key == repository.key => {
+                            Some(parent)
+                        }
+                        _ => None,
+                    });
+                let child_count = parent
+                    .as_ref()
+                    .map(|parent| parent.child_count)
+                    .unwrap_or(0);
+                let running = app
+                    .hierarchy_rows()
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        LocalRow::Checkout(child) if child.repository_key == repository.key => {
+                            child.runtime_id
+                        }
+                        _ => None,
+                    })
+                    .count();
+                let runtime_summary = if running == 0 {
+                    repository_runtime_summary(child_count, 76)
+                } else {
+                    format!("{child_count} checkouts · {running} running")
+                };
+                let lines = vec![
+                    row(
+                        "repository",
+                        parent
+                            .as_ref()
+                            .map(|parent| parent.display_name.clone())
+                            .unwrap_or_else(|| app.selected_target_label()),
+                    ),
+                    row(
+                        "main checkout",
+                        repository
+                            .observed_main_worktree
+                            .to_path_buf()
+                            .display()
+                            .to_string(),
+                    ),
+                    row("sessions", runtime_summary),
+                    row("health", format!("{:?}", repository.health)),
+                    Line::raw(""),
+                    Line::from(Span::styled("  press any key to close", dim)),
+                ];
+                let rect = centered(area, 76, lines.len() as u16 + 2);
+                frame.render_widget(Clear, rect);
+                frame.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(" repository info "),
+                    ),
+                    rect,
+                );
+                return;
+            }
+            if app.selected().is_none() {
+                if let Some(saved) = app.selected_standalone() {
+                    let dim = Style::default().fg(Color::DarkGray);
+                    let val = Style::default().fg(Color::White);
+                    let row = |label: &str, value: String| {
+                        Line::from(vec![
+                            Span::styled(format!("  {label:<16}"), dim),
+                            Span::styled(value, val),
+                        ])
+                    };
+                    let lines = vec![
+                        row("folder session", saved.session.name.clone()),
+                        row(
+                            "folder",
+                            saved.canonical_path.to_path_buf().display().to_string(),
+                        ),
+                        row("state", format!("{:?}", saved.lifecycle())),
+                        row(
+                            "resume id",
+                            saved
+                                .session
+                                .resume_id
+                                .clone()
+                                .unwrap_or_else(|| "—".into()),
+                        ),
+                        Line::raw(""),
+                        Line::from(Span::styled("  press any key to close", dim)),
+                    ];
+                    let rect = centered(area, 76, lines.len() as u16 + 2);
+                    frame.render_widget(Clear, rect);
+                    frame.render_widget(
+                        Paragraph::new(lines).block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(Color::Cyan))
+                                .title(" standalone folder info "),
+                        ),
+                        rect,
+                    );
+                    return;
+                }
+            }
+            let Some(s) = app.selected() else {
+                let Some(checkout) = app.selected_checkout() else {
+                    return;
+                };
+                let dim = Style::default().fg(Color::DarkGray);
+                let val = Style::default().fg(Color::White);
+                let row = |label: &str, value: String| {
+                    Line::from(vec![
+                        Span::styled(format!("  {label:<16}"), dim),
+                        Span::styled(value, val),
+                    ])
+                };
+                let cause = match checkout.health() {
+                    CheckoutHealth::Available => format!("{:?}", checkout.lifecycle()),
+                    CheckoutHealth::Unavailable(cause) => format!("unavailable: {cause:?}"),
+                };
+                let lines = vec![
+                    row("checkout", checkout.session.name.clone()),
+                    row(
+                        "cwd",
+                        checkout.observed_path.to_path_buf().display().to_string(),
+                    ),
+                    row(
+                        "branch",
+                        checkout
+                            .observed_branch
+                            .clone()
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    row("role", format!("{:?}", checkout.role)),
+                    row("state", cause),
+                    Line::raw(""),
+                    Line::from(Span::styled("  press any key to close", dim)),
+                ];
+                let rect = centered(area, 76, lines.len() as u16 + 2);
+                frame.render_widget(Clear, rect);
+                frame.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(" checkout info "),
+                    ),
+                    rect,
+                );
+                return;
+            };
             let dim = Style::default().fg(Color::DarkGray);
             let val = Style::default().fg(Color::White);
             let row = |label: &str, value: String| {
@@ -1253,8 +1944,24 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 return;
             }
             // Local: read the ClaudeMeta ring directly.
-            let Some(s) = app.selected() else { return };
-            let mut lines = activity_lines(s.meta.activity().iter(), MAX_ROWS);
+            let (title, mut lines) = if let Some(s) = app.selected() {
+                (
+                    s.name.clone(),
+                    activity_lines(s.meta.activity().iter(), MAX_ROWS),
+                )
+            } else if let Some(checkout) = app.selected_checkout() {
+                (
+                    checkout.session.name.clone(),
+                    vec![Line::from(Span::styled("  no activity yet", dim))],
+                )
+            } else if let Some(saved) = app.selected_standalone() {
+                (
+                    saved.session.name.clone(),
+                    vec![Line::from(Span::styled("  no activity yet", dim))],
+                )
+            } else {
+                return;
+            };
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled("  press any key to close", dim)));
             let rect = centered(area, WIDTH, lines.len() as u16 + 2);
@@ -1265,13 +1972,12 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Cyan))
-                        .title(format!(" activity — {} ", s.name)),
+                        .title(format!(" activity — {title} ")),
                 ),
                 rect,
             );
         }
         Modal::Gsd => {
-            let Some(s) = app.selected() else { return };
             let dim = Style::default().fg(Color::DarkGray);
             let val = Style::default().fg(Color::White);
             let row = |label: &str, value: String| {
@@ -1280,7 +1986,33 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     Span::styled(value, val),
                 ])
             };
-            let lines = match &s.meta.gsd {
+            let (repo_root, title, gsd) = if let Some(s) = app.selected() {
+                (s.repo_root.clone(), s.name.clone(), s.meta.gsd.clone())
+            } else if let Some(repository) = app.selected_repository() {
+                let root = repository.observed_main_worktree.to_path_buf();
+                (
+                    root.clone(),
+                    app.selected_target_label(),
+                    baude_core::meta::parse_gsd(&root),
+                )
+            } else if let Some(checkout) = app.selected_checkout() {
+                let root = checkout.session.repo_root.to_path_buf();
+                (
+                    root.clone(),
+                    checkout.session.name.clone(),
+                    baude_core::meta::parse_gsd(&root),
+                )
+            } else if let Some(saved) = app.selected_standalone() {
+                let root = saved.canonical_path.to_path_buf();
+                (
+                    root.clone(),
+                    saved.session.name.clone(),
+                    baude_core::meta::parse_gsd(&root),
+                )
+            } else {
+                return;
+            };
+            let lines = match &gsd {
                 Some(g) => {
                     let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
                     let mut lines = vec![
@@ -1308,7 +2040,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     lines
                 }
                 None => vec![Line::from(Span::styled(
-                    "  no .planning/STATE.md in this repo",
+                    "  no .planning/STATE.md in this folder",
                     dim,
                 ))],
             };
@@ -1325,10 +2057,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                         .border_style(Style::default().fg(Color::Green))
                         .title(format!(
                             " gsd — {} ",
-                            s.repo_root
+                            repo_root
                                 .file_name()
                                 .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default()
+                                .unwrap_or(title)
                         )),
                 ),
                 rect,
@@ -1340,11 +2072,14 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "sidebar (control mode)",
+                    "select repository or checkout",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::raw("  j/k ↑/↓     select session"),
-                Line::raw("  enter       attach to selected session"),
+                Line::raw("  j/k ↑/↓     select repository or checkout"),
+                Line::raw("  enter       open, attach, or reopen"),
+                Line::raw("  x           close session; keep checkout"),
+                Line::raw("  X removes verified clean managed worktree"),
+                Line::raw("              local branch is retained"),
                 Line::raw("  t           open shell pane (focuses it)"),
                 Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
@@ -1355,7 +2090,6 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
                 Line::raw("  a           archive/unarchive (auto after idle timeout)"),
-                Line::raw("  x           close session"),
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),
                 Line::from(Span::styled(
@@ -1391,10 +2125,605 @@ fn draw_modal(frame: &mut Frame, app: &App) {
     }
 }
 
+fn close_confirmation_lines(target: &str) -> [String; 2] {
+    [
+        format!("Close session “{target}” and keep its checkout for reopening?"),
+        "y/enter close · n/esc keep session open".into(),
+    ]
+}
+
+fn remove_confirmation_lines(
+    target: &str,
+    path: &std::path::Path,
+    branch_ref: &str,
+    width: usize,
+) -> Vec<String> {
+    let labeled = |label: &str, value: &str| {
+        let prefix = format!("{label}: ");
+        format!(
+            "{prefix}{}",
+            truncate(value, width.saturating_sub(cell_width(&prefix)))
+        )
+    };
+    vec![
+        truncate("Remove this clean baude-managed linked worktree?", width),
+        labeled("target", target),
+        labeled("branch", branch_ref),
+        labeled("path", &path.display().to_string()),
+        truncate(
+            "The local branch is retained. The repository parent and siblings are unchanged.",
+            width,
+        ),
+        truncate("y/enter remove · n/esc keep worktree", width),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::rate_5h_chip;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use baude_core::repository::{
+        CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+        RetainedSessionState, RetainedStandaloneSessionState, SavedCheckout, SavedRepository,
+        SavedStandaloneSession, StandaloneLifecycle,
+    };
+    use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Style};
+    use ratatui::Terminal;
+
+    use crate::app::{App, Focus, Modal, SelId};
+
+    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines};
+
+    fn persisted_path(value: &str) -> PersistedPath {
+        PersistedPath::from_path(Path::new(value))
+    }
+
+    fn hierarchy_fixture() -> (App, baude_core::repository::RepositoryKey) {
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/viewport/repository/.git"),
+            observed_main_worktree: persisted_path("/tmp/viewport/repository"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        for (index, (name, branch, role, managed, lifecycle, archived)) in [
+            (
+                "repository:develop",
+                "develop",
+                CheckoutRole::Main,
+                false,
+                CheckoutLifecycle::Inactive,
+                false,
+            ),
+            (
+                "repository:feature/界e\u{301}-leaf",
+                "feature/界e\u{301}-leaf",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Inactive,
+                false,
+            ),
+            (
+                "repository:archived",
+                "archived",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Inactive,
+                true,
+            ),
+            (
+                "repository:missing",
+                "missing",
+                CheckoutRole::ManagedBranch,
+                true,
+                CheckoutLifecycle::Protected(baude_core::repository::UnavailableCause::Missing),
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let path = format!("/tmp/viewport/repository worktrees/{index}-{branch}");
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                role,
+                managed,
+                persisted_path(&path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                lifecycle,
+                RetainedSessionState {
+                    name: name.into(),
+                    cwd: persisted_path(&path),
+                    repo_root: persisted_path("/tmp/viewport/repository"),
+                    branch: Some(branch.into()),
+                    is_worktree: role != CheckoutRole::Main,
+                    shell_open: false,
+                    archived,
+                    archived_by_user: archived,
+                    resume_id: None,
+                },
+            ));
+        }
+        let selected = state.checkouts[1].key;
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Checkout(selected));
+        (app, repository)
+    }
+
+    fn render(app: &App, width: u16, height: u16) -> (String, ratatui::buffer::Buffer) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (rendered, buffer)
+    }
+
+    #[test]
+    fn hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics() {
+        let (mut app, repository) = hierarchy_fixture();
+        for (width, height) in [(160, 40), (100, 30), (79, 24), (59, 20), (40, 12)] {
+            app.focus = Focus::Sidebar;
+            let (rendered, buffer) = render(&app, width, height);
+            assert!(
+                rendered.contains("repo · repository"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(
+                rendered.contains("! repository:missing"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(
+                rendered.contains("? more") || width >= 80,
+                "{width}x{height}: {rendered}"
+            );
+            assert!(buffer
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Indexed(237)));
+            let expected_sidebar_right = match width {
+                120.. => 41,
+                80..=119 => (width / 3).clamp(28, 38) - 1,
+                60..=79 => 25,
+                _ => width - 1,
+            };
+            assert_eq!(
+                buffer[(expected_sidebar_right, 0)].symbol(),
+                "╮",
+                "{width}x{height}"
+            );
+        }
+
+        app.selected_id = Some(SelId::Repository(repository));
+        app.focus = Focus::Claude;
+        let (rendered, buffer) = render(&app, 59, 20);
+        assert!(
+            !rendered.contains("repo · repository"),
+            "single content pane leaked sidebar"
+        );
+        assert_eq!(buffer[(58, 0)].symbol(), "╮");
+
+        app.focus = Focus::Sidebar;
+        app.modal = Modal::Help;
+        let (rendered, _) = render(&app, 40, 12);
+        assert!(rendered.contains("repository or checkout"), "{rendered}");
+        assert!(rendered.contains("X removes"), "{rendered}");
+    }
+
+    #[test]
+    fn hierarchy_unicode_width_scroll_and_selection_band_are_cell_correct() {
+        use ratatui::text::Line;
+
+        let clipped = super::truncate("feature/界e\u{301}", 6);
+        assert!(Line::raw(clipped.clone()).width() <= 6, "{clipped:?}");
+        assert!(clipped.ends_with("界e\u{301}"), "{clipped:?}");
+
+        let (mut app, _) = hierarchy_fixture();
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child)
+                if child.status == crate::hierarchy::LocalStatus::Unavailable =>
+            {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
+        let (rendered, buffer) = render(&app, 26, 13);
+        assert!(
+            rendered.contains(":missing"),
+            "selected row was not scrolled into view: {rendered}"
+        );
+        for y in 1..12 {
+            assert_ne!(
+                buffer[(25, y)].bg,
+                Color::Indexed(237),
+                "selection overwrote border at row {y}"
+            );
+        }
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Indexed(237)));
+    }
+
+    #[test]
+    fn hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove() {
+        let (mut app, _) = hierarchy_fixture();
+        app.modal = Modal::ConfirmCloseWorktree { id: u64::MAX };
+        let (wide, wide_buffer) = render(&app, 100, 30);
+        assert!(wide.contains("close local session"), "{wide}");
+        assert_eq!(
+            close_confirmation_lines("repository:feature/界e\u{301}-leaf")[0],
+            "Close session “repository:feature/界e\u{301}-leaf” and keep its checkout for reopening?"
+        );
+        assert!(wide.contains("repository:feature/界"), "{wide}");
+        assert!(
+            wide.contains("y/enter close · n/esc keep session open"),
+            "{wide}"
+        );
+        assert!(wide_buffer
+            .content
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan));
+        assert!(!wide_buffer
+            .content
+            .iter()
+            .any(|cell| { cell.fg == Color::Red && cell.symbol().contains("close checkout") }));
+        let (tiny, _) = render(&app, 40, 12);
+        assert!(tiny.contains("界"), "{tiny}");
+        assert!(tiny.contains("y/enter close"), "{tiny}");
+
+        let lines = remove_confirmation_lines(
+            "repository:feature/safe-remove",
+            std::path::Path::new("/tmp/repository worktrees/safe-remove"),
+            "refs/heads/feature/safe-remove",
+            100,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Remove this clean baude-managed linked worktree?",
+                "target: repository:feature/safe-remove",
+                "branch: refs/heads/feature/safe-remove",
+                "path: /tmp/repository worktrees/safe-remove",
+                "The local branch is retained. The repository parent and siblings are unchanged.",
+                "y/enter remove · n/esc keep worktree",
+            ]
+        );
+        let tiny_lines = remove_confirmation_lines(
+            "repository:feature/safe-remove",
+            std::path::Path::new("/tmp/repository worktrees/safe-remove"),
+            "refs/heads/feature/safe-remove",
+            38,
+        );
+        assert_eq!(tiny_lines.len(), 6);
+        assert!(tiny_lines[1].ends_with("safe-remove"), "{tiny_lines:?}");
+        assert_eq!(tiny_lines[5], "y/enter remove · n/esc keep worktree");
+        assert!(tiny_lines
+            .iter()
+            .all(|line| ratatui::text::Line::raw(line).width() <= 38));
+    }
+
+    #[test]
+    fn hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints() {
+        let mut empty = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        empty.remote = None;
+        let (rendered, _) = render(&empty, 100, 30);
+        assert_eq!(super::EMPTY_HEADING, "no sessions yet");
+        assert_eq!(
+            super::EMPTY_BODY,
+            "press n to open a repository or folder, or c to clone"
+        );
+        assert!(rendered.contains(super::EMPTY_HEADING), "{rendered}");
+
+        let (mut app, repository) = hierarchy_fixture();
+        app.selected_id = Some(SelId::Repository(repository));
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "enter open default · w branch · e edit · i info · ? help"
+        );
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child) if child.managed_by_baude => {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "enter reopen · X remove* · e edit · i info · ? help"
+        );
+        assert_eq!(
+            super::status_hint(&app, 59),
+            "enter reopen · X remove · ? more"
+        );
+        app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
+            crate::hierarchy::LocalRow::Checkout(child) if !child.managed_by_baude => {
+                Some(SelId::Checkout(child.key))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            super::status_hint(&app, 59),
+            "enter reopen · e edit · ? more"
+        );
+        app.focus = Focus::Claude;
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle"
+        );
+        app.focus = Focus::Shell;
+        assert_eq!(
+            super::status_hint(&app, 160),
+            "ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle"
+        );
+
+        use crate::hierarchy::{action_view, ActionSelection};
+        use baude_core::lifecycle::LifecycleCapability;
+        let repository = action_view(ActionSelection::Repository { available: true }, false, None);
+        let live = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: true,
+            },
+            true,
+            None,
+        );
+        let retained = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: true,
+            },
+            false,
+            Some(LifecycleCapability::RetryReopen),
+        );
+        let retry_reopen = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: false,
+            },
+            false,
+            Some(LifecycleCapability::RetryReopen),
+        );
+        let retry_recovery = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: false,
+            },
+            false,
+            Some(LifecycleCapability::RetryRecovery),
+        );
+        let unavailable = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::ManagedBranch,
+                managed_by_baude: true,
+                available: false,
+            },
+            false,
+            None,
+        );
+        for (focus, view, expected) in [
+            (
+                Focus::Sidebar,
+                Some(repository),
+                "enter open default · w branch · e edit · i info · ? help",
+            ),
+            (
+                Focus::Sidebar,
+                Some(live),
+                "enter attach · x close · X remove* · t shell · e edit · a archive · ? help",
+            ),
+            (
+                Focus::Sidebar,
+                Some(retained),
+                "enter reopen · X remove* · e edit · i info · ? help",
+            ),
+            (
+                Focus::Sidebar,
+                Some(retry_reopen),
+                "i details · r recheck and reopen · ? help",
+            ),
+            (
+                Focus::Sidebar,
+                Some(retry_recovery),
+                "i details · r continue recovery · ? help",
+            ),
+            (Focus::Sidebar, Some(unavailable), "i details · ? help"),
+            (
+                Focus::Claude,
+                None,
+                "ctrl+q sidebar · ctrl+\\ shell · alt+←/→ cycle",
+            ),
+            (
+                Focus::Shell,
+                None,
+                "ctrl+q sidebar · ctrl+\\ close shell · alt+←/→ cycle",
+            ),
+        ] {
+            assert_eq!(super::action_status_hint(focus, view, 160), expected);
+        }
+        assert_eq!(
+            super::action_status_hint(Focus::Sidebar, Some(retained), 59),
+            "enter reopen · X remove · ? more"
+        );
+        let retained_main = action_view(
+            ActionSelection::Checkout {
+                role: CheckoutRole::Main,
+                managed_by_baude: false,
+                available: true,
+            },
+            false,
+            Some(LifecycleCapability::RetryReopen),
+        );
+        assert_eq!(
+            super::action_status_hint(Focus::Sidebar, Some(retained_main), 59),
+            "enter reopen · e edit · ? more"
+        );
+
+        let source = include_str!("app.rs");
+        for literal in [
+            "State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started.",
+            "reopening “{target}”…",
+            "session closed — checkout kept",
+            "created worktree for {value}",
+            "activated {value}",
+            "focused existing {value}",
+            "worktree removed — local branch {branch_ref} retained",
+        ] {
+            assert!(source.contains(literal), "missing exact copy: {literal}");
+        }
+        assert_eq!(
+            super::repository_runtime_summary(3, 80),
+            "3 checkouts · none running"
+        );
+        assert_eq!(
+            super::repository_runtime_summary(3, 20),
+            "no running sessions"
+        );
+    }
+
+    #[test]
+    fn standalone_root_row_and_overlays_use_folder_language() {
+        let mut state = RepositoryState::default();
+        let key = state.allocate_standalone_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.standalone_sessions.push(SavedStandaloneSession::new(
+            key,
+            persisted_path("/t/plain folder"),
+            order,
+            StandaloneLifecycle::Missing,
+            None,
+            RetainedStandaloneSessionState {
+                name: "plain folder".into(),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: Some("resume-folder".into()),
+                ever_launched: true,
+            },
+        ));
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Standalone(key));
+
+        let (sidebar, _) = render(&app, 120, 30);
+        assert!(sidebar.contains("plain folder"), "{sidebar}");
+        assert!(
+            sidebar.contains("folder · /t/plain folder · missing"),
+            "{sidebar}"
+        );
+        assert!(
+            sidebar.contains("enter reopen · e edit · i info · g gsd"),
+            "{sidebar}"
+        );
+        assert!(!sidebar.contains("X remove"), "{sidebar}");
+
+        app.modal = Modal::Info;
+        let (info, _) = render(&app, 120, 30);
+        assert!(info.contains("standalone folder info"), "{info}");
+        assert!(info.contains("resume-folder"), "{info}");
+        app.modal = Modal::Gsd;
+        let (gsd, _) = render(&app, 120, 30);
+        assert!(
+            gsd.contains("no .planning/STATE.md in this folder"),
+            "{gsd}"
+        );
+    }
+
+    #[test]
+    fn hierarchy_tracer_renders_real_app_parent_and_child() {
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/tracer/repo/.git"),
+            observed_main_worktree: persisted_path("/tmp/tracer/repo"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+        });
+        for (role, managed, checkout_path, branch) in [
+            (CheckoutRole::Main, false, "/tmp/tracer/repo", "develop"),
+            (
+                CheckoutRole::PrimaryDefault,
+                true,
+                "/tmp/tracer/default",
+                "main",
+            ),
+        ] {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                role,
+                managed,
+                persisted_path(checkout_path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("repo:{branch}"),
+                    cwd: persisted_path(checkout_path),
+                    repo_root: persisted_path("/tmp/tracer/repo"),
+                    branch: Some(branch.into()),
+                    is_worktree: checkout_path != "/tmp/tracer/repo",
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+        }
+
+        let selected = state.checkouts[0].key;
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Checkout(selected));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("repo · repo"), "{rendered}");
+        assert!(rendered.contains("▌ ○ repo:develop"), "{rendered}");
+        assert!(rendered.contains("  ○ repo:main"), "{rendered}");
+        assert!(rendered.contains("main · closed"), "{rendered}");
+        assert!(rendered.contains("default · closed"), "{rendered}");
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Indexed(237)));
+        assert!(buffer.content.iter().any(|cell| cell.fg == Color::Cyan));
+    }
 
     #[test]
     fn rate_5h_chip_formats_and_colors() {
@@ -1429,5 +2758,20 @@ mod tests {
         // Degenerate widths never panic.
         assert_eq!(input_tail("abc", 0), "…");
         assert_eq!(input_tail("abc", 1), "…");
+    }
+
+    #[test]
+    fn remove_confirmation_names_exact_branch_and_path() {
+        let lines = remove_confirmation_lines(
+            "repo:feature/safe-remove",
+            std::path::Path::new("/tmp/repo worktree"),
+            "refs/heads/feature/safe-remove",
+            100,
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("refs/heads/feature/safe-remove")));
+        assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
+        assert!(lines.iter().any(|line| line.contains("branch is retained")));
     }
 }
