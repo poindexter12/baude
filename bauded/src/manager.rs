@@ -2580,7 +2580,7 @@ mod tests {
     }
 
     fn mgr() -> Manager {
-        Manager::new("sleep 30".into(), false)
+        Manager::new("sh -c 'sleep 30'".into(), false)
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -2775,7 +2775,7 @@ mod tests {
 
     #[test]
     fn exhausted_durable_counter_rejects_create_before_spawn() {
-        let mut manager = Manager::new("sleep 30".into(), true);
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::MAX - 1;
 
         let error = match manager.create("/tmp", None, None) {
@@ -2880,7 +2880,7 @@ mod tests {
     #[test]
     fn create_persistence_failure_keeps_memory_process_and_disk_consistent() {
         let (root, workspace) = persistence_fixture("create");
-        let mut manager = Manager::new("sleep 30".into(), true);
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
 
         assert!(manager.create("/tmp", None, Some("pre")).is_err());
@@ -3139,7 +3139,7 @@ mod tests {
             |_| {},
         );
         let snapshot = git::discover_repository(&repo).unwrap();
-        let mut crashed = Manager::new("sleep 30".into(), true);
+        let mut crashed = Manager::new("sh -c 'sleep 30'".into(), true);
         crashed.persist_at_for_test(&state_root, &workspace, None);
         let prepared = lifecycle::prepare_activation(
             &mut crashed.repository_state,
@@ -3151,7 +3151,7 @@ mod tests {
             .unwrap();
         crashed.save_checked().unwrap();
 
-        let mut restarted = Manager::new("sleep 30".into(), true);
+        let mut restarted = Manager::new("sh -c 'sleep 30'".into(), true);
         assert_eq!(restarted.restore_at(&state_root, &workspace), 1);
         assert_eq!(restarted.repository_state.checkouts.len(), 1);
         let recovered = &restarted.repository_state.checkouts[0];
@@ -3267,7 +3267,7 @@ mod tests {
             ("remove-post", persist::AtomicFailure::DirectorySync, true),
         ] {
             let (root, workspace) = persistence_fixture(label);
-            let mut manager = Manager::new("sleep 30".into(), true);
+            let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
             manager.session_id_for_test(id, &format!("opaque-{label}"));
@@ -3292,18 +3292,28 @@ mod tests {
             // facts so a CI-only failure names the path that really ran.
             let ps = |pid: u32| {
                 Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "pid,ppid,pgid,stat,etime,command"])
+                    .args([
+                        "-p",
+                        &pid.to_string(),
+                        "-o",
+                        "pid,ppid,pgid,stat,etime,command",
+                    ])
                     .output()
-                    .map(|o| format!(
-                        "status={} out={} err={}",
-                        o.status,
-                        String::from_utf8_lossy(&o.stdout).trim(),
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ))
+                    .map(|o| {
+                        format!(
+                            "status={} out={} err={}",
+                            o.status,
+                            String::from_utf8_lossy(&o.stdout).trim(),
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        )
+                    })
                     .unwrap_or_else(|e| format!("ps failed: {e}"))
             };
             eprintln!("[diag {label}] close_error={close_error:?}");
-            eprintln!("[diag {label}] elapsed_after_remove={:?}", spawn_instant.elapsed());
+            eprintln!(
+                "[diag {label}] elapsed_after_remove={:?}",
+                spawn_instant.elapsed()
+            );
             eprintln!("[diag {label}] agent {}", ps(original_pid));
             eprintln!("[diag {label}] shell {}", ps(original_shell_pid));
             eprintln!(
@@ -3370,7 +3380,7 @@ mod tests {
     #[test]
     fn lifecycle_close_manager_success_retains_exact_child_context() {
         let (root, workspace) = persistence_fixture("close-success");
-        let mut manager = Manager::new("sleep 30".into(), true);
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, &workspace, None);
         let id = manager
             .create("/tmp", None, Some("retained daemon"))
@@ -3411,7 +3421,7 @@ mod tests {
             })
         ));
 
-        let mut restarted = Manager::new("sleep 30".into(), true);
+        let mut restarted = Manager::new("sh -c 'sleep 30'".into(), true);
         assert_eq!(restarted.restore_at(&root, &workspace), 0);
         assert!(restarted.sessions.is_empty());
         assert!(restarted.runtime_checkouts.is_empty());
@@ -3466,7 +3476,7 @@ mod tests {
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
-        let mut manager = Manager::new("sleep 30".into(), true);
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, &workspace, None);
         let runtime = manager
             .create(repo.to_str().unwrap(), None, Some("retained daemon"))
@@ -3690,7 +3700,7 @@ mod tests {
             ("archive-post", persist::AtomicFailure::DirectorySync, true),
         ] {
             let (root, workspace) = persistence_fixture(label);
-            let mut manager = Manager::new("sleep 30".into(), true);
+            let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
             manager.persist_at_for_test(&root, &workspace, Some(failure));
