@@ -9,12 +9,17 @@ re_verification:
   previous_status: none
   previous_score: n/a
 human_verification:
+
   - test: "Live --permission-prompt-tool wire-contract confirmation against claude 2.1.178 (04-02 Task 4 CONTRACT gate)"
     expected: "A real `claude -p --permission-prompt-tool mcp__baude__approve --mcp-config .mcp.json \"...\"` fires the seeded approve tool; the logged frames confirm the framing (Content-Length vs line), the tools/call request field names (tool_name / input / tool_use_id), and that the content[0].text JSON.stringify({behavior}) result is accepted to unblock the tool. If the shape diverges, only parse_frame / parse_tool_call / build_approve_result need correcting."
     why_human: "The exact 2.1.178 --permission-prompt-tool wire shape is MEDIUM-confidence (no complete official example, claude-code #1175). Only a live CLI invoking the seeded MCP tool confirms the framing + field names + accepted response envelope. No automated path exists; the bridge currently encodes the ASSUMED RESEARCH §C/§D contract, deliberately isolated to three functions so a divergence is cheap to correct."
   - test: "PWA approve/deny card + distinct-push end-to-end on a live prompt-mode session (04-04 Task 2 UAT)"
     expected: "Spawn BAUDE_PERMISSION_MODE=prompt, trigger a tool Claude must ask about. (a) A distinct push fires (\"<name> needs permission\"), separate from the generic waiting push. (b) The approve/deny card appears above the composer showing the tool + an esc()'d input summary. (c) Approve runs the tool and the card clears. (d) Deny denies only that single tool call (session survives, turn continues) and the card clears. (e) No response past BAUDE_PERMISSION_TIMEOUT_S denies on timeout (never auto-allows). Web Push phone-verification status noted (separate deferred milestone, not a blocker)."
     why_human: "The PWA is vanilla JS with no test runner / no build step (PERM-03 is manual by construction per 04-VALIDATION.md), and real Web Push needs a device/browser. node --check + grep confirm the card, fetch, both POST decisions, deny-uses-permission-route, and the sw.js cache bump statically; the user-visible behavior (render/clear, run-on-approve, deny-survives, timeout-denies) is the irreducible human UAT."
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  status: human_needed
 ---
 
 # Phase 4: Remote Permission Approval Verification Report

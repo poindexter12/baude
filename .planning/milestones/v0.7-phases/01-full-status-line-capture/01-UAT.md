@@ -4,6 +4,10 @@ phase: 01-full-status-line-capture
 source: [01-VERIFICATION.md]
 started: 2026-06-15
 updated: 2026-06-15
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  gap_snapshot: "testing::scenarios=1"
 ---
 
 ## Current Test
@@ -23,6 +27,7 @@ awaiting: user response
 ## Tests
 
 ### 1. `i` info overlay renders effort / thinking / PR rows (STL-03)
+
 expected: With a session whose bridge JSON has effort/thinking/pr set, pressing `i` shows effort, thinking (on/off), and PR (#number (review_state)) rows in the local info overlay; absent fields omit their row; vim_mode is not rendered; remote overlay unchanged.
 result: [pending]
 

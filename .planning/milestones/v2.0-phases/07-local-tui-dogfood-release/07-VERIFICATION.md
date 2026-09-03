@@ -1,7 +1,7 @@
 ---
 phase: 07-local-tui-dogfood-release
 verified: 2026-09-02T02:40:24Z
-status: human_needed
+status: passed  # human items closed 2026-09-01/03 (see addenda)
 score: 11/12 must-haves verified
 behavior_unverified: 0
 overrides_applied: 1

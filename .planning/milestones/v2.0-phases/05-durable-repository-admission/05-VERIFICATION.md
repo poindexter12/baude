@@ -5,12 +5,17 @@ status: human_needed
 score: 4/5 must-haves verified
 overrides_applied: 0
 human_verification:
+
   - test: "Exercise successful repository admission and repeat admission with real Claude Code and OpenCode workspaces"
     expected: "Main, nested, symlink, and linked-worktree entry paths converge on one parent and one usable default-branch session; repeat open focuses the live session or resumes the retained exited session without duplication."
     why_human: "Source and stand-in tests verify dispatch and wiring, but the suite deliberately does not launch either real external coding-agent CLI."
   - test: "Inspect actionable unavailable-default feedback in the local TUI"
     expected: "The message names the local remote-HEAD/default-state problem, gives a practical recovery action, launches nothing, and remains readable for the user."
     why_human: "The exact message and no-launch branch are code-verified, but presentation and recovery clarity require a user-facing check."
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  status: human_needed
 ---
 
 # Phase 5: Durable Repository Admission Verification Report

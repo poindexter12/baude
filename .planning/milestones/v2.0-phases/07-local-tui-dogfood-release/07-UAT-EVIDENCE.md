@@ -1,3 +1,10 @@
+---
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  gap_snapshot: "unknown::scenarios=0"
+---
+
 # Phase 07 Dogfood Evidence
 
 ## 2026-08-31 - Initial real-sidebar observation

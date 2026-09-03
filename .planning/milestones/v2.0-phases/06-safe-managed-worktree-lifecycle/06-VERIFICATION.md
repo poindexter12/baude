@@ -1,7 +1,7 @@
 ---
 phase: 06-safe-managed-worktree-lifecycle
 verified: 2026-09-01T00:00:00Z
-status: human_needed
+status: passed  # human items adjudicated 2026-09-02 (see addendum)
 score: 19/21 must-haves verified
 behavior_unverified: 1
 overrides_applied: 0

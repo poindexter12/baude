@@ -3,6 +3,10 @@ phase: 05-durable-repository-admission
 status: partial
 created: 2026-08-30
 deferred_until: end-of-milestone-or-published-build
+audit_acknowledged:
+  milestone: v2.0
+  at: 2026-09-03
+  gap_snapshot: "partial::scenarios=0"
 ---
 
 # Phase 5 Human UAT
