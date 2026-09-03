@@ -3286,41 +3286,7 @@ mod tests {
             assert!(pid_is_live(original_shell_pid));
             manager.persist_at_for_test(&root, &workspace, Some(failure));
 
-            let spawn_instant = std::time::Instant::now();
             let close_error = manager.remove(id).unwrap_err().to_string();
-            // Diagnostics for #58: always print the actual error and process
-            // facts so a CI-only failure names the path that really ran.
-            let ps = |pid: u32| {
-                Command::new("ps")
-                    .args([
-                        "-p",
-                        &pid.to_string(),
-                        "-o",
-                        "pid,ppid,pgid,stat,etime,command",
-                    ])
-                    .output()
-                    .map(|o| {
-                        format!(
-                            "status={} out={} err={}",
-                            o.status,
-                            String::from_utf8_lossy(&o.stdout).trim(),
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        )
-                    })
-                    .unwrap_or_else(|e| format!("ps failed: {e}"))
-            };
-            eprintln!("[diag {label}] close_error={close_error:?}");
-            eprintln!(
-                "[diag {label}] elapsed_after_remove={:?}",
-                spawn_instant.elapsed()
-            );
-            eprintln!("[diag {label}] agent {}", ps(original_pid));
-            eprintln!("[diag {label}] shell {}", ps(original_shell_pid));
-            eprintln!(
-                "[diag {label}] session exited={:?} runtime_map={:?}",
-                manager.session(id).map(|s| s.claude.is_exited()),
-                manager.runtime_checkouts
-            );
             assert_eq!(manager.repository_state.repositories.len(), 1);
             assert_eq!(manager.repository_state.checkouts.len(), 1);
             assert_eq!(
