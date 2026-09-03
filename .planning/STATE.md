@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Local TUI Dogfood Release
-current_phase: 7
-current_phase_name: local tui dogfood release
-status: complete
-stopped_at: Phases 6 and 7 certified and completed; PR #56 merge to main in progress
-last_updated: "2026-09-03T17:00:00.000Z"
+status: Awaiting next milestone
+stopped_at: Phases 6 and 7 certified and completed; PR
+last_updated: "2026-09-03T19:34:43.558Z"
 last_activity: 2026-09-03
-last_activity_desc: certified phases 6/7 (verification, adjudicated review, Nyquist, Linux CI, UI audit + fixes); v2.0.0-beta published
-state_head: 872f52443aa5aade4e9fb4f66d68ad29823c3871
+last_activity_desc: Milestone v2.0 completed and archived
+state_head: 4a62be38691588028a6177a3162cf19dd597249a
 progress:
   total_phases: 3
-  completed_phases: 3
+  completed_phases: 2
   total_plans: 16
   completed_plans: 16
-  percent: 100
+  percent: 67
+current_phase: 7
+current_phase_name: local tui dogfood release
 ---
 
 # Project State
@@ -29,12 +29,10 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 7 (3 of 3 v2.0 phases) — local TUI dogfood release — COMPLETE
-Plan: all 16 v2.0 plans executed and certified
-Status: Phases 5, 6, and 7 complete. Certification evidence: goal-backward verification (06/07-VERIFICATION.md), adjudicated clean review, Nyquist-compliant validation, Linux/runtime CI certification (PR #56 run 33641979151), UI audit 20/24 with priority fixes applied, three live dogfood passes. v2.0.0-beta published at ad37088.
-Last activity: 2026-09-03 — phases certified and completed; PR #56 merging to main to hand the beta channel to release-please
-
-Progress: [██████████] 100% (3 of 3 milestone phases complete)
+Phase: Milestone v2.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-09-03 — Milestone v2.0 completed and archived
 
 ## Performance Metrics
 
@@ -162,3 +160,26 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 Last session: 2026-08-31T10:21:35.011Z
 Stopped at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
 Resume file: None
+
+## Deferred Items
+
+Items acknowledged and deferred at milestone close, most recent first:
+
+| Category | Item | Status | Deferred At | Milestone |
+|----------|------|--------|-------------|-----------|
+| uat_gaps | 05/05-HUMAN-UAT.md | partial | 2026-09-03 | v2.0 |
+| uat_gaps | 07/07-UAT-EVIDENCE.md | unknown (evidence log, not scenario UAT) | 2026-09-03 | v2.0 |
+| uat_gaps | 01/01-UAT.md (archived v0.7) | testing, 1 pending | 2026-09-03 | v2.0 |
+| uat_gaps | 02/02-UAT.md (archived v0.7) | testing | 2026-09-03 | v2.0 |
+| uat_gaps | 03/03-UAT.md (archived v0.7) | testing, 1 pending | 2026-09-03 | v2.0 |
+| uat_gaps | 04/04-UAT.md (archived v0.7) | testing | 2026-09-03 | v2.0 |
+| verification_gaps | 05/05-VERIFICATION.md | human_needed | 2026-09-03 | v2.0 |
+| verification_gaps | 01/01-VERIFICATION.md (archived v0.7) | human_needed | 2026-09-03 | v2.0 |
+| verification_gaps | 03/03-VERIFICATION.md (archived v0.7) | human_needed | 2026-09-03 | v2.0 |
+| verification_gaps | 04/04-VERIFICATION.md (archived v0.7) | human_needed | 2026-09-03 | v2.0 |
+| deferred_items | 06/deferred-items.md: legacy App removal route is_dirty note (superseded by 06-06 inspect_removal) | acknowledged | 2026-09-03 | v2.0 |
+| deferred_items | 07/deferred-items.md: pre-existing docker smoke shellcheck SC2015/SC2034 | acknowledged | 2026-09-03 | v2.0 |
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone

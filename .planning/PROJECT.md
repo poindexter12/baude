@@ -14,17 +14,24 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current Milestone: v2.0 Local TUI Dogfood Release
+## Current State (v2.0 shipped 2026-09-03)
 
-**Goal:** Make the local TUI safe and complete enough to dogfood repository-centered worktree sessions, with one shared lifecycle authority and release readiness for `v2.0.0-beta`.
+v2.0 shipped as the `v2.0.0-beta` prerelease bootstrap, handed to
+release-please at `v2.0.0-beta.1`. The TUI is checkout-first: durable
+repository parents with main-checkout/worktree children and standalone
+non-git sessions (schema-v3 state), one shared `baude-core` lifecycle
+engine behind thin App/Manager adapters, capability-gated create/close/
+reopen and seed-aware verified worktree removal, and existing-worktree
+auto-population. ~353 workspace tests green on macOS and Linux CI; four
+supported release targets ship `baude`+`bauded` tarballs and ghcr `beta`
+images. Install lane: `baude-prerelease` (pinned mise prerelease).
 
-**Target features:**
-- `baude-core` owns one enforceable lifecycle protocol/state machine for Git topology, persistence commit stages, exact agent and shell process ownership, protected recovery transitions, startup recovery, and rollback
-- The TUI App and daemon Manager are thin effect adapters over the shared lifecycle contract and prove equivalent behavior with mirrored contract tests
-- The local TUI shows persistent repository parents and default-session/worktree children in stable order with context-aware actions
-- Local users can create or activate eligible branch worktrees, close and reopen them, and safely remove only clean managed worktrees
-- CI, package metadata, and release documentation are ready for a `v2.0.0-beta` build without publishing or pushing a release
-- Dormant branch rows/deletion and daemon/remote/PWA hierarchy parity are deferred beyond this milestone
+## Next Milestone Goals
+
+Not yet defined — run `/gsd-new-milestone`. Leading candidates from the
+v2.0 out-of-scope list: dormant branch rows/activation/deletion,
+daemon/remote/PWA hierarchy parity, and the nine minor UI-audit
+recommendations plus the remote-modal red-border decision.
 
 ## Requirements
 
@@ -38,6 +45,11 @@ and act on it — whether you're at the terminal or on your phone.
 - ✓ Live Claude metadata from disk (model, context %, permission mode, tokens, GSD state) — v0.3
 - ✓ Usage/cost panel: per-session cost, today/week via ccusage, 5h + weekly rate-limit windows; `baude statusline` bridge — v0.3
 - ✓ Headless `bauded` daemon: REST + SSE, sessions survive client detach, restore via `claude --continue` — v0.4
+- ✓ Shared core lifecycle state machine governing Git, durable commit stages, exact process ownership, recovery, and rollback across App and Manager — v2.0
+- ✓ Persistent repository parents with checkout/worktree children, stable durable ordering, and context-aware actions — v2.0
+- ✓ Branch worktree create/activate, retained close, reopen, and seed-aware verified safe removal — v2.0
+- ✓ Standalone non-git folder sessions as first-class durable rows — v2.0 (added mid-milestone from dogfood feedback)
+- ✓ v2.0.0-beta released (manual bootstrap + release-please beta channel), 4-target tarballs bundling both binaries — v2.0 (publish decision overrode the original no-publish framing)
 - ✓ Containerized deploy: Dockerfile + compose behind a Tailscale sidecar (VPN-only) — v0.4
 - ✓ Phone PWA: triage list, chat with live SSE, queued-message bubbles, terminal-peek drawer, interrupt, create/kill/restart — v0.4
 - ✓ TUI attaches to remote daemon sessions over WebSocket (raw PTY) — v0.5
@@ -55,11 +67,7 @@ and act on it — whether you're at the terminal or on your phone.
 
 <!-- Current milestone scope. -->
 
-- [ ] One shared core lifecycle state machine controls Git, durable commit stages, exact process ownership, recovery, and rollback across App and Manager
-- [ ] Repositories are persistent local-TUI parents with their default branch opened automatically in the active backend
-- [ ] Eligible local branch worktrees can be created or activated, displayed, closed, reopened, and safely removed without discarding dirty changes
-- [ ] Local repository and worktree rows retain stable ordering and expose context-aware actions without regressing applicable session behavior
-- [ ] The codebase, package metadata, and release documentation pass the dogfood gate for target `v2.0.0-beta` without publishing it
+(None — define with /gsd-new-milestone.)
 
 ### Out of Scope
 
@@ -120,4 +128,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-30 after narrowing v2.0 to shared lifecycle refactoring and a local-TUI dogfood release*
+*Last updated: 2026-09-03 after v2.0 milestone*

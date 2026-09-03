@@ -1,5 +1,31 @@
 # Milestones
 
+## v2.0 Local TUI Dogfood Release (Shipped: 2026-09-03)
+
+**Phases completed:** 3 phases, 16 plans, 38 tasks
+**Known verification overrides:** 12 newly acknowledged, 0 carried forward from a prior close (see STATE.md Deferred Items)
+
+**Key accomplishments:**
+
+- Byte-safe canonical repository discovery with offline remote-HEAD resolution and non-destructive, inventory-verified default-worktree reuse or creation
+- Validated repository intent with byte-exact Unix paths, one-time selected-source legacy migration, typed corruption failures, and synced atomic replacement
+- Canonical local admission now atomically reserves one Git-reconciled default primary before active-backend spawn, then focuses, resumes, or retains it without duplication
+- Literal branch requests now create from the verified default, activate unchanged local refs, or reuse occupied worktrees through one durable App/Manager lifecycle contract
+- Managed worktree activation now rejects every unsafe ref/path fact and compensates uncommitted Git additions without deleting branches or creating duplicate runtimes
+- Managed worktree removal now requires conclusive porcelain-v2, recursive-submodule, ownership, topology, branch, and OID proof before an opaque removal target can exist
+- Managed session close now preserves exact checkout and conversation context while committing inactive intent before stopping one App or daemon runtime
+- Retained main and managed checkouts now reconcile exact Git topology, durably activate, and resume the intended Claude Code or OpenCode conversation through one checkout-key runtime
+- Clean baude-managed linked worktrees now require a target-specific confirmation, a fresh post-stop authorization, plain Git removal, preservation proofs, and commit-aware runtime recovery
+- One durable lifecycle engine now governs App and Manager persistence, Git/process effects, exact PTY ownership, restart, close, removal, rollback, and recovery behavior.
+- Persistent repository parents and checkout children now render from durable state and retain key-based selection across refresh, removal, and focus changes.
+- Durable hierarchy targets now create or activate local branches, retain-close and reopen sessions, and separately remove safe managed worktrees through Phase 6 lifecycle authority.
+- Ratatui hierarchy rendering now honors the exact viewport, Unicode-cell, focus, hint, confirmation, and durable interaction contract without changing lifecycle authority.
+- A fixture-isolated production App flow now proves durable real-Git restart/reopen/removal behavior while remote TUI rows and daemon sessions remain flat and non-destructive.
+- All crates, packaged sources, host binaries, release proposal fields, and four supported CI archive targets now agree on `2.0.0-beta` without changing or invoking publication automation.
+- Isolated `v2.0.0-beta` source-install and TUI dogfood guidance backed by a green 337-test local package/archive/install gate, with every morning certification and publication decision still pending.
+
+---
+
 ## v0.7 Native Claude Integration (Shipped: 2026-06-16)
 
 **Phases completed:** 4 phases, 14 plans, 28 tasks
