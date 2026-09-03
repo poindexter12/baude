@@ -16,7 +16,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # Serial test execution on CI (#58): the manager close-rollback test
+      # fails only on loaded 3-core CI runners with varying assertions — the
+      # signature of cross-test process interference (PTY children spawned in
+      # parallel with pid/pgid churn), not a lifecycle defect. Every assertion
+      # stays intact; serial execution removes the interference channel.
+      - run: cargo test -- --test-threads=1
 
   docker:
     runs-on: ubuntu-22.04
