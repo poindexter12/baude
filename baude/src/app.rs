@@ -479,6 +479,9 @@ pub struct App {
     pub shell_scroll: usize,
     /// Active text selection (if any).
     pub selection: Option<Selection>,
+    /// Sidebar `z` toggle: reveal archived sessions. Runtime-only — every
+    /// launch starts with the archive hidden.
+    pub show_archived: bool,
     /// Clones in flight (`c` key); sessions open as each one lands.
     pending_clones: Vec<PendingClone>,
     /// macOS banner state machine (waiting/permission/finished/exited).
@@ -714,6 +717,7 @@ impl App {
             claude_scroll: 0,
             shell_scroll: 0,
             selection: None,
+            show_archived: false,
             pending_clones: Vec::new(),
             desktop_notifier: DesktopNotifier::default(),
             desktop_notify_enabled: std::env::var("BAUDE_NOTIFY")
@@ -795,6 +799,35 @@ impl App {
             &decorations,
             &standalone_decorations,
         )
+    }
+
+    /// The rows the sidebar presents: `hierarchy_rows` minus archived
+    /// children while the `z` reveal is off.
+    pub fn visible_hierarchy_rows(&self) -> Vec<LocalRow> {
+        hierarchy::visible_rows(&self.hierarchy_rows(), self.show_archived)
+    }
+
+    /// Sessions the sidebar can hide: archived local children plus archived
+    /// remote rows. Drives the `z` footer count.
+    pub fn archived_count(&self) -> usize {
+        let local = self
+            .hierarchy_rows()
+            .iter()
+            .filter(|row| match row {
+                LocalRow::Repository(_) => false,
+                LocalRow::Checkout(child) => child.status == hierarchy::LocalStatus::Archived,
+                LocalRow::Standalone(standalone) => {
+                    standalone.status == hierarchy::LocalStatus::Archived
+                }
+            })
+            .count();
+        local
+            + self
+                .remote_snap
+                .sessions
+                .iter()
+                .filter(|remote| remote.archived)
+                .count()
     }
 
     pub(crate) fn selected_action_view(&self) -> Option<ActionView> {
@@ -2260,8 +2293,13 @@ impl App {
 
     /// Selection order: durable local parents and children in structural
     /// hierarchy order, followed by the existing flat remote compatibility
-    /// order. Volatile local status never participates in ordering.
+    /// order. Volatile local status never participates in ordering. Archived
+    /// rows (local and remote) drop out entirely while hidden.
     pub fn ordered_ids(&self) -> Vec<SelId> {
+        self.ordered_ids_with(self.show_archived)
+    }
+
+    fn ordered_ids_with(&self, show_archived: bool) -> Vec<SelId> {
         let mut active_remote: Vec<(String, SelId)> = Vec::new();
         let mut archived_remote: Vec<(String, SelId)> = Vec::new();
         for r in &self.remote_snap.sessions {
@@ -2272,10 +2310,13 @@ impl App {
                 active_remote.push(entry);
             }
         }
+        if !show_archived {
+            archived_remote.clear();
+        }
         for group in [&mut active_remote, &mut archived_remote] {
             group.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        let hierarchy = self.hierarchy_rows();
+        let hierarchy = hierarchy::visible_rows(&self.hierarchy_rows(), show_archived);
         hierarchy::selectable_local_ids(&hierarchy)
             .into_iter()
             .map(|id| match id {
@@ -2814,7 +2855,7 @@ impl App {
         &mut self,
         confirmation: lifecycle::RemovalConfirmation,
     ) -> std::result::Result<LifecycleOutcome, lifecycle::RemovalFailure> {
-        let rows_before_removal = self.hierarchy_rows();
+        let rows_before_removal = self.visible_hierarchy_rows();
         let _reservation = self
             .repository_reservations
             .reserve(confirmation.repository())
@@ -3006,7 +3047,7 @@ impl App {
             .iter()
             .any(|saved| saved.key == checkout)
         {
-            let rows_after_removal = self.hierarchy_rows();
+            let rows_after_removal = self.visible_hierarchy_rows();
             if let Some(selected) = self.selection_target() {
                 let fallback = hierarchy::reconcile_after_removal(
                     selected,
@@ -3304,11 +3345,12 @@ impl App {
         if self.selected_id.is_none() {
             self.selected_id = self.ordered_ids().first().copied();
         }
+        self.clamp_selection_if_hidden();
         if matches!(
             self.selected_id,
             Some(SelId::Repository(_) | SelId::Checkout(_) | SelId::Standalone(_))
         ) {
-            let rows = self.hierarchy_rows();
+            let rows = self.visible_hierarchy_rows();
             let remote_ids: Vec<_> = self
                 .ordered_ids()
                 .into_iter()
@@ -3877,6 +3919,7 @@ impl App {
                 };
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::Char('z') => self.toggle_show_archived(),
             _ => {
                 let Some(view) = self.selected_action_view() else {
                     return;
@@ -3916,7 +3959,12 @@ impl App {
                     SidebarAction::Info => self.modal = Modal::Info,
                     SidebarAction::Activity => self.modal = Modal::Activity,
                     SidebarAction::Gsd => self.modal = Modal::Gsd,
-                    SidebarAction::Archive => self.toggle_archive(),
+                    SidebarAction::Archive => {
+                        // Archiving under the hidden-archive default removes
+                        // the row; hand the selection to a visible neighbor.
+                        self.toggle_archive();
+                        self.clamp_selection_if_hidden();
+                    }
                     SidebarAction::RemoteOpen => self.attach_selected_remote(),
                     SidebarAction::RemoteClose => self.confirm_close_selected(),
                     SidebarAction::RemoteRestart => {
@@ -3924,7 +3972,10 @@ impl App {
                             self.restart_remote(id);
                         }
                     }
-                    SidebarAction::RemoteArchive => self.toggle_archive(),
+                    SidebarAction::RemoteArchive => {
+                        self.toggle_archive();
+                        self.clamp_selection_if_hidden();
+                    }
                     SidebarAction::Refuse(refusal) => self.refuse_sidebar_action(refusal),
                 }
             }
@@ -4454,6 +4505,84 @@ impl App {
         }
     }
 
+    /// Sidebar `z`: reveal or re-hide archived sessions.
+    fn toggle_show_archived(&mut self) {
+        self.show_archived = !self.show_archived;
+        let count = self.archived_count();
+        self.set_message(if self.show_archived {
+            format!("{count} archived shown")
+        } else {
+            format!("{count} archived hidden")
+        });
+        if self.show_archived {
+            // A collapsed parent stops being selectable once its archived
+            // children are revealed; land on its first revealed child.
+            if let Some(SelId::Repository(key)) = self.selected_id {
+                if !self.ordered_ids().contains(&SelId::Repository(key)) {
+                    let child = self.hierarchy_rows().iter().find_map(|row| match row {
+                        LocalRow::Checkout(child) if child.repository_key == key => {
+                            Some(SelId::Checkout(child.key))
+                        }
+                        _ => None,
+                    });
+                    if child.is_some() {
+                        self.selected_id = child;
+                    }
+                }
+            }
+        } else {
+            self.clamp_selection_to_visible();
+        }
+    }
+
+    /// Auto-archive (or a remote-side archive) can hide the selected row out
+    /// from under the cursor; keep the selection on something visible.
+    fn clamp_selection_if_hidden(&mut self) {
+        if self.show_archived {
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        if self.is_archived(id) {
+            self.clamp_selection_to_visible();
+        }
+    }
+
+    /// Move a selection stranded on a now-hidden row to the nearest visible
+    /// row: next in full sidebar order, else previous, else the first visible
+    /// row, else nothing.
+    fn clamp_selection_to_visible(&mut self) {
+        let Some(current) = self.selected_id else {
+            return;
+        };
+        let visible = self.ordered_ids();
+        if visible.contains(&current) {
+            return;
+        }
+        let full = self.ordered_ids_with(true);
+        let position = full.iter().position(|&id| id == current);
+        let next = position
+            .and_then(|index| {
+                full[index + 1..]
+                    .iter()
+                    .find(|id| visible.contains(id))
+                    .copied()
+            })
+            .or_else(|| {
+                position.and_then(|index| {
+                    full[..index]
+                        .iter()
+                        .rev()
+                        .find(|id| visible.contains(id))
+                        .copied()
+                })
+            })
+            .or_else(|| visible.first().copied());
+        self.claude_scroll = 0;
+        self.shell_scroll = 0;
+        self.selection = None;
+        self.selected_id = next;
+    }
+
     fn move_selection(&mut self, delta: i64) {
         let ids = self.ordered_ids();
         if ids.is_empty() {
@@ -4477,13 +4606,38 @@ impl App {
     /// wrapping around. When attached, stays attached to the same kind of
     /// pane — falling back to the claude pane if the new session has no shell.
     fn cycle_session(&mut self, delta: i64) {
-        // Cycling reaches the archive too — sending input into an archived
-        // session auto-unarchives it, so landing there and typing resurfaces
-        // it without an explicit `a`.
+        // Cycling is for switching between live work: repository parents,
+        // archived rows (even while revealed by `z`), and closed checkouts
+        // are all skipped. j/k still reaches everything visible, and typing
+        // into an archived session still auto-unarchives it.
+        let parked: Vec<SelId> = self
+            .hierarchy_rows()
+            .iter()
+            .filter_map(|row| match row {
+                LocalRow::Checkout(child)
+                    if matches!(
+                        child.status,
+                        hierarchy::LocalStatus::Archived | hierarchy::LocalStatus::Closed
+                    ) =>
+                {
+                    Some(SelId::Checkout(child.key))
+                }
+                LocalRow::Standalone(standalone)
+                    if matches!(
+                        standalone.status,
+                        hierarchy::LocalStatus::Archived | hierarchy::LocalStatus::Closed
+                    ) =>
+                {
+                    Some(SelId::Standalone(standalone.key))
+                }
+                _ => None,
+            })
+            .collect();
         let ids: Vec<_> = self
             .ordered_ids()
             .into_iter()
             .filter(|id| !matches!(id, SelId::Repository(_)))
+            .filter(|id| !parked.contains(id) && !self.is_archived(*id))
             .collect();
         if ids.is_empty() {
             return;
@@ -5197,11 +5351,11 @@ mod tests {
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
         app.move_selection(-1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
-        app.cycle_session(1);
-        assert_eq!(app.selected_id, Some(super::SelId::Checkout(second)));
+        // Both checkouts are closed (no runtime): cycling skips closed rows
+        // entirely, so alt-cycling parks. j/k remains the way to reach them.
         app.cycle_session(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(first)));
-        app.cycle_session(1);
+        app.move_selection(1);
         assert_eq!(app.selected_id, Some(super::SelId::Checkout(second)));
 
         app.focus = super::Focus::Claude;
@@ -5587,8 +5741,26 @@ mod tests {
             app.message
         );
         assert_eq!(app.runtime_checkouts, before_runtimes);
+        // The freshly archived row hides and the selection hands off to the
+        // next visible row; revealing with `z` restores the full order.
+        let hidden_order: Vec<_> = before_order
+            .iter()
+            .copied()
+            .filter(|id| *id != super::SelId::Checkout(main))
+            .collect();
+        assert_eq!(app.ordered_ids(), hidden_order);
+        let next_after_main = before_order
+            .iter()
+            .skip_while(|id| **id != super::SelId::Checkout(main))
+            .nth(1)
+            .copied();
+        assert_eq!(app.selected_id, next_after_main);
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.show_archived);
         assert_eq!(app.ordered_ids(), before_order);
-        assert_eq!(app.selected_id, Some(super::SelId::Checkout(main)));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(!app.show_archived);
+        assert_eq!(app.ordered_ids(), hidden_order);
         std::fs::remove_dir_all(action_state_root).unwrap();
 
         let (mut app, repo, root, checkout, runtime, worktree_path) =
@@ -5743,10 +5915,15 @@ mod tests {
         assert!(app.repository_state.repositories.is_empty());
         assert!(app.repository_state.checkouts.is_empty());
         assert!(app.hierarchy_rows().is_empty());
+        // Hidden-archive default drops the archived remote row entirely;
+        // revealing with `z` sinks it to the bottom of the flat order.
+        assert_eq!(app.ordered_ids(), vec![SelId::Remote(41)]);
+        app.show_archived = true;
         assert_eq!(
             app.ordered_ids(),
             vec![SelId::Remote(41), SelId::Remote(72)]
         );
+        app.show_archived = false;
         app.selected_id = Some(SelId::Remote(41));
         assert!(app.selected_repository().is_none());
         assert!(app.selected_checkout().is_none());
@@ -5821,6 +5998,100 @@ mod tests {
                 id: SelId::Remote(41)
             }
         ));
+    }
+
+    #[test]
+    fn archived_rows_hide_from_selection_and_cycling_until_revealed() {
+        use super::SelId;
+
+        let remote = |id: u64, name: &str, archived: bool| {
+            serde_json::from_value::<crate::remote::RemoteInfo>(serde_json::json!({
+                "id": id,
+                "name": name,
+                "title": null,
+                "status": "busy",
+                "waiting_for_ms": null,
+                "model": null,
+                "permission_mode": null,
+                "context_used_pct": null,
+                "branch": "main",
+                "session_cost_usd": null,
+                "archived": archived
+            }))
+            .unwrap()
+        };
+        let mut state = RepositoryState::default();
+        let repository_key = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository_key,
+            observed_common_dir: PersistedPath::from_path(Path::new("/repo/.git")),
+            observed_main_worktree: PersistedPath::from_path(Path::new("/repo")),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        add_checkout(&mut state, CheckoutRole::Main, false);
+        state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/repo/closed"));
+        state.checkouts[0].session.cwd = PersistedPath::from_path(Path::new("/repo/closed"));
+        add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
+        state.checkouts[1].observed_path = PersistedPath::from_path(Path::new("/repo/parked"));
+        state.checkouts[1].session.cwd = PersistedPath::from_path(Path::new("/repo/parked"));
+        state.checkouts[1].session.archived = true;
+        state.checkouts[1].session.archived_by_user = true;
+        let closed = state.checkouts[0].key;
+        let parked = state.checkouts[1].key;
+
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.remote_snap = crate::remote::RemoteSnapshot {
+            sessions: vec![remote(62, "sleepy", true), remote(51, "busy-bee", false)],
+            fetched_ms: 1,
+            ok: true,
+        };
+
+        // Hidden default: archived rows (local and remote) leave selection
+        // order entirely; the footer count still sees both of them.
+        assert_eq!(
+            app.ordered_ids(),
+            vec![SelId::Checkout(closed), SelId::Remote(51)]
+        );
+        assert_eq!(app.archived_count(), 2);
+
+        // Cycling skips the closed checkout and the archived rows in every
+        // mode, so the only cycle stop is the live remote session.
+        app.selected_id = Some(SelId::Checkout(closed));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(SelId::Remote(51)));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(SelId::Remote(51)));
+
+        // Reveal: archived rows come back for j/k, but never for cycling.
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.show_archived);
+        assert_eq!(
+            app.ordered_ids(),
+            vec![
+                SelId::Checkout(closed),
+                SelId::Checkout(parked),
+                SelId::Remote(51),
+                SelId::Remote(62)
+            ]
+        );
+        app.selected_id = Some(SelId::Checkout(parked));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(SelId::Remote(51)));
+
+        // Re-hide while parked on an archived row: the selection clamps to
+        // the nearest visible neighbor instead of dangling.
+        app.selected_id = Some(SelId::Checkout(parked));
+        app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(!app.show_archived);
+        assert_eq!(app.selected_id, Some(SelId::Remote(51)));
+        assert_eq!(
+            app.message.as_ref().map(|message| message.0.as_str()),
+            Some("2 archived hidden")
+        );
     }
 
     #[test]

@@ -244,13 +244,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
         draw_usage_footer(frame, app, fa);
     }
 
-    let hierarchy = app.hierarchy_rows();
+    let hierarchy = app.visible_hierarchy_rows();
     let remote_ids: Vec<_> = app
         .ordered_ids()
         .into_iter()
         .filter(|id| matches!(id, SelId::Remote(_)))
         .collect();
-    if hierarchy.is_empty() && remote_ids.is_empty() {
+    let archived_count = app.archived_count();
+    if hierarchy.is_empty() && remote_ids.is_empty() && archived_count == 0 {
         let dim = Style::default().fg(Color::DarkGray);
         frame.render_widget(
             Paragraph::new(vec![
@@ -278,7 +279,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
                     selected_line = Some((lines.len(), lines.len()));
                     selected_parent_line = current_parent_line;
                 }
-                repository_row(&mut lines, parent, selected, focused, width)
+                repository_row(
+                    &mut lines,
+                    parent,
+                    selected,
+                    focused,
+                    width,
+                    app.show_archived,
+                )
             }
             LocalRow::Checkout(child) => {
                 let selected = app.selected_id == Some(SelId::Checkout(child.key));
@@ -341,6 +349,16 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
         );
         lines.push(remote_meta_line(r, selected, focused, width));
     }
+    if archived_count > 0 {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        let verb = if app.show_archived { "hide" } else { "show" };
+        lines.push(Line::from(Span::styled(
+            format!("  {archived_count} archived · z to {verb}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     let visible = list_area.height as usize;
     let scroll = selected_line
         .filter(|_| lines.len() > visible && visible > 0)
@@ -363,7 +381,10 @@ fn repository_row(
     selected: bool,
     focused: bool,
     width: usize,
+    show_archived: bool,
 ) {
+    // No textual "repo" label: the italic dim name plus the indented children
+    // beneath it carry the repository-parent meaning.
     let name_style = if selected {
         Style::default()
             .fg(Color::Cyan)
@@ -373,29 +394,30 @@ fn repository_row(
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC)
     };
+    let fully_archived =
+        row.child_count > 0 && row.archived_count == row.child_count && !show_archived;
     let aggregate = if !matches!(row.health, RepositoryHealth::Available) {
         "unavailable".to_string()
-    } else if row.waiting_count == 0 {
-        String::new()
     } else if row.waiting_count == 1 {
         "1 waiting".to_string()
-    } else {
+    } else if row.waiting_count > 1 {
         format!("{} waiting", row.waiting_count)
+    } else if fully_archived {
+        // Every child is hidden: the parent row is all that remains, so it
+        // carries the hidden count until `z` reveals the children.
+        format!("{} archived", row.archived_count)
+    } else {
+        String::new()
     };
     let reserve = if aggregate.is_empty() {
         0
     } else {
         cell_width(&aggregate) + 1
     };
-    // The actual prefix is 11 cells: 2-cell gutter plus the 9-cell
-    // "  repo · " label. Reserving less lets a maximal name push the
-    // right-aligned aggregate past the row width at narrow sidebars.
-    let name = truncate(&row.display_name, width.saturating_sub(11 + reserve).max(1));
-    let mut spans = vec![
-        gutter(selected, focused),
-        Span::styled("  repo · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(name, name_style),
-    ];
+    // The prefix is the 2-cell gutter. Reserving less lets a maximal name
+    // push the right-aligned aggregate past the row width at narrow sidebars.
+    let name = truncate(&row.display_name, width.saturating_sub(2 + reserve).max(1));
+    let mut spans = vec![gutter(selected, focused), Span::styled(name, name_style)];
     let used = Line::from(spans.clone()).width() + cell_width(&aggregate);
     if !aggregate.is_empty() {
         spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
@@ -2067,7 +2089,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 60, 32);
+            let rect = centered(area, 60, 34);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2090,6 +2112,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  w           new worktree session for selected repo"),
                 Line::raw("  r           restart exited claude"),
                 Line::raw("  a           archive/unarchive (auto after idle timeout)"),
+                Line::raw("  z           show/hide archived sessions"),
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),
                 Line::from(Span::styled(
@@ -2101,7 +2124,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  ctrl+e      open folder in editor"),
                 Line::raw("  ctrl+n      new session"),
                 Line::raw("  ctrl+q, x   close session"),
-                Line::raw("  alt+←/→     cycle prev/next session"),
+                Line::raw("  alt+←/→     cycle sessions (skips archived + closed)"),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "status (sidebar sorts alphabetically)",
@@ -2169,7 +2192,7 @@ mod tests {
         SavedStandaloneSession, StandaloneLifecycle,
     };
     use ratatui::backend::TestBackend;
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::Terminal;
 
     use crate::app::{App, Focus, Modal, SelId};
@@ -2282,8 +2305,21 @@ mod tests {
         for (width, height) in [(160, 40), (100, 30), (79, 24), (59, 20), (40, 12)] {
             app.focus = Focus::Sidebar;
             let (rendered, buffer) = render(&app, width, height);
+            // The repository parent renders label-free: gutter + italic name.
             assert!(
-                rendered.contains("repo · repository"),
+                rendered.contains("  repository"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.modifier.contains(Modifier::ITALIC)),
+                "{width}x{height}: no italic repository name"
+            );
+            // The archived child stays hidden behind the z toggle.
+            assert!(
+                !rendered.contains("repository:archived"),
                 "{width}x{height}: {rendered}"
             );
             assert!(
@@ -2315,7 +2351,7 @@ mod tests {
         app.focus = Focus::Claude;
         let (rendered, buffer) = render(&app, 59, 20);
         assert!(
-            !rendered.contains("repo · repository"),
+            !rendered.contains("! repository:missing"),
             "single content pane leaked sidebar"
         );
         assert_eq!(buffer[(58, 0)].symbol(), "╮");
@@ -2325,6 +2361,78 @@ mod tests {
         let (rendered, _) = render(&app, 40, 12);
         assert!(rendered.contains("repository or checkout"), "{rendered}");
         assert!(rendered.contains("X removes"), "{rendered}");
+    }
+
+    #[test]
+    fn archived_rows_hide_behind_z_and_fully_archived_repository_collapses() {
+        // Mixed repository: the archived child hides, the footer counts it,
+        // and no per-parent chip appears while a live sibling is visible.
+        let (mut app, _) = hierarchy_fixture();
+        app.remote = None;
+        app.focus = Focus::Sidebar;
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(!rendered.contains("repository:archived"), "{rendered}");
+        assert!(rendered.contains("1 archived · z to show"), "{rendered}");
+        assert!(!rendered.contains("1 archived│"), "{rendered}");
+
+        app.show_archived = true;
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("repository:archived"), "{rendered}");
+        assert!(rendered.contains("1 archived · z to hide"), "{rendered}");
+
+        // Fully archived repository: children hide, the parent row carries
+        // the hidden count chip, and revealing dissolves the chip into rows.
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/collapse/quiet/.git"),
+            observed_main_worktree: persisted_path("/tmp/collapse/quiet"),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+        });
+        for branch in ["one", "two"] {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let path = format!("/tmp/collapse/quiet worktrees/{branch}");
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                CheckoutRole::ManagedBranch,
+                true,
+                persisted_path(&path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("quiet:{branch}"),
+                    cwd: persisted_path(&path),
+                    repo_root: persisted_path("/tmp/collapse/quiet"),
+                    branch: Some(branch.to_string()),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: true,
+                    archived_by_user: true,
+                    resume_id: None,
+                },
+            ));
+        }
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.remote = None;
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.focus = Focus::Sidebar;
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("2 archived│"), "{rendered}");
+        assert!(!rendered.contains("quiet:one"), "{rendered}");
+        assert!(rendered.contains("2 archived · z to show"), "{rendered}");
+
+        app.show_archived = true;
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(!rendered.contains("2 archived│"), "{rendered}");
+        assert!(rendered.contains("quiet:one"), "{rendered}");
+        assert!(rendered.contains("quiet:two"), "{rendered}");
+        assert!(rendered.contains("2 archived · z to hide"), "{rendered}");
     }
 
     #[test]
@@ -2588,6 +2696,8 @@ mod tests {
             "activated {value}",
             "focused existing {value}",
             "worktree removed — local branch {branch_ref} retained",
+            "{count} archived shown",
+            "{count} archived hidden",
         ] {
             assert!(source.contains(literal), "missing exact copy: {literal}");
         }
@@ -2713,7 +2823,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("repo · repo"), "{rendered}");
+        assert!(rendered.contains("  repo "), "{rendered}");
         assert!(rendered.contains("▌ ○ repo:develop"), "{rendered}");
         assert!(rendered.contains("  ○ repo:main"), "{rendered}");
         assert!(rendered.contains("main · closed"), "{rendered}");
