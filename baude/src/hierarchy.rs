@@ -133,6 +133,9 @@ pub struct LocalRepositoryRow {
     pub health: RepositoryHealth,
     pub child_count: usize,
     pub waiting_count: usize,
+    /// Children currently in the archived state (available + archived).
+    /// Unavailable children never count: their `!` alarm row stays visible.
+    pub archived_count: usize,
     pub actions: ActionView,
 }
 
@@ -224,6 +227,25 @@ pub fn selectable_local_ids(rows: &[LocalRow]) -> Vec<LocalRowId> {
             LocalRow::Checkout(checkout) => Some(LocalRowId::Checkout(checkout.key)),
             LocalRow::Standalone(standalone) => Some(LocalRowId::Standalone(standalone.key)),
         })
+        .collect()
+}
+
+/// Rows the sidebar presents. Archived children are hidden unless
+/// `show_archived`; repository parents always render, so a fully-archived
+/// repository collapses to its parent row (its chip carries the hidden
+/// count). Hiding keys off the rendered `Archived` status, not the raw flag:
+/// an unavailable child keeps its `!` alarm row even while flagged archived.
+pub fn visible_rows(rows: &[LocalRow], show_archived: bool) -> Vec<LocalRow> {
+    rows.iter()
+        .filter(|row| {
+            show_archived
+                || match row {
+                    LocalRow::Repository(_) => true,
+                    LocalRow::Checkout(child) => child.status != LocalStatus::Archived,
+                    LocalRow::Standalone(standalone) => standalone.status != LocalStatus::Archived,
+                }
+        })
+        .cloned()
         .collect()
 }
 
@@ -436,25 +458,7 @@ pub fn project_local_with_standalones(
                     .find(|checkout| checkout.role == CheckoutRole::Main)
             })
             .and_then(|checkout| lifecycle_capability(checkout.lifecycle()));
-        result.push(LocalRow::Repository(LocalRepositoryRow {
-            key: repository.key,
-            display_name: labels
-                .get(&repository.key)
-                .cloned()
-                .unwrap_or_else(|| name.clone()),
-            name,
-            main_path,
-            health: repository.health.clone(),
-            child_count: children.len(),
-            waiting_count,
-            actions: action_view(
-                ActionSelection::Repository {
-                    available: matches!(repository.health, RepositoryHealth::Available),
-                },
-                false,
-                default_capability,
-            ),
-        }));
+        let mut child_rows = Vec::with_capacity(children.len());
         for checkout in children {
             let decoration = decorations.get(&checkout.key).copied();
             let archived = decoration
@@ -475,7 +479,7 @@ pub fn project_local_with_standalones(
             };
             let capability = lifecycle_capability(checkout.lifecycle());
             let has_runtime = decoration.and_then(|value| value.runtime_id).is_some();
-            result.push(LocalRow::Checkout(LocalCheckoutRow {
+            child_rows.push(LocalCheckoutRow {
                 key: checkout.key,
                 repository_key: checkout.repository_key,
                 role: checkout.role,
@@ -496,8 +500,33 @@ pub fn project_local_with_standalones(
                     has_runtime,
                     capability,
                 ),
-            }));
+            });
         }
+        let archived_count = child_rows
+            .iter()
+            .filter(|child| child.status == LocalStatus::Archived)
+            .count();
+        result.push(LocalRow::Repository(LocalRepositoryRow {
+            key: repository.key,
+            display_name: labels
+                .get(&repository.key)
+                .cloned()
+                .unwrap_or_else(|| name.clone()),
+            name,
+            main_path,
+            health: repository.health.clone(),
+            child_count: child_rows.len(),
+            waiting_count,
+            archived_count,
+            actions: action_view(
+                ActionSelection::Repository {
+                    available: matches!(repository.health, RepositoryHealth::Available),
+                },
+                false,
+                default_capability,
+            ),
+        }));
+        result.extend(child_rows.into_iter().map(LocalRow::Checkout));
     }
 
     debug_assert!(state
@@ -1042,6 +1071,103 @@ mod tests {
             Some(SelectionTarget::Remote(81))
         );
         assert_eq!(initial_selection(&[], &[]), None);
+    }
+
+    #[test]
+    fn visible_rows_hide_archived_children_and_parents_carry_the_count() {
+        let mut state = RepositoryState::default();
+        let repository = add_repository(&mut state, "/repos/quiet");
+        let active = add_checkout(
+            &mut state,
+            repository,
+            "/repos/quiet",
+            "/repos/quiet",
+            CheckoutRole::Main,
+            false,
+            10,
+            "main",
+        );
+        let parked = add_checkout(
+            &mut state,
+            repository,
+            "/repos/quiet",
+            "/worktrees/quiet-parked",
+            CheckoutRole::ManagedBranch,
+            true,
+            20,
+            "parked",
+        );
+        state.checkouts[1].session.archived = true;
+        state.checkouts[1].session.archived_by_user = true;
+
+        let rows = project_local(&state, &HashMap::new());
+        let parent = |rows: &[LocalRow]| {
+            rows.iter()
+                .find_map(|row| match row {
+                    LocalRow::Repository(parent) => Some(parent.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(parent(&rows).child_count, 2);
+        assert_eq!(parent(&rows).archived_count, 1);
+        let hidden = super::visible_rows(&rows, false);
+        assert_eq!(
+            hidden.iter().map(LocalRow::id).collect::<Vec<_>>(),
+            vec![
+                LocalRowId::Repository(repository),
+                LocalRowId::Checkout(active)
+            ]
+        );
+        assert_eq!(super::visible_rows(&rows, true), rows);
+
+        // An unavailable child keeps its alarm row even while flagged
+        // archived, and never counts toward the parent's archived chip.
+        let saved = state.checkouts[1].clone();
+        state.checkouts[1] = SavedCheckout::new(
+            saved.key,
+            saved.repository_key,
+            saved.role,
+            saved.managed_by_baude,
+            saved.observed_path,
+            saved.observed_branch,
+            saved.first_seen_order,
+            CheckoutLifecycle::Protected(baude_core::repository::UnavailableCause::Missing),
+            saved.session,
+        );
+        let rows = project_local(&state, &HashMap::new());
+        assert_eq!(parent(&rows).archived_count, 0);
+        assert!(super::visible_rows(&rows, false)
+            .iter()
+            .any(|row| row.id() == LocalRowId::Checkout(parked)));
+
+        // A fully-archived repository collapses to a parent row that stays
+        // selectable, so the repository never becomes unreachable.
+        let restored = state.checkouts[1].clone();
+        state.checkouts[1] = SavedCheckout::new(
+            restored.key,
+            restored.repository_key,
+            restored.role,
+            restored.managed_by_baude,
+            restored.observed_path,
+            restored.observed_branch,
+            restored.first_seen_order,
+            CheckoutLifecycle::Inactive,
+            restored.session,
+        );
+        state.checkouts[0].session.archived = true;
+        state.checkouts[0].session.archived_by_user = true;
+        let rows = project_local(&state, &HashMap::new());
+        assert_eq!(parent(&rows).archived_count, 2);
+        let hidden = super::visible_rows(&rows, false);
+        assert_eq!(
+            hidden.iter().map(LocalRow::id).collect::<Vec<_>>(),
+            vec![LocalRowId::Repository(repository)]
+        );
+        assert_eq!(
+            selectable_local_ids(&hidden),
+            vec![LocalRowId::Repository(repository)]
+        );
     }
 
     #[test]
