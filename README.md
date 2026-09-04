@@ -128,7 +128,7 @@ through to Claude.
 | `ctrl+\` | anywhere | toggle shell pane (opening focuses it) |
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
-| `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps) |
+| `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
 | `t` | sidebar | open shell pane (focuses it) |
@@ -139,7 +139,8 @@ through to Claude.
 | `c` | sidebar | clone a repo (GitHub URL or `owner/repo`) and start a session in it |
 | `w` | local repository/child | create a valid branch or activate an eligible existing local branch as a managed worktree |
 | `r` | eligible child | retry only the reopen/recovery action authorized for that durable checkout |
-| `a` | applicable child | archive/unarchive in place under its repository |
+| `a` | applicable child | archive/unarchive (archived rows hide until revealed with `z`) |
+| `z` | sidebar | show/hide archived sessions (hidden by default; the footer shows the count) |
 | `x` | running child | close the runtime and retain its checkout for reopening |
 | `X` | managed worktree child | after a fresh clean-state check and distinct confirmation, remove the worktree while retaining its branch |
 | `?` | sidebar | help |
@@ -180,12 +181,14 @@ stateDiagram-v2
 
 Sessions waiting unattended past the idle timeout auto-archive (default 30
 minutes; `auto_archive_minutes` in config or `BAUDED_AUTO_ARCHIVE_MIN`, 0
-disables). A local archived child stays in its persisted position beneath its
-repository and becomes quiet; it does not move into a separate group.
-`alt+←/→` cycling and `j/k` still reach applicable children. Sending an
-auto-archived session input re-engages it; a manual archive (`a`) sticks until
-you unarchive or re-engage. The daemon applies the same archive rules to its
-separate flat rows, and archived sessions never send push notifications.
+disables). Archived sessions hide from the sidebar: a dim footer counts them
+and `z` reveals them in their persisted positions (they never reorder). A
+repository whose children are all archived collapses to its parent row with an
+`N archived` chip. `alt+←/→` cycling always skips archived and closed rows;
+`j/k` reaches revealed rows. Sending an auto-archived session input re-engages
+it; a manual archive (`a`) sticks until you unarchive or re-engage. The daemon
+applies the same archive rules to its separate flat rows, and archived
+sessions never send push notifications.
 
 ## Cloning
 
