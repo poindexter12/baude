@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.0-beta.2](https://github.com/poindexter12/baude/compare/v2.0.0-beta.1...v2.0.0-beta.2) (2026-09-04)
+
+
+### Features
+
+* **tui:** hide archived sessions behind a z toggle ([fd996c1](https://github.com/poindexter12/baude/commit/fd996c13d69c70d777cb902f3e9cd0d5fadf03f3))
+* **tui:** hide archived sessions behind a z toggle ([7ba696b](https://github.com/poindexter12/baude/commit/7ba696b31ed8b8f69764495720aa61b19ccbcf64))
+
 ## [2.0.0-beta.1](https://github.com/poindexter12/baude/compare/v0.14.1...v2.0.0-beta.1) (2026-09-03)
 
 
