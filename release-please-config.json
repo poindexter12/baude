@@ -7,7 +7,6 @@
       "include-component-in-tag": false,
       "bump-minor-pre-major": false,
       "draft": false,
-      "release-as": "2.0.0",
       "extra-files": [
         {
           "type": "generic",
