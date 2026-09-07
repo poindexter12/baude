@@ -39,27 +39,15 @@ state, and (Claude Code) context usage and permission mode.
 
 ## Install
 
-The latest available stable build remains v0.14.1. Via
-[mise](https://mise.jdx.dev), install that build from the existing GitHub
-assets (its tarball includes both `baude` and `bauded`):
+Install the latest stable release via [mise](https://mise.jdx.dev) — the
+release tarball includes both `baude` and `bauded`:
 
 ```sh
 mise use -g github:poindexter12/baude
 ```
 
-Beta builds are published as GitHub prereleases. Pin an exact beta in a
-project's `.mise.toml` so entering that project activates both `baude` and
-`bauded` from the matching release archive:
-
-```toml
-[tools]
-"github:poindexter12/baude" = { version = "2.0.0-beta", prerelease = true }
-```
-
-Run `mise install`, then verify the active project version with
-`mise exec -- baude --version`. Replace the pinned version deliberately when a
-later beta is available; prereleases are not selected by the stable global
-install above. For an isolated source build and test environment, follow the
+Verify with `mise exec -- baude --version`. For an isolated source build and
+test environment, follow the
 [local TUI dogfood runbook](docs/local-tui-dogfood.md).
 
 ## Usage
