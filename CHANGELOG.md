@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.0](https://github.com/poindexter12/baude/compare/v2.0.0-beta.2...v2.0.0) (2026-09-07)
+
+
+### Miscellaneous Chores
+
+* release 2.0.0 ([ba428a8](https://github.com/poindexter12/baude/commit/ba428a875f7ae4ace665231af41d3c209a571c91))
+
 ## [2.0.0-beta.2](https://github.com/poindexter12/baude/compare/v2.0.0-beta.1...v2.0.0-beta.2) (2026-09-04)
 
 
