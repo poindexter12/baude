@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.1.0](https://github.com/poindexter12/baude/compare/v2.0.0...v2.1.0) (2026-09-08)
+
+
+### Features
+
+* **core:** add a per-folder session breadcrumb store ([48bc4ad](https://github.com/poindexter12/baude/commit/48bc4ad3bde3d1e1a6c5786170975904ddce19a4))
+* **core:** remember each launch folder's last-used workspace ([d9e599c](https://github.com/poindexter12/baude/commit/d9e599cfa510687835980801824bab6522c43ab1))
+* launch into the folder's remembered workspace ([226ebdf](https://github.com/poindexter12/baude/commit/226ebdfe9477fffbe5525f13d9345b4deccb0b8c))
+* scope the sidebar to the launch folder's session context ([d82e2dc](https://github.com/poindexter12/baude/commit/d82e2dcffd7b98a3fadb4676f7374f467aef655a))
+* **tui:** launch into the folder's remembered workspace ([eede277](https://github.com/poindexter12/baude/commit/eede2779c9273d3a04ecf8f98a80885782f3fdcf))
+* **tui:** scope the sidebar to the launch folder's context ([3802e45](https://github.com/poindexter12/baude/commit/3802e45cbc2159eacdf52728eebd7b80fdbdc13e))
+
 ## [2.0.0](https://github.com/poindexter12/baude/compare/v2.0.0-beta.2...v2.0.0) (2026-09-07)
 
 
