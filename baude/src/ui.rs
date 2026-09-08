@@ -349,10 +349,25 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
         );
         lines.push(remote_meta_line(r, selected, focused, width));
     }
+    let context_footer = app.context_footer();
+    if (context_footer.is_some() || archived_count > 0) && !lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    if let Some(footer) = context_footer {
+        let copy = match footer {
+            crate::app::ContextFooter::Scoped { dir, more } => {
+                format!("  {dir} · {more} more · f to show")
+            }
+            crate::app::ContextFooter::RevealedAll { dir: _ } => {
+                "  showing all · f to scope".to_string()
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            copy,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     if archived_count > 0 {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
         let verb = if app.show_archived { "hide" } else { "show" };
         lines.push(Line::from(Span::styled(
             format!("  {archived_count} archived · z to {verb}"),
@@ -2089,7 +2104,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 60, 34);
+            let rect = centered(area, 60, 35);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2113,6 +2128,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  r           restart exited claude"),
                 Line::raw("  a           archive/unarchive (auto after idle timeout)"),
                 Line::raw("  z           show/hide archived sessions"),
+                Line::raw("  f           show all sessions / scope to this folder"),
                 Line::raw("  q           quit (sessions resume next launch)"),
                 Line::raw(""),
                 Line::from(Span::styled(
@@ -2698,6 +2714,10 @@ mod tests {
             "worktree removed — local branch {branch_ref} retained",
             "{count} archived shown",
             "{count} archived hidden",
+            "{more} more shown",
+            "scoped to {dir}",
+            "folder context is disabled (config folder_context / BAUDE_FOLDER_CONTEXT)",
+            "nothing is hidden — this folder's context covers the sidebar",
         ] {
             assert!(source.contains(literal), "missing exact copy: {literal}");
         }
@@ -2709,6 +2729,49 @@ mod tests {
             super::repository_runtime_summary(3, 20),
             "no running sessions"
         );
+    }
+
+    #[test]
+    fn context_footer_names_the_folder_and_composes_with_the_archived_line() {
+        let (mut app, _repository) = hierarchy_fixture();
+        app.remote = None;
+        app.enable_folder_context_for_test(Path::new("/tmp/viewport/launch"));
+
+        // Unpopulated context: fail open, no context footer, archived line only.
+        let (rendered, _) = render(&app, 120, 34);
+        assert!(!rendered.contains("context:"), "{rendered}");
+        assert!(rendered.contains("1 archived · z to show"), "{rendered}");
+
+        // Record the develop checkout: the two other visible checkouts hide
+        // behind the context and the footer says so.
+        let develop = app
+            .hierarchy_rows()
+            .into_iter()
+            .find_map(|row| match row {
+                crate::hierarchy::LocalRow::Checkout(child)
+                    if child.branch.as_deref() == Some("develop") =>
+                {
+                    Some(child.key)
+                }
+                _ => None,
+            })
+            .unwrap();
+        app.selected_id = Some(SelId::Checkout(develop));
+        app.record_context_use(SelId::Checkout(develop));
+        let (rendered, _) = render(&app, 120, 34);
+        assert!(
+            rendered.contains("…/launch · 2 more · f to show"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1 archived · z to show"), "{rendered}");
+        assert!(rendered.contains("repository:develop"), "{rendered}");
+        assert!(!rendered.contains("repository:missing"), "{rendered}");
+
+        // Revealed: everything renders and the footer flips to the scope hint.
+        app.show_all_context = true;
+        let (rendered, _) = render(&app, 120, 34);
+        assert!(rendered.contains("showing all · f to scope"), "{rendered}");
+        assert!(rendered.contains("repository:missing"), "{rendered}");
     }
 
     #[test]

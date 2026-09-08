@@ -236,14 +236,54 @@ pub fn selectable_local_ids(rows: &[LocalRow]) -> Vec<LocalRowId> {
 /// count). Hiding keys off the rendered `Archived` status, not the raw flag:
 /// an unavailable child keeps its `!` alarm row even while flagged archived.
 pub fn visible_rows(rows: &[LocalRow], show_archived: bool) -> Vec<LocalRow> {
+    scoped_rows(rows, show_archived, None)
+}
+
+/// [`visible_rows`] composed with the launch-folder context filter. `context`
+/// is the set of in-context checkout/standalone row ids (`None` disables
+/// scoping): a child row must be in the context to render, and a repository
+/// parent renders only while at least one of its checkouts is in the context
+/// — so a repository entirely outside the context disappears, while an
+/// in-context repository whose children are all archived still collapses to
+/// its parent row exactly as the archive filter alone would show it.
+pub fn scoped_rows(
+    rows: &[LocalRow],
+    show_archived: bool,
+    context: Option<&HashSet<LocalRowId>>,
+) -> Vec<LocalRow> {
+    let context_repositories: Option<HashSet<RepositoryKey>> = context.map(|ids| {
+        rows.iter()
+            .filter_map(|row| match row {
+                LocalRow::Checkout(child) if ids.contains(&LocalRowId::Checkout(child.key)) => {
+                    Some(child.repository_key)
+                }
+                _ => None,
+            })
+            .collect()
+    });
     rows.iter()
         .filter(|row| {
-            show_archived
-                || match row {
-                    LocalRow::Repository(_) => true,
-                    LocalRow::Checkout(child) => child.status != LocalStatus::Archived,
-                    LocalRow::Standalone(standalone) => standalone.status != LocalStatus::Archived,
+            let in_context = match (context, row) {
+                (None, _) => true,
+                (Some(ids), LocalRow::Checkout(child)) => {
+                    ids.contains(&LocalRowId::Checkout(child.key))
                 }
+                (Some(ids), LocalRow::Standalone(standalone)) => {
+                    ids.contains(&LocalRowId::Standalone(standalone.key))
+                }
+                (Some(_), LocalRow::Repository(repository)) => context_repositories
+                    .as_ref()
+                    .is_some_and(|repositories| repositories.contains(&repository.key)),
+            };
+            in_context
+                && (show_archived
+                    || match row {
+                        LocalRow::Repository(_) => true,
+                        LocalRow::Checkout(child) => child.status != LocalStatus::Archived,
+                        LocalRow::Standalone(standalone) => {
+                            standalone.status != LocalStatus::Archived
+                        }
+                    })
         })
         .cloned()
         .collect()
@@ -1168,6 +1208,84 @@ mod tests {
             selectable_local_ids(&hidden),
             vec![LocalRowId::Repository(repository)]
         );
+    }
+
+    #[test]
+    fn scoped_rows_filter_to_the_context_and_compose_with_the_archive_filter() {
+        use std::collections::HashSet;
+
+        let mut state = RepositoryState::default();
+        let inside = add_repository(&mut state, "/repos/inside");
+        let inside_main = add_checkout(
+            &mut state,
+            inside,
+            "/repos/inside",
+            "/repos/inside",
+            CheckoutRole::Main,
+            false,
+            10,
+            "main",
+        );
+        let inside_extra = add_checkout(
+            &mut state,
+            inside,
+            "/repos/inside",
+            "/worktrees/inside-extra",
+            CheckoutRole::ManagedBranch,
+            true,
+            20,
+            "extra",
+        );
+        let outside = add_repository(&mut state, "/repos/outside");
+        add_checkout(
+            &mut state,
+            outside,
+            "/repos/outside",
+            "/repos/outside",
+            CheckoutRole::Main,
+            false,
+            30,
+            "main",
+        );
+        let rows = project_local(&state, &HashMap::new());
+
+        // No context: identical to the plain archive filter.
+        assert_eq!(super::scoped_rows(&rows, false, None), rows);
+
+        // Context with one checkout: its repository parent renders, its
+        // sibling and the other repository disappear entirely.
+        let context: HashSet<LocalRowId> =
+            [LocalRowId::Checkout(inside_main)].into_iter().collect();
+        let scoped = super::scoped_rows(&rows, false, Some(&context));
+        assert_eq!(
+            scoped.iter().map(LocalRow::id).collect::<Vec<_>>(),
+            vec![
+                LocalRowId::Repository(inside),
+                LocalRowId::Checkout(inside_main)
+            ]
+        );
+
+        // Composition: the in-context checkout archived and hidden leaves the
+        // collapsed in-context parent, never the out-of-context repository.
+        state.checkouts[0].session.archived = true;
+        state.checkouts[0].session.archived_by_user = true;
+        let rows = project_local(&state, &HashMap::new());
+        let scoped = super::scoped_rows(&rows, false, Some(&context));
+        assert_eq!(
+            scoped.iter().map(LocalRow::id).collect::<Vec<_>>(),
+            vec![LocalRowId::Repository(inside)]
+        );
+        // Revealing archived (`z`) inside the scope shows the archived
+        // in-context checkout but still no out-of-context rows.
+        let revealed = super::scoped_rows(&rows, true, Some(&context));
+        assert_eq!(
+            revealed.iter().map(LocalRow::id).collect::<Vec<_>>(),
+            vec![
+                LocalRowId::Repository(inside),
+                LocalRowId::Checkout(inside_main)
+            ]
+        );
+        let _ = inside_extra;
     }
 
     #[test]
