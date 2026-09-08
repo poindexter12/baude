@@ -222,29 +222,34 @@ impl FolderContext {
     }
 }
 
-/// Load the shared file; a missing file is an empty store, an unreadable or
-/// unparsable one is an empty store plus a `corrupted` flag.
-fn load_file(path: &Path) -> (BreadcrumbFile, bool) {
+/// Load a per-folder JSON store; a missing file is an empty store, an
+/// unreadable or unparsable one is an empty store plus a `corrupted` flag.
+/// Shared by breadcrumbs and the folder-workspace memory
+/// ([`crate::folder_workspace`]).
+pub(crate) fn load_json<T: Default + serde::de::DeserializeOwned>(path: &Path) -> (T, bool) {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(file) => (file, false),
-            Err(_) => (BreadcrumbFile::default(), true),
+            Err(_) => (T::default(), true),
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (BreadcrumbFile::default(), false)
-        }
-        Err(_) => (BreadcrumbFile::default(), true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (T::default(), false),
+        Err(_) => (T::default(), true),
     }
 }
 
-/// Read-merge-write one folder's entry under an advisory lock: reload the
-/// file, replace only `folder_key`, write atomically (temp + rename + fsync).
-fn save_folder(
-    root: &Path,
-    file: &str,
-    folder_key: &str,
-    entry: &FolderEntry,
-) -> std::io::Result<()> {
+fn load_file(path: &Path) -> (BreadcrumbFile, bool) {
+    load_json(path)
+}
+
+/// Read-merge-write a shared per-folder store under an advisory lock: reload
+/// the file, let `update` replace only the caller's entry, write atomically
+/// (temp + rename + fsync). A corrupt file is replaced by a fresh one holding
+/// just the caller's entry.
+pub(crate) fn locked_merge_write<T, F>(root: &Path, file: &str, update: F) -> std::io::Result<()>
+where
+    T: Default + serde::de::DeserializeOwned + Serialize,
+    F: FnOnce(&mut T),
+{
     std::fs::create_dir_all(root)?;
     let destination = root.join(file);
     let lock_path = root.join(format!(".{file}.lock"));
@@ -256,9 +261,8 @@ fn save_folder(
         .open(&lock_path)?;
     lock.lock()?;
     let result = (|| {
-        let (mut merged, _) = load_file(&destination);
-        merged.schema_version = SCHEMA_VERSION;
-        merged.folders.insert(folder_key.to_string(), entry.clone());
+        let (mut merged, _) = load_json::<T>(&destination);
+        update(&mut merged);
         let bytes =
             serde_json::to_vec_pretty(&merged).map_err(|e| std::io::Error::other(e.to_string()))?;
         let temporary = root.join(format!(".{file}.tmp-{}", std::process::id()));
@@ -276,6 +280,19 @@ fn save_folder(
     })();
     let _ = lock.unlock();
     result
+}
+
+/// Merge one folder's breadcrumb entry back into the shared file.
+fn save_folder(
+    root: &Path,
+    file: &str,
+    folder_key: &str,
+    entry: &FolderEntry,
+) -> std::io::Result<()> {
+    locked_merge_write(root, file, |merged: &mut BreadcrumbFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged.folders.insert(folder_key.to_string(), entry.clone());
+    })
 }
 
 #[cfg(test)]

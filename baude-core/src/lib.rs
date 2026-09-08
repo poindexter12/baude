@@ -8,6 +8,7 @@ pub use vt100;
 pub mod backend;
 pub mod breadcrumbs;
 pub mod bridge;
+pub mod folder_workspace;
 pub mod git;
 pub mod hook;
 pub mod lifecycle;

@@ -25,6 +25,14 @@
 //! `BAUDE_BACKEND` (that is the whole point: the env var can't cross-wire a
 //! workspace onto the wrong backend; a conflict warns and is ignored).
 //!
+//! The TUI may additionally pass a folder-memory HINT (the workspace last
+//! used from the launch folder, see [`crate::folder_workspace`]) through
+//! [`initialize`]. The hint fills in only when NEITHER env var is set — an
+//! explicit `BAUDE_WORKSPACE`/`BAUDE_BACKEND` invocation always wins — and
+//! then outranks the config defaults, so a folder that last ran `opencode`
+//! comes back up there even when config names another default. With no hint,
+//! resolution is byte-identical to the chain above.
+//!
 //! Back-compat: the `claude` workspace falls back to reading the legacy
 //! un-suffixed `state.json` / `daemon-state.json` when its own file does not
 //! exist yet, so pre-workspace session lists survive the upgrade (saves go to
@@ -109,10 +117,33 @@ pub fn resolve(
     ws_env: Option<&str>,
     backend_env: Option<&str>,
     config: &Config,
+    warn: impl FnMut(String),
+) -> Workspace {
+    resolve_with_hint(ws_env, backend_env, None, config, warn)
+}
+
+/// [`resolve`] plus a folder-memory hint. The hint is consulted ONLY when
+/// neither `BAUDE_WORKSPACE` nor `BAUDE_BACKEND` is set — either env var is
+/// an explicit per-invocation choice that wins over remembered history — and
+/// then slots ABOVE the config defaults. Any hinted name resolves the same
+/// way an explicit `BAUDE_WORKSPACE` of that name would (undeclared names get
+/// their own namespace and the default backend chain), so a stale hint fails
+/// open instead of erroring.
+pub fn resolve_with_hint(
+    ws_env: Option<&str>,
+    backend_env: Option<&str>,
+    hint: Option<&str>,
+    config: &Config,
     mut warn: impl FnMut(String),
 ) -> Workspace {
+    let hint = if ws_env.is_some() || backend_env.is_some() {
+        None
+    } else {
+        hint
+    };
     let name = sanitize(
         ws_env
+            .or(hint)
             .or(config.workspace.as_deref())
             .or(backend_env)
             .or(config.backend.as_deref())
@@ -165,19 +196,30 @@ pub fn resolve(
     }
 }
 
-/// The active workspace for this process: resolved once from
-/// `BAUDE_WORKSPACE`/`BAUDE_BACKEND`/config and cached (the poll loop reads
-/// it every tick via [`backend::active`]).
-pub fn active() -> &'static Workspace {
-    static ACTIVE: OnceLock<Workspace> = OnceLock::new();
+static ACTIVE: OnceLock<Workspace> = OnceLock::new();
+
+/// Resolve and cache the process-wide workspace, optionally with a
+/// folder-memory hint. The FIRST caller wins the cache: the TUI calls this
+/// once from `main` (before `ensure_daemon` or any `active()` reader) so the
+/// hint participates; every other binary and subcommand never passes a hint
+/// and resolves exactly as before.
+pub fn initialize(hint: Option<&str>) -> &'static Workspace {
     ACTIVE.get_or_init(|| {
-        resolve(
+        resolve_with_hint(
             std::env::var("BAUDE_WORKSPACE").ok().as_deref(),
             std::env::var("BAUDE_BACKEND").ok().as_deref(),
+            hint,
             &crate::persist::load_config(),
             |msg| eprintln!("baude: {msg}"),
         )
     })
+}
+
+/// The active workspace for this process: resolved once from
+/// `BAUDE_WORKSPACE`/`BAUDE_BACKEND`/config and cached (the poll loop reads
+/// it every tick via [`backend::active`]).
+pub fn active() -> &'static Workspace {
+    initialize(None)
 }
 
 #[cfg(test)]
@@ -301,6 +343,59 @@ mod tests {
         )]);
         let ws = resolve(Some("work"), None, &work_cfg, no_warn);
         assert_eq!(ws.display_label(), "work · Claude Code");
+    }
+
+    #[test]
+    fn hint_outranks_config_defaults_but_never_env() {
+        let config = Config {
+            workspace: Some("work".into()),
+            backend: Some("claude".into()),
+            ..Config::default()
+        };
+        // Hint beats config `workspace` and config `backend`.
+        let ws = resolve_with_hint(None, None, Some("opencode"), &config, no_warn);
+        assert_eq!(ws.name, "opencode");
+        assert_eq!(ws.backend.name(), "opencode");
+        // BAUDE_WORKSPACE beats the hint.
+        let ws = resolve_with_hint(Some("work"), None, Some("opencode"), &config, no_warn);
+        assert_eq!(ws.name, "work");
+        // BAUDE_BACKEND alone suppresses the hint entirely — the chain then
+        // runs exactly as without one (config `workspace` outranks the env
+        // backend name, as today).
+        let ws = resolve_with_hint(None, Some("claude"), Some("opencode"), &config, no_warn);
+        assert_eq!(ws.name, "work");
+        let ws = resolve_with_hint(
+            None,
+            Some("opencode"),
+            Some("scratch"),
+            &Config::default(),
+            no_warn,
+        );
+        assert_eq!(ws.name, "opencode");
+    }
+
+    #[test]
+    fn no_hint_resolution_is_unchanged() {
+        let config = Config {
+            workspace: Some("work".into()),
+            ..Config::default()
+        };
+        let with = resolve_with_hint(None, Some("opencode"), None, &config, |_| {});
+        let without = resolve(None, Some("opencode"), &config, |_| {});
+        assert_eq!(with.name, without.name);
+        assert_eq!(with.backend.name(), without.backend.name());
+    }
+
+    #[test]
+    fn stale_hint_fails_open_like_an_explicit_workspace() {
+        // A hinted workspace whose config entry vanished still resolves: its
+        // own namespace, default backend chain — same as BAUDE_WORKSPACE.
+        let ws = resolve_with_hint(None, None, Some("gone"), &Config::default(), no_warn);
+        assert_eq!(ws.name, "gone");
+        assert_eq!(ws.backend.name(), "claude");
+        // Hostile names sanitize instead of escaping the config dir.
+        let ws = resolve_with_hint(None, None, Some("../evil"), &Config::default(), no_warn);
+        assert_eq!(ws.name, "---evil");
     }
 
     #[test]
