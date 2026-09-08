@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 
 use baude_core::backend;
+use baude_core::breadcrumbs::{FolderContext, LastSelected};
 use baude_core::git;
 use baude_core::lifecycle::{self, LifecycleOutcome, RepositoryReservations};
 use baude_core::meta::{now_unix_ms, ClaudeMeta, RateWindow};
@@ -45,6 +46,15 @@ enum LocalAdmissionRoute {
 enum RuntimeOwner {
     Checkout(CheckoutKey),
     Standalone(StandaloneKey),
+}
+
+/// Sidebar footer line for the launch-folder context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextFooter {
+    /// Scoped to the folder with `more` rows hidden behind `f`.
+    Scoped { dir: String, more: usize },
+    /// `f` is revealing the whole workspace.
+    RevealedAll { dir: String },
 }
 
 fn local_admission_route(_route: LocalAdmissionRoute, remote_configured: bool) -> bool {
@@ -482,6 +492,18 @@ pub struct App {
     /// Sidebar `z` toggle: reveal archived sessions. Runtime-only — every
     /// launch starts with the archive hidden.
     pub show_archived: bool,
+    /// Sidebar `f` toggle: reveal rows outside the launch folder's context.
+    /// Runtime-only — every launch starts scoped.
+    pub show_all_context: bool,
+    /// Breadcrumbs for the launch folder (None: feature disabled, or not
+    /// restored yet). Records which sessions runs from this folder used and
+    /// scopes the sidebar to them.
+    folder_context: Option<FolderContext>,
+    /// Resolved once at startup (BAUDE_FOLDER_CONTEXT / config
+    /// `folder_context` / on).
+    folder_context_enabled: bool,
+    #[cfg(test)]
+    folder_context_enabled_for_test: bool,
     /// Clones in flight (`c` key); sessions open as each one lands.
     pending_clones: Vec<PendingClone>,
     /// macOS banner state machine (waiting/permission/finished/exited).
@@ -691,6 +713,7 @@ impl App {
     pub fn new(launch_dir: PathBuf) -> App {
         let config = persist::load_config();
         let config_notify = config.desktop_notifications;
+        let folder_context_enabled = config.folder_context_enabled();
         let remote = std::env::var("BAUDE_DAEMON_URL")
             .ok()
             .or_else(|| baude_core::workspace::active().daemon_url.clone())
@@ -718,6 +741,11 @@ impl App {
             shell_scroll: 0,
             selection: None,
             show_archived: false,
+            show_all_context: false,
+            folder_context: None,
+            folder_context_enabled,
+            #[cfg(test)]
+            folder_context_enabled_for_test: false,
             pending_clones: Vec::new(),
             desktop_notifier: DesktopNotifier::default(),
             desktop_notify_enabled: std::env::var("BAUDE_NOTIFY")
@@ -802,9 +830,14 @@ impl App {
     }
 
     /// The rows the sidebar presents: `hierarchy_rows` minus archived
-    /// children while the `z` reveal is off.
+    /// children while the `z` reveal is off, minus rows outside the launch
+    /// folder's context while the `f` reveal is off.
     pub fn visible_hierarchy_rows(&self) -> Vec<LocalRow> {
-        hierarchy::visible_rows(&self.hierarchy_rows(), self.show_archived)
+        hierarchy::scoped_rows(
+            &self.hierarchy_rows(),
+            self.show_archived,
+            self.context_row_ids().as_ref(),
+        )
     }
 
     /// Sessions the sidebar can hide: archived local children plus archived
@@ -1196,15 +1229,249 @@ impl App {
                 self.set_message(format!("restore primary: {error}"));
             }
         }
+        // Load this folder's breadcrumbs before admission so the launch
+        // session's own recording lands in the loaded entry. In tests the
+        // context stays off unless a test opts in — the real user file is
+        // never read under cargo test.
+        let context_active = {
+            #[cfg(test)]
+            {
+                self.folder_context_enabled && self.folder_context_enabled_for_test
+            }
+            #[cfg(not(test))]
+            {
+                self.folder_context_enabled
+            }
+        };
+        if context_active && self.folder_context.is_none() {
+            #[cfg(test)]
+            let root = None;
+            #[cfg(not(test))]
+            let root = Some(persist::config_dir());
+            let mut context = FolderContext::load(
+                root,
+                baude_core::workspace::active(),
+                &self.launch_dir,
+                now_ms(),
+            );
+            if let Some(note) = context.take_load_note() {
+                self.set_message(note);
+            }
+            self.folder_context = Some(context);
+        }
         // Admit the launch directory through the same Git/non-Git classifier as `n`.
         let launch = self.launch_dir.clone();
         if launch.is_dir() {
             self.open_repo_session_via(launch, LocalAdmissionRoute::LaunchDirectory);
         }
-        self.selected_id = self.ordered_ids().first().copied();
+        // Selection: the session last used from this folder when it is still
+        // visible, else the first visible row (pre-context behavior).
+        let ids = self.ordered_ids();
+        self.selected_id = self
+            .context_last_selected_id()
+            .filter(|id| ids.contains(id))
+            .or_else(|| ids.first().copied());
+    }
+
+    /// Map the folder's `last_selected` breadcrumb back to a live row id.
+    fn context_last_selected_id(&self) -> Option<SelId> {
+        match self
+            .folder_context
+            .as_ref()?
+            .entry()
+            .last_selected
+            .as_ref()?
+        {
+            LastSelected::Checkout { path } => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| &checkout.observed_path == path)
+                .map(|checkout| SelId::Checkout(checkout.key)),
+            LastSelected::Standalone { path } => self
+                .repository_state
+                .standalone_sessions
+                .iter()
+                .find(|standalone| &standalone.canonical_path == path)
+                .map(|standalone| SelId::Standalone(standalone.key)),
+        }
+    }
+
+    /// In-context row ids regardless of the `f` reveal. `None` = the filter
+    /// has nothing to scope to (feature disabled, no breadcrumbs yet, or no
+    /// breadcrumb resolves in durable state) — fail open, hide nothing.
+    fn context_row_ids_raw(&self) -> Option<std::collections::HashSet<LocalRowId>> {
+        let context = self.folder_context.as_ref()?;
+        if context.is_unpopulated() {
+            return None;
+        }
+        let entry = context.entry();
+        let mut ids = std::collections::HashSet::new();
+        for checkout in &self.repository_state.checkouts {
+            if entry.contains_checkout(&checkout.observed_path) {
+                ids.insert(LocalRowId::Checkout(checkout.key));
+            }
+        }
+        for standalone in &self.repository_state.standalone_sessions {
+            if entry.contains_standalone(&standalone.canonical_path) {
+                ids.insert(LocalRowId::Standalone(standalone.key));
+            }
+        }
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// The context filter as the sidebar applies it: absent while `f` reveals
+    /// the whole workspace.
+    fn context_row_ids(&self) -> Option<std::collections::HashSet<LocalRowId>> {
+        if self.show_all_context {
+            return None;
+        }
+        self.context_row_ids_raw()
+    }
+
+    /// Local rows the context filter is currently hiding (checkouts and
+    /// standalones surviving the archive filter but outside the context).
+    pub fn context_hidden_count(&self) -> usize {
+        let Some(context) = self.context_row_ids_raw() else {
+            return 0;
+        };
+        hierarchy::visible_rows(&self.hierarchy_rows(), self.show_archived)
+            .iter()
+            .filter(|row| match row {
+                LocalRow::Repository(_) => false,
+                LocalRow::Checkout(child) => !context.contains(&LocalRowId::Checkout(child.key)),
+                LocalRow::Standalone(standalone) => {
+                    !context.contains(&LocalRowId::Standalone(standalone.key))
+                }
+            })
+            .count()
+    }
+
+    /// Launch folder for footer copy: `~`-abbreviated, elided to a basename
+    /// tail when long.
+    pub fn context_dir_label(&self) -> String {
+        let Some(context) = self.folder_context.as_ref() else {
+            return String::new();
+        };
+        let key = context.folder_key();
+        let home = dirs::home_dir()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let abbreviated = match key.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() => format!("~{rest}"),
+            _ => key.to_string(),
+        };
+        // The sidebar is narrow; keep the whole footer line inside it.
+        if abbreviated.chars().count() <= 16 {
+            return abbreviated;
+        }
+        let basename = abbreviated.rsplit('/').next().unwrap_or(&abbreviated);
+        format!("…/{basename}")
+    }
+
+    /// What the context footer line should say, if anything.
+    pub fn context_footer(&self) -> Option<ContextFooter> {
+        self.context_row_ids_raw()?;
+        let dir = self.context_dir_label();
+        if self.show_all_context {
+            return Some(ContextFooter::RevealedAll { dir });
+        }
+        let more = self.context_hidden_count();
+        (more > 0).then_some(ContextFooter::Scoped { dir, more })
+    }
+
+    /// Record that a run from this folder used a row ("interacted with":
+    /// opened, typed into, created, or activated — selection alone never
+    /// records).
+    pub(crate) fn record_context_use(&mut self, id: SelId) {
+        let Some(context) = self.folder_context.as_mut() else {
+            return;
+        };
+        match id {
+            SelId::Checkout(key) => {
+                if let Some(saved) = self
+                    .repository_state
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.key == key)
+                {
+                    context.record_checkout(&saved.observed_path, now_ms());
+                }
+            }
+            SelId::Standalone(key) => {
+                if let Some(saved) = self.repository_state.standalone_session(key) {
+                    context.record_standalone(&saved.canonical_path, now_ms());
+                }
+            }
+            SelId::Repository(_) | SelId::Remote(_) => {}
+        }
+    }
+
+    fn record_context_use_selected(&mut self) {
+        if let Some(id) = self.selected_id {
+            self.record_context_use(id);
+        }
+    }
+
+    /// Record by a live runtime id (admission paths return one before any
+    /// selection exists).
+    fn record_context_use_for_runtime(&mut self, runtime: u64) {
+        let id = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(SelId::Checkout(*key)))
+            .or_else(|| {
+                self.runtime_standalones
+                    .iter()
+                    .find_map(|(key, id)| (*id == runtime).then_some(SelId::Standalone(*key)))
+            });
+        if let Some(id) = id {
+            self.record_context_use(id);
+        }
+    }
+
+    /// Test seam: activate an in-memory folder context (no file I/O) as if
+    /// baude had been launched from `launch_dir`.
+    #[cfg(test)]
+    pub(crate) fn enable_folder_context_for_test(&mut self, launch_dir: &Path) {
+        self.folder_context_enabled = true;
+        self.folder_context_enabled_for_test = true;
+        self.folder_context = Some(FolderContext::load(
+            None,
+            baude_core::workspace::active(),
+            launch_dir,
+            0,
+        ));
+    }
+
+    /// Sidebar `f`: reveal the whole workspace, or scope back to the folder.
+    fn toggle_show_all_context(&mut self) {
+        if self.folder_context.is_none() {
+            self.set_message(
+                "folder context is disabled (config folder_context / BAUDE_FOLDER_CONTEXT)".into(),
+            );
+            return;
+        }
+        if self.context_row_ids_raw().is_none() && !self.show_all_context {
+            self.set_message("nothing is hidden — this folder's context covers the sidebar".into());
+            return;
+        }
+        if self.show_all_context {
+            self.show_all_context = false;
+            let dir = self.context_dir_label();
+            self.set_message(format!("scoped to {dir}"));
+            self.clamp_selection_to_visible();
+        } else {
+            let more = self.context_hidden_count();
+            self.show_all_context = true;
+            self.set_message(format!("{more} more shown"));
+        }
     }
 
     pub fn save(&mut self) {
+        if let Some(context) = self.folder_context.as_mut() {
+            context.flush(&self.repository_state, now_ms());
+        }
         match self.save_durable() {
             Ok(()) => self.persistence_dirty = false,
             Err(error) => {
@@ -2296,10 +2563,12 @@ impl App {
     /// order. Volatile local status never participates in ordering. Archived
     /// rows (local and remote) drop out entirely while hidden.
     pub fn ordered_ids(&self) -> Vec<SelId> {
-        self.ordered_ids_with(self.show_archived)
+        self.ordered_ids_scoped(self.show_archived, true)
     }
 
-    fn ordered_ids_with(&self, show_archived: bool) -> Vec<SelId> {
+    /// Sidebar order with explicit filter switches: `scope_context: false` is
+    /// the full workspace order (used to find a hidden row's neighbors).
+    fn ordered_ids_scoped(&self, show_archived: bool, scope_context: bool) -> Vec<SelId> {
         let mut active_remote: Vec<(String, SelId)> = Vec::new();
         let mut archived_remote: Vec<(String, SelId)> = Vec::new();
         for r in &self.remote_snap.sessions {
@@ -2316,7 +2585,13 @@ impl App {
         for group in [&mut active_remote, &mut archived_remote] {
             group.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        let hierarchy = hierarchy::visible_rows(&self.hierarchy_rows(), show_archived);
+        let context = if scope_context {
+            self.context_row_ids()
+        } else {
+            None
+        };
+        let hierarchy =
+            hierarchy::scoped_rows(&self.hierarchy_rows(), show_archived, context.as_ref());
         hierarchy::selectable_local_ids(&hierarchy)
             .into_iter()
             .map(|id| match id {
@@ -3339,6 +3614,9 @@ impl App {
         if let Some(r) = &self.remote {
             self.remote_snap = r.snapshot();
         }
+        if let Some(context) = self.folder_context.as_mut() {
+            context.maybe_flush(&self.repository_state, now_ms());
+        }
         self.tick_desktop_notify();
         // Remote rows can appear after startup (first poll): give an empty
         // selection something to land on.
@@ -3574,6 +3852,7 @@ impl App {
         if !to_shell && s.unarchive_on_input() {
             self.save();
         }
+        self.record_context_use_selected();
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -3634,6 +3913,7 @@ impl App {
             bytes.extend_from_slice(text.as_bytes());
         }
         pty.write_input(&bytes);
+        self.record_context_use_selected();
     }
 
     fn open_editor_for_selection(&mut self) {
@@ -3716,10 +3996,11 @@ impl App {
     fn open_local_target(&mut self) {
         if let Some(SelId::Standalone(key)) = self.selected_id {
             let target = self.selected_target_label();
-            if let Err(error) = self.reopen_standalone(key) {
-                self.set_message(format!(
+            match self.reopen_standalone(key) {
+                Ok(_) => self.record_context_use(SelId::Standalone(key)),
+                Err(error) => self.set_message(format!(
                     "Cannot reopen “{target}”: {error}; no runtime was started."
-                ));
+                )),
             }
             return;
         }
@@ -3737,6 +4018,7 @@ impl App {
             {
                 self.selected_id = Some(SelId::Checkout(checkout));
                 self.focus = Focus::Claude;
+                self.record_context_use(SelId::Checkout(checkout));
                 return;
             }
         }
@@ -3759,9 +4041,21 @@ impl App {
         }
         let target = self.selected_target_label();
         self.set_message(format!("reopening “{target}”…"));
-        if let Err(error) = self.reopen_checkout(checkout) {
-            // Contracted refusal (UI-SPEC): a post-gate reopen failure names
-            // the cause, the exact path to repair, and whether r retries.
+        match self.reopen_checkout(checkout) {
+            Ok(_) => self.record_context_use(SelId::Checkout(checkout)),
+            Err(error) => self.reopen_checkout_refusal(checkout, &target, error),
+        }
+    }
+
+    /// Contracted refusal (UI-SPEC): a post-gate reopen failure names the
+    /// cause, the exact path to repair, and whether r retries.
+    fn reopen_checkout_refusal(
+        &mut self,
+        checkout: CheckoutKey,
+        target: &str,
+        error: anyhow::Error,
+    ) {
+        {
             let saved = self
                 .repository_state
                 .checkouts
@@ -3920,6 +4214,7 @@ impl App {
             }
             KeyCode::Char('?') => self.modal = Modal::Help,
             KeyCode::Char('z') => self.toggle_show_archived(),
+            KeyCode::Char('f') => self.toggle_show_all_context(),
             _ => {
                 let Some(view) = self.selected_action_view() else {
                     return;
@@ -4193,13 +4488,19 @@ impl App {
                     Ok(LifecycleOutcome::Busy { .. }) => self.set_message(format!(
                         "Cannot create or activate a branch in “{repository}”: another lifecycle action is in progress. Wait for it to finish, then press w to retry."
                     )),
-                    Ok(LifecycleOutcome::Created { .. }) => {
+                    Ok(LifecycleOutcome::Created { checkout, .. }) => {
+                        self.record_context_use(SelId::Checkout(checkout));
                         self.set_message(format!("created worktree for {value}"))
                     }
-                    Ok(LifecycleOutcome::Activated { .. }) => {
+                    Ok(LifecycleOutcome::Activated { checkout, .. }) => {
+                        self.record_context_use(SelId::Checkout(checkout));
                         self.set_message(format!("activated {value}"))
                     }
-                    Ok(LifecycleOutcome::Reused { .. } | LifecycleOutcome::Focused { .. }) => {
+                    Ok(
+                        LifecycleOutcome::Reused { checkout, .. }
+                        | LifecycleOutcome::Focused { checkout, .. },
+                    ) => {
+                        self.record_context_use(SelId::Checkout(checkout));
                         self.set_message(format!("focused existing {value}"))
                     }
                     Ok(other) => self.set_message(format!(
@@ -4292,7 +4593,10 @@ impl App {
                 .is_some()
             {
                 match self.admit_standalone(&canonical) {
-                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(Some(runtime)) => {
+                        self.focus = Focus::Claude;
+                        self.record_context_use_for_runtime(runtime);
+                    }
                     Ok(None) => {}
                     Err(error) => self.set_message(format!("folder admission failed: {error}")),
                 }
@@ -4310,14 +4614,20 @@ impl App {
                 }
                 debug_assert!(local_admission_route(route, false));
                 match self.admit_repository(&path) {
-                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(Some(runtime)) => {
+                        self.focus = Focus::Claude;
+                        self.record_context_use_for_runtime(runtime);
+                    }
                     Ok(None) => {}
                     Err(e) => self.set_message(format!("repository admission failed: {e}")),
                 }
             }
             Err(git::RepositoryDiscoveryError::NotRepository(_)) => {
                 match self.admit_standalone(&path) {
-                    Ok(Some(_)) => self.focus = Focus::Claude,
+                    Ok(Some(runtime)) => {
+                        self.focus = Focus::Claude;
+                        self.record_context_use_for_runtime(runtime);
+                    }
                     Ok(None) => {}
                     Err(error) => self.set_message(format!("folder admission failed: {error}")),
                 }
@@ -4536,13 +4846,18 @@ impl App {
     }
 
     /// Auto-archive (or a remote-side archive) can hide the selected row out
-    /// from under the cursor; keep the selection on something visible.
+    /// from under the cursor, and so can the context filter; keep the
+    /// selection on something visible.
     fn clamp_selection_if_hidden(&mut self) {
-        if self.show_archived {
+        let Some(id) = self.selected_id else { return };
+        if !self.show_archived && self.is_archived(id) {
+            self.clamp_selection_to_visible();
             return;
         }
-        let Some(id) = self.selected_id else { return };
-        if self.is_archived(id) {
+        if matches!(id, SelId::Checkout(_) | SelId::Standalone(_))
+            && self.context_row_ids().is_some()
+            && !self.ordered_ids().contains(&id)
+        {
             self.clamp_selection_to_visible();
         }
     }
@@ -4558,7 +4873,7 @@ impl App {
         if visible.contains(&current) {
             return;
         }
-        let full = self.ordered_ids_with(true);
+        let full = self.ordered_ids_scoped(true, false);
         let position = full.iter().position(|&id| id == current);
         let next = position
             .and_then(|index| {
@@ -5122,8 +5437,9 @@ mod tests {
     use baude_core::persist;
     use baude_core::repository::{
         CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
-        RepositoryHealth, RepositoryState, RetainedSessionState, SavedCheckout, SavedRepository,
-        StandaloneLifecycle, UnavailableCause,
+        RepositoryHealth, RepositoryState, RetainedSessionState, RetainedStandaloneSessionState,
+        SavedCheckout, SavedRepository, SavedStandaloneSession, StandaloneKey, StandaloneLifecycle,
+        UnavailableCause,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -8006,6 +8322,243 @@ mod tests {
         ));
         restarted.close_standalone(key).unwrap();
         std::mem::forget(crashed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn context_fixture() -> (
+        RepositoryState,
+        CheckoutKey,
+        CheckoutKey,
+        CheckoutKey,
+        StandaloneKey,
+    ) {
+        let mut state = RepositoryState::default();
+        let repo = |state: &mut RepositoryState, main: &str| {
+            let key = state.allocate_repository_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: PersistedPath::from_path(Path::new(&format!("{main}/.git"))),
+                observed_main_worktree: PersistedPath::from_path(Path::new(main)),
+                first_seen_order: order,
+                health: RepositoryHealth::Available,
+            });
+            key
+        };
+        let checkout = |state: &mut RepositoryState,
+                        repository: baude_core::repository::RepositoryKey,
+                        repo_root: &str,
+                        path: &str,
+                        role: CheckoutRole| {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let persisted = PersistedPath::from_path(Path::new(path));
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                role,
+                role != CheckoutRole::Main,
+                persisted.clone(),
+                Some("refs/heads/main".into()),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: path.rsplit('/').next().unwrap().into(),
+                    cwd: persisted.clone(),
+                    repo_root: PersistedPath::from_path(Path::new(repo_root)),
+                    branch: Some("main".into()),
+                    is_worktree: role != CheckoutRole::Main,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            key
+        };
+        let inside = repo(&mut state, "/ctx/inside");
+        let inside_main = checkout(
+            &mut state,
+            inside,
+            "/ctx/inside",
+            "/ctx/inside",
+            CheckoutRole::Main,
+        );
+        let inside_wt = checkout(
+            &mut state,
+            inside,
+            "/ctx/inside",
+            "/ctx/inside-wt",
+            CheckoutRole::ManagedBranch,
+        );
+        let outside = repo(&mut state, "/ctx/outside");
+        let outside_main = checkout(
+            &mut state,
+            outside,
+            "/ctx/outside",
+            "/ctx/outside",
+            CheckoutRole::Main,
+        );
+        let standalone_key = state.allocate_standalone_key().unwrap();
+        let standalone_order = state.allocate_first_seen_order().unwrap();
+        state.standalone_sessions.push(SavedStandaloneSession::new(
+            standalone_key,
+            PersistedPath::from_path(Path::new("/ctx/notes")),
+            standalone_order,
+            StandaloneLifecycle::Inactive,
+            None,
+            RetainedStandaloneSessionState {
+                name: "notes".into(),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+                ever_launched: true,
+            },
+        ));
+        (state, inside_main, inside_wt, outside_main, standalone_key)
+    }
+
+    #[test]
+    fn folder_context_scopes_rows_cycling_and_the_f_reveal() {
+        let (state, inside_main, inside_wt, outside_main, standalone) = context_fixture();
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+
+        // Disabled: everything visible, footer absent, f explains itself.
+        let all_ids = app.ordered_ids();
+        assert!(all_ids.contains(&SelId::Checkout(outside_main)));
+        assert!(all_ids.contains(&SelId::Standalone(standalone)));
+        assert!(app.context_footer().is_none());
+        app.toggle_show_all_context();
+        assert_eq!(
+            app.message.as_ref().unwrap().0,
+            "folder context is disabled (config folder_context / BAUDE_FOLDER_CONTEXT)"
+        );
+
+        // Enabled but unpopulated: fail open — hide nothing.
+        app.enable_folder_context_for_test(Path::new("/ctx/inside"));
+        assert_eq!(app.ordered_ids(), all_ids);
+        assert_eq!(app.context_hidden_count(), 0);
+        assert!(app.context_footer().is_none());
+
+        // One recorded checkout scopes the sidebar to its repository.
+        app.record_context_use(SelId::Checkout(inside_main));
+        assert_eq!(app.ordered_ids(), vec![SelId::Checkout(inside_main)]);
+        assert_eq!(app.context_hidden_count(), 3);
+        assert_eq!(
+            app.context_footer(),
+            Some(super::ContextFooter::Scoped {
+                dir: "/ctx/inside".into(),
+                more: 3
+            })
+        );
+
+        // Cycling never leaves the context.
+        app.selected_id = Some(SelId::Checkout(inside_main));
+        app.cycle_session(1);
+        assert_eq!(app.selected_id, Some(SelId::Checkout(inside_main)));
+
+        // f reveals the whole workspace; interacting with a revealed row
+        // pulls it into the context permanently.
+        app.toggle_show_all_context();
+        assert_eq!(app.message.as_ref().unwrap().0, "3 more shown");
+        assert_eq!(app.ordered_ids(), all_ids);
+        assert_eq!(
+            app.context_footer(),
+            Some(super::ContextFooter::RevealedAll {
+                dir: "/ctx/inside".into()
+            })
+        );
+        app.selected_id = Some(SelId::Checkout(outside_main));
+        app.record_context_use_selected();
+        app.toggle_show_all_context();
+        assert_eq!(app.message.as_ref().unwrap().0, "scoped to /ctx/inside");
+        let scoped = app.ordered_ids();
+        assert!(scoped.contains(&SelId::Checkout(outside_main)));
+        assert!(!scoped.contains(&SelId::Checkout(inside_wt)));
+        assert!(!scoped.contains(&SelId::Standalone(standalone)));
+        assert_eq!(app.selected_id, Some(SelId::Checkout(outside_main)));
+
+        // Re-scoping with the selection on a row outside the context clamps
+        // to a visible neighbor instead of stranding it.
+        app.toggle_show_all_context();
+        app.selected_id = Some(SelId::Standalone(standalone));
+        app.toggle_show_all_context();
+        assert_ne!(app.selected_id, Some(SelId::Standalone(standalone)));
+        assert!(app.ordered_ids().contains(&app.selected_id.unwrap()));
+    }
+
+    #[test]
+    fn folder_context_selection_moves_never_record() {
+        let (state, inside_main, ..) = context_fixture();
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.enable_folder_context_for_test(Path::new("/ctx/inside"));
+        app.selected_id = Some(SelId::Checkout(inside_main));
+        for _ in 0..4 {
+            app.move_selection(1);
+        }
+        app.cycle_session(1);
+        assert!(app.folder_context.as_ref().unwrap().is_unpopulated());
+    }
+
+    #[test]
+    fn folder_context_restore_prefers_the_last_used_session() {
+        let (state, inside_main, _inside_wt, outside_main, _standalone) = context_fixture();
+        let root = std::env::temp_dir().join(format!(
+            "baude-folder-context-restore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut seeded = App::new(PathBuf::from("/not-a-repository"));
+        seeded.remote = None;
+        seeded.persistence_root_for_test = Some(root.clone());
+        seeded.install_hierarchy_state_for_test(state.clone(), HashMap::new());
+        seeded.save();
+        assert!(
+            !seeded.persistence_dirty(),
+            "save failed: {:?}",
+            seeded.message
+        );
+
+        // Relaunch: last_selected resolves and wins over first-row order.
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.persistence_root_for_test = Some(root.clone());
+        app.enable_folder_context_for_test(Path::new("/ctx/inside"));
+        app.folder_context
+            .as_mut()
+            .unwrap()
+            .record_checkout(&PersistedPath::from_path(Path::new("/ctx/inside")), 1);
+        app.folder_context
+            .as_mut()
+            .unwrap()
+            .record_checkout(&PersistedPath::from_path(Path::new("/ctx/outside")), 2);
+        app.restore();
+        assert_eq!(app.selected_id, Some(SelId::Checkout(outside_main)));
+
+        // Relaunch with a stale last_selected: fall back to the first visible
+        // context row.
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.persistence_root_for_test = Some(root.clone());
+        app.enable_folder_context_for_test(Path::new("/ctx/inside"));
+        app.folder_context
+            .as_mut()
+            .unwrap()
+            .record_checkout(&PersistedPath::from_path(Path::new("/ctx/inside")), 1);
+        app.folder_context.as_mut().unwrap().record_standalone(
+            &PersistedPath::from_path(Path::new("/ctx/deleted-notes")),
+            2,
+        );
+        app.restore();
+        assert_eq!(app.selected_id, Some(SelId::Checkout(inside_main)));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }
