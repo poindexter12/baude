@@ -199,6 +199,17 @@ scoped in this release: launch-folder attribution isn't reliable for daemon
 sessions, so they always render. Set `folder_context: false` in config (or
 `BAUDE_FOLDER_CONTEXT=0`) to disable recording and filtering entirely.
 
+Folder memory also covers the [workspace](#workspaces): every launch records
+which workspace the folder ran in
+(`~/.config/baude/folder-workspaces.json`), and a later plain `baude` there
+comes back up in that workspace — same backend, daemon, and state pool.
+Precedence: an explicit `BAUDE_WORKSPACE` or `BAUDE_BACKEND` always wins and
+suppresses the memory for that run (while still teaching the folder for the
+next one); the remembered workspace outranks the config `workspace`/`backend`
+defaults; with no memory, resolution is unchanged. When memory changes the
+outcome the status line notes `workspace <name> (folder history)`. The
+`folder_context` kill switch above disables this too.
+
 ## Cloning
 
 `c` starts a session in a repo you haven't cloned yet. Paste anything that
@@ -328,8 +339,9 @@ the profile's shell.
 - `workspace` / `workspaces` — named, hard-separated session pools, each
   bound to one backend. See "Workspaces" below.
 - `folder_context` — scope the sidebar to the sessions previously used from
-  the launch folder, recorded as breadcrumbs (see "Folder context").
-  Default `true`; `BAUDE_FOLDER_CONTEXT=0` env overrides.
+  the launch folder, recorded as breadcrumbs, and reopen the folder's
+  last-used workspace (see "Folder context"). Default `true`;
+  `BAUDE_FOLDER_CONTEXT=0` env overrides.
 - `desktop_notifications` — macOS banners when a session needs attention:
   a pending permission (immediate, with sound), waiting on input for 10s+
   (with sound, once per turn), a finished turn, or an exit (both silent).
@@ -356,8 +368,10 @@ histories. Custom workspaces are declared in config:
 }
 ```
 
-`BAUDE_WORKSPACE` selects the workspace (then config `workspace`, then the
-backend name). A workspace's backend binding **wins over `BAUDE_BACKEND`** —
+`BAUDE_WORKSPACE` selects the workspace; with neither env var set, the launch
+folder's remembered workspace comes next (see "Folder context"), then config
+`workspace`, then the backend name. A workspace's backend binding **wins over
+`BAUDE_BACKEND`** —
 the env var can't cross-wire a workspace onto the wrong backend (a conflict
 warns and is ignored). The status bar shows the active workspace and its
 platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces,
