@@ -723,6 +723,12 @@ fn config_base() -> PathBuf {
         .join("baude")
 }
 
+/// The config directory (`~/.config/baude`), for sibling stores that live
+/// next to config.json and the state files (e.g. breadcrumbs).
+pub fn config_dir() -> PathBuf {
+    config_base()
+}
+
 /// User configuration, ~/.config/baude/config.json. All fields optional.
 #[derive(Deserialize, Default)]
 pub struct Config {
@@ -773,6 +779,9 @@ pub struct Config {
     /// permission / finished / exited). Default true (macOS only);
     /// BAUDE_NOTIFY=0 overrides.
     pub desktop_notifications: Option<bool>,
+    /// Scope the sidebar to the sessions previously used from the launch
+    /// folder (breadcrumbs). Default true; BAUDE_FOLDER_CONTEXT=0 overrides.
+    pub folder_context: Option<bool>,
 }
 
 /// One `workspaces.<name>` config entry. All fields optional.
@@ -799,6 +808,16 @@ impl Config {
             .or(self.auto_archive_minutes)
             .map(|min| min * 60_000)
             .unwrap_or(crate::session::AUTO_ARCHIVE_IDLE_MS)
+    }
+
+    /// Resolved folder-context switch: BAUDE_FOLDER_CONTEXT env ("0"/"false"
+    /// disables), then `folder_context`, then on.
+    pub fn folder_context_enabled(&self) -> bool {
+        std::env::var("BAUDE_FOLDER_CONTEXT")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .or(self.folder_context)
+            .unwrap_or(true)
     }
 }
 

@@ -6,6 +6,7 @@
 pub use vt100;
 
 pub mod backend;
+pub mod breadcrumbs;
 pub mod bridge;
 pub mod git;
 pub mod hook;
