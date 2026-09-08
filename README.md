@@ -129,6 +129,7 @@ through to Claude.
 | `r` | eligible child | retry only the reopen/recovery action authorized for that durable checkout |
 | `a` | applicable child | archive/unarchive (archived rows hide until revealed with `z`) |
 | `z` | sidebar | show/hide archived sessions (hidden by default; the footer shows the count) |
+| `f` | sidebar | show all sessions / scope back to the launch folder's context (see "Folder context") |
 | `x` | running child | close the runtime and retain its checkout for reopening |
 | `X` | managed worktree child | after a fresh clean-state check and distinct confirmation, remove the worktree while retaining its branch |
 | `?` | sidebar | help |
@@ -177,6 +178,26 @@ repository whose children are all archived collapses to its parent row with an
 it; a manual archive (`a`) sticks until you unarchive or re-engage. The daemon
 applies the same archive rules to its separate flat rows, and archived
 sessions never send push notifications.
+
+## Folder context
+
+baude leaves breadcrumbs per launch folder: the sessions a run actually used
+(opened, typed into, created with `w`, or admitted) are recorded against the
+folder baude was started in, and the next launch from that folder scopes the
+sidebar to exactly those rows. Everything else in the workspace stays put —
+`f` reveals the full list (a dim footer counts what's hidden), and
+interacting with a revealed row adds it to the folder's context permanently.
+The first launch in a folder starts with just that folder's own repository or
+standalone session, and the launch also restores the selection to the session
+you last used from there.
+
+Breadcrumbs live in `~/.config/baude/breadcrumbs-<workspace>.json` — nothing
+is ever written into your repositories. Entries reference sessions by path,
+prune automatically when a checkout or folder leaves durable state, and a
+corrupt file just means a fresh context. Remote (`⇄ remote`) rows are not
+scoped in this release: launch-folder attribution isn't reliable for daemon
+sessions, so they always render. Set `folder_context: false` in config (or
+`BAUDE_FOLDER_CONTEXT=0`) to disable recording and filtering entirely.
 
 ## Cloning
 
@@ -306,6 +327,9 @@ the profile's shell.
   below.
 - `workspace` / `workspaces` — named, hard-separated session pools, each
   bound to one backend. See "Workspaces" below.
+- `folder_context` — scope the sidebar to the sessions previously used from
+  the launch folder, recorded as breadcrumbs (see "Folder context").
+  Default `true`; `BAUDE_FOLDER_CONTEXT=0` env overrides.
 - `desktop_notifications` — macOS banners when a session needs attention:
   a pending permission (immediate, with sound), waiting on input for 10s+
   (with sound, once per turn), a finished turn, or an exit (both silent).
