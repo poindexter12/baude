@@ -277,10 +277,45 @@ fn main() -> Result<()> {
         .unwrap_or(std::env::current_dir()?);
     let launch_dir = launch_dir.canonicalize().unwrap_or(launch_dir);
 
+    let config = baude_core::persist::load_config();
+
+    // Folder-workspace memory: consult this folder's remembered workspace and
+    // pin the process-wide resolution BEFORE anything reads workspace::active()
+    // (ensure_daemon below is the first reader — the auto-daemon must serve
+    // the same workspace). Explicit BAUDE_WORKSPACE/BAUDE_BACKEND always win;
+    // the folder_context kill switch disables both consulting and recording.
+    // Only this TUI launch path passes a hint — the statusline/hook/
+    // permission-mcp subcommands exited above and resolve untouched.
+    let ws_env = std::env::var("BAUDE_WORKSPACE").ok();
+    let backend_env = std::env::var("BAUDE_BACKEND").ok();
+    let memory_root = baude_core::persist::config_dir();
+    let plan = baude_core::folder_workspace::plan_launch(
+        config.folder_context_enabled(),
+        ws_env.as_deref(),
+        backend_env.as_deref(),
+        Some(&memory_root),
+        &launch_dir,
+    );
+    let workspace = baude_core::workspace::initialize(plan.hint.as_deref());
+    let mut startup_notes = plan.notes;
+    if config.folder_context_enabled() {
+        startup_notes.extend(baude_core::folder_workspace::applied_note(
+            &workspace.name,
+            ws_env.as_deref(),
+            backend_env.as_deref(),
+            &config,
+        ));
+        baude_core::folder_workspace::record(
+            Some(&memory_root),
+            &launch_dir,
+            &workspace.name,
+            baude_core::pty::now_ms(),
+        );
+    }
+
     // Auto-start local bauded when auto_daemon is configured. Must run before
     // App::new() reads the env, and before any threads start (set_var is not
     // thread-safe, but we're still single-threaded here).
-    let config = baude_core::persist::load_config();
     if let Some(url) = ensure_daemon(&config) {
         std::env::set_var("BAUDE_DAEMON_URL", url);
     }
@@ -301,6 +336,11 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(launch_dir);
+    // Folder-memory notes go up first so a real restore error overwrites an
+    // informational banner, never the other way around.
+    for note in startup_notes {
+        app.set_message(note);
+    }
     app.restore();
 
     let result = run(&mut terminal, &mut app);
