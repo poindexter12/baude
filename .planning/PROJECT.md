@@ -14,24 +14,20 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current State (v2.0 shipped 2026-09-03)
+## Current State (v2.1.0 source baseline)
 
-v2.0 shipped as the `v2.0.0-beta` prerelease bootstrap, handed to
-release-please at `v2.0.0-beta.1`. The TUI is checkout-first: durable
-repository parents with main-checkout/worktree children and standalone
-non-git sessions (schema-v3 state), one shared `baude-core` lifecycle
-engine behind thin App/Manager adapters, capability-gated create/close/
-reopen and seed-aware verified worktree removal, and existing-worktree
-auto-population. ~353 workspace tests green on macOS and Linux CI; four
-supported release targets ship `baude`+`bauded` tarballs and ghcr `beta`
-images. Install lane: `baude-prerelease` (pinned mise prerelease).
+v2.1.0 is the source baseline for this milestone. The latest GSD-completed milestone remains v2.0 through Phase 7. v2.2 focuses on reliability fixes from GitHub issues #70, #71, and #72 plus safer, more usable terminal links and newline input, followed by the existing v2.2.0 release process.
 
-## Next Milestone Goals
+## Current Milestone: v2.2 Reliability and Terminal Usability
 
-Not yet defined — run `/gsd-new-milestone`. Leading candidates from the
-v2.0 out-of-scope list: dormant branch rows/activation/deletion,
-daemon/remote/PWA hierarchy parity, and the nine minor UI-audit
-recommendations plus the remote-modal red-border decision.
+**Goal:** Make everyday session management safer and more dependable while improving terminal interaction.
+
+**Target features:**
+- Stop GitHub #70 hook configuration accumulation while preserving user hooks and settings.
+- Add actionable state-lock contention diagnostics without removing locks or overwriting another live owner.
+- Isolate test worktrees and environments so tests do not leak state or race through global environment.
+- Support clickable OSC8 labeled links and bare URLs without shell evaluation, while preserving text selection.
+- Fix Shift+Enter newline behavior on supported terminals with terminal mode restoration and a legacy fallback.
 
 ## Requirements
 
@@ -67,7 +63,12 @@ recommendations plus the remote-modal red-border decision.
 
 <!-- Current milestone scope. -->
 
-(None — define with /gsd-new-milestone.)
+- [ ] Prevent hook configuration accumulation for GitHub #70 with idempotent updates that preserve user hooks and settings.
+- [ ] Diagnose state-lock contention for GitHub #71 without removing state locks or overwriting another live owner.
+- [ ] Prevent test worktree leakage for GitHub #72 by isolating fixtures and avoiding global-environment races.
+- [ ] Make OSC8 labeled links and bare URLs clickable on supported terminals without shell evaluation, and preserve text selection.
+- [ ] Make Shift+Enter insert a newline on supported terminals while restoring terminal mode and retaining a legacy fallback.
+- [ ] Complete test, CI, and smoke validation before publishing v2.2.0 through the existing release process.
 
 ### Out of Scope
 
@@ -79,24 +80,27 @@ recommendations plus the remote-modal red-border decision.
 - Remote vt100 rendering as the primary remote UX — the message/chat model is the core; raw PTY is an escape hatch
 - Dormant local branch rows, dormant-branch activation UI, and safe branch deletion — deferred to a future milestone
 - Daemon-backed remote TUI and PWA repository hierarchy/action parity — deferred to a future milestone; existing flat APIs remain non-destructive compatibility projections
+- Proxy-monitor integration: deferred until the external telemetry contract is resolved; this milestone will not claim a confirmed protocol solution
 
 ## Context
 
-- Mature codebase at **v0.14.0**; public repo `github.com/poindexter12/baude`, MIT.
+- Mature codebase at **v2.1.0**, source baseline for this milestone; public repo `github.com/poindexter12/baude`, MIT.
 - Cargo workspace: `baude-core/` (pty, session, meta, persist, git, bridge — no UI deps), `baude/` (ratatui TUI), `bauded/` (axum daemon + embedded PWA).
 - Distributed as prebuilt binaries via `mise`/`ubi` (release.yml builds 4 targets) and a multi-arch `ghcr.io/poindexter12/bauded` image.
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
 - The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
 - Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
 - Phase 5 repository admission is complete. Phase 6 plans 06-01 through 06-06 are retained as execution history, but deep review found lifecycle ownership gaps that require a shared-core corrective refactor before local TUI dogfooding.
-- The active v2.0 release surface is local TUI only. Remote/PWA hierarchy and dormant branch rows are future scope; `v2.0.0-beta` is a readiness target, not authorization to publish or push a release.
+- The v2.0 GSD-completed milestone runs through Phase 7. v2.1.0 is the source baseline for the current v2.2 reliability and terminal usability work.
 
 ## Constraints
 
 - **Tech stack**: Rust (ratatui TUI, axum/tokio daemon, portable-pty + vt100); vanilla JS/CSS PWA embedded in the binary with no build step — keep it that way.
 - **Security**: VPN/Tailscale-only; no auth layer is added. New endpoints inherit this model.
 - **Compatibility**: backend-specific integrations must tolerate upstream schema drift; pin verified Claude Code and OpenCode versions in comments where wire assumptions are made.
-- **Safety**: managed sessions run `--dangerously-skip-permissions` for unattended work; any permission-prompting mode is opt-in and must not become the unattended default.
+- **Safety**: managed sessions run `--dangerously-skip-permissions` for unattended work; any permission-prompting mode is opt-in and must not become the unattended default. Preserve user hooks and settings, never remove state locks or overwrite another live owner, isolate tests per fixture without global-environment races, and never automatically delete real user worktrees; cleanup requires preview and manual approval.
+- **Terminal compatibility**: links must open only on user gesture without shell evaluation and must preserve text selection; terminal mode must be restored, with a legacy fallback when supported input protocols are unavailable.
+- **Release validation**: publish v2.2.0 only after test, CI, and smoke checks pass through the existing release process.
 - **No regressions**: stable sidebar order and the dual-source (session-file + silence-fallback) waiting logic are hard-won; changes must preserve current behavior as a labeled fallback.
 
 ## Key Decisions
@@ -128,4 +132,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-03 after v2.0 milestone*
+*Last updated: 2026-09-08 for v2.2 milestone kickoff*

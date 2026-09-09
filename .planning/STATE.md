@@ -1,21 +1,16 @@
 ---
-gsd_state_version: 1.0
-milestone: v2.0
-milestone_name: Local TUI Dogfood Release
-status: Awaiting next milestone
-stopped_at: Phases 6 and 7 certified and completed; PR
-last_updated: "2026-09-03T19:34:43.558Z"
-last_activity: 2026-09-03
-last_activity_desc: Milestone v2.0 completed and archived
-state_head: 4a62be38691588028a6177a3162cf19dd597249a
+gsd_state_version: "1.0"
+milestone: v2.2
+milestone_name: Reliability and Terminal Usability
+status: planning
+last_updated: "2026-09-09T05:28:36.074Z"
+last_activity: 2026-09-08
 progress:
-  total_phases: 3
-  completed_phases: 2
-  total_plans: 16
-  completed_plans: 16
-  percent: 67
-current_phase: 7
-current_phase_name: local tui dogfood release
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -29,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: Milestone v2.0 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-09-03 — Milestone v2.0 completed and archived
+Status: Defining requirements
+Last activity: 2026-09-08 — Milestone v2.2 started
 
 ## Performance Metrics
 
