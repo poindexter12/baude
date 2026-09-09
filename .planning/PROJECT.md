@@ -26,7 +26,7 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 - Stop GitHub #70 hook configuration accumulation while preserving user hooks and settings.
 - Add actionable state-lock contention diagnostics without removing locks or overwriting another live owner.
 - Isolate test worktrees and environments so tests do not leak state or race through global environment.
-- Support clickable OSC8 labeled links and bare URLs without shell evaluation, while preserving text selection.
+- Support clickable OSC8 labeled links and bare URLs with destination preview and copy, without shell evaluation or loss of text selection.
 - Fix Shift+Enter newline behavior on supported terminals with terminal mode restoration and a legacy fallback.
 
 ## Requirements
@@ -66,7 +66,7 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 - [ ] Prevent hook configuration accumulation for GitHub #70 with idempotent updates that preserve user hooks and settings.
 - [ ] Diagnose state-lock contention for GitHub #71 without removing state locks or overwriting another live owner.
 - [ ] Prevent test worktree leakage for GitHub #72 by isolating fixtures and avoiding global-environment races.
-- [ ] Make OSC8 labeled links and bare URLs clickable on supported terminals without shell evaluation, and preserve text selection.
+- [ ] Make OSC8 labeled links and bare URLs clickable on supported terminals with destination preview and copy, without shell evaluation or loss of text selection.
 - [ ] Make Shift+Enter insert a newline on supported terminals while restoring terminal mode and retaining a legacy fallback.
 - [ ] Complete test, CI, and smoke validation before publishing v2.2.0 through the existing release process.
 
@@ -90,7 +90,7 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
 - The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
 - Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
-- Phase 5 repository admission is complete. Phase 6 plans 06-01 through 06-06 are retained as execution history, but deep review found lifecycle ownership gaps that require a shared-core corrective refactor before local TUI dogfooding.
+- Phases 5 through 7 are retained as completed v2.0 history. The Phase 6 corrective shared-core work is shipped, not an active v2.2 blocker; explicitly deferred human verification remains recorded in STATE.md.
 - The v2.0 GSD-completed milestone runs through Phase 7. v2.1.0 is the source baseline for the current v2.2 reliability and terminal usability work.
 
 ## Constraints
@@ -112,7 +112,7 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 | Local hook transport via per-session event files; HTTP only in the daemon | Matches existing `meta.rs`/bridge file-tail patterns; avoids a new bind for the TUI | ✓ Good — one event model serves file-tail + daemon POST (v0.7) |
 | Permission-prompt mode is opt-in; `skip` stays default | Unattended overnight runs must not block on phone approval | ✓ Good — fail-safe default-stays-skip + deny-on-timeout, security-reviewed (v0.7) |
 | `--permission-prompt-tool` requires a stdio MCP server (not a plain command) | Pinned by v0.7 research; baude hand-rolls a 3-method JSON-RPC server in both binaries, no new deps | ⚠️ Revisit — wire contract is MEDIUM-confidence (claude-code #1175); confirm against live claude 2.1.178 before public ship |
-| Narrow v2.0 to shared lifecycle ownership plus a local-TUI dogfood release | Deep Phase 6 review exposed duplicated App/Manager ownership and unsafe recovery transitions; remote/PWA and dormant-branch breadth would compound that risk | Active — preserve Phase 5, correct Phase 6 through a new plan, then gate `v2.0.0-beta` readiness in Phase 7 without publishing |
+| Narrow v2.0 to shared lifecycle ownership plus a local-TUI dogfood release | Deep Phase 6 review exposed duplicated App/Manager ownership and unsafe recovery transitions; remote/PWA and dormant-branch breadth would compound that risk | Completed in v2.0; later publication superseded the original no-publish boundary |
 
 ## Evolution
 
