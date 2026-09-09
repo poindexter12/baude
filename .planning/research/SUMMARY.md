@@ -1,8 +1,8 @@
 # Project Research Summary
 
-**Project:** baude v2.2 Reliability and Terminal Usability  
-**Domain:** Reliability fixes and terminal interaction in a Rust ratatui and VT application  
-**Researched:** 2026-09-08  
+**Project:** baude v2.2 Reliability and Terminal Usability
+**Domain:** Reliability fixes and terminal interaction in a Rust ratatui and VT application
+**Researched:** 2026-09-08
 **Confidence:** HIGH for scope and safety contracts, MEDIUM for terminal interoperability
 
 ## Executive Summary
@@ -80,38 +80,38 @@ Suggested five-phase sequence, continuing after completed Phase 7. The roadmappe
 
 ### Phase 8: Test Isolation and Fixture Ownership
 
-**Rationale:** Later reliability and terminal tests need deterministic roots and must not race through global state.  
-**Delivers:** Injected roots, unique repositories and worktrees, child `Command.env` setup, ownership-aware fixture cleanup, and missing-gitdir safety tests.  
-**Addresses:** #72 and safe cleanup.  
+**Rationale:** Later reliability and terminal tests need deterministic roots and must not race through global state.
+**Delivers:** Injected roots, unique repositories and worktrees, child `Command.env` setup, ownership-aware fixture cleanup, and missing-gitdir safety tests.
+**Addresses:** #72 and safe cleanup.
 **Avoids:** Environment races, OnceLock contamination, shared worktrees, and destructive cleanup.
 
 ### Phase 9: Reliability Contracts for Hooks and Locks
 
-**Rationale:** These are shared core boundaries and release-blocking data safety fixes.  
-**Delivers:** Idempotent owned hook seeding, custom and mixed group preservation, invalid JSON preservation, typed lock diagnostics, and no forced takeover.  
-**Addresses:** #70 and #71.  
+**Rationale:** These are shared core boundaries and release-blocking data safety fixes.
+**Delivers:** Idempotent owned hook seeding, custom and mixed group preservation, invalid JSON preservation, typed lock diagnostics, and no forced takeover.
+**Addresses:** #70 and #71.
 **Avoids:** Duplicate registrations, lost settings, generic empty-state fallback, PID authority, and lock overwrites.
 
 ### Phase 10: Clickable Link Metadata and Safe Gestures
 
-**Rationale:** Link activation depends on a coherent rendered-cell coordinate model.  
-**Delivers:** Shared vt100 annotations, OSC8 targets, bounded bare HTTP(S) discovery, selection/scrollback-aware hit testing, child mouse compatibility, and argv-based opening.  
-**Addresses:** Labeled links, bare URLs, selection preservation, and safe activation.  
+**Rationale:** Link activation depends on a coherent rendered-cell coordinate model.
+**Delivers:** Shared vt100 annotations, OSC8 targets, bounded bare HTTP(S) discovery, selection/scrollback-aware hit testing, child mouse compatibility, and argv-based opening.
+**Addresses:** Labeled links, bare URLs, selection preservation, and safe activation.
 **Avoids:** A second screen model, label spoofing, shell execution, arbitrary schemes, and click stealing.
 
 Verify the smallest viable vt100 extension here. Adjacent metadata must follow the authoritative grid; do not silently substitute a full terminal engine.
 
 ### Phase 11: Negotiated Multiline Input
 
-**Rationale:** Modified Enter has a distinct outer terminal lifecycle and must not be conflated with child encoding.  
-**Delivers:** Support-gated negotiation, scoped restoration, pure child encoding, Shift+Enter newline on supported paths, unchanged Enter/Ctrl-C, and honest legacy fallback.  
-**Addresses:** Reliable Shift+Enter.  
+**Rationale:** Modified Enter has a distinct outer terminal lifecycle and must not be conflated with child encoding.
+**Delivers:** Support-gated negotiation, scoped restoration, pure child encoding, Shift+Enter newline on supported paths, unchanged Enter/Ctrl-C, and honest legacy fallback.
+**Addresses:** Reliable Shift+Enter.
 **Avoids:** Unconditional CSI-u bytes, guessed distinctions, broken child input, and leaked terminal modes.
 
 ### Phase 12: Validation and v2.2.0 Release
 
-**Rationale:** Cross-surface regressions require integrated evidence.  
-**Delivers:** Focused and workspace tests, fmt, clippy, CI, lock subprocess tests, parser/selection vectors, and manual terminal smoke for links, mouse behavior, Shift+Enter, normal Enter, restoration, and failure exits. Publish only after checks pass.  
+**Rationale:** Cross-surface regressions require integrated evidence.
+**Delivers:** Focused and workspace tests, fmt, clippy, CI, lock subprocess tests, parser/selection vectors, and manual terminal smoke for links, mouse behavior, Shift+Enter, normal Enter, restoration, and failure exits. Publish only after checks pass.
 **Addresses:** Release evidence and regression prevention.
 
 ### Phase Ordering Rationale
@@ -155,7 +155,10 @@ Phase 9 uses standard JSON preservation and OS lock contention patterns, but imp
 ### Primary
 
 - `.planning/PROJECT.md` for baseline, approved scope, constraints, and release gates.
-- `.planning/research/{STACK,FEATURES,ARCHITECTURE,PITFALLS}.md` for supporting findings and source references.
+- `.planning/research/STACK.md` for supporting findings and source references.
+- `.planning/research/FEATURES.md` for supporting findings and source references.
+- `.planning/research/ARCHITECTURE.md` for supporting findings and source references.
+- `.planning/research/PITFALLS.md` for supporting findings and source references.
 - `Cargo.lock` and current hook, persistence, PTY, app, key, remote, UI, and manager sources.
 - [Rust environment safety](https://doc.rust-lang.org/std/env/fn.set_var.html)
 - [crossterm keyboard enhancement APIs](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.KeyboardEnhancementFlags.html)
@@ -168,6 +171,12 @@ Phase 9 uses standard JSON preservation and OS lock contention patterns, but imp
 
 - iTerm2, Contour, and Solo terminal documentation linked in the dimension reports.
 
+## Artifact Validation
+
+Research baseline: `acb6442` (v2.1.0). Milestone initialization: `a6237f2`. Research artifacts: `6642913`.
+
+All four dimension files exist and are substantive. The source and milestone commits resolve locally. This is document validation only; implementation tests and terminal smoke tests have not run.
+
 ---
-*Research completed: 2026-09-08*  
+*Research completed: 2026-09-08*
 *Ready for roadmap: yes, after requirements and roadmap approval*
