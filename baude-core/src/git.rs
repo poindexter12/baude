@@ -534,8 +534,9 @@ impl fmt::Display for DefaultBranchUnavailable {
             ),
             Self::NoCandidate { remotes } => write!(
                 f,
-                "no verified local remote HEAD was found (tried {}); fetch or set the remote HEAD explicitly",
-                remotes.join(", ")
+                "no verified local remote HEAD was found (tried {}) and the main branch tracks no verified remote branch; run `git remote set-head {} -a`",
+                remotes.join(", "),
+                remotes.first().map_or("origin", String::as_str)
             ),
             Self::MalformedMainHead { detail } => {
                 write!(f, "the main worktree HEAD is malformed: {detail}")
@@ -607,6 +608,42 @@ fn unsupported_from_output(operation: &'static str, output: &Output) -> DefaultB
             String::from_utf8_lossy(&output.stderr).trim()
         ),
     }
+}
+
+/// Read one `for-each-ref` field for a single ref, rejecting multi-line output.
+fn upstream_field(
+    repo: &Path,
+    field: &str,
+    reference: &str,
+    operation: &'static str,
+) -> std::result::Result<String, DefaultBranchUnavailable> {
+    let format = format!("--format={field}");
+    let output = git_probe(
+        repo,
+        &[
+            OsStr::new("for-each-ref"),
+            OsStr::new(&format),
+            OsStr::new("--"),
+            OsStr::new(reference),
+        ],
+        operation,
+    )?;
+    if !output.status.success() {
+        return Err(unsupported_from_output(operation, &output));
+    }
+    let value = std::str::from_utf8(&output.stdout)
+        .map_err(|error| DefaultBranchUnavailable::UnsupportedCommand {
+            operation,
+            detail: error.to_string(),
+        })?
+        .trim_end_matches(['\r', '\n']);
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(DefaultBranchUnavailable::UnsupportedCommand {
+            operation,
+            detail: "multi-line ref output".into(),
+        });
+    }
+    Ok(value.to_owned())
 }
 
 fn verify_commit(
@@ -693,34 +730,13 @@ pub fn resolve_default_branch(
         ));
     }
 
-    let upstream = git_probe(
+    let upstream = upstream_field(
         &snapshot.main_worktree,
-        &[
-            OsStr::new("for-each-ref"),
-            OsStr::new("--format=%(upstream:remotename)"),
-            OsStr::new("--"),
-            OsStr::new(&main_head),
-        ],
+        "%(upstream:remotename)",
+        &main_head,
         "resolve main upstream remote",
     )?;
-    if !upstream.status.success() {
-        return Err(unsupported_from_output(
-            "resolve main upstream remote",
-            &upstream,
-        ));
-    }
-    let upstream = std::str::from_utf8(&upstream.stdout)
-        .map_err(|error| DefaultBranchUnavailable::UnsupportedCommand {
-            operation: "resolve main upstream remote",
-            detail: error.to_string(),
-        })?
-        .trim_end_matches(['\r', '\n']);
-    if upstream.contains(['\r', '\n', '\0']) {
-        return Err(DefaultBranchUnavailable::UnsupportedCommand {
-            operation: "resolve main upstream remote",
-            detail: "multi-line remote output".into(),
-        });
-    }
+    let upstream = upstream.as_str();
 
     let mut remotes = Vec::with_capacity(2);
     if !upstream.is_empty() && upstream != "." {
@@ -784,10 +800,87 @@ pub fn resolve_default_branch(
     }
 
     if let Some((remote, target)) = dangling {
-        Err(DefaultBranchUnavailable::DanglingTarget { remote, target })
-    } else {
-        Err(DefaultBranchUnavailable::NoCandidate { remotes })
+        return Err(DefaultBranchUnavailable::DanglingTarget { remote, target });
     }
+    if let Some(adopted) = adopt_tracked_remote_head(snapshot, &main_head, &remotes)? {
+        return Ok(adopted);
+    }
+    Err(DefaultBranchUnavailable::NoCandidate { remotes })
+}
+
+/// Adopt the remote branch the main worktree already tracks as that remote's HEAD.
+///
+/// `git init` + `remote add` + `push -u` (what `gh repo create` produces) never writes
+/// `refs/remotes/<remote>/HEAD`; only `git clone` does. When the main branch tracks a
+/// verified remote branch, the default is unambiguous, so record it locally instead of
+/// refusing the repository.
+///
+/// Deliberately narrow: only a *missing* remote HEAD is adopted. A malformed or dangling
+/// one signals stale metadata that the caller should surface rather than silently rewrite.
+fn adopt_tracked_remote_head(
+    snapshot: &RepositorySnapshot,
+    main_head: &str,
+    remotes: &[String],
+) -> std::result::Result<Option<DefaultBranch>, DefaultBranchUnavailable> {
+    let target = upstream_field(
+        &snapshot.main_worktree,
+        "%(upstream)",
+        main_head,
+        "resolve main upstream ref",
+    )?;
+    if target.is_empty() {
+        return Ok(None);
+    }
+
+    let Some((remote, local_branch)) = remotes.iter().find_map(|remote| {
+        let prefix = format!("refs/remotes/{remote}/");
+        target
+            .strip_prefix(&prefix)
+            .filter(|name| !name.is_empty())
+            .map(|name| (remote.clone(), name.to_owned()))
+    }) else {
+        return Ok(None);
+    };
+
+    let verified = verify_commit(
+        &snapshot.main_worktree,
+        &target,
+        "verify tracked upstream commit",
+    )?;
+    if !verified.status.success() {
+        if verified.status.code() == Some(1) {
+            return Ok(None);
+        }
+        return Err(unsupported_from_output(
+            "verify tracked upstream commit",
+            &verified,
+        ));
+    }
+
+    let remote_head = format!("refs/remotes/{remote}/HEAD");
+    let written = git_probe(
+        &snapshot.main_worktree,
+        &[
+            OsStr::new("symbolic-ref"),
+            OsStr::new("--"),
+            OsStr::new(&remote_head),
+            OsStr::new(&target),
+        ],
+        "adopt tracked remote HEAD",
+    )?;
+    if !written.status.success() {
+        return Err(unsupported_from_output(
+            "adopt tracked remote HEAD",
+            &written,
+        ));
+    }
+
+    Ok(Some(DefaultBranch {
+        remote,
+        remote_ref: target,
+        local_ref: format!("refs/heads/{local_branch}"),
+        local_branch,
+    }))
 }
 
 /// Where an ensured default checkout came from.
@@ -2540,7 +2633,10 @@ mod tests {
             repo
         }
 
-        fn remote_head(&self, repo: &Path, remote: &str, branch: &str) {
+        /// The `git init` + `remote add` + `push -u` shape (what `gh repo create` leaves
+        /// behind): a remote and a tracking ref, but no `refs/remotes/<remote>/HEAD`.
+        /// Only `git clone` writes that ref, so this is the majority real-world shape.
+        fn remote_tracking(&self, repo: &Path, remote: &str, branch: &str) {
             let url = self.root.join(format!("{remote}-remote.git"));
             git_ok(
                 repo,
@@ -2560,6 +2656,13 @@ mod tests {
                     OsStr::new("HEAD"),
                 ],
             );
+        }
+
+        /// The post-`git clone` shape: [`Self::remote_tracking`] plus the
+        /// `refs/remotes/<remote>/HEAD` symbolic ref that `clone` records.
+        fn remote_head(&self, repo: &Path, remote: &str, branch: &str) {
+            self.remote_tracking(repo, remote, branch);
+            let tracking = format!("refs/remotes/{remote}/{branch}");
             let remote_head = format!("refs/remotes/{remote}/HEAD");
             git_ok(
                 repo,
@@ -2567,6 +2670,28 @@ mod tests {
                     OsStr::new("symbolic-ref"),
                     OsStr::new(&remote_head),
                     OsStr::new(&tracking),
+                ],
+            );
+        }
+
+        /// Point the fixture's `topic` branch at a specific remote-tracking branch, so
+        /// `%(upstream)` resolves to `refs/remotes/<remote>/<branch>` the way `push -u` does.
+        fn set_main_upstream(&self, repo: &Path, remote: &str, branch: &str) {
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("branch.topic.remote"),
+                    OsStr::new(remote),
+                ],
+            );
+            let merge = format!("refs/heads/{branch}");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("branch.topic.merge"),
+                    OsStr::new(&merge),
                 ],
             );
         }
@@ -2750,6 +2875,112 @@ mod tests {
             let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
             assert_eq!(default.remote, "origin");
             assert_eq!(default.local_branch, "trunk");
+        }
+
+        /// Guards the fixture itself. Writing `refs/remotes/origin/HEAD` into the pushed shape
+        /// is exactly what hid the adoption gap for the whole v2.0 cycle, and it hid it by
+        /// making every success-path test pass. If this fails, a repair step came back.
+        #[test]
+        fn remote_tracking_fixture_records_no_remote_head() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("shape guard");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+
+            let probe = crate::git::git_probe(
+                &repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("-q"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                ],
+                "fixture shape guard",
+            )
+            .unwrap();
+            assert!(
+                !probe.status.success(),
+                "remote_tracking must leave refs/remotes/origin/HEAD absent; use remote_head \
+                 for the cloned shape instead of repairing this one"
+            );
+        }
+
+        /// The `gh repo create` shape: a remote and a tracking ref pushed with `-u`, but no
+        /// `refs/remotes/origin/HEAD`. Before adoption existed this was unrepresentable in
+        /// the fixture API, and every fixture hand-wrote the missing ref as setup.
+        #[test]
+        fn pushed_repo_without_remote_head_adopts_tracked_upstream() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("pushed no head");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.set_main_upstream(&repo, "origin", "trunk");
+
+            let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(default.remote, "origin");
+            assert_eq!(default.local_branch, "trunk");
+            assert_eq!(default.remote_ref, "refs/remotes/origin/trunk");
+            assert_eq!(default.local_ref, "refs/heads/trunk");
+        }
+
+        /// Adoption records the ref, so a second resolve takes the ordinary verified path.
+        #[test]
+        fn adoption_records_remote_head_for_later_resolves() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("adoption persists");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.set_main_upstream(&repo, "origin", "trunk");
+
+            resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+
+            let recorded = git_ok(
+                &repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                ],
+            );
+            assert_eq!(
+                String::from_utf8(recorded).unwrap().trim(),
+                "refs/remotes/origin/trunk"
+            );
+
+            let again = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(again.local_branch, "trunk");
+        }
+
+        /// A remote with no tracked upstream is genuinely ambiguous, so it still fails closed.
+        #[test]
+        fn remote_without_tracked_upstream_still_fails_closed() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("no upstream");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&repo).unwrap()),
+                Err(DefaultBranchUnavailable::NoCandidate { .. })
+            ));
+        }
+
+        /// Adoption is narrow by design: it fills a *missing* remote HEAD only. A dangling one
+        /// means stale metadata worth surfacing, so it is never silently rewritten even when a
+        /// verified upstream is available to rewrite it with.
+        #[test]
+        fn adoption_never_rewrites_a_dangling_remote_head() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("dangling with upstream");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.set_main_upstream(&repo, "origin", "trunk");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                    OsStr::new("refs/remotes/origin/gone"),
+                ],
+            );
+
+            assert!(matches!(
+                resolve_default_branch(&discover_repository(&repo).unwrap()),
+                Err(DefaultBranchUnavailable::DanglingTarget { .. })
+            ));
         }
 
         #[test]

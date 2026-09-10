@@ -5541,17 +5541,51 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         repo
     }
+
+    /// The post-`git clone` shape, so the admission matrix covers repositories that already
+    /// carry `refs/remotes/origin/HEAD` as well as those that never will.
+    fn admission_repo_cloned(name: &str) -> PathBuf {
+        let pushed = admission_repo(name);
+        let root = pushed.parent().unwrap().to_path_buf();
+        let origin = root.join("origin.git");
+        let clone = root.join("clone");
+        let _ = std::fs::remove_dir_all(&clone);
+        git(
+            &root,
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        clone
+    }
+
+    /// Guards the fixture itself: `admission_repo` must keep the pushed shape. Repairing
+    /// `refs/remotes/origin/HEAD` here is what kept every admission test green while real
+    /// `gh repo create` repositories were being refused.
+    #[test]
+    fn admission_fixture_records_no_remote_head() {
+        let repo = admission_repo("shape-guard");
+        let probe = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            !probe.status.success(),
+            "admission_repo must leave refs/remotes/origin/HEAD absent; use \
+             admission_repo_cloned for the cloned shape instead of repairing this one"
+        );
+    }
+
+    // Both provisioning shapes are covered at admission level without a dedicated test:
+    // `admission_repo` is now the pushed shape, so every admission test exercises it, and
+    // `admit_repository_assigns_main_role_to_unselected_main_worktree` covers the cloned one.
+    // Resolve-level adoption is pinned in baude-core::git::tests::default_branch.
 
     fn removal_app(
         label: &str,
@@ -6701,7 +6735,10 @@ mod tests {
 
     #[test]
     fn admit_repository_assigns_main_role_to_unselected_main_worktree() {
-        let repo = admission_repo("worktree-main-role");
+        // Cloned shape on purpose: this test is about role assignment, and it parks the main
+        // worktree on a branch that tracks nothing, so `origin/HEAD` is the only remaining
+        // local evidence of the default. The pushed shape cannot express that (see #73).
+        let repo = admission_repo_cloned("worktree-main-role");
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
