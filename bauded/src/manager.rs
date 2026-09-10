@@ -2835,15 +2835,10 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -2925,15 +2920,10 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -3041,15 +3031,10 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -3202,15 +3187,10 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -3508,15 +3488,10 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
+        // refs/remotes/origin/HEAD here would hide whether admission works for a repo
+        // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
