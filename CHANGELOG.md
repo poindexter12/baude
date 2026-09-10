@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/poindexter12/baude/compare/v2.1.0...v2.1.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **core:** resolve the default branch when a remote records no HEAD ([0078fb4](https://github.com/poindexter12/baude/commit/0078fb471b75f47d7871767e816037768c7e8fd4))
+* **core:** resolve the default branch when a remote records no HEAD ([afd0e75](https://github.com/poindexter12/baude/commit/afd0e753dfeaa48dd8f06765e068e12ceebca219))
+
 ## [2.1.0](https://github.com/poindexter12/baude/compare/v2.0.0...v2.1.0) (2026-09-08)
 
 
