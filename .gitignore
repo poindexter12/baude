@@ -6,6 +6,9 @@
 # GSD machine-readable state projection (regenerated from planning artifacts)
 .planning/state.json
 
+# Per-developer opencode config; points at whatever inference endpoint you run.
+opencode.json
+
 # Graphify portable outputs; caches and machine-local intermediates are rebuilt.
 /graphify-out/*
 !/graphify-out/GRAPH_REPORT.md
