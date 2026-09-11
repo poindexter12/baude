@@ -78,17 +78,70 @@ pub fn baude_hook_command() -> String {
     }
 }
 
-/// Idempotently merge baude's hook entries into an existing settings value.
+/// True iff `command` is one this module previously seeded from a resolved
+/// `current_exe()` — i.e. `"<absolute path> hook"` whose file stem is `baude`
+/// or `bauded`.
 ///
-/// Reads whatever JSON is in `settings.local.json` and returns the merged
-/// JSON. `command` is both the inserted command and the idempotency sentinel:
-/// an entry is "baude's" iff one of its inner hooks has `command == command`.
-/// Re-running this on its own output is a no-op (HOOK-01 idempotency).
+/// This is the "that group is ours" test that the literal-string idempotency
+/// sentinel could never express: every mise re-pin, lane switch, dev build, or
+/// `bauded`-vs-`baude` spawn produces a *different* sentinel, so entries piled
+/// up per binary path and kept firing after their binary was deleted.
 ///
-/// Never clobbers sibling keys (`statusLine`, `permissions`, `env`, …) or a
-/// user's own hook groups — only `.entry().or_insert()` into `hooks.<event>`
-/// arrays, appending baude's group when absent. Never panics on a minimal /
-/// non-object / odd file (T-02-04).
+/// Deliberately excludes the bare `"baude hook"` fallback ([`baude_hook_command`]
+/// when `current_exe()` fails): it names no specific install, so it can never go
+/// stale and is never pruned.
+pub fn is_seeded_hook_command(command: &str) -> bool {
+    let Some(path) = command.strip_suffix(" hook") else {
+        return false;
+    };
+    let path = std::path::Path::new(path);
+    path.is_absolute()
+        && matches!(
+            path.file_stem().and_then(|stem| stem.to_str()),
+            Some("baude" | "bauded")
+        )
+}
+
+/// The command of `group` iff `group` has exactly the shape this module writes:
+/// a lone `hooks` key holding exactly one `{type: "command", command: …}` entry.
+///
+/// Any other shape — a `matcher`, extra fields, several inner hooks, a user hook
+/// sharing the group — means a user has touched it, so it is neither pruned nor
+/// counted as a pure seed.
+fn seeded_group_command(group: &Value) -> Option<&str> {
+    let obj = group.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let [entry] = obj.get("hooks")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let entry = entry.as_object()?;
+    if entry.len() != 2 || entry.get("type")?.as_str()? != "command" {
+        return None;
+    }
+    entry.get("command")?.as_str()
+}
+
+/// Idempotently merge baude's hook entries into an existing settings value,
+/// pruning the groups any *other* baude install left behind.
+///
+/// Reads whatever JSON is in `settings.local.json` and returns the merged JSON.
+/// Last launcher wins: every group matching [`seeded_group_command`] +
+/// [`is_seeded_hook_command`] is dropped first — dead paths and live ones alike —
+/// then `command` is appended, leaving exactly one baude group per event
+/// pointing at the binary that launched this session. Re-running this on its own
+/// output is a no-op (HOOK-01 idempotency).
+///
+/// Never clobbers sibling keys (`statusLine`, `permissions`, `env`, …), a user's
+/// own hook groups, a group mixing a seeded entry with a user hook, or the bare
+/// `baude hook` fallback. Never panics on a minimal / non-object / odd file
+/// (T-02-04).
+///
+/// The tradeoff is that two lanes launching in the same repo flip the path back
+/// and forth; that is harmless (the `hook` contract is identical in both
+/// binaries and Claude Code snapshots hooks at session start) and strictly
+/// better than a file that only grows.
 pub fn merge_hook_settings(existing: &Value, command: &str) -> Value {
     let mut root = existing.clone();
     if !root.is_object() {
@@ -106,6 +159,11 @@ pub fn merge_hook_settings(existing: &Value, command: &str) -> Value {
         let Some(groups) = arr.as_array_mut() else {
             continue;
         };
+        // Last launcher wins: drop the groups other baude installs seeded so
+        // this event carries exactly one, pointing at the live binary.
+        groups.retain(|g| !seeded_group_command(g).is_some_and(is_seeded_hook_command));
+        // Anything still holding `command` is user-shaped (a mixed group, or the
+        // bare fallback) — leave it alone rather than adding a second copy.
         let already = groups.iter().any(|g| {
             g["hooks"]
                 .as_array()
@@ -122,9 +180,10 @@ pub fn merge_hook_settings(existing: &Value, command: &str) -> Value {
 
 /// True iff a `settings.local.json` value is PURELY baude's own hook seed —
 /// exactly the shape [`merge_hook_settings`] writes into an empty file, with
-/// nothing a user could have added. Multiple seed groups per event are
-/// accepted (the TUI and the daemon seed distinct `current_exe()` commands),
-/// and a subset of [`EVENTS`] keys is accepted (a seed from an older binary).
+/// nothing a user could have added. Multiple seed groups per event are still
+/// accepted — a file last written before [`merge_hook_settings`] learned to
+/// prune carries one group per binary path that ever launched there — and a
+/// subset of [`EVENTS`] keys is accepted (a seed from an older binary).
 /// Any other key, group shape, or command form means the file may carry user
 /// content and must keep blocking removal.
 pub fn is_pure_seed_settings(root: &Value) -> bool {
@@ -148,28 +207,13 @@ pub fn is_pure_seed_settings(root: &Value) -> bool {
     })
 }
 
+/// True iff `group` has the shape baude seeds, holding any `… hook` command.
+///
+/// Deliberately looser than [`is_seeded_hook_command`]: this predicate governs
+/// worktree-removal exemption, where the seeding binary is whatever resolved
+/// `current_exe()` (a test harness included), not only `baude`/`bauded`.
 fn is_pure_seed_group(group: &Value) -> bool {
-    let Some(obj) = group.as_object() else {
-        return false;
-    };
-    if obj.len() != 1 {
-        return false;
-    }
-    let Some(inner) = obj.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    let [entry] = inner.as_slice() else {
-        return false;
-    };
-    let Some(entry) = entry.as_object() else {
-        return false;
-    };
-    entry.len() == 2
-        && entry.get("type").and_then(Value::as_str) == Some("command")
-        && entry
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|command| command.ends_with(" hook"))
+    seeded_group_command(group).is_some_and(|command| command.ends_with(" hook"))
 }
 
 /// Append one event line to the per-session `/tmp` file (O_APPEND).
@@ -448,6 +492,122 @@ mod tests {
         assert_eq!(baude_entry_count(&out, "UserPromptSubmit"), 1);
     }
 
+    // ---- seeded-command recognition / pruning ---------------------------
+
+    #[test]
+    fn seeded_hook_command_recognizes_only_resolved_baude_paths() {
+        assert!(is_seeded_hook_command("/opt/baude hook"));
+        assert!(is_seeded_hook_command("/opt/bauded hook"));
+        // A real accumulated path from the issue, and one with spaces in it.
+        assert!(is_seeded_hook_command(
+            "/Users/j/.local/share/mise/installs/baude/2.0.0-beta.1/baude hook"
+        ));
+        assert!(is_seeded_hook_command("/Users/j/my dir/baude hook"));
+
+        // The bare fallback names no install, so it can never go stale.
+        assert!(!is_seeded_hook_command("baude hook"));
+        // Relative paths, other binaries, and user commands are not ours.
+        assert!(!is_seeded_hook_command("./target/release/baude hook"));
+        assert!(!is_seeded_hook_command("/usr/bin/mybaude hook"));
+        assert!(!is_seeded_hook_command("/usr/local/bin/my-lint hook"));
+        assert!(!is_seeded_hook_command("/opt/baude hooks"));
+        assert!(!is_seeded_hook_command("/opt/baude statusline"));
+        assert!(!is_seeded_hook_command(""));
+    }
+
+    #[test]
+    fn merge_prunes_stale_seeds_leaving_only_the_launching_binary() {
+        // The issue's shape: one repo carrying a group per binary path that
+        // ever launched there, several of them now deleted.
+        let mut settings = json!({});
+        for stale in [
+            "/Users/j/.local/share/mise/installs/baude/2.0.0-beta.1/baude hook",
+            "/Users/j/.local/share/mise/installs/baude/latest/baude hook",
+            "/Users/j/Code/baude/target/release/baude hook",
+            "/Users/j/Code/baude/target/release/bauded hook",
+        ] {
+            settings = merge_hook_settings(&settings, stale);
+        }
+        let merged = merge_hook_settings(&settings, CMD);
+
+        for ev in EVENTS {
+            let groups = merged["hooks"][ev].as_array().unwrap();
+            assert_eq!(
+                groups.len(),
+                1,
+                "exactly one baude group must survive for {ev}"
+            );
+            assert_eq!(
+                seeded_group_command(&groups[0]),
+                Some(CMD),
+                "surviving group for {ev} must name the launching binary"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_prune_never_touches_user_content_or_the_bare_fallback() {
+        let existing = parse(
+            r#"{
+                "statusLine": {"type":"command","command":"my-statusline"},
+                "hooks": {
+                    "Stop": [
+                        {"hooks":[{"type":"command","command":"user-own-hook"}]},
+                        {"hooks":[{"type":"command","command":"/usr/local/bin/my-lint hook"}]},
+                        {"hooks":[
+                            {"type":"command","command":"/old/baude hook"},
+                            {"type":"command","command":"notify-send done"}
+                        ]},
+                        {"matcher":"Bash","hooks":[{"type":"command","command":"/old/baude hook"}]},
+                        {"hooks":[{"type":"command","command":"baude hook"}]},
+                        {"hooks":[{"type":"command","command":"/old/baude hook"}]}
+                    ]
+                }
+            }"#,
+        );
+        let out = merge_hook_settings(&existing, CMD);
+        let groups = out["hooks"]["Stop"].as_array().unwrap();
+
+        assert_eq!(out["statusLine"], existing["statusLine"]);
+        // Only the last group — a lone, exactly-shaped seed — is prunable. The
+        // user's own hook, their `… hook` command, the group mixing a seed with
+        // a user hook, the matcher-carrying group, and the bare fallback all
+        // survive verbatim, in order, with baude's fresh group appended.
+        let expected = existing["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), expected.len());
+        for (i, kept) in expected[..expected.len() - 1].iter().enumerate() {
+            assert_eq!(&groups[i], kept, "group {i} must survive untouched");
+        }
+        assert_eq!(seeded_group_command(groups.last().unwrap()), Some(CMD));
+    }
+
+    #[test]
+    fn merge_with_prune_is_idempotent_on_its_own_output() {
+        // HOOK-01: prune + merge over already-merged content is a byte no-op,
+        // including when user groups sit on either side of baude's.
+        let user = parse(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"user-own-hook"}]}]}}"#,
+        );
+        for start in [json!({}), user] {
+            let once = merge_hook_settings(&start, CMD);
+            let twice = merge_hook_settings(&once, CMD);
+            assert_eq!(once, twice, "re-merge must not change its own output");
+        }
+    }
+
+    #[test]
+    fn merge_prunes_the_other_binary_so_lanes_alternate_rather_than_accumulate() {
+        // The accepted tradeoff: `bauded` launching after `baude` in the same
+        // repo takes the slot over rather than adding to it.
+        let by_tui = merge_hook_settings(&json!({}), "/opt/baude hook");
+        let by_daemon = merge_hook_settings(&by_tui, "/opt/bauded hook");
+        for ev in EVENTS {
+            let groups = by_daemon["hooks"][ev].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "one group per event for {ev}");
+            assert_eq!(seeded_group_command(&groups[0]), Some("/opt/bauded hook"));
+        }
+    }
+
     // ---- event_path / append_event -------------------------------------
 
     #[test]
@@ -565,6 +725,18 @@ mod tests {
             "baude hook"
         )));
 
+        // A file last written before merge learned to prune carries one group
+        // per binary path; it is still purely baude's and must stay removable.
+        let mut legacy = seed.clone();
+        for (event, groups) in legacy["hooks"].as_object_mut().unwrap() {
+            let _ = event;
+            groups
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "hooks": [{ "type": "command", "command": "/old/bauded hook" }] }));
+        }
+        assert!(is_pure_seed_settings(&legacy));
+
         // An older binary's seed carries fewer events; still pure.
         let mut subset = seed.clone();
         subset["hooks"]
@@ -581,6 +753,11 @@ mod tests {
         assert!(!is_pure_seed_settings(&sibling_key));
         let user_command = merge_hook_settings(&seed, "notify-send done");
         assert!(!is_pure_seed_settings(&user_command));
+        // Seeds from a binary that is not literally baude/bauded — a test
+        // harness resolving current_exe() to target/debug/deps/baude-<hash> —
+        // are still baude's own seed and must not block removal.
+        let harness = merge_hook_settings(&seed, "/t/target/debug/deps/baude-9f2c hook");
+        assert!(is_pure_seed_settings(&harness));
         let mut unknown_event = seed.clone();
         unknown_event["hooks"]["PreToolUse"] =
             json!([{ "hooks": [{ "type": "command", "command": "/opt/baude hook" }] }]);
