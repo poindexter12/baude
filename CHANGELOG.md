@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.2](https://github.com/poindexter12/baude/compare/v2.1.1...v2.1.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* **core:** keep one seeded hook entry per event, not one per binary path ([#77](https://github.com/poindexter12/baude/issues/77)) ([b570668](https://github.com/poindexter12/baude/commit/b570668d0b7a406703221b808c47428f9da34900)), closes [#70](https://github.com/poindexter12/baude/issues/70)
+
 ## [2.1.1](https://github.com/poindexter12/baude/compare/v2.1.0...v2.1.1) (2026-09-10)
 
 
