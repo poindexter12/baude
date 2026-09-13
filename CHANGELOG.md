@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.5](https://github.com/poindexter12/baude/compare/v2.1.4...v2.1.5) (2026-09-13)
+
+
+### Bug Fixes
+
+* **core:** only baude's own seed exempts a file from blocking removal ([#84](https://github.com/poindexter12/baude/issues/84)) ([f0d2462](https://github.com/poindexter12/baude/commit/f0d2462ce060dfc8f59a157a5be31c6fb8ff9e60))
+
 ## [2.1.4](https://github.com/poindexter12/baude/compare/v2.1.3...v2.1.4) (2026-09-13)
 
 
