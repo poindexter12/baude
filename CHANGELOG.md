@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.4](https://github.com/poindexter12/baude/compare/v2.1.3...v2.1.4) (2026-09-13)
+
+
+### Bug Fixes
+
+* **test:** contain managed worktrees in fixture roots ([#82](https://github.com/poindexter12/baude/issues/82)) ([725c558](https://github.com/poindexter12/baude/commit/725c5584d1e4d921742f84605130114555e03548))
+
 ## [2.1.3](https://github.com/poindexter12/baude/compare/v2.1.2...v2.1.3) (2026-09-13)
 
 
