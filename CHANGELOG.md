@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.3](https://github.com/poindexter12/baude/compare/v2.1.2...v2.1.3) (2026-09-13)
+
+
+### Bug Fixes
+
+* name the baude holding a workspace, and resolve defaults from linked worktrees ([#80](https://github.com/poindexter12/baude/issues/80)) ([eab3297](https://github.com/poindexter12/baude/commit/eab329754a754019e70ca556525d6500102a98da))
+
 ## [2.1.2](https://github.com/poindexter12/baude/compare/v2.1.1...v2.1.2) (2026-09-11)
 
 
