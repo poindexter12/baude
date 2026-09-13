@@ -504,6 +504,13 @@ pub enum DefaultBranchUnavailable {
     NoCandidate {
         remotes: Vec<String>,
     },
+    /// Linked worktrees track more than one remote branch and nothing local
+    /// ranks them, so adopting either would be a guess written into the user's
+    /// Git metadata. Fails closed the way a missing candidate does.
+    AmbiguousTrackedDefault {
+        remote: String,
+        targets: Vec<String>,
+    },
     MalformedMainHead {
         detail: String,
     },
@@ -537,6 +544,11 @@ impl fmt::Display for DefaultBranchUnavailable {
                 "no verified local remote HEAD was found (tried {}) and the main branch tracks no verified remote branch; run `git remote set-head {} -a`",
                 remotes.join(", "),
                 remotes.first().map_or("origin", String::as_str)
+            ),
+            Self::AmbiguousTrackedDefault { remote, targets } => write!(
+                f,
+                "no remote HEAD is recorded and the checked-out branches track more than one remote branch ({}); run `git remote set-head {remote} -a`",
+                targets.join(", ")
             ),
             Self::MalformedMainHead { detail } => {
                 write!(f, "the main worktree HEAD is malformed: {detail}")
@@ -808,12 +820,17 @@ pub fn resolve_default_branch(
     Err(DefaultBranchUnavailable::NoCandidate { remotes })
 }
 
-/// Adopt the remote branch the main worktree already tracks as that remote's HEAD.
+/// Adopt a remote branch this repository already tracks as that remote's HEAD.
 ///
 /// `git init` + `remote add` + `push -u` (what `gh repo create` produces) never writes
-/// `refs/remotes/<remote>/HEAD`; only `git clone` does. When the main branch tracks a
-/// verified remote branch, the default is unambiguous, so record it locally instead of
+/// `refs/remotes/<remote>/HEAD`; only `git clone` does. When a checked-out branch tracks
+/// a verified remote branch, the default is unambiguous, so record it locally instead of
 /// refusing the repository.
+///
+/// The main worktree is asked first and wins outright. Only when it tracks nothing do the
+/// linked worktrees get a vote — the shape where the main worktree sits on a feature branch
+/// and the default branch lives in a linked worktree (#73). Linked worktrees that disagree
+/// are ambiguous and fail closed rather than guessing at the user's default.
 ///
 /// Deliberately narrow: only a *missing* remote HEAD is adopted. A malformed or dangling
 /// one signals stale metadata that the caller should surface rather than silently rewrite.
@@ -822,11 +839,70 @@ fn adopt_tracked_remote_head(
     main_head: &str,
     remotes: &[String],
 ) -> std::result::Result<Option<DefaultBranch>, DefaultBranchUnavailable> {
+    if let Some(tracked) = tracked_upstream(snapshot, main_head, remotes)? {
+        return record_remote_head(snapshot, tracked).map(Some);
+    }
+
+    let mut candidates: Vec<TrackedUpstream> = Vec::new();
+    for record in snapshot.worktrees.iter().skip(1) {
+        // A prunable record points at a directory that is already gone, so its
+        // branch is not evidence of anything the user is working in.
+        if record.detached || record.prunable {
+            continue;
+        }
+        let Some(branch) = record
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != main_head)
+        else {
+            continue;
+        };
+        let Some(tracked) = tracked_upstream(snapshot, branch, remotes)? else {
+            continue;
+        };
+        if !candidates
+            .iter()
+            .any(|known| known.remote_ref == tracked.remote_ref)
+        {
+            candidates.push(tracked);
+        }
+    }
+
+    if candidates.len() > 1 {
+        return Err(DefaultBranchUnavailable::AmbiguousTrackedDefault {
+            remote: candidates[0].remote.clone(),
+            targets: candidates
+                .into_iter()
+                .map(|candidate| candidate.remote_ref)
+                .collect(),
+        });
+    }
+    match candidates.pop() {
+        Some(tracked) => record_remote_head(snapshot, tracked).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// One branch's verified upstream, resolved into the remote it belongs to.
+struct TrackedUpstream {
+    remote: String,
+    remote_ref: String,
+    local_branch: String,
+}
+
+/// The verified remote-tracking branch `branch_ref` follows, if any. Branch refs
+/// and their upstream config live in the common dir, so the main worktree can
+/// answer for every branch in the repository, checked out or not.
+fn tracked_upstream(
+    snapshot: &RepositorySnapshot,
+    branch_ref: &str,
+    remotes: &[String],
+) -> std::result::Result<Option<TrackedUpstream>, DefaultBranchUnavailable> {
     let target = upstream_field(
         &snapshot.main_worktree,
         "%(upstream)",
-        main_head,
-        "resolve main upstream ref",
+        branch_ref,
+        "resolve tracked upstream ref",
     )?;
     if target.is_empty() {
         return Ok(None);
@@ -857,6 +933,24 @@ fn adopt_tracked_remote_head(
         ));
     }
 
+    Ok(Some(TrackedUpstream {
+        remote,
+        remote_ref: target,
+        local_branch,
+    }))
+}
+
+/// Record the adopted upstream as `refs/remotes/<remote>/HEAD` so later resolves
+/// take the ordinary verified path instead of adopting again.
+fn record_remote_head(
+    snapshot: &RepositorySnapshot,
+    tracked: TrackedUpstream,
+) -> std::result::Result<DefaultBranch, DefaultBranchUnavailable> {
+    let TrackedUpstream {
+        remote,
+        remote_ref,
+        local_branch,
+    } = tracked;
     let remote_head = format!("refs/remotes/{remote}/HEAD");
     let written = git_probe(
         &snapshot.main_worktree,
@@ -864,7 +958,7 @@ fn adopt_tracked_remote_head(
             OsStr::new("symbolic-ref"),
             OsStr::new("--"),
             OsStr::new(&remote_head),
-            OsStr::new(&target),
+            OsStr::new(&remote_ref),
         ],
         "adopt tracked remote HEAD",
     )?;
@@ -875,12 +969,12 @@ fn adopt_tracked_remote_head(
         ));
     }
 
-    Ok(Some(DefaultBranch {
+    Ok(DefaultBranch {
         remote,
-        remote_ref: target,
+        remote_ref,
         local_ref: format!("refs/heads/{local_branch}"),
         local_branch,
-    }))
+    })
 }
 
 /// Where an ensured default checkout came from.
@@ -2696,6 +2790,44 @@ mod tests {
             );
         }
 
+        /// Track an extra remote branch without re-adding the remote, so a
+        /// fixture can express two plausible defaults at once.
+        fn remote_tracking_branch(&self, repo: &Path, remote: &str, branch: &str) {
+            let tracking = format!("refs/remotes/{remote}/{branch}");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("update-ref"),
+                    OsStr::new(&tracking),
+                    OsStr::new("HEAD"),
+                ],
+            );
+        }
+
+        /// [`Self::set_main_upstream`] for any branch, not just `topic` — the
+        /// default branch of a pushed repo often lives outside the main worktree.
+        fn set_branch_upstream(&self, repo: &Path, branch: &str, remote: &str, tracked: &str) {
+            let remote_key = format!("branch.{branch}.remote");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new(&remote_key),
+                    OsStr::new(remote),
+                ],
+            );
+            let merge_key = format!("branch.{branch}.merge");
+            let merge = format!("refs/heads/{tracked}");
+            git_ok(
+                repo,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new(&merge_key),
+                    OsStr::new(&merge),
+                ],
+            );
+        }
+
         fn set_main_upstream_remote(&self, repo: &Path, remote: &str) {
             git_ok(
                 repo,
@@ -2944,6 +3076,96 @@ mod tests {
 
             let again = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
             assert_eq!(again.local_branch, "trunk");
+        }
+
+        /// The shape #73 named: pushed repo, main worktree parked on a branch that tracks
+        /// nothing, and the default branch living in a linked worktree. There is no
+        /// `refs/remotes/origin/HEAD` and no main-worktree upstream, so the linked
+        /// worktree is the only local evidence of the default — and it is enough.
+        #[test]
+        fn default_branch_in_a_linked_worktree_is_adopted() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("linked default");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.linked_worktree(&repo, "wt-trunk", "trunk");
+            fixture.set_branch_upstream(&repo, "trunk", "origin", "trunk");
+
+            let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(default.remote, "origin");
+            assert_eq!(default.local_branch, "trunk");
+            assert_eq!(default.remote_ref, "refs/remotes/origin/trunk");
+            assert_eq!(default.local_ref, "refs/heads/trunk");
+
+            // Adoption is recorded, so the next resolve takes the verified path.
+            let recorded = git_ok(
+                &repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                ],
+            );
+            assert_eq!(
+                String::from_utf8(recorded).unwrap().trim(),
+                "refs/remotes/origin/trunk"
+            );
+        }
+
+        /// The main worktree outranks the linked ones: when both track something, the
+        /// branch the user checked out in the repository root is the default.
+        #[test]
+        fn main_worktree_upstream_outranks_a_linked_worktree() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("main wins");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.remote_tracking_branch(&repo, "origin", "side");
+            fixture.set_main_upstream(&repo, "origin", "trunk");
+            fixture.linked_worktree(&repo, "wt-side", "side");
+            fixture.set_branch_upstream(&repo, "side", "origin", "side");
+
+            let default = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap();
+            assert_eq!(default.remote_ref, "refs/remotes/origin/trunk");
+        }
+
+        /// Two linked worktrees tracking different remote branches are a genuine
+        /// coin flip. Adoption writes the user's Git metadata, so it fails closed
+        /// and names the command that settles it rather than guessing.
+        #[test]
+        fn disagreeing_linked_worktrees_fail_closed() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("ambiguous linked");
+            fixture.remote_tracking(&repo, "origin", "trunk");
+            fixture.remote_tracking_branch(&repo, "origin", "side");
+            fixture.linked_worktree(&repo, "wt-trunk", "trunk");
+            fixture.set_branch_upstream(&repo, "trunk", "origin", "trunk");
+            fixture.linked_worktree(&repo, "wt-side", "side");
+            fixture.set_branch_upstream(&repo, "side", "origin", "side");
+
+            let error = resolve_default_branch(&discover_repository(&repo).unwrap()).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    DefaultBranchUnavailable::AmbiguousTrackedDefault { targets, .. }
+                        if targets.len() == 2
+                ),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains("git remote set-head origin -a"),
+                "{error}"
+            );
+
+            // Nothing was written: the repository is left exactly as it was found.
+            let probe = crate::git::git_probe(
+                &repo,
+                &[
+                    OsStr::new("symbolic-ref"),
+                    OsStr::new("-q"),
+                    OsStr::new("refs/remotes/origin/HEAD"),
+                ],
+                "ambiguity leaves no remote HEAD",
+            )
+            .unwrap();
+            assert!(!probe.status.success());
         }
 
         /// A remote with no tracked upstream is genuinely ambiguous, so it still fails closed.

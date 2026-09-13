@@ -516,6 +516,11 @@ pub struct App {
     runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
     persistence_blocked: bool,
+    /// Why persistence is blocked, in the user's words, carried from the
+    /// failing load to every action it later refuses. Without it the refusal
+    /// reads "persistence is blocked after a state load failure" long after
+    /// the one-shot status line that named the cause has expired (#71).
+    persistence_block_reason: Option<String>,
     persistence_dirty: bool,
     #[cfg(test)]
     persistence_root_for_test: Option<PathBuf>,
@@ -758,6 +763,7 @@ impl App {
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
             persistence_blocked: false,
+            persistence_block_reason: None,
             persistence_dirty: false,
             #[cfg(test)]
             persistence_root_for_test: None,
@@ -783,6 +789,13 @@ impl App {
 
     pub fn persistence_dirty(&self) -> bool {
         self.persistence_dirty
+    }
+
+    /// True while state cannot be saved at all. Drawn as a standing status
+    /// chip: the one-shot message that explains it expires, the condition
+    /// does not, and every refused action after it needs the cause on screen.
+    pub fn persistence_blocked(&self) -> bool {
+        self.persistence_blocked
     }
 
     pub fn hierarchy_rows(&self) -> Vec<LocalRow> {
@@ -1207,10 +1220,24 @@ impl App {
             Ok(LoadOutcome::Missing) => RepositoryState::default(),
             Ok(LoadOutcome::Legacy(state) | LoadOutcome::Current(state)) => state.state,
             Err(error) => {
+                // A held lock is a live neighbour, not a damaged file: say so,
+                // and never send the user off to repair healthy state (#71).
+                // The TUI normally refuses to start on this (see main.rs); the
+                // branch stays because the daemon-less and embedded callers
+                // reach restore() directly.
+                let reason = match &error {
+                    persist::LoadError::Locked { .. } => format!(
+                        "persistence is blocked: {error}; quit that baude or start \
+                         this one with BAUDE_WORKSPACE=<name>"
+                    ),
+                    _ => format!(
+                        "persistence is blocked: {error}; repair or move the named \
+                         state file, then restart"
+                    ),
+                };
                 self.persistence_blocked = true;
-                self.set_message(format!(
-                    "repository state blocked: {error}; repair or move the named state file, then restart"
-                ));
+                self.persistence_block_reason = Some(reason.clone());
+                self.set_message(reason);
                 return;
             }
         };
@@ -1486,7 +1513,9 @@ impl App {
     fn save_durable_status(&self) -> std::result::Result<(), persist::SaveError> {
         if self.persistence_blocked {
             return Err(persist::SaveError::before_replacement(anyhow::anyhow!(
-                "automatic persistence is blocked after a state load failure"
+                self.persistence_block_reason.clone().unwrap_or_else(|| {
+                    "persistence is blocked after a state load failure".into()
+                })
             )));
         }
         #[cfg(test)]
@@ -5582,10 +5611,10 @@ mod tests {
         );
     }
 
-    // Both provisioning shapes are covered at admission level without a dedicated test:
-    // `admission_repo` is now the pushed shape, so every admission test exercises it, and
-    // `admit_repository_assigns_main_role_to_unselected_main_worktree` covers the cloned one.
-    // Resolve-level adoption is pinned in baude-core::git::tests::default_branch.
+    // Both provisioning shapes are covered at admission level: `admission_repo` is the
+    // pushed shape, so every admission test exercises it, and `admit_repository_admits_
+    // cloned_shape` covers the cloned one. Resolve-level adoption — including the default
+    // branch living in a linked worktree — is pinned in baude-core::git::tests::default_branch.
 
     fn removal_app(
         label: &str,
@@ -6735,10 +6764,11 @@ mod tests {
 
     #[test]
     fn admit_repository_assigns_main_role_to_unselected_main_worktree() {
-        // Cloned shape on purpose: this test is about role assignment, and it parks the main
-        // worktree on a branch that tracks nothing, so `origin/HEAD` is the only remaining
-        // local evidence of the default. The pushed shape cannot express that (see #73).
-        let repo = admission_repo_cloned("worktree-main-role");
+        // Pushed shape: the main worktree parks on a branch that tracks nothing and the
+        // default lives in a linked worktree, so the linked worktree's upstream is the
+        // only local evidence of the default. Resolution covers that now (#73); the
+        // cloned shape has its own coverage in `admit_repository_admits_cloned_shape`.
+        let repo = admission_repo("worktree-main-role");
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6787,6 +6817,39 @@ mod tests {
         assert!(!main_row.managed_by_baude);
         assert_eq!(main_row.lifecycle(), &CheckoutLifecycle::Inactive);
         assert!(!main_row.session.is_worktree);
+        app.repository_state.validate().unwrap();
+        app.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The other provisioning shape: a repository that came from `git clone` and so
+    /// carries `refs/remotes/origin/HEAD`. Every other admission test runs the pushed
+    /// shape, so this is what keeps the recorded-remote-HEAD path covered.
+    #[test]
+    fn admit_repository_admits_cloned_shape() {
+        let repo = admission_repo_cloned("cloned-shape");
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+
+        let primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .expect("primary default row");
+        assert_eq!(
+            primary.observed_path,
+            PersistedPath::from_path(&repo.canonicalize().unwrap())
+        );
         app.repository_state.validate().unwrap();
         app.kill_all();
         std::fs::remove_dir_all(root).unwrap();
@@ -8596,6 +8659,48 @@ mod tests {
         app.restore();
         assert_eq!(app.selected_id, Some(SelId::Checkout(inside_main)));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A workspace another baude already owns must be reported as exactly
+    /// that — with the holder named — and the cause must outlive the status
+    /// line, because the failures that follow are the ones the user sees (#71).
+    #[test]
+    fn held_workspace_lock_names_the_holder_instead_of_asking_for_a_repair() {
+        let root =
+            std::env::temp_dir().join(format!("baude-held-workspace-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = baude_core::workspace::active();
+        let lock_path = root.join(format!(".{}.lock", workspace.state_file("state")));
+        std::fs::write(&lock_path, b"4242\n").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.persistence_root_for_test = Some(root.clone());
+        app.restore();
+
+        assert!(app.persistence_blocked());
+        let message = app.message.clone().expect("restore reports the block").0;
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(message.contains("already owns this workspace"), "{message}");
+        assert!(
+            !message.contains("repair"),
+            "a held lock is not a damaged file: {message}"
+        );
+
+        // The status line expires; the refusal it explains does not.
+        let refused = app.save_durable_status().unwrap_err().to_string();
+        assert!(refused.contains("pid 4242"), "{refused}");
+        assert!(refused.contains("already owns this workspace"), "{refused}");
+
+        holder.unlock().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
