@@ -24,6 +24,7 @@
 //! Re-verify `claude --version` at execution time and update this comment if
 //! it advances past 2.1.177.
 
+use std::cell::RefCell;
 use std::io::Write;
 
 use serde_json::{json, Value};
@@ -64,18 +65,47 @@ pub fn build_event(v: &Value) -> Value {
     })
 }
 
+/// The command seeded when `current_exe()` fails. It names no specific
+/// install, so it can never go stale: never pruned ([`is_seeded_hook_command`]
+/// rejects it), but still baude's own seed for the removal exemption
+/// ([`is_pure_seed_settings`]).
+pub const FALLBACK_HOOK_COMMAND: &str = "baude hook";
+
 /// The hook command string baude seeds into `settings.local.json`.
 ///
 /// Resolves to the absolute path of the running binary plus ` hook`
 /// (research A2: `baude` may not be on the managed session's PATH, so the
-/// bare `baude hook` string could silently never fire). Falls back to the
-/// bare `"baude hook"` string if `current_exe()` fails. This string IS the
+/// bare `baude hook` string could silently never fire). Falls back to
+/// [`FALLBACK_HOOK_COMMAND`] if `current_exe()` fails. This string IS the
 /// idempotency sentinel for [`merge_hook_settings`].
 pub fn baude_hook_command() -> String {
+    if let Some(command) = HOOK_COMMAND_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return command;
+    }
     match std::env::current_exe() {
         Ok(p) => format!("{} hook", p.display()),
-        Err(_) => "baude hook".to_string(),
+        Err(_) => FALLBACK_HOOK_COMMAND.to_string(),
     }
+}
+
+thread_local! {
+    /// Test-only override for [`baude_hook_command`]. Thread-local so parallel
+    /// cases cannot decide each other's seeded command.
+    static HOOK_COMMAND_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Seed `command` instead of the resolved `current_exe()` on the CURRENT
+/// THREAD. Test support only.
+///
+/// Under a test harness `current_exe()` is `target/debug/deps/baude-<hash>`,
+/// whose file stem is not `baude`, so a seeded file is not recognizable by
+/// [`is_seeded_hook_command`] — the divergence that let a fixture look unlike
+/// anything production writes, and that kept the pruning path (#70) beyond the
+/// reach of app-level tests. Fixtures call this with a production-shaped
+/// `<absolute path>/baude hook` so what they seed is what baude really writes.
+pub fn set_hook_command_for_test(command: impl Into<String>) {
+    let command = command.into();
+    HOOK_COMMAND_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(command));
 }
 
 /// True iff `command` is one this module previously seeded from a resolved
@@ -207,13 +237,18 @@ pub fn is_pure_seed_settings(root: &Value) -> bool {
     })
 }
 
-/// True iff `group` has the shape baude seeds, holding any `… hook` command.
+/// True iff `group` has the shape baude seeds AND carries a command baude
+/// itself seeded ([`is_seeded_hook_command`]).
 ///
-/// Deliberately looser than [`is_seeded_hook_command`]: this predicate governs
-/// worktree-removal exemption, where the seeding binary is whatever resolved
-/// `current_exe()` (a test harness included), not only `baude`/`bauded`.
+/// This governs worktree-removal exemption, so a false positive DELETES a
+/// user's `.claude` directory. The predicate was once `ends_with(" hook")`,
+/// which accepted commands baude never wrote: a user hook like
+/// `/usr/local/bin/my-lint hook` in an otherwise seed-shaped file made the
+/// whole file read as pure seed, and removal took the user's content with it
+/// (#78).
 fn is_pure_seed_group(group: &Value) -> bool {
-    seeded_group_command(group).is_some_and(|command| command.ends_with(" hook"))
+    seeded_group_command(group)
+        .is_some_and(|command| is_seeded_hook_command(command) || command == FALLBACK_HOOK_COMMAND)
 }
 
 /// Append one event line to the per-session `/tmp` file (O_APPEND).
@@ -753,11 +788,18 @@ mod tests {
         assert!(!is_pure_seed_settings(&sibling_key));
         let user_command = merge_hook_settings(&seed, "notify-send done");
         assert!(!is_pure_seed_settings(&user_command));
-        // Seeds from a binary that is not literally baude/bauded — a test
-        // harness resolving current_exe() to target/debug/deps/baude-<hash> —
-        // are still baude's own seed and must not block removal.
+        // A command baude never wrote does NOT make the file its own seed, no
+        // matter how seed-shaped the group is. This exemption decides whether
+        // removal deletes the user's `.claude` directory, so a false positive
+        // here destroys their content (#78).
+        let user_hook = merge_hook_settings(&seed, "/usr/local/bin/my-lint hook");
+        assert!(!is_pure_seed_settings(&user_hook));
+        // Including the harness's own `target/debug/deps/baude-<hash>`: it is
+        // not a shape production ever writes, so fixtures seed a real
+        // `<abs>/baude hook` via `set_hook_command_for_test` instead of
+        // widening this predicate to accept it.
         let harness = merge_hook_settings(&seed, "/t/target/debug/deps/baude-9f2c hook");
-        assert!(is_pure_seed_settings(&harness));
+        assert!(!is_pure_seed_settings(&harness));
         let mut unknown_event = seed.clone();
         unknown_event["hooks"]["PreToolUse"] =
             json!([{ "hooks": [{ "type": "command", "command": "/opt/baude hook" }] }]);

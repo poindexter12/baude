@@ -711,6 +711,10 @@ mod tests {
         // Contain managed worktree allocation (issue #72): every API test that
         // restarts or activates a session can reach worktree creation.
         baude_core::git::set_worktrees_base_for_test(root.join("data"));
+        baude_core::hook::set_hook_command_for_test(format!(
+            "{} hook",
+            root.join("bin").join("baude").display()
+        ));
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
