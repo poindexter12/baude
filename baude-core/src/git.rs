@@ -3905,6 +3905,10 @@ mod tests {
                 let repo = fixture.repo("seed exemption repo");
                 let linked =
                     fixture.linked_worktree(&repo, "seed exemption linked", "seed-exemption");
+                // Seed what production seeds: under the harness `current_exe()`
+                // is `target/debug/deps/baude-<hash>`, which baude does not
+                // recognize as its own (#78).
+                crate::hook::set_hook_command_for_test("/opt/baude hook");
                 crate::hook::seed_settings(&linked);
                 std::fs::write(
                     linked.join(".mcp.json"),

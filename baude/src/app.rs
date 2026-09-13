@@ -5559,6 +5559,17 @@ mod tests {
         // the fixture root before anything can create one. Without this the
         // suite seeds the developer's real ~/.local/share/baude/worktrees.
         baude_core::git::set_worktrees_base_for_test(root.join("data"));
+        // Seed the shape production seeds. Under the harness `current_exe()` is
+        // `target/debug/deps/baude-<hash>`, whose stem is not `baude`, so
+        // everything seeded here would be unrecognizable as baude's own — the
+        // divergence that hid #78 and kept #70's pruning path untested at this
+        // level.
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        baude_core::hook::set_hook_command_for_test(format!(
+            "{} hook",
+            bin.join("baude").display()
+        ));
         let origin = root.join("origin.git");
         let repo = root.join("repo");
         std::fs::create_dir_all(&origin).unwrap();
@@ -5632,6 +5643,40 @@ mod tests {
             allocated.display(),
             root.display()
         );
+    }
+
+    /// The seed a fixture writes must be the seed production writes — an
+    /// absolute `…/baude hook` that baude recognizes as its own. While the
+    /// harness seeded `target/debug/deps/baude-<hash>`, nothing at this level
+    /// could observe recognition, which is how #78 survived and why #70's
+    /// pruning path had no app-level coverage.
+    #[test]
+    fn activation_seeds_a_recognizable_command_and_reseeding_prunes_the_old_one() {
+        let (_app, _repo, root, _checkout, _runtime, path) = removal_app("seed-shape", 260_000);
+        let settings = path.join(".claude").join("settings.local.json");
+        let seeded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(
+            baude_core::hook::is_pure_seed_settings(&seeded),
+            "activation must seed a command baude recognizes as its own; got {seeded}"
+        );
+
+        // A second install seeds over the first: one group per event, pointing
+        // at the newcomer. The old path is pruned, not stacked beside it.
+        let newer = format!("{} hook", root.join("bin2").join("baude").display());
+        baude_core::hook::set_hook_command_for_test(&newer);
+        baude_core::hook::seed_settings(&path);
+        let reseeded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        for (event, groups) in reseeded["hooks"].as_object().unwrap() {
+            let groups = groups.as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{event} kept {} groups", groups.len());
+            assert_eq!(
+                groups[0]["hooks"][0]["command"].as_str().unwrap(),
+                newer,
+                "{event} still points at the superseded install"
+            );
+        }
     }
 
     // Both provisioning shapes are covered at admission level: `admission_repo` is the
