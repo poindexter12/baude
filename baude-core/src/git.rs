@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Result};
 
@@ -1722,7 +1724,38 @@ pub fn repo_root(path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+thread_local! {
+    /// Test-only redirect for [`worktrees_base`]. Thread-local, not an env
+    /// var: the test binary runs cases in parallel, and a process-wide
+    /// `XDG_DATA_HOME` written by one case would decide where another one's
+    /// worktrees land.
+    static WORKTREES_BASE_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Armed by the first test fixture that redirects the worktree root. Once
+/// armed, [`worktrees_base`] refuses to fall back to the real data dir on a
+/// thread that set no override, so a fixture that forgets fails the test
+/// instead of silently seeding `~/.local/share/baude/worktrees`.
+static REQUIRE_WORKTREES_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+/// Point managed worktree allocation at `base` for the CURRENT THREAD, and
+/// arm the leak guard process-wide. Test support only — production resolves
+/// the root from `XDG_DATA_HOME`/`$HOME` and never calls this.
+pub fn set_worktrees_base_for_test(base: impl Into<PathBuf>) {
+    let base = base.into();
+    WORKTREES_BASE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(base));
+    REQUIRE_WORKTREES_OVERRIDE.store(true, Ordering::SeqCst);
+}
+
 fn worktrees_base() -> PathBuf {
+    if let Some(base) = WORKTREES_BASE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return base.join("baude").join("worktrees");
+    }
+    assert!(
+        !REQUIRE_WORKTREES_OVERRIDE.load(Ordering::SeqCst),
+        "managed worktree root resolved to the real data dir during a test; \
+         call baude_core::git::set_worktrees_base_for_test on this thread first"
+    );
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))

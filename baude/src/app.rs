@@ -5555,6 +5555,10 @@ mod tests {
                 std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
             });
         let _ = std::fs::remove_dir_all(&root);
+        // Managed worktrees are allocated under the data dir, so pin that to
+        // the fixture root before anything can create one. Without this the
+        // suite seeds the developer's real ~/.local/share/baude/worktrees.
+        baude_core::git::set_worktrees_base_for_test(root.join("data"));
         let origin = root.join("origin.git");
         let repo = root.join("repo");
         std::fs::create_dir_all(&origin).unwrap();
@@ -5608,6 +5612,25 @@ mod tests {
             !probe.status.success(),
             "admission_repo must leave refs/remotes/origin/HEAD absent; use \
              admission_repo_cloned for the cloned shape instead of repairing this one"
+        );
+    }
+
+    /// Guards the fixture's OTHER job: containment. `admission_repo` must
+    /// redirect managed worktree allocation into its own temp root, because a
+    /// miss here is invisible — the tests still pass, and the cost shows up as
+    /// hundreds of stale `repository-<pid>` directories in the developer's real
+    /// data dir (issue #72).
+    #[test]
+    fn admission_fixture_contains_managed_worktrees() {
+        let repo = admission_repo("containment-guard");
+        let root = repo.parent().unwrap().to_path_buf();
+        let allocated = baude_core::git::managed_default_worktree_path(1, 2);
+        assert!(
+            allocated.starts_with(&root),
+            "admission_repo must pin the managed worktree root inside its fixture \
+             root; allocated {} outside {}",
+            allocated.display(),
+            root.display()
         );
     }
 
