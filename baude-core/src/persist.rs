@@ -167,6 +167,13 @@ pub enum LoadError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// Another process owns this workspace's state file. Distinct from
+    /// [`Self::Read`] because nothing is wrong with the file — the answer is
+    /// "quit the other baude", not "repair the state".
+    Locked {
+        path: PathBuf,
+        holder: Option<u32>,
+    },
     Malformed {
         path: PathBuf,
         cause: String,
@@ -189,6 +196,18 @@ impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read { path, source } => write!(f, "read {}: {source}", path.display()),
+            Self::Locked { path, holder } => match holder {
+                Some(pid) => write!(
+                    f,
+                    "another baude (pid {pid}) already owns this workspace; its lock is {}",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "another baude already owns this workspace; its lock is {}",
+                    path.display()
+                ),
+            },
             Self::Malformed { path, cause } => {
                 write!(f, "malformed state {}: {cause}", path.display())
             }
@@ -324,9 +343,9 @@ pub fn load_for_workspace_strict_at(
 ) -> std::result::Result<LoadOutcome, LoadError> {
     let primary_file = ws.state_file(base);
     let primary_path = root.join(&primary_file);
-    hold_state_lock(&primary_path).map_err(|source| LoadError::Read {
-        path: lock_path(&primary_path),
-        source,
+    hold_state_lock(&primary_path).map_err(|error| match error {
+        StateLockError::Held { path, holder } => LoadError::Locked { path, holder },
+        StateLockError::Io { path, source } => LoadError::Read { path, source },
     })?;
     let (source_path, bytes) = match read_state_source(&primary_path)? {
         Some(bytes) => (primary_path.clone(), bytes),
@@ -458,8 +477,95 @@ fn lock_path(destination: &std::path::Path) -> PathBuf {
     destination.with_file_name(format!(".{name}.lock"))
 }
 
-fn hold_state_lock(destination: &std::path::Path) -> std::io::Result<()> {
+/// Why this process could not take a workspace's single-writer lock.
+#[derive(Debug)]
+pub enum StateLockError {
+    /// Another live process holds the lock. `holder` is the pid it recorded,
+    /// absent when the lock file predates pid stamping or could not be read.
+    Held { path: PathBuf, holder: Option<u32> },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for StateLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held { path, holder } => match holder {
+                Some(pid) => write!(
+                    f,
+                    "another baude (pid {pid}) already owns this workspace; its lock is {}",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "another baude already owns this workspace; its lock is {}",
+                    path.display()
+                ),
+            },
+            Self::Io { path, source } => write!(f, "state lock {}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for StateLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Held { .. } => None,
+        }
+    }
+}
+
+impl StateLockError {
+    /// The pid recorded by the holder, when the lock is held and readable.
+    pub fn holder_pid(&self) -> Option<u32> {
+        match self {
+            Self::Held { holder, .. } => *holder,
+            Self::Io { .. } => None,
+        }
+    }
+}
+
+/// Claim a workspace's single-writer state lock for the life of this process.
+///
+/// Callers that want to refuse a degraded start (the TUI) take the lock up
+/// front so the "another baude owns this workspace" case is reported once, in
+/// full, instead of surfacing later as a chain of persistence failures.
+pub fn claim_workspace_state_lock(
+    base: &str,
+    ws: &crate::workspace::Workspace,
+) -> std::result::Result<(), StateLockError> {
+    hold_state_lock(&config_base().join(ws.state_file(base)))
+}
+
+/// Read the pid a holder stamped into its lock file, if any.
+fn lock_holder_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+}
+
+/// Drop this process's claim on a lock so a fixture root can be reused or
+/// removed. Tests only — the real lock is held for the life of the process.
+#[cfg(test)]
+fn release_state_lock_for_test(destination: &std::path::Path) {
     let path = lock_path(destination);
+    if let Some(locks) = HELD_STATE_LOCKS.get() {
+        let mut locks = locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.remove(&path);
+    }
+}
+
+fn hold_state_lock(destination: &std::path::Path) -> std::result::Result<(), StateLockError> {
+    let path = lock_path(destination);
+    let io = |source: std::io::Error| StateLockError::Io {
+        path: path.clone(),
+        source,
+    };
     let locks = HELD_STATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks
         .lock()
@@ -468,15 +574,31 @@ fn hold_state_lock(destination: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(&io)?;
     }
-    let lock = OpenOptions::new()
+    let mut lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)?;
-    lock.try_lock()?;
+        .open(&path)
+        .map_err(&io)?;
+    if let Err(source) = lock.try_lock() {
+        return Err(match source {
+            std::fs::TryLockError::WouldBlock => StateLockError::Held {
+                holder: lock_holder_pid(&path),
+                path,
+            },
+            std::fs::TryLockError::Error(source) => io(source),
+        });
+    }
+    // Stamp the pid so the next process can name us instead of reporting an
+    // anonymous lock. Best effort: a failure here must not lose the lock we
+    // just won, and a stale or empty stamp only costs the pid in the message.
+    let _ = lock
+        .set_len(0)
+        .and_then(|()| writeln!(lock, "{}", std::process::id()))
+        .and_then(|()| lock.flush());
     locks.insert(path, lock);
     Ok(())
 }
@@ -1391,12 +1513,36 @@ mod tests {
             .unwrap();
         lock.try_lock().unwrap();
 
+        // A held lock is NOT a damaged state file: it must arrive as its own
+        // variant so callers can say "another baude owns this workspace"
+        // instead of sending the user off to repair a healthy file (#71).
         assert!(matches!(
             load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
-            Err(LoadError::Read { ref path, ref source })
-                if path == &lock_path && source.kind() == std::io::ErrorKind::WouldBlock
+            Err(LoadError::Locked { ref path, holder: None }) if path == &lock_path
         ));
         lock.unlock().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The holder stamps its pid so the refusal can name the process to quit.
+    #[test]
+    fn held_state_lock_records_holder_pid() {
+        let root = isolated_root("writer-lock-pid");
+        let workspace = test_workspace("claude");
+        let destination = root.join(workspace.state_file("state"));
+        let lock_path = lock_path(&destination);
+
+        hold_state_lock(&destination).expect("first owner takes the lock");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        assert_eq!(lock_holder_pid(&lock_path), Some(std::process::id()));
+
+        // Same process re-entering is the cached no-op, not a second claim.
+        hold_state_lock(&destination).expect("re-entrant claim is a no-op");
+
+        release_state_lock_for_test(&destination);
         std::fs::remove_dir_all(root).unwrap();
     }
 

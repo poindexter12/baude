@@ -297,6 +297,35 @@ fn main() -> Result<()> {
         &launch_dir,
     );
     let workspace = baude_core::workspace::initialize(plan.hint.as_deref());
+
+    // One writer per workspace. Claim the state lock BEFORE the terminal, the
+    // daemon, or any folder-memory write: a second baude on a held lock used
+    // to start in a degraded mode where every later action failed with
+    // "persistence is blocked" and nothing named the real cause (#71). Refuse
+    // here instead, once, while stderr is still a normal terminal.
+    // A lock we cannot even open (unwritable config dir) is NOT a refusal:
+    // that path still degrades through App::restore the way it always has.
+    if let Err(baude_core::persist::StateLockError::Held { path, holder }) =
+        baude_core::persist::claim_workspace_state_lock("state", workspace)
+    {
+        match holder {
+            Some(pid) => eprintln!(
+                "baude: workspace {} is already open in another baude (pid {pid}).",
+                workspace.name
+            ),
+            None => eprintln!(
+                "baude: workspace {} is already open in another baude.",
+                workspace.name
+            ),
+        }
+        eprintln!(
+            "       Quit that instance, or run this one in another workspace: \
+             BAUDE_WORKSPACE=<name> baude"
+        );
+        eprintln!("       lock: {}", path.display());
+        std::process::exit(1);
+    }
+
     let mut startup_notes = plan.notes;
     if config.folder_context_enabled() {
         startup_notes.extend(baude_core::folder_workspace::applied_note(
