@@ -39,7 +39,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 </details>
 
-## v2.2 Phases
+## v2.2 Reliability and Terminal Usability
 
 - [ ] **Phase 8: Test Isolation and Fixture Ownership** (narrowed): Close the config, workspace-identity, escape-guard and leak-preview gaps left after v2.1.4.
 - [ ] **Phase 9: Hook Seeding Safety** (narrowed): Stop silently replacing unparseable settings and seed a shell-safe executable path.
