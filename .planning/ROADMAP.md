@@ -63,15 +63,16 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
 4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
 
-**Plans**: 6 plans
+**Plans**: 7 plans
 
 Plans:
 - [ ] 08-01-PLAN.md — Tracer: cross-crate test-support gate, unified RAII redirect guard, arming flag deleted (wave 1)
 - [ ] 08-02-PLAN.md — `~/.claude` redirect and `bauded` push/VAPID resolver dedup (wave 2)
 - [ ] 08-03-PLAN.md — Per-fixture workspace identity, config injected into `initialize` (wave 2)
 - [ ] 08-04-PLAN.md — Leak scan: evidence/verdict model and read-only enumeration (wave 2, decision checkpoint)
-- [ ] 08-05-PLAN.md — State cross-reference, re-verifying prune, `baude worktrees` CLI (wave 3, decision checkpoint)
+- [ ] 08-05-PLAN.md — State cross-reference and re-verifying prune (wave 3, decision checkpoint)
 - [ ] 08-06-PLAN.md — Shared `bauded` fixture helper and suite-level real-root assertion (wave 3)
+- [ ] 08-07-PLAN.md — `baude worktrees` CLI surface: grouped report, JSON mode, two-flag prune (wave 4)
 
 ### Phase 9: Hook Seeding Safety
 
