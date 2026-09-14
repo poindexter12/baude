@@ -1,10 +1,15 @@
 ---
 gsd_state_version: "1.0"
 milestone: v2.2
-milestone_name: Reliability and Terminal Usability
-status: planning
-last_updated: "2026-09-09T05:28:36.074Z"
+milestone_name: Phases
+current_phase: 8
+current_phase_name: Test Isolation and Fixture Ownership
+status: Awaiting roadmap approval
+stopped_at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
+last_updated: "2026-09-09T06:06:00.262Z"
 last_activity: 2026-09-08
+last_activity_desc: v2.2 roadmap drafted; approval pending
+state_head: 19c18be78362606af2c295b8d21c1727c28ecbee
 progress:
   total_phases: 0
   completed_phases: 0
@@ -20,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** v2.0 milestone complete; beta channel handoff to release-please via PR #56
+**Current focus:** v2.2 roadmap approval, then Phase 8 test isolation before broad test execution
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-09-08 — Milestone v2.2 started
+Phase: 8 (Test Isolation and Fixture Ownership)
+Plan: Not started
+Status: Awaiting roadmap approval
+Last activity: 2026-09-08 — v2.2 roadmap drafted; approval pending
 
 ## Performance Metrics
 

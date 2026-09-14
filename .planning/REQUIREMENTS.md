@@ -83,44 +83,44 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 ## Traceability
 
-Each v2.2 requirement will map to exactly one phase when the roadmap is approved. Continue after archived Phase 7; do not reset numbering.
+Each v2.2 requirement maps to exactly one proposed roadmap phase; roadmap approval is pending. Continue after archived Phase 7; do not reset numbering.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TISO-01 | TBD | Pending |
-| TISO-02 | TBD | Pending |
-| TISO-03 | TBD | Pending |
-| TISO-04 | TBD | Pending |
-| HREG-01 | TBD | Pending |
-| HREG-02 | TBD | Pending |
-| HREG-03 | TBD | Pending |
-| HREG-04 | TBD | Pending |
-| WLOCK-01 | TBD | Pending |
-| WLOCK-02 | TBD | Pending |
-| WLOCK-03 | TBD | Pending |
-| WLOCK-04 | TBD | Pending |
-| LINK-01 | TBD | Pending |
-| LINK-02 | TBD | Pending |
-| LINK-03 | TBD | Pending |
-| LINK-04 | TBD | Pending |
-| LINK-05 | TBD | Pending |
-| LINK-06 | TBD | Pending |
-| LINK-07 | TBD | Pending |
-| LINK-08 | TBD | Pending |
-| TKEY-01 | TBD | Pending |
-| TKEY-02 | TBD | Pending |
-| TKEY-03 | TBD | Pending |
-| TKEY-04 | TBD | Pending |
-| TKEY-05 | TBD | Pending |
-| SHIP-01 | TBD | Pending |
-| SHIP-02 | TBD | Pending |
-| SHIP-03 | TBD | Pending |
-| SHIP-04 | TBD | Pending |
+| TISO-01 | Phase 8 | Pending |
+| TISO-02 | Phase 8 | Pending |
+| TISO-03 | Phase 8 | Pending |
+| TISO-04 | Phase 8 | Pending |
+| HREG-01 | Phase 9 | Pending |
+| HREG-02 | Phase 9 | Pending |
+| HREG-03 | Phase 9 | Pending |
+| HREG-04 | Phase 9 | Pending |
+| WLOCK-01 | Phase 9 | Pending |
+| WLOCK-02 | Phase 9 | Pending |
+| WLOCK-03 | Phase 9 | Pending |
+| WLOCK-04 | Phase 9 | Pending |
+| LINK-01 | Phase 10 | Pending |
+| LINK-02 | Phase 10 | Pending |
+| LINK-03 | Phase 10 | Pending |
+| LINK-04 | Phase 10 | Pending |
+| LINK-05 | Phase 10 | Pending |
+| LINK-06 | Phase 10 | Pending |
+| LINK-07 | Phase 10 | Pending |
+| LINK-08 | Phase 10 | Pending |
+| TKEY-01 | Phase 11 | Pending |
+| TKEY-02 | Phase 11 | Pending |
+| TKEY-03 | Phase 11 | Pending |
+| TKEY-04 | Phase 11 | Pending |
+| TKEY-05 | Phase 11 | Pending |
+| SHIP-01 | Phase 12 | Pending |
+| SHIP-02 | Phase 12 | Pending |
+| SHIP-03 | Phase 12 | Pending |
+| SHIP-04 | Phase 12 | Pending |
 
 **Coverage:**
 - v2.2 requirements: 29 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 29
+- Mapped to phases: 29
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-09-08*

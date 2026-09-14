@@ -13,3 +13,7 @@ opencode.json
 /graphify-out/*
 !/graphify-out/GRAPH_REPORT.md
 !/graphify-out/graph.json
+
+# Baude-seeded backend hook config (runtime artifact, per-machine paths).
+.codex/
+.claude/settings.local.json
