@@ -1,21 +1,21 @@
 ---
-gsd_state_version: 1.0
-milestone: v2.0
-milestone_name: Local TUI Dogfood Release
-status: Awaiting next milestone
-stopped_at: Phases 6 and 7 certified and completed; PR
-last_updated: "2026-09-03T19:34:43.558Z"
-last_activity: 2026-09-03
-last_activity_desc: Milestone v2.0 completed and archived
-state_head: 4a62be38691588028a6177a3162cf19dd597249a
+gsd_state_version: "1.0"
+milestone: v2.2
+milestone_name: Reliability and Terminal Usability
+current_phase: 8
+current_phase_name: Test Isolation and Fixture Ownership
+status: Ready to plan Phase 8
+stopped_at: v2.2 roadmap reconciled against shipped v2.1.2-v2.1.5 code; Phases 8 and 9 narrowed
+last_updated: "2026-09-14T00:20:00.000Z"
+last_activity: 2026-09-13
+last_activity_desc: Phases 8 and 9 re-scoped to verified remaining gaps
+state_head: 7ccb2bd74ac94b923aa9b92c032623cf19b88a72
 progress:
-  total_phases: 3
-  completed_phases: 2
-  total_plans: 16
-  completed_plans: 16
-  percent: 67
-current_phase: 7
-current_phase_name: local tui dogfood release
+  total_phases: 5
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -25,14 +25,16 @@ current_phase_name: local tui dogfood release
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** v2.0 milestone complete; beta channel handoff to release-please via PR #56
+**Current focus:** Phase 8 planning — config/identity isolation and leak preview, the gaps v2.1.4 did not close
 
 ## Current Position
 
-Phase: Milestone v2.0 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-09-03 — Milestone v2.0 completed and archived
+Phase: 8 (Test Isolation and Fixture Ownership, narrowed)
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-09-13 — Phases 8 and 9 reconciled against shipped code
+
+Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
 ## Performance Metrics
 

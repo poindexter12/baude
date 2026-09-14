@@ -1,219 +1,182 @@
 # Project Research Summary
 
-**Project:** baude v2.0 Repository Worktree Management
-**Domain:** Repository-centered AI session and managed Git worktree orchestration
-**Researched:** 2026-08-30
-**Confidence:** HIGH
+**Project:** baude v2.2 Reliability and Terminal Usability
+**Domain:** Reliability fixes and terminal interaction in a Rust ratatui and VT application
+**Researched:** 2026-09-08
+**Confidence:** HIGH for scope and safety contracts, MEDIUM for terminal interoperability
 
 ## Executive Summary
 
-Baude v2.0 should replace the flat, process-centered sidebar model with a durable repository aggregate whose children are live or reopenable sessions rooted in the main checkout and baude-managed linked worktrees. Experts build this by keeping Git authoritative for repository topology and safety, keeping product membership and UI state in versioned persistence, and treating PTYs as children rather than as repository identity. Opening or cloning a repository must be idempotent, preserve a parent after its session closes, and ensure a primary session through the active workspace backend without silently changing the user's checkout.
+baude v2.2 is a reliability and terminal usability milestone for an established Rust TUI and daemon that owns child PTY sessions. Preserve the current workspace boundaries, shared core seams, vt100 screen model, ratatui renderer, and crossterm lifecycle rather than introducing a new terminal engine. The approved scope is test isolation (#72), hook reconciliation (#70), lock diagnostics (#71), clickable links, and Shift+Enter input, followed by release validation.
 
-The recommended implementation changes no dependencies: extend `baude-core` with byte-safe Git discovery, shared repository/worktree value types, typed lifecycle errors, and an explicit migration; retain Serde JSON with atomic replacement; and project the hierarchy into one flat, stable ratatui row model. Managed worktrees must be created only after branch validation and Git inventory checks, and removal must be a fail-closed transaction: inspect before teardown, never force, let Git remove its own metadata, and commit persistence only after success. The same domain operations must power local and daemon paths so remote mode cannot weaken safety or reinterpret client-local paths.
+The central architectural recommendation is one vt100-owned screen model with bounded link metadata, shared by local PTY and remote WebSocket paths. Do not create two terminal grids or make ratatui cell text carry escape sequences. A targeted pinned vt100 fork may be necessary because current cells discard OSC8 targets, but fork mechanics and API feasibility require a planning spike. An adjacent annotation adapter is viable only if it follows the authoritative grid through every mutation; it must not independently emulate the screen. Keep outer terminal keyboard enhancement negotiation and cleanup separate from child key encoding. Unsupported or ambiguous terminals retain legacy behavior honestly rather than guessing.
 
-The main risks are identity errors, ambiguous “default branch” semantics, lossy migration, deletion races, and local/daemon behavior drift. Mitigate them by using Git common-directory/worktree inventory plus persisted opaque membership keys, specifying an offline and non-destructive default-branch policy in requirements, preserving malformed/legacy state through atomic migration, serializing mutations per repository, and testing a parity matrix against temporary real repositories. UI hierarchy should come only after the domain and lifecycle contracts are stable.
+The highest risks are destructive configuration recovery, unsafe lock takeover, test leakage, link activation becoming a command channel, and terminal mode leakage. Preserve malformed settings, treat the OS lock as authoritative and PID metadata as advisory, inject fixture roots and child environments, validate HTTP(S) targets and open them through argv on an explicit gesture, and restore keyboard modes on controlled exit paths.
 
 ## Key Findings
 
 ### Recommended Stack
 
-No crate, framework, or lockfile upgrade is justified for v2.0. This milestone is a domain-model and Git-orchestration change. Continue invoking the installed Git CLI with argument arrays, preserve machine output as bytes where paths are involved, and keep the current workspace/backend boundaries. See [STACK.md](./STACK.md).
+Keep the locked Rust 2021 workspace, ratatui 0.30.2, crossterm 0.29.0, serde and serde_json, and standard library filesystem and process APIs. No general-purpose dependency is currently justified. Platform launchers must receive validated URLs as separate arguments, never through a shell.
 
 **Core technologies:**
-- **Rust 2021 workspace and standard library:** domain models, subprocesses, worker threads, path handling, and atomic same-directory file replacement — all required primitives already exist.
-- **System Git CLI:** canonical identity, default/current branch facts, worktree inventory, validation, dirty status, creation, and removal — preserves native config, credentials, and Git's safety rules.
-- **`serde` 1.0.228 + `serde_json` 1.0.150:** workspace-scoped, versioned hierarchy persistence and explicit migration — already integrated and sufficient for small single-writer state.
-- **`ratatui` 0.30.2:** parent/child rows, modals, and contextual hints — one-level flattening needs no tree widget.
-- **Existing threads/channels and `anyhow`:** keep blocking Git work off render/async paths and preserve stderr/context in errors — no Tokio runtime is needed in the TUI.
 
-**Critical compatibility requirements:** use `git worktree list --porcelain -z`; validate branches with `git check-ref-format --branch`; avoid lossy UTF-8 conversion for paths; keep new persisted fields backward compatible; and do not bundle dependency upgrades into this milestone.
+- **Rust standard library:** Fixture roots, filesystem safeguards, and argv-based process launching.
+- **serde and serde_json:** Existing configuration serialization and preservation boundaries.
+- **ratatui 0.30.2:** Existing frame, selection, and rendering lifecycle. Its cells are not a hyperlink metadata solution.
+- **crossterm 0.29.0:** Support queries and keyboard enhancement push/pop APIs for modified Enter.
+- **vt100 0.15.2 baseline:** Authoritative characters, scrolling, wrapping, erasure, and colors. Verify whether a small pinned fork or patch can expose OSC8 metadata.
+
+The fork is an option to verify during planning, not a user-approved mandate or an already available dependency. An upgrade to vt100 or ratatui alone is not expected to provide link metadata.
 
 ### Expected Features
 
-The feature set is a coherent safety contract, not merely nested rendering. See [FEATURES.md](./FEATURES.md).
+**Must have:**
 
-**Must have (v2.0 table stakes):**
-- **Persistent repository parents:** survive closed/exited sessions and deduplicate open, clone, subdirectory, symlink, and linked-worktree admission.
-- **Primary/default-branch active-backend session:** first admission ensures one usable session through the active workspace backend; repeated admission focuses or reopens it rather than spawning duplicates.
-- **Explicit nested hierarchy:** main/default and managed-worktree children appear under one parent with stable ordering and unchanged child attention/status behavior.
-- **Verified named-branch worktree creation:** support new and existing branches, collision-proof managed paths, explicit bases, and Git-native checked-out-elsewhere refusal.
-- **Separate close and remove lifecycles:** closing a session retains the child checkout; removal is a distinct confirmed operation.
-- **Fail-closed safe removal:** staged, unstaged, untracked, conflicted, submodule, unknown, locked, or otherwise unsafe states block before session teardown; no `--force` or recursive deletion exists.
-- **Typed contextual selection and shortcuts:** parent and child actions resolve through stable IDs; hints and confirmations state exactly what will happen.
-- **Versioned persistence migration and reconciliation:** retain sessionless parents, migrate flat workspace state idempotently, preserve valid UI/session metadata, and show missing or changed worktrees as degraded rather than silently dropping them.
-- **Local/daemon parity:** active backend/workspace isolation, identity, create/reuse, close/keep, clean removal, dirty refusal, restart, and typed errors have the same semantics on both owners.
+- Idempotent owned hook reconciliation preserving custom and mixed groups.
+- Explicit lock contention diagnostics without removal, takeover, or PID-based authority.
+- Isolated tests with unique fixture repositories, worktrees, config, state, and child environments.
+- User-gesture-only OSC8 and bare HTTP(S) links with safe targets and preserved selection.
+- Shift+Enter newline when the outer terminal reports a distinguishable supported event and the child input contract supports it.
+- Focused tests, CI gates, and macOS/Linux terminal smoke before v2.2.0 publication.
 
-**Should have (competitive behavior within the core):**
-- **Repository as a durable control surface:** decouple “known repository” from “running agent.”
-- **Agent-aware worktrees:** retain shell/editor, resume, archive, waiting/working, metadata, and conversation behavior on every child.
-- **Git reconciliation with operator context preservation:** failed actions retain a navigable child/session and explain recovery.
-- **Selection-derived action semantics:** repository-scoped actions work from either a parent or any child.
+**Should have:**
 
-**Defer until after v2.0 validation:**
-- Collapsible groups and read-only adoption/display of unmanaged external worktrees.
-- Forget-repository bulk semantics, rich dirty summaries, worktree repair/move/lock controls, and branch deletion.
-- Full Git GUI operations, automatic fetch/stash/commit/reset/clean, and bulk actions.
-- PWA hierarchy redesign may remain an additive follow-up, but existing PWA/session endpoints must not gain weaker or destructive semantics.
+- Target preview or copy for hidden OSC8 targets.
+- Link affordance and unsupported-terminal guidance.
+- Structured lock diagnostics.
+- Fixture cleanup preview requiring explicit approval.
+
+**Defer:**
+
+- File, SSH, mailto, custom-scheme, or arbitrary-protocol links.
+- Automatic cleanup based only on a missing gitdir.
+- Forced lock recovery, read-only lock mode, and unrelated product expansion.
+- Proxy-monitor integration.
 
 ### Architecture Approach
 
-Add a PTY-free repository aggregate above existing sessions and keep storage, runtime ownership, and presentation separate. `App` and daemon `Manager` each own host/workspace-scoped repositories and sessions; `baude-core` owns shared discovery and lifecycle semantics; persistence records baude intent while Git records live topology; and the TUI/API are projections. The stronger cross-file recommendation is to persist opaque repository/worktree keys while retaining canonical main path/common-directory observations as attributes: this supports collision-free managed paths and degraded/moved state, while Git revalidation prevents stale IDs from authorizing operations. See [ARCHITECTURE.md](./ARCHITECTURE.md).
+Extend existing seams rather than adding a second subsystem. Test-root injection supports all reliability work. Persistence should return typed lock contention before hydration or mutation. Hook seeding remains one shared core operation for TUI and daemon. Local and remote PTY byte paths feed the same vt100 model and annotation adapter. The renderer and mouse handler query one synchronized snapshot. Outer terminal mode ownership stays in main lifecycle code, while the pure key encoder receives a negotiated capability or explicit fallback.
 
 **Major components:**
-1. **Core repository/worktree model:** stable membership keys, canonical main path, managed ownership, health state, and PTY-free parent metadata.
-2. **Core Git discovery and lifecycle:** common-directory identity, NUL-delimited inventory parsing, typed default/branch state, validated create/reuse, dirty safety, and non-force removal.
-3. **Versioned aggregate persistence:** workspace-local repository, worktree, and session records; legacy migration; reconciliation; backup/error retention; atomic write/rename.
-4. **Local `App` aggregate:** idempotent repository admission, active-backend session ensure/reopen, contextual action dispatch, and nonblocking operation progress.
-5. **Flattened sidebar projection:** one typed local/remote parent/child sequence shared by rendering, movement, selection repair, actions, and help text.
-6. **Daemon `Manager` and additive API:** server-authoritative IDs and mutations, repository-native routes, typed safety conflicts, old session-route compatibility, and no lock held across blocking/awaited work.
 
-**Patterns to enforce:** discover/normalize before mutation; reserve under lock, act outside it, then commit under lock; persist baude intent but reconcile against Git facts; scope identity to owner/host/workspace; and calculate notifications/status from sessions only.
+1. **Test and persistence boundaries:** Injected roots, child environments, typed lock errors, and durable state preservation.
+2. **Hook ownership reconciler:** Narrow structural ownership classification and idempotent merge.
+3. **Shared terminal annotation adapter:** Bounded OSC8 metadata and visible bare-URL discovery.
+4. **Renderer and gesture policy:** Coordinate-aware hit testing, selection, scrollback, child mouse reporting, and direct validated opening.
+5. **Outer terminal guard and key policy:** Capability negotiation, restoration, pure child encoding, and legacy fallback.
 
 ### Critical Pitfalls
 
-1. **Using checkout paths, basenames, or branch slugs as identity** — resolve Git common-directory/worktree membership, persist opaque keys, and use collision-free storage components independent of display labels.
-2. **Guessing or forcing the default branch** — define a typed offline discovery policy; never fetch or switch on open; attach an already-safe checkout or require explicit resolution when ambiguous.
-3. **Reimplementing Git worktree rules** — validate refs, inspect stable porcelain inventory, distinguish new/existing/already-checked-out/error cases, and never trust directory existence or retry every failure.
-4. **Fail-open or teardown-first removal** — only `Clean` permits removal; recheck before plain `git worktree remove`; retain session, child, and metadata on any error.
-5. **Lossy persistence migration** — use an explicit schema version, real legacy fixtures, atomic replacement and backup/error retention; never convert malformed input into empty state.
-6. **Duplicate default sessions and mutation races** — enforce one owner/worktree/session-role key with pending reservations and per-repository mutation serialization.
-7. **Session-only selection or local-only safety** — use stable typed parent/child/owner selection and one shared lifecycle contract across local TUI, daemon, remote TUI, REST, and retained compatibility endpoints.
+1. **Brittle hook ownership:** Recognize only a proven baude executable plus literal hook registration. Never delete a containing custom or mixed group.
+2. **Invalid settings replaced with empty JSON:** Existing invalid content remains byte-preserved and seeding fails closed.
+3. **PID treated as lock authority:** Acquire and retain the OS advisory lock. PID metadata is diagnostic only.
+4. **Global test state and unsafe cleanup:** Use injected roots, child environments, unique fixture ownership, and explicit cleanup approval.
+5. **Unsafe links or keyboard protocols:** Keep labels separate from targets, validate HTTP(S), avoid shells, preserve selection, negotiate modified keys, and restore terminal state.
 
 ## Implications for Roadmap
 
-Based on dependencies and release risk, use five phases. Treat Phases 1 and 2 as domain/safety gates; do not start hierarchy polish before their contracts and integration tests pass.
+Suggested five-phase sequence, continuing after completed Phase 7. The roadmapper may combine or split these groups; final numbering and scope remain subject to roadmap approval.
 
-### Phase 1: Repository Identity, Primary-Session Contract, and Persistence Migration
-**Rationale:** Persistent parents, idempotent open, nested ownership, and safe migration all depend on one canonical admission and identity model. This phase must also settle the only material product ambiguity: what “default branch session” means for an existing checkout.
+### Phase 8: Test Isolation and Fixture Ownership
 
-**Delivers:**
-- PTY-free repository/worktree records with stable persisted membership keys and owner/workspace scope.
-- Git discovery from main checkout, linked worktree, subdirectory, and symlink; explicit health/default-branch result types.
-- Requirement contract for primary session behavior: fresh clone uses clone's checked-out remote default; existing repositories never mutate `HEAD`; an already registered checkout of the resolved default is reused; ambiguity/detached/unborn state is explicit.
-- Idempotent `open_repository`/clone completion that ensures one active-backend primary session without backend data in repository records.
-- Versioned state envelope, flat-session migration, reconciliation, atomic save, and corrupt-state retention.
+**Rationale:** Later reliability and terminal tests need deterministic roots and must not race through global state.
+**Delivers:** Injected roots, unique repositories and worktrees, child `Command.env` setup, ownership-aware fixture cleanup, and missing-gitdir safety tests.
+**Addresses:** #72 and safe cleanup.
+**Avoids:** Environment races, OnceLock contamination, shared worktrees, and destructive cleanup.
 
-**Addresses:** persistent repository parent, canonical identity, automatic active-backend primary session, durable hierarchy, migration, backend/workspace isolation, and honest missing state.
+### Phase 9: Reliability Contracts for Hooks and Locks
 
-**Avoids:** duplicate parents/sessions, guessed default branches, path identity collisions, lossy migration, silent empty-state recovery, and cross-workspace leakage.
+**Rationale:** These are shared core boundaries and release-blocking data safety fixes.
+**Delivers:** Idempotent owned hook seeding, custom and mixed group preservation, invalid JSON preservation, typed lock diagnostics, and no forced takeover.
+**Addresses:** #70 and #71.
+**Avoids:** Duplicate registrations, lost settings, generic empty-state fallback, PID authority, and lock overwrites.
 
-### Phase 2: Shared Managed-Worktree Lifecycle and Safe Removal
-**Rationale:** Nested children are trustworthy only after create/reuse/remove behavior is centralized and tested against real Git repositories. This is the release-blocking data-safety phase.
+### Phase 10: Clickable Link Metadata and Safe Gestures
 
-**Delivers:**
-- Byte-preserving worktree inventory and branch/ref validation.
-- Collision-proof managed path allocation while honoring existing persisted paths.
-- Explicit new-branch versus existing-branch/remote-branch flows, deterministic base selection, rediscovery verification, and typed errors.
-- Distinct close-session/keep-worktree and remove-managed-worktree operations.
-- Result-valued dirty/unknown checks, preflight-before-teardown, recheck, plain Git removal, postcondition verification, and persistence only after success.
-- Per-repository operation reservations/coordinator so Git/process work does not block the TUI or daemon mutex and duplicate/racing mutations cannot win.
+**Rationale:** Link activation depends on a coherent rendered-cell coordinate model.
+**Delivers:** Shared vt100 annotations, OSC8 targets, bounded bare HTTP(S) discovery, selection/scrollback-aware hit testing, child mouse compatibility, and argv-based opening.
+**Addresses:** Labeled links, bare URLs, selection preservation, and safe activation.
+**Avoids:** A second screen model, label spoofing, shell execution, arbitrary schemes, and click stealing.
 
-**Addresses:** named-branch nested worktrees, verified collisions, close/remove separation, fail-closed removal, Git-native safeguards, and context preservation on failure.
+Verify the smallest viable vt100 extension here. Adjacent metadata must follow the authoritative grid; do not silently substitute a full terminal engine.
 
-**Avoids:** arbitrary directory reuse, retry-any-error behavior, `--force`, direct deletion, dirty-check errors treated as clean, close-before-check, duplicate PTYs, and global-lock stalls.
+### Phase 11: Negotiated Multiline Input
 
-### Phase 3: Local Hierarchy, Navigation, and Context-Aware Shortcuts
-**Rationale:** The UI should consume stable domain operations rather than encode lifecycle rules. Building it after Phases 1–2 keeps destructive semantics out of event handlers.
+**Rationale:** Modified Enter has a distinct outer terminal lifecycle and must not be conflated with child encoding.
+**Delivers:** Support-gated negotiation, scoped restoration, pure child encoding, Shift+Enter newline on supported paths, unchanged Enter/Ctrl-C, and honest legacy fallback.
+**Addresses:** Reliable Shift+Enter.
+**Avoids:** Unconditional CSI-u bytes, guessed distinctions, broken child input, and leaked terminal modes.
 
-**Delivers:**
-- One flattened `VisibleRow`/sidebar projection with typed repository/session IDs and deterministic selection repair.
-- Persistent parent rows with indented primary and managed-worktree children; stable waiting/working flashes and archive ordering.
-- Parent/child action matrix for Enter, open/editor, create worktree, close, remove, and disabled actions.
-- Context-derived status/help hints and confirmations naming owner, repository, branch, path, and whether files remain.
-- Local open, clone, create/reopen, close/keep, remove, restore, shell/editor, resume, archive, and attention behavior wired through shared contracts.
+### Phase 12: Validation and v2.2.0 Release
 
-**Addresses:** explicit hierarchy, hierarchy-aware navigation, contextual shortcuts, repository control surface, and agent-aware child behavior.
-
-**Avoids:** fake repository sessions, stale/index-based selection, hidden action targets, duplicate parent alarms, status-based row reordering, and ambiguous destructive keys.
-
-### Phase 4: Daemon and Remote-TUI Contract Parity
-**Rationale:** Remote behavior must use the tested core semantics, but its API and host-scoped identity should stabilize only after local domain behavior is proven. Parity is required for v2.0 even if full PWA hierarchy presentation is deferred.
-
-**Delivers:**
-- Daemon repository aggregate and server-issued repository/worktree IDs scoped to daemon host and workspace.
-- Additive repository hierarchy/open/create routes plus explicit close-session and remove-worktree operations with typed `409` safety conflicts.
-- Existing flat session endpoints as compatibility projections/adapters; old-daemon fallback where non-destructive.
-- Remote hierarchy polling/actions and workspace guard reuse; no client-local path authority.
-- Shared tests proving dirty refusal leaves the daemon session alive and that blocking Git/process work does not span `.await` or the global manager lock.
-
-**Addresses:** local/daemon parity, remote nested managed worktrees, active-backend isolation, daemon persistence, and compatibility.
-
-**Avoids:** duplicated safety logic, path confusion across hosts, silently changed DELETE semantics, lock-held blocking work, and local-only completion claims.
-
-### Phase 5: Migration, Recovery, and Cross-Surface Release Hardening
-**Rationale:** Identity, persistence, Git mutation, UI selection, and remote concurrency interact in failure states that unit tests alone will miss. v2.0 should not ship until the observable behavior contract passes end to end.
-
-**Delivers:**
-- Legacy local and daemon fixture migration across Claude and OpenCode workspaces.
-- Real-Git matrix for duplicate basenames, slash refs, linked admission, detached/unborn/no-remote repositories, locked/prunable/missing/moved children, untracked/conflicted/submodule dirt, and Git command failures.
-- Race tests for repeated open/clone completion, concurrent API requests, create-versus-remove, and mutations between dirty preflight and removal.
-- Local/remote parity UAT for open, primary-session ensure, nested create/reuse, close/keep, clean remove, dirty/unknown block, restart, degraded state, offline stale rendering, and old-daemon compatibility.
-- Responsiveness and recovery verification, with no automatic prune/repair/adoption or destructive fallback.
-
-**Addresses:** every v2.0 behavior-contract scenario and regression preservation for existing session functionality.
-
-**Avoids:** “looks done” releases that lose state, duplicate agents, hide degraded worktrees, freeze during Git operations, or diverge across owners.
+**Rationale:** Cross-surface regressions require integrated evidence.
+**Delivers:** Focused and workspace tests, fmt, clippy, CI, lock subprocess tests, parser/selection vectors, and manual terminal smoke for links, mouse behavior, Shift+Enter, normal Enter, restoration, and failure exits. Publish only after checks pass.
+**Addresses:** Release evidence and regression prevention.
 
 ### Phase Ordering Rationale
 
-- Canonical identity and migration precede parents and children because linked-worktree top-level paths are not repository identity and the flat schema cannot represent a sessionless parent.
-- The default/primary-session policy is fixed with admission, before UI wording and API contracts encode inconsistent meanings.
-- Shared lifecycle and safety precede UI and daemon adapters so neither surface can invent weaker removal semantics.
-- Local hierarchy precedes remote projection to validate interaction semantics cheaply, while daemon parity remains a v2.0 requirement rather than an indefinite follow-up.
-- Recovery and parity verification close the roadmap because persistence corruption, external Git mutation, and races span all prior components.
+- Isolation comes first because later tests can otherwise leak state or hide races.
+- Hooks and locks are grouped as reliability work with independent contracts.
+- Links require one authoritative screen model and coordinate mapping.
+- Keyboard negotiation has separate outer-terminal and child-protocol responsibilities; grouping after links is a sequencing suggestion, not a strict technical dependency.
+- Validation follows implementation so smoke tests exercise integrated paths.
 
 ### Research Flags
 
-Phases likely needing deeper research during planning:
-- **Phase 1:** run `/gsd-plan-phase --research-phase 1` to settle default-branch/primary-session semantics, stable persisted ID versus path relationship, missing-parent representation, and downgrade/backup policy.
-- **Phase 2:** run focused research or a spike if submodule superprojects are in scope; Git documents incomplete multiple-worktree support. Also validate the oldest supported Git version for required porcelain flags.
-- **Phase 4:** research current daemon/PWA compatibility constraints and remote clone ownership if TUI and daemon filesystems may differ; remote clone jobs are otherwise out of scope.
+- **Phase 8:** Confirm global roots, OnceLock seams, subprocess boundaries, and cleanup ownership.
+- **Phase 10:** Verify vt100 extension feasibility, OSC8 behavior through scrollback/overwrite, and terminal mouse interoperability.
+- **Phase 11:** Verify bounded support negotiation and restoration for panic, suspend, failed setup, and alternate screens.
+- **Phase 12:** Confirm the release workflow and cross-platform smoke evidence.
 
-Phases with standard patterns (skip research-phase unless requirements change):
-- **Phase 3:** typed tree flattening, stable-ID selection, and contextual action matrices are well understood once the domain contract is fixed; use UI specification/discussion rather than more ecosystem research.
-- **Phase 5:** test planning follows the explicit behavior, race, migration, and parity matrices already identified; no new technology research is needed.
+Phase 9 uses standard JSON preservation and OS lock contention patterns, but implementation tests remain mandatory.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Existing lockfile/source boundaries and official Git, Serde, and Rust documentation directly support the no-new-dependency recommendation. |
-| Features | HIGH overall; MEDIUM interaction details | Table stakes follow the milestone and current baude behavior; exact default-branch fallback, parent key assignments, and forget behavior require product decisions. |
-| Architecture | HIGH integration; MEDIUM default semantics | Current code boundaries strongly support a repository aggregate over existing sessions and shared core lifecycle; whether the primary child must be the main worktree or the resolved remote default remains ambiguous. |
-| Pitfalls | HIGH | Critical hazards are evidenced in current code and official Git behavior, with concrete reproduction/test matrices. |
+| Stack | MEDIUM | Existing versions are verified; a vt100 patch remains a planning decision. |
+| Features | HIGH | Approved scope and safety boundaries are clear. |
+| Architecture | HIGH for boundaries, MEDIUM for link metadata | One model is supported; parser extension details remain unresolved. |
+| Pitfalls | HIGH for project evidence, MEDIUM for terminal behavior | Failure modes are concrete, but terminal support varies. |
 
-**Overall confidence:** HIGH
+**Overall confidence:** HIGH for sequencing and safety contracts, MEDIUM for terminal implementation details.
 
 ### Gaps to Address
 
-- **Meaning of “default-branch session”:** requirements must choose between “main worktree's current branch” and “resolved remote default.” Recommended contract is non-destructive: clone uses checked-out default; existing repos discover offline, reuse an already-safe matching worktree, and surface ambiguity rather than switching/fetching.
-- **Persistent identity shape:** research differs on runtime-only repository IDs versus persisted opaque IDs. Prefer persisted opaque repository/worktree keys for durable membership, managed path allocation, missing-state recovery, and daemon APIs, while always revalidating Git common-directory/path facts before mutation.
-- **Parent forget behavior:** decide whether v2.0 omits it, disallows it while children exist, or only removes baude metadata/processes. It must never delete the main checkout or cascade-remove linked worktrees.
-- **Remote clone ownership:** clarify whether daemon and TUI share a filesystem. If not, daemon-side clone needs its own background operation and should be separately scoped.
-- **Submodules:** define support as safe refusal/preservation unless focused real-repository tests prove stronger behavior.
-- **State rollback/corruption policy:** specify schema version, backup retention, error surfacing, and whether downgrade after the first v2 write is unsupported.
-- **PWA scope:** daemon safety and compatibility are required; full PWA nested presentation can follow only if requirements explicitly include it.
+- **OSC8 storage/rendering:** Decide whether a pinned patch is maintainable and carries metadata across local/remote paths without a second screen model.
+- **Gesture ownership:** Choose a modifier or context action compatible with child mouse reporting and outer-terminal interception.
+- **Keyboard capability timing:** Verify bounded negotiation and restoration across controlled exits.
+- **Hook ownership syntax:** Settle shell-safe registration and conservative legacy ownership detection.
+- **Release matrix:** Confirm supported terminal/OS combinations. Do not claim universal Shift+Enter detection.
 
 ## Sources
 
-### Primary (HIGH confidence)
-- [Git worktree documentation](https://git-scm.com/docs/git-worktree) — topology, stable porcelain/NUL output, one-branch checkout safeguards, locks/prunable state, clean-only removal, repair/prune, and submodule caveat.
-- [Git rev-parse documentation](https://git-scm.com/docs/git-rev-parse) — top-level versus common-directory discovery and absolute path formats.
-- [Git symbolic-ref documentation](https://git-scm.com/docs/git-symbolic-ref) — symbolic branch lookup and detached-HEAD behavior.
-- [Git clone documentation](https://git-scm.com/docs/git-clone) — initial checkout from the remote's active branch.
-- [Git remote documentation](https://git-scm.com/docs/git-remote) — optional/cached remote HEAD and network-query implications.
-- [Git check-ref-format documentation](https://git-scm.com/docs/git-check-ref-format) — authoritative branch validation.
-- [Git status documentation](https://git-scm.com/docs/git-status) — porcelain formats, untracked/submodule state, and optional-lock guidance.
-- [Serde field attributes](https://serde.rs/field-attrs.html) — compatible defaulted fields.
-- [Rust `std::fs::rename`](https://doc.rust-lang.org/std/fs/fn.rename.html) — same-filesystem atomic replacement constraints.
-- Current baude project evidence: `.planning/PROJECT.md`, `README.md`, workspace manifests/lockfile, `baude-core/src/{git,persist,session}.rs`, `baude/src/{app,ui,remote}.rs`, and `bauded/src/{manager,api}.rs`.
+### Primary
 
-### Secondary (MEDIUM confidence)
-- Product deductions in [FEATURES.md](./FEATURES.md), [ARCHITECTURE.md](./ARCHITECTURE.md), and [PITFALLS.md](./PITFALLS.md) — contextual key assignments, exact primary/default policy, parent forgetting, remote-clone scope, and PWA sequencing require requirements validation.
+- `.planning/PROJECT.md` for baseline, approved scope, constraints, and release gates.
+- `.planning/research/STACK.md` for supporting findings and source references.
+- `.planning/research/FEATURES.md` for supporting findings and source references.
+- `.planning/research/ARCHITECTURE.md` for supporting findings and source references.
+- `.planning/research/PITFALLS.md` for supporting findings and source references.
+- `Cargo.lock` and current hook, persistence, PTY, app, key, remote, UI, and manager sources.
+- [Rust environment safety](https://doc.rust-lang.org/std/env/fn.set_var.html)
+- [crossterm keyboard enhancement APIs](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.KeyboardEnhancementFlags.html)
+- [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+- [vt100 Cell API](https://docs.rs/vt100/0.15.2/vt100/struct.Cell.html)
+- [ratatui Cell](https://docs.rs/ratatui/0.30.2/ratatui/buffer/struct.Cell.html)
+- [OSC8 specification](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda)
 
-### Tertiary (LOW confidence)
-- None. Unresolved points are explicit product/scope decisions rather than unsupported technical claims.
+### Supporting
+
+- iTerm2, Contour, and Solo terminal documentation linked in the dimension reports.
+
+## Artifact Validation
+
+Research baseline: `acb6442` (v2.1.0). Milestone initialization: `a6237f2`. Research artifacts: `6642913`.
+
+All four dimension files exist and are substantive. The source and milestone commits resolve locally. This is document validation only; implementation tests and terminal smoke tests have not run.
 
 ---
-*Research completed: 2026-08-30*
-*Ready for roadmap: yes*
+*Research completed: 2026-09-08*
+*Ready for roadmap: yes, after requirements and roadmap approval*
