@@ -2,18 +2,18 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 8
+current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
-status: Ready to plan Phase 8
-stopped_at: context exhaustion at 75% (2026-09-14)
-last_updated: "2026-09-14T03:26:30.332Z"
-last_activity: 2026-09-13
-last_activity_desc: Phases 8 and 9 re-scoped to verified remaining gaps
-state_head: c80d6bd5155a2bbdb8cc90389bc810b25c586ac8
+status: executing
+stopped_at: context exhaustion at 100% (2026-09-14)
+last_updated: "2026-09-14T16:43:49.390Z"
+last_activity: 2026-09-14
+last_activity_desc: Phase 08 execution started
+state_head: 3c28f4276a883956de73b0b4da262d92544fc6e0
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 6
+  total_plans: 8
   completed_plans: 0
   percent: 0
 ---
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 8 planning — config/identity isolation and leak preview, the gaps v2.1.4 did not close
+**Current focus:** Phase 08 — Test Isolation and Fixture Ownership
 
 ## Current Position
 
-Phase: 8 (Test Isolation and Fixture Ownership, narrowed)
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-09-13 — Phases 8 and 9 reconciled against shipped code
+Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
+Plan: 1 of 7
+Status: Executing Phase 08
+Last activity: 2026-09-14 — Phase 08 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -159,8 +159,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-14T03:26:30.297Z
-Stopped at: context exhaustion at 75% (2026-09-14)
+Last session: 2026-09-14T16:43:49.342Z
+Stopped at: context exhaustion at 100% (2026-09-14)
 Resume file: None
 
 ## Deferred Items

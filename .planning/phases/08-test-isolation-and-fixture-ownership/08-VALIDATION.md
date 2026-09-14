@@ -48,15 +48,31 @@ on its own line and tested afterwards.
 
 ## Sampling Rate
 
-- **After every task commit:** the task's own `<automated>` command (all are filtered; each
-  returns in well under 60s warm)
-- **After every plan wave:** `cargo test -- --test-threads=1` plus
-  `cargo clippy --all-targets -- -D warnings`
-- **After wave 3 and wave 4:** additionally
-  `bash scripts/assert-real-roots-untouched.sh before` / `after` around the full suite
-- **Before `/gsd-verify-work`:** full suite green, clippy clean, `cargo fmt --check` clean,
-  `cargo build --workspace --release --locked` succeeds
-- **Max feedback latency:** 20 seconds for the per-task filtered commands
+- **Fast feedback during tasks:** run the named contained filters in each PLAN. Target
+  approximately 5-20 seconds warm for resolver/pure tests; git-backed fixture groups may
+  take 20-60 seconds or longer. These are estimates, not measured maxima.
+- **Wave 1 and concurrent wave 2:** no broad crate/binary/workspace tests. Only new contained
+  tests and compile-only checks run. 08-03's fixture_identity_isolation filters are owner/
+  identity/path-only and construct no App or PTY; UI tests are authored/compiled, not run.
+- **Wave 3 worker boundary:** 08-08 first makes App usage/ambient remote workers inert,
+  runs worker_isolation_app_ plus ui_fixture_isolation_, then contains the PTY child
+  environment and runs worker_isolation_pty_. 08-04 remains parallel and synthetic-only.
+- **First broad-test boundary:** 08-06 task 2 in wave 4, after 01/02/03/08 and 06 task 1.
+  This includes app/API/UI/core/manager guards and identities, returned lifetimes, inert
+  App workers, contained PTY environments, and the dogfood child's config environment.
+  Repeat worker/UI filters before the full serial suite and full downstream binaries with
+  default concurrency, bracketed by the external observer. No-write snapshots do not
+  certify absence of reads; synthetic worker/child tests supply separate no-read evidence.
+- **End-of-phase integration:** after wave 5, repeat the suite/observer pair, clippy,
+  formatting and release build so scanner/CLI changes receive full regression coverage.
+- **Latency accounting:** 08-01 task 2 also contains a compile-only check; 08-01 task 3
+  contains a release build; 08-03 task 2 compiles all targets; 08-06 task 2 is a full
+  integration gate (~4-6 minutes warm for the serial suite alone). Clippy/release builds
+  and cold builds can take several additional minutes. None has a sub-20-second claim.
+- **Failure direction:** every PLAN automated block has an adjacent fails_when. Nonzero
+  exit or a missing intended test fails; an empty Cargo filter is not accepted as evidence.
+  Expected-panic tests fail if the guarded call returns normally. Manual/integration
+  results remain pending until observed; this revision executed no tests or real-root checks.
 
 ---
 
@@ -64,40 +80,46 @@ on its own line and tested afterwards.
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 8-01-01 | 01 | 1 | TISO-01, TISO-03 | T-08-01 / T-08-02 / T-08-03 | Feature gate reaches a downstream test binary; release build selects no test-support code | tracer (end-to-end) | `cargo test -p baude --bins test_support_gate_is_active && cargo test -p baude-core --lib persist:: && cargo build --release -p baude -p bauded` | ✅ existing | ⬜ pending |
-| 8-01-02 | 01 | 1 | TISO-01, TISO-03 | T-08-01 / T-08-09 | Unguarded real-path resolution aborts; arming flag removed so there is no pre-arm window | unit | `cargo test -p baude-core --lib testing:: && cargo test -p baude-core --lib git::tests && cargo test -p baude --bins && cargo test -p bauded --bins && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
-| 8-01-03 | 01 | 1 | TISO-03 | T-08-02 / T-08-23 | Escape aborts in all three test binaries; probe is thread-local so it disturbs no concurrent test | unit + integration | `cargo test -p baude --bins && cargo test -p bauded --bins && cargo test -p baude-core --lib && cargo build --workspace --release --locked` | ✅ existing | ⬜ pending |
-| 8-02-01 | 02 | 2 | TISO-01, TISO-03 | T-08-04 | `~/.claude` unreachable from a guarded test binary; `CLAUDE_CONFIG_DIR` chain preserved verbatim | unit | `cargo test -p baude-core --lib meta:: && cargo test -p baude --bins local_tui_dogfood && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
-| 8-02-02 | 02 | 2 | TISO-01 | T-08-01 / T-08-08 / T-08-10 | VAPID key and subscription store land inside the fixture root; key format unchanged | unit (new coverage) | `cargo test -p bauded --bins push:: && cargo test -p bauded --bins && cargo clippy --all-targets -- -D warnings` | ❌ W0 — `push::tests` module is created by this task | ⬜ pending |
-| 8-03-01 | 03 | 2 | TISO-02, TISO-03 | T-08-05 / T-08-11 | Concurrent fixtures resolve independent identities; managed path composition unchanged | unit (concurrency) | `cargo test -p baude-core --lib workspace:: && cargo test -p baude-core --lib git::tests && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
-| 8-03-02 | 03 | 2 | TISO-02 | T-08-06 / T-08-24 | Identity path performs no config read; bootstrap arm containment-guarded and unreachable in production | unit + counter assertion | `cargo test -p baude-core --lib workspace:: && cargo test -p baude --bins && cargo test -p bauded --bins && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
-| 8-04-01 | 04 | 2 | TISO-04 | T-08-12 | Removal predicate agreed before any code can produce `Removable` | checkpoint:decision | N/A — blocking decision checkpoint | N/A | ⬜ pending |
-| 8-04-02 | 04 | 2 | TISO-04 | T-08-12 / T-08-15 | Shape alone and missing-gitdir alone both yield `Indeterminate`; empty evidence yields `Indeterminate` | unit (pure) | `cargo test -p baude-core --lib worktree_scan::tests::verdict && cargo clippy --all-targets -- -D warnings` | ❌ W0 — `worktree_scan.rs` is created by this task | ⬜ pending |
-| 8-04-03 | 04 | 2 | TISO-04 | T-08-04 / T-08-13 / T-08-14 | Read-only enumeration; symlink refused; key overflow skipped not fatal; tree byte-identical after scan | unit (filesystem fixture) | `cargo test -p baude-core --lib worktree_scan:: && cargo clippy --all-targets -- -D warnings && cargo test -p baude-core --lib git::tests` | ❌ W0 — created by 8-04-02 | ⬜ pending |
-| 8-05-01 | 05 | 3 | TISO-04 | T-08-16 | Unreadable state blocks every candidate in its workspace; absent state is a checked absence | unit | `cargo test -p baude-core --lib worktree_scan:: && cargo clippy --all-targets -- -D warnings` | ✅ after 8-04-02 | ⬜ pending |
-| 8-05-02 | 05 | 3 | TISO-04 | T-08-05 / T-08-04 / T-08-18 | Prune re-derives all evidence and requires the proof to match; no confirmation means no removal | checkpoint:decision then unit | `cargo test -p baude-core --lib worktree_scan:: && cargo clippy --all-targets -- -D warnings` | ✅ after 8-04-02 | ⬜ pending |
-| 8-06-01 | 06 | 3 | TISO-01, TISO-03 | T-08-09 / T-08-21 | Fixture helper holds the redirect guard as a field for the fixture lifetime | unit (refactor regression) | `cargo test -p bauded --bins manager:: && cargo test -p bauded --bins && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
-| 8-06-02 | 06 | 3 | TISO-01, TISO-02, TISO-03 | T-08-20 / T-08-22 | A full suite run changes none of the three real roots; failure names the root and the entries | suite-level script | `bash scripts/assert-real-roots-untouched.sh before && cargo test -- --test-threads=1; status=$?; bash scripts/assert-real-roots-untouched.sh after; after=$?; test "$status" -eq 0 -a "$after" -eq 0` | ❌ W0 — script created by this task | ⬜ pending |
-| 8-07-01 | 07 | 4 | TISO-04 | T-08-17 / T-08-18 / T-08-19 | `scan` is read-only; removal needs two distinct flags; no verb added to `bauded` | unit + manual | `cargo test -p baude --bins && cargo build -p baude && cargo clippy --all-targets -- -D warnings` | ✅ existing | ⬜ pending |
+| 8-01-01 | 01 | 1 | TISO-01, TISO-03 | T-08-01 / T-08-02 | Downstream observes dependency-gated config resolver | tracer | `cargo test -p baude --bins test_support_gate_is_active && cargo test -p baude-core --lib persist::tests::config_dir_honours_redirect` | New tests in task | Pending |
+| 8-01-02 | 01 | 1 | TISO-01, TISO-03 | T-08-01 / T-08-09 | Root/command RAII and complete setter migration compile | unit + compile-only | `cargo test -p baude-core --lib testing:: && cargo check --workspace --all-targets --locked` | New tests in task | Pending |
+| 8-01-03 | 01 | 1 | TISO-03 | T-08-02 / T-08-23 / T-08-03 | Escape panics in all harnesses; release compiles | unit + release build | `cargo test -p baude --bins unguarded_resolution_panics && cargo test -p bauded --bins unguarded_resolution_panics && cargo test -p baude-core --lib unguarded_resolution_panics && cargo build --workspace --release --locked` | New tests in task | Pending |
+| 8-02-01 | 02 | 2 | TISO-01, TISO-03 | T-08-04 | Synthetic Claude resolver/poll tests; escape panics | unit | `cargo test -p baude-core --lib meta::tests::claude_config_dir_` | New tests in task | Pending |
+| 8-02-02 | 02 | 2 | TISO-01 | T-08-01 / T-08-08 / T-08-10 | VAPID/subscriptions in synthetic roots; no developer-root observation | store tests | `cargo test -p bauded --bins push::tests::store_isolation_` | New store cases in existing crypto module | Pending |
+| 8-03-01 | 03 | 2 | TISO-02, TISO-03 | T-08-05 / T-08-11 / T-08-24 | Reader-only identity; override required before cache lookup; thread-local read counter | unit/concurrency | `cargo test -p baude-core --lib workspace::` | Extended tests in task | Pending |
+| 8-03-02 | 03 | 2 | TISO-01, TISO-02, TISO-03 | T-08-06 / T-08-24 | Explicit startup and retained app/API/UI guards; executes owner-only filters, compiles UI cases | unit + compile-only | `cargo test -p baude-core --lib workspace:: && cargo test -p baude --bins fixture_identity_isolation && cargo test -p bauded --bins fixture_identity_isolation && cargo check --workspace --all-targets --locked` | New tests in task; UI cases execute at 8-08-01 | Pending |
+| 8-04-01 | 04 | 3 | TISO-04 | T-08-12 | Removal predicate needs human response before implementation | checkpoint:decision | N/A; blocking human gate | N/A | Not approved |
+| 8-04-02 | 04 | 3 | TISO-04 | T-08-12 / T-08-15 | Weak evidence never clears; blockers win | pure unit | `cargo test -p baude-core --lib worktree_scan::tests::verdict` | New module/tests in task | Pending |
+| 8-04-03 | 04 | 3 | TISO-04 | T-08-04 / T-08-13 / T-08-14 | Read-only synthetic scan, symlink refusal and non-locking reader | filesystem fixture | `cargo test -p baude-core --lib worktree_scan::` | Extended tests in task | Pending |
+| 8-05-01 | 05 | 4 | TISO-04 | T-08-16 | All state files, repo keys and path overlaps checked; unreadability blocks clearing globally | unit | `cargo test -p baude-core --lib worktree_scan::` | Extended tests in task | Pending |
+| 8-05-gate | 05 | 4 | TISO-04 | T-08-05 | Prune semantics need separate human response | checkpoint:decision | N/A; blocking human gate | N/A | Not approved |
+| 8-05-02 | 05 | 4 | TISO-04 | T-08-05 / T-08-04 / T-08-18 / T-08-25 | Prior report/proof and fresh re-verification; no confirmation means no removal | unit | `cargo test -p baude-core --lib worktree_scan::` | Extended tests in task | Pending |
+| 8-06-01 | 06 | 4 | TISO-01, TISO-02, TISO-03 | T-08-09 / T-08-21 | Helper holds root and literal identity through use and PTY teardown, including persist=false | fixture unit | `cargo test -p bauded --bins manager::tests::fixture_isolation_` | New helper tests in task | Pending |
+| 8-06-02 | 06 | 4 | TISO-01, TISO-02, TISO-03 | T-08-20 / T-08-22 / T-08-26 / T-08-28 | Worker/UI no-read controls before suite; observer failures independent | longer integration gate | `bash scripts/assert-real-roots-untouched.sh --self-test && cargo test -p baude --bins worker_isolation_app_ && cargo test -p baude --bins ui_fixture_isolation_ && cargo test -p baude-core --lib worker_isolation_pty_ && bash scripts/assert-real-roots-untouched.sh before && { cargo test -- --test-threads=1; status=$?; bash scripts/assert-real-roots-untouched.sh after; after=$?; test "$status" -eq 0 -a "$after" -eq 0; }` | Script/self-tests created in task | Pending |
+| 8-07-01 | 07 | 5 | TISO-04 | T-08-17 / T-08-18 / T-08-19 / T-08-25 | CLI consumes inspected report; no new candidate enters prune | CLI fixture | `cargo test -p baude --bins worktrees_cli_` | New tests in task | Pending |
+| 8-08-01 | 08 | 3 | TISO-01, TISO-02, TISO-03 | T-08-26 / T-08-27 | Inert App workers; real App/UI render retains fixture roots and identity | tracer, synthetic child | `cargo test -p baude --bins worker_isolation_app_ && cargo test -p baude --bins ui_fixture_isolation_` | Worker test created in task; UI cases authored by 03 | Pending |
+| 8-08-02 | 08 | 3 | TISO-01, TISO-02, TISO-03 | T-08-28 / T-08-29 | Test PTY child roots/startup inputs contained before registration | synthetic child + compile-only | `cargo test -p baude-core --lib worker_isolation_pty_ && cargo check --workspace --all-targets --locked` | New tests and five existing fixture migrations in task | Pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+This map records scheduled checks, not observed passes. All automatic commands have an
+adjacent scenario-specific fails_when in their PLAN. Empty filters and nonzero exits fail;
+expected-panic tests fail when a guarded call returns normally.
 
 ---
 
 ## Wave 0 Requirements
 
-No separate Wave 0 pass is needed: every `❌ W0` row above names a file the task itself
-creates as its first action, and no task depends on a test file another task was supposed to
-scaffold. The framework is cargo's built-in `libtest`, already in use across all three crates.
+No separate Wave 0 pass is needed: every new test/scaffold named in the map is created by
+its owning task before implementation or verification. Existing source-file presence does
+not mean the new test exists. The framework is cargo's built-in libtest, already in use
+across all three crates.
 
 - `baude-core/src/worktree_scan.rs` — created by task 8-04-02 before its own tests run; 8-04-03 and both plan 05 tasks extend the same module.
-- `bauded/src/push.rs` test module — created by task 8-02-02; the push subsystem has no coverage today.
+- `bauded/src/push.rs` store-isolation tests are added by 8-02-02 to the existing crypto test module; the filesystem store path has no coverage today.
 - `scripts/assert-real-roots-untouched.sh` — created by task 8-06-02 together with its CI wiring.
 - `baude-core/src/testing.rs` — created by task 8-01-01; every later plan consumes it, which is why plan 01 is the wave-1 tracer.
 
-Sampling continuity check: no three consecutive tasks lack an `<automated>` command. The only
-task without one is the plan 04 decision checkpoint (8-04-01), which is bracketed by
-automated tasks on both sides.
+Sampling continuity: no three consecutive tasks lack automated verification. The two
+human decision checkpoints (08-04 task 1 and the 08-05 prune gate) remain unapproved and
+are bracketed by automated implementation tasks.
 
 ---
 
@@ -110,13 +132,74 @@ automated tasks on both sides.
 
 ---
 
+## Multi-Source Coverage Audit
+
+Coverage means planned, not implemented or approved. The two human decision gates remain
+pending. IDs follow the stable prose-decision map in 08-01; CONTEXT itself is unchanged.
+
+| Source | ID / feature | Plan | Status / disposition |
+|--------|--------------|------|----------------------|
+| GOAL | Suite cannot access developer config/state/Claude files | 01, 02, 03, 06, 08 | COVERED: contained resolvers, fixture-owned identity, inert usage workers, contained PTY child env and external no-write observer |
+| GOAL | Historical leaks inspectable before deletion | 04, 05, 07 | COVERED: read-only preview and separately gated report-bound prune |
+| REQ | TISO-01 | 01, 02, 03, 06, 08 | COVERED: retained root guards across core/app/API/UI/manager/push and explicit subprocess roots |
+| REQ | TISO-02 | 03, 06, 08 | COVERED: literal per-thread identity, no parent environment mutation |
+| REQ | TISO-03 | 01, 02, 03, 06, 08 | COVERED: unconditional guard, expected-panic proofs, cache-bypass and pre-spawn regressions |
+| REQ | TISO-04 | 04, 05, 07 | COVERED: complete state protection, inspected-report transport and re-verification; human gates pending |
+| CONTEXT | D-01 RAII config redirect | 01 | COVERED |
+| CONTEXT | D-02 shared push config resolver | 02 | COVERED |
+| CONTEXT | D-03 thread-local Claude redirect | 02 | COVERED |
+| CONTEXT | D-04 one unified redirect guard | 01, 03, 06 | COVERED: scoped hook/workspace updates use the same storage and guard |
+| CONTEXT | D-05 override-first identity with production OnceLock | 03 | COVERED |
+| CONTEXT | D-06 injected config with no identity-path reads | 03 | COVERED: explicit startup, same-thread read instrumentation |
+| CONTEXT | D-07 unchanged active signature | 03 | COVERED |
+| CONTEXT | D-08 no-override panic | 03, 06 | COVERED: checked before any cached identity, including contained child paths |
+| CONTEXT | D-09 first-instruction arming | 01 | COVERED: existing documented cross-crate mechanism correction retained |
+| CONTEXT | D-10 panic on escape | 01, 02, 03 | COVERED |
+| CONTEXT | D-11 all five path categories | 01, 02, 06 | COVERED |
+| CONTEXT | D-12 no shipped test support | 01, 06 | COVERED: dev-only feature wiring plus release graph check |
+| CONTEXT | D-13 CLI, not TUI | 07 | COVERED |
+| CONTEXT | D-14 ownership predicate | 04, 05 | COVERED by genuine human checkpoint and fail-closed implementation tasks; proposed correction not approved |
+| CONTEXT | D-15 separate approval and re-verification | 05, 07 | COVERED; exact prune semantics remain pending human response |
+| CONTEXT | D-16 preview default | 04, 05, 07 | COVERED |
+| CONTEXT | D-17 dogfood child discretion | 01, 03, 06 | COVERED: child-only env plus explicit literal identity |
+| CONTEXT | D-18 manager helper discretion | 06 | COVERED |
+| CONTEXT | D-19 CLI naming discretion | 07 | COVERED |
+| RESEARCH | Findings 1-3: cross-crate cfg, libtest scope, static lifetime | 01, 03 | COVERED: dependency behavior proof, nested/concurrent tests, bounded fixture allocation |
+| RESEARCH | Findings 4/7: new push store tests and lock helper visibility | 01, 02, 04 | COVERED: existing crypto tests retained, new store coverage, read-only scanner avoids locking loader |
+| RESEARCH | Finding 5: live counterexamples and weak ownership signals | 04, 05 | COVERED: realistic empty repo-1/repo-5 fixtures, all state files, key/path parent-child exclusions, global fail-closed uncertainty |
+| RESEARCH | Finding 8: environment-contained re-exec | 01, 03, 06 | COVERED: exact per-root env precedence and fixture identity scope |
+| RESEARCH | Patterns 1-6 and pitfalls 1-5/7 | 01-08 | COVERED: scoped guard lifetimes/custom commands, no env races, unchanged poll interfaces, strict scan inputs, symlink/TOCTOU refusal, existing git safety reuse |
+| RESEARCH | UI constructor census and worker-boundary correction | 03, 06, 08 | COVERED: 44 test App sites including five UI sites; retained hierarchy helper owner, inert ccusage/ambient remote, explicit no-startup-file PTY env and synthetic regressions |
+| RESEARCH | Output/placement/explicit-root questions | 01, 04, 05, 07 | COVERED: four RESOLVED entries record existing choices, full JSON report transports proof |
+| RESEARCH | Security/no-new-packages constraints | 01-07 | COVERED: threat registers, existing std/serde tooling, no package installs |
+
+Excluded by existing source scope: production empty-parent cleanup (Finding 6), actual
+historical deletion, orphaned real atomic-write temps, VAPID rotation, and work assigned
+to phases 9-12. Nothing from those exclusions is implemented by these plans. No uncovered
+in-scope source item was found in this revision.
+
+## Revision Scope and Dependency Check
+
+Eight plans, five waves: 1=[01], 2=[02,03], 3=[04,08], 4=[05,06], 5=[07].
+08 depends on 01/02/03; 06 adds 08; 07 depends explicitly on 05/06. The new app.rs
+writer runs after 03, and no same-wave modified-file overlap is introduced. Both human
+decision checkpoints remain pending. STATE/config and runtime locks are not updated by
+this planning-only revision.
+
+The 08-01 scope warning remains for human escalation, not a waived pass: 11 files,
+62,000 raw/calibrated tokens, factor 1 with zero samples and low confidence. Its scope_budget
+records why a one-file reassignment leaves incomplete setter/lifetime migration; a larger
+additive-API/migration split requires deliberate re-decomposition. The separate 08 worker
+plan addresses newly found scope without pretending to shrink 01. 03 is 54,000 tokens;
+08 is 38,000 tokens. These are projections, not measured execution costs.
+
 ## Validation Sign-Off
 
-- [x] All tasks have `<automated>` verify or Wave 0 dependencies — the sole exception is the 8-04-01 decision checkpoint
+- [x] All implementation tasks have automated verification; both decision checkpoints require actual human responses
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
 - [x] Wave 0 covers all MISSING references — each is created by the task that first needs it
 - [x] No watch-mode flags
-- [x] Feedback latency < 20s for per-task commands
+- [x] Fast filter targets distinguished from compile/release and 4-6 minute full-suite integration gates; no measured maximum claimed
 - [x] No `--lib` filter on a binary-only crate; no gate read through a pipe
 - [x] `nyquist_compliant: true` set in frontmatter
 

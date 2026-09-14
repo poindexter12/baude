@@ -133,12 +133,47 @@ it out of release builds), replace the arming `AtomicBool` with a *containment p
 accepts either a thread-local override or a path inside `BAUDE_TEST_FIXTURE_ROOT`, and build
 TISO-04's ownership proof from layered evidence with `scan` defaulting to a report that authorizes nothing.
 
+**Revision-grounded implementation constraints (2026-09-14, source inspection only):**
+- Shared support uses the feature predicate inside baude-core. Downstream test modules use
+  cfg(test) and observe dependency behavior; cfg!(feature) in baude would inspect baude.
+- D-06/D-07 are compatible: explicit production initialization and reader-only active(),
+  with no lazy config read. D-08 requires a test identity override before any cache lookup.
+  Test initialization updates only a held thread-local scope; it never seeds ACTIVE.
+- App/API/UI helper return values must own the guard through caller use; a local guard in a
+  path-returning helper drops too early. The hook reconciliation case needs a nested custom
+  command guard preserving the newer bin2 command.
+- Revision iteration 2 inspected every App constructor: 39 test calls in app.rs, five in
+  ui.rs (2298, 2439, 2551, 2799, 2874), one production call in main.rs. hierarchy_fixture
+  returns App and has six callers, so plan 03 retains a UiFixture owner beyond helper return.
+- App::new at 741 unconditionally starts UsagePoller; usage.rs:30-44 starts a detached
+  thread and :75-79 runs ccusage with inherited env. This bypasses the core Claude resolver.
+  Plan 08 makes the test poller inert and suppresses App's ambient BAUDE_DAEMON_URL remote
+  startup before construction, with synthetic child-process regressions.
+- Pty::spawn_registered_with at pty.rs:78-98 runs inherited SHELL with -il before even a
+  harmless test command. Plan 08 clears/rebuilds its test child env, pins fixture roots and
+  uses a no-profile/no-rc test shell while retaining production launch/registration behavior.
+  The five direct PTY fixtures gain retained root owners. A no-write snapshot detects
+  neither transcript reads nor shell startup reads.
+- The dogfood child must pin XDG_CONFIG_HOME and CLAUDE_CONFIG_DIR as well as HOME/data,
+  and hold a literal identity override. Filesystem containment does not prove identity scope.
+- State inventory starts at the config directory and covers all files, not just workspaces
+  with managed directories. SavedRepository keys protect empty repo parents even with
+  external main checkouts; overlapping descendant paths and cross-workspace refs also block.
+  Unreadable potentially referencing state blocks clearing the entire scan.
+- `load_for_workspace_strict_at` acquires a state lock. Scanner reads must instead use the
+  strict non-locking `load_named_at`, with unsupported legacy schemas failing closed.
+- Tests use explicit synthetic ScanRoots; prune consumes a previously inspected serialized
+  report with candidate proofs, independently binds roots and re-derives evidence.
+- Before 08-06 task 2, execute only the new contained filters. The canonical command/wave
+  and latency schedule is 08-VALIDATION.md; broad execution waits for every isolation owner.
+
 ## Architectural Responsibility Map
 
 | Capability | Primary Tier | Secondary Tier | Rationale |
 |------------|-------------|----------------|-----------|
 | Config/state path resolution + redirect | `baude-core` (`persist`) | — | `persist::config_base()` is already the single real resolver; `bauded/src/push.rs:27` is a duplicate to delete |
-| `~/.claude` path resolution + redirect | `baude-core` (`meta`) | — | `meta::claude_config_dir()` (`meta.rs:24`) is the only resolver; its two callers are internal to `ClaudeMeta` |
+| `~/.claude` path resolution + redirect | `baude-core` (`meta`) | — | Core filesystem resolver; ccusage and PTY subprocesses bypass it and require the separate boundary below |
+| Fixture worker/subprocess isolation | `baude` (`app`, `usage`) and `baude-core` (`pty`) | Fixture owners in app/API/UI/manager | Inert test usage/ambient remote startup; explicit test-child env and shell startup containment at the single PTY launcher |
 | Managed worktree root resolution | `baude-core` (`git`) | — | `worktrees_base()` (`git.rs:1750`) already owns this and already carries the v2.1.4 guard |
 | Workspace identity resolution | `baude-core` (`workspace`) | — | `ACTIVE: OnceLock` (`workspace.rs:199`) is the single cache; `active()` has ~30 readers across all three crates |
 | Escape guard enforcement | `baude-core` (each resolver) | — | The guard must sit where the real path is produced, not where it is consumed; consumers cannot know they escaped |
@@ -707,29 +742,19 @@ inheriting the rest: `baude-core = { workspace = true, features = ["test-support
 
 ### Pattern 3: Thread-local `&'static` workspace override
 
-**What:** Check a thread-local first, fall back to the existing `OnceLock`; preserve `active()`'s
-signature by leaking the fixture workspace.
-**When to use:** `workspace::active()` only.
+**What:** Read a held thread-local identity first; support builds panic if absent, before
+consulting any process cache. Production active() only reads an explicitly seeded OnceLock.
+**When to use:** `workspace::active()`; preserve its static return signature through the
+fixture's leaked reference. The executable contract is 08-03 `<decision_collision>`.
 
-```rust
-pub fn initialize(config: &Config, hint: Option<&str>) -> &'static Workspace {
-    ACTIVE.get_or_init(|| resolve_with_hint(
-        std::env::var("BAUDE_WORKSPACE").ok().as_deref(),
-        std::env::var("BAUDE_BACKEND").ok().as_deref(),
-        hint, config, |msg| eprintln!("baude: {msg}"),
-    ))
-}
-
-pub fn active() -> &'static Workspace {
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(ws) = crate::testing::workspace_override() { return ws; }
-
-    #[cfg(any(test, feature = "test-support"))]
-    crate::testing::assert_no_escape_workspace();   // panic: fixture forgot to set identity
-
-    initialize(&crate::persist::load_config(), None)
-}
-```
+Production `initialize(&Config, hint)` resolves the existing environment/config precedence
+once into ACTIVE. Support-build initialize requires a fixture identity scope and replaces
+only that thread's reference using literal config and hint, without ambient identity env.
+`override_for_test(&Config, hint)` constructs that scope using the same unified TestRedirect.
+Every arm of both initialize and active performs zero filesystem config reads. There is
+no lazy initializer in active; a missing production initializer is a startup programmer
+error. The same-thread config-read counter in plan 03 measures this property without
+racing unrelated parallel tests.
 
 Config injection into `initialize()` is the locked decision and is what removes the real-config read
 from the identity path. `baude/src/main.rs:296` already computes `let config = persist::load_config();`
@@ -827,10 +852,9 @@ The rules that fall out of §Finding 5:
 - `ShapeMatch` alone → `Indeterminate`. It matches real production worktrees.
 - `NoGitdir` alone → `Indeterminate`. All 1433 candidates have no gitdir; treating it as proof
   would authorize deleting every one, which is exactly what TISO-04 forbids.
-- Any state file that fails to parse → `Indeterminate` for **every** candidate in that workspace.
-  The alternative is deriving "not referenced" from a file you could not read — an absence that
-  proves nothing. This matches the fail-closed precedent set for removal in
-  `inspect_removal`/`RemovalSafety`.
+- Any unreadable potentially referencing state file or incomplete config-directory inventory
+  blocks clearing **every** candidate across the scan, including other workspaces. Path
+  references are not workspace-local, so a failed read cannot certify any candidate's absence.
 - `ReferencedByState`, `ContainsCheckout`, `IsSymlink` → hard blockers, independent of everything else.
 - `scan` prints all three verdicts. `--prune --yes` operates only on `Removable`, and re-derives
   every evidence item from scratch at removal time (the two-step approval decision).
@@ -921,8 +945,10 @@ tests keep leaking into the real data dir with no signal.
 **How to avoid:** `cfg(any(test, feature = "test-support"))` everywhere, with the dev-dependency wiring.
 **Warning signs:** A test that *should* panic passes. Add a deliberate escape test in `baude`'s and
 `bauded`'s test modules — not just `baude-core`'s — and assert it panics via `#[should_panic]`.
-The cheapest proof the gate actually works is a `#[test] fn gate_is_active() { assert!(cfg!(feature = "test-support")); }`
-in each downstream crate.
+The cheapest direct proof calls the dependency's redirect-aware config resolver under a
+held synthetic TestRedirect in each downstream crate. A downstream cfg!(feature) expression
+would inspect the binary crate's features, not the core dependency where test-support is
+enabled; it is not a valid proof.
 
 ### Pitfall 2: A redirect guard that is constructed but not bound
 **What goes wrong:** `TestRedirect::new(root);` arms and immediately disarms; the fixture writes to
@@ -938,18 +964,23 @@ also drops immediately).
 **What goes wrong:** Code resolving a redirected path on a thread the fixture did not create sees
 no override, then either panics on the guard or writes to the real directory.
 **Why it happens:** `thread_local!` is per-thread by definition; `std::thread::spawn` starts fresh.
-**Current exposure — low but real.** Spawned threads in the codebase: `pty.rs:169` (PTY reader,
-no path resolution), `app.rs:4496` (`git::clone_repo`, no redirected resolver),
-`usage.rs:33`, `remote.rs:87`, `remote.rs:253`, `notify_desktop.rs:142`, `bauded/main.rs:190`
-(manager poll loop — **does** reach `ClaudeMeta::poll` → `claude_config_dir()`),
-`bauded/api.rs:541`, `bauded/permission_bridge.rs:62` [VERIFIED: `grep -rn "thread::spawn"`].
+**Current exposure — confirmed in ordinary App fixtures, not merely hypothetical.** Every
+App::new starts usage.rs:33, whose ccusage subprocess scans transcripts with inherited env;
+thread-local meta redirection never reaches that process. The PTY launcher at pty.rs:78
+also starts inherited SHELL with -il before executing fixture commands. Plan 08 contains
+both paths and disables ambient App remote/notification startup. Its worker_inventory
+records the inspected remaining thread dispositions. Other spawned threads include
+pty.rs:169 (stream reader), app.rs:4496 (explicit clone destination), remote.rs:87/:253,
+notify_desktop.rs:142, bauded/main.rs:190 (production-only manager poll), bauded/api.rs:541
+(channel bridge), and bauded/permission_bridge.rs:62 (explicit loopback SSE).
 Every `#[tokio::test]` in `bauded/src/api.rs` uses the default current-thread flavor (16 occurrences,
 none with `flavor = "multi_thread"`) [VERIFIED: `grep -rn "tokio::test"` and
 `grep -rn "multi_thread"` — the only runtime builder is `new_current_thread()` at manager.rs:4130],
 so axum handlers run on the test's own thread and do see the override.
-**How to avoid:** Do not introduce a `flavor = "multi_thread"` test, and do not resolve a redirected
-path inside `std::thread::spawn` in code under test. If one becomes necessary, capture the resolved
-`PathBuf` before spawning and move it in.
+**How to avoid:** Do not introduce a `flavor = "multi_thread"` test. Capture resolved paths
+before worker launch when a worker needs them; for external commands set an explicit
+child environment or use an inert test worker. Merely moving a PathBuf does not redirect
+an external CLI's independent environment lookup. Do not mutate the parent environment.
 **Warning signs:** A new `#[tokio::test(flavor = "multi_thread")]`, or a guard panic whose backtrace
 does not start at a `#[test]` frame.
 
@@ -1199,29 +1230,35 @@ files) and `meta.rs:261` (transcripts).
 |--------|----------|-----------|-------------------|-------------|
 | TISO-01 | `persist::config_base()` honours the redirect | unit | `cargo test -p baude-core --lib persist::tests::config_dir_honours_redirect` | ❌ Wave 0 |
 | TISO-01 | `meta::claude_config_dir()` honours the redirect | unit | `cargo test -p baude-core --lib meta::tests::claude_config_dir_honours_redirect` | ❌ Wave 0 |
-| TISO-01 | `PushState::load` writes VAPID + subscriptions inside the fixture | unit | `cargo test -p bauded --lib push::tests::vapid_and_subs_stay_in_fixture` | ❌ Wave 0 — see §Finding 4, no existing coverage |
+| TISO-01 | `PushState::load` writes VAPID + subscriptions inside the fixture | unit | `cargo test -p bauded --bins push::tests::vapid_and_subs_stay_in_fixture` | ❌ Wave 0 — see §Finding 4, no existing coverage |
 | TISO-01 | No test run touches the real config dir | integration | `cargo test -- --test-threads=1` then assert `~/.config/baude` mtime unchanged | ❌ Wave 0 (manual/scripted check) |
 | TISO-02 | Two fixtures on different threads resolve different workspace identities | unit | `cargo test -p baude-core --lib workspace::tests::per_fixture_identity_is_independent` | ❌ Wave 0 |
 | TISO-02 | `initialize()` takes config by parameter; no real-config read on the identity path | unit | `cargo test -p baude-core --lib workspace::tests::initialize_uses_injected_config` | ❌ Wave 0 |
 | TISO-03 | `baude-core`'s own test binary panics on an unguarded real resolution | unit | `cargo test -p baude-core --lib testing::tests::unguarded_resolution_panics` (`#[should_panic]`) | ❌ Wave 0 |
-| TISO-03 | `baude`'s test binary has the gate compiled in | unit | `cargo test -p baude --lib app::tests::test_support_gate_is_active` | ❌ Wave 0 — proves Finding 1's fix |
-| TISO-03 | `bauded`'s test binary has the gate compiled in | unit | `cargo test -p bauded --lib manager::tests::test_support_gate_is_active` | ❌ Wave 0 |
+| TISO-03 | `baude`'s test binary has the gate compiled in | unit | `cargo test -p baude --bins app::tests::test_support_gate_is_active` | ❌ Wave 0 — proves Finding 1's fix |
+| TISO-03 | `bauded`'s test binary has the gate compiled in | unit | `cargo test -p bauded --bins manager::tests::test_support_gate_is_active` | ❌ Wave 0 |
 | TISO-03 | The guard covers all five paths | unit | `cargo test -p baude-core --lib testing::tests::guard_covers_every_path` | ❌ Wave 0 |
-| TISO-03 | The dogfood child still passes under the guard | integration | `cargo test -p baude --lib local_tui_dogfood_real_git_flow_survives_restart_without_duplicates` | ✅ exists (`app.rs:7641`) — must keep passing |
+| TISO-03 | The dogfood child still passes under the guard | integration | `cargo test -p baude --bins local_tui_dogfood_real_git_flow_survives_restart_without_duplicates` | ✅ exists (`app.rs:7641`) — must keep passing |
 | TISO-04 | Shape-matching candidate that state references is classified `Live` | unit | `cargo test -p baude-core --lib worktree_scan::tests::state_reference_blocks_removal` | ❌ Wave 0 |
 | TISO-04 | Missing gitdir alone yields `Indeterminate`, never `Removable` | unit | `cargo test -p baude-core --lib worktree_scan::tests::missing_gitdir_never_authorizes` | ❌ Wave 0 — the literal TISO-04 wording |
 | TISO-04 | Unreadable state file blocks every candidate in that workspace | unit | `cargo test -p baude-core --lib worktree_scan::tests::unreadable_state_blocks` | ❌ Wave 0 |
 | TISO-04 | A symlink candidate is refused | unit | `cargo test -p baude-core --lib worktree_scan::tests::symlink_candidate_refused` | ❌ Wave 0 |
-| TISO-04 | `scan` without `--prune --yes` removes nothing | integration | `cargo test -p baude --lib main::tests::scan_is_read_only` | ❌ Wave 0 |
+| TISO-04 | `scan` without `--prune --yes` removes nothing | integration | `cargo test -p baude --bins main::tests::scan_is_read_only` | ❌ Wave 0 |
 | TISO-04 | `--prune` re-verifies evidence at removal time | unit | `cargo test -p baude-core --lib worktree_scan::tests::prune_reverifies` | ❌ Wave 0 |
 
 ### Sampling Rate
 
-- **Per task commit:** `cargo test -p <crate> --lib` for the crate touched, plus `cargo fmt --check`.
-- **Per wave merge:** `cargo test -- --test-threads=1` (matches CI) plus
-  `cargo clippy --all-targets -- -D warnings`.
-- **Phase gate:** full suite green on both `macos-14` and `ubuntu-22.04`, plus a manual run of
-  `baude worktrees scan` against the real 1433-directory dataset with output reviewed and nothing deleted.
+- **Per task:** use the exact named contained filter in the revised PLAN, plus formatting.
+- **Before the isolation boundary:** no full crate/binary/workspace test runs. 08-03 runs
+  owner-only filters without App/PTY construction; 08-08 first runs the synthetic App/UI
+  and PTY regressions. 08-06 task 2 in wave 4 is the first broad run after all owners and
+  worker/subprocess containment complete.
+- **Integration after isolation and at phase end:** full serial suite, full downstream
+  binaries with default concurrency, external root observer, clippy and release build.
+  These take minutes; see 08-VALIDATION.md for realistic latency and fail directions.
+- **Manual acceptance:** read-only real-tree preview after implementation; historical
+  deletion remains outside phase execution. No tests or real-root observation ran during
+  the 2026-09-14 planning revision.
 
 ### Wave 0 Gaps
 
@@ -1272,7 +1309,13 @@ No framework install is needed — libtest and `tokio` are already present.
 
 ## Open Questions
 
-1. **Does this phase also fix the production empty-parent leak (§Finding 6)?**
+All four planning questions below are RESOLVED by existing plan dispositions. The separate
+ownership-predicate gate in 08-04 and prune-semantics gate in 08-05 remain genuine pending
+human decisions; these resolution markers do not approve either gate.
+
+1. **RESOLVED — Does this phase also fix the production empty-parent leak (§Finding 6)?**
+   - Resolution: out of implementation scope; 08-04 task 3 and 08-05 Deferred record the
+     existing v2.2 follow-up. A zero-candidate scan is not an acceptance condition.
    - What we know: `create_dir_all(parent)` at `git.rs:1069` and `git.rs:1568` leaves an empty
      `repository-<key>` on any downstream failure; nothing removes it; two such directories appeared
      on 2026-09-13 *after* v2.1.4.
@@ -1284,7 +1327,9 @@ No framework install is needed — libtest and `tokio` are already present.
      directories, so it is inherently safe — the same reasoning already used at `git.rs:2322`).
      Raise it as a deviation rather than silently expanding scope.
 
-2. **Is `persistence_root_for_test` retired once the config redirect lands?**
+2. **RESOLVED — Is `persistence_root_for_test` retired once the config redirect lands?**
+   - Resolution: retain explicit persistence roots for failure injection, alongside the
+     ambient containment guard, as specified in 08-01 task 1 and 08-03 fixture migrations.
    - What we know: `App` carries `persistence_root_for_test: Option<PathBuf>` used at 20+ test sites
      (`app.rs:526, 769, 1202, 1572`, and 16 assignments in tests), and `Manager` has the analogous
      `persistence_target_for_test` (`manager.rs:99`).
@@ -1295,7 +1340,10 @@ No framework install is needed — libtest and `tokio` are already present.
      stays for failure injection. Say so explicitly in the plan so the two do not disagree
      (§Pitfall 7).
 
-3. **What does `scan` output look like, and does it need `--json`?**
+3. **RESOLVED — What does `scan` output look like, and does it need `--json`?**
+   - Resolution: 08-07 uses grouped counts with paths/evidence and --json. Its JSON is the
+     complete core ScanReport from 08-05, saved and inspected before --prune --report PATH
+     consumes it; a fresh destructive scan never substitutes for the inspected set.
    - What we know: 1433 candidates is too many for unstructured text; the repo already depends on
      `serde_json` in all three crates.
    - What's unclear: whether a human-readable summary (counts by workspace and verdict, with a
@@ -1303,7 +1351,9 @@ No framework install is needed — libtest and `tokio` are already present.
    - Recommendation: default to a grouped summary plus a `--json` flag for the eventual scripted
      deletion. This is the "exact CLI noun/verb naming" discretion item extended one notch.
 
-4. **Should the scanner live in `baude-core` or the `baude` binary?**
+4. **RESOLVED — Should the scanner live in `baude-core` or the `baude` binary?**
+   - Resolution: 08-04/08-05 own `baude-core::worktree_scan`; 08-07 adds the operator CLI
+     only to baude. The daemon gains no destructive operator command.
    - What we know: it needs `worktrees_base()` (private), `discover_repository`, and state loading —
      all core-internal. The CLI arm belongs in `baude/src/main.rs`.
    - What's unclear: whether `bauded` should also expose it.

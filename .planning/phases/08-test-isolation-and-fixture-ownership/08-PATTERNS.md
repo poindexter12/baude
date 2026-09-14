@@ -21,6 +21,9 @@ repo has no gitignored install mirror.
 | `baude/src/main.rs` (scan subcommand arm) | CLI route | request-response | `baude/src/main.rs:225-251` (`statusline`/`hook`/`permission-mcp` arms) | exact |
 | `bauded/src/push.rs` | store (VAPID + subscriptions) | file-I/O | `baude-core/src/persist.rs:840-852` (`config_base`/`config_dir`) | exact — it is a verbatim duplicate to delete |
 | `bauded/src/manager.rs` fixture helper | test fixture | — | `baude-core/src/git.rs:2706-2790` `GitFixture` (seq counter + Drop) | exact |
+| `baude/src/ui.rs` fixture ownership (revision 2) | test fixture | App constructor -> renderer | Returned owner pattern from 08-01 app/API fixtures; five direct App sites and six hierarchy_fixture callers | role-match |
+| `baude/src/usage.rs` (revision 2) | test worker boundary | App -> detached thread -> ccusage | Existing UsageCosts snapshot; test start becomes inert, production start unchanged | new compile-time test policy |
+| `baude-core/src/pty.rs` (revision 2) | subprocess environment boundary | shared spawn -> paused gate -> shell | Existing CommandBuilder::env wiring at 80-98 and registration gate at 145-155 | exact launch seam, additional test containment |
 | `baude-core/Cargo.toml` / `baude`/`bauded` `Cargo.toml` | config (feature wiring) | — | none in repo (`[features]` absent from all three manifests) | **no analog** |
 
 ## Pattern Assignments
@@ -122,7 +125,7 @@ Change both: `pub` + `#[cfg(any(test, feature = "test-support"))]` (RESEARCH §F
 
 **Analog:** same as `persist.rs` — `git.rs:1750`.
 
-**Current code** (`meta.rs:23-29`) — identical XDG→home→fallback shape, split the body into `real_claude_config_dir()`:
+**Current code** (`meta.rs:23-29`) — CLAUDE_CONFIG_DIR→home→fallback, not XDG; split the body into `real_claude_config_dir()`:
 ```rust
 /// The config dir the spawned claude processes will use (inherited env).
 pub fn claude_config_dir() -> PathBuf {
@@ -182,7 +185,11 @@ pub fn active() -> &'static Workspace { initialize(None) }
 `active()`'s signature is `-> &'static Workspace`, so the thread-local stores a
 `Box::leak`'d `&'static Workspace` in a `Cell` (Copy) — not the `RefCell<Option<PathBuf>>`
 of the path redirects. This is the one place the `git.rs` shape must be adapted
-rather than copied; the verified skeleton is in RESEARCH §Finding 3.
+rather than copied; the verified lifetime skeleton is in RESEARCH §Finding 3. The executable
+08-03 contract supersedes the lazy initializer shown as current code above: active() is a
+reader only, support builds require an override before cache lookup, and production
+startup calls initialize(&config, hint) explicitly. Neither identity function reads config.
+Test initialization updates a held fixture scope, never the production OnceLock.
 
 ---
 
@@ -225,7 +232,7 @@ with an alias; keep the qualification when adding functions to `git.rs`.
 **Reusable primitives (do not reimplement):**
 - `git::discover_repository(path: &Path) -> Result<RepositorySnapshot, RepositoryDiscoveryError>` (`git.rs:294`) — canonicalizes input first (`git.rs:297`).
 - `git::inspect_removal` (`git.rs:2499`), `remove_verified_worktree` (`git.rs:2660`) for `--prune`.
-- `persist::load_for_workspace_strict_at(root, base, ws, reconcile)` (`persist.rs:338-343`) — the state cross-reference source.
+- `persist::load_named_at(root, file)` (`persist.rs:1007`) — strict non-locking state reader, widened to pub(crate) in 08-04. The workspace-aware loader at :338 acquires a lock and must not be used by the read-only scanner. Inventory every state file independently, including legacy filenames.
 - `parse_worktree_porcelain` (`git.rs:211`) — currently private; needs `pub(crate)` or `pub` if the scanner calls it.
 
 **Symlink precedent** (`git.rs:2594`): classification uses `std::fs::symlink_metadata`, never `metadata`/`exists()`.
@@ -338,15 +345,17 @@ template; there is no in-repo precedent to copy.
 
 ### Real-root resolution chain
 **Source:** `persist.rs:840-846`, `git.rs:1760-1766`, `meta.rs:24-29`, `push.rs:27-33`
-**Apply to:** all four `real_*()` extractions — same three-step shape every time
-```rust
-std::env::var_os("<XDG_VAR>")
-    .map(PathBuf::from)
-    .or_else(|| dirs::home_dir().map(|h| h.join(/* … */)))
-    .unwrap_or_else(|| PathBuf::from(/* fallback */))
-    .join("baude")
-```
-Fallbacks differ deliberately: `"."` for config/claude, `"/tmp"` for the data dir. Preserve each verbatim.
+**Apply to:** real-root extractions and the external suite observer. Preserve each chain:
+
+| Root | Precedence |
+|------|------------|
+| Config/state/push | XDG_CONFIG_HOME → home/.config → `.`; append baude |
+| Claude | CLAUDE_CONFIG_DIR → home/.claude → `.`; no XDG lookup, no baude suffix |
+| Worktrees | XDG_DATA_HOME → home/.local/share → `/tmp`; append baude/worktrees |
+
+`var_os` treats an empty but present override as present. Unix `dirs::home_dir` uses a
+nonempty HOME, then passwd-home fallback. 08-06 self-tests these distinctions with synthetic
+child environments; a generic XDG chain would observe the wrong Claude root.
 
 ### Assertion messages state the fix, not just the fault
 **Source:** `git.rs:1753-1757`
@@ -367,6 +376,28 @@ was chosen over the obvious alternative; reviewers expect it.
 |------|------|-----------|--------|
 | `baude-core/Cargo.toml` `[features]` + dev-dependency wiring | config | — | No manifest in the workspace declares a feature today; use RESEARCH §Pattern 2 |
 | `worktree_scan::enumerate` (directory walk) | service | file-I/O | Greenfield — no code walks `~/.local/share/baude/worktrees`; only the *verdict* half has an analog (`inspect_removal`) |
+
+## Revision 2: Returned UI Owners and Worker Boundaries
+
+Source inspection found 39 test App::new calls in app.rs, five in ui.rs and one production
+call in main.rs. ui.rs's hierarchy_fixture returns (App, RepositoryKey) at 2224/2301;
+its guard owner must return with the App or be held by the caller. The other four direct
+sites are 2439, 2551, 2799 and 2874. UiFixture in 08-03 follows the existing pid-plus-sequence
+root and RAII restoration pattern; all six helper callers retain it through render/use.
+08-03 authors ui_fixture_isolation_ regressions and 08-08 runs them after worker isolation.
+
+App::new at 741 starts UsagePoller; usage.rs:33 launches a detached thread whose ccusage
+command at 76 inherits environment. There is no core resolver call to intercept. Use an
+inert cfg(test) start, not a dropped handle or an environment mutation. App's ambient remote
+selection at 722-727 also runs before callers assign remote=None; gate it before launch.
+
+The PTY reader thread does not resolve roots, but its child launcher at pty.rs:78-98 reads
+SHELL and starts -il before the fixture command. 08-08 adds a support-only cleared child
+map and explicit no-profile/no-rc test shell at this single shared launch seam, retaining
+the existing registration/teardown and production branch. portable-pty 0.8.1 exposes
+env_clear, env, env_remove and get_env; docs/source were checked in this revision, no
+package installation. Worker inventory and synthetic regression contracts live in 08-08.
+Thread-local guards remain the in-process rule, not a claim that subprocesses inherit them.
 
 ## Metadata
 
