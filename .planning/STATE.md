@@ -1,17 +1,17 @@
 ---
 gsd_state_version: "1.0"
 milestone: v2.2
-milestone_name: Phases
+milestone_name: Reliability and Terminal Usability
 current_phase: 8
 current_phase_name: Test Isolation and Fixture Ownership
-status: Awaiting roadmap approval
-stopped_at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
-last_updated: "2026-09-09T06:06:00.262Z"
-last_activity: 2026-09-08
-last_activity_desc: v2.2 roadmap drafted; approval pending
-state_head: 19c18be78362606af2c295b8d21c1727c28ecbee
+status: Ready to plan Phase 8
+stopped_at: v2.2 roadmap reconciled against shipped v2.1.2-v2.1.5 code; Phases 8 and 9 narrowed
+last_updated: "2026-09-14T00:20:00.000Z"
+last_activity: 2026-09-13
+last_activity_desc: Phases 8 and 9 re-scoped to verified remaining gaps
+state_head: 7ccb2bd74ac94b923aa9b92c032623cf19b88a72
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -25,14 +25,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** v2.2 roadmap approval, then Phase 8 test isolation before broad test execution
+**Current focus:** Phase 8 planning — config/identity isolation and leak preview, the gaps v2.1.4 did not close
 
 ## Current Position
 
-Phase: 8 (Test Isolation and Fixture Ownership)
+Phase: 8 (Test Isolation and Fixture Ownership, narrowed)
 Plan: Not started
-Status: Awaiting roadmap approval
-Last activity: 2026-09-08 — v2.2 roadmap drafted; approval pending
+Status: Ready to plan
+Last activity: 2026-09-13 — Phases 8 and 9 reconciled against shipped code
+
+Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
 ## Performance Metrics
 

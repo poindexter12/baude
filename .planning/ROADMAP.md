@@ -2,7 +2,9 @@
 
 ## Overview
 
-v2.2 Reliability and Terminal Usability continues after completed Phase 7. Establish isolated test fixtures first, then deliver safe hook and workspace-lock behavior, clickable HTTP(S) terminal links, negotiated multiline input, and validation through the existing v2.2.0 release workflow.
+v2.2 Reliability and Terminal Usability continues after completed Phase 7. Close the remaining test-isolation and hook-seeding gaps first, then deliver clickable HTTP(S) terminal links, negotiated multiline input, and validation through the existing v2.2.0 release workflow.
+
+**Re-scoped 2026-09-13.** Releases v2.1.2 through v2.1.5 shipped fixes for issues #70, #71, #72 and #78 before this milestone began executing. Every Phase 8 and Phase 9 requirement was re-verified against main at v2.1.5: six are delivered, four are partial, two were never started. Phases 8 and 9 are narrowed to the verified remainder. Phases 10 through 12 are unchanged.
 
 ## Milestones
 
@@ -39,8 +41,8 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 ## v2.2 Phases
 
-- [ ] **Phase 8: Test Isolation and Fixture Ownership**: Confine tests and cleanup to owned temporary roots.
-- [ ] **Phase 9: Hook Registration and Workspace Lock Diagnostics**: Reconcile owned hooks safely and report contention without takeover.
+- [ ] **Phase 8: Test Isolation and Fixture Ownership** (narrowed): Close the config, workspace-identity, escape-guard and leak-preview gaps left after v2.1.4.
+- [ ] **Phase 9: Hook Seeding Safety** (narrowed): Stop silently replacing unparseable settings and seed a shell-safe executable path.
 - [ ] **Phase 10: Clickable Terminal Links**: Expose safe link activation, destination preview, and copy using authoritative screen metadata.
 - [ ] **Phase 11: Negotiated Multiline Input**: Support Shift+Enter where capability is verified, with honest fallback elsewhere.
 - [ ] **Phase 12: Validation and v2.2.0 Release**: Complete regression, CI, terminal smoke, documentation, and release validation.
@@ -49,32 +51,33 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 ### Phase 8: Test Isolation and Fixture Ownership
 
-**Goal**: Developers can run repository and worktree tests concurrently without touching real user data or sharing fixture state.
+**Goal**: Running the suite cannot read or write the developer's real config, state, or `~/.claude`, and suspected historical leaks can be inspected before anyone deletes anything.
 **Depends on**: Nothing within v2.2. This phase precedes test-heavy milestone work.
-**Requirements**: TISO-01, TISO-02, TISO-03, TISO-04
+**Requirements**: TISO-01 (remainder), TISO-02 (remainder), TISO-03 (remainder), TISO-04
+
+**Already delivered (v2.1.4, PR #82)**: managed worktrees and repos are confined to per-label temp roots; `REQUIRE_WORKTREES_OVERRIDE` turns a managed-worktree escape into a failing assert; state persistence is redirectable; test redirects are thread-local and no test mutates the parent process HOME/XDG.
 
 **Success Criteria**:
-1. Every test-created repository, worktree, config, and state file is confined to a unique test-owned temporary root.
-2. Concurrent tests do not modify parent HOME/XDG environment or share cached workspace identity between fixtures.
-3. A tested creation path that escapes its fixture root fails while the real user data directory remains untouched.
-4. Suspected historical leaks can be previewed without deletion; removal requires separate approval and verified ownership, not a missing gitdir alone.
+1. Config resolution (`persist::config_dir`, `meta::claude_config_dir`) accepts a test redirect, and no test run reads or writes the real `~/.config/baude` or `~/.claude` — including `bauded` push-subscription and VAPID key storage.
+2. Workspace identity is resolvable per fixture rather than through a process-wide `OnceLock` seeded from the developer's real environment, so concurrent fixtures cannot share or race one identity.
+3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
+4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
 
 **Plans**: TBD
 
-### Phase 9: Hook Registration and Workspace Lock Diagnostics
+### Phase 9: Hook Seeding Safety
 
-**Goal**: Users retain their configuration and receive safe, actionable behavior when hooks or workspace locks require reconciliation.
-**Depends on**: Phase 8 for isolated regression coverage. Hook and lock contracts are otherwise independent.
-**Requirements**: HREG-01, HREG-02, HREG-03, HREG-04, WLOCK-01, WLOCK-02, WLOCK-03, WLOCK-04
+**Goal**: Seeding a project's hooks never destroys a user's existing settings and never emits a command string the shell will mis-execute.
+**Depends on**: Phase 8 for isolated regression coverage.
+**Requirements**: HREG-03, HREG-04 (remainder)
+
+**Already delivered (v2.1.2 PR #77, v2.1.3 PR #80, v2.1.5 PR #84)**: all four lifecycle events converge to one baude-owned registration regardless of install path (HREG-01); custom hooks, mixed groups, matcher groups, the bare fallback and unrelated keys survive reconciliation verbatim (HREG-02); and the full workspace-lock contract — refusal before session operations, no takeover, diagnostic pid with recovery guidance, and `try_lock` rather than file existence deciding contention (WLOCK-01 through WLOCK-04).
 
 **Success Criteria**:
-1. Opening or reopening from different baude/bauded executable paths converges each lifecycle event to one recognized owned registration using the current executable.
-2. Custom hooks, mixed groups, ambiguous registrations, unrelated settings, and malformed settings remain preserved, with an actionable warning when safe reconciliation is impossible.
-3. Executables whose paths contain spaces or shell metacharacters are invoked exactly and safely, without duplicate registration.
-4. A second instance reports explicit lock contention before session operations and cannot replace, remove, or interfere with the live owner's state or sessions.
-5. Diagnostics identify the affected workspace/path, include a reliably recorded PID only as advisory metadata, provide recovery guidance, distinguish invalid state, and allow reopening after OS lock release even if the lock file remains.
-
-**Plans**: TBD
+1. An existing `.claude/settings.local.json` or `.mcp.json` that cannot be read or parsed is left untouched rather than overwritten with baude's seed alone, and the user receives an actionable warning naming the file.
+2. The seeded hook command quotes or otherwise escapes the executable path, so an install path containing a space, `$`, `;`, or a backtick invokes exactly that executable. Verified 2026-09-13: hook commands are executed through a shell, so the current unquoted `format!("{} hook", ...)` is a live defect.
+3. The seed recognizer matches the quoted form, so quoting does not reintroduce the per-path accumulation that HREG-01 fixed.
+4. Regression tests cover a malformed settings file, a spaced install path end to end, and the two behaviors verified by inspection only in v2.1.3: reopening a workspace whose lock file remains after the OS lock released, and `bauded` encountering a held lock.
 
 ### Phase 10: Clickable Terminal Links
 
@@ -127,8 +130,8 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Test Isolation and Fixture Ownership | 0/TBD | Not started | - |
-| 9. Hook Registration and Workspace Lock Diagnostics | 0/TBD | Not started | - |
+| 8. Test Isolation and Fixture Ownership (narrowed) | 0/TBD | Not started | - |
+| 9. Hook Seeding Safety (narrowed) | 0/TBD | Not started | - |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
@@ -142,6 +145,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 - Historical leak cleanup is preview-only unless ownership and approval are separately verified; normal cleanup of newly created owned fixtures remains automatic.
 - No SIGKILL or power-loss restoration guarantee is claimed.
 - Release approval requires observed tests, CI, and terminal smoke evidence.
+- A closed GitHub issue does not retire a requirement. Phases 8 and 9 were narrowed only after each requirement was re-verified against code on main; see REQUIREMENTS.md for per-requirement evidence.
 - Proxy monitoring, extra URL schemes, forced lock takeover, full terminal-engine replacement, and PWA redesign remain out of scope.
 
 ## Backlog
@@ -153,4 +157,4 @@ See `.planning/BACKLOG.md`:
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
 
 ---
-*Last updated: 2026-09-08. v2.2 roadmap approval pending.*
+*Last updated: 2026-09-13. Phases 8 and 9 re-scoped against shipped v2.1.2-v2.1.5 code.*

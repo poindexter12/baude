@@ -2,33 +2,45 @@
 
 **Defined:** 2026-09-08
 **Target release:** v2.2.0
-**Baseline:** v2.1.0
+**Baseline:** v2.1.5 (re-baselined 2026-09-13; original baseline v2.1.0)
 **Core Value:** See which coding-agent session needs attention and act from the terminal or phone.
 
 ## v2.2 Requirements
 
 Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter. Target preview and copy-link actions were explicitly selected during requirements scoping. Proxy-monitor integration is deferred.
 
+**Reconciliation 2026-09-13.** Requirements were defined against v2.1.0. Releases v2.1.2 through v2.1.5 then shipped fixes for the same issues (#70, #71, #72, #78) ahead of milestone execution. Each requirement below was re-verified against code on main at v2.1.5; delivered ones are checked with their evidence, and the surviving gaps are what Phases 8 and 9 now cover. Issue closure did not by itself count as delivery — six of twelve requirements shipped, four are partial, and two were never started.
+
 ### Test Isolation (#72)
 
-- [ ] **TISO-01**: A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
-- [ ] **TISO-02**: A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
-- [ ] **TISO-03**: A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
-- [ ] **TISO-04**: A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
+- [ ] **TISO-01** (partial): A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
+  - Shipped v2.1.4: managed worktrees and repos are confined; state is redirectable (`git.rs:1744`, `app.rs:5551`, `app.rs:1202`).
+  - Gap: config has no test redirect (`persist.rs:840`, `meta.rs:24`), so `App::new` reads the real `~/.config/baude/config.json` (`app.rs:719`) and `bauded/src/push.rs` writes real VAPID keys.
+- [ ] **TISO-02** (partial): A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
+  - Shipped: no parent-process HOME/XDG mutation; both test redirects are thread-local (`git.rs:1727`, `hook.rs:80`).
+  - Gap: workspace identity is a process-wide `OnceLock` (`workspace.rs:199`) resolved from the developer's real environment and shared by every fixture, with no reset.
+- [ ] **TISO-03** (partial): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
+  - Shipped v2.1.4: `REQUIRE_WORKTREES_OVERRIDE` asserts on managed-worktree escape (`git.rs:1736`), with a containment test (`app.rs:5635`).
+  - Gap: the guard covers one path only; escapes into config, state (`app.rs:1581`) or `~/.claude` still pass silently, and the flag is armed per-binary by the first fixture, so `baude-core`'s own tests never arm it.
+- [ ] **TISO-04** (not started): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
+  - No enumeration, preview, or approval tooling exists. The 2026-09-13 cleanup of 661 stray directories was a manual shell operation with nothing checked in.
 
 ### Hook Registration (#70)
 
-- [ ] **HREG-01**: Opening or reopening sessions from different baude/bauded executable paths converges each of the four lifecycle events to one recognized baude-owned registration using the current executable.
-- [ ] **HREG-02**: A user's custom hooks, mixed groups, ambiguous registrations, and unrelated settings remain unchanged during owned-registration reconciliation.
-- [ ] **HREG-03**: A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
-- [ ] **HREG-04**: A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
+- [x] **HREG-01** (delivered v2.1.2): Opening or reopening sessions from different baude/bauded executable paths converges each of the four lifecycle events to one recognized baude-owned registration using the current executable.
+- [x] **HREG-02** (delivered v2.1.2): A user's custom hooks, mixed groups, ambiguous registrations, and unrelated settings remain unchanged during owned-registration reconciliation.
+- [ ] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
+  - `seed_settings` degrades an unparseable file to `json!({})` and overwrites it (`hook.rs:282-288`); every fs call is `let _ =` and no warning path exists. `backend/claude.rs:114-121` repeats the pattern for `.mcp.json`.
+- [ ] **HREG-04** (partial): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
+  - Shipped: recognition and pruning handle spaced paths (`hook.rs:123`).
+  - Gap: `baude_hook_command` interpolates the path unquoted (`hook.rs:86`). Verified 2026-09-13 that hook commands are executed through a shell, so a spaced path runs the wrong argv and a path bearing `$`, `;` or a backtick is worse. A quoting fix must ship with a recognizer that matches the quoted form.
 
 ### Workspace Lock Diagnostics (#71)
 
-- [ ] **WLOCK-01**: Starting a second instance for an already-owned workspace reports explicit lock contention before accepting session operations, rather than starting in a misleading degraded state.
-- [ ] **WLOCK-02**: A second instance cannot replace another owner's state, remove its lock, or interfere with its live sessions.
-- [ ] **WLOCK-03**: A user sees the affected workspace/state path, owner PID when reliably recorded, and a recovery action such as closing the other instance or selecting another workspace; PID metadata is diagnostic only.
-- [ ] **WLOCK-04**: A user can reopen the workspace after the OS lock is released even if its lock file remains, while malformed or unreadable state is still reported distinctly and preserved.
+- [x] **WLOCK-01** (delivered v2.1.3; TUI refuses before session operations (`main.rs:301-327`). `bauded` still learns of contention at first save rather than at startup): Starting a second instance for an already-owned workspace reports explicit lock contention before accepting session operations, rather than starting in a misleading degraded state.
+- [x] **WLOCK-02** (delivered v2.1.3; every write claims the lock before creating a temp (`persist.rs:624`) and no code removes a lock file): A second instance cannot replace another owner's state, remove its lock, or interfere with its live sessions.
+- [x] **WLOCK-03** (delivered v2.1.3; message names workspace, pid, lock path and recovery (`main.rs:311-326`), pid is diagnostic only): A user sees the affected workspace/state path, owner PID when reliably recorded, and a recovery action such as closing the other instance or selecting another workspace; PID metadata is diagnostic only.
+- [x] **WLOCK-04** (delivered v2.1.3; contention is decided by `try_lock` alone, never file existence (`persist.rs:579-594`). The reopen-with-leftover-lock-file sequence has no regression test): A user can reopen the workspace after the OS lock is released even if its lock file remains, while malformed or unreadable state is still reported distinctly and preserved.
 
 ### Clickable Terminal Links
 
@@ -83,22 +95,22 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 ## Traceability
 
-Each v2.2 requirement maps to exactly one proposed roadmap phase; roadmap approval is pending. Continue after archived Phase 7; do not reset numbering.
+Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived Phase 7; do not reset numbering. Status reflects verification against main at v2.1.5 on 2026-09-13, not issue closure.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TISO-01 | Phase 8 | Pending |
-| TISO-02 | Phase 8 | Pending |
-| TISO-03 | Phase 8 | Pending |
+| TISO-01 | Phase 8 | Partial — gap in Phase 8 |
+| TISO-02 | Phase 8 | Partial — gap in Phase 8 |
+| TISO-03 | Phase 8 | Partial — gap in Phase 8 |
 | TISO-04 | Phase 8 | Pending |
-| HREG-01 | Phase 9 | Pending |
-| HREG-02 | Phase 9 | Pending |
+| HREG-01 | Phase 9 | Delivered v2.1.2 |
+| HREG-02 | Phase 9 | Delivered v2.1.2 |
 | HREG-03 | Phase 9 | Pending |
-| HREG-04 | Phase 9 | Pending |
-| WLOCK-01 | Phase 9 | Pending |
-| WLOCK-02 | Phase 9 | Pending |
-| WLOCK-03 | Phase 9 | Pending |
-| WLOCK-04 | Phase 9 | Pending |
+| HREG-04 | Phase 9 | Partial — gap in Phase 9 |
+| WLOCK-01 | Phase 9 | Delivered v2.1.3 |
+| WLOCK-02 | Phase 9 | Delivered v2.1.3 |
+| WLOCK-03 | Phase 9 | Delivered v2.1.3 |
+| WLOCK-04 | Phase 9 | Delivered v2.1.3 |
 | LINK-01 | Phase 10 | Pending |
 | LINK-02 | Phase 10 | Pending |
 | LINK-03 | Phase 10 | Pending |
@@ -121,7 +133,10 @@ Each v2.2 requirement maps to exactly one proposed roadmap phase; roadmap approv
 - v2.2 requirements: 29 total
 - Mapped to phases: 29
 - Unmapped: 0
+- Delivered before execution: 6 (HREG-01, HREG-02, WLOCK-01 through WLOCK-04)
+- Partially delivered, remainder in scope: 4 (TISO-01, TISO-02, TISO-03, HREG-04)
+- Open: 23
 
 ---
 *Requirements defined: 2026-09-08*
-*Last updated: 2026-09-08 after full requirements approval*
+*Last updated: 2026-09-13 — re-baselined to v2.1.5 and reconciled against shipped code*
