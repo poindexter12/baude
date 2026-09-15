@@ -732,10 +732,19 @@ pub struct ScanRoots {
 
 /// One shaped directory found under the worktrees root, with the conclusion
 /// drawn about it.
+///
+/// The location is carried as path *components relative to the report's base*
+/// and never as an absolute path. A report is transported to, and re-read by, a
+/// separate process ([`prune_at`]); an absolute field in it would be a place for
+/// an edited report to name a directory outside the base the pruning process
+/// resolved for itself (T-08-25).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Candidate {
-    /// The candidate's path, resolved under the canonicalized base.
-    pub path: PathBuf,
+    /// Exactly `[workspace, "repository-<key>"]`. Validated on the way in to
+    /// prune: two components, no separator, no `.` or `..`, and agreeing with
+    /// `workspace` and `repository_key`.
+    pub relative: Vec<String>,
     /// The workspace segment it sits under.
     pub workspace: String,
     /// The `repository-<key>` key, parsed as a `u64`.
@@ -744,12 +753,46 @@ pub struct Candidate {
     pub verdict: Verdict,
 }
 
+impl Candidate {
+    /// Where this candidate lives under `base`.
+    ///
+    /// Private on purpose: composing an absolute path from report data is only
+    /// legitimate after the components have been validated, and [`prune_at`] is
+    /// the only caller that has done so.
+    // TEMPORARY, removed by this plan's implementation commit: `prune_at` is a
+    // stub that removes nothing and therefore resolves nothing.
+    #[allow(dead_code)]
+    fn resolve(&self, base: &Path) -> PathBuf {
+        self.relative
+            .iter()
+            .fold(base.to_path_buf(), |mut path, segment| {
+                path.push(segment);
+                path
+            })
+    }
+}
+
+/// The report format this build writes and the only one it reads.
+///
+/// Bumped when the meaning of any field changes. [`prune_at`] refuses anything
+/// else outright rather than interpreting fields it may not understand.
+pub const REPORT_FORMAT_VERSION: u32 = 1;
+
 /// The output of a scan. This is the tool's *only* output: nothing is created,
 /// modified or removed to produce it (D-16).
+///
+/// Serde-serializable in full, so plan 07 can hand the exact value a developer
+/// inspected to [`prune_at`] — including the complete evidence behind every
+/// verdict, not a display summary. Prune compares against it; it never trusts
+/// it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanReport {
-    /// The canonicalized base every candidate was resolved under.
-    pub base: PathBuf,
+    pub format_version: u32,
+    /// The normalized base every candidate is relative to, losslessly encoded.
+    pub worktrees_base: crate::repository::PersistedPath,
+    /// The normalized config directory the state inventory was read from.
+    pub config_dir: crate::repository::PersistedPath,
     pub candidates: Vec<Candidate>,
     /// The state files and workspaces the cross-reference actually consulted.
     /// A developer reading a preview can see the inventory the verdicts rest
@@ -808,7 +851,9 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             // against, which is the "checked" claim this module exists to keep
             // honest.
             return Ok(ScanReport {
-                base: roots.worktrees_base.clone(),
+                format_version: REPORT_FORMAT_VERSION,
+                worktrees_base: normalized(&roots.worktrees_base),
+                config_dir: normalized(&roots.config_dir),
                 candidates: Vec::new(),
                 state_inventory: StateInventorySummary::default(),
             });
@@ -831,7 +876,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     // present. Pass two adds state evidence, which cannot run first: the state
     // inventory's expected-filename set is the UNION of the workspaces seen here
     // with the ones discovered in the config directory.
-    let mut observed: Vec<(PathBuf, String, u64, Vec<Evidence>)> = Vec::new();
+    let mut observed: Vec<(PathBuf, String, String, u64, Vec<Evidence>)> = Vec::new();
     let mut workspaces = std::collections::BTreeSet::new();
     for workspace_entry in sorted_entries(&base).map_err(|error| ScanError::BaseUnreadable {
         path: base.clone(),
@@ -867,7 +912,13 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             let Some(evidence) = candidate_evidence(&base, &path) else {
                 continue;
             };
-            observed.push((path, workspace.clone(), repository_key, evidence));
+            observed.push((
+                path,
+                workspace.clone(),
+                name.to_string(),
+                repository_key,
+                evidence,
+            ));
         }
     }
 
@@ -879,7 +930,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
 
     let mut candidates: Vec<Candidate> = observed
         .into_iter()
-        .map(|(path, workspace, repository_key, mut evidence)| {
+        .map(|(path, workspace, name, repository_key, mut evidence)| {
             evidence.extend(state_evidence(
                 &inventory,
                 &workspace,
@@ -889,7 +940,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             evidence.extend(inventory.uncertainty.iter().cloned());
             sort_evidence(&mut evidence);
             Candidate {
-                path,
+                relative: vec![workspace.clone(), name],
                 workspace,
                 repository_key,
                 verdict: classify(evidence),
@@ -903,10 +954,24 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     });
 
     Ok(ScanReport {
-        base,
+        format_version: REPORT_FORMAT_VERSION,
+        worktrees_base: crate::repository::PersistedPath::from_path(&base),
+        config_dir: normalized(&roots.config_dir),
         candidates,
         state_inventory: inventory.summary,
     })
+}
+
+/// A root in the one form both a scan and a later prune will compute for it.
+///
+/// `canonicalize` is preferred, and [`resolve_prefix`] covers the root that does
+/// not exist yet — a config directory a fresh install has not written. The point
+/// is only that the two processes agree: prune compares the root it resolved
+/// independently against the one recorded in the report, and refuses on any
+/// difference, so a report cannot be replayed against a different tree (T-08-25).
+fn normalized(path: &Path) -> crate::repository::PersistedPath {
+    let resolved = resolve_prefix(path).unwrap_or_else(|| path.to_path_buf());
+    crate::repository::PersistedPath::from_path(&resolved)
 }
 
 /// Canonical evidence ordering, so a report round-trip and a prune-time
@@ -1065,6 +1130,168 @@ fn gitdir_holder(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Prune
+// ---------------------------------------------------------------------------
+
+/// A prune could not start at all. Nothing was examined and nothing removed.
+///
+/// Every variant is a property of the *report* or the *roots*, checked before
+/// any candidate is looked at, so a rejected report never reaches the
+/// filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PruneError {
+    /// A report written by a build whose field meanings this one does not know.
+    UnsupportedFormat { found: u32, expected: u32 },
+    /// The report was produced against roots other than the ones this process
+    /// resolved for itself. A report is not a place to name the tree to act on.
+    RootMismatch {
+        field: &'static str,
+        reported: PathBuf,
+        resolved: PathBuf,
+    },
+    /// The worktrees root could not be resolved, so nothing can be placed
+    /// under it.
+    BaseUnreadable { path: PathBuf, detail: String },
+    /// A candidate record whose components are not the strict two-segment
+    /// managed shape, or that disagrees with its own workspace or key.
+    MalformedCandidate {
+        relative: Vec<String>,
+        detail: String,
+    },
+    /// Two records naming the same directory. One of them is describing
+    /// something it did not observe.
+    DuplicateCandidate { relative: Vec<String> },
+}
+
+impl std::fmt::Display for PruneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFormat { found, expected } => write!(
+                f,
+                "report format version {found} is not the supported version {expected}"
+            ),
+            Self::RootMismatch {
+                field,
+                reported,
+                resolved,
+            } => write!(
+                f,
+                "the report's {field} ({}) is not the {field} this process resolved ({})",
+                reported.display(),
+                resolved.display()
+            ),
+            Self::BaseUnreadable { path, detail } => write!(
+                f,
+                "managed worktree root {} could not be read: {detail}",
+                path.display()
+            ),
+            Self::MalformedCandidate { relative, detail } => {
+                write!(f, "candidate record {relative:?} is malformed: {detail}")
+            }
+            Self::DuplicateCandidate { relative } => {
+                write!(f, "candidate record {relative:?} appears more than once")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PruneError {}
+
+/// Why one candidate was not removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RefusalReason {
+    /// Re-derivation no longer clears it. Carries the current verdict, so the
+    /// account names the blocker rather than merely reporting a refusal.
+    NotRemovableNow { verdict: Box<Verdict> },
+    /// Still cleared — but not by the facts the developer approved. The
+    /// approval was of a specific reported set, not of the predicate (D-15).
+    ProofChanged {
+        approved: Box<RemovalProof>,
+        rederived: Box<RemovalProof>,
+    },
+    /// Gone between the approved scan and this run. Nothing to remove, and the
+    /// account says so rather than silently reporting a success.
+    Vanished,
+    /// A symbolic link at the instant before the removal call. Refused without
+    /// resolving the target.
+    BecameSymlink,
+    /// Not a directory at the instant before the removal call.
+    NotADirectory,
+    /// A gitdir is present, so this is git's to remove and not this module's.
+    GitdirPresent { holder: PathBuf },
+    /// The bounded removal itself failed, or found something it refuses to
+    /// delete.
+    RemovalFailed { detail: String },
+}
+
+/// What happened to one candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PruneDisposition {
+    /// Named by the report, but not as `Removable`. Re-verified and reported;
+    /// never a removal target, even if it would qualify now.
+    NotApproved,
+    /// Found on disk during re-verification and absent from the approved
+    /// report. Reported so the account is complete, never removed.
+    Unapproved,
+    /// Re-verification agreed with the approved proof and confirmation was
+    /// withheld. This is the default path (D-16).
+    WouldRemove,
+    /// Re-verification agreed, confirmation was given, and the directory is
+    /// gone.
+    Removed,
+    Refused {
+        reason: RefusalReason,
+    },
+}
+
+/// The account of one candidate, kept for refusals as much as for removals
+/// (T-08-15).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneOutcome {
+    pub relative: Vec<String>,
+    pub workspace: String,
+    pub repository_key: u64,
+    pub disposition: PruneDisposition,
+}
+
+/// The complete account of one prune.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneReport {
+    /// Whether removal was authorized. `false` is the default path.
+    pub confirmed: bool,
+    /// One entry per candidate — approved, refused, or merely observed.
+    pub outcomes: Vec<PruneOutcome>,
+}
+
+/// Re-verify an approved report and, only with explicit confirmation, remove
+/// what still agrees with it.
+///
+/// `preview` is a report a developer already inspected. It is **comparison
+/// data, never authority** (D-15): every evidence item is re-derived here from
+/// scratch through the same collectors [`scan_at`] uses, and a candidate is
+/// removed only when the fresh verdict is [`Verdict::Removable`] *and* its fresh
+/// proof equals the approved one. A candidate that newly qualifies is refused
+/// exactly as firmly as one that stopped qualifying.
+///
+/// `confirmed` has no default. Called with `false` this runs the entire
+/// re-verification and removes nothing, which is both the project's
+/// preview-only constraint and a way to see the re-verification result before
+/// committing to it (T-08-18).
+pub fn prune_at(
+    roots: &ScanRoots,
+    preview: &ScanReport,
+    confirmed: bool,
+) -> Result<PruneReport, PruneError> {
+    let _ = (roots, preview);
+    // Plan 08-05 task 2 replaces this body. Until it does, prune accounts for
+    // nothing and — far more importantly — removes nothing.
+    Ok(PruneReport {
+        confirmed,
+        outcomes: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -1366,17 +1593,7 @@ mod tests {
         let mut names: Vec<String> = report
             .candidates
             .iter()
-            .map(|found| {
-                format!(
-                    "{}/{}",
-                    found.workspace,
-                    found
-                        .path
-                        .file_name()
-                        .expect("candidate has a final segment")
-                        .to_string_lossy()
-                )
-            })
+            .map(|found| found.relative.join("/"))
             .collect();
         names.sort();
         names
@@ -1386,7 +1603,7 @@ mod tests {
         report
             .candidates
             .iter()
-            .find(|found| found.workspace == workspace && found.path.ends_with(name))
+            .find(|found| found.relative == vec![workspace.to_string(), name.to_string()])
             .unwrap_or_else(|| panic!("candidate {workspace}/{name} missing from {report:?}"))
     }
 
@@ -1573,6 +1790,14 @@ mod tests {
         fn build(self) -> RepositoryState {
             self.state
         }
+    }
+
+    /// A repository recorded under `key`, with its real checkout outside the
+    /// managed base — the shape the developer's two surviving `claude`
+    /// repository records actually have.
+    fn external_repository(fixture: &ScanFixture, key: u64, name: &str) -> RepositoryState {
+        let main = fixture.external(name);
+        StateBuilder::new().repository(key, &main).build()
     }
 
     /// Enumeration and filesystem classification, always against a synthetic
@@ -1895,14 +2120,6 @@ mod tests {
 
         fn is_live(found: &Candidate) -> bool {
             matches!(found.verdict, Verdict::Live { .. })
-        }
-
-        /// A repository recorded in `workspace` under `key`, with its real
-        /// checkout outside the managed base — the shape the developer's two
-        /// surviving `claude` repository records actually have.
-        fn external_repository(fixture: &ScanFixture, key: u64, name: &str) -> RepositoryState {
-            let main = fixture.external(name);
-            StateBuilder::new().repository(key, &main).build()
         }
 
         // ---- repository-key ownership ------------------------------------
@@ -2488,6 +2705,566 @@ mod tests {
                 before,
                 "reading state must not take the lock or leave a temp file"
             );
+        }
+    }
+
+    /// The report contract and the prune path.
+    ///
+    /// This is the only code in the module that deletes anything, and every case
+    /// here acts on a temporary fixture root. Nothing resolves a real root; the
+    /// one production entry point ([`scan`]) is never called.
+    mod prune {
+        use super::*;
+
+        /// The shape every prune case starts from: one empty, shaped, unclaimed
+        /// directory and a readable state file, which together clear the
+        /// predicate.
+        fn approved(fixture: &ScanFixture, workspace: &str, name: &str) -> PathBuf {
+            let path = fixture.dir(workspace, name);
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            path
+        }
+
+        fn prune_ok(fixture: &ScanFixture, preview: &ScanReport, confirmed: bool) -> PruneReport {
+            prune_at(&fixture.roots(), preview, confirmed).expect("prune a synthetic fixture root")
+        }
+
+        fn disposition(report: &PruneReport, workspace: &str, name: &str) -> PruneDisposition {
+            report
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.relative == vec![workspace.to_string(), name.to_string()])
+                .unwrap_or_else(|| panic!("no outcome for {workspace}/{name} in {report:?}"))
+                .disposition
+                .clone()
+        }
+
+        /// Replace one candidate's record wholesale, standing in for a report
+        /// that was edited on its way between the inspecting process and this
+        /// one.
+        fn forge(report: &ScanReport, relative: Vec<&str>) -> ScanReport {
+            let mut forged = report.clone();
+            forged.candidates[0].relative = relative.into_iter().map(str::to_string).collect();
+            forged
+        }
+
+        // ---- the report contract -----------------------------------------
+
+        /// Plan 07 transports this value between two processes, so what the
+        /// core validates has to be exactly what the developer inspected —
+        /// evidence included, not a display summary.
+        #[test]
+        fn a_report_round_trips_through_json() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            fixture.dir("claude", "repository-2/primary-2");
+            let report = scan_ok(&fixture);
+
+            let json = serde_json::to_string(&report).expect("serialize a report");
+            let parsed: ScanReport = serde_json::from_str(&json).expect("parse a report");
+
+            assert_eq!(parsed, report, "the round-trip must be lossless");
+            assert_eq!(parsed.format_version, REPORT_FORMAT_VERSION);
+        }
+
+        /// No absolute path in a candidate record. An absolute field is a place
+        /// for an edited report to name a directory outside the base the
+        /// pruning process resolved for itself (T-08-25).
+        #[test]
+        fn candidate_records_are_relative_to_the_base() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+
+            let report = scan_ok(&fixture);
+
+            assert_eq!(
+                report.candidates[0].relative,
+                vec!["claude".to_string(), "repository-9".to_string()]
+            );
+            let json = serde_json::to_string(&report.candidates[0]).expect("serialize");
+            assert!(
+                !json.contains(&fixture.root.display().to_string()),
+                "a candidate record must not carry an absolute path: {json}"
+            );
+        }
+
+        // ---- everything checked before the filesystem is touched ----------
+
+        #[test]
+        fn an_unknown_format_version_is_refused() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let mut report = scan_ok(&fixture);
+            report.format_version = REPORT_FORMAT_VERSION + 1;
+
+            let error = prune_at(&fixture.roots(), &report, true).expect_err("must refuse");
+
+            assert!(
+                matches!(error, PruneError::UnsupportedFormat { .. }),
+                "{error:?}"
+            );
+        }
+
+        /// A report is not a place to name the tree to act on. The roots come
+        /// from the caller, and a report that disagrees with them is replaying
+        /// one tree's approval against another.
+        #[test]
+        fn a_report_bound_to_another_worktrees_base_is_refused() {
+            let approved_fixture = ScanFixture::new();
+            approved(&approved_fixture, "claude", "repository-9");
+            let report = scan_ok(&approved_fixture);
+
+            let other = ScanFixture::new();
+            approved(&other, "claude", "repository-9");
+            let before = tree_snapshot(&other.base());
+
+            let error = prune_at(&other.roots(), &report, true).expect_err("must refuse");
+
+            assert!(
+                matches!(error, PruneError::RootMismatch { .. }),
+                "{error:?}"
+            );
+            assert_eq!(tree_snapshot(&other.base()), before);
+        }
+
+        #[test]
+        fn a_report_bound_to_another_config_directory_is_refused() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let other = ScanFixture::new();
+            let roots = ScanRoots {
+                worktrees_base: fixture.base(),
+                config_dir: other.config(),
+            };
+
+            let error = prune_at(&roots, &report, true).expect_err("must refuse");
+
+            assert!(
+                matches!(error, PruneError::RootMismatch { .. }),
+                "{error:?}"
+            );
+        }
+
+        /// The strict shape is the containment proof. A record is exactly two
+        /// components, so no `..` and no embedded separator can compose a path
+        /// that leaves the base.
+        #[test]
+        fn a_candidate_record_that_escapes_the_base_is_refused() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+            let outside = fixture.root.join("outside");
+            std::fs::create_dir_all(&outside).expect("create a directory outside the base");
+
+            for forged in [
+                forge(&report, vec!["..", "outside"]),
+                forge(&report, vec!["claude", "../../outside"]),
+                forge(&report, vec!["claude/repository-9", "repository-9"]),
+                forge(&report, vec![".", "repository-9"]),
+            ] {
+                let error = prune_at(&fixture.roots(), &forged, true)
+                    .expect_err("an escaping record must refuse the whole prune");
+                assert!(
+                    matches!(error, PruneError::MalformedCandidate { .. }),
+                    "{error:?}"
+                );
+            }
+            assert!(outside.exists(), "nothing outside the base was touched");
+        }
+
+        #[test]
+        fn a_candidate_record_that_disagrees_with_itself_is_refused() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let mut wrong_key = report.clone();
+            wrong_key.candidates[0].repository_key = 4;
+            let mut wrong_workspace = report.clone();
+            wrong_workspace.candidates[0].workspace = "opencode".to_string();
+            let deep = forge(&report, vec!["claude", "repository-9", "primary-9"]);
+
+            for forged in [wrong_key, wrong_workspace, deep] {
+                let error = prune_at(&fixture.roots(), &forged, true).expect_err("must refuse");
+                assert!(
+                    matches!(error, PruneError::MalformedCandidate { .. }),
+                    "{error:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_duplicated_candidate_record_is_refused() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let mut report = scan_ok(&fixture);
+            let duplicate = report.candidates[0].clone();
+            report.candidates.push(duplicate);
+
+            let error = prune_at(&fixture.roots(), &report, true).expect_err("must refuse");
+
+            assert!(
+                matches!(error, PruneError::DuplicateCandidate { .. }),
+                "{error:?}"
+            );
+        }
+
+        // ---- the confirmation gate ---------------------------------------
+
+        /// The preview-only default (D-16, T-08-18). The full re-verification
+        /// runs; nothing is removed.
+        #[test]
+        fn prune_without_confirmation_removes_nothing() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+            assert!(matches!(
+                report.candidates[0].verdict,
+                Verdict::Removable { .. }
+            ));
+            let before = tree_snapshot(&fixture.base());
+
+            let pruned = prune_ok(&fixture, &report, false);
+
+            assert!(!pruned.confirmed);
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-9"),
+                PruneDisposition::WouldRemove
+            );
+            assert_eq!(
+                tree_snapshot(&fixture.base()),
+                before,
+                "the default path is a preview, byte for byte"
+            );
+        }
+
+        #[test]
+        fn prune_with_confirmation_removes_an_approved_candidate() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-9"),
+                PruneDisposition::Removed
+            );
+            assert!(!path.exists(), "the approved candidate is gone");
+            assert!(
+                fixture.base().join("claude").exists(),
+                "and nothing above it"
+            );
+        }
+
+        /// The removal walks the tree itself rather than calling
+        /// `remove_dir_all`, so it can refuse anything it did not expect. An
+        /// all-directories candidate is removed to its root.
+        #[test]
+        fn a_nested_empty_candidate_is_removed_completely() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9/primary-9/nested");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            let report = scan_ok(&fixture);
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-9"),
+                PruneDisposition::Removed
+            );
+            assert!(!fixture.base().join("claude").join("repository-9").exists());
+        }
+
+        // ---- re-derivation, and the proof comparison ---------------------
+
+        /// T-08-05. The approved report is comparison data; the facts are taken
+        /// again, and the refusal names the blocker it found.
+        #[test]
+        fn a_candidate_that_acquired_a_blocker_is_refused_and_names_it() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            std::fs::write(path.join("work.txt"), b"real work\n").expect("write after the scan");
+            let pruned = prune_ok(&fixture, &report, true);
+
+            let PruneDisposition::Refused {
+                reason: RefusalReason::NotRemovableNow { verdict },
+            } = disposition(&pruned, "claude", "repository-9")
+            else {
+                panic!("expected a named refusal: {pruned:?}");
+            };
+            let Verdict::Live { evidence } = *verdict else {
+                panic!("a populated candidate is live");
+            };
+            assert!(
+                evidence
+                    .iter()
+                    .any(|signal| matches!(signal, Evidence::ContainsCheckout { .. })),
+                "the refusal must name the blocker: {evidence:?}"
+            );
+            assert!(path.exists());
+        }
+
+        /// A forged verdict grants nothing: authorization comes from the
+        /// re-derivation, and the report only has to agree with it (D-15).
+        #[test]
+        fn a_forged_removable_verdict_is_defeated_by_re_derivation() {
+            let fixture = ScanFixture::new();
+            let path = fixture.dir("claude", "repository-9");
+            std::fs::write(path.join("work.txt"), b"real work\n").expect("write fixture file");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            let mut report = scan_ok(&fixture);
+            report.candidates[0].verdict = Verdict::Removable {
+                proof: RemovalProof {
+                    workspaces_checked: vec!["claude".to_string()],
+                    clearing: ClearingSignal::Empty,
+                    observed: vec![Evidence::ShapeMatch, Evidence::Empty],
+                },
+            };
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert!(
+                matches!(
+                    disposition(&pruned, "claude", "repository-9"),
+                    PruneDisposition::Refused { .. }
+                ),
+                "{pruned:?}"
+            );
+            assert!(path.join("work.txt").exists());
+        }
+
+        /// The developer approved a specific reported set, not a predicate. A
+        /// candidate that still clears, but by different facts, is refused.
+        #[test]
+        fn a_candidate_whose_proof_changed_is_refused() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            // A second workspace appears, so the inventory the proof names is
+            // no longer the inventory that was approved.
+            fixture.workspace("opencode");
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert!(
+                matches!(
+                    disposition(&pruned, "claude", "repository-9"),
+                    PruneDisposition::Refused {
+                        reason: RefusalReason::ProofChanged { .. }
+                    }
+                ),
+                "{pruned:?}"
+            );
+            assert!(path.exists());
+        }
+
+        /// Decision C's other half: newly qualifying is refused just as firmly
+        /// as newly disqualifying. Nothing enters the removal set that the
+        /// developer did not see.
+        #[test]
+        fn a_candidate_that_newly_qualifies_is_not_removed() {
+            let fixture = ScanFixture::new();
+            let path = fixture.dir("claude", "repository-7");
+            fixture.write_state(
+                "state-claude.json",
+                external_repository(&fixture, 7, "repo-a"),
+            );
+            let report = scan_ok(&fixture);
+            assert!(matches!(report.candidates[0].verdict, Verdict::Live { .. }));
+
+            // The record goes away, so the candidate would clear if it were
+            // judged fresh with no reference to the approved report.
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-7"),
+                PruneDisposition::NotApproved
+            );
+            assert!(path.exists(), "it was never in the approved set");
+        }
+
+        /// A candidate that appears between the approved scan and the prune is
+        /// accounted for and left alone.
+        #[test]
+        fn a_candidate_found_only_at_prune_time_is_reported_and_not_removed() {
+            let fixture = ScanFixture::new();
+            approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let newcomer = fixture.dir("claude", "repository-11");
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-11"),
+                PruneDisposition::Unapproved
+            );
+            assert!(newcomer.exists());
+        }
+
+        #[test]
+        fn a_candidate_that_vanished_is_reported_rather_than_claimed_removed() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            std::fs::remove_dir(&path).expect("remove the candidate before pruning");
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-9"),
+                PruneDisposition::Refused {
+                    reason: RefusalReason::Vanished
+                }
+            );
+        }
+
+        /// T-08-04. Classifying on a target's properties while the removal acts
+        /// on the link is how a deletion escapes the base entirely.
+        #[cfg(unix)]
+        #[test]
+        fn a_candidate_replaced_by_a_symlink_is_refused() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let target = fixture.root.join("precious");
+            std::fs::create_dir_all(target.join("inside")).expect("create the link target");
+            std::fs::remove_dir(&path).expect("remove the candidate");
+            std::os::unix::fs::symlink(&target, &path).expect("swap in a symlink");
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert!(
+                matches!(
+                    disposition(&pruned, "claude", "repository-9"),
+                    PruneDisposition::Refused { .. }
+                ),
+                "{pruned:?}"
+            );
+            assert!(
+                target.join("inside").exists(),
+                "the link target must be untouched"
+            );
+            assert!(std::fs::symlink_metadata(&path)
+                .expect("the link itself survives")
+                .file_type()
+                .is_symlink());
+        }
+
+        /// A gitdir appearing between scan and prune must never be removed by
+        /// this module: a checkout belongs to git's own verified-removal path.
+        #[test]
+        fn a_candidate_that_gained_a_gitdir_is_never_removed() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            let checkout = path.join("primary-9");
+            std::fs::create_dir_all(&checkout).expect("create a checkout dir");
+            std::fs::write(checkout.join(".git"), b"gitdir: /nonexistent/x/.git\n")
+                .expect("write a gitdir file");
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert!(
+                matches!(
+                    disposition(&pruned, "claude", "repository-9"),
+                    PruneDisposition::Refused { .. }
+                ),
+                "{pruned:?}"
+            );
+            assert!(checkout.join(".git").exists());
+        }
+
+        // ---- the account -------------------------------------------------
+
+        /// T-08-15. A prune that printed only its successes would leave a
+        /// developer unable to tell a refusal from a directory that was never
+        /// considered.
+        #[test]
+        fn every_candidate_appears_in_the_account() {
+            let fixture = ScanFixture::new();
+            let removable = approved(&fixture, "claude", "repository-9");
+            let blocked = fixture.dir("claude", "repository-2");
+            std::fs::write(blocked.join("work.txt"), b"real work\n").expect("write file");
+            fixture.dir("opencode", "repository-3");
+            let report = scan_ok(&fixture);
+            assert_eq!(report.candidates.len(), 3);
+
+            let pruned = prune_ok(&fixture, &report, false);
+
+            let mut seen: Vec<String> = pruned
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.relative.join("/"))
+                .collect();
+            seen.sort();
+            assert_eq!(
+                seen,
+                vec![
+                    "claude/repository-2".to_string(),
+                    "claude/repository-9".to_string(),
+                    "opencode/repository-3".to_string(),
+                ]
+            );
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-2"),
+                PruneDisposition::NotApproved
+            );
+            assert!(removable.exists(), "a preview removes nothing");
+        }
+
+        /// Only the approved set. A directory that is removable on its own
+        /// merits but missing from the report is reported, not removed.
+        #[test]
+        fn prune_removes_only_what_the_report_approved() {
+            let fixture = ScanFixture::new();
+            let approved_path = approved(&fixture, "claude", "repository-9");
+            let unapproved = fixture.dir("claude", "repository-11");
+            let mut report = scan_ok(&fixture);
+            assert_eq!(report.candidates.len(), 2);
+            report.candidates.retain(|found| found.repository_key == 9);
+
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-9"),
+                PruneDisposition::Removed
+            );
+            assert_eq!(
+                disposition(&pruned, "claude", "repository-11"),
+                PruneDisposition::Unapproved
+            );
+            assert!(!approved_path.exists());
+            assert!(unapproved.exists());
+        }
+
+        /// An incomplete inventory clears nothing, so a prune run while state is
+        /// unreadable removes nothing either — the same fail-closed rule the
+        /// scan applies, re-applied at removal time rather than inherited.
+        #[test]
+        fn an_inventory_that_became_incomplete_refuses_every_removal() {
+            let fixture = ScanFixture::new();
+            let path = approved(&fixture, "claude", "repository-9");
+            let report = scan_ok(&fixture);
+
+            fixture.write_raw("state-claude.json", b"{ not json");
+            let pruned = prune_ok(&fixture, &report, true);
+
+            assert!(
+                matches!(
+                    disposition(&pruned, "claude", "repository-9"),
+                    PruneDisposition::Refused { .. }
+                ),
+                "{pruned:?}"
+            );
+            assert!(path.exists());
         }
     }
 }
