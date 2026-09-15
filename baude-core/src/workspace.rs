@@ -196,6 +196,15 @@ pub fn resolve_with_hint(
     }
 }
 
+/// The production identity cache, written exactly once by production
+/// [`initialize`] at start-up.
+///
+/// Support builds never write it and never read it: a cached `Workspace`
+/// carries no fixture provenance, so "someone already initialized it" must not
+/// count as "this fixture owns it" (D-08). It is dead in a support build that
+/// is not `baude-core`'s own harness — `baude-core`'s tests seed it directly to
+/// prove a populated cache STILL cannot be observed without an override.
+#[cfg_attr(all(not(test), feature = "test-support"), allow(dead_code))]
 static ACTIVE: OnceLock<Workspace> = OnceLock::new();
 
 /// Substring every override-free identity panic carries, so a
@@ -261,6 +270,9 @@ pub fn override_for_test(config: &Config, hint: Option<&str>) -> crate::testing:
 /// (before `ensure_daemon` or any `active()` reader) so the hint participates;
 /// every other binary and subcommand never passes a hint and resolves exactly
 /// as before.
+///
+/// Reads NO configuration of its own — see the parameter above.
+#[cfg(not(any(test, feature = "test-support")))]
 pub fn initialize(config: &Config, hint: Option<&str>) -> &'static Workspace {
     ACTIVE.get_or_init(|| {
         resolve_with_hint(
@@ -273,11 +285,52 @@ pub fn initialize(config: &Config, hint: Option<&str>) -> &'static Workspace {
     })
 }
 
+/// Support-build [`initialize`]: resolves the supplied literal into the
+/// CURRENT FIXTURE'S identity scope and nothing else.
+///
+/// Distinct storage from production on purpose (D-05, D-08). It never writes
+/// `ACTIVE`, so re-initializing one fixture cannot reach another one running
+/// concurrently, and it never arms an override of its own — the enclosing
+/// [`override_for_test`] guard must already be held, and that guard is what
+/// restores the previous identity on drop. It reads no configuration: the
+/// literal and hint are the whole input (D-06).
+#[cfg(any(test, feature = "test-support"))]
+pub fn initialize(config: &Config, hint: Option<&str>) -> &'static Workspace {
+    let resolved = leak_identity(config, hint);
+    crate::testing::replace_workspace_override(resolved);
+    resolved
+}
+
 /// The active workspace for this process: resolved once from
 /// `BAUDE_WORKSPACE`/`BAUDE_BACKEND`/config and cached (the poll loop reads
 /// it every tick via [`backend::active`]).
+///
+/// READER ONLY. It resolves nothing, loads no config, and seeds no identity:
+/// a missing production identity is a start-up bug to fix at the entry point,
+/// never something to paper over with a lazy config read here (D-06, D-07).
+#[cfg(not(any(test, feature = "test-support")))]
 pub fn active() -> &'static Workspace {
-    initialize(&crate::persist::load_config(), None)
+    ACTIVE.get().expect(
+        "workspace::initialize(&config, hint) must run at start-up before any workspace::active() \
+         reader — this binary reached identity resolution without initializing it",
+    )
+}
+
+/// Support-build [`active`]: the fixture's own identity, or an abort.
+///
+/// The escape assertion runs BEFORE any cache lookup, because containment is
+/// not provenance: a workspace pinned by whichever fixture ran first is still
+/// the wrong identity for this one, and the filesystem paths it composes would
+/// all be correct-looking and shared (D-08, T-08-24).
+#[cfg(any(test, feature = "test-support"))]
+pub fn active() -> &'static Workspace {
+    crate::testing::workspace_override().unwrap_or_else(|| {
+        panic!(
+            "{IDENTITY_ESCAPE_PANIC_MARKER} during a test; hold a fixture identity \
+             (`baude_core::workspace::override_for_test(&literal_config, None)`) on this thread \
+             before anything reads the active workspace"
+        )
+    })
 }
 
 #[cfg(test)]

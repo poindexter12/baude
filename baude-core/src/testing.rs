@@ -167,9 +167,11 @@ impl Drop for TestRedirect {
 /// Requires a [`TestRedirect::with_workspace`] guard to be live on this thread:
 /// injected initialization must never implicitly arm an override or write the
 /// production cache.
-// Consumed by the workspace identity work in plan 03; declared now so that plan
-// does not have to edit this module (D-04).
-#[allow(dead_code)]
+///
+/// Consumed by support-build [`crate::workspace::initialize`], which resolves a
+/// literal config into the CURRENT fixture scope. Restoration stays with the
+/// already-held guard, so a re-initializing fixture still hands the enclosing
+/// identity back on drop.
 pub(crate) fn replace_workspace_override(workspace: &'static crate::workspace::Workspace) {
     REDIRECTS.with(|cell| {
         let mut redirects = cell.borrow_mut();
