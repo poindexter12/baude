@@ -58,31 +58,37 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Already delivered (v2.1.4, PR #82)**: managed worktrees and repos are confined to per-label temp roots; `REQUIRE_WORKTREES_OVERRIDE` turns a managed-worktree escape into a failing assert; state persistence is redirectable; test redirects are thread-local and no test mutates the parent process HOME/XDG.
 
 **Success Criteria**:
+
 1. Config resolution (`persist::config_dir`, `meta::claude_config_dir`) accepts a test redirect, and no test run reads or writes the real `~/.config/baude` or `~/.claude` — including `bauded` push-subscription and VAPID key storage.
 2. Workspace identity is resolvable per fixture rather than through a process-wide `OnceLock` seeded from the developer's real environment, so concurrent fixtures cannot share or race one identity.
 3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
 4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
 
-**Plans**: 8 plans
+**Plans**: 1/8 plans executed
 
 Plans:
 
 **Wave 1**
-- [ ] 08-01-PLAN.md — Tracer: cross-crate test-support gate, unified RAII redirect guard, complete setter migration (11-file scope warning remains)
+
+- [x] 08-01-PLAN.md — Tracer: cross-crate test-support gate, unified RAII redirect guard, complete setter migration (11-file scope warning remains)
 
 **Wave 2 (after 08-01)**
+
 - [ ] 08-02-PLAN.md — `~/.claude` redirect and `bauded` push/VAPID resolver dedup
 - [ ] 08-03-PLAN.md — Per-fixture identity, explicit initialization, retained app/API/UI guard owners; owner-only verification
 
 **Wave 3 (after identity/resolver prerequisites)**
+
 - [ ] 08-04-PLAN.md — Leak scan: evidence/verdict model and read-only enumeration (pending human decision)
 - [ ] 08-08-PLAN.md — Inert App workers, UI ownership regressions and contained PTY child environments
 
 **Wave 4**
+
 - [ ] 08-05-PLAN.md — Complete state inventory and report-bound re-verifying prune (after 08-04, pending human decision)
 - [ ] 08-06-PLAN.md — Shared `bauded` fixture helper and suite-level assertion (after 08-08; first broad-test boundary)
 
 **Wave 5 (after 08-05 and 08-06)**
+
 - [ ] 08-07-PLAN.md — `baude worktrees` CLI surface: grouped report, JSON preview input, two-flag prune
 
 ### Phase 9: Hook Seeding Safety
@@ -94,6 +100,7 @@ Plans:
 **Already delivered (v2.1.2 PR #77, v2.1.3 PR #80, v2.1.5 PR #84)**: all four lifecycle events converge to one baude-owned registration regardless of install path (HREG-01); custom hooks, mixed groups, matcher groups, the bare fallback and unrelated keys survive reconciliation verbatim (HREG-02); and the full workspace-lock contract — refusal before session operations, no takeover, diagnostic pid with recovery guidance, and `try_lock` rather than file existence deciding contention (WLOCK-01 through WLOCK-04).
 
 **Success Criteria**:
+
 1. An existing `.claude/settings.local.json` or `.mcp.json` that cannot be read or parsed is left untouched rather than overwritten with baude's seed alone, and the user receives an actionable warning naming the file.
 2. The seeded hook command quotes or otherwise escapes the executable path, so an install path containing a space, `$`, `;`, or a backtick invokes exactly that executable. Verified 2026-09-13: hook commands are executed through a shell, so the current unquoted `format!("{} hook", ...)` is a live defect.
 3. The seed recognizer matches the quoted form, so quoting does not reintroduce the per-path accumulation that HREG-01 fixed.
@@ -106,6 +113,7 @@ Plans:
 **Requirements**: LINK-01, LINK-02, LINK-03, LINK-04, LINK-05, LINK-06, LINK-07, LINK-08
 
 **Success Criteria**:
+
 1. Labeled OSC8 links open their actual HTTP(S) destination, and users can preview or copy the destination before opening.
 2. Bare HTTP(S) URLs, including soft-wrapped URLs, retain valid characters without surrounding prose punctuation.
 3. Link metadata remains attached to the correct cells through scrolling, scrollback, wrapping, resizing, overwrites, and erasure in local and attached remote terminals.
@@ -122,6 +130,7 @@ Plans:
 **Requirements**: TKEY-01, TKEY-02, TKEY-03, TKEY-04, TKEY-05
 
 **Success Criteria**:
+
 1. Shift+Enter inserts a newline without submitting Claude/claudex prompts on documented, tested terminal paths.
 2. Ordinary Enter, Ctrl-C, navigation keys, and existing baude shortcuts retain their behavior.
 3. Terminals that cannot distinguish Shift+Enter retain legacy behavior, with documented setup or fallback guidance.
@@ -137,6 +146,7 @@ Plans:
 **Requirements**: SHIP-01, SHIP-02, SHIP-03, SHIP-04
 
 **Success Criteria**:
+
 1. Focused and workspace regression tests, formatting, clippy, and supported-platform CI checks pass after test isolation is in place.
 2. Users can find documented activation/preview/copy gestures, tested terminal support, multiline setup/fallback, and lock recovery.
 3. Real macOS/Linux terminal smoke evidence covers links, selection, scrollback, mouse behavior, Shift+Enter, ordinary Enter, and restoration.
@@ -150,7 +160,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Test Isolation and Fixture Ownership (narrowed) | 0/TBD | Not started | - |
+| 8. Test Isolation and Fixture Ownership (narrowed) | 1/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 0/TBD | Not started | - |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |

@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: context exhaustion at 100% (2026-09-14)
-last_updated: "2026-09-14T16:43:49.390Z"
+stopped_at: Completed 08-01-PLAN.md
+last_updated: "2026-09-15T02:29:02.476Z"
 last_activity: 2026-09-14
-last_activity_desc: Phase 08 execution started
-state_head: 3c28f4276a883956de73b0b4da262d92544fc6e0
+last_activity_desc: Phase 08 execution resumed (wave continue)
+state_head: c52be5bd4d6a75b9037af319312cd85156b4d92a
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -30,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 1 of 7
-Status: Executing Phase 08
-Last activity: 2026-09-14 — Phase 08 execution started
+Plan: 2 of 7
+Status: Ready to execute
+Last activity: 2026-09-14 — Phase 08 execution resumed (wave continue)
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -70,6 +70,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 07 P04 | 16min | 2 tasks | 2 files |
 | Phase 07 P05 | 9min | 3 tasks | 7 files |
 | Phase 07 P06 | 12min | 2 tasks | 4 files |
+| Phase 08 P01 | 26min | 3 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -130,6 +131,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Artifact readiness copies only the supported target and two-binary archive shape, with read-only contents permission and no publication authority.
 - [Phase 07]: The beta is described only as a local source-readiness target; stable remote install guidance remains at v0.14.0.
 - [Phase 07]: Morning UAT evidence is created only from observed commands, screenshots, and certification outcomes; implementation creates no placeholder evidence file.
+- [Phase 08]: Phase 8 guard is gated on cfg(any(test, feature = "test-support")), not cfg(test): rustc --test sets `test` per crate, so a cfg(test)-only guard is absent from baude's and bauded's test binaries — the two that leaked (RESEARCH Deviation 1).
+- [Phase 08]: assert_contained is a containment predicate (did this resolve inside BAUDE_TEST_FIXTURE_ROOT?), not an override-presence check, so it needs no arming state and holds for the first test in a binary (D-09).
+- [Phase 08]: Test fixture helpers return owner structs (AdmissionRepo, FixtureRepo), never a bare TestRedirect or a path alone — a returned guard drops in the same statement and leaves the fixture unredirected while still compiling.
 
 ### Pending Todos
 
@@ -143,6 +147,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - Linux synchronized gate/release and descendant process-group extinction remain uncertified.
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
 - REL-03 and remaining Phase 7 requirement/phase completion remain blocked on morning dogfood, certification, review, verification, and approvals.
+- TISO-01 and TISO-03 remain PARTIAL after 08-01: requirements.mark-complete reports both not_found in REQUIREMENTS.md (entries carry a '(partial)' suffix) and neither is fully delivered until plans 02/03/06 migrate the remaining consumers. Do not check them off before plan 06.
 
 ## Deferred Items
 
@@ -159,8 +164,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-14T16:43:49.342Z
-Stopped at: context exhaustion at 100% (2026-09-14)
+Last session: 2026-09-15T02:28:26.912Z
+Stopped at: Completed 08-01-PLAN.md
 Resume file: None
 
 ## Deferred Items
