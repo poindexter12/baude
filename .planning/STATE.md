@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: Completed 08-05-PLAN.md
-last_updated: "2026-09-15T16:29:58.226Z"
+stopped_at: Completed 08-06-PLAN.md
+last_updated: "2026-09-15T17:36:09.743Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: 9b9c8ef063d2f053af05416c260fc1e8ea7c9565
+state_head: 5777f753b30f790b09570c1be651a13070ec8e86
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 6
+  completed_plans: 7
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 7 of 8
+Plan: 8 of 8
 Status: Ready to execute
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
@@ -76,6 +76,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P04 | 70min | 3 tasks | 4 files |
 | Phase 08 P08 | ~3h | 2 tasks | 4 files |
 | Phase 08 P05 | 39min | 3 tasks | 1 files |
+| Phase 08 P06 | 58min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -160,6 +161,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: 08-05: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
 - [Phase 08]: 08-05: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
 - [Phase 08]: 08-05 DEVIATION: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
+- [Phase 08]: 08-06: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
+- [Phase 08]: 08-06: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
+- [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
 
 ### Pending Todos
 
@@ -193,8 +197,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T16:29:58.204Z
-Stopped at: Completed 08-05-PLAN.md
+Last session: 2026-09-15T17:36:09.713Z
+Stopped at: Completed 08-06-PLAN.md
 Resume file: None
 
 ## Deferred Items

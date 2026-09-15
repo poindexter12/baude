@@ -13,15 +13,19 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 ### Test Isolation (#72)
 
-- [ ] **TISO-01** (partial): A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
+- [x] **TISO-01** (delivered plan 08-06): A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
   - Shipped v2.1.4: managed worktrees and repos are confined; state is redirectable (`git.rs:1744`, `app.rs:5551`, `app.rs:1202`).
-  - Gap: config has no test redirect (`persist.rs:840`, `meta.rs:24`), so `App::new` reads the real `~/.config/baude/config.json` (`app.rs:719`) and `bauded/src/push.rs` writes real VAPID keys.
-- [ ] **TISO-02** (partial): A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
+  - Closed by plan 08-01: `baude_core::testing::TestRedirect` redirects the config dir, state dir, managed worktrees root, hook command and Claude config dir in one guard; plan 08-02 redirected `bauded/src/push.rs`'s VAPID storage (regressions at `push.rs:390`, `:432`, `:479`).
+  - Closed by plan 08-06: `ManagerFixture` makes a `bauded` fixture one construction holding both guards as fields, and `scripts/assert-real-roots-untouched.sh` proves a full 497-test serial run creates or modifies none of the three real roots.
+- [x] **TISO-02** (delivered plan 08-06): A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
   - Shipped: no parent-process HOME/XDG mutation; both test redirects are thread-local (`git.rs:1727`, `hook.rs:80`).
-  - Gap: workspace identity is a process-wide `OnceLock` (`workspace.rs:199`) resolved from the developer's real environment and shared by every fixture, with no reset.
-- [ ] **TISO-03** (partial): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
+  - Closed by plan 08-03: `workspace::override_for_test(&Config, hint)` gives each fixture a literal identity in the same thread-local redirect storage, and `active()` panics in a support build with no override rather than falling back to the process cache.
+  - Closed by plan 08-06: both downstream binaries run UNSERIALIZED inside the observer's before/after bracket with no root change, so concurrency does not alter containment.
+- [x] **TISO-03** (delivered plan 08-06): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
   - Shipped v2.1.4: `REQUIRE_WORKTREES_OVERRIDE` asserts on managed-worktree escape (`git.rs:1736`), with a containment test (`app.rs:5635`).
-  - Gap: the guard covers one path only; escapes into config, state (`app.rs:1581`) or `~/.claude` still pass silently, and the flag is armed per-binary by the first fixture, so `baude-core`'s own tests never arm it.
+  - Closed by plan 08-01: `assert_contained` (`testing.rs:278`) covers the config, state, Claude and managed-worktrees resolutions, keys on `BAUDE_TEST_FIXTURE_ROOT` (independent of XDG, so it arms in every test binary — proven for both downstream binaries by `c52be5b`), and panics at resolution, so an escape performs no real-root I/O.
+  - Closed by plan 08-06: the guard demonstrably fired across the first broad run, catching 22 `manager`, 8 `api`, 5 `lifecycle` and 2 `app` escapes, all since owned; the suite-level observer asserts the aggregate claim the per-resolver guards only constrain.
+  - Residual (tracked, not part of this requirement): `App::open_editor` (`app.rs:5077`) and `copy_to_clipboard` (`app.rs:5442`) spawn subprocesses with the inherited environment rather than through the contained launcher. Neither is test-reachable; WINDOWS entry 6.
 - [ ] **TISO-04** (partial): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
   - Shipped plan 08-04: read-only enumeration and the `Evidence`/`Verdict` classification, with a missing gitdir explicitly unable to clear a candidate (`worktree_scan.rs`).
   - Shipped plan 08-05: state cross-referencing as ownership-negative evidence, and `prune_at(roots, report, confirmed)` — full re-derivation plus proof equality plus a non-defaulting confirmation parameter.
@@ -101,9 +105,9 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TISO-01 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-02 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-03 | Phase 8 | Partial — gap in Phase 8 |
+| TISO-01 | Phase 8 | Delivered plan 08-06 |
+| TISO-02 | Phase 8 | Delivered plan 08-06 |
+| TISO-03 | Phase 8 | Delivered plan 08-06 |
 | TISO-04 | Phase 8 | Partial — gap in Phase 8 |
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
@@ -136,9 +140,10 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 - Mapped to phases: 29
 - Unmapped: 0
 - Delivered before execution: 6 (HREG-01, HREG-02, WLOCK-01 through WLOCK-04)
-- Partially delivered, remainder in scope: 4 (TISO-01, TISO-02, TISO-03, HREG-04)
-- Open: 23
+- Delivered during execution: 3 (TISO-01, TISO-02, TISO-03 — plan 08-06)
+- Partially delivered, remainder in scope: 2 (TISO-04, HREG-04)
+- Open: 20
 
 ---
 *Requirements defined: 2026-09-08*
-*Last updated: 2026-09-13 — re-baselined to v2.1.5 and reconciled against shipped code*
+*Last updated: 2026-09-15 — TISO-01/02/03 closed by plan 08-06 (suite-level real-root assertion)*

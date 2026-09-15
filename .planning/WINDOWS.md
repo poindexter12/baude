@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 8
+open_count: 5
 waived_count: 0
-fixed_count: 0
+fixed_count: 3
 total_count: 8
-last_updated: 2026-09-15T16:31:46.217Z
+last_updated: 2026-09-15T17:34:26.610Z
 ---
 
 # Broken Windows Ledger
@@ -15,11 +15,11 @@ last_updated: 2026-09-15T16:31:46.217Z
 
 | id | phase | kind | file | line | description | status | reason | recorded_at | resolved_at |
 |----|-------|------|------|------|-------------|--------|--------|-------------|-------------|
-| 1 | 08 | unrun-verify | baude/src/ui.rs |  | ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are #[ignore]d until plan 08-08 contains the UsagePoller | open |  | 2026-09-15T14:49:18.515Z |  |
-| 2 | 08 | unmet-truth | baude-core/src/lifecycle.rs |  | five lifecycle::tests::* fixtures hold no TestRedirect and fail plan-01 containment; deferred to plan 08-06 | open |  | 2026-09-15T14:49:18.921Z |  |
+| 1 | 08 | unrun-verify | baude/src/ui.rs |  | ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are #[ignore]d until plan 08-08 contains the UsagePoller | fixed |  | 2026-09-15T14:49:18.515Z | 2026-09-15T17:34:25.822Z |
+| 2 | 08 | unmet-truth | baude-core/src/lifecycle.rs |  | five lifecycle::tests::* fixtures hold no TestRedirect and fail plan-01 containment; deferred to plan 08-06 | fixed |  | 2026-09-15T14:49:18.921Z | 2026-09-15T17:34:26.211Z |
 | 3 | 08 | deviation | baude-core/src/git.rs |  | 08-04: worktree_inventory extracted from discover_repository (Rule 3) — discover_repository cannot answer the disownment question, so GitDisownsIt would have been unreachable | open |  | 2026-09-15T15:13:58.758Z |  |
 | 4 | 08 | deviation | baude-core/src/git.rs |  | 08-04 v2.2 FOLLOW-UP: empty-parent worktree leak is a LIVE production defect in ensure_default_worktree and activate_branch_with_post_add_hook — nothing removes the repository-<key> parent on failure; 'zero candidates' must never be an exit criterion | open |  | 2026-09-15T15:13:59.247Z |  |
-| 5 | 08 | unrun-verify | .planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md |  | Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership | open |  | 2026-09-15T15:38:04.984Z |  |
+| 5 | 08 | unrun-verify | .planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md |  | Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership | fixed |  | 2026-09-15T15:38:04.984Z | 2026-09-15T17:34:26.610Z |
 | 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it | open |  | 2026-09-15T15:38:12.573Z |  |
 | 7 | 08 | deviation | baude-core/src/worktree_scan.rs |  | 08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path | open |  | 2026-09-15T16:31:45.745Z |  |
 | 8 | 08 | deviation | .planning/REQUIREMENTS.md |  | 08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises | open |  | 2026-09-15T16:31:46.217Z |  |
@@ -33,10 +33,10 @@ last_updated: 2026-09-15T16:31:46.217Z
     "file": "baude/src/ui.rs",
     "line": null,
     "description": "ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are #[ignore]d until plan 08-08 contains the UsagePoller",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-15T14:49:18.515Z",
-    "resolved_at": null,
+    "resolved_at": "2026-09-15T17:34:25.822Z",
     "milestone": "v2.2"
   },
   {
@@ -46,10 +46,10 @@ last_updated: 2026-09-15T16:31:46.217Z
     "file": "baude-core/src/lifecycle.rs",
     "line": null,
     "description": "five lifecycle::tests::* fixtures hold no TestRedirect and fail plan-01 containment; deferred to plan 08-06",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-15T14:49:18.921Z",
-    "resolved_at": null,
+    "resolved_at": "2026-09-15T17:34:26.211Z",
     "milestone": "v2.2"
   },
   {
@@ -85,10 +85,10 @@ last_updated: 2026-09-15T16:31:46.217Z
     "file": ".planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md",
     "line": null,
     "description": "Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-09-15T15:38:04.984Z",
-    "resolved_at": null,
+    "resolved_at": "2026-09-15T17:34:26.610Z",
     "milestone": "v2.2"
   },
   {
