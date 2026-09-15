@@ -3035,12 +3035,12 @@ mod tests {
 
     // ---- UI fixture ownership regressions -------------------------------
     //
-    // These two cases run an App and therefore a UsagePoller, which is not
-    // isolated until plan 08. They are authored and COMPILED here so the
-    // ownership contract is pinned alongside the migration it guards, and are
-    // executed by plan 08-08 task 1 once the workers are inert — remove the
-    // `#[ignore]` there. Neither name contains `fixture_identity_isolation`,
-    // so this plan's owner-only filter cannot select them.
+    // Authored `#[ignore]`d by plan 08-03 so the ownership contract was pinned
+    // alongside the migration it guards, and un-ignored by plan 08-08 task 1:
+    // both cases run an App, and an App's `UsagePoller` was not inert — and its
+    // remote selection not disabled — until that plan compiled those workers
+    // out of test builds. Running them before that would have read the
+    // developer's real Claude transcripts through `ccusage`.
 
     /// The guard must still be held AFTER the helper returned: the sentinel
     /// config the fixture wrote, the identity it resolved and the config path
@@ -3049,7 +3049,6 @@ mod tests {
     /// the instant it returned, and every assertion here would read the real
     /// machine while still rendering green.
     #[test]
-    #[ignore = "runs an App (and its UsagePoller); executed by plan 08-08 task 1"]
     fn ui_fixture_isolation_after_helper_return() {
         let fixture = UiFixture::with_config("after-return", "ui-after-return", Some(7));
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
@@ -3083,7 +3082,6 @@ mod tests {
     /// identity and config path — once the inner owner drops, including for a
     /// directly constructed App.
     #[test]
-    #[ignore = "runs an App (and its UsagePoller); executed by plan 08-08 task 1"]
     fn ui_fixture_isolation_nested_restore() {
         let outer = UiFixture::with_config("nested-outer", "ui-nested-outer", Some(7));
         let mut outer_app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
