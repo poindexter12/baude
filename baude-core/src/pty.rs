@@ -582,6 +582,51 @@ mod tests {
     /// [`worker_isolation_pty_child_environment`].
     const PTY_CHILD_ENV_CHILD: &str = "BAUDE_WORKER_ISOLATION_PTY_CHILD";
 
+    /// A synthetic root a single PTY test OWNS: created empty, redirected for
+    /// the duration, removed with the test.
+    ///
+    /// Every PTY test needs one now, because [`configure_test_child`] resolves
+    /// the child's roots through the guarded resolvers — an unredirected test
+    /// aborts instead of launching. That is the point: it also gives the child
+    /// a cwd the fixture owns, replacing the shared `/tmp` these tests used,
+    /// where two concurrent runs (or two runs of the same test) wrote over each
+    /// other.
+    ///
+    /// The name plus pid plus a per-process sequence is what keeps roots unique:
+    /// pid alone collides between two tests in one binary, and a name alone
+    /// collides between two binaries running at once.
+    struct PtyFixture {
+        root: PathBuf,
+        _redirect: crate::testing::TestRedirect,
+    }
+
+    impl PtyFixture {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::AtomicUsize;
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "baude-pty-{name}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let _redirect = crate::testing::TestRedirect::new(&root);
+            Self { root, _redirect }
+        }
+
+        /// The cwd handed to the child — inside the fixture, by construction.
+        fn cwd(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for PtyFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     /// A sentinel "startup file" that records the fact it was sourced or
     /// executed, and nothing else. Every one of these lives inside the
     /// synthetic ambient tree, so a sentinel that DOES run writes somewhere
@@ -877,10 +922,8 @@ mod tests {
 
     #[test]
     fn pre_exec_registration_gate_owner_death_and_release() {
-        let root =
-            std::env::temp_dir().join(format!("baude-registration-gate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = PtyFixture::new("registration-gate");
+        let root = fixture.cwd().to_path_buf();
         let marker = root.join("released");
         let command = format!(
             "trap '' HUP; printf released > {}; sleep 30",
@@ -910,19 +953,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(pty.process_identity(), &identity);
+        // Before the fixture drops: the child must be gone while its root, and
+        // the redirects that contained it, still exist.
         pty.kill_and_wait().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn subscribe_snapshot_then_live_bytes() {
-        let mut pty = Pty::spawn(
-            Some("echo before; cat; echo after"),
-            Path::new("/tmp"),
-            6,
-            60,
-        )
-        .unwrap();
+        let fixture = PtyFixture::new("subscribe");
+        let mut pty =
+            Pty::spawn(Some("echo before; cat; echo after"), fixture.cwd(), 6, 60).unwrap();
         // Let "before" land in the parser, then attach.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -963,7 +1003,8 @@ mod tests {
 
     #[test]
     fn kill_and_wait_confirms_child_exit() {
-        let mut pty = Pty::spawn(Some("sleep 30"), Path::new("/tmp"), 5, 40).unwrap();
+        let fixture = PtyFixture::new("kill-confirms");
+        let mut pty = Pty::spawn(Some("sleep 30"), fixture.cwd(), 5, 40).unwrap();
         assert!(!pty.is_exited());
         pty.kill_and_wait().unwrap();
         assert!(pty.is_exited());
@@ -971,7 +1012,8 @@ mod tests {
 
     #[test]
     fn kill_and_wait_accepts_and_retries_naturally_exited_child() {
-        let mut pty = Pty::spawn(Some("exit 0"), Path::new("/tmp"), 5, 40).unwrap();
+        let fixture = PtyFixture::new("kill-retries");
+        let mut pty = Pty::spawn(Some("exit 0"), fixture.cwd(), 5, 40).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !pty.is_exited() {
             assert!(std::time::Instant::now() < deadline, "child did not exit");
@@ -984,7 +1026,8 @@ mod tests {
     #[test]
     fn output_timestamp_goes_idle() {
         // The child speaks once (`echo hi`) then goes quiet for a long time.
-        let pty = Pty::spawn(Some("echo hi; sleep 30"), Path::new("/tmp"), 5, 40).unwrap();
+        let fixture = PtyFixture::new("idle");
+        let mut pty = Pty::spawn(Some("echo hi; sleep 30"), fixture.cwd(), 5, 40).unwrap();
         // Poll until the silence since the last output crosses the ~2s idle
         // threshold, rather than asserting a fixed sleep lines up with when the
         // reader thread happens to record the echo — that coupling made this
@@ -1009,5 +1052,8 @@ mod tests {
             !pty.is_exited(),
             "child should still be sleeping, not exited"
         );
+        // The 30s sleeper outlives the test otherwise, and would still be
+        // holding the fixture root as its cwd after the fixture removed it.
+        pty.kill_and_wait().unwrap();
     }
 }
