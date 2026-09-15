@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: Completed 08-02-PLAN.md
-last_updated: "2026-09-15T03:11:05.623Z"
-last_activity: 2026-09-14
+stopped_at: Completed 08-03-PLAN.md
+last_updated: "2026-09-15T14:50:34.909Z"
+last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: da538454451eb6f42fe1e6b9608bb5629281b876
+state_head: 5ca0ab04d278cde1bde4c9604b4f4dcbb38dcf4f
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -30,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 2 of 8
+Plan: 4 of 8
 Status: Ready to execute
-Last activity: 2026-09-14 — Phase 08 execution started
+Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -72,6 +72,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 07 P06 | 12min | 2 tasks | 4 files |
 | Phase 08 P01 | 26min | 3 tasks | 11 files |
 | Phase 08 P02 | 16min | 2 tasks | 2 files |
+| Phase 08 P03 | 45min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -138,6 +139,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: meta::claude_config_dir isolates by ambient redirect, not by parameter: both ClaudeMeta::poll call sites keep their signatures and neither gains an _at variant (D-03).
 - [Phase 08]: The three real-root resolvers (meta CLAUDE_CONFIG_DIR, persist XDG+baude, git XDG+/tmp tail) stay separate — same shape, different heads and tails; collapsing them would change production behavior.
 - [Phase 08]: bauded's duplicate config resolver was deleted rather than separately guarded; its chain was byte-identical to persist's, so production paths and the already-written VAPID key are unchanged (T-08-08 still accepted).
+- [Phase 08]: Phase 08 plan 03: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
+- [Phase 08]: Phase 08 plan 03: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
+- [Phase 08]: Phase 08 plan 03: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
+- [Phase 08]: Phase 08 plan 03: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
 
 ### Pending Todos
 
@@ -152,6 +157,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
 - REL-03 and remaining Phase 7 requirement/phase completion remain blocked on morning dogfood, certification, review, verification, and approvals.
 - TISO-01 and TISO-03 remain PARTIAL after 08-01: requirements.mark-complete reports both not_found in REQUIREMENTS.md (entries carry a '(partial)' suffix) and neither is fully delivered until plans 02/03/06 migrate the remaining consumers. Do not check them off before plan 06.
+- Five baude-core/src/lifecycle.rs tests fail plan-01 containment (no TestRedirect held); measured pre-existing at 08-03's RED commit f6a3b1c. lifecycle.rs is in no phase-08 plan's files_modified — deferred to 08-06, which cannot go green until they hold a root and a literal identity. See 08 deferred-items.md.
+- ui::tests::ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are committed #[ignore]d: they build an App whose UsagePoller is uncontained until 08-08. Plan 08-08 task 1 must remove the attribute and run them.
 
 ## Deferred Items
 
@@ -168,8 +175,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T03:11:05.577Z
-Stopped at: Completed 08-02-PLAN.md
+Last session: 2026-09-15T14:50:03.694Z
+Stopped at: Completed 08-03-PLAN.md
 Resume file: None
 
 ## Deferred Items
