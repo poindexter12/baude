@@ -272,9 +272,15 @@ fn main() -> Result<()> {
     // report is compared against them and is never a place to name the tree to
     // act on (T-08-25). No matching arm exists in `bauded` (T-08-17).
     if args.get(1).map(String::as_str) == Some("worktrees") {
+        // Both halves are the REAL resolvers, deliberately. The scanner's
+        // subject is the developer's actual tree, so pairing a real worktrees
+        // root with the redirect-aware `persist::config_dir()` would, in a
+        // support build, cross-reference a real candidate set against a fixture's
+        // state files — an inconsistency the release binary happens to hide
+        // because there the two resolvers coincide (#72, WR-01).
         let roots = baude_core::worktree_scan::ScanRoots {
             worktrees_base: baude_core::git::real_worktrees_base(),
-            config_dir: baude_core::persist::config_dir(),
+            config_dir: baude_core::persist::real_config_base(),
         };
         let mut out = std::io::stdout();
         let mut err = std::io::stderr();

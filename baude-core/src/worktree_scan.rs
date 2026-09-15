@@ -820,16 +820,12 @@ impl std::fmt::Display for ScanError {
 
 impl std::error::Error for ScanError {}
 
-/// Scan the developer's real managed-worktree root.
-///
-/// The production wrapper, and the only place a real root is resolved. Every
-/// test calls [`scan_at`] with synthetic roots instead.
-pub fn scan() -> Result<ScanReport, ScanError> {
-    scan_at(&ScanRoots {
-        worktrees_base: crate::git::real_worktrees_base(),
-        config_dir: crate::persist::config_dir(),
-    })
-}
+// There is deliberately no `scan()` convenience wrapper here. One existed, was
+// called by nothing, and paired `git::real_worktrees_base()` with the *guarded*
+// `persist::config_dir()` — so in a support build the two halves of one
+// `ScanRoots` named different trees. The CLI resolves both real roots itself
+// (T-08-25: the acting process resolves the tree it acts on), which is the only
+// caller there has ever been (#72, WR-01).
 
 /// Enumerate and classify candidates under an explicit worktrees root.
 ///

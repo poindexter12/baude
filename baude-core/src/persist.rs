@@ -848,7 +848,14 @@ pub struct SavedSession {
 /// fallback is `"."` here and `/tmp` in [`crate::git`]'s worktrees resolver —
 /// the four real-root resolvers in this crate share a shape but not their
 /// tails, so they must not be collapsed into one helper.
-fn real_config_base() -> PathBuf {
+///
+/// Public — and ungated — for the same reason [`crate::git::real_worktrees_base`]
+/// is: the leak scanner is production code whose whole job is the real tree, and
+/// it needs a real *config* root to pair with the real worktrees root. Pairing a
+/// real root with the guarded [`config_dir`] gives a support build one
+/// `ScanRoots` whose halves live in different universes (#72, WR-01). Nothing
+/// that allocates, writes, or removes may call this.
+pub fn real_config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
