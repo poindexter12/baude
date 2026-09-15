@@ -92,8 +92,19 @@ impl TestChildRoots {
         }
     }
 
-    /// Create only these directories. A child whose `HOME` does not exist falls
-    /// back to the passwd database inside `portable-pty`, which is the real one.
+    /// Create only these directories.
+    ///
+    /// A `HOME` that does not exist is not itself a containment failure:
+    /// `portable_pty`'s `CommandBuilder::get_home_dir` returns the builder's own
+    /// `HOME` whenever that key is *present* and consults the passwd database
+    /// only when it is unset, and [`configure_test_child`] always sets it. So
+    /// the child would get a `HOME` that merely does not resolve — no escape.
+    ///
+    /// It is still a broken fixture, and it aborts here for the same reason
+    /// every other guard in this phase does: the alternative is a confusing
+    /// child-side failure (a tool that cannot write its own config) several
+    /// layers away from the call that could not build the directory (#72,
+    /// WR-03).
     fn create(&self) {
         for dir in [
             &self.home,
@@ -103,7 +114,12 @@ impl TestChildRoots {
             &self.cache,
             &self.claude,
         ] {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir).unwrap_or_else(|error| {
+                panic!(
+                    "fixture child root {} could not be created: {error}",
+                    dir.display()
+                )
+            });
         }
     }
 }
