@@ -2146,6 +2146,90 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_LIFECYCLE_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    /// Owns one activation case's fixture root: the redirect that pins every
+    /// resolved config, state and managed-worktree path inside it, plus the
+    /// literal workspace identity resolved under that root.
+    ///
+    /// Activation composes its target through
+    /// `git::managed_branch_worktree_path`, which reads the data root and the
+    /// active workspace. Before this owner existed the five activation cases
+    /// resolved the developer's real `~/.local/share/baude/worktrees` and were
+    /// stopped by the plan-01 containment guard.
+    struct LifecycleFixture {
+        /// Struct fields drop in DECLARATION order — the inverse of locals — so
+        /// the identity is restored while the root redirect it was resolved
+        /// under is still installed. The 08-03 owner convention.
+        _identity: crate::testing::TestRedirect,
+        /// Held as a FIELD, never constructed and let go. An unbound guard arms
+        /// and disarms in the same statement, so the case would run entirely
+        /// unredirected while still compiling and still reading like an
+        /// isolated fixture at the call site.
+        _redirect: crate::testing::TestRedirect,
+        root: PathBuf,
+    }
+
+    impl LifecycleFixture {
+        #[must_use = "the returned LifecycleFixture owns this case's root and identity; bind it \
+                      to a named local declared before every path it contains"]
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_LIFECYCLE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "baude-lifecycle-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create unique lifecycle fixture root");
+            // Canonicalized because activation compares a composed managed path
+            // against the path Git reports for the same worktree. On macOS
+            // `temp_dir()` is `/var/...`, a symlink to `/private/var/...`, and
+            // Git reports the resolved form — so an uncanonicalized fixture root
+            // makes an exact path owner look like a different one. Real data
+            // roots have no such symlink, which is why this only surfaces under
+            // a temp-dir fixture.
+            let root = std::fs::canonicalize(&root).expect("canonicalize lifecycle fixture root");
+            // Acquisition order is root FIRST, identity SECOND, so the identity
+            // is resolved with this fixture's roots already installed.
+            let redirect = crate::testing::TestRedirect::new(&root);
+            let identity = crate::workspace::override_for_test(
+                &crate::persist::Config {
+                    workspace: Some(label.to_string()),
+                    ..crate::persist::Config::default()
+                },
+                None,
+            );
+            Self {
+                _identity: identity,
+                _redirect: redirect,
+                root,
+            }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// A created subdirectory of the fixture root for the scenario's own
+        /// repository tree. Deliberately a SIBLING of the redirect's `data/`
+        /// subtree, so managed worktrees are never allocated inside the
+        /// repository under test.
+        fn subdir(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(&path).expect("create lifecycle fixture subdirectory");
+            path
+        }
+    }
+
+    impl Drop for LifecycleFixture {
+        fn drop(&mut self) {
+            // Swallowed like `GitFixture::drop`: a cleanup failure must not mask
+            // the assertion failure that is the reason the case matters.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn lifecycle_capabilities_expose_only_dispatchable_reopen_and_recovery_actions() {
@@ -2416,12 +2500,10 @@ mod tests {
 
     #[test]
     fn post_verification_compensation_failure_records_typed_recovery_child() {
-        let root = std::env::temp_dir().join(format!(
-            "baude-lifecycle-post-verification-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        // Declared first so it drops last: the redirect must outlive every
+        // managed path this case composes, including the cleanup below.
+        let fixture = LifecycleFixture::new("post-verification");
+        let root = fixture.subdir("repo");
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -2489,7 +2571,6 @@ mod tests {
             .arg(&path)
             .current_dir(&root)
             .status();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2498,13 +2579,9 @@ mod tests {
         // worktree for the requested branch and durable state records that
         // exact path under a DIFFERENT, protected checkout, finalization must
         // refuse with OccupiedProtected and leave the occupant untouched.
-        let root = std::env::temp_dir().join(format!(
-            "baude-lifecycle-occupied-protected-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let fixture = LifecycleFixture::new("occupied-protected");
+        let root = fixture.root();
+        let repo = fixture.subdir("repo");
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -2612,7 +2689,6 @@ mod tests {
             .args(["worktree", "remove", "--force", "--", "../occupied"])
             .current_dir(&repo)
             .status();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2621,13 +2697,9 @@ mod tests {
         // pending activation whose branch lives at a preexisting owner path
         // must return Blocked — never merge into — an occupant carrying
         // protected recovery state, and must leave both records untouched.
-        let root = std::env::temp_dir().join(format!(
-            "baude-lifecycle-occupied-recovery-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let fixture = LifecycleFixture::new("occupied-recovery");
+        let root = fixture.root();
+        let repo = fixture.subdir("repo");
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -2739,17 +2811,12 @@ mod tests {
             .args(["worktree", "remove", "--force", "--", "../occupied"])
             .current_dir(&repo)
             .status();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn pending_activation_recovery_distinguishes_absent_and_exact_git_facts() {
-        let root = std::env::temp_dir().join(format!(
-            "baude-lifecycle-pending-recovery-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = LifecycleFixture::new("pending-recovery");
+        let root = fixture.subdir("repo");
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -2815,17 +2882,12 @@ mod tests {
             .arg(&exact.request.managed_path)
             .current_dir(&root)
             .status();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn blocked_activation_retry_round_trips_all_provenance() {
-        let root = std::env::temp_dir().join(format!(
-            "baude-lifecycle-activation-evidence-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let fixture = LifecycleFixture::new("activation-evidence");
+        let root = fixture.subdir("repo");
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -2951,7 +3013,6 @@ mod tests {
             .arg(&conflicting_owner)
             .current_dir(&root)
             .status();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
