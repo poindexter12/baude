@@ -4409,6 +4409,21 @@ mod tests {
 
             #[test]
             fn durable_keys_not_labels_supply_bounded_path_identity() {
+                // Root first, identity second: identity is restored before the
+                // root it was resolved under. This test only composes paths, so
+                // the root never needs to exist on disk.
+                let _root = crate::testing::TestRedirect::new(format!(
+                    "/nonexistent/baude-git-durable-keys-{}",
+                    std::process::id()
+                ));
+                let _identity = crate::workspace::override_for_test(
+                    &crate::persist::Config {
+                        workspace: Some("durable-keys".to_string()),
+                        ..crate::persist::Config::default()
+                    },
+                    None,
+                );
+
                 let slash = managed_branch_worktree_path(7, 11, "feature/a");
                 let dash = managed_branch_worktree_path(7, 12, "feature-a");
                 let other_repository = managed_branch_worktree_path(8, 11, "feature/a");
