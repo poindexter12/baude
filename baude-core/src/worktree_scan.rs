@@ -289,10 +289,6 @@ pub struct StateInventorySummary {
 /// One ownership claim extracted from a parsed state file.
 ///
 /// Both kinds are *exclusions from removal*. Neither authorizes anything.
-// TEMPORARY, removed by this plan's implementation commit: the vocabulary is
-// declared here so the failing tests below can name it, and nothing constructs
-// it until `state_inventory` stops being a stub.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StateReference {
     /// A `SavedRepository.key` or `SavedCheckout.repository_key` recorded in
@@ -318,7 +314,6 @@ enum StateReference {
 #[derive(Clone, Debug, Default)]
 struct StateInventory {
     summary: StateInventorySummary,
-    #[allow(dead_code)]
     references: Vec<StateReference>,
     /// Non-empty means the inventory is INCOMPLETE. Every item is attached to
     /// every candidate, so one unreadable file in one workspace withholds
@@ -328,13 +323,15 @@ struct StateInventory {
 
 /// The two state kinds. The TUI and the daemon keep separate files so they
 /// never clobber each other's sessions, and either can reference a candidate.
-#[allow(dead_code)]
+///
+/// Ordered longest-prefix-first so `daemon-state-<ws>.json` is attributed to
+/// `daemon-state` rather than being read as a `state` file with a mangled
+/// workspace segment.
 const STATE_BASES: [&str; 2] = ["daemon-state", "state"];
 
 /// A workspace name is filesystem- and URL-safe by construction
 /// (`workspace::sanitize`), so anything outside `[A-Za-z0-9_-]` in a filename
 /// segment is not a workspace and the file is not a state file we can attribute.
-#[allow(dead_code)]
 fn valid_workspace_segment(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -355,20 +352,371 @@ fn state_inventory(
     config_dir: &Path,
     worktree_workspaces: &std::collections::BTreeSet<String>,
 ) -> StateInventory {
-    let _ = (config_dir, worktree_workspaces);
-    // Plan 08-05 task 1 replaces this body. Until it does, the inventory is
-    // reported INCOMPLETE — the only stub value that cannot authorize a
-    // removal, since incompleteness withholds `NotReferencedByState` from every
-    // candidate in the scan.
-    StateInventory {
-        summary: StateInventorySummary::default(),
-        references: Vec::new(),
-        uncertainty: vec![Evidence::StateUnreadable {
-            source: config_dir.to_path_buf(),
+    let mut uncertainty: Vec<Evidence> = Vec::new();
+    let mut unattributable = |source: PathBuf, detail: String| {
+        uncertainty.push(Evidence::StateUnreadable {
+            source,
             workspace: ANY_WORKSPACE.to_string(),
-            detail: "the state cross-reference is not implemented".to_string(),
-        }],
+            detail,
+        });
+    };
+
+    // The default workspace is always consulted: it is the one whose state can
+    // exist under two different filenames, and the one a fresh install writes.
+    let mut workspaces = std::collections::BTreeSet::new();
+    workspaces.insert(crate::workspace::DEFAULT.to_string());
+
+    // Half one of the union: names discovered in the config directory. A
+    // workspace can hold records and own no directory under the base.
+    match sorted_entries(config_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let Some(name) = entry.to_str() else {
+                    unattributable(
+                        config_dir.join(&entry),
+                        "a config directory entry is not valid UTF-8, so it cannot be \
+                         compared against any derived state filename"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                match classify_config_entry(name) {
+                    ConfigEntry::Irrelevant => {}
+                    ConfigEntry::State { workspace } => {
+                        workspaces.insert(workspace);
+                    }
+                    ConfigEntry::Ambiguous => unattributable(
+                        config_dir.join(name),
+                        "a state-like entry under a name no derivation produces; its bytes \
+                         could name candidates and it was not read"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+        Err(error) => unattributable(
+            config_dir.to_path_buf(),
+            format!(
+                "the config directory could not be listed, so no absence below it is a \
+                 checked absence: {error}"
+            ),
+        ),
     }
+
+    // Half two: names observed under the worktrees base. A workspace can own a
+    // directory and have written no state yet, and deriving names from the
+    // config directory alone would turn "never written" into "never checked".
+    for name in worktree_workspaces {
+        if valid_workspace_segment(name) {
+            workspaces.insert(name.clone());
+        } else {
+            unattributable(
+                config_dir.to_path_buf(),
+                format!(
+                    "workspace directory {name:?} is not a name any state filename can be \
+                     derived for, so its records cannot be located"
+                ),
+            );
+        }
+    }
+
+    // Every derived filename is read on its own. There is deliberately no
+    // fallback from one to another: a readable `state-<ws>.json` says nothing
+    // about an unreadable `daemon-state-<ws>.json`, and treating it as though
+    // it did is how a daemon-recorded checkout becomes invisible (T-08-16).
+    let mut files_checked: Vec<String> = Vec::new();
+    let mut files_absent: Vec<String> = Vec::new();
+    let mut references: Vec<StateReference> = Vec::new();
+    for workspace in &workspaces {
+        let handle = crate::workspace::Workspace {
+            name: workspace.clone(),
+            // `backend_for` is a pure lookup. `workspace::active()` would read
+            // configuration — and panics outright in support builds after 08-03.
+            backend: crate::backend::backend_for(None),
+            daemon_url: None,
+            daemon_port: None,
+        };
+        for base in STATE_BASES {
+            let mut names = vec![handle.state_file(base)];
+            names.extend(handle.legacy_state_file(base));
+            for file in names {
+                files_checked.push(file.clone());
+                match crate::persist::load_named_at(config_dir, &file) {
+                    Ok(crate::persist::LoadOutcome::Missing) => files_absent.push(file),
+                    Ok(crate::persist::LoadOutcome::Legacy(loaded))
+                    | Ok(crate::persist::LoadOutcome::Current(loaded)) => collect_references(
+                        workspace,
+                        &loaded.state,
+                        &config_dir.join(&file),
+                        &mut references,
+                        &mut uncertainty,
+                    ),
+                    Err(error) => uncertainty.push(Evidence::StateUnreadable {
+                        source: config_dir.join(&file),
+                        workspace: workspace.clone(),
+                        detail: error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    files_checked.sort();
+    files_checked.dedup();
+    files_absent.sort();
+    files_absent.dedup();
+
+    StateInventory {
+        summary: StateInventorySummary {
+            workspaces_checked: workspaces.into_iter().collect(),
+            files_checked,
+            files_absent,
+            // One unresolved item anywhere makes the whole inventory
+            // incomplete, and an incomplete inventory clears nothing.
+            complete: uncertainty.is_empty(),
+        },
+        references,
+        uncertainty,
+    }
+}
+
+/// What one entry in the config directory is, for inventory purposes.
+enum ConfigEntry {
+    /// Not state and not state-like: it cannot hold records naming candidates.
+    Irrelevant,
+    /// Exactly a filename [`crate::workspace::Workspace`] derives, for this
+    /// workspace.
+    State { workspace: String },
+    /// State-like but attributable to no derived filename, so it is never read
+    /// and its contents are unknown. Uncertainty, not noise.
+    Ambiguous,
+}
+
+/// Classify a config-directory entry by name alone.
+///
+/// The bias is deliberate and one-directional: anything that *might* hold state
+/// records and is not a name this module reads becomes [`ConfigEntry::Ambiguous`],
+/// which withholds clearance from the entire scan. An interrupted atomic write
+/// leaves `.state-<ws>.json.tmp-<pid>-<n>` behind — six sit in the developer's
+/// real config directory today — and those bytes are state.
+fn classify_config_entry(name: &str) -> ConfigEntry {
+    // A lock is an advisory marker holding no records at all, and production
+    // holds one for as long as the TUI runs. Treating it as uncertainty would
+    // make this tool useless exactly when a developer reaches for it.
+    let hidden = name.starts_with('.');
+    if hidden && name.ends_with(".lock") {
+        return ConfigEntry::Irrelevant;
+    }
+    let stem = name.strip_prefix('.').unwrap_or(name);
+    let Some(base) = STATE_BASES.iter().find(|base| stem.starts_with(**base)) else {
+        return ConfigEntry::Irrelevant;
+    };
+    // A hidden entry is never a name `Workspace::state_file` produces, so even a
+    // perfectly-shaped `.state-claude.json` is something else — and something
+    // else holding state bytes is exactly the ambiguous case.
+    if hidden {
+        return ConfigEntry::Ambiguous;
+    }
+    let rest = &stem[base.len()..];
+    if rest == ".json" {
+        // The legacy un-suffixed form, which only the default workspace has.
+        return ConfigEntry::State {
+            workspace: crate::workspace::DEFAULT.to_string(),
+        };
+    }
+    match rest
+        .strip_prefix('-')
+        .and_then(|rest| rest.strip_suffix(".json"))
+    {
+        Some(segment) if valid_workspace_segment(segment) => ConfigEntry::State {
+            workspace: segment.to_string(),
+        },
+        // Includes names that merely begin with a state base — over-cautious by
+        // construction, and the over-caution costs a refused removal rather
+        // than an unrecoverable one.
+        _ => ConfigEntry::Ambiguous,
+    }
+}
+
+/// Extract every ownership claim one parsed state file makes.
+///
+/// Repository keys and paths are collected separately because they are matched
+/// differently: a key is workspace-scoped, a path is not.
+fn collect_references(
+    workspace: &str,
+    state: &crate::repository::RepositoryState,
+    source: &Path,
+    references: &mut Vec<StateReference>,
+    uncertainty: &mut Vec<Evidence>,
+) {
+    let mut claim = |repository_key: Option<u64>,
+                     persisted: &crate::repository::PersistedPath,
+                     references: &mut Vec<StateReference>| {
+        let path = persisted.to_path_buf();
+        if !path.is_absolute() {
+            // A relative recorded path cannot be placed against a canonicalized
+            // candidate without inventing the root it was relative to. Refuse
+            // to guess: this is uncertainty, not an absent claim.
+            uncertainty.push(Evidence::StateUnreadable {
+                source: source.to_path_buf(),
+                workspace: ANY_WORKSPACE.to_string(),
+                detail: format!(
+                    "a recorded path is not absolute and cannot be placed: {}",
+                    path.display()
+                ),
+            });
+            return;
+        }
+        references.push(StateReference::Path {
+            workspace: workspace.to_string(),
+            repository_key,
+            forms: reference_forms(&path),
+        });
+    };
+
+    for repository in &state.repositories {
+        let key = repository.key.get();
+        references.push(StateReference::RepositoryKey {
+            workspace: workspace.to_string(),
+            key,
+        });
+        claim(Some(key), &repository.observed_main_worktree, references);
+        claim(Some(key), &repository.observed_common_dir, references);
+    }
+    for checkout in &state.checkouts {
+        let key = checkout.repository_key.get();
+        references.push(StateReference::RepositoryKey {
+            workspace: workspace.to_string(),
+            key,
+        });
+        claim(Some(key), &checkout.observed_path, references);
+        claim(Some(key), &checkout.session.cwd, references);
+        claim(Some(key), &checkout.session.repo_root, references);
+    }
+    for standalone in &state.standalone_sessions {
+        // Standalone sessions carry no repository key, so the claim they make
+        // is purely positional.
+        claim(None, &standalone.canonical_path, references);
+    }
+}
+
+/// Every form a recorded path could take on this filesystem: the bytes as
+/// recorded, and the same path with its longest existing ancestor resolved.
+///
+/// Both are kept because either can be the one that matches. The candidate side
+/// is always canonical (the scan canonicalizes its base up front), but a
+/// process that never resolved its own root persisted the unresolved form — and
+/// on macOS the temporary and data roots both reach the tree through a symlink.
+fn reference_forms(path: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    if let Some(resolved) = resolve_prefix(path) {
+        if !forms.contains(&resolved) {
+            forms.push(resolved);
+        }
+    }
+    forms
+}
+
+/// How far up [`resolve_prefix`] will walk looking for an ancestor that exists.
+/// Deeper than any managed path, and bounded so a pathological recorded value
+/// cannot spin.
+const MAX_PREFIX_WALK: usize = 64;
+
+/// Canonicalize the longest existing ancestor of `path` and re-append the rest.
+///
+/// A recorded path whose leaf is gone — a checkout that was removed, the very
+/// case this tool exists for — still has to be placed: it may name a directory
+/// beneath a candidate that is still on disk, and a plain `canonicalize` of the
+/// whole path would fail and silently read as "no claim".
+fn resolve_prefix(path: &Path) -> Option<PathBuf> {
+    let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    for _ in 0..MAX_PREFIX_WALK {
+        if let Ok(resolved) = cursor.canonicalize() {
+            let mut out = resolved;
+            out.extend(remainder.iter().rev());
+            return Some(out);
+        }
+        remainder.push(cursor.file_name()?);
+        cursor = cursor.parent()?;
+    }
+    None
+}
+
+/// The state signals for one candidate.
+///
+/// Returns the matches when state claims the candidate, the single negative
+/// signal when a COMPLETE inventory claims nothing, and nothing at all when the
+/// inventory is incomplete — in that last case the uncertainty already attached
+/// to every candidate is the honest answer, and asserting non-reference on top
+/// of it would be the lie this module is built to prevent.
+fn state_evidence(
+    inventory: &StateInventory,
+    workspace: &str,
+    repository_key: u64,
+    path: &Path,
+) -> Vec<Evidence> {
+    let mut matches: Vec<Evidence> = Vec::new();
+    for reference in &inventory.references {
+        match reference {
+            StateReference::RepositoryKey {
+                workspace: recorded,
+                key,
+            } => {
+                // Keys are workspace-scoped, and the comparison is on the parsed
+                // `u64` rather than the directory name, so `repository-1` is
+                // never a prefix claim on `repository-10`.
+                if recorded == workspace && *key == repository_key {
+                    matches.push(Evidence::ReferencedByState {
+                        workspace: recorded.clone(),
+                        repository_key: Some(*key),
+                        matched: ReferenceMatch::Key,
+                    });
+                }
+            }
+            StateReference::Path {
+                workspace: recorded,
+                repository_key,
+                forms,
+            } => {
+                for form in forms {
+                    // `Path::starts_with` compares whole components, so
+                    // `repository-1` is not an ancestor of `repository-10`.
+                    let matched = if form == path {
+                        ReferenceMatch::ExactPath
+                    } else if form.starts_with(path) {
+                        ReferenceMatch::Descendant
+                    } else if path.starts_with(form) {
+                        ReferenceMatch::Ancestor
+                    } else {
+                        continue;
+                    };
+                    matches.push(Evidence::ReferencedByState {
+                        workspace: recorded.clone(),
+                        repository_key: *repository_key,
+                        matched,
+                    });
+                }
+            }
+        }
+    }
+
+    if !matches.is_empty() {
+        // One record commonly makes the same claim through several fields (a
+        // checkout's `observed_path` and its session `cwd` are the same
+        // directory), and both recorded forms of one path can match.
+        sort_evidence(&mut matches);
+        matches.dedup();
+        return matches;
+    }
+    if !inventory.summary.complete {
+        return Vec::new();
+    }
+    vec![Evidence::NotReferencedByState {
+        workspaces_checked: inventory.summary.workspaces_checked.clone(),
+        files_checked: inventory.summary.files_checked.clone(),
+        files_absent: inventory.summary.files_absent.clone(),
+    }]
 }
 
 /// The two roots a scan reads. Both are explicit so filesystem tests can pass
@@ -532,6 +880,12 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     let mut candidates: Vec<Candidate> = observed
         .into_iter()
         .map(|(path, workspace, repository_key, mut evidence)| {
+            evidence.extend(state_evidence(
+                &inventory,
+                &workspace,
+                repository_key,
+                &path,
+            ));
             evidence.extend(inventory.uncertainty.iter().cloned());
             sort_evidence(&mut evidence);
             Candidate {
