@@ -873,6 +873,52 @@ pub fn config_dir() -> PathBuf {
     config_base()
 }
 
+/// The real home directory, with no test redirect and no containment check.
+///
+/// Kept verbatim from the private `expand_tilde` helpers this replaced,
+/// terminal fallback included: `dirs::home_dir()` yields `None` only when
+/// neither `$HOME` nor a passwd entry supplies one, and `/` is what those
+/// helpers substituted.
+pub fn real_home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The home directory a leading `~` expands to, guarded exactly as
+/// [`config_dir`] is.
+///
+/// This exists because three copies of an unguarded `dirs::home_dir()` survived
+/// the fixture migration in `baude` and `bauded` — code `rustc --test` compiles
+/// verbatim into the two harnesses that produced the original leak (#72). The
+/// reachable touches were a tab-completion `read_dir`, a `POST /sessions`
+/// repository path, and the destination a real `git clone` is written into, so
+/// an unredirected resolution aborts here rather than reaching the developer's
+/// real home.
+pub fn home_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(home) = crate::testing::home_dir_override() {
+        return home;
+    }
+    let real = real_home_dir();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "home directory");
+    real
+}
+
+/// Expand a leading `~` through the guarded [`home_dir`].
+///
+/// One copy on purpose. `baude` and `bauded` each carried a byte-identical
+/// private version reading `dirs::home_dir()` directly, which is how the same
+/// escape survived in two crates at once.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else if s == "~" {
+        home_dir()
+    } else {
+        PathBuf::from(s)
+    }
+}
+
 /// User configuration, ~/.config/baude/config.json. All fields optional.
 #[derive(Deserialize, Default)]
 pub struct Config {

@@ -1214,17 +1214,23 @@ fn draw_term(
 }
 
 /// Shorten a path for display: home → `~`.
+///
+/// Display-only, and still routed through the guarded resolver: containment is
+/// a property of the compiled binary, so a render inside an unredirected test
+/// aborts rather than quietly reading the developer's real HOME.
 fn tilde_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
-    match dirs::home_dir() {
-        Some(h) => {
-            let h = h.display().to_string();
-            s.strip_prefix(&h)
-                .map(|rest| format!("~{rest}"))
-                .unwrap_or(s)
-        }
-        None => s,
+    let home = baude_core::persist::home_dir();
+    // `/` is the resolver's terminal fallback for "no home at all". Stripping
+    // it would abbreviate every absolute path to nonsense; the pre-guard code
+    // reached the same outcome by matching `dirs::home_dir()`'s `None`.
+    if home == std::path::Path::new("/") {
+        return s;
     }
+    let home = home.display().to_string();
+    s.strip_prefix(&home)
+        .map(|rest| format!("~{rest}"))
+        .unwrap_or(s)
 }
 
 /// Status bar: `hints │ ~/path ⎇ branch` with right-aligned session counts
@@ -2215,10 +2221,38 @@ mod tests {
 
     use crate::app::{App, Focus, Modal, SelId};
 
-    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines};
+    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines, tilde_path};
 
     fn persisted_path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
+    }
+
+    /// `tilde_path` runs on every sidebar row and every status-bar draw. It
+    /// reads a home rather than writing one, but the phase's invariant is that
+    /// containment is a property of the compiled binary — so the display path
+    /// aborts on an unredirected resolution like every other resolver.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_display_abbreviation_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = tilde_path(Path::new("/anywhere"));
+    }
+
+    /// And under a redirect it abbreviates against the FIXTURE's home, so the
+    /// guard is usable rather than merely a tripwire.
+    #[test]
+    fn a_redirected_abbreviation_uses_the_fixture_home() {
+        let root = std::path::PathBuf::from("/nonexistent/baude-ui-tilde");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        assert_eq!(
+            tilde_path(&root.join("home").join("Code").join("baude")),
+            "~/Code/baude"
+        );
+        assert_eq!(
+            tilde_path(Path::new("/elsewhere/baude")),
+            "/elsewhere/baude",
+            "a path outside the home is shown in full"
+        );
     }
 
     /// Owns everything a UI case needs to resolve paths and identity on its own

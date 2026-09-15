@@ -154,18 +154,6 @@ fn is_backslash(code: KeyCode) -> bool {
     matches!(code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(rest)
-    } else if s == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-    } else {
-        PathBuf::from(s)
-    }
-}
-
 /// Shell-style directory completion: complete the component after the last
 /// '/' against directories on disk. Returns the new buffer (if it advanced)
 /// and the candidate list when ambiguous. The typed prefix (incl. `~/`) is
@@ -178,7 +166,9 @@ fn complete_dir_path(input: &str) -> (Option<String>, Vec<String>) {
     let search = if dir_part.is_empty() {
         PathBuf::from(".")
     } else {
-        expand_tilde(dir_part)
+        // Guarded: this feeds a `read_dir`, so an unredirected `~` would list
+        // the developer's real home from inside this crate's test binary.
+        persist::expand_tilde(dir_part)
     };
     let Ok(entries) = std::fs::read_dir(&search) else {
         return (None, vec![]);
@@ -1416,9 +1406,17 @@ impl App {
             return String::new();
         };
         let key = context.folder_key();
-        let home = dirs::home_dir()
-            .map(|home| home.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // Guarded like every other home resolution in this crate. Display-only,
+        // but still compiled into the test binary, and `/` is the resolver's
+        // terminal "no home at all" fallback — abbreviating against it would
+        // rewrite every absolute path, which the pre-guard empty-string case
+        // already declined to do.
+        let home = persist::home_dir();
+        let home = if home == std::path::Path::new("/") {
+            String::new()
+        } else {
+            home.to_string_lossy().into_owned()
+        };
         let abbreviated = match key.strip_prefix(&home) {
             Some(rest) if !home.is_empty() => format!("~{rest}"),
             _ => key.to_string(),
@@ -4475,7 +4473,7 @@ impl App {
         }
         match kind {
             InputKind::NewSessionPath => {
-                let expanded = expand_tilde(&value);
+                let expanded = persist::expand_tilde(&value);
                 let expanded = expanded.canonicalize().unwrap_or(expanded);
                 if expanded.is_dir() {
                     self.open_repo_session(expanded);
@@ -4511,7 +4509,10 @@ impl App {
                 };
             }
             InputKind::CloneDest { url, name } => {
-                let dest = expand_tilde(&value);
+                // Guarded, and this is the call that mattered most: the buffer
+                // is prefilled from `clone_base_dir` (default `~/Code`) and a
+                // clear destination is handed to a real `git clone`.
+                let dest = persist::expand_tilde(&value);
                 // Already cloned there? Just open a session on it.
                 if dest.join(".git").exists() {
                     self.set_message(format!("{name} already cloned — opening session"));
@@ -5791,6 +5792,34 @@ mod tests {
     fn unguarded_resolution_panics() {
         let _no_root = baude_core::testing::NoFixtureRoot::new();
         let _escaped = persist::config_dir();
+    }
+
+    /// The `~` expansion behind tab completion and the clone destination.
+    /// Unguarded, the worst of those call sites wrote a real `git clone` into
+    /// the developer's `~/Code` — a root the CI bracket did not even observe.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_tilde_expansion_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = persist::expand_tilde("~/Code");
+    }
+
+    /// A redirected fixture expands `~` inside its own root, so the guarded
+    /// resolver is usable and not merely a tripwire.
+    #[test]
+    fn a_redirected_tilde_expands_inside_the_fixture() {
+        let root = std::path::PathBuf::from("/nonexistent/baude-app-tilde");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        assert_eq!(
+            persist::expand_tilde("~/Code"),
+            root.join("home").join("Code")
+        );
+        assert_eq!(persist::expand_tilde("~"), root.join("home"));
+        assert_eq!(
+            persist::expand_tilde("/absolute/path"),
+            std::path::PathBuf::from("/absolute/path"),
+            "a path without a leading tilde resolves nothing at all"
+        );
     }
 
     fn pid_is_live(pid: u32) -> bool {

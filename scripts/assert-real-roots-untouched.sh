@@ -6,11 +6,12 @@
 # The per-resolver guards in baude-core prove one resolution at a time cannot
 # escape a fixture. Nothing proved the aggregate claim the phase goal actually
 # makes: that *running the suite* neither creates nor modifies the real config
-# dir, the real Claude config dir, or the real managed-worktrees root. This
-# script is that statement, made from OUTSIDE the test process.
+# dir, the real Claude config dir, the real managed-worktrees root, or the
+# clone destination root a `git clone` would be written into. This script is
+# that statement, made from OUTSIDE the test process.
 #
 #   assert-real-roots-untouched.sh before      record a fingerprint of the
-#                                              three real roots
+#                                              four real roots
 #   assert-real-roots-untouched.sh after       recompute and fail if anything
 #                                              changed
 #   assert-real-roots-untouched.sh --self-test exercise the resolvers and the
@@ -20,9 +21,11 @@
 # `before` and `after` OBSERVE whatever roots resolve in the environment they
 # are given; they never write to them. To rehearse the bracket locally without
 # reading a developer's real account directories, run both the script and the
-# suite with XDG_CONFIG_HOME, XDG_DATA_HOME and CLAUDE_CONFIG_DIR pointed at a
-# throwaway fixture root — the same resolver precedence then lands entirely
-# inside the fixture. `--self-test` never observes a real root at all.
+# suite with HOME, XDG_CONFIG_HOME, XDG_DATA_HOME and CLAUDE_CONFIG_DIR pointed
+# at a throwaway fixture root — the same resolver precedence then lands entirely
+# inside the fixture, the clone root included (it is HOME-relative unless
+# `clone_base_dir` names an absolute path). `--self-test` never observes a real
+# root at all.
 #
 # Exit codes: 0 pass, 1 a root changed (or the snapshots cannot be compared),
 # 2 usage or internal error.
@@ -38,7 +41,7 @@ BAUDE_ASSERT_BASH="${BASH:-/bin/bash}"
 export BAUDE_ASSERT_SCRIPT BAUDE_ASSERT_BASH
 
 exec "${BAUDE_ASSERT_PYTHON:-python3}" - "$@" <<'PY'
-"""Fingerprint the three real baude roots and compare two fingerprints.
+"""Fingerprint the four real baude roots and compare two fingerprints.
 
 Everything here is Python 3 standard library: no package install, and lossless
 handling of non-UTF-8 path bytes (which a shell `ls | sort` pipeline cannot
@@ -58,16 +61,31 @@ import subprocess
 import sys
 import tempfile
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-# Ordered so diagnostics always read config -> claude -> worktrees.
-ROOT_NAMES = ("config", "claude", "worktrees")
+# Ordered so diagnostics always read config -> claude -> worktrees -> clone.
+ROOT_NAMES = ("config", "claude", "worktrees", "clone")
 
 ROOT_LABELS = {
     "config": "config and state root",
     "claude": "Claude config root",
     "worktrees": "managed worktrees root",
+    "clone": "clone destination root",
 }
+
+# How deep each root is walked. `None` is the whole subtree.
+#
+# The clone root is the exception, and it is bounded rather than omitted. It is
+# the developer's entire code tree -- a full walk would be unaffordable and its
+# fingerprint would churn on every unrelated build -- but the thing this root
+# exists to catch has a known shape: `baude` prefills its clone destination as
+# `<clone base>/<host>/<owner>/<repo>` and then runs a real `git clone` into it.
+# Three levels covers every directory such a clone CREATES; what changes inside
+# an already-present repository is somebody's editor, not this test suite.
+ROOT_DEPTH = {"clone": 3}
+
+# `Config::clone_base_dir`'s documented default, in `baude-core/src/persist.rs`.
+CLONE_BASE_DEFAULT = "~/Code"
 
 MAX_DIFF_LINES = 40
 
@@ -86,6 +104,9 @@ MAX_DIFF_LINES = 40
 #     not a bare $HOME expansion.
 #   * The Claude root never consults XDG_CONFIG_HOME and never appends
 #     "baude"; it is the one chain that does not share the config prefix.
+#   * The clone root is not an XDG chain at all: it is a CONFIGURED string
+#     (`clone_base_dir`, default "~/Code") expanded through
+#     `persist::expand_tilde`, which substitutes "/" when there is no home.
 # --------------------------------------------------------------------------
 
 
@@ -119,8 +140,23 @@ def home_dir(environ, passwd_home):
     return None
 
 
-def resolve_roots(environ, passwd_home):
-    """The three real roots, as the application would resolve them."""
+def expand_tilde(value, home):
+    """`persist::expand_tilde`: a leading `~` is the home, or "/" without one."""
+    fallback = home if home else "/"
+    if value.startswith("~/"):
+        return rust_join(fallback, value[2:])
+    if value == "~":
+        return fallback
+    return value
+
+
+def resolve_roots(environ, passwd_home, clone_base=None):
+    """The four real roots, as the application would resolve them.
+
+    `clone_base` is the configured `clone_base_dir`, or None for its default.
+    It is a PARAMETER rather than a read so this stays a pure function of its
+    inputs; `resolve_roots_from_disk` supplies the recorded value.
+    """
     home = home_dir(environ, passwd_home)
 
     config_base = environ.get("XDG_CONFIG_HOME")
@@ -141,7 +177,41 @@ def resolve_roots(environ, passwd_home):
         "config": rust_join(config_base, "baude"),
         "claude": claude,
         "worktrees": rust_join(data_base, "baude", "worktrees"),
+        "clone": expand_tilde(
+            clone_base if clone_base else CLONE_BASE_DEFAULT, home
+        ),
     }
+
+
+def read_clone_base(config_root):
+    """`clone_base_dir` from the real config.json, or None for the default.
+
+    Reading a file changes its atime and nothing else, and the fingerprint
+    records size and mtime only -- so consulting the config is not itself a
+    modification of the root being observed.
+    """
+    try:
+        with open(rust_join(config_root, "config.json"), "r", encoding="utf-8") as h:
+            parsed = json.load(h)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("clone_base_dir")
+    return value if isinstance(value, str) and value else None
+
+
+def resolve_roots_from_disk(environ, passwd_home):
+    """`resolve_roots`, with `clone_base_dir` taken from the real config.json.
+
+    Two passes, because the setting lives inside the config root this same
+    function resolves.
+    """
+    first = resolve_roots(environ, passwd_home)
+    configured = read_clone_base(first["config"])
+    if configured is None:
+        return first
+    return resolve_roots(environ, passwd_home, clone_base=configured)
 
 
 def real_passwd_home():
@@ -180,7 +250,7 @@ def entry_for(rel_bytes, st, root_bytes):
     return (rel_bytes, kind, st.st_size, st.st_mtime_ns, extra)
 
 
-def walk_root(root):
+def walk_root(root, max_depth=None):
     """Sorted (relpath, kind, size, mtime_ns, extra) tuples, or None if absent.
 
     Absence is a recorded STATE, not an error: CI runners legitimately have
@@ -189,6 +259,10 @@ def walk_root(root):
 
     Directories carry their own mtime, so a file that is created and deleted
     again inside the run still shows up as a change.
+
+    `max_depth` bounds the descent (see ROOT_DEPTH). Entries AT the bound are
+    still recorded -- only their contents are left unread -- so a directory
+    appearing at the bound is still a detected change.
     """
     if root == "":
         return None
@@ -204,9 +278,9 @@ def walk_root(root):
     if not stat.S_ISDIR(st.st_mode):
         return entries
 
-    pending = [b""]
+    pending = [(b"", 0)]
     while pending:
-        rel_dir = pending.pop()
+        rel_dir, depth = pending.pop()
         dir_bytes = os.path.join(root_bytes, rel_dir) if rel_dir else root_bytes
         try:
             names = os.listdir(dir_bytes)
@@ -232,8 +306,12 @@ def walk_root(root):
                 )
                 continue
             entries.append(entry_for(rel, child_st, root_bytes))
-            if stat.S_ISDIR(child_st.st_mode) and not stat.S_ISLNK(child_st.st_mode):
-                pending.append(rel)
+            if (
+                stat.S_ISDIR(child_st.st_mode)
+                and not stat.S_ISLNK(child_st.st_mode)
+                and (max_depth is None or depth + 1 < max_depth)
+            ):
+                pending.append((rel, depth + 1))
 
     entries.sort(key=lambda item: item[0])
     return entries
@@ -275,10 +353,10 @@ def encode_entries(entries):
 
 
 def snapshot(environ, passwd_home):
-    roots = resolve_roots(environ, passwd_home)
+    roots = resolve_roots_from_disk(environ, passwd_home)
     recorded = {}
     for name in ROOT_NAMES:
-        entries = walk_root(roots[name])
+        entries = walk_root(roots[name], ROOT_DEPTH.get(name))
         recorded[name] = {
             "path": roots[name],
             "exists": entries is not None,
@@ -421,7 +499,7 @@ def compare(before, after, out):
 
 
 def mode_before(environ, passwd_home, out):
-    roots = resolve_roots(environ, passwd_home)
+    roots = resolve_roots_from_disk(environ, passwd_home)
     path = snapshot_path(environ)
     if not assert_snapshot_is_outside_every_root(path, roots, out):
         return 2
@@ -468,7 +546,7 @@ def mode_after(environ, passwd_home, out):
     after = snapshot(environ, passwd_home)
     unchanged = compare(before, after, out)
     if unchanged:
-        out.write("PASS: the run left all three real roots untouched.\n")
+        out.write("PASS: the run left all four real roots untouched.\n")
         return 0
     out.write(
         "FAIL: the run touched a real root. Every effect a test has must land "
@@ -520,6 +598,7 @@ def resolver_table(test):
                 "config": "/x/config/baude",
                 "claude": "/x/claude",
                 "worktrees": "/x/data/baude/worktrees",
+                "clone": "/home/dev/Code",
             },
         ),
         (
@@ -530,6 +609,7 @@ def resolver_table(test):
                 "config": "/x/config/baude",
                 "claude": "/c",
                 "worktrees": "/home/dev/.local/share/baude/worktrees",
+                "clone": "/home/dev/Code",
             },
         ),
         (
@@ -540,16 +620,18 @@ def resolver_table(test):
                 "config": "/x/config/baude",
                 "claude": "/home/dev/.claude",
                 "worktrees": "/home/dev/.local/share/baude/worktrees",
+                "clone": "/home/dev/Code",
             },
         ),
         (
-            "HOME fallback for all three when no override is present",
+            "HOME fallback for every root when no override is present",
             {"HOME": "/home/dev"},
             "/pw/home",
             {
                 "config": "/home/dev/.config/baude",
                 "claude": "/home/dev/.claude",
                 "worktrees": "/home/dev/.local/share/baude/worktrees",
+                "clone": "/home/dev/Code",
             },
         ),
         (
@@ -561,7 +643,12 @@ def resolver_table(test):
                 "CLAUDE_CONFIG_DIR": "",
             },
             "/pw/home",
-            {"config": "baude", "claude": "", "worktrees": "baude/worktrees"},
+            {
+                "config": "baude",
+                "claude": "",
+                "worktrees": "baude/worktrees",
+                "clone": "/home/dev/Code",
+            },
         ),
         (
             "empty HOME falls through to the injected passwd home",
@@ -571,6 +658,7 @@ def resolver_table(test):
                 "config": "/pw/home/.config/baude",
                 "claude": "/pw/home/.claude",
                 "worktrees": "/pw/home/.local/share/baude/worktrees",
+                "clone": "/pw/home/Code",
             },
         ),
         (
@@ -581,13 +669,19 @@ def resolver_table(test):
                 "config": "/pw/home/.config/baude",
                 "claude": "/pw/home/.claude",
                 "worktrees": "/pw/home/.local/share/baude/worktrees",
+                "clone": "/pw/home/Code",
             },
         ),
         (
-            "no home at all lands on the terminal fallbacks . / . / /tmp",
+            "no home at all lands on the terminal fallbacks . / . / /tmp / /Code",
             {},
             None,
-            {"config": "./baude", "claude": ".", "worktrees": "/tmp/baude/worktrees"},
+            {
+                "config": "./baude",
+                "claude": ".",
+                "worktrees": "/tmp/baude/worktrees",
+                "clone": "/Code",
+            },
         ),
     ]
     for name, environ, passwd_home, expected in cases:
@@ -740,6 +834,65 @@ def comparison_table(test):
     )
 
 
+def clone_root_table(test):
+    """The clone destination root: configured, not named by any XDG variable.
+
+    It is the one root a leak reaches by WRITING A WHOLE REPOSITORY into it --
+    `baude`'s clone modal prefills `<clone base>/<host>/<owner>/<repo>` and
+    hands a clear destination to a real `git clone`.
+    """
+    bracket(
+        test,
+        "a clone under the default clone base fails and is named",
+        "cloned",
+        lambda env: None,
+        lambda env: os.makedirs(
+            os.path.join(env["HOME"], "Code", "github.com", "owner", "repo")
+        ),
+        expect_pass=False,
+        expect_names=("clone destination root", "CREATED"),
+    )
+
+    def seed_configured_base(env):
+        write_file(
+            os.path.join(synthetic_roots(env)[0], "config.json"),
+            json.dumps({"clone_base_dir": os.path.join(env["HOME"], "Elsewhere")})
+            + "\n",
+        )
+        os.makedirs(os.path.join(env["HOME"], "Elsewhere"))
+
+    bracket(
+        test,
+        "a configured clone_base_dir is the root that gets observed",
+        "configured-clone",
+        seed_configured_base,
+        lambda env: os.makedirs(
+            os.path.join(env["HOME"], "Elsewhere", "github.com", "owner", "repo")
+        ),
+        expect_pass=False,
+        expect_names=("clone destination root", "added", "repo"),
+    )
+
+    # The bound is a deliberate trade, stated as a test rather than only as a
+    # comment: this root is the developer's whole code tree, so edits INSIDE an
+    # already-present checkout are not the suite's doing and are not observed.
+    bracket(
+        test,
+        "a change below the clone root's depth bound is not reported",
+        "clone-depth",
+        lambda env: os.makedirs(
+            os.path.join(env["HOME"], "Code", "github.com", "owner", "repo", "src")
+        ),
+        lambda env: write_file(
+            os.path.join(
+                env["HOME"], "Code", "github.com", "owner", "repo", "src", "main.rs"
+            ),
+            "fn main() {}\n",
+        ),
+        expect_pass=True,
+    )
+
+
 def snapshot_location_table(test):
     """The observer must refuse to store its state inside what it observes."""
     with tempfile.TemporaryDirectory(prefix="baude-selftest-loc-") as scratch:
@@ -782,6 +935,8 @@ def mode_self_test(out):
     resolver_table(test)
     out.write("before/after comparison (synthetic trees, explicit child env):\n")
     comparison_table(test)
+    out.write("clone destination root:\n")
+    clone_root_table(test)
     out.write("snapshot location:\n")
     snapshot_location_table(test)
     out.write("resolution stability:\n")

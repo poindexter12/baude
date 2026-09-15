@@ -55,6 +55,11 @@ pub struct Redirects {
     pub config_dir: Option<PathBuf>,
     /// Replaces `meta::claude_config_dir()` (consumed from plan 02).
     pub claude_config_dir: Option<PathBuf>,
+    /// Replaces `persist::home_dir()`, the home a leading `~` expands to.
+    /// `baude` and `bauded` expand `~` for a tab-completion `read_dir`, a
+    /// `POST /sessions` repository path, and the destination a `git clone` is
+    /// written into — all of them compiled into those crates' test harnesses.
+    pub home_dir: Option<PathBuf>,
     /// Replaces the `current_exe()`-derived hook command.
     pub hook_command: Option<String>,
     /// Per-fixture workspace identity (consumed from plan 03).
@@ -67,6 +72,7 @@ impl Redirects {
             worktrees_base: None,
             config_dir: None,
             claude_config_dir: None,
+            home_dir: None,
             hook_command: None,
             workspace: None,
         }
@@ -113,6 +119,7 @@ impl TestRedirect {
     /// | worktrees base | `<root>/data` (the resolver appends `baude/worktrees`) |
     /// | config dir | `<root>/config` |
     /// | claude config dir | `<root>/claude` |
+    /// | home dir | `<root>/home` |
     /// | hook command | `<root>/bin/baude hook` |
     ///
     /// The hook command keeps the production shape — an absolute path whose
@@ -124,6 +131,7 @@ impl TestRedirect {
             worktrees_base: Some(root.join("data")),
             config_dir: Some(root.join("config")),
             claude_config_dir: Some(root.join("claude")),
+            home_dir: Some(root.join("home")),
             hook_command: Some(format!("{} hook", root.join("bin").join("baude").display())),
             workspace: None,
         })
@@ -197,6 +205,11 @@ pub fn config_dir_override() -> Option<PathBuf> {
 /// The redirected `~/.claude` directory, if one is live on this thread.
 pub fn claude_config_dir_override() -> Option<PathBuf> {
     REDIRECTS.with(|cell| cell.borrow().claude_config_dir.clone())
+}
+
+/// The redirected home directory, if one is live on this thread.
+pub fn home_dir_override() -> Option<PathBuf> {
+    REDIRECTS.with(|cell| cell.borrow().home_dir.clone())
 }
 
 /// The redirected hook command, if one is live on this thread.

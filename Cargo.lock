@@ -201,7 +201,6 @@ version = "2.1.5"
 dependencies = [
  "anyhow",
  "baude-core",
- "dirs",
  "ratatui",
  "serde",
  "serde_json",
@@ -233,7 +232,6 @@ dependencies = [
  "axum",
  "base64",
  "baude-core",
- "dirs",
  "futures-core",
  "futures-util",
  "hkdf",

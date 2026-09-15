@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# `dirs` is deliberately NOT a dependency of this crate. Every home resolution
+# goes through `baude_core::persist::home_dir`, which is guarded; keeping the
+# unguarded crate out of scope means a fourth private `expand_tilde` cannot be
+# written here by accident (#72, CR-01).
 baude-core.workspace = true
-dirs.workspace = true
 ratatui = "0.30"
 serde.workspace = true
 serde_json.workspace = true

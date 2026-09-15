@@ -228,18 +228,6 @@ pub struct PermissionView {
     pub decision: Option<String>,
 }
 
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(rest)
-    } else if s == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-    } else {
-        PathBuf::from(s)
-    }
-}
-
 fn status_str(s: Status) -> &'static str {
     match s {
         Status::Waiting => "waiting",
@@ -782,7 +770,9 @@ impl Manager {
             ))
             .into());
         }
-        let repo = expand_tilde(repo);
+        // Guarded: a `~`-prefixed `repo` in a request body would otherwise
+        // stat the developer's real home from inside this crate's test binary.
+        let repo = persist::expand_tilde(repo);
         let repo = repo.canonicalize().unwrap_or(repo);
         if !repo.is_dir() {
             return Err(anyhow!("not a directory: {}", repo.display()).into());
@@ -2601,6 +2591,16 @@ mod tests {
     fn unguarded_resolution_panics() {
         let _no_root = baude_core::testing::NoFixtureRoot::new();
         let _escaped = baude_core::persist::config_dir();
+    }
+
+    /// The `~` expansion behind `create_session`: a `POST /sessions` body
+    /// naming `~/repo` used to stat the developer's real home from inside this
+    /// binary. Same shape as the sibling above, one resolver down.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_tilde_expansion_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = persist::expand_tilde("~/repo");
     }
 
     fn mgr() -> Manager {
