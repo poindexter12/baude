@@ -1023,24 +1023,35 @@ fn run_worktrees_prune(
             // at all — its non-matching arm is an implicit wildcard, so a new
             // `RefusalReason` would compile with no warning and land silently on
             // the exit-0 side whatever its semantics (#72, WR-02, iteration 2).
-            let failed = report
-                .outcomes
-                .iter()
-                .any(|outcome| match &outcome.disposition {
-                    PruneDisposition::Refused { reason } => match reason {
-                        RefusalReason::RemovalFailed { .. } => true,
-                        RefusalReason::NotRemovableNow { .. }
-                        | RefusalReason::ProofChanged { .. }
-                        | RefusalReason::Vanished
-                        | RefusalReason::BecameSymlink
-                        | RefusalReason::NotADirectory
-                        | RefusalReason::GitdirPresent { .. } => false,
-                    },
-                    PruneDisposition::NotApproved
-                    | PruneDisposition::Unapproved
-                    | PruneDisposition::WouldRemove
-                    | PruneDisposition::Removed => false,
-                });
+            //
+            // Gated on `confirmed` because CR-02 moved `removal_gate` onto the
+            // unconfirmed path, and that gate maps any non-`NotFound`
+            // `symlink_metadata` error to `RemovalFailed` — so a *preview*,
+            // which by contract "reads only; removes nothing", could otherwise
+            // exit 1 on an `EACCES`/`EIO` while printing "Nothing was removed."
+            // An operator scripting the documented two-step flow could not tell
+            // that apart from a real removal failure. `RemovalFailed` means "a
+            // removal was attempted and failed", and only the confirmed path
+            // attempts one (#72, WR-03, iteration 2).
+            let failed = report.confirmed
+                && report
+                    .outcomes
+                    .iter()
+                    .any(|outcome| match &outcome.disposition {
+                        PruneDisposition::Refused { reason } => match reason {
+                            RefusalReason::RemovalFailed { .. } => true,
+                            RefusalReason::NotRemovableNow { .. }
+                            | RefusalReason::ProofChanged { .. }
+                            | RefusalReason::Vanished
+                            | RefusalReason::BecameSymlink
+                            | RefusalReason::NotADirectory
+                            | RefusalReason::GitdirPresent { .. } => false,
+                        },
+                        PruneDisposition::NotApproved
+                        | PruneDisposition::Unapproved
+                        | PruneDisposition::WouldRemove
+                        | PruneDisposition::Removed => false,
+                    });
             if failed {
                 WORKTREES_EXIT_FAILED
             } else {
