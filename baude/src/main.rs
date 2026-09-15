@@ -459,7 +459,17 @@ fn run(
 
 /// Exit code when the command did what was asked.
 const WORKTREES_EXIT_OK: i32 = 0;
-/// Exit code when the command could not complete. Nothing was removed.
+/// Exit code when the command could not complete.
+///
+/// Deliberately does *not* promise the tree is untouched, and must not be read
+/// alongside [`WORKTREES_EXIT_USAGE`]'s "nothing was read or removed" as though
+/// the two made the same guarantee. A confirmed prune that removed one
+/// candidate and then failed on the next exits here — that is the whole point
+/// of the rule, since a part-way removal must not look like success (#72,
+/// WR-02). The paths that bail before touching anything (an unreadable or
+/// unparseable report, or one `prune_at` refuses outright) say "Nothing was
+/// removed." in their own message. Everywhere else, the account printed above
+/// the exit is the record of what actually happened (#72, WR-04, iteration 2).
 const WORKTREES_EXIT_FAILED: i32 = 1;
 /// Exit code when the command line itself was wrong. Nothing was read or
 /// removed — the arguments never reached the filesystem.
