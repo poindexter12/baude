@@ -2702,6 +2702,14 @@ mod tests {
         fn workspace(&self) -> &baude_core::workspace::Workspace {
             &self.workspace
         }
+
+        /// A created subdirectory of the fixture root, for the scenario-specific
+        /// `repo` / `origin.git` / `state` trees the preambles built by hand.
+        fn subdir(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(&path).expect("create manager fixture subdirectory");
+            path
+        }
     }
 
     impl Drop for ManagerFixture {
@@ -2776,14 +2784,9 @@ mod tests {
 
     #[test]
     fn manager_restore_reconciles_current_git_before_spawn_and_persists_failure() {
-        let root =
-            std::env::temp_dir().join(format!("bauded-manager-reconcile-{}", std::process::id()));
-        let repo = root.join("repo");
-        let state_root = root.join("state");
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("manager-reconcile");
+        let repo = fixture.subdir("repo");
+        let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -2825,12 +2828,7 @@ mod tests {
                 resume_id: None,
             },
         ));
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         persist::save_current_at(
             &state_root,
             &workspace.state_file(STATE_BASE),
@@ -2852,22 +2850,13 @@ mod tests {
             persisted.state.checkouts[0].health(),
             CheckoutHealth::Unavailable(_)
         ));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn manager_persistence_blocks_malformed_state_and_later_saves() {
-        let root =
-            std::env::temp_dir().join(format!("bauded-manager-persistence-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let fixture = ManagerFixture::new("manager-persistence");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
         let path = root.join(workspace.state_file(STATE_BASE));
         let original = b"{truncated";
         std::fs::write(&path, original).unwrap();
@@ -2879,22 +2868,13 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(manager.create("/tmp", None, None).is_err());
         assert!(manager.sessions.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn manager_persistence_migrates_selected_legacy_once_without_field_loss() {
-        let root =
-            std::env::temp_dir().join(format!("bauded-manager-legacy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let fixture = ManagerFixture::new("manager-legacy");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
         let legacy_path = root.join(workspace.legacy_state_file(STATE_BASE).unwrap());
         let legacy = baude_core::persist::State {
             sessions: vec![baude_core::persist::SavedSession {
@@ -2928,7 +2908,6 @@ mod tests {
             std::fs::read(&legacy_path).unwrap(),
             serde_json::to_vec_pretty(&legacy).unwrap()
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2961,45 +2940,42 @@ mod tests {
         assert_eq!(manager.next_id, 1);
     }
 
-    fn persistence_fixture(label: &str) -> (PathBuf, baude_core::workspace::Workspace) {
-        let root =
-            std::env::temp_dir().join(format!("bauded-transaction-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
-        (root, workspace)
+    /// The transaction-scenario fixture.
+    ///
+    /// It returns the OWNER, not `(root, workspace)`. The previous shape
+    /// constructed a `TestRedirect` and dropped it at the `return`, so every
+    /// line in every caller ran unredirected while the call site still read
+    /// like an isolated fixture — the exact failure mode this helper now makes
+    /// impossible to express.
+    #[must_use = "the returned fixture owns this case's root, redirects and identity; bind it to a \
+                  named local that outlives the Manager it isolates"]
+    fn persistence_fixture(label: &str) -> ManagerFixture {
+        ManagerFixture::new(&format!("transaction-{label}"))
     }
 
+    /// Returns its `ManagerFixture` in place of the bare root and workspace it
+    /// used to hand back, for the same reason as [`persistence_fixture`]: the
+    /// guard has to outlive the call.
+    #[must_use = "the returned fixture owns this case's root, redirects and identity; bind it to a \
+                  named local that outlives the Manager, its sessions and its worktrees"]
     fn removal_manager(
         label: &str,
         offset: u64,
     ) -> (
         Manager,
         PathBuf,
-        PathBuf,
-        baude_core::workspace::Workspace,
+        ManagerFixture,
         PathBuf,
         CheckoutKey,
         u64,
         PathBuf,
     ) {
-        let root = std::env::temp_dir().join(format!("bauded-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        // Contain managed worktree allocation (issue #72) before the manager
+        // Contains managed worktree allocation (issue #72) before the manager
         // can activate a branch and create one under the real data dir.
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let origin = root.join("origin.git");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&origin).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new(label);
+        let repo = fixture.subdir("repo");
+        let origin = fixture.subdir("origin.git");
+        let state_root = fixture.subdir("state");
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
@@ -3015,12 +2991,7 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + offset;
         manager.persist_at_for_test(&state_root, &workspace, None);
@@ -3037,9 +3008,7 @@ mod tests {
         let path = manager.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
-        (
-            manager, state_root, root, workspace, repo, checkout, runtime, path,
-        )
+        (manager, state_root, fixture, repo, checkout, runtime, path)
     }
 
     fn persisted_at(root: &Path, workspace: &baude_core::workspace::Workspace) -> RepositoryState {
@@ -3050,7 +3019,9 @@ mod tests {
 
     #[test]
     fn create_persistence_failure_keeps_memory_process_and_disk_consistent() {
-        let (root, workspace) = persistence_fixture("create");
+        let fixture = persistence_fixture("create");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
 
@@ -3069,21 +3040,14 @@ mod tests {
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
         assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lifecycle_create_activate_manager_persists_once_and_reuses_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-lifecycle-create-activate-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("lifecycle-create-activate");
+        let root = fixture.root().to_path_buf();
+        let repo = fixture.subdir("repo");
+        let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -3101,12 +3065,7 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id());
         manager.persist_at_for_test(&state_root, &workspace, None);
@@ -3181,21 +3140,14 @@ mod tests {
                 .current_dir(&repo)
                 .status();
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lifecycle_creation_rollback_manager_precommit_save_failure_has_no_partial_child() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-lifecycle-create-rollback-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("lifecycle-create-rollback");
+        let root = fixture.root().to_path_buf();
+        let repo = fixture.subdir("repo");
+        let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -3213,12 +3165,7 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("true".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 20_000;
         manager.persist_at_for_test(
@@ -3264,21 +3211,14 @@ mod tests {
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
         assert!(!branch_retained);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn activation_recovery_manager_reuses_occupied_owner_after_pending_save_crash() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-occupied-pending-recovery-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("occupied-pending-recovery");
+        let root = fixture.root().to_path_buf();
+        let repo = fixture.subdir("repo");
+        let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -3296,12 +3236,7 @@ mod tests {
                 "occupied-before-crash",
             ],
         );
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let snapshot = git::discover_repository(&repo).unwrap();
         let mut crashed = Manager::new("sh -c 'sleep 30'".into(), true);
         crashed.persist_at_for_test(&state_root, &workspace, None);
@@ -3339,21 +3274,14 @@ mod tests {
                 occupied.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lifecycle_creation_rollback_manager_committed_save_and_spawn_failures_retain_retry_child() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-lifecycle-create-stages-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("lifecycle-create-stages");
+        let root = fixture.root().to_path_buf();
+        let repo = fixture.subdir("repo");
+        let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -3371,12 +3299,7 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("true".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 40_000;
         manager.persist_at_for_test(
@@ -3417,7 +3340,6 @@ mod tests {
                 .current_dir(&repo)
                 .status();
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3426,7 +3348,9 @@ mod tests {
             ("remove-pre", persist::AtomicFailure::Rename, false),
             ("remove-post", persist::AtomicFailure::DirectorySync, true),
         ] {
-            let (root, workspace) = persistence_fixture(label);
+            let fixture = persistence_fixture(label);
+            let root = fixture.root().to_path_buf();
+            let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
@@ -3499,13 +3423,14 @@ mod tests {
                 ));
                 manager.kill_all();
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
     fn lifecycle_close_manager_success_retains_exact_child_context() {
-        let (root, workspace) = persistence_fixture("close-success");
+        let fixture = persistence_fixture("close-success");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, &workspace, None);
         let id = manager
@@ -3588,12 +3513,13 @@ mod tests {
             Some("opaque-daemon-before-poll")
         );
         assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lifecycle_reopen_manager_reuses_one_runtime_and_preserves_failed_save() {
-        let (root, workspace) = persistence_fixture("reopen-manager");
+        let fixture = persistence_fixture("reopen-manager");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -3641,23 +3567,14 @@ mod tests {
         assert!(!manager.repository_state.checkouts[0].active_intent());
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lifecycle_remove_clean_manager_uses_the_shared_child_only_transaction() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-lifecycle-safe-remove-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let _redirect = baude_core::testing::TestRedirect::new(&root);
-        let repo = root.join("repo");
-        let origin = root.join("origin.git");
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(&origin).unwrap();
-        std::fs::create_dir_all(&state_root).unwrap();
+        let fixture = ManagerFixture::new("lifecycle-safe-remove");
+        let repo = fixture.subdir("repo");
+        let origin = fixture.subdir("origin.git");
+        let state_root = fixture.subdir("state");
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
@@ -3673,12 +3590,7 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
+        let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 110_000;
         manager.persist_at_for_test(&state_root, &workspace, None);
@@ -3755,7 +3667,6 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3764,8 +3675,9 @@ mod tests {
             ("remove-agent-partial", true, 120_000),
             ("remove-shell-partial", false, 130_000),
         ] {
-            let (mut manager, state_root, root, workspace, _repo, checkout, runtime, path) =
+            let (mut manager, state_root, fixture, _repo, checkout, runtime, path) =
                 removal_manager(label, offset);
+            let workspace = fixture.workspace();
             manager
                 .session_mut(runtime)
                 .unwrap()
@@ -3811,7 +3723,6 @@ mod tests {
             assert!(!path.exists());
             assert!(manager.sessions.is_empty());
             assert!(manager.runtime_checkouts.is_empty());
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -3821,7 +3732,9 @@ mod tests {
             ("archive-pre", persist::AtomicFailure::Rename, false),
             ("archive-post", persist::AtomicFailure::DirectorySync, true),
         ] {
-            let (root, workspace) = persistence_fixture(label);
+            let fixture = persistence_fixture(label);
+            let root = fixture.root().to_path_buf();
+            let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, &workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
@@ -3836,7 +3749,6 @@ mod tests {
                 committed
             );
             manager.kill_all();
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
