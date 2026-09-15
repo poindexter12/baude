@@ -833,8 +833,8 @@ mod tests {
         /// An override-free thread cannot inherit a live API fixture identity.
         #[test]
         fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
-            let root = std::env::temp_dir()
-                .join(format!("bauded-identity-escape-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("bauded-identity-escape-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             let _fixture = initialized_repo(&root, "repo");

@@ -1134,6 +1134,18 @@ impl App {
         });
     }
 
+    /// The raw config this App loaded at construction.
+    ///
+    /// UI fixtures assert the loaded sentinel field directly rather than going
+    /// through `auto_archive_ms()`, which folds in an environment override and
+    /// would answer the developer's environment instead of the fixture's
+    /// synthetic `config.json`. Test-only, so production visibility of
+    /// `App::config` is unchanged.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &Config {
+        &self.config
+    }
+
     #[cfg(test)]
     pub(crate) fn install_hierarchy_state_for_test(
         &mut self,

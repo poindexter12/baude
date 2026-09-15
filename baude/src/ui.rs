@@ -2221,7 +2221,83 @@ mod tests {
         PersistedPath::from_path(Path::new(value))
     }
 
-    fn hierarchy_fixture() -> (App, baude_core::repository::RepositoryKey) {
+    /// Owns everything a UI case needs to resolve paths and identity on its own
+    /// terms: a unique synthetic root, the redirect that pins every resolved
+    /// path inside it, and the literal workspace identity resolved under that
+    /// root.
+    ///
+    /// `App::new` reads `config.json` from the redirected config dir and
+    /// resolves the active workspace, so a case that renders without holding
+    /// this reads the developer's real config and real workspace. The guards
+    /// are thread-local and drop with this value, so every caller must bind it
+    /// to a NAMED local that outlives the App's final render — returning only
+    /// the App would compile and leave the whole case unredirected.
+    struct UiFixture {
+        root: std::path::PathBuf,
+        /// Struct fields drop in DECLARATION order, the reverse of locals, so
+        /// the identity is declared first and therefore restored while its own
+        /// root is still installed — mirroring the acquisition order below
+        /// (root first, identity second).
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl UiFixture {
+        #[must_use = "the returned UiFixture owns this case's root and identity; bind it to a \
+                      named local that outlives the App's final render"]
+        fn new(label: &str) -> Self {
+            Self::with_config(label, label, None)
+        }
+
+        /// The same owner with an explicit literal workspace and an optional
+        /// synthetic `config.json` sentinel written before the redirect is
+        /// installed, so `App::new`'s own config read observes it.
+        #[must_use = "the returned UiFixture owns this case's root and identity; bind it to a \
+                      named local that outlives the App's final render"]
+        fn with_config(label: &str, workspace: &str, auto_archive_minutes: Option<u64>) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "baude-ui-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            if let Some(minutes) = auto_archive_minutes {
+                std::fs::write(
+                    root.join("config").join("config.json"),
+                    format!("{{\"auto_archive_minutes\":{minutes}}}"),
+                )
+                .unwrap();
+            }
+            let redirect = baude_core::testing::TestRedirect::new(&root);
+            let identity = baude_core::workspace::override_for_test(
+                &baude_core::persist::Config {
+                    workspace: Some(workspace.to_string()),
+                    ..baude_core::persist::Config::default()
+                },
+                None,
+            );
+            Self {
+                root,
+                _identity: identity,
+                _redirect: redirect,
+            }
+        }
+
+        #[allow(dead_code)]
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn config_path(&self) -> std::path::PathBuf {
+            self.root.join("config").join("config.json")
+        }
+    }
+
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn hierarchy_fixture() -> (UiFixture, App, baude_core::repository::RepositoryKey) {
         let mut state = RepositoryState::default();
         let repository = state.allocate_repository_key().unwrap();
         let repository_order = state.allocate_first_seen_order().unwrap();
@@ -2295,10 +2371,13 @@ mod tests {
             ));
         }
         let selected = state.checkouts[1].key;
+        // Root and identity before construction: App::new reads config.json
+        // from the redirected config dir and resolves the active workspace.
+        let fixture = UiFixture::new("hierarchy");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Checkout(selected));
-        (app, repository)
+        (fixture, app, repository)
     }
 
     fn render(app: &App, width: u16, height: u16) -> (String, ratatui::buffer::Buffer) {
@@ -2319,7 +2398,7 @@ mod tests {
 
     #[test]
     fn hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics() {
-        let (mut app, repository) = hierarchy_fixture();
+        let (_fixture, mut app, repository) = hierarchy_fixture();
         for (width, height) in [(160, 40), (100, 30), (79, 24), (59, 20), (40, 12)] {
             app.focus = Focus::Sidebar;
             let (rendered, buffer) = render(&app, width, height);
@@ -2385,7 +2464,7 @@ mod tests {
     fn archived_rows_hide_behind_z_and_fully_archived_repository_collapses() {
         // Mixed repository: the archived child hides, the footer counts it,
         // and no per-parent chip appears while a live sibling is visible.
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.remote = None;
         app.focus = Focus::Sidebar;
         let (rendered, _) = render(&app, 100, 30);
@@ -2436,6 +2515,7 @@ mod tests {
                 },
             ));
         }
+        let _fixture = UiFixture::new("collapsed-archive");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.remote = None;
         app.install_hierarchy_state_for_test(state, HashMap::new());
@@ -2461,7 +2541,7 @@ mod tests {
         assert!(Line::raw(clipped.clone()).width() <= 6, "{clipped:?}");
         assert!(clipped.ends_with("界e\u{301}"), "{clipped:?}");
 
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child)
                 if child.status == crate::hierarchy::LocalStatus::Unavailable =>
@@ -2490,7 +2570,7 @@ mod tests {
 
     #[test]
     fn hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove() {
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.modal = Modal::ConfirmCloseWorktree { id: u64::MAX };
         let (wide, wide_buffer) = render(&app, 100, 30);
         assert!(wide.contains("close local session"), "{wide}");
@@ -2548,6 +2628,7 @@ mod tests {
 
     #[test]
     fn hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints() {
+        let _fixture = UiFixture::new("empty-copy");
         let mut empty = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         empty.remote = None;
         let (rendered, _) = render(&empty, 100, 30);
@@ -2558,7 +2639,7 @@ mod tests {
         );
         assert!(rendered.contains(super::EMPTY_HEADING), "{rendered}");
 
-        let (mut app, repository) = hierarchy_fixture();
+        let (_fixture, mut app, repository) = hierarchy_fixture();
         app.selected_id = Some(SelId::Repository(repository));
         assert_eq!(
             super::status_hint(&app, 160),
@@ -2735,7 +2816,7 @@ mod tests {
 
     #[test]
     fn context_footer_names_the_folder_and_composes_with_the_archived_line() {
-        let (mut app, _repository) = hierarchy_fixture();
+        let (_fixture, mut app, _repository) = hierarchy_fixture();
         app.remote = None;
         app.enable_folder_context_for_test(Path::new("/tmp/viewport/launch"));
 
@@ -2796,6 +2877,7 @@ mod tests {
                 ever_launched: true,
             },
         ));
+        let _fixture = UiFixture::new("standalone-folder");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Standalone(key));
@@ -2871,6 +2953,7 @@ mod tests {
         }
 
         let selected = state.checkouts[0].key;
+        let _fixture = UiFixture::new("tracer-render");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Checkout(selected));
@@ -2948,5 +3031,100 @@ mod tests {
             .any(|line| line.contains("refs/heads/feature/safe-remove")));
         assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
         assert!(lines.iter().any(|line| line.contains("branch is retained")));
+    }
+
+    // ---- UI fixture ownership regressions -------------------------------
+    //
+    // These two cases run an App and therefore a UsagePoller, which is not
+    // isolated until plan 08. They are authored and COMPILED here so the
+    // ownership contract is pinned alongside the migration it guards, and are
+    // executed by plan 08-08 task 1 once the workers are inert — remove the
+    // `#[ignore]` there. Neither name contains `fixture_identity_isolation`,
+    // so this plan's owner-only filter cannot select them.
+
+    /// The guard must still be held AFTER the helper returned: the sentinel
+    /// config the fixture wrote, the identity it resolved and the config path
+    /// it redirected all have to survive into the caller's renders. A helper
+    /// that returned only the App would restore the developer's real config dir
+    /// the instant it returned, and every assertion here would read the real
+    /// machine while still rendering green.
+    #[test]
+    #[ignore = "runs an App (and its UsagePoller); executed by plan 08-08 task 1"]
+    fn ui_fixture_isolation_after_helper_return() {
+        let fixture = UiFixture::with_config("after-return", "ui-after-return", Some(7));
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.remote = None;
+
+        // The raw loaded field, not auto_archive_ms(): that folds in an
+        // environment override and would answer the developer's environment.
+        assert_eq!(
+            app.config_for_test().auto_archive_minutes,
+            Some(7),
+            "the App must have loaded the fixture's synthetic config.json"
+        );
+        assert_eq!(baude_core::workspace::active().name, "ui-after-return");
+        assert_eq!(
+            baude_core::persist::config_dir().join("config.json"),
+            fixture.config_path(),
+            "the config path must still point inside the fixture root"
+        );
+
+        // Two widths: the wide layout and the narrow one, both after the
+        // helper returned and with the owner still bound.
+        let (wide, _) = render(&app, 100, 30);
+        let (narrow, _) = render(&app, 40, 12);
+        assert!(!wide.is_empty());
+        assert!(!narrow.is_empty());
+        assert_eq!(baude_core::workspace::active().name, "ui-after-return");
+        assert_eq!(app.config_for_test().auto_archive_minutes, Some(7));
+    }
+
+    /// Nesting a second fixture must restore the first one exactly — root,
+    /// identity and config path — once the inner owner drops, including for a
+    /// directly constructed App.
+    #[test]
+    #[ignore = "runs an App (and its UsagePoller); executed by plan 08-08 task 1"]
+    fn ui_fixture_isolation_nested_restore() {
+        let outer = UiFixture::with_config("nested-outer", "ui-nested-outer", Some(7));
+        let mut outer_app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        outer_app.remote = None;
+        assert_eq!(outer_app.config_for_test().auto_archive_minutes, Some(7));
+        assert_eq!(baude_core::workspace::active().name, "ui-nested-outer");
+
+        {
+            let inner = UiFixture::with_config("nested-inner", "ui-nested-inner", Some(11));
+            // Direct construction inside the inner scope, same owner contract.
+            let mut inner_app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+            inner_app.remote = None;
+            assert_eq!(
+                inner_app.config_for_test().auto_archive_minutes,
+                Some(11),
+                "the inner App must read the inner fixture's config.json"
+            );
+            assert_eq!(baude_core::workspace::active().name, "ui-nested-inner");
+            assert_eq!(
+                baude_core::persist::config_dir().join("config.json"),
+                inner.config_path()
+            );
+            let (rendered, _) = render(&inner_app, 40, 12);
+            assert!(!rendered.is_empty());
+            // The inner App is dropped before the outer one is used again.
+        }
+
+        assert_eq!(
+            baude_core::workspace::active().name,
+            "ui-nested-outer",
+            "dropping the inner fixture must restore the outer identity"
+        );
+        assert_eq!(
+            baude_core::persist::config_dir().join("config.json"),
+            outer.config_path(),
+            "dropping the inner fixture must restore the outer root"
+        );
+        let (wide, _) = render(&outer_app, 100, 30);
+        let (narrow, _) = render(&outer_app, 40, 12);
+        assert!(!wide.is_empty());
+        assert!(!narrow.is_empty());
+        assert_eq!(outer_app.config_for_test().auto_archive_minutes, Some(7));
     }
 }
