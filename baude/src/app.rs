@@ -5609,6 +5609,14 @@ mod tests {
     struct AdmissionRepo {
         root: PathBuf,
         repo: PathBuf,
+        /// Struct fields drop in DECLARATION order, which is the reverse of the
+        /// order locals drop in. The identity scope is therefore declared
+        /// before the root redirect so it is restored while its own root is
+        /// still installed — the mirror image of the acquisition order in
+        /// `admission_repo` (root first, identity second). Swapping these two
+        /// lines restores the root first and leaves the identity pointing at a
+        /// root that no longer exists.
+        _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
     }
 
@@ -5651,6 +5659,17 @@ mod tests {
         // own — the divergence that hid #78 and kept #70's pruning path
         // untested at this level.
         let redirect = baude_core::testing::TestRedirect::new(&root);
+        // Identity second, resolved under the root the redirect just installed.
+        // The literal names THIS fixture, so two fixtures alive at once compose
+        // managed paths into two different directories and neither inherits the
+        // developer's configured workspace.
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(name.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let origin = root.join("origin.git");
@@ -5675,6 +5694,7 @@ mod tests {
         AdmissionRepo {
             root,
             repo,
+            _identity: identity,
             _redirect: redirect,
         }
     }

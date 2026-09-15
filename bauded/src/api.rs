@@ -717,6 +717,12 @@ mod tests {
     /// leave the fixture running completely unredirected (issue #72).
     struct FixtureRepo {
         repo: std::path::PathBuf,
+        /// Struct fields drop in DECLARATION order, the reverse of locals, so
+        /// the identity scope is declared before the root redirect and is
+        /// therefore restored while its own root is still installed — mirroring
+        /// the acquisition order in `initialized_repo_in_workspace` (root
+        /// first, identity second).
+        _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
     }
 
@@ -744,7 +750,16 @@ mod tests {
         // Contain managed worktree allocation (issue #72): every API test that
         // restarts or activates a session can reach worktree creation.
         let redirect = baude_core::testing::TestRedirect::new(root);
-        let _ = workspace;
+        // Identity second, under the root just installed. Held by the returned
+        // owner so it survives every handler `await`, which is where session
+        // creation reaches managed worktree allocation.
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(workspace.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -755,6 +770,7 @@ mod tests {
         git(&repo, &["commit", "-m", "initial"]);
         FixtureRepo {
             repo,
+            _identity: identity,
             _redirect: redirect,
         }
     }
