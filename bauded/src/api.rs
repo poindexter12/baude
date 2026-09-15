@@ -678,8 +678,56 @@ mod tests {
 
     use crate::manager::Manager;
 
-    fn app() -> axum::Router {
-        super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))))
+    /// The minimal API isolation owner: a unique synthetic root, the redirect
+    /// that pins every resolved path inside it, and the literal workspace
+    /// identity resolved under that root. For router cases that need no
+    /// repository fixture — they still reach `workspace::active()` through the
+    /// handlers.
+    struct ApiScope {
+        /// Struct fields drop in declaration order, so the identity is restored
+        /// while its own root is still installed.
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    #[must_use = "the returned ApiScope owns this case's root and identity; bind it to a named \
+                  local that outlives every handler await"]
+    fn api_scope(label: &str) -> ApiScope {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "bauded-scope-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(label.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        ApiScope {
+            _identity: identity,
+            _redirect: redirect,
+        }
+    }
+
+    /// The router together with the scope that isolates it.
+    ///
+    /// Every handler resolves the active workspace and names its state file
+    /// from it, so the scope must be retained for the whole test body —
+    /// including across every `await`, which is where session creation reaches
+    /// managed worktree allocation. Returning the bare router would compile and
+    /// run the case against the developer's real workspace and data dir.
+    #[must_use = "the leading ApiScope isolates this router; bind it to a named local that \
+                  outlives every handler await"]
+    fn app() -> (ApiScope, axum::Router) {
+        let scope = api_scope("router");
+        let router = super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))));
+        (scope, router)
     }
 
     async fn body_json(res: axum::response::Response) -> serde_json::Value {
@@ -854,7 +902,17 @@ mod tests {
         }
     }
 
+    /// Requires a caller-owned isolation scope established BEFORE the call:
+    /// the manager it returns polls session metadata through
+    /// `backend::active()` and names its state file from `workspace::active()`.
+    /// Every caller already binds an `initialized_repo` owner first; this
+    /// assertion is what keeps the next one from forgetting.
     fn exited_tracked_manager(repo: &Path) -> (crate::manager::Shared, u64) {
+        assert!(
+            baude_core::testing::workspace_override().is_some(),
+            "exited_tracked_manager requires a caller-owned isolation scope: bind an \
+             initialized_repo (or api_scope) owner before calling it"
+        );
         let state = Arc::new(Mutex::new(Manager::new("true".into(), false)));
         let id = crate::manager::lock(&state)
             .create(repo.to_str().unwrap(), None, None)
@@ -871,7 +929,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_starts_empty() {
-        let res = app().oneshot(get("/sessions")).await.unwrap();
+        let (_scope, router) = app();
+        let res = router.oneshot(get("/sessions")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, serde_json::json!([]));
     }
@@ -982,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_session_is_404() {
-        let app = app();
+        let (_scope, app) = app();
         for req in [
             get("/sessions/9"),
             get("/sessions/9/messages"),
@@ -1001,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_requests_are_400() {
-        let app = app();
+        let (_scope, app) = app();
         let res = app
             .clone()
             .oneshot(post_json("/sessions", r#"{"repo":"/nonexistent-xyz"}"#))
@@ -1594,7 +1653,8 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_pwa() {
-        let res = app().oneshot(get("/")).await.unwrap();
+        let (_scope, router) = app();
+        let res = router.oneshot(get("/")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let ct = res.headers()[header::CONTENT_TYPE].to_str().unwrap();
         assert!(ct.starts_with("text/html"));
@@ -1604,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_lifecycle_over_http() {
-        let app = app();
+        let (_scope, app) = app();
         // create
         let res = app
             .clone()
