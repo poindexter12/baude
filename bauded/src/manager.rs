@@ -2650,6 +2650,16 @@ mod tests {
     /// that forgot the guard reads and writes the developer's real roots while
     /// looking exactly like its neighbours.
     struct ManagerFixture {
+        /// Struct fields drop in DECLARATION order (the inverse of locals), so
+        /// the identity is restored while the root redirect it was resolved
+        /// under is still installed — the 08-03 owner convention.
+        _identity: baude_core::testing::TestRedirect,
+        /// Held as a FIELD, never constructed and let go. An unbound guard arms
+        /// and disarms in the same statement, so the fixture would run entirely
+        /// unredirected while still compiling and still reading correctly at the
+        /// call site. Tying the redirect's lifetime to the fixture's is the
+        /// whole reason the guard is RAII (D-01).
+        _redirect: baude_core::testing::TestRedirect,
         root: PathBuf,
         workspace: baude_core::workspace::Workspace,
     }
@@ -2671,9 +2681,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("create unique manager fixture root");
             let config = fixture_config(workspace_name);
+            // Acquisition order is root FIRST, identity SECOND, so the identity
+            // is resolved with this fixture's roots already installed.
+            let redirect = baude_core::testing::TestRedirect::new(&root);
+            let identity = baude_core::workspace::override_for_test(&config, None);
             let workspace =
                 baude_core::workspace::resolve(Some(workspace_name), None, &config, |_| {});
-            Self { root, workspace }
+            Self {
+                _identity: identity,
+                _redirect: redirect,
+                root,
+                workspace,
+            }
         }
 
         fn root(&self) -> &Path {
@@ -2682,14 +2701,6 @@ mod tests {
 
         fn workspace(&self) -> &baude_core::workspace::Workspace {
             &self.workspace
-        }
-
-        /// A created subdirectory of the fixture root, for the scenario-specific
-        /// `repo` / `origin.git` / `state` trees the preambles built by hand.
-        fn subdir(&self, relative: impl AsRef<Path>) -> PathBuf {
-            let path = self.root.join(relative);
-            std::fs::create_dir_all(&path).expect("create manager fixture subdirectory");
-            path
         }
     }
 
