@@ -491,7 +491,14 @@ fn worktrees_help_text() -> String {
      freshly re-derived proof still matches the one in the report you approved.\n\
      `--json` describes a scan, so it cannot be combined with `--prune`.\n\
      \n\
-     exit codes: 0 did what was asked, 1 could not complete (nothing removed),\n\
+     A refusal is the tool working: a candidate that stopped qualifying, or one\n\
+     git owns, is reported and left alone, and the run still exits 0. A removal\n\
+     that was attempted and FAILED exits 1 — that is the one outcome a script\n\
+     cannot infer from the exit code otherwise. Read the account either way.\n\
+     \n\
+     exit codes: 0 did what was asked (refusals included),\n\
+     \x20           1 could not complete — a report that was rejected outright\n\
+     \x20             (nothing removed), or a removal that failed part-way,\n\
      \x20           2 the command line was wrong (nothing was read or removed)"
         .to_string()
 }
@@ -1000,7 +1007,26 @@ fn run_worktrees_prune(
     match baude_core::worktree_scan::prune_at(roots, &approved, options.yes) {
         Ok(report) => {
             print_prune_account(&report, out);
-            WORKTREES_EXIT_OK
+            // `prune_at` returns `Ok` when the *report* was acceptable; a
+            // per-candidate failure travels inside the account. A removal that
+            // was attempted and failed on I/O is the one disposition an operator
+            // scripting this flow cannot be told about by an exit code of 0
+            // (#72, WR-02). Safety refusals stay exit-0: they are the tool
+            // working, not failing — a deliberate policy line, so the match is
+            // written without a wildcard on the reason.
+            let failed = report.outcomes.iter().any(|outcome| {
+                matches!(
+                    &outcome.disposition,
+                    baude_core::worktree_scan::PruneDisposition::Refused {
+                        reason: baude_core::worktree_scan::RefusalReason::RemovalFailed { .. }
+                    }
+                )
+            });
+            if failed {
+                WORKTREES_EXIT_FAILED
+            } else {
+                WORKTREES_EXIT_OK
+            }
         }
         Err(error) => {
             let _ = writeln!(
@@ -1392,6 +1418,93 @@ mod worktrees_cli_tests {
             stdout.contains("claude/repository-9"),
             "the re-verification result is reported: {stdout}"
         );
+    }
+
+    /// WR-02. `prune_at` returns `Ok` whenever the *report* was acceptable, so
+    /// a removal that was attempted and failed on I/O used to exit 0 — the one
+    /// outcome an operator scripting this two-step flow could not tell apart
+    /// from "removed cleanly" without parsing stdout prose.
+    ///
+    /// Built by making the candidate's parent read-only after the preview:
+    /// `remove_dir` needs write permission on the parent, so the gate clears
+    /// (the candidate itself is untouched and still empty) and the removal
+    /// itself is what fails. Root ignores the mode bits, so the case probes for
+    /// that first and declines rather than asserting something false.
+    #[test]
+    fn a_removal_that_failed_exits_nonzero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = CliFixture::new("removal-failed");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let parent = fixture.workspace("claude");
+        let saved = save_preview(&fixture, "preview.json");
+
+        let readonly = std::fs::Permissions::from_mode(0o555);
+        let writable = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&parent, readonly.clone()).expect("make the parent read-only");
+        // Root bypasses the mode bits entirely, and a case that silently passed
+        // there would be asserting nothing at all.
+        let enforced = std::fs::create_dir(parent.join("probe-9")).is_err();
+        if !enforced {
+            let _ = std::fs::remove_dir(parent.join("probe-9"));
+            std::fs::set_permissions(&parent, writable).expect("restore the parent");
+            eprintln!("skipped: this user can write a read-only directory (running as root?)");
+            return;
+        }
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+        // Restored before the assertions so a failure here cannot leave an
+        // undeletable fixture behind for `Drop`.
+        std::fs::set_permissions(&parent, writable).expect("restore the parent");
+
+        assert_eq!(
+            code, WORKTREES_EXIT_FAILED,
+            "a failed removal must not exit 0 — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("refused"),
+            "the account still names the failure: {stdout}"
+        );
+        assert!(approved.exists(), "the candidate was not in fact removed");
+    }
+
+    /// The other half of the line WR-02 draws: a refusal is the tool working,
+    /// so it stays exit 0. Only an attempted-and-failed removal is exit 1.
+    #[test]
+    fn a_safety_refusal_still_exits_zero() {
+        let fixture = CliFixture::new("refusal-exit-ok");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        // A second workspace widens `workspaces_checked`, so the candidate still
+        // clears but no longer by the approved proof.
+        fixture.workspace("opencode");
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(stdout.contains("refused"), "{stdout}");
+        assert!(approved.exists());
     }
 
     // ---- refusals, each naming its reason ---------------------------------
