@@ -72,9 +72,19 @@ pub enum Evidence {
     /// Necessary, and on its own proof of nothing — see the module docs.
     ShapeMatch,
     /// A complete inventory of every workspace's state files was read and none
-    /// of them references this candidate. Carries the workspaces actually
-    /// checked so "not referenced" can never be confused with "not checked".
-    NotReferencedByState { workspaces_checked: Vec<String> },
+    /// of them references this candidate. Carries the workspaces, the exact
+    /// filenames, and the filenames found absent, so "not referenced" can never
+    /// be confused with "not checked" — and so plan 08-05's prune can compare
+    /// the inventory it re-derives against the one the developer approved.
+    ///
+    /// Emitted **only** from a complete inventory. One unreadable file, one
+    /// ambiguous directory entry, or one unresolvable reference anywhere in the
+    /// scan withholds this signal from every candidate.
+    NotReferencedByState {
+        workspaces_checked: Vec<String>,
+        files_checked: Vec<String>,
+        files_absent: Vec<String>,
+    },
     /// No `.git` entry exists at the candidate or in any immediate child.
     ///
     /// Recorded so a developer reading the report can see it. **Inert in the
@@ -103,12 +113,26 @@ pub enum Evidence {
     /// the target's properties while a removal acted on the link is how a
     /// deletion escapes the base entirely.
     IsSymlink,
-    /// A state file that could reference candidates could not be read. Hard
-    /// blocker **across the whole scan**, not merely for its own workspace:
-    /// state can reference paths in another workspace, so inferring absence
-    /// from a failed read could clear a live repository parent.
-    StateUnreadable { source: PathBuf, workspace: String },
+    /// A state file that could reference candidates could not be read, or the
+    /// inventory of state files could not be completed. Hard blocker **across
+    /// the whole scan**, not merely for its own workspace: state can reference
+    /// paths in another workspace, so inferring absence from a failed read
+    /// could clear a live repository parent.
+    ///
+    /// `workspace` is [`ANY_WORKSPACE`] when the uncertainty is not attributable
+    /// to one workspace (a config directory that could not be listed, an
+    /// ambiguous state-like entry, a reference path that could not be placed).
+    StateUnreadable {
+        source: PathBuf,
+        workspace: String,
+        detail: String,
+    },
 }
+
+/// The `workspace` label on a [`Evidence::StateUnreadable`] that belongs to the
+/// whole inventory rather than to one workspace. Not a legal workspace name —
+/// [`valid_workspace_segment`] rejects it — so it can never collide with one.
+pub const ANY_WORKSPACE: &str = "*";
 
 /// Whether a blocker proves the candidate is alive or merely prevents any
 /// conclusion. Both refuse removal; they differ only in what the report says.
@@ -211,7 +235,9 @@ pub fn classify(evidence: Vec<Evidence>) -> Verdict {
     // admits exactly `Empty` and `GitDisownsIt`; `NoGitdir` is not a member.
     let shape_matched = evidence.contains(&Evidence::ShapeMatch);
     let workspaces_checked = evidence.iter().find_map(|signal| match signal {
-        Evidence::NotReferencedByState { workspaces_checked } => Some(workspaces_checked.clone()),
+        Evidence::NotReferencedByState {
+            workspaces_checked, ..
+        } => Some(workspaces_checked.clone()),
         _ => None,
     });
     let clearing = evidence.iter().find_map(|signal| match signal {
@@ -232,6 +258,116 @@ pub fn classify(evidence: Vec<Evidence>) -> Verdict {
         },
         // Everything else falls through, including the empty evidence list.
         _ => Verdict::Indeterminate { evidence },
+    }
+}
+
+/// The audit trail of a state cross-reference: which workspaces and which exact
+/// filenames were consulted, and which were found genuinely absent.
+///
+/// Carried by [`ScanReport`] so the developer reading a preview can see the
+/// inventory the verdicts rest on, and so prune can require the inventory it
+/// re-derives to agree with the approved one.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateInventorySummary {
+    /// Every workspace name whose state files were derived and consulted,
+    /// sorted. Always contains [`crate::workspace::DEFAULT`].
+    pub workspaces_checked: Vec<String>,
+    /// Every filename consulted under the config directory, sorted.
+    pub files_checked: Vec<String>,
+    /// The subset of `files_checked` that was successfully determined to be
+    /// absent. A *checked* absence, never an unexamined one.
+    pub files_absent: Vec<String>,
+    /// `true` when every consulted file produced either a parsed state or a
+    /// checked absence, and every reference in every parsed state could be
+    /// placed on the filesystem.
+    ///
+    /// `false` withholds [`Evidence::NotReferencedByState`] from **every**
+    /// candidate in the scan, across every workspace (threat T-08-16).
+    pub complete: bool,
+}
+
+/// One ownership claim extracted from a parsed state file.
+///
+/// Both kinds are *exclusions from removal*. Neither authorizes anything.
+// TEMPORARY, removed by this plan's implementation commit: the vocabulary is
+// declared here so the failing tests below can name it, and nothing constructs
+// it until `state_inventory` stops being a stub.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StateReference {
+    /// A `SavedRepository.key` or `SavedCheckout.repository_key` recorded in
+    /// workspace `workspace`. Protects `<base>/<workspace>/repository-<key>`
+    /// and everything beneath it.
+    ///
+    /// Keys are **workspace-scoped**: repository 5 in `claude` says nothing
+    /// about repository 5 in `opencode`.
+    RepositoryKey { workspace: String, key: u64 },
+    /// A recorded absolute path, in every form it could be placed on the
+    /// filesystem. Matched across **all** workspaces: state in one workspace
+    /// can legitimately name a path under another's directory, and a deletion
+    /// does not care which file recorded it.
+    Path {
+        workspace: String,
+        repository_key: Option<u64>,
+        forms: Vec<PathBuf>,
+    },
+}
+
+/// Everything a scan learned from persisted state, plus the uncertainty it
+/// could not resolve.
+#[derive(Clone, Debug, Default)]
+struct StateInventory {
+    summary: StateInventorySummary,
+    #[allow(dead_code)]
+    references: Vec<StateReference>,
+    /// Non-empty means the inventory is INCOMPLETE. Every item is attached to
+    /// every candidate, so one unreadable file in one workspace withholds
+    /// clearing from the entire scan.
+    uncertainty: Vec<Evidence>,
+}
+
+/// The two state kinds. The TUI and the daemon keep separate files so they
+/// never clobber each other's sessions, and either can reference a candidate.
+#[allow(dead_code)]
+const STATE_BASES: [&str; 2] = ["daemon-state", "state"];
+
+/// A workspace name is filesystem- and URL-safe by construction
+/// (`workspace::sanitize`), so anything outside `[A-Za-z0-9_-]` in a filename
+/// segment is not a workspace and the file is not a state file we can attribute.
+#[allow(dead_code)]
+fn valid_workspace_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Read every workspace's persisted state under `config_dir` and extract the
+/// ownership claims it makes.
+///
+/// `worktree_workspaces` are the workspace directory names observed under the
+/// worktrees base. They are UNIONED with the names discovered in the config
+/// directory (and with the default workspace) because either source alone is
+/// incomplete: a workspace can have state and no directory, or a directory and
+/// no state, and missing either class silently converts "not referenced" into
+/// "not checked".
+fn state_inventory(
+    config_dir: &Path,
+    worktree_workspaces: &std::collections::BTreeSet<String>,
+) -> StateInventory {
+    let _ = (config_dir, worktree_workspaces);
+    // Plan 08-05 task 1 replaces this body. Until it does, the inventory is
+    // reported INCOMPLETE — the only stub value that cannot authorize a
+    // removal, since incompleteness withholds `NotReferencedByState` from every
+    // candidate in the scan.
+    StateInventory {
+        summary: StateInventorySummary::default(),
+        references: Vec::new(),
+        uncertainty: vec![Evidence::StateUnreadable {
+            source: config_dir.to_path_buf(),
+            workspace: ANY_WORKSPACE.to_string(),
+            detail: "the state cross-reference is not implemented".to_string(),
+        }],
     }
 }
 
@@ -267,6 +403,10 @@ pub struct ScanReport {
     /// The canonicalized base every candidate was resolved under.
     pub base: PathBuf,
     pub candidates: Vec<Candidate>,
+    /// The state files and workspaces the cross-reference actually consulted.
+    /// A developer reading a preview can see the inventory the verdicts rest
+    /// on; prune requires the inventory it re-derives to agree with it.
+    pub state_inventory: StateInventorySummary,
 }
 
 /// A scan cannot start. Per-candidate problems are evidence, not errors — only
@@ -314,9 +454,15 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     let base = match roots.worktrees_base.canonicalize() {
         Ok(base) => base,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No worktrees root means no candidates, so there is nothing for a
+            // state cross-reference to exclude. The inventory is deliberately
+            // not read: it would name workspaces no candidate was compared
+            // against, which is the "checked" claim this module exists to keep
+            // honest.
             return Ok(ScanReport {
                 base: roots.worktrees_base.clone(),
                 candidates: Vec::new(),
+                state_inventory: StateInventorySummary::default(),
             });
         }
         Err(error) => {
@@ -332,7 +478,13 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     // rather than a generic recursive walker. A generic walker would weaken the
     // shape check, which is the first filter and the only thing bounding how
     // much of the filesystem this tool ever looks at.
-    let mut candidates = Vec::new();
+    //
+    // Pass one collects filesystem evidence and the workspace names actually
+    // present. Pass two adds state evidence, which cannot run first: the state
+    // inventory's expected-filename set is the UNION of the workspaces seen here
+    // with the ones discovered in the config directory.
+    let mut observed: Vec<(PathBuf, String, u64, Vec<Evidence>)> = Vec::new();
+    let mut workspaces = std::collections::BTreeSet::new();
     for workspace_entry in sorted_entries(&base).map_err(|error| ScanError::BaseUnreadable {
         path: base.clone(),
         detail: error.to_string(),
@@ -349,6 +501,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
         let Some(workspace) = workspace_entry.to_str().map(str::to_owned) else {
             continue;
         };
+        workspaces.insert(workspace.clone());
         let Ok(entries) = sorted_entries(&workspace_path) else {
             continue;
         };
@@ -366,16 +519,66 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             let Some(evidence) = candidate_evidence(&base, &path) else {
                 continue;
             };
-            candidates.push(Candidate {
-                path,
-                workspace: workspace.clone(),
-                repository_key,
-                verdict: classify(evidence),
-            });
+            observed.push((path, workspace.clone(), repository_key, evidence));
         }
     }
 
-    Ok(ScanReport { base, candidates })
+    // Pass two. The inventory is read ONCE for the whole scan, not per
+    // candidate: a single read is what makes "these workspaces were checked"
+    // one fact that every verdict in the report shares, and what lets one
+    // unreadable file withhold clearing from all of them at once.
+    let inventory = state_inventory(&roots.config_dir, &workspaces);
+
+    let mut candidates: Vec<Candidate> = observed
+        .into_iter()
+        .map(|(path, workspace, repository_key, mut evidence)| {
+            evidence.extend(inventory.uncertainty.iter().cloned());
+            sort_evidence(&mut evidence);
+            Candidate {
+                path,
+                workspace,
+                repository_key,
+                verdict: classify(evidence),
+            }
+        })
+        .collect();
+    // Sorted by (workspace, key) rather than by directory-iteration order, so
+    // two scans of an unchanged tree compare and serialize identically.
+    candidates.sort_by(|left, right| {
+        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+    });
+
+    Ok(ScanReport {
+        base,
+        candidates,
+        state_inventory: inventory.summary,
+    })
+}
+
+/// Canonical evidence ordering, so a report round-trip and a prune-time
+/// re-derivation compare by *content* rather than by the order two filesystem
+/// walks happened to observe things in.
+fn sort_evidence(evidence: &mut [Evidence]) {
+    evidence.sort_by_key(|signal| (signal.rank(), format!("{signal:?}")));
+}
+
+impl Evidence {
+    /// Stable ordering rank. Paired with the `Debug` rendering as a tiebreak so
+    /// two signals of the same kind (two state references, two unreadable
+    /// files) also order deterministically.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::ShapeMatch => 0,
+            Self::ReferencedByState { .. } => 1,
+            Self::NotReferencedByState { .. } => 2,
+            Self::StateUnreadable { .. } => 3,
+            Self::IsSymlink => 4,
+            Self::ContainsCheckout { .. } => 5,
+            Self::Empty => 6,
+            Self::NoGitdir => 7,
+            Self::GitDisownsIt { .. } => 8,
+        }
+    }
 }
 
 /// Directory entry names, sorted, so a report is stable across runs.
@@ -521,6 +724,11 @@ mod tests {
     fn not_referenced() -> Evidence {
         Evidence::NotReferencedByState {
             workspaces_checked: workspaces(),
+            files_checked: vec![
+                "daemon-state-claude.json".to_string(),
+                "state-claude.json".to_string(),
+            ],
+            files_absent: vec!["daemon-state-claude.json".to_string()],
         }
     }
 
@@ -694,6 +902,7 @@ mod tests {
                 Evidence::StateUnreadable {
                     source: PathBuf::from("/fixture/config/state-claude.json"),
                     workspace: "claude".to_string(),
+                    detail: "malformed".to_string(),
                 },
             ]);
             assert!(
@@ -703,166 +912,320 @@ mod tests {
         }
     }
 
+    use crate::persist::StateFile;
+    use crate::repository::{
+        CheckoutLifecycle, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
+        RetainedSessionState, RetainedStandaloneSessionState, SavedCheckout, SavedRepository,
+        SavedStandaloneSession, StandaloneLifecycle,
+    };
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    /// A tree shaped exactly like the real one, under a unique temp root.
+    /// Same convention as `git::tests::GitFixture`: an atomic counter in the
+    /// root name so parallel cases cannot collide, and a `Drop` that cleans
+    /// up and swallows its errors.
+    struct ScanFixture {
+        root: PathBuf,
+    }
+
+    impl ScanFixture {
+        fn new() -> Self {
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("baude-scan-test-{}-{sequence}", std::process::id()));
+            std::fs::create_dir(&root).expect("create unique scan fixture root");
+            std::fs::create_dir(root.join("worktrees")).expect("create fixture worktrees base");
+            std::fs::create_dir(root.join("config")).expect("create fixture config dir");
+            Self { root }
+        }
+
+        fn base(&self) -> PathBuf {
+            self.root.join("worktrees")
+        }
+
+        fn config(&self) -> PathBuf {
+            self.root.join("config")
+        }
+
+        fn roots(&self) -> ScanRoots {
+            ScanRoots {
+                worktrees_base: self.base(),
+                config_dir: self.config(),
+            }
+        }
+
+        /// Create `<base>/<workspace>/<relative>` and return it.
+        fn dir(&self, workspace: &str, relative: &str) -> PathBuf {
+            let path = self.base().join(workspace).join(relative);
+            std::fs::create_dir_all(&path).expect("create fixture directory");
+            path
+        }
+
+        fn workspace(&self, workspace: &str) -> PathBuf {
+            let path = self.base().join(workspace);
+            std::fs::create_dir_all(&path).expect("create fixture workspace");
+            path
+        }
+
+        /// A real single-commit repository, outside the worktrees base.
+        fn git_repo(&self, name: &str) -> PathBuf {
+            let repo = self.root.join(name);
+            std::fs::create_dir_all(&repo).expect("create fixture repo dir");
+            git_ok(&repo, &["init", "-q", "."]);
+            git_ok(&repo, &["config", "user.name", "Baude Test"]);
+            git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+            std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
+            git_ok(&repo, &["add", "tracked.txt"]);
+            git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
+            repo.canonicalize().expect("canonicalize fixture repo")
+        }
+    }
+
+    impl Drop for ScanFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("run fixture git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn scan_ok(fixture: &ScanFixture) -> ScanReport {
+        scan_at(&fixture.roots()).expect("scan a synthetic fixture root")
+    }
+
+    fn reported(report: &ScanReport) -> Vec<String> {
+        let mut names: Vec<String> = report
+            .candidates
+            .iter()
+            .map(|found| {
+                format!(
+                    "{}/{}",
+                    found.workspace,
+                    found
+                        .path
+                        .file_name()
+                        .expect("candidate has a final segment")
+                        .to_string_lossy()
+                )
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn candidate<'a>(report: &'a ScanReport, workspace: &str, name: &str) -> &'a Candidate {
+        report
+            .candidates
+            .iter()
+            .find(|found| found.workspace == workspace && found.path.ends_with(name))
+            .unwrap_or_else(|| panic!("candidate {workspace}/{name} missing from {report:?}"))
+    }
+
+    fn evidence(found: &Candidate) -> &[Evidence] {
+        match &found.verdict {
+            Verdict::Live { evidence } | Verdict::Indeterminate { evidence } => evidence,
+            Verdict::Removable { proof } => &proof.observed,
+        }
+    }
+
+    /// Path, type, length and mtime for every entry beneath `root`.
+    /// Reading a directory touches atime, never mtime, so a scan that
+    /// writes nothing leaves this value identical.
+    fn tree_snapshot(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).expect("read fixture directory");
+            for entry in entries {
+                let path = entry.expect("fixture directory entry").path();
+                let meta = std::fs::symlink_metadata(&path).expect("stat fixture entry");
+                let modified = meta
+                    .modified()
+                    .map(|time| format!("{time:?}"))
+                    .unwrap_or_else(|error| format!("{error}"));
+                out.push(format!(
+                    "{}|{:?}|{}|{modified}",
+                    path.display(),
+                    meta.file_type(),
+                    meta.len()
+                ));
+                if meta.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Persisted-state fixtures.
+    ///
+    /// State files are written with a plain `fs::write` of the serialized
+    /// `StateFile` rather than through `persist::save_current_at`, which calls
+    /// `hold_state_lock` and would leave a `.state-<ws>.json.lock` in the very
+    /// directory these cases assert is untouched.
+    impl ScanFixture {
+        fn write_state(&self, file: &str, state: RepositoryState) {
+            let bytes =
+                serde_json::to_vec_pretty(&StateFile::new(state)).expect("serialize fixture state");
+            std::fs::write(self.config().join(file), bytes).expect("write fixture state file");
+        }
+
+        fn write_raw(&self, file: &str, bytes: &[u8]) {
+            std::fs::write(self.config().join(file), bytes).expect("write raw fixture file");
+        }
+
+        /// A directory outside the worktrees base, standing in for a repository
+        /// the developer keeps in `~/Code` — the shape the two real
+        /// `claude/repository-1` and `repository-5` records have.
+        fn external(&self, name: &str) -> PathBuf {
+            let path = self.root.join("external").join(name);
+            std::fs::create_dir_all(&path).expect("create external fixture path");
+            path.canonicalize().expect("canonicalize external path")
+        }
+    }
+
+    /// Builds a `RepositoryState` that satisfies `RepositoryState::validate`,
+    /// so every fixture exercises the same strict loader production uses.
+    struct StateBuilder {
+        state: RepositoryState,
+    }
+
+    impl StateBuilder {
+        fn new() -> Self {
+            Self {
+                state: RepositoryState::default(),
+            }
+        }
+
+        fn order(&mut self) -> u64 {
+            let order = self.state.next_first_seen_order;
+            self.state.next_first_seen_order += 1;
+            order
+        }
+
+        /// A repository recorded under an EXACT key, whose observed main
+        /// worktree is external to the managed base.
+        fn repository(mut self, key: u64, main_worktree: &Path) -> Self {
+            assert!(
+                key >= self.state.next_repository_key,
+                "fixture repository keys are allocated in ascending order"
+            );
+            self.state.next_repository_key = key;
+            let key = self
+                .state
+                .allocate_repository_key()
+                .expect("allocate fixture repository key");
+            let order = self.order();
+            self.state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: PersistedPath::from_path(&main_worktree.join(".git")),
+                observed_main_worktree: PersistedPath::from_path(main_worktree),
+                first_seen_order: order,
+                health: RepositoryHealth::Available,
+            });
+            self
+        }
+
+        /// A checkout of `repository_key` at `path`. `managed` is
+        /// `managed_by_baude`; the real repo-1/repo-5 records carry `false`,
+        /// which must not weaken the protection their key supplies.
+        fn checkout(mut self, repository_key: u64, path: &Path, managed: bool) -> Self {
+            let repository = self
+                .state
+                .repositories
+                .iter()
+                .find(|candidate| candidate.key.get() == repository_key)
+                .cloned()
+                .expect("fixture checkout references a recorded repository");
+            let main = repository.observed_main_worktree.to_path_buf();
+            let key = self
+                .state
+                .allocate_checkout_key()
+                .expect("allocate fixture checkout key");
+            let order = self.order();
+            let role = if path == main {
+                CheckoutRole::Main
+            } else {
+                CheckoutRole::ManagedBranch
+            };
+            self.state.checkouts.push(SavedCheckout::new(
+                key,
+                repository.key,
+                role,
+                managed,
+                PersistedPath::from_path(path),
+                Some("main".to_string()),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: "fixture".to_string(),
+                    cwd: PersistedPath::from_path(path),
+                    repo_root: repository.observed_main_worktree.clone(),
+                    branch: Some("main".to_string()),
+                    is_worktree: path != main,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            self
+        }
+
+        /// A non-Git standalone session. Its `canonical_path` is an ownership
+        /// claim exactly like a checkout's `observed_path`.
+        fn standalone(mut self, path: &Path) -> Self {
+            let key = self
+                .state
+                .allocate_standalone_key()
+                .expect("allocate fixture standalone key");
+            let order = self.order();
+            self.state
+                .standalone_sessions
+                .push(SavedStandaloneSession::new(
+                    key,
+                    PersistedPath::from_path(path),
+                    order,
+                    StandaloneLifecycle::Inactive,
+                    None,
+                    RetainedStandaloneSessionState {
+                        name: "fixture".to_string(),
+                        shell_open: false,
+                        archived: false,
+                        archived_by_user: false,
+                        resume_id: None,
+                        ever_launched: false,
+                    },
+                ));
+            self
+        }
+
+        fn build(self) -> RepositoryState {
+            self.state
+        }
+    }
+
     /// Enumeration and filesystem classification, always against a synthetic
     /// tree passed through [`ScanRoots`]. No case here calls [`scan`] or
     /// resolves a developer root.
     mod enumeration {
         use super::*;
-        use std::path::Path;
-        use std::process::Command;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-        /// A tree shaped exactly like the real one, under a unique temp root.
-        /// Same convention as `git::tests::GitFixture`: an atomic counter in the
-        /// root name so parallel cases cannot collide, and a `Drop` that cleans
-        /// up and swallows its errors.
-        struct ScanFixture {
-            root: PathBuf,
-        }
-
-        impl ScanFixture {
-            fn new() -> Self {
-                let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-                let root = std::env::temp_dir()
-                    .join(format!("baude-scan-test-{}-{sequence}", std::process::id()));
-                std::fs::create_dir(&root).expect("create unique scan fixture root");
-                std::fs::create_dir(root.join("worktrees")).expect("create fixture worktrees base");
-                std::fs::create_dir(root.join("config")).expect("create fixture config dir");
-                Self { root }
-            }
-
-            fn base(&self) -> PathBuf {
-                self.root.join("worktrees")
-            }
-
-            fn config(&self) -> PathBuf {
-                self.root.join("config")
-            }
-
-            fn roots(&self) -> ScanRoots {
-                ScanRoots {
-                    worktrees_base: self.base(),
-                    config_dir: self.config(),
-                }
-            }
-
-            /// Create `<base>/<workspace>/<relative>` and return it.
-            fn dir(&self, workspace: &str, relative: &str) -> PathBuf {
-                let path = self.base().join(workspace).join(relative);
-                std::fs::create_dir_all(&path).expect("create fixture directory");
-                path
-            }
-
-            fn workspace(&self, workspace: &str) -> PathBuf {
-                let path = self.base().join(workspace);
-                std::fs::create_dir_all(&path).expect("create fixture workspace");
-                path
-            }
-
-            /// A real single-commit repository, outside the worktrees base.
-            fn git_repo(&self, name: &str) -> PathBuf {
-                let repo = self.root.join(name);
-                std::fs::create_dir_all(&repo).expect("create fixture repo dir");
-                git_ok(&repo, &["init", "-q", "."]);
-                git_ok(&repo, &["config", "user.name", "Baude Test"]);
-                git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
-                std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
-                git_ok(&repo, &["add", "tracked.txt"]);
-                git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
-                repo.canonicalize().expect("canonicalize fixture repo")
-            }
-        }
-
-        impl Drop for ScanFixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.root);
-            }
-        }
-
-        fn git_ok(cwd: &Path, args: &[&str]) {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(cwd)
-                .args(args)
-                .output()
-                .expect("run fixture git command");
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        fn scan_ok(fixture: &ScanFixture) -> ScanReport {
-            scan_at(&fixture.roots()).expect("scan a synthetic fixture root")
-        }
-
-        fn reported(report: &ScanReport) -> Vec<String> {
-            let mut names: Vec<String> = report
-                .candidates
-                .iter()
-                .map(|found| {
-                    format!(
-                        "{}/{}",
-                        found.workspace,
-                        found
-                            .path
-                            .file_name()
-                            .expect("candidate has a final segment")
-                            .to_string_lossy()
-                    )
-                })
-                .collect();
-            names.sort();
-            names
-        }
-
-        fn candidate<'a>(report: &'a ScanReport, workspace: &str, name: &str) -> &'a Candidate {
-            report
-                .candidates
-                .iter()
-                .find(|found| found.workspace == workspace && found.path.ends_with(name))
-                .unwrap_or_else(|| panic!("candidate {workspace}/{name} missing from {report:?}"))
-        }
-
-        fn evidence(found: &Candidate) -> &[Evidence] {
-            match &found.verdict {
-                Verdict::Live { evidence } | Verdict::Indeterminate { evidence } => evidence,
-                Verdict::Removable { proof } => &proof.observed,
-            }
-        }
-
-        /// Path, type, length and mtime for every entry beneath `root`.
-        /// Reading a directory touches atime, never mtime, so a scan that
-        /// writes nothing leaves this value identical.
-        fn tree_snapshot(root: &Path) -> Vec<String> {
-            let mut out = Vec::new();
-            let mut stack = vec![root.to_path_buf()];
-            while let Some(dir) = stack.pop() {
-                let entries = std::fs::read_dir(&dir).expect("read fixture directory");
-                for entry in entries {
-                    let path = entry.expect("fixture directory entry").path();
-                    let meta = std::fs::symlink_metadata(&path).expect("stat fixture entry");
-                    let modified = meta
-                        .modified()
-                        .map(|time| format!("{time:?}"))
-                        .unwrap_or_else(|error| format!("{error}"));
-                    out.push(format!(
-                        "{}|{:?}|{}|{modified}",
-                        path.display(),
-                        meta.file_type(),
-                        meta.len()
-                    ));
-                    if meta.is_dir() {
-                        stack.push(path);
-                    }
-                }
-            }
-            out.sort();
-            out
-        }
 
         #[test]
         fn returns_one_candidate_per_shaped_directory() {
@@ -1046,11 +1409,15 @@ mod tests {
             );
         }
 
-        /// Until plan 08-05 supplies the state cross-reference there is no
-        /// source of `NotReferencedByState`, so no scanned candidate can be
-        /// cleared — by construction, not by luck.
+        /// Successor to plan 08-04's `no_scanned_candidate_is_removable_without_
+        /// state_evidence`, which held only because the scanner emitted no state
+        /// signal at all. Plan 08-05 supplies one, so the guard is restated at
+        /// the level that still matters: the state check is never *skipped*.
+        /// Every candidate carries a reference, a checked non-reference, or the
+        /// uncertainty that prevented both — and the second conjunct of the
+        /// predicate can never be satisfied by silence.
         #[test]
-        fn no_scanned_candidate_is_removable_without_state_evidence() {
+        fn every_scanned_candidate_carries_a_state_signal() {
             let fixture = ScanFixture::new();
             fixture.dir("claude", "repository-1");
             fixture.dir("claude", "repository-2/primary-2");
@@ -1061,8 +1428,13 @@ mod tests {
             assert_eq!(report.candidates.len(), 3);
             for found in &report.candidates {
                 assert!(
-                    !matches!(found.verdict, Verdict::Removable { .. }),
-                    "scan cannot clear without state evidence: {found:?}"
+                    evidence(found).iter().any(|signal| matches!(
+                        signal,
+                        Evidence::ReferencedByState { .. }
+                            | Evidence::NotReferencedByState { .. }
+                            | Evidence::StateUnreadable { .. }
+                    )),
+                    "the state cross-reference is never skipped: {found:?}"
                 );
             }
         }
@@ -1118,6 +1490,650 @@ mod tests {
             let report = scan_at(&roots).expect("a missing root is not an error");
 
             assert!(report.candidates.is_empty());
+        }
+    }
+
+    /// The persisted-state cross-reference: the only *negative* ownership
+    /// evidence the scan has, and the only signal that can clear a candidate.
+    ///
+    /// Every case here writes its state files into a fixture config directory.
+    /// Nothing in this module resolves [`crate::persist::config_dir`], and
+    /// nothing writes through [`crate::persist`] — a `save` would take the state
+    /// lock and drop a `.state-<ws>.json.lock` into the directory the read-only
+    /// cases assert is untouched.
+    mod state {
+        use super::*;
+        use crate::workspace::DEFAULT;
+
+        /// Only the signals that speak about persisted state.
+        fn state_signals(found: &Candidate) -> Vec<Evidence> {
+            evidence(found)
+                .iter()
+                .filter(|signal| {
+                    matches!(
+                        signal,
+                        Evidence::ReferencedByState { .. }
+                            | Evidence::NotReferencedByState { .. }
+                            | Evidence::StateUnreadable { .. }
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn references(found: &Candidate) -> Vec<(String, Option<u64>, ReferenceMatch)> {
+            evidence(found)
+                .iter()
+                .filter_map(|signal| match signal {
+                    Evidence::ReferencedByState {
+                        workspace,
+                        repository_key,
+                        matched,
+                    } => Some((workspace.clone(), *repository_key, *matched)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn is_removable(found: &Candidate) -> bool {
+            matches!(found.verdict, Verdict::Removable { .. })
+        }
+
+        fn is_live(found: &Candidate) -> bool {
+            matches!(found.verdict, Verdict::Live { .. })
+        }
+
+        /// A repository recorded in `workspace` under `key`, with its real
+        /// checkout outside the managed base — the shape the developer's two
+        /// surviving `claude` repository records actually have.
+        fn external_repository(fixture: &ScanFixture, key: u64, name: &str) -> RepositoryState {
+            let main = fixture.external(name);
+            StateBuilder::new().repository(key, &main).build()
+        }
+
+        // ---- repository-key ownership ------------------------------------
+
+        #[test]
+        fn a_recorded_repository_key_proves_its_candidate_live() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-7");
+            fixture.write_state(
+                "state-claude.json",
+                external_repository(&fixture, 7, "repo-a"),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-7");
+
+            assert!(
+                is_live(found),
+                "a recorded repository key is positive proof of liveness: {found:?}"
+            );
+            assert!(
+                references(found).contains(&("claude".to_string(), Some(7), ReferenceMatch::Key)),
+                "the key match must be named in the evidence: {found:?}"
+            );
+        }
+
+        /// Keys are allocated per workspace, so repository 7 in `opencode` says
+        /// nothing at all about repository 7 in `claude`. Reading them as one
+        /// namespace would be a false *protection*, which is the safe direction —
+        /// but it would also mask a genuine leak forever.
+        #[test]
+        fn a_repository_key_is_scoped_to_its_own_workspace() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-7");
+            fixture.workspace("opencode");
+            fixture.write_state(
+                "state-opencode.json",
+                external_repository(&fixture, 7, "repo-a"),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-7");
+
+            assert!(
+                references(found).is_empty(),
+                "another workspace's key 7 is not a claim on claude/repository-7: {found:?}"
+            );
+            assert!(
+                is_removable(found),
+                "an empty, unreferenced, shaped directory clears: {found:?}"
+            );
+        }
+
+        /// `repository-1` and `repository-10` differ by a suffix, and a prefix
+        /// comparison anywhere in the key path would silently protect 1433
+        /// directories behind one live record.
+        #[test]
+        fn a_recorded_key_does_not_protect_a_key_that_merely_starts_with_it() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-1");
+            fixture.dir("claude", "repository-10");
+            fixture.write_state(
+                "state-claude.json",
+                external_repository(&fixture, 1, "repo-a"),
+            );
+
+            let report = scan_ok(&fixture);
+
+            assert!(is_live(candidate(&report, "claude", "repository-1")));
+            assert!(
+                is_removable(candidate(&report, "claude", "repository-10")),
+                "key 1 is not a claim on key 10: {:?}",
+                candidate(&report, "claude", "repository-10")
+            );
+        }
+
+        // ---- path ownership ----------------------------------------------
+
+        /// A standalone session carries no repository key, so this case isolates
+        /// the path rule from the key rule entirely.
+        #[test]
+        fn an_exactly_recorded_path_proves_its_candidate_live() {
+            let fixture = ScanFixture::new();
+            let candidate_path = fixture.dir("claude", "repository-9");
+            fixture.write_state(
+                "state-claude.json",
+                StateBuilder::new().standalone(&candidate_path).build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(is_live(found), "{found:?}");
+            assert!(
+                references(found).contains(&(
+                    "claude".to_string(),
+                    None,
+                    ReferenceMatch::ExactPath
+                )),
+                "an exact path match carries no repository key: {found:?}"
+            );
+        }
+
+        /// The managed shape puts the checkout one level *inside* the candidate,
+        /// so the recorded path is a descendant of the directory being judged.
+        /// This is the single most important path case: the candidate itself is
+        /// dirs-only and therefore reads as `Empty`.
+        #[test]
+        fn a_checkout_recorded_beneath_a_candidate_proves_it_live() {
+            let fixture = ScanFixture::new();
+            let checkout = fixture.dir("claude", "repository-9/primary-9");
+            let main = fixture.external("repo-a");
+            fixture.write_state(
+                "state-claude.json",
+                StateBuilder::new()
+                    .repository(1, &main)
+                    .checkout(1, &checkout, true)
+                    .build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(
+                is_live(found),
+                "an empty-looking parent holding a recorded checkout is live: {found:?}"
+            );
+            assert!(
+                references(found).contains(&(
+                    "claude".to_string(),
+                    Some(1),
+                    ReferenceMatch::Descendant
+                )),
+                "{found:?}"
+            );
+        }
+
+        /// A recorded path that *contains* the candidate. Defensive rather than
+        /// load-bearing in production, and cheap: whichever direction the overlap
+        /// runs, a deletion would destroy recorded state.
+        #[test]
+        fn a_path_recorded_above_a_candidate_proves_it_live() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            let workspace_dir = fixture.workspace("claude");
+            fixture.write_state(
+                "state-claude.json",
+                StateBuilder::new().standalone(&workspace_dir).build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(is_live(found), "{found:?}");
+            assert!(
+                references(found).contains(&("claude".to_string(), None, ReferenceMatch::Ancestor)),
+                "{found:?}"
+            );
+        }
+
+        /// Path claims are matched across every workspace's state. A path is a
+        /// path: the deletion does not care which file recorded it, and one
+        /// workspace's state can legitimately name a directory under another's.
+        #[test]
+        fn a_path_recorded_in_another_workspaces_state_still_protects() {
+            let fixture = ScanFixture::new();
+            let candidate_path = fixture.dir("claude", "repository-9");
+            fixture.workspace("opencode");
+            fixture.write_state(
+                "state-opencode.json",
+                StateBuilder::new().standalone(&candidate_path).build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(
+                is_live(found),
+                "path ownership crosses workspaces even though keys do not: {found:?}"
+            );
+            assert!(
+                references(found).contains(&(
+                    "opencode".to_string(),
+                    None,
+                    ReferenceMatch::ExactPath
+                )),
+                "{found:?}"
+            );
+        }
+
+        /// The scan canonicalizes its base; persisted paths were recorded
+        /// through whatever form the process saw at the time. On macOS the
+        /// fixture root itself reaches the tree through `/var -> /private/var`,
+        /// so comparing the recorded bytes alone would miss every match.
+        #[test]
+        fn a_recorded_path_reaching_the_tree_through_a_symlink_still_matches() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            // Deliberately NOT canonicalized: the uncanonical form is what a
+            // process that never resolved its own root would have persisted.
+            let uncanonical = fixture.base().join("claude").join("repository-9");
+            fixture.write_state(
+                "state-claude.json",
+                StateBuilder::new().standalone(&uncanonical).build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(
+                is_live(found),
+                "the recorded path must be resolved before comparison: {found:?}"
+            );
+        }
+
+        /// A path recorded for a directory that no longer exists still has to be
+        /// placed: its leaf cannot be canonicalized, but its surviving ancestor
+        /// can, and the candidate it names may still be on disk beneath it.
+        #[test]
+        fn a_recorded_path_whose_leaf_is_gone_is_still_placed() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            let missing = fixture
+                .base()
+                .join("claude")
+                .join("repository-9")
+                .join("primary-9");
+            fixture.write_state(
+                "state-claude.json",
+                StateBuilder::new().standalone(&missing).build(),
+            );
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(
+                is_live(found),
+                "a vanished checkout still proves its parent was in use: {found:?}"
+            );
+            assert!(
+                references(found).contains(&(
+                    "claude".to_string(),
+                    None,
+                    ReferenceMatch::Descendant
+                )),
+                "{found:?}"
+            );
+        }
+
+        // ---- inventory completeness --------------------------------------
+
+        /// T-08-16, stated directly. A file that could not be read is not a file
+        /// that said "no", and the uncertainty is global: state in one workspace
+        /// can name a path in another, so a failed read in `opencode` must
+        /// withhold clearance from `claude` too.
+        #[test]
+        fn one_unreadable_state_file_withholds_clearance_from_every_candidate() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.workspace("opencode");
+            fixture.dir("opencode", "repository-3");
+            fixture.write_raw("state-opencode.json", b"{ this is not json");
+
+            let report = scan_ok(&fixture);
+
+            assert!(!report.state_inventory.complete);
+            for found in &report.candidates {
+                assert!(
+                    !is_removable(found),
+                    "an incomplete inventory clears nothing: {found:?}"
+                );
+                assert!(
+                    state_signals(found)
+                        .iter()
+                        .any(|signal| matches!(signal, Evidence::StateUnreadable { .. })),
+                    "the uncertainty must be attached to every candidate: {found:?}"
+                );
+            }
+        }
+
+        /// Every derived filename is read on its own. A readable
+        /// `state-claude.json` must not be allowed to stand in for an unreadable
+        /// `daemon-state-claude.json`: falling back is how a daemon-recorded
+        /// checkout becomes invisible.
+        #[test]
+        fn a_readable_state_file_does_not_excuse_an_unreadable_sibling() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            fixture.write_raw("daemon-state-claude.json", b"\x00\x01 not json at all");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+
+            assert!(!report.state_inventory.complete);
+            assert!(
+                !is_removable(found),
+                "the sibling read failed, so nothing was proven: {found:?}"
+            );
+        }
+
+        /// An interrupted atomic write leaves `.state-<ws>.json.tmp-<pid>-<n>`
+        /// behind — six of them sit in the developer's real config directory
+        /// today. Those bytes are state and can name candidates, so an entry
+        /// that is state-like but not attributable to a derived filename makes
+        /// the inventory incomplete rather than being quietly ignored.
+        #[test]
+        fn an_orphaned_temp_state_file_makes_the_inventory_incomplete() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_raw(".state-claude.json.tmp-9999-1", b"{}");
+
+            let report = scan_ok(&fixture);
+
+            assert!(
+                !report.state_inventory.complete,
+                "an unattributable state-like entry is uncertainty: {report:?}"
+            );
+            assert!(!is_removable(candidate(&report, "claude", "repository-9")));
+        }
+
+        /// A lock file is an advisory marker with no state in it, so it must not
+        /// poison the inventory. Production holds one whenever the TUI is
+        /// running; treating it as uncertainty would make the tool useless
+        /// exactly when a developer reaches for it.
+        #[test]
+        fn a_state_lock_file_does_not_make_the_inventory_incomplete() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            fixture.write_raw(".state-claude.json.lock", b"");
+
+            let report = scan_ok(&fixture);
+
+            assert!(report.state_inventory.complete, "{report:?}");
+            assert!(is_removable(candidate(&report, "claude", "repository-9")));
+        }
+
+        #[test]
+        fn an_unrelated_config_file_does_not_make_the_inventory_incomplete() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            fixture.write_raw("config.toml", b"theme = \"dark\"\n");
+            std::fs::create_dir(fixture.config().join("logs")).expect("create logs dir");
+
+            let report = scan_ok(&fixture);
+
+            assert!(report.state_inventory.complete, "{report:?}");
+            assert!(is_removable(candidate(&report, "claude", "repository-9")));
+        }
+
+        /// A config directory that does not exist is not a checked absence of
+        /// every state file — it means the scan is pointed somewhere other than
+        /// where state lives. Fail closed.
+        #[test]
+        fn a_missing_config_directory_withholds_clearance() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            let roots = ScanRoots {
+                worktrees_base: fixture.base(),
+                config_dir: fixture.root.join("never-created"),
+            };
+
+            let report = scan_at(&roots).expect("a missing config dir is evidence, not an error");
+
+            assert!(!report.state_inventory.complete);
+            assert!(!is_removable(candidate(&report, "claude", "repository-9")));
+        }
+
+        // ---- which files get consulted -----------------------------------
+
+        /// The union's first half: a workspace with persisted state but no
+        /// directory under the worktrees base.
+        #[test]
+        fn a_workspace_known_only_from_the_config_directory_is_checked() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+            fixture.write_state("state-opencode.json", RepositoryState::default());
+
+            let report = scan_ok(&fixture);
+
+            assert!(
+                report
+                    .state_inventory
+                    .workspaces_checked
+                    .contains(&"opencode".to_string()),
+                "{:?}",
+                report.state_inventory
+            );
+            assert!(
+                report
+                    .state_inventory
+                    .files_checked
+                    .contains(&"daemon-state-opencode.json".to_string()),
+                "both state bases are derived for a discovered workspace: {:?}",
+                report.state_inventory
+            );
+        }
+
+        /// The union's second half: a workspace with a directory under the base
+        /// but no state file yet. Deriving names from the config directory alone
+        /// would turn "never written" into "never checked".
+        #[test]
+        fn a_workspace_known_only_from_the_worktrees_base_is_checked() {
+            let fixture = ScanFixture::new();
+            fixture.dir("codex", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+
+            let report = scan_ok(&fixture);
+
+            assert!(
+                report
+                    .state_inventory
+                    .workspaces_checked
+                    .contains(&"codex".to_string()),
+                "{:?}",
+                report.state_inventory
+            );
+            assert!(
+                report
+                    .state_inventory
+                    .files_absent
+                    .contains(&"state-codex.json".to_string()),
+                "its absent file is a CHECKED absence: {:?}",
+                report.state_inventory
+            );
+        }
+
+        #[test]
+        fn the_default_workspace_is_always_checked() {
+            let fixture = ScanFixture::new();
+            fixture.dir("codex", "repository-9");
+
+            let report = scan_ok(&fixture);
+
+            assert!(
+                report
+                    .state_inventory
+                    .workspaces_checked
+                    .contains(&DEFAULT.to_string()),
+                "{:?}",
+                report.state_inventory
+            );
+        }
+
+        /// The default workspace kept unsuffixed filenames for backward
+        /// compatibility, and `Workspace::legacy_state_file` is the only place
+        /// that knows it. A reference living there must protect exactly as well.
+        #[test]
+        fn the_legacy_unsuffixed_state_file_is_read_for_the_default_workspace() {
+            let fixture = ScanFixture::new();
+            fixture.dir(DEFAULT, "repository-7");
+            fixture.write_state("state.json", external_repository(&fixture, 7, "repo-a"));
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, DEFAULT, "repository-7");
+
+            assert!(
+                report
+                    .state_inventory
+                    .files_checked
+                    .contains(&"state.json".to_string()),
+                "{:?}",
+                report.state_inventory
+            );
+            assert!(
+                is_live(found),
+                "a legacy-file reference protects exactly as well: {found:?}"
+            );
+        }
+
+        /// ...and only for the default workspace. Deriving a bare `state.json`
+        /// for `opencode` would attribute one workspace's records to another.
+        #[test]
+        fn no_legacy_file_is_derived_for_a_non_default_workspace() {
+            let fixture = ScanFixture::new();
+            fixture.dir("opencode", "repository-9");
+            fixture.write_state("state-opencode.json", RepositoryState::default());
+            fixture.write_state("state-claude.json", RepositoryState::default());
+
+            let report = scan_ok(&fixture);
+            let expected = vec![
+                "daemon-state-claude.json".to_string(),
+                "daemon-state-opencode.json".to_string(),
+                "daemon-state.json".to_string(),
+                "state-claude.json".to_string(),
+                "state-opencode.json".to_string(),
+                "state.json".to_string(),
+            ];
+
+            assert_eq!(
+                report.state_inventory.files_checked, expected,
+                "exactly two bases per workspace, plus the default's two legacy names"
+            );
+        }
+
+        // ---- what the negative signal carries ----------------------------
+
+        #[test]
+        fn not_referenced_names_the_inventory_it_rests_on() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+            let signals = state_signals(found);
+            let [Evidence::NotReferencedByState {
+                workspaces_checked,
+                files_checked,
+                files_absent,
+            }] = signals.as_slice()
+            else {
+                panic!("expected exactly one negative state signal: {signals:?}");
+            };
+
+            assert_eq!(workspaces_checked, &vec![DEFAULT.to_string()]);
+            assert_eq!(
+                files_checked,
+                &vec![
+                    "daemon-state-claude.json".to_string(),
+                    "daemon-state.json".to_string(),
+                    "state-claude.json".to_string(),
+                    "state.json".to_string(),
+                ],
+                "sorted, so two reports of an unchanged tree compare equal"
+            );
+            assert_eq!(
+                files_absent,
+                &vec![
+                    "daemon-state-claude.json".to_string(),
+                    "daemon-state.json".to_string(),
+                    "state.json".to_string(),
+                ],
+                "the absences are enumerated, never left implicit"
+            );
+        }
+
+        /// The inventory is read once for the whole scan, so every candidate
+        /// rests on the identical fact. Two candidates disagreeing about what
+        /// was checked would mean the cross-reference ran per candidate and
+        /// could observe the directory mid-change.
+        #[test]
+        fn every_candidate_rests_on_one_shared_inventory() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.dir("claude", "repository-10");
+            fixture.dir("opencode", "repository-2");
+            fixture.write_state("state-claude.json", RepositoryState::default());
+
+            let report = scan_ok(&fixture);
+            let signals: Vec<_> = report.candidates.iter().map(state_signals).collect();
+
+            assert_eq!(signals.len(), 3);
+            assert!(
+                signals.windows(2).all(|pair| pair[0] == pair[1]),
+                "one inventory, one answer: {signals:?}"
+            );
+        }
+
+        /// The read-only contract (D-16) extended to the config directory now
+        /// that it is actually opened. No lock, no temp file, no mtime change.
+        #[test]
+        fn the_state_cross_reference_writes_nothing() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-9");
+            fixture.dir("opencode", "repository-2");
+            fixture.write_state(
+                "state-claude.json",
+                external_repository(&fixture, 9, "repo-a"),
+            );
+            fixture.write_state("state-opencode.json", RepositoryState::default());
+            fixture.write_raw(".state-claude.json.lock", b"");
+
+            let before = tree_snapshot(&fixture.config());
+            let report = scan_ok(&fixture);
+            assert!(!report.candidates.is_empty());
+
+            assert_eq!(
+                tree_snapshot(&fixture.config()),
+                before,
+                "reading state must not take the lock or leave a temp file"
+            );
         }
     }
 }
