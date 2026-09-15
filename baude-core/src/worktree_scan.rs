@@ -234,6 +234,85 @@ pub fn classify(evidence: Vec<Evidence>) -> Verdict {
     }
 }
 
+/// The two roots a scan reads. Both are explicit so filesystem tests can pass
+/// synthetic roots and never resolve a developer directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanRoots {
+    /// The managed-worktree root to enumerate.
+    pub worktrees_base: PathBuf,
+    /// The config directory holding every workspace's state files. Read by
+    /// plan 08-05's state cross-reference; enumeration itself never opens it.
+    pub config_dir: PathBuf,
+}
+
+/// One shaped directory found under the worktrees root, with the conclusion
+/// drawn about it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Candidate {
+    /// The candidate's path, resolved under the canonicalized base.
+    pub path: PathBuf,
+    /// The workspace segment it sits under.
+    pub workspace: String,
+    /// The `repository-<key>` key, parsed as a `u64`.
+    pub repository_key: u64,
+    /// The verdict, which carries the evidence that produced it.
+    pub verdict: Verdict,
+}
+
+/// The output of a scan. This is the tool's *only* output: nothing is created,
+/// modified or removed to produce it (D-16).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScanReport {
+    /// The canonicalized base every candidate was resolved under.
+    pub base: PathBuf,
+    pub candidates: Vec<Candidate>,
+}
+
+/// A scan cannot start. Per-candidate problems are evidence, not errors — only
+/// a base that cannot be read at all stops the scan.
+#[derive(Debug)]
+pub enum ScanError {
+    BaseUnreadable { path: PathBuf, detail: String },
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BaseUnreadable { path, detail } => {
+                write!(
+                    f,
+                    "managed worktree root {} could not be read: {detail}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+/// Scan the developer's real managed-worktree root.
+///
+/// The production wrapper, and the only place a real root is resolved. Every
+/// test calls [`scan_at`] with synthetic roots instead.
+pub fn scan() -> Result<ScanReport, ScanError> {
+    scan_at(&ScanRoots {
+        worktrees_base: crate::git::real_worktrees_base(),
+        config_dir: crate::persist::config_dir(),
+    })
+}
+
+/// Enumerate and classify candidates under an explicit worktrees root.
+///
+/// Read-only, unconditionally: no temporary file, no lock, no probe directory,
+/// not even to test writability.
+pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
+    todo!(
+        "plan 08-04 task 3 enumerates {} read-only",
+        roots.worktrees_base.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +503,424 @@ mod tests {
                 matches!(verdict, Verdict::Indeterminate { .. }),
                 "an unreadable inventory blocks clearing: {verdict:?}"
             );
+        }
+    }
+
+    /// Enumeration and filesystem classification, always against a synthetic
+    /// tree passed through [`ScanRoots`]. No case here calls [`scan`] or
+    /// resolves a developer root.
+    mod enumeration {
+        use super::*;
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+        /// A tree shaped exactly like the real one, under a unique temp root.
+        /// Same convention as `git::tests::GitFixture`: an atomic counter in the
+        /// root name so parallel cases cannot collide, and a `Drop` that cleans
+        /// up and swallows its errors.
+        struct ScanFixture {
+            root: PathBuf,
+        }
+
+        impl ScanFixture {
+            fn new() -> Self {
+                let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir()
+                    .join(format!("baude-scan-test-{}-{sequence}", std::process::id()));
+                std::fs::create_dir(&root).expect("create unique scan fixture root");
+                std::fs::create_dir(root.join("worktrees")).expect("create fixture worktrees base");
+                std::fs::create_dir(root.join("config")).expect("create fixture config dir");
+                Self { root }
+            }
+
+            fn base(&self) -> PathBuf {
+                self.root.join("worktrees")
+            }
+
+            fn config(&self) -> PathBuf {
+                self.root.join("config")
+            }
+
+            fn roots(&self) -> ScanRoots {
+                ScanRoots {
+                    worktrees_base: self.base(),
+                    config_dir: self.config(),
+                }
+            }
+
+            /// Create `<base>/<workspace>/<relative>` and return it.
+            fn dir(&self, workspace: &str, relative: &str) -> PathBuf {
+                let path = self.base().join(workspace).join(relative);
+                std::fs::create_dir_all(&path).expect("create fixture directory");
+                path
+            }
+
+            fn workspace(&self, workspace: &str) -> PathBuf {
+                let path = self.base().join(workspace);
+                std::fs::create_dir_all(&path).expect("create fixture workspace");
+                path
+            }
+
+            /// A real single-commit repository, outside the worktrees base.
+            fn git_repo(&self, name: &str) -> PathBuf {
+                let repo = self.root.join(name);
+                std::fs::create_dir_all(&repo).expect("create fixture repo dir");
+                git_ok(&repo, &["init", "-q", "."]);
+                git_ok(&repo, &["config", "user.name", "Baude Test"]);
+                git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+                std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
+                git_ok(&repo, &["add", "tracked.txt"]);
+                git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
+                repo.canonicalize().expect("canonicalize fixture repo")
+            }
+        }
+
+        impl Drop for ScanFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        fn git_ok(cwd: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("run fixture git command");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn scan_ok(fixture: &ScanFixture) -> ScanReport {
+            scan_at(&fixture.roots()).expect("scan a synthetic fixture root")
+        }
+
+        fn reported(report: &ScanReport) -> Vec<String> {
+            let mut names: Vec<String> = report
+                .candidates
+                .iter()
+                .map(|found| {
+                    format!(
+                        "{}/{}",
+                        found.workspace,
+                        found
+                            .path
+                            .file_name()
+                            .expect("candidate has a final segment")
+                            .to_string_lossy()
+                    )
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn candidate<'a>(report: &'a ScanReport, workspace: &str, name: &str) -> &'a Candidate {
+            report
+                .candidates
+                .iter()
+                .find(|found| found.workspace == workspace && found.path.ends_with(name))
+                .unwrap_or_else(|| panic!("candidate {workspace}/{name} missing from {report:?}"))
+        }
+
+        fn evidence(found: &Candidate) -> &[Evidence] {
+            match &found.verdict {
+                Verdict::Live { evidence } | Verdict::Indeterminate { evidence } => evidence,
+                Verdict::Removable { proof } => &proof.observed,
+            }
+        }
+
+        /// Path, type, length and mtime for every entry beneath `root`.
+        /// Reading a directory touches atime, never mtime, so a scan that
+        /// writes nothing leaves this value identical.
+        fn tree_snapshot(root: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let entries = std::fs::read_dir(&dir).expect("read fixture directory");
+                for entry in entries {
+                    let path = entry.expect("fixture directory entry").path();
+                    let meta = std::fs::symlink_metadata(&path).expect("stat fixture entry");
+                    let modified = meta
+                        .modified()
+                        .map(|time| format!("{time:?}"))
+                        .unwrap_or_else(|error| format!("{error}"));
+                    out.push(format!(
+                        "{}|{:?}|{}|{modified}",
+                        path.display(),
+                        meta.file_type(),
+                        meta.len()
+                    ));
+                    if meta.is_dir() {
+                        stack.push(path);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        #[test]
+        fn returns_one_candidate_per_shaped_directory() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-1");
+            fixture.dir("claude", "repository-42");
+            fixture.dir("opencode", "repository-7");
+            // Shape mismatches. Each is skipped, never reported as an error.
+            fixture.dir("claude", "repository-notanumber");
+            fixture.dir("claude", "repository-18446744073709551616"); // u64::MAX + 1
+            fixture.dir("claude", "repository-007"); // does not round-trip
+            fixture.dir("claude", "notrepository-3");
+            // A third-level directory that matches the shape: the walk is
+            // exactly three levels deep and must not descend into it.
+            fixture.dir("claude", "repository-42/repository-99");
+            std::fs::write(
+                fixture.base().join("claude").join("repository-9"),
+                b"a file, not a directory",
+            )
+            .expect("write shaped file");
+            std::fs::write(fixture.base().join("loose.json"), b"{}").expect("write loose file");
+
+            let report = scan_ok(&fixture);
+
+            assert_eq!(
+                reported(&report),
+                vec![
+                    "claude/repository-1",
+                    "claude/repository-42",
+                    "opencode/repository-7",
+                ]
+            );
+            assert_eq!(
+                candidate(&report, "claude", "repository-42").repository_key,
+                42
+            );
+            assert_eq!(
+                candidate(&report, "opencode", "repository-7").repository_key,
+                7
+            );
+        }
+
+        #[test]
+        fn an_empty_candidate_is_recorded_as_empty() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-1");
+            fixture.dir("claude", "repository-2/primary-2"); // empty at every level
+
+            let report = scan_ok(&fixture);
+
+            for name in ["repository-1", "repository-2"] {
+                let found = candidate(&report, "claude", name);
+                assert!(
+                    evidence(found).contains(&Evidence::Empty),
+                    "{name} is empty at every level: {found:?}"
+                );
+                assert!(
+                    evidence(found).contains(&Evidence::NoGitdir),
+                    "{name} has no gitdir: {found:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_candidate_with_entries_contains_a_checkout() {
+            let fixture = ScanFixture::new();
+            let path = fixture.dir("claude", "repository-2/primary-2");
+            std::fs::write(path.join("tracked.txt"), b"real work\n").expect("write checkout file");
+            fixture.dir("claude", "repository-2/feature-3");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-2");
+
+            assert!(
+                evidence(found).contains(&Evidence::ContainsCheckout { entries: 2 }),
+                "two entries, one of them populated: {found:?}"
+            );
+            assert!(
+                matches!(found.verdict, Verdict::Live { .. }),
+                "a populated candidate is live: {found:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_symlink_candidate_is_recorded_and_never_removable() {
+            let fixture = ScanFixture::new();
+            let outside = fixture.root.join("outside");
+            std::fs::create_dir_all(&outside).expect("create link target");
+            fixture.workspace("claude");
+            std::os::unix::fs::symlink(
+                &outside,
+                fixture.base().join("claude").join("repository-3"),
+            )
+            .expect("create symlinked candidate");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-3");
+
+            assert!(
+                evidence(found).contains(&Evidence::IsSymlink),
+                "the link itself is recorded: {found:?}"
+            );
+            assert!(
+                matches!(found.verdict, Verdict::Indeterminate { .. }),
+                "a symlink is refused outright: {found:?}"
+            );
+            // Classified on the link, never on its target: the empty target
+            // must not supply a clearing signal.
+            assert!(
+                !evidence(found).contains(&Evidence::Empty),
+                "the target's emptiness must not leak into the verdict: {found:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_symlinked_workspace_is_not_descended() {
+            let fixture = ScanFixture::new();
+            let outside = fixture.root.join("outside");
+            std::fs::create_dir_all(outside.join("repository-4")).expect("create link target");
+            std::os::unix::fs::symlink(&outside, fixture.base().join("elsewhere"))
+                .expect("create symlinked workspace");
+
+            let report = scan_ok(&fixture);
+
+            assert!(
+                report.candidates.is_empty(),
+                "a symlinked workspace is not descended: {report:?}"
+            );
+        }
+
+        #[test]
+        fn git_disownment_is_recorded_only_when_git_actually_spoke() {
+            let fixture = ScanFixture::new();
+            let repo = fixture.git_repo("repo");
+            let disowned = fixture.dir("claude", "repository-8");
+            std::fs::write(
+                disowned.join(".git"),
+                format!("gitdir: {}/.git\n", repo.display()),
+            )
+            .expect("write orphan gitdir file");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-8");
+
+            assert!(
+                evidence(found).contains(&Evidence::GitDisownsIt {
+                    owning_repository: repo
+                }),
+                "git's inventory does not list this path: {found:?}"
+            );
+            assert!(
+                !evidence(found).contains(&Evidence::NoGitdir),
+                "a gitdir is present: {found:?}"
+            );
+        }
+
+        #[test]
+        fn a_failed_git_lookup_is_not_a_disownment() {
+            let fixture = ScanFixture::new();
+            let path = fixture.dir("claude", "repository-5");
+            std::fs::write(
+                path.join(".git"),
+                b"gitdir: /nonexistent/baude-08-04/.git\n",
+            )
+            .expect("write broken gitdir file");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-5");
+
+            assert!(
+                !evidence(found)
+                    .iter()
+                    .any(|signal| matches!(signal, Evidence::GitDisownsIt { .. })),
+                "a failed lookup is not a disownment: {found:?}"
+            );
+            assert!(
+                !matches!(found.verdict, Verdict::Removable { .. }),
+                "nothing clears on a failed lookup: {found:?}"
+            );
+        }
+
+        /// Until plan 08-05 supplies the state cross-reference there is no
+        /// source of `NotReferencedByState`, so no scanned candidate can be
+        /// cleared — by construction, not by luck.
+        #[test]
+        fn no_scanned_candidate_is_removable_without_state_evidence() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-1");
+            fixture.dir("claude", "repository-2/primary-2");
+            fixture.dir("opencode", "repository-3");
+
+            let report = scan_ok(&fixture);
+
+            assert_eq!(report.candidates.len(), 3);
+            for found in &report.candidates {
+                assert!(
+                    !matches!(found.verdict, Verdict::Removable { .. }),
+                    "scan cannot clear without state evidence: {found:?}"
+                );
+            }
+        }
+
+        /// D-16: the scan's only output is a report. Asserted by comparing the
+        /// entries and modification times of both synthetic roots before and
+        /// after — a created lock, temp file or probe directory fails this.
+        #[test]
+        fn a_scan_leaves_both_roots_unchanged() {
+            let fixture = ScanFixture::new();
+            fixture.dir("claude", "repository-1");
+            let populated = fixture.dir("claude", "repository-2/primary-2");
+            std::fs::write(populated.join("tracked.txt"), b"real work\n").expect("write file");
+            let broken = fixture.dir("opencode", "repository-3");
+            std::fs::write(
+                broken.join(".git"),
+                b"gitdir: /nonexistent/baude-08-04/.git\n",
+            )
+            .expect("write broken gitdir file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                fixture.root.join("outside"),
+                fixture.base().join("claude").join("repository-4"),
+            )
+            .expect("create symlinked candidate");
+
+            let base_before = tree_snapshot(&fixture.base());
+            let config_before = tree_snapshot(&fixture.config());
+
+            let report = scan_ok(&fixture);
+            assert!(!report.candidates.is_empty(), "the fixture has candidates");
+
+            assert_eq!(
+                tree_snapshot(&fixture.base()),
+                base_before,
+                "the worktrees root must be byte-for-byte unchanged"
+            );
+            assert_eq!(
+                tree_snapshot(&fixture.config()),
+                config_before,
+                "the config root must be untouched — no state lock, no temp file"
+            );
+        }
+
+        #[test]
+        fn a_missing_base_yields_an_empty_report() {
+            let fixture = ScanFixture::new();
+            let roots = ScanRoots {
+                worktrees_base: fixture.root.join("never-created"),
+                config_dir: fixture.config(),
+            };
+
+            let report = scan_at(&roots).expect("a missing root is not an error");
+
+            assert!(report.candidates.is_empty());
         }
     }
 }
