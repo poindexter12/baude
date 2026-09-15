@@ -381,9 +381,27 @@ def snapshot_path(environ):
 
 
 def is_inside(candidate, root):
+    """Containment after resolving links, then lexically.
+
+    Deliberately the ONE place in this script that follows a symlink. Everything
+    else uses os.lstat and never resolves, because the thing being fingerprinted
+    is the link, not its target. Here the question is the opposite one: whether
+    the observer's own state really lands inside a tree it observes. A pure
+    string comparison answers that with the unresolved spelling, so a snapshot
+    directory reached through a link into a root reads as two unrelated strings,
+    the FATAL never fires, and before.json ends up inside the very tree the after
+    run compares against a snapshot that now includes itself. On macOS runners
+    /tmp is itself a link to /private/tmp, so mismatched spellings are the norm
+    on this matrix rather than a corner case (#72, WR-05).
+
+    realpath does not raise on a path that does not exist -- it resolves what it
+    can and leaves the rest -- so this stays usable before the snapshot
+    directory has been created.
+    """
     if root == "" or candidate == "":
         return False
-    root = root.rstrip("/") or "/"
+    candidate = os.path.realpath(candidate)
+    root = os.path.realpath(root).rstrip("/") or "/"
     return candidate == root or candidate.startswith(root + "/")
 
 
@@ -906,6 +924,42 @@ def snapshot_location_table(test):
             "Claude config root" in output,
             True,
         )
+
+    # WR-05. The overlap above is lexically obvious. This one is not: the
+    # snapshot directory is named by a path OUTSIDE every root that resolves,
+    # through a link, to a path INSIDE one. The pre-fix string comparison saw
+    # two unrelated spellings and let the observer write its own state into the
+    # tree it was about to fingerprint.
+    with tempfile.TemporaryDirectory(prefix="baude-selftest-link-") as scratch:
+        fixture = os.path.join(scratch, "linked")
+        os.makedirs(os.path.join(fixture, "claude", "snapshots"))
+        link = os.path.join(scratch, "outside-looking")
+        os.symlink(os.path.join(fixture, "claude", "snapshots"), link)
+        env = child_env(fixture, link)
+        status, output = run_mode(env, "before")
+        test.check("a symlinked snapshot directory is refused", status, 2)
+        # The FATAL line specifically. A bare "Claude config root" substring
+        # would also match the ordinary before-mode listing, so it would pass
+        # even on a run that was NOT refused.
+        test.check(
+            "the symlinked overlap names the offending root",
+            "FATAL:" in output and "Claude config root" in output,
+            True,
+        )
+
+    # The other side of the same line: resolving must not turn an UNRELATED
+    # directory into an overlap. Without this, "normalize both operands" could
+    # be satisfied by a check that refuses everything.
+    with tempfile.TemporaryDirectory(prefix="baude-selftest-ok-") as scratch:
+        fixture = os.path.join(scratch, "fine")
+        os.makedirs(fixture)
+        real = os.path.join(scratch, "snapshots-real")
+        os.makedirs(real)
+        link = os.path.join(scratch, "snapshots-link")
+        os.symlink(real, link)
+        env = child_env(fixture, link)
+        status, _ = run_mode(env, "before")
+        test.check("a symlinked snapshot dir outside every root is accepted", status, 0)
 
 
 def resolution_change_table(test):
