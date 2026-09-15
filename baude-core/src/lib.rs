@@ -21,3 +21,4 @@ pub mod session;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 pub mod workspace;
+pub mod worktree_scan;
