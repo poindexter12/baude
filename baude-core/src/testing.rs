@@ -289,3 +289,96 @@ pub(crate) fn assert_contained(resolved: &Path, what: &str) {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Declared FIRST in this module on purpose, and it constructs no
+    /// [`TestRedirect`] at all: that is what proves the guard is armed from the
+    /// first instruction of the binary rather than by some earlier fixture's
+    /// side effect (D-09). It mutates no environment variable — the probe is
+    /// thread-local, so this needs no mutex, no serial flag, and no
+    /// `--test-threads=1`.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_resolution_panics() {
+        let _no_root = NoFixtureRoot::new();
+        let _escaped = crate::git::worktrees_base();
+    }
+
+    #[test]
+    fn redirect_contains_the_managed_worktree_root() {
+        let root = PathBuf::from("/nonexistent/baude-testing-worktrees");
+        let _redirect = TestRedirect::new(&root);
+        assert_eq!(
+            crate::git::worktrees_base(),
+            root.join("data").join("baude").join("worktrees")
+        );
+    }
+
+    #[test]
+    fn nested_redirects_restore_the_outer_root() {
+        let outer = PathBuf::from("/nonexistent/baude-testing-outer");
+        let inner = PathBuf::from("/nonexistent/baude-testing-inner");
+        let _outer = TestRedirect::new(&outer);
+        assert_eq!(config_dir_override(), Some(outer.join("config")));
+        {
+            let _inner = TestRedirect::new(&inner);
+            assert_eq!(
+                crate::git::worktrees_base(),
+                inner.join("data").join("baude").join("worktrees")
+            );
+            assert_eq!(config_dir_override(), Some(inner.join("config")));
+        }
+        assert_eq!(
+            crate::git::worktrees_base(),
+            outer.join("data").join("baude").join("worktrees")
+        );
+        assert_eq!(config_dir_override(), Some(outer.join("config")));
+    }
+
+    /// A nested `with_hook_command` scope changes only the command and restores
+    /// the whole enclosing set on drop — the shape the second-install
+    /// reconciliation regression needs.
+    #[test]
+    fn nested_hook_command_restores_the_outer_command() {
+        let root = PathBuf::from("/nonexistent/baude-testing-hook");
+        let _redirect = TestRedirect::new(&root);
+        let original = format!("{} hook", root.join("bin").join("baude").display());
+        assert_eq!(crate::hook::baude_hook_command(), original);
+
+        let newer = format!("{} hook", root.join("bin2").join("baude").display());
+        {
+            let _newer = TestRedirect::with_hook_command(&newer);
+            assert_eq!(crate::hook::baude_hook_command(), newer);
+            assert_ne!(newer, original, "the second install must be distinct");
+            assert_eq!(
+                config_dir_override(),
+                Some(root.join("config")),
+                "a hook-only scope must not disturb the config redirect"
+            );
+            assert_eq!(
+                worktrees_base_override(),
+                Some(root.join("data")),
+                "a hook-only scope must not disturb the worktrees redirect"
+            );
+        }
+        assert_eq!(crate::hook::baude_hook_command(), original);
+    }
+
+    /// The scanner plan 04 builds is production code that must reach the REAL
+    /// root, so this resolver carries no guard and no redirect.
+    #[test]
+    fn real_worktrees_base_is_never_redirected() {
+        let root = PathBuf::from("/nonexistent/baude-testing-real");
+        let _redirect = TestRedirect::new(&root);
+        let real = crate::git::real_worktrees_base();
+        assert!(
+            !real.starts_with(&root),
+            "real_worktrees_base must ignore the redirect; got {}",
+            real.display()
+        );
+        assert!(real.ends_with("baude/worktrees"), "got {}", real.display());
+    }
+}

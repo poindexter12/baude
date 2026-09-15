@@ -1747,7 +1747,24 @@ pub fn set_worktrees_base_for_test(base: impl Into<PathBuf>) {
     REQUIRE_WORKTREES_OVERRIDE.store(true, Ordering::SeqCst);
 }
 
-fn worktrees_base() -> PathBuf {
+/// The real managed-worktree root, with no test redirect and no containment
+/// check.
+///
+/// Ungated and public on purpose: the leak scanner is production code whose
+/// entire job is to target the real root. Note the terminal fallback is `/tmp`
+/// here and `"."` in [`crate::persist`]'s config resolver — the real-root
+/// resolvers share a shape but not their tails, so they must not be collapsed
+/// into one helper.
+pub fn real_worktrees_base() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("baude")
+        .join("worktrees")
+}
+
+pub(crate) fn worktrees_base() -> PathBuf {
     if let Some(base) = WORKTREES_BASE_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return base.join("baude").join("worktrees");
     }
@@ -1756,12 +1773,7 @@ fn worktrees_base() -> PathBuf {
         "managed worktree root resolved to the real data dir during a test; \
          call baude_core::git::set_worktrees_base_for_test on this thread first"
     );
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("baude")
-        .join("worktrees")
+    real_worktrees_base()
 }
 
 /// Deterministic workspace-local allocation for a durable primary checkout.
