@@ -3,7 +3,6 @@
 //! system TLS libs. Subscriptions persist in the config dir; dead ones are
 //! pruned when the push service answers 404/410.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,13 +23,15 @@ use sha2::Sha256;
 const VAPID_FILE: &str = "daemon-vapid.json";
 const SUBS_FILE: &str = "daemon-push.json";
 
-fn config_base() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("baude")
-}
+// Both stores resolve through `baude_core::persist::config_dir()` (D-02).
+// This module used to carry its own copy of that chain, which made the daemon
+// the one subsystem a fixture redirect could not contain: it wrote a real VAPID
+// signing key and a real subscription store into `~/.config/baude` from the
+// test suite (#72). The copy was byte-identical to persist's — same
+// `XDG_CONFIG_HOME` head, same `~/.config` and `"."` fallbacks, same
+// `.join("baude")` tail — so routing through the shared resolver leaves every
+// production path exactly where it was and the already-written key is read, not
+// rotated.
 
 // ---- VAPID ----
 
@@ -49,7 +50,7 @@ pub struct Vapid {
 impl Vapid {
     /// Load the daemon's VAPID keypair, generating one on first run.
     pub fn load_or_generate() -> Result<Vapid> {
-        let path = config_base().join(VAPID_FILE);
+        let path = baude_core::persist::config_dir().join(VAPID_FILE);
         if let Ok(text) = std::fs::read_to_string(&path) {
             let disk: VapidOnDisk = serde_json::from_str(&text).context("bad vapid file")?;
             let bytes = B64.decode(&disk.private).context("bad vapid key")?;
@@ -186,7 +187,7 @@ pub fn lock(shared: &SharedPush) -> MutexGuard<'_, PushState> {
 impl PushState {
     pub fn load(persist: bool) -> Result<PushState> {
         let subs = if persist {
-            std::fs::read_to_string(config_base().join(SUBS_FILE))
+            std::fs::read_to_string(baude_core::persist::config_dir().join(SUBS_FILE))
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
@@ -204,7 +205,7 @@ impl PushState {
         if !self.persist {
             return;
         }
-        let path = config_base().join(SUBS_FILE);
+        let path = baude_core::persist::config_dir().join(SUBS_FILE);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -272,6 +273,7 @@ pub fn send(vapid: &Vapid, sub: &Subscription, payload: &[u8]) -> Result<bool> {
 mod tests {
     use super::*;
     use aes_gcm::aead::Aead;
+    use std::path::PathBuf;
 
     /// Decrypt an aes128gcm body the way a user agent would — proves both
     /// directions of the RFC 8291 construction agree.
