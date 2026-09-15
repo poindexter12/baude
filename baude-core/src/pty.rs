@@ -38,7 +38,130 @@ const GATE_TOKEN: &str = "baude-runtime-registered";
 ///
 /// `-il` is what makes a session usable: PATH from `.zshrc`/`.zprofile` (mise,
 /// homebrew) is how the configured `claude` command is found at all.
+#[cfg(not(any(test, feature = "test-support")))]
 const GATE_SCRIPT: &str = "IFS= read -r gate || exit 125; [ \"$gate\" = \"$BAUDE_GATE_TOKEN\" ] || exit 126; if [ \"$BAUDE_GATE_MODE\" = command ]; then exec \"$BAUDE_GATE_SHELL\" -il -c \"$BAUDE_GATE_COMMAND\"; else exec \"$BAUDE_GATE_SHELL\" -il; fi";
+
+/// The same paused gate, then an explicit shell with NO startup files.
+///
+/// `-il` is the escape this phase exists to close: a login shell sources the
+/// developer's `.zprofile`/`.zshrc` — reading `~/.claude`, exporting API keys,
+/// running `mise`, whatever the machine happens to do — BEFORE the fixture's
+/// command runs, and no Rust-side redirect can intercept that. `--noprofile
+/// --norc -i` keeps the interactive PTY semantics the registration handshake
+/// and idle detection rely on while reading nothing.
+#[cfg(any(test, feature = "test-support"))]
+const GATE_SCRIPT: &str = "IFS= read -r gate || exit 125; [ \"$gate\" = \"$BAUDE_GATE_TOKEN\" ] || exit 126; if [ \"$BAUDE_GATE_MODE\" = command ]; then exec \"$BAUDE_GATE_SHELL\" --noprofile --norc -i -c \"$BAUDE_GATE_COMMAND\"; else exec \"$BAUDE_GATE_SHELL\" --noprofile --norc -i; fi";
+
+/// The gate shell for fixtures: named explicitly rather than inherited, because
+/// `$SHELL` is exactly the value a developer's environment supplies.
+#[cfg(any(test, feature = "test-support"))]
+const TEST_GATE_SHELL: &str = "/bin/bash";
+
+/// Every root a support-build PTY child is allowed to see, resolved on the
+/// CALLING thread — the only thread that holds the fixture's redirects.
+#[cfg(any(test, feature = "test-support"))]
+struct TestChildRoots {
+    home: std::path::PathBuf,
+    config: std::path::PathBuf,
+    data: std::path::PathBuf,
+    state: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    claude: std::path::PathBuf,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestChildRoots {
+    /// Resolve through the GUARDED resolvers, which panic when this thread
+    /// holds neither a redirect nor a fixture root (D-09/D-10).
+    ///
+    /// The dogfood child satisfies this without a thread-local: it is launched
+    /// with already-contained `HOME`/`XDG_*`/`CLAUDE_CONFIG_DIR`, so the real
+    /// resolvers land inside `BAUDE_TEST_FIXTURE_ROOT` and the containment
+    /// assertion passes (D-17). Declaring a root is not enough — it has to be
+    /// contained.
+    fn resolve() -> Self {
+        let config_dir = crate::persist::config_dir();
+        let claude = crate::meta::claude_config_dir();
+        Self {
+            home: config_dir.join("child-home"),
+            config: config_dir.join("child-config"),
+            data: config_dir.join("child-data"),
+            state: config_dir.join("child-state"),
+            cache: config_dir.join("child-cache"),
+            claude,
+        }
+    }
+
+    /// Create only these directories. A child whose `HOME` does not exist falls
+    /// back to the passwd database inside `portable-pty`, which is the real one.
+    fn create(&self) {
+        for dir in [
+            &self.home,
+            &self.config,
+            &self.data,
+            &self.state,
+            &self.cache,
+            &self.claude,
+        ] {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+}
+
+/// Replace the child's environment wholesale with a fixture-owned one.
+///
+/// Every `Pty::spawn*` entry point funnels through `build_gate_command`, so
+/// this is the single place child-environment policy lives: `App`, `Manager`
+/// and direct PTY tests are all covered without any caller repeating it.
+///
+/// Order is the policy. The caller's explicit env goes in FIRST so opaque
+/// launch-plan values (resume ids and the like) reach the child, and the
+/// protected root/shell/gate keys go in LAST so no caller — and no inherited
+/// value — can name a root or a startup file.
+#[cfg(any(test, feature = "test-support"))]
+fn configure_test_child(cmd: &mut CommandBuilder, env: &[(String, String)], command: Option<&str>) {
+    let roots = TestChildRoots::resolve();
+    roots.create();
+
+    // Not "override the interesting keys": the ambient environment is not
+    // copied at all. An inherited `ANTHROPIC_*`, `CCUSAGE_*` or NODE config
+    // would otherwise reach the child through a name this policy never listed.
+    cmd.env_clear();
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    cmd.env("HOME", &roots.home);
+    cmd.env("XDG_CONFIG_HOME", &roots.config);
+    cmd.env("XDG_DATA_HOME", &roots.data);
+    cmd.env("XDG_STATE_HOME", &roots.state);
+    cmd.env("XDG_CACHE_HOME", &roots.cache);
+    cmd.env("CLAUDE_CONFIG_DIR", &roots.claude);
+    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    // A redirected HOME alone is insufficient: `ZDOTDIR` overrides it for zsh,
+    // and `ENV`/`BASH_ENV` are sourced by sh/bash regardless of HOME.
+    cmd.env("ZDOTDIR", &roots.home);
+    cmd.env("ENV", "/dev/null");
+    cmd.env("BASH_ENV", "/dev/null");
+    // `portable_pty` consults the builder's own `SHELL` when it materializes
+    // the command, so pinning it here also pins what it resolves.
+    cmd.env("SHELL", TEST_GATE_SHELL);
+    cmd.env("BAUDE_GATE_TOKEN", GATE_TOKEN);
+    cmd.env("BAUDE_GATE_SHELL", TEST_GATE_SHELL);
+    cmd.env("BAUDE_GATE_MODE", gate_mode(command));
+    cmd.env("BAUDE_GATE_COMMAND", command.unwrap_or_default());
+}
+
+fn gate_mode(command: Option<&str>) -> &'static str {
+    if command.is_some() {
+        "command"
+    } else {
+        "interactive"
+    }
+}
 
 /// Assemble the gate command, including (in support builds) the child's whole
 /// environment. Separated from the spawn so it can run — and abort — before any
@@ -52,23 +175,21 @@ fn build_gate_command(
     cmd.args(["-c", GATE_SCRIPT]);
     cmd.cwd(cwd);
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.env("BAUDE_GATE_TOKEN", GATE_TOKEN);
-    cmd.env("BAUDE_GATE_SHELL", &shell);
-    cmd.env(
-        "BAUDE_GATE_MODE",
-        if command.is_some() {
-            "command"
-        } else {
-            "interactive"
-        },
-    );
-    cmd.env("BAUDE_GATE_COMMAND", command.unwrap_or_default());
-    for (key, value) in env {
-        cmd.env(key, value);
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("BAUDE_GATE_TOKEN", GATE_TOKEN);
+        cmd.env("BAUDE_GATE_SHELL", &shell);
+        cmd.env("BAUDE_GATE_MODE", gate_mode(command));
+        cmd.env("BAUDE_GATE_COMMAND", command.unwrap_or_default());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
     }
+    #[cfg(any(test, feature = "test-support"))]
+    configure_test_child(&mut cmd, env, command);
 
     cmd
 }
