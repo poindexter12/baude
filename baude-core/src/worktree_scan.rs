@@ -759,9 +759,6 @@ impl Candidate {
     /// Private on purpose: composing an absolute path from report data is only
     /// legitimate after the components have been validated, and [`prune_at`] is
     /// the only caller that has done so.
-    // TEMPORARY, removed by this plan's implementation commit: `prune_at` is a
-    // stub that removes nothing and therefore resolves nothing.
-    #[allow(dead_code)]
     fn resolve(&self, base: &Path) -> PathBuf {
         self.relative
             .iter()
@@ -1285,13 +1282,295 @@ pub fn prune_at(
     preview: &ScanReport,
     confirmed: bool,
 ) -> Result<PruneReport, PruneError> {
-    let _ = (roots, preview);
-    // Plan 08-05 task 2 replaces this body. Until it does, prune accounts for
-    // nothing and — far more importantly — removes nothing.
+    // ---- everything that can be judged without touching the tree ----------
+    //
+    // All of it runs before the first candidate is examined, so a report this
+    // process will not act on never reaches the filesystem at all.
+    if preview.format_version != REPORT_FORMAT_VERSION {
+        return Err(PruneError::UnsupportedFormat {
+            found: preview.format_version,
+            expected: REPORT_FORMAT_VERSION,
+        });
+    }
+
+    // The roots come from the caller and are resolved here, independently. The
+    // report's copies are compared against them and never substituted for them:
+    // a report is a record of what was inspected, not a place to name the tree
+    // to act on (T-08-25).
+    let base = roots
+        .worktrees_base
+        .canonicalize()
+        .map_err(|error| PruneError::BaseUnreadable {
+            path: roots.worktrees_base.clone(),
+            detail: error.to_string(),
+        })?;
+    let reported_base = preview.worktrees_base.to_path_buf();
+    if reported_base != base {
+        return Err(PruneError::RootMismatch {
+            field: "worktrees base",
+            reported: reported_base,
+            resolved: base,
+        });
+    }
+    let config_dir = normalized(&roots.config_dir).to_path_buf();
+    let reported_config = preview.config_dir.to_path_buf();
+    if reported_config != config_dir {
+        return Err(PruneError::RootMismatch {
+            field: "config directory",
+            reported: reported_config,
+            resolved: config_dir,
+        });
+    }
+
+    // The strict two-component shape is the containment proof: a record that is
+    // exactly `[workspace, "repository-<key>"]`, with no separator and no `.` or
+    // `..` in either segment, cannot compose a path outside the base no matter
+    // what it was edited to say. One malformed record refuses the whole prune
+    // rather than being skipped — a report containing a record this process
+    // cannot account for is not a report it should be acting on any part of.
+    let mut seen: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+    for candidate in &preview.candidates {
+        validate_record(candidate, &base)?;
+        if !seen.insert(candidate.relative.clone()) {
+            return Err(PruneError::DuplicateCandidate {
+                relative: candidate.relative.clone(),
+            });
+        }
+    }
+
+    // ---- re-derivation ----------------------------------------------------
+    //
+    // Every fact is taken again, through the same collectors the scan used —
+    // the filesystem classification, the git inventory, and a complete fresh
+    // read of persisted state. Nothing in the approved report is carried
+    // forward as a fact; it is only ever compared against (D-15).
+    let fresh = scan_at(roots).map_err(|error| match error {
+        ScanError::BaseUnreadable { path, detail } => PruneError::BaseUnreadable { path, detail },
+    })?;
+    let fresh_by_path: std::collections::BTreeMap<&[String], &Candidate> = fresh
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.relative.as_slice(), candidate))
+        .collect();
+
+    let mut outcomes: Vec<PruneOutcome> = Vec::new();
+    for candidate in &preview.candidates {
+        let disposition = prune_one(&base, candidate, &fresh_by_path, confirmed);
+        outcomes.push(PruneOutcome {
+            relative: candidate.relative.clone(),
+            workspace: candidate.workspace.clone(),
+            repository_key: candidate.repository_key,
+            disposition,
+        });
+    }
+
+    // A directory that appeared after the approved scan is accounted for and
+    // left alone, however removable it looks on its own merits. Reporting it is
+    // what keeps the account complete; removing it would be acting on something
+    // no developer ever saw (T-08-15).
+    for candidate in &fresh.candidates {
+        if seen.contains(&candidate.relative) {
+            continue;
+        }
+        outcomes.push(PruneOutcome {
+            relative: candidate.relative.clone(),
+            workspace: candidate.workspace.clone(),
+            repository_key: candidate.repository_key,
+            disposition: PruneDisposition::Unapproved,
+        });
+    }
+    outcomes.sort_by(|left, right| {
+        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+    });
+
     Ok(PruneReport {
         confirmed,
-        outcomes: Vec::new(),
+        outcomes,
     })
+}
+
+/// Refuse any candidate record that is not the strict managed shape, or that
+/// disagrees with its own `workspace` or `repository_key` fields.
+///
+/// The redundancy is deliberate: the same location is stated three ways in a
+/// record, and a record whose statements disagree is describing something it did
+/// not observe.
+fn validate_record(candidate: &Candidate, base: &Path) -> Result<(), PruneError> {
+    let malformed = |detail: &str| PruneError::MalformedCandidate {
+        relative: candidate.relative.clone(),
+        detail: detail.to_string(),
+    };
+
+    let [workspace, name] = candidate.relative.as_slice() else {
+        return Err(malformed(
+            "a candidate is exactly two path components, `[workspace, repository-<key>]`",
+        ));
+    };
+    for segment in [workspace, name] {
+        if segment.is_empty() {
+            return Err(malformed("a path component is empty"));
+        }
+        // Checked on the string rather than on parsed `Components`, because
+        // `Path::components` normalizes a `.` away entirely and would let it
+        // through.
+        if segment == "." || segment == ".." {
+            return Err(malformed("`.` and `..` are not directory names"));
+        }
+        if segment.contains(std::path::MAIN_SEPARATOR) || segment.contains('/') {
+            return Err(malformed("a path component may not contain a separator"));
+        }
+        if segment.contains('\0') {
+            return Err(malformed("a path component may not contain a NUL byte"));
+        }
+    }
+    if workspace != &candidate.workspace {
+        return Err(malformed(
+            "the record's first component is not its own workspace",
+        ));
+    }
+    match repository_key(name) {
+        Some(key) if key == candidate.repository_key => {}
+        Some(_) => {
+            return Err(malformed(
+                "the record's directory name is not its own repository key",
+            ));
+        }
+        None => {
+            return Err(malformed(
+                "the record's directory name is not the managed shape",
+            ))
+        }
+    }
+
+    // Belt and braces. The shape check above already makes this unreachable,
+    // and it is kept so that weakening the shape check cannot silently unbind
+    // the removal set from the base.
+    if !candidate.resolve(base).starts_with(base) {
+        return Err(malformed(
+            "the composed path is not under the worktrees base",
+        ));
+    }
+    Ok(())
+}
+
+/// Decide, and possibly carry out, the fate of one approved record.
+fn prune_one(
+    base: &Path,
+    candidate: &Candidate,
+    fresh_by_path: &std::collections::BTreeMap<&[String], &Candidate>,
+    confirmed: bool,
+) -> PruneDisposition {
+    // Only what the developer saw and approved is eligible, and the approved
+    // verdict is checked before anything else. Decision C cuts both ways: a
+    // candidate that newly qualifies is refused as firmly as one that stopped
+    // qualifying, because the approval was of a specific reported set.
+    let Verdict::Removable { proof: approved } = &candidate.verdict else {
+        return PruneDisposition::NotApproved;
+    };
+
+    let Some(current) = fresh_by_path.get(candidate.relative.as_slice()) else {
+        // Gone between the approved scan and now. Reported as a refusal rather
+        // than as a success this run did not earn.
+        return PruneDisposition::Refused {
+            reason: RefusalReason::Vanished,
+        };
+    };
+    let Verdict::Removable { proof: rederived } = &current.verdict else {
+        return PruneDisposition::Refused {
+            reason: RefusalReason::NotRemovableNow {
+                verdict: Box::new(current.verdict.clone()),
+            },
+        };
+    };
+    if rederived != approved {
+        // Still cleared, but by facts nobody approved: a different inventory, a
+        // different clearing signal, a different observed set.
+        return PruneDisposition::Refused {
+            reason: RefusalReason::ProofChanged {
+                approved: Box::new(approved.clone()),
+                rederived: Box::new(rederived.clone()),
+            },
+        };
+    }
+
+    if !confirmed {
+        // The default path, and the one this whole phase runs in (D-16,
+        // T-08-18). The re-verification above has already happened in full.
+        return PruneDisposition::WouldRemove;
+    }
+
+    remove_verified(&candidate.resolve(base))
+}
+
+/// The last window. Everything here is re-checked immediately before the removal
+/// call, on the path itself, with non-following metadata.
+fn remove_verified(path: &Path) -> PruneDisposition {
+    let refused = |reason| PruneDisposition::Refused { reason };
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refused(RefusalReason::Vanished);
+        }
+        Err(error) => {
+            return refused(RefusalReason::RemovalFailed {
+                detail: format!("{} could not be examined: {error}", path.display()),
+            });
+        }
+    };
+    // Non-following, and the link is never resolved. Classifying on a target's
+    // properties while the removal acts on the link is how a deletion escapes
+    // the base entirely (T-08-04).
+    if metadata.file_type().is_symlink() {
+        return refused(RefusalReason::BecameSymlink);
+    }
+    if !metadata.is_dir() {
+        return refused(RefusalReason::NotADirectory);
+    }
+    // A gitdir means git owns this directory, and git's verified-removal path
+    // owns its deletion. This module refuses rather than substituting its own
+    // removal for that one.
+    if let Some(holder) = gitdir_holder(path) {
+        return refused(RefusalReason::GitdirPresent { holder });
+    }
+
+    match remove_empty_tree(path, MAX_EMPTY_DEPTH) {
+        Ok(()) => PruneDisposition::Removed,
+        Err(detail) => refused(RefusalReason::RemovalFailed { detail }),
+    }
+}
+
+/// Delete a tree of directories, and only of directories.
+///
+/// Deliberately not `std::fs::remove_dir_all`: that call deletes whatever it
+/// finds, so a file appearing mid-walk would be destroyed by the same call that
+/// discovered it. This walks the tree itself so the first thing it does not
+/// expect stops it, and stops it before that entry is unlinked.
+fn remove_empty_tree(path: &Path, depth: u32) -> Result<(), String> {
+    if depth == 0 {
+        return Err(format!(
+            "{} is nested deeper than the managed shape allows",
+            path.display()
+        ));
+    }
+    let entries = sorted_entries(path)
+        .map_err(|error| format!("{} could not be listed: {error}", path.display()))?;
+    for name in entries {
+        let child = path.join(&name);
+        let metadata = std::fs::symlink_metadata(&child)
+            .map_err(|error| format!("{} could not be examined: {error}", child.display()))?;
+        // `is_dir()` on non-following metadata is false for a symlink, so a
+        // link is refused here like any other non-directory entry.
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{} is not a directory; refusing to delete it",
+                child.display()
+            ));
+        }
+        remove_empty_tree(&child, depth - 1)?;
+    }
+    std::fs::remove_dir(path)
+        .map_err(|error| format!("{} could not be removed: {error}", path.display()))
 }
 
 #[cfg(test)]
