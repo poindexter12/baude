@@ -5549,6 +5549,206 @@ mod tests {
         );
     }
 
+    /// Selects the re-exec'd child branch of
+    /// [`worker_isolation_app_does_not_launch_ambient_readers`].
+    const WORKER_ISOLATION_APP_CHILD: &str = "BAUDE_WORKER_ISOLATION_APP_CHILD";
+
+    /// Write a fake executable that records the fact it ran and nothing else.
+    ///
+    /// The marker path is baked into the script text rather than read from the
+    /// environment, so the detector cannot be silenced by the very environment
+    /// policy under test.
+    fn write_invocation_recorder(bin: &Path, markers: &Path, name: &str, stdout: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf invoked >> {}\nprintf '{stdout}'\nexit 0\n",
+                markers.join(name).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Constructing an `App` must not start the ccusage reader, an
+    /// environment-selected remote poller, or a desktop-notification worker.
+    ///
+    /// Those three escape the thread-local redirects entirely: a detached
+    /// thread does not inherit them, and `ccusage` reads every Claude
+    /// transcript on disk through the *inherited environment* rather than
+    /// through any Rust resolver. No containment guard and no filesystem
+    /// no-write observer can see that read.
+    ///
+    /// The whole exercise therefore runs in a re-exec'd child with an explicit
+    /// environment map whose apparent ambient roots are synthetic siblings of
+    /// the held fixture root, and with fake `ccusage`/`date` executables ahead
+    /// of the real ones on `PATH`. Each fake is invoked directly first as a
+    /// POSITIVE CONTROL, so a detector that silently stopped working cannot let
+    /// this pass. Nothing here can reach developer data even while it is red.
+    #[test]
+    fn worker_isolation_app_does_not_launch_ambient_readers() {
+        if std::env::var_os(WORKER_ISOLATION_APP_CHILD).is_some() {
+            let root = PathBuf::from(
+                std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
+                    .expect("the child must receive a synthetic fixture root"),
+            );
+            let markers = root.join("markers");
+            let fixture = root.join("fixture");
+
+            // Positive controls: prove the recorder works before relying on its
+            // silence. Both fakes shadow the real commands on PATH.
+            std::process::Command::new("ccusage")
+                .args(["daily", "--json", "-O"])
+                .output()
+                .expect("the fake ccusage must be reachable on the child PATH");
+            std::process::Command::new("date")
+                .arg("+%F")
+                .output()
+                .expect("the fake date must be reachable on the child PATH");
+            assert!(
+                markers.join("ccusage").exists(),
+                "positive control failed: invoking ccusage recorded no marker"
+            );
+            assert!(
+                markers.join("date").exists(),
+                "positive control failed: invoking date recorded no marker"
+            );
+            std::fs::remove_file(markers.join("ccusage")).unwrap();
+            std::fs::remove_file(markers.join("date")).unwrap();
+
+            // The fixture root is a SIBLING of the synthetic ambient roots, so
+            // an escape lands somewhere observably different rather than
+            // accidentally inside the fixture.
+            std::fs::create_dir_all(fixture.join("config")).unwrap();
+            let _redirect = baude_core::testing::TestRedirect::new(&fixture);
+            let _identity = baude_core::workspace::override_for_test(
+                &persist::Config {
+                    workspace: Some("worker-isolation".to_string()),
+                    ..persist::Config::default()
+                },
+                None,
+            );
+
+            let app = App::new(fixture.clone());
+            assert!(
+                app.remote.is_none(),
+                "App::new selected a remote poller from the ambient BAUDE_DAEMON_URL"
+            );
+            assert!(
+                !app.desktop_notify_enabled,
+                "App::new left desktop notifications armed in a test build"
+            );
+            assert!(
+                app.usage.is_inert_for_test(),
+                "a background worker still owns the App's usage snapshot"
+            );
+
+            // Direct construction must be protected too: the guarantee is a
+            // property of the poller, not of one blessed helper.
+            let poller = crate::usage::UsagePoller::start();
+            assert!(
+                poller.is_inert_for_test(),
+                "a directly constructed UsagePoller still spawned a worker"
+            );
+            for _ in 0..3 {
+                let from_app = app.usage_costs();
+                assert!(
+                    from_app.today_usd.is_none() && from_app.week_usd.is_none(),
+                    "the App reported usage costs in a test build"
+                );
+                let direct = poller.costs();
+                assert!(
+                    direct.today_usd.is_none() && direct.week_usd.is_none(),
+                    "a directly constructed poller reported usage costs"
+                );
+            }
+
+            drop(app);
+            drop(poller);
+
+            assert!(
+                !markers.join("ccusage").exists(),
+                "constructing, polling or dropping an App invoked ccusage"
+            );
+            assert!(
+                !markers.join("date").exists(),
+                "constructing, polling or dropping an App invoked date"
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "baude-worker-isolation-app-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for leaf in [
+            "fixture",
+            "markers",
+            "bin",
+            "ambient/home",
+            "ambient/config",
+            "ambient/data",
+            "ambient/claude",
+        ] {
+            std::fs::create_dir_all(root.join(leaf)).expect("synthetic child tree");
+        }
+        let bin = root.join("bin");
+        let markers = root.join("markers");
+        write_invocation_recorder(&bin, &markers, "ccusage", "{}");
+        write_invocation_recorder(&bin, &markers, "date", "1970-01-01");
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "app::tests::worker_isolation_app_does_not_launch_ambient_readers",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        // An explicit map, not the parent's environment plus overrides: an
+        // inherited CLAUDE_CONFIG_DIR or ccusage config would otherwise reach
+        // the developer's data through a path this test does not name.
+        command.env_clear();
+        command.env(WORKER_ISOLATION_APP_CHILD, "1");
+        command.env("BAUDE_TEST_FIXTURE_ROOT", &root);
+        command.env("HOME", root.join("ambient").join("home"));
+        command.env("XDG_CONFIG_HOME", root.join("ambient").join("config"));
+        command.env("XDG_DATA_HOME", root.join("ambient").join("data"));
+        command.env("CLAUDE_CONFIG_DIR", root.join("ambient").join("claude"));
+        command.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        // A synthetic loopback endpoint: nothing listens, and the assertion is
+        // that no poller was ever constructed to try.
+        command.env("BAUDE_DAEMON_URL", "http://127.0.0.1:9/");
+        let output = command.output().expect("re-exec the test binary");
+
+        let status = output.status;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let ccusage_marker = markers.join("ccusage").exists();
+        let date_marker = markers.join("date").exists();
+        if status.success() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(
+            status.success(),
+            "worker-isolation child failed ({status})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have RUN the case, not filtered it out:\n{stdout}"
+        );
+        assert!(
+            !ccusage_marker && !date_marker,
+            "the child left an ambient-reader invocation marker behind"
+        );
+    }
+
     /// The deliberate escape: config resolution with NO redirect must abort
     /// this binary's test, not quietly reach the developer's real
     /// `~/.config/baude`.

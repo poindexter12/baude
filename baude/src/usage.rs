@@ -48,6 +48,18 @@ impl UsagePoller {
     pub fn costs(&self) -> UsageCosts {
         self.data.lock().map(|d| d.clone()).unwrap_or_default()
     }
+
+    /// True when NOTHING but this poller holds the snapshot.
+    ///
+    /// A live worker clones the `Arc` before it is spawned and holds it for the
+    /// process lifetime, so a strong count of one is a compile-independent
+    /// statement that no background thread exists to publish into it later.
+    /// That is why the regression asserts this rather than sleeping: a sleep
+    /// only proves nothing happened *yet*.
+    #[cfg(test)]
+    pub fn is_inert_for_test(&self) -> bool {
+        Arc::strong_count(&self.data) == 1
+    }
 }
 
 fn fetch() -> UsageCosts {
