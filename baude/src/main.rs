@@ -1006,22 +1006,41 @@ fn run_worktrees_prune(
     };
     match baude_core::worktree_scan::prune_at(roots, &approved, options.yes) {
         Ok(report) => {
+            use baude_core::worktree_scan::{PruneDisposition, RefusalReason};
+
             print_prune_account(&report, out);
             // `prune_at` returns `Ok` when the *report* was acceptable; a
             // per-candidate failure travels inside the account. A removal that
             // was attempted and failed on I/O is the one disposition an operator
             // scripting this flow cannot be told about by an exit code of 0
             // (#72, WR-02). Safety refusals stay exit-0: they are the tool
-            // working, not failing — a deliberate policy line, so the match is
-            // written without a wildcard on the reason.
-            let failed = report.outcomes.iter().any(|outcome| {
-                matches!(
-                    &outcome.disposition,
-                    baude_core::worktree_scan::PruneDisposition::Refused {
-                        reason: baude_core::worktree_scan::RefusalReason::RemovalFailed { .. }
-                    }
-                )
-            });
+            // working, not failing — a deliberate policy line, and every variant
+            // below has been placed on one side of it by hand.
+            //
+            // Spelled as a real `match` rather than `matches!` because that is
+            // the only form which makes the compiler enforce the paragraph
+            // above. `matches!` does not participate in exhaustiveness checking
+            // at all — its non-matching arm is an implicit wildcard, so a new
+            // `RefusalReason` would compile with no warning and land silently on
+            // the exit-0 side whatever its semantics (#72, WR-02, iteration 2).
+            let failed = report
+                .outcomes
+                .iter()
+                .any(|outcome| match &outcome.disposition {
+                    PruneDisposition::Refused { reason } => match reason {
+                        RefusalReason::RemovalFailed { .. } => true,
+                        RefusalReason::NotRemovableNow { .. }
+                        | RefusalReason::ProofChanged { .. }
+                        | RefusalReason::Vanished
+                        | RefusalReason::BecameSymlink
+                        | RefusalReason::NotADirectory
+                        | RefusalReason::GitdirPresent { .. } => false,
+                    },
+                    PruneDisposition::NotApproved
+                    | PruneDisposition::Unapproved
+                    | PruneDisposition::WouldRemove
+                    | PruneDisposition::Removed => false,
+                });
             if failed {
                 WORKTREES_EXIT_FAILED
             } else {
