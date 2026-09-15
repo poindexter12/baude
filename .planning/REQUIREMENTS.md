@@ -22,8 +22,10 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 - [ ] **TISO-03** (partial): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
   - Shipped v2.1.4: `REQUIRE_WORKTREES_OVERRIDE` asserts on managed-worktree escape (`git.rs:1736`), with a containment test (`app.rs:5635`).
   - Gap: the guard covers one path only; escapes into config, state (`app.rs:1581`) or `~/.claude` still pass silently, and the flag is armed per-binary by the first fixture, so `baude-core`'s own tests never arm it.
-- [ ] **TISO-04** (not started): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
-  - No enumeration, preview, or approval tooling exists. The 2026-09-13 cleanup of 661 stray directories was a manual shell operation with nothing checked in.
+- [ ] **TISO-04** (partial): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
+  - Shipped plan 08-04: read-only enumeration and the `Evidence`/`Verdict` classification, with a missing gitdir explicitly unable to clear a candidate (`worktree_scan.rs`).
+  - Shipped plan 08-05: state cross-referencing as ownership-negative evidence, and `prune_at(roots, report, confirmed)` — full re-derivation plus proof equality plus a non-defaulting confirmation parameter.
+  - Gap: no CLI surface yet, so a developer still cannot *run* a preview. Plan 08-07 exposes both through `baude worktrees` with `--prune` and a separate `--yes`.
 
 ### Hook Registration (#70)
 
@@ -102,7 +104,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | TISO-01 | Phase 8 | Partial — gap in Phase 8 |
 | TISO-02 | Phase 8 | Partial — gap in Phase 8 |
 | TISO-03 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-04 | Phase 8 | Pending |
+| TISO-04 | Phase 8 | Partial — gap in Phase 8 |
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
 | HREG-03 | Phase 9 | Pending |

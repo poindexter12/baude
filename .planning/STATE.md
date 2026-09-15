@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: Completed 08-08-PLAN.md
-last_updated: "2026-09-15T15:41:28.599Z"
+stopped_at: Completed 08-05-PLAN.md
+last_updated: "2026-09-15T16:29:58.226Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: 40b4fe3517f43f42624164c535003ebdb8cd5ac3
+state_head: 9b9c8ef063d2f053af05416c260fc1e8ea7c9565
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Ready to execute
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
@@ -75,6 +75,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P03 | 45min | 2 tasks | 9 files |
 | Phase 08 P04 | 70min | 3 tasks | 4 files |
 | Phase 08 P08 | ~3h | 2 tasks | 4 files |
+| Phase 08 P05 | 39min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -155,6 +156,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: 08-08: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
 - [Phase 08]: 08-08: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
 - [Phase 08]: 08-08: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
+- [Phase 08]: 08-05: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
+- [Phase 08]: 08-05: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
+- [Phase 08]: 08-05: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
+- [Phase 08]: 08-05 DEVIATION: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
 
 ### Pending Todos
 
@@ -188,8 +193,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T15:41:19.286Z
-Stopped at: Completed 08-08-PLAN.md
+Last session: 2026-09-15T16:29:58.204Z
+Stopped at: Completed 08-05-PLAN.md
 Resume file: None
 
 ## Deferred Items

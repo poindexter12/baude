@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 6
+open_count: 8
 waived_count: 0
 fixed_count: 0
-total_count: 6
-last_updated: 2026-09-15T15:38:12.573Z
+total_count: 8
+last_updated: 2026-09-15T16:31:46.217Z
 ---
 
 # Broken Windows Ledger
@@ -21,6 +21,8 @@ last_updated: 2026-09-15T15:38:12.573Z
 | 4 | 08 | deviation | baude-core/src/git.rs |  | 08-04 v2.2 FOLLOW-UP: empty-parent worktree leak is a LIVE production defect in ensure_default_worktree and activate_branch_with_post_add_hook — nothing removes the repository-<key> parent on failure; 'zero candidates' must never be an exit criterion | open |  | 2026-09-15T15:13:59.247Z |  |
 | 5 | 08 | unrun-verify | .planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md |  | Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership | open |  | 2026-09-15T15:38:04.984Z |  |
 | 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it | open |  | 2026-09-15T15:38:12.573Z |  |
+| 7 | 08 | deviation | baude-core/src/worktree_scan.rs |  | 08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path | open |  | 2026-09-15T16:31:45.745Z |  |
+| 8 | 08 | deviation | .planning/REQUIREMENTS.md |  | 08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises | open |  | 2026-09-15T16:31:46.217Z |  |
 
 ````json
 [
@@ -99,6 +101,32 @@ last_updated: 2026-09-15T15:38:12.573Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-15T15:38:12.573Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 7,
+    "kind": "deviation",
+    "phase": "08",
+    "file": "baude-core/src/worktree_scan.rs",
+    "line": null,
+    "description": "08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-15T16:31:45.745Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 8,
+    "kind": "deviation",
+    "phase": "08",
+    "file": ".planning/REQUIREMENTS.md",
+    "line": null,
+    "description": "08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-15T16:31:46.217Z",
     "resolved_at": null,
     "milestone": "v2.2"
   }
