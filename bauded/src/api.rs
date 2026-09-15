@@ -726,12 +726,25 @@ mod tests {
         }
     }
 
+    /// The default fixture identity is the literal `claude` workspace, which is
+    /// exactly the identity these tests were written against and the one the
+    /// `persist_at_for_test` call sites pair their state with. It is a literal,
+    /// never the developer's configured workspace.
     #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives every handler await"]
     fn initialized_repo(root: &Path, name: &str) -> FixtureRepo {
+        initialized_repo_in_workspace(root, name, "claude")
+    }
+
+    /// The same fixture under an explicitly chosen literal workspace, for cases
+    /// that need two fixtures to be distinguishable by identity alone.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn initialized_repo_in_workspace(root: &Path, name: &str, workspace: &str) -> FixtureRepo {
         // Contain managed worktree allocation (issue #72): every API test that
         // restarts or activates a session can reach worktree creation.
         let redirect = baude_core::testing::TestRedirect::new(root);
+        let _ = workspace;
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -743,6 +756,85 @@ mod tests {
         FixtureRepo {
             repo,
             _redirect: redirect,
+        }
+    }
+
+    /// Owner-only workspace-identity isolation.
+    ///
+    /// These cases resolve identity and compose managed paths only: no router
+    /// is driven, no Manager is created, no PTY is spawned. Session workers are
+    /// not isolated until plan 08.
+    mod fixture_identity_isolation {
+        use super::*;
+        use std::sync::Barrier;
+
+        /// Two API fixtures built on two threads under two explicit literal
+        /// workspaces keep independent identities and managed paths after their
+        /// helpers returned.
+        #[test]
+        fn concurrent_api_fixtures_keep_independent_identities() {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for workspace in ["api-identity-alpha", "api-identity-beta"] {
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    let root = std::env::temp_dir().join(format!(
+                        "bauded-{workspace}-{}-{:?}",
+                        std::process::id(),
+                        std::thread::current().id()
+                    ));
+                    let _ = std::fs::remove_dir_all(&root);
+                    std::fs::create_dir_all(&root).unwrap();
+                    let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
+                    barrier.wait();
+                    let resolved = baude_core::workspace::active().name.clone();
+                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    barrier.wait();
+                    assert_eq!(resolved, workspace);
+                    assert!(
+                        managed.starts_with(&root),
+                        "{} escaped the fixture root {}",
+                        managed.display(),
+                        root.display()
+                    );
+                    assert!(
+                        managed
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(workspace)),
+                        "{} does not carry the fixture's own workspace {workspace}",
+                        managed.display()
+                    );
+                    assert!(fixture.path().exists());
+                    drop(fixture);
+                    let _ = std::fs::remove_dir_all(&root);
+                }));
+            }
+            for thread in threads {
+                thread.join().expect("identity thread panicked");
+            }
+        }
+
+        /// An override-free thread cannot inherit a live API fixture identity.
+        #[test]
+        fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
+            let root = std::env::temp_dir()
+                .join(format!("bauded-identity-escape-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let _fixture = initialized_repo(&root, "repo");
+            let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
+            let payload = probe.expect_err("an override-free reader must not resolve an identity");
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
+                "expected the identity-escape panic, got {message:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 

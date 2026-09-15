@@ -5737,6 +5737,106 @@ mod tests {
         );
     }
 
+    /// Owner-only workspace-identity isolation.
+    ///
+    /// Every case here resolves identity and composes managed paths and NOTHING
+    /// else: no `App` is constructed, no poller is started, no PTY is spawned.
+    /// Those workers are not isolated until plan 08, so running them from this
+    /// filter would reach unisolated background work before its containment
+    /// exists.
+    mod fixture_identity_isolation {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        /// Two admission fixtures built on two threads resolve two different
+        /// identities, and each keeps composing managed paths under its own
+        /// workspace AFTER the helper returned. A process-wide identity cache
+        /// makes the two agree — which is the whole defect.
+        #[test]
+        fn concurrent_admission_fixtures_keep_independent_identities() {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for name in ["identity-alpha", "identity-beta"] {
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    // The owner is retained for the whole body: the identity
+                    // assertions below all run after the helper returned.
+                    let fixture = admission_repo(name);
+                    // Both identities are live before either is observed, so a
+                    // shared cache cannot be masked by sequential execution.
+                    barrier.wait();
+                    let resolved = baude_core::workspace::active().name.clone();
+                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    barrier.wait();
+                    assert_eq!(
+                        resolved, name,
+                        "each fixture must resolve its own literal workspace"
+                    );
+                    assert!(
+                        managed.starts_with(fixture.root()),
+                        "{} escaped the fixture root {}",
+                        managed.display(),
+                        fixture.root().display()
+                    );
+                    assert!(
+                        managed
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(name)),
+                        "{} does not carry the fixture's own workspace {name}",
+                        managed.display()
+                    );
+                }));
+            }
+            for thread in threads {
+                thread.join().expect("identity thread panicked");
+            }
+        }
+
+        /// A thread that holds no fixture identity cannot inherit one from a
+        /// fixture live on another thread: it must panic rather than silently
+        /// resolve the developer's real workspace.
+        #[test]
+        fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
+            let _fixture = admission_repo("identity-escape");
+            let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
+            let payload = probe.expect_err("an override-free reader must not resolve an identity");
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
+                "expected the identity-escape panic, got {message:?}"
+            );
+        }
+
+        /// Dropping a fixture owner restores the caller's identity, not the
+        /// process default — the nesting property every helper depends on.
+        #[test]
+        fn dropping_a_fixture_owner_restores_the_enclosing_identity() {
+            let _outer = baude_core::workspace::override_for_test(
+                &baude_core::persist::Config {
+                    workspace: Some("enclosing-identity".to_string()),
+                    ..baude_core::persist::Config::default()
+                },
+                None,
+            );
+            assert_eq!(baude_core::workspace::active().name, "enclosing-identity");
+            {
+                let inner = admission_repo("identity-nested");
+                assert_eq!(baude_core::workspace::active().name, "identity-nested");
+                drop(inner);
+            }
+            assert_eq!(
+                baude_core::workspace::active().name,
+                "enclosing-identity",
+                "the inner fixture must restore the enclosing identity on drop"
+            );
+        }
+    }
+
     /// The seed a fixture writes must be the seed production writes — an
     /// absolute `…/baude hook` that baude recognizes as its own. While the
     /// harness seeded `target/debug/deps/baude-<hash>`, nothing at this level
