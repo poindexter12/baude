@@ -20,12 +20,42 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The config dir the spawned claude processes will use (inherited env).
-pub fn claude_config_dir() -> PathBuf {
+/// The real `~/.claude` root, with no test redirect and no containment check.
+///
+/// Kept verbatim from the pre-redirect `claude_config_dir`. This is NOT an XDG
+/// chain: it consults `CLAUDE_CONFIG_DIR` where [`crate::persist`] and
+/// [`crate::git`] consult `XDG_*`, and its terminal fallback (`"."`) differs
+/// from `crate::git`'s. The real-root resolvers in this crate share a shape but
+/// not their heads or their tails, so they must not be collapsed into one
+/// helper — doing so would change production behavior.
+///
+/// `CLAUDE_CONFIG_DIR` coming first is also why a re-exec'd test child must be
+/// given that variable explicitly: a developer who exports it in their shell
+/// would otherwise have the child resolve their real Claude directory and trip
+/// [`crate::testing::assert_contained`].
+fn real_claude_config_dir() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The config dir the spawned claude processes will use (inherited env).
+///
+/// Under a test redirect this resolves inside the fixture root; with no
+/// redirect and no fixture root it aborts the test rather than reaching the
+/// developer's real `~/.claude` (#72, D-03). Isolating here rather than by
+/// parameter is deliberate: both [`ClaudeMeta::poll`] call sites keep their
+/// current signatures and neither gains an `_at` variant.
+pub fn claude_config_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(dir) = crate::testing::claude_config_dir_override() {
+        return dir;
+    }
+    let real = real_claude_config_dir();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "claude config dir");
+    real
 }
 
 /// Claude Code encodes a project cwd into a directory name by replacing
