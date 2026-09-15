@@ -347,4 +347,161 @@ mod tests {
         assert_eq!(claims["aud"], "https://web.push.apple.com");
         assert_eq!(B64.decode(parts[2]).unwrap().len(), 64); // raw r||s
     }
+
+    // ---- store isolation (#72, D-02) ----
+    //
+    // The push subsystem owned a SECOND config-directory resolver, so a
+    // baude-core-only redirect would not have contained the VAPID signing key
+    // or the subscription store — and it had no coverage at all, so no existing
+    // test could have noticed. These cases assert POSITIVELY that both files
+    // land inside the held fixture root.
+    //
+    // None of them observes, derives, or fingerprints the developer's real
+    // config directory. A test that looked there to prove a negative would be
+    // committing the very leak it exists to detect; the whole-suite no-write
+    // check belongs to the external observer in plan 06.
+
+    /// A unique on-disk fixture root, keyed by pid and a counter so parallel
+    /// cases never collide.
+    fn isolated_push_root(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "bauded-push-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    /// Local synthetic subscription data. The key material is never parsed —
+    /// only [`send`] decodes it, and no case here goes near the network.
+    fn fixture_subscription(endpoint: &str) -> Subscription {
+        Subscription {
+            endpoint: endpoint.to_string(),
+            p256dh: B64.encode([4u8; 65]),
+            auth: B64.encode([9u8; 16]),
+        }
+    }
+
+    #[test]
+    fn store_isolation_persists_both_stores_inside_the_fixture_root() {
+        let root = isolated_push_root("persist");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let config = baude_core::persist::config_dir();
+        assert_eq!(
+            config,
+            root.join("config"),
+            "the redirect owns the shared config dir"
+        );
+        let vapid_path = config.join(VAPID_FILE);
+        let subs_path = config.join(SUBS_FILE);
+
+        let mut state = PushState::load(true).expect("load under a redirect");
+        assert!(
+            vapid_path.exists(),
+            "the VAPID key must be written inside the fixture root; nothing at {}",
+            vapid_path.display()
+        );
+        assert!(
+            !subs_path.exists(),
+            "loading alone must not write a subscription store"
+        );
+
+        state.subscribe(fixture_subscription("https://push.example/aaa"));
+        assert!(
+            subs_path.exists(),
+            "subscribe must persist inside the fixture root; nothing at {}",
+            subs_path.display()
+        );
+
+        // Reload from the fixture files: the key is read back rather than
+        // regenerated, and the subscription survives the round trip.
+        let reloaded = PushState::load(true).expect("reload from the fixture root");
+        assert_eq!(reloaded.vapid.public_b64, state.vapid.public_b64);
+        let subs = reloaded.subs();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].endpoint, "https://push.example/aaa");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_isolation_nested_roots_do_not_interfere() {
+        let outer = isolated_push_root("outer");
+        let _outer = baude_core::testing::TestRedirect::new(&outer);
+        let outer_config = outer.join("config");
+        let mut state = PushState::load(true).expect("outer load");
+        state.subscribe(fixture_subscription("https://push.example/outer"));
+        assert!(
+            outer_config.join(VAPID_FILE).exists() && outer_config.join(SUBS_FILE).exists(),
+            "the outer scope must own both stores under {}",
+            outer_config.display()
+        );
+        let outer_key = std::fs::read_to_string(outer_config.join(VAPID_FILE)).unwrap();
+        let outer_subs = std::fs::read_to_string(outer_config.join(SUBS_FILE)).unwrap();
+
+        {
+            let inner = isolated_push_root("inner");
+            let _inner = baude_core::testing::TestRedirect::new(&inner);
+            let inner_config = inner.join("config");
+            let mut inner_state = PushState::load(true).expect("inner load");
+            inner_state.subscribe(fixture_subscription("https://push.example/inner"));
+            assert!(
+                inner_config.join(VAPID_FILE).exists(),
+                "the inner scope must own its own key under {}",
+                inner_config.display()
+            );
+            assert_ne!(
+                inner_state.vapid.public_b64, state.vapid.public_b64,
+                "a second root must not read the first root's key"
+            );
+            std::fs::remove_dir_all(&inner).ok();
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(outer_config.join(VAPID_FILE)).unwrap(),
+            outer_key,
+            "the inner scope must leave the outer key byte-identical"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outer_config.join(SUBS_FILE)).unwrap(),
+            outer_subs
+        );
+        std::fs::remove_dir_all(&outer).ok();
+    }
+
+    /// `persist = false` is the shortcut a future contributor reaches for, and
+    /// it does NOT contain the key write — only the subscription I/O.
+    #[test]
+    fn store_isolation_contains_the_key_even_when_persist_is_false() {
+        let root = isolated_push_root("ephemeral");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let config = root.join("config");
+        let mut state = PushState::load(false).expect("non-persisting load");
+        assert!(
+            config.join(VAPID_FILE).exists(),
+            "persist=false still generates and writes the VAPID key, so it is \
+             never a substitute for the redirect; nothing at {}",
+            config.join(VAPID_FILE).display()
+        );
+        state.subscribe(fixture_subscription("https://push.example/ephemeral"));
+        assert!(
+            !config.join(SUBS_FILE).exists(),
+            "persist=false must not write a subscription store"
+        );
+        assert_eq!(
+            state.subs().len(),
+            1,
+            "the subscription is still held in memory"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// With no redirect and the thread-local escape probe held, resolution must
+    /// abort BEFORE any key or store I/O.
+    #[test]
+    #[should_panic(expected = "config dir resolved to the real user path")]
+    fn store_isolation_denies_unredirected_load() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _state = PushState::load(true);
+    }
 }
