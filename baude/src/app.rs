@@ -5639,6 +5639,46 @@ mod tests {
         }
     }
 
+    /// The minimal fixture owner: a unique synthetic root plus the literal
+    /// workspace identity resolved under it, in restoration order.
+    ///
+    /// For cases that construct an `App` without a repository fixture. "No
+    /// repository" is not "no identity": `App::new` and `restore` still resolve
+    /// the active workspace, name state files from it and compose managed
+    /// paths, so without this the case reads the developer's real workspace and
+    /// writes into the real data dir.
+    struct IsolationScope {
+        /// Struct fields drop in declaration order, so the identity is restored
+        /// while its own root is still installed.
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    #[must_use = "the returned IsolationScope owns this case's root and identity guards; bind it \
+                  to a named local that outlives every App it isolates"]
+    fn isolation_scope(label: &str) -> IsolationScope {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "baude-isolation-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(label.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        IsolationScope {
+            _identity: identity,
+            _redirect: redirect,
+        }
+    }
+
     #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives the test body"]
     fn admission_repo(name: &str) -> AdmissionRepo {
@@ -6034,6 +6074,7 @@ mod tests {
 
     #[test]
     fn hierarchy_navigation_skips_parent_with_available_checkout_and_retains_selection() {
+        let _scope = isolation_scope("hierarchy-navigation");
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();
         let order = state.allocate_first_seen_order().unwrap();
@@ -6594,6 +6635,7 @@ mod tests {
 
     #[test]
     fn hierarchy_flat_remote_compatibility_has_no_local_parent_or_remove_action() {
+        let _scope = isolation_scope("hierarchy-flat-remote");
         use super::{SelId, SidebarAction};
         use crate::hierarchy::ActionKind;
 
@@ -6714,6 +6756,7 @@ mod tests {
 
     #[test]
     fn archived_rows_hide_from_selection_and_cycling_until_revealed() {
+        let _scope = isolation_scope("archived-rows");
         use super::SelId;
 
         let remote = |id: u64, name: &str, archived: bool| {
@@ -8043,6 +8086,19 @@ mod tests {
             std::env::var_os("HOME"),
             Some(configured_root.join("home").into_os_string())
         );
+        // The child is a test-harness entry, not `main`, so nothing called
+        // `workspace::initialize` for it. It holds its own literal identity
+        // before the first app or backend reader rather than inheriting one;
+        // the admission fixture below nests its own inside this. Filesystem
+        // containment is the parent's child-only HOME, XDG_DATA_HOME,
+        // XDG_CONFIG_HOME and CLAUDE_CONFIG_DIR, asserted just above.
+        let _child_identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("dogfood".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let fixture = admission_repo("restart-dedup");
         let repo = fixture.path().canonicalize().unwrap();
         let root = configured_root.canonicalize().unwrap();
@@ -8597,6 +8653,7 @@ mod tests {
 
     #[test]
     fn standalone_admission_dedup_close_reopen_and_missing_are_durable() {
+        let _scope = isolation_scope("standalone-lifecycle");
         let root =
             std::env::temp_dir().join(format!("baude-standalone-lifecycle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8699,6 +8756,7 @@ mod tests {
 
     #[test]
     fn standalone_failed_first_spawn_retries_fresh_intent() {
+        let _scope = isolation_scope("standalone-first-spawn");
         let root = std::env::temp_dir().join(format!(
             "baude-standalone-first-spawn-{}",
             std::process::id()
@@ -8747,6 +8805,7 @@ mod tests {
 
     #[test]
     fn standalone_active_runtime_is_restored_with_exact_recorded_teardown() {
+        let _scope = isolation_scope("standalone-restore");
         let root =
             std::env::temp_dir().join(format!("baude-standalone-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8884,6 +8943,7 @@ mod tests {
 
     #[test]
     fn folder_context_scopes_rows_cycling_and_the_f_reveal() {
+        let _scope = isolation_scope("folder-context-rows");
         let (state, inside_main, inside_wt, outside_main, standalone) = context_fixture();
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
@@ -8955,6 +9015,7 @@ mod tests {
 
     #[test]
     fn folder_context_selection_moves_never_record() {
+        let _scope = isolation_scope("folder-context-moves");
         let (state, inside_main, ..) = context_fixture();
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
@@ -8970,6 +9031,7 @@ mod tests {
 
     #[test]
     fn folder_context_restore_prefers_the_last_used_session() {
+        let _scope = isolation_scope("folder-context-restore");
         let (state, inside_main, _inside_wt, outside_main, _standalone) = context_fixture();
         let root = std::env::temp_dir().join(format!(
             "baude-folder-context-restore-{}",
@@ -9030,6 +9092,8 @@ mod tests {
     /// line, because the failures that follow are the ones the user sees (#71).
     #[test]
     fn held_workspace_lock_names_the_holder_instead_of_asking_for_a_repair() {
+        // Installed before the `workspace::active()` read two lines below.
+        let _scope = isolation_scope("held-workspace-lock");
         let root =
             std::env::temp_dir().join(format!("baude-held-workspace-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
