@@ -5537,6 +5537,27 @@ mod tests {
         );
     }
 
+    /// The deliberate escape: config resolution with NO redirect must abort
+    /// this binary's test, not quietly reach the developer's real
+    /// `~/.config/baude`.
+    ///
+    /// This is the test that would have caught the original leak, and it is the
+    /// only direct evidence that the cross-crate gate survived into `baude`'s
+    /// test binary. A pass WITHOUT a panic is the warning sign that the gate
+    /// vanished downstream, which is exactly how #72 went unnoticed.
+    ///
+    /// It mutates no environment variable. `BAUDE_TEST_FIXTURE_ROOT` is
+    /// process-wide, so clearing it to observe this condition would change what
+    /// every concurrently running test sees, and a mutex could not fix that —
+    /// non-participating tests never take the lock. The `NoFixtureRoot` probe is
+    /// thread-local, so this needs no serial flag and no `--test-threads=1`.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_resolution_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = persist::config_dir();
+    }
+
     fn pid_is_live(pid: u32) -> bool {
         Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -7794,6 +7815,18 @@ mod tests {
                 .env("BAUDE_TEST_FIXTURE_ROOT", &root)
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("HOME", root.join("home"))
+                // `HOME` alone does NOT contain the child's config resolution:
+                // `meta::claude_config_dir` reads `CLAUDE_CONFIG_DIR` FIRST and
+                // only then falls back to `$HOME/.claude`, and `persist`
+                // likewise prefers `XDG_CONFIG_HOME`. On any machine where the
+                // developer exports either (this project's documented setup
+                // does), the child would inherit a real root and trip
+                // `assert_contained`. Pinning both under the fixture root is the
+                // isolation this test always intended; it is a fixture
+                // correction, not an exemption from the guard. Set on the CHILD
+                // command only — never on the parent process environment.
+                .env("CLAUDE_CONFIG_DIR", root.join("home").join(".claude"))
+                .env("XDG_CONFIG_HOME", root.join("home").join(".config"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env_remove("BAUDE_DAEMON_URL")

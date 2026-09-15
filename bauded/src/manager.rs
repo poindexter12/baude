@@ -2579,6 +2579,29 @@ mod tests {
         }
     }
 
+    /// The deliberate escape: config resolution with NO redirect must abort
+    /// this binary's test, not quietly reach the developer's real
+    /// `~/.config/baude`.
+    ///
+    /// `cfg(test)` is set per crate by `rustc --test`, so a `#[cfg(test)]`-only
+    /// guard inside `baude-core` would be absent from exactly the two binaries
+    /// that leaked (#72). This is the direct evidence that the `test-support`
+    /// feature carried the gate into `bauded`'s test binary: it fails to COMPILE
+    /// if the dev-dependency feature wiring is removed, and passes WITHOUT a
+    /// panic if the guard itself vanished — the warning sign the phase exists
+    /// to make visible.
+    ///
+    /// It mutates no environment variable. `BAUDE_TEST_FIXTURE_ROOT` is
+    /// process-wide, so clearing it would change what every concurrently
+    /// running test sees; the `NoFixtureRoot` probe is thread-local, so this
+    /// needs no serial flag and no `--test-threads=1`.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_resolution_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = baude_core::persist::config_dir();
+    }
+
     fn mgr() -> Manager {
         Manager::new("sh -c 'sleep 30'".into(), false)
     }
