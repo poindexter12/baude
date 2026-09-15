@@ -186,10 +186,52 @@ pub enum Verdict {
 /// clearing set required, explicitly and in full. Everything else — including
 /// an empty evidence list — falls through to [`Verdict::Indeterminate`].
 pub fn classify(evidence: Vec<Evidence>) -> Verdict {
-    todo!(
-        "plan 08-04 task 2 implements the agreed predicate over {} signals",
-        evidence.len()
-    )
+    // Blockers first, and they win outright. Refusing before the clearing set
+    // is even looked at is what makes "a hard blocker overrides any number of
+    // clearing signals" a structural property rather than a rule someone has
+    // to remember when adding the next signal.
+    let mut proves_live = false;
+    let mut prevents_conclusion = false;
+    for signal in &evidence {
+        match signal.blocking_role() {
+            Some(BlockingRole::ProvesLive) => proves_live = true,
+            Some(BlockingRole::PreventsConclusion) => prevents_conclusion = true,
+            None => {}
+        }
+    }
+    if proves_live {
+        return Verdict::Live { evidence };
+    }
+    if prevents_conclusion {
+        return Verdict::Indeterminate { evidence };
+    }
+
+    // Then require the agreed clearing set explicitly and in full. Clause 3
+    // admits exactly `Empty` and `GitDisownsIt`; `NoGitdir` is not a member.
+    let shape_matched = evidence.contains(&Evidence::ShapeMatch);
+    let workspaces_checked = evidence.iter().find_map(|signal| match signal {
+        Evidence::NotReferencedByState { workspaces_checked } => Some(workspaces_checked.clone()),
+        _ => None,
+    });
+    let clearing = evidence.iter().find_map(|signal| match signal {
+        Evidence::Empty => Some(ClearingSignal::Empty),
+        Evidence::GitDisownsIt { owning_repository } => Some(ClearingSignal::GitDisownsIt {
+            owning_repository: owning_repository.clone(),
+        }),
+        _ => None,
+    });
+
+    match (shape_matched, workspaces_checked, clearing) {
+        (true, Some(workspaces_checked), Some(clearing)) => Verdict::Removable {
+            proof: RemovalProof {
+                workspaces_checked,
+                clearing,
+                observed: evidence,
+            },
+        },
+        // Everything else falls through, including the empty evidence list.
+        _ => Verdict::Indeterminate { evidence },
+    }
 }
 
 #[cfg(test)]
