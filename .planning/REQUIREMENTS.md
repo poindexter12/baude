@@ -26,7 +26,7 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
   - Closed by plan 08-01: `assert_contained` (`testing.rs:278`) covers the config, state, Claude and managed-worktrees resolutions, keys on `BAUDE_TEST_FIXTURE_ROOT` (independent of XDG, so it arms in every test binary — proven for both downstream binaries by `c52be5b`), and panics at resolution, so an escape performs no real-root I/O.
   - Closed by plan 08-06: the guard demonstrably fired across the first broad run, catching 22 `manager`, 8 `api`, 5 `lifecycle` and 2 `app` escapes, all since owned; the suite-level observer asserts the aggregate claim the per-resolver guards only constrain.
   - Residual (tracked, not part of this requirement): `App::open_editor` (`app.rs:5077`) and `copy_to_clipboard` (`app.rs:5442`) spawn subprocesses with the inherited environment rather than through the contained launcher. Neither is test-reachable; WINDOWS entry 6.
-- [ ] **TISO-04** (partial): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
+- [x] **TISO-04**: A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
   - Shipped plan 08-04: read-only enumeration and the `Evidence`/`Verdict` classification, with a missing gitdir explicitly unable to clear a candidate (`worktree_scan.rs`).
   - Shipped plan 08-05: state cross-referencing as ownership-negative evidence, and `prune_at(roots, report, confirmed)` — full re-derivation plus proof equality plus a non-defaulting confirmation parameter.
   - Gap: no CLI surface yet, so a developer still cannot *run* a preview. Plan 08-07 exposes both through `baude worktrees` with `--prune` and a separate `--yes`.
@@ -108,7 +108,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | TISO-01 | Phase 8 | Delivered plan 08-06 |
 | TISO-02 | Phase 8 | Delivered plan 08-06 |
 | TISO-03 | Phase 8 | Delivered plan 08-06 |
-| TISO-04 | Phase 8 | Partial — gap in Phase 8 |
+| TISO-04 | Phase 8 | Delivered plan 08-07 |
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
 | HREG-03 | Phase 9 | Pending |
@@ -140,10 +140,10 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 - Mapped to phases: 29
 - Unmapped: 0
 - Delivered before execution: 6 (HREG-01, HREG-02, WLOCK-01 through WLOCK-04)
-- Delivered during execution: 3 (TISO-01, TISO-02, TISO-03 — plan 08-06)
-- Partially delivered, remainder in scope: 2 (TISO-04, HREG-04)
+- Delivered during execution: 4 (TISO-01, TISO-02, TISO-03 — plan 08-06; TISO-04 — plan 08-07)
+- Partially delivered, remainder in scope: 1 (HREG-04)
 - Open: 20
 
 ---
 *Requirements defined: 2026-09-08*
-*Last updated: 2026-09-15 — TISO-01/02/03 closed by plan 08-06 (suite-level real-root assertion)*
+*Last updated: 2026-09-15 — TISO-04 closed by plan 08-07 (`baude worktrees scan` preview surface)*

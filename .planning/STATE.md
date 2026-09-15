@@ -4,17 +4,17 @@ milestone: v2.2
 milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
-status: executing
-stopped_at: Completed 08-06-PLAN.md
-last_updated: "2026-09-15T17:36:09.743Z"
+status: verifying
+stopped_at: Completed 08-07-PLAN.md
+last_updated: "2026-09-15T18:04:58.389Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: 5777f753b30f790b09570c1be651a13070ec8e86
+state_head: b3e905c93f81938255c633c8b49f07ec44f88ca5
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
   percent: 0
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
 Plan: 8 of 8
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
@@ -77,6 +77,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P08 | ~3h | 2 tasks | 4 files |
 | Phase 08 P05 | 39min | 3 tasks | 1 files |
 | Phase 08 P06 | 58min | 2 tasks | 6 files |
+| Phase 08 P07 | 25min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -164,6 +165,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: 08-06: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
 - [Phase 08]: 08-06: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
 - [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
+- [Phase 08]: 08-07: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
+- [Phase 08]: 08-07: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
 
 ### Pending Todos
 
@@ -197,8 +200,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T17:36:09.713Z
-Stopped at: Completed 08-06-PLAN.md
+Last session: 2026-09-15T18:04:58.373Z
+Stopped at: Completed 08-07-PLAN.md
 Resume file: None
 
 ## Deferred Items

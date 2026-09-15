@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 5
+open_count: 6
 waived_count: 0
 fixed_count: 3
-total_count: 8
-last_updated: 2026-09-15T17:34:26.610Z
+total_count: 9
+last_updated: 2026-09-15T18:05:06.320Z
 ---
 
 # Broken Windows Ledger
@@ -23,6 +23,7 @@ last_updated: 2026-09-15T17:34:26.610Z
 | 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it | open |  | 2026-09-15T15:38:12.573Z |  |
 | 7 | 08 | deviation | baude-core/src/worktree_scan.rs |  | 08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path | open |  | 2026-09-15T16:31:45.745Z |  |
 | 8 | 08 | deviation | .planning/REQUIREMENTS.md |  | 08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises | open |  | 2026-09-15T16:31:46.217Z |  |
+| 9 | 08 | stub | baude/src/main.rs |  | `--json --prune` rejection path is fail-closed but untested; a future serializable prune account should replace the rejection and test both | open |  | 2026-09-15T18:05:06.320Z |  |
 
 ````json
 [
@@ -127,6 +128,19 @@ last_updated: 2026-09-15T17:34:26.610Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-15T16:31:46.217Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 9,
+    "kind": "stub",
+    "phase": "08",
+    "file": "baude/src/main.rs",
+    "line": null,
+    "description": "`--json --prune` rejection path is fail-closed but untested; a future serializable prune account should replace the rejection and test both",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-15T18:05:06.320Z",
     "resolved_at": null,
     "milestone": "v2.2"
   }

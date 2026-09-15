@@ -64,7 +64,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
 4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
 
-**Plans**: 7/8 plans executed
+**Plans**: 8/8 plans executed
 
 Plans:
 
@@ -89,7 +89,7 @@ Plans:
 
 **Wave 5 (after 08-05 and 08-06)**
 
-- [ ] 08-07-PLAN.md — `baude worktrees` CLI surface: grouped report, JSON preview input, two-flag prune
+- [x] 08-07-PLAN.md — `baude worktrees` CLI surface: grouped report, JSON preview input, two-flag prune
 
 ### Phase 9: Hook Seeding Safety
 
@@ -160,7 +160,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Test Isolation and Fixture Ownership (narrowed) | 7/8 | In Progress|  |
+| 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 0/TBD | Not started | - |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
