@@ -64,7 +64,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
 4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
 
-**Plans**: 3/8 plans executed
+**Plans**: 4/8 plans executed
 
 Plans:
 
@@ -79,7 +79,7 @@ Plans:
 
 **Wave 3 (after identity/resolver prerequisites)**
 
-- [ ] 08-04-PLAN.md — Leak scan: evidence/verdict model and read-only enumeration (pending human decision)
+- [x] 08-04-PLAN.md — Leak scan: evidence/verdict model and read-only enumeration (pending human decision)
 - [ ] 08-08-PLAN.md — Inert App workers, UI ownership regressions and contained PTY child environments
 
 **Wave 4**
@@ -160,7 +160,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Test Isolation and Fixture Ownership (narrowed) | 3/8 | In Progress|  |
+| 8. Test Isolation and Fixture Ownership (narrowed) | 4/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 0/TBD | Not started | - |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |

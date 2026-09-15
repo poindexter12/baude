@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: Completed 08-03-PLAN.md
-last_updated: "2026-09-15T14:50:34.909Z"
+stopped_at: Completed 08-04-PLAN.md
+last_updated: "2026-09-15T15:13:43.916Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: 5ca0ab04d278cde1bde4c9604b4f4dcbb38dcf4f
+state_head: 5a89a0fee3865eff96956fdd976f6ee4677df392
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 4 of 8
+Plan: 5 of 8
 Status: Ready to execute
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
@@ -73,6 +73,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P01 | 26min | 3 tasks | 11 files |
 | Phase 08 P02 | 16min | 2 tasks | 2 files |
 | Phase 08 P03 | 45min | 2 tasks | 9 files |
+| Phase 08 P04 | 70min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -143,6 +144,12 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: Phase 08 plan 03: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
 - [Phase 08]: Phase 08 plan 03: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
 - [Phase 08]: Phase 08 plan 03: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
+- [Phase 08]: 08-04: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
+- [Phase 08]: 08-04: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
+- [Phase 08]: 08-04: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
+- [Phase 08]: 08-04: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
+- [Phase 08]: 08-04: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
+- [Phase 08]: 08-04: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
 
 ### Pending Todos
 
@@ -175,8 +182,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T14:50:03.694Z
-Stopped at: Completed 08-03-PLAN.md
+Last session: 2026-09-15T15:13:43.893Z
+Stopped at: Completed 08-04-PLAN.md
 Resume file: None
 
 ## Deferred Items
