@@ -683,7 +683,11 @@ mod tests {
     /// identity resolved under that root. For router cases that need no
     /// repository fixture — they still reach `workspace::active()` through the
     /// handlers.
-    struct ApiScope {
+    ///
+    /// `pub(super)` so the sibling `pty_ws_tests` module can own one too: the
+    /// websocket case drives the same handlers over a real socket and reaches
+    /// the same ambient config reads.
+    pub(super) struct ApiScope {
         /// Struct fields drop in declaration order, so the identity is restored
         /// while its own root is still installed.
         _identity: baude_core::testing::TestRedirect,
@@ -692,7 +696,7 @@ mod tests {
 
     #[must_use = "the returned ApiScope owns this case's root and identity; bind it to a named \
                   local that outlives every handler await"]
-    fn api_scope(label: &str) -> ApiScope {
+    pub(super) fn api_scope(label: &str) -> ApiScope {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "bauded-scope-{label}-{}-{}",
@@ -1084,6 +1088,10 @@ mod tests {
     async fn real_atomic_persistence_failures_are_503_for_every_mutation() {
         use baude_core::persist::{self, AtomicFailure};
 
+        // Declared first so it drops last: every `Manager::new` below reads
+        // config ambiently even though the state roots are passed explicitly.
+        let _scope = api_scope("atomic-persistence");
+
         for (failure, committed) in [
             (AtomicFailure::Rename, false),
             (AtomicFailure::DirectorySync, true),
@@ -1298,7 +1306,8 @@ mod tests {
     async fn post_event_appends_and_404s_unknown() {
         use crate::manager::lock;
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("post-event");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         // Pin a deterministic claude session_id so the /tmp path is isolated.
         let sid = format!("api-event-test-{}", std::process::id());
@@ -1343,7 +1352,8 @@ mod tests {
     async fn activity_returns_events_clamps_limit_and_404s_unknown() {
         use crate::manager::lock;
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("activity-events");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let sid = format!("api-activity-test-{}", std::process::id());
         let path = baude_core::hook::event_path(&sid);
@@ -1419,7 +1429,8 @@ mod tests {
     async fn activity_stream_guards_known_and_unknown() {
         use crate::manager::lock;
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("activity-stream");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1449,7 +1460,8 @@ mod tests {
     async fn permission_get_post_round_trip_and_validation() {
         use crate::manager::{lock, PendingPermission};
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("permission-round-trip");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1550,7 +1562,8 @@ mod tests {
     async fn permission_post_deny_resolves_deny() {
         use crate::manager::{lock, PendingPermission};
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("permission-deny");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
@@ -1595,7 +1608,8 @@ mod tests {
 
         use crate::manager::{lock, PendingPermission};
 
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let _scope = api_scope("permission-long-poll");
+        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
@@ -1744,10 +1758,15 @@ mod pty_ws_tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+    use super::tests::api_scope;
     use crate::manager::{lock, Manager};
 
     #[tokio::test]
     async fn pty_websocket_round_trip() {
+        // Declared first so it drops last: the spawned `axum::serve` task and
+        // the PTY it drives run on this same current-thread runtime, so the
+        // thread-local redirect must outlive the socket, not just the setup.
+        let _scope = api_scope("pty-websocket");
         // Wrap the shell so the spawn-site permission flag (appended to the
         // base cmd, default `--dangerously-skip-permissions`) lands as the
         // harmless `$0` of `sh -c` instead of breaking bash's arg parsing.
