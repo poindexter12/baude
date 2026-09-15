@@ -226,7 +226,7 @@ fn help_text() -> String {
     format!(
         "baude {} — multiple AI coding sessions in one terminal\n\n\
          usage: baude [<repo-dir>]\n\n\
-         subcommands: statusline, hook, permission-mcp\n\
+         subcommands: statusline, hook, permission-mcp, worktrees\n\
          options:     --version/-V, --help/-h",
         env!("CARGO_PKG_VERSION")
     )
@@ -263,6 +263,24 @@ fn main() -> Result<()> {
     // deny-on-timeout — contrast `hook`'s always-exit-0.
     if args.get(1).map(String::as_str) == Some("permission-mcp") {
         run_permission_mcp();
+    }
+
+    // `baude worktrees …` — the TISO-04 managed-worktree preview. Dispatched
+    // before the launch-dir logic for the same reason as the flags below: an
+    // undispatched verb is read as a repo path and boots the TUI. The roots are
+    // resolved HERE, by this process, and handed down explicitly — a saved
+    // report is compared against them and is never a place to name the tree to
+    // act on (T-08-25). No matching arm exists in `bauded` (T-08-17).
+    if args.get(1).map(String::as_str) == Some("worktrees") {
+        let roots = baude_core::worktree_scan::ScanRoots {
+            worktrees_base: baude_core::git::real_worktrees_base(),
+            config_dir: baude_core::persist::config_dir(),
+        };
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let code = run_worktrees_at(&args[2..], &roots, &mut out, &mut err);
+        let _ = std::io::Write::flush(&mut out);
+        std::process::exit(code);
     }
 
     // `baude --version` / `--help` — print and exit BEFORE the launch-dir logic
@@ -433,24 +451,46 @@ fn run(
 // present to approve a deletion (T-08-17).
 // ---------------------------------------------------------------------------
 
-// RED scaffolding note: nothing in `main` dispatches here yet, so a non-test
-// build sees every item below as dead. The dispatch arm — and the deletion of
-// these `allow`s — ships in the GREEN commit; `-D warnings` would otherwise
-// fail the RED commit for the very absence the RED tests are asserting.
-
 /// Exit code when the command did what was asked.
-#[allow(dead_code)]
 const WORKTREES_EXIT_OK: i32 = 0;
 /// Exit code when the command could not complete. Nothing was removed.
-#[allow(dead_code)]
 const WORKTREES_EXIT_FAILED: i32 = 1;
 /// Exit code when the command line itself was wrong. Nothing was read or
 /// removed — the arguments never reached the filesystem.
-#[allow(dead_code)]
 const WORKTREES_EXIT_USAGE: i32 = 2;
 
-/// The parsed `baude worktrees scan` command line.
-#[allow(dead_code)]
+/// The verb's own help, printed by `baude worktrees --help` and appended to
+/// every usage error.
+///
+/// It documents the flow as two invocations on purpose: the operator saves a
+/// preview, reads it, and only then hands that same file back. A help text that
+/// showed a one-shot `--prune` would be teaching the habit this surface exists
+/// to prevent.
+fn worktrees_help_text() -> String {
+    "baude worktrees — inspect the managed-worktree root\n\
+     \n\
+     usage: baude worktrees scan [--json]\n\
+     \x20      baude worktrees scan --prune --report <file> [--yes]\n\
+     \n\
+     Step one — preview. Reads only; removes nothing:\n\
+     \x20 baude worktrees scan                 grouped, human-readable summary\n\
+     \x20 baude worktrees scan --json > p.json the full report, evidence included\n\
+     \n\
+     Step two — act on a preview you have read:\n\
+     \x20 --prune --report <file>   re-derive every fact and report what WOULD go\n\
+     \x20 --yes                     a separate confirmation; without it nothing goes\n\
+     \n\
+     `--prune` requires `--report`, and the removal set comes from that saved\n\
+     file — never from a fresh scan. A candidate is removed only when the\n\
+     freshly re-derived proof still matches the one in the report you approved.\n\
+     `--json` describes a scan, so it cannot be combined with `--prune`.\n\
+     \n\
+     exit codes: 0 did what was asked, 1 could not complete (nothing removed),\n\
+     \x20           2 the command line was wrong (nothing was read or removed)"
+        .to_string()
+}
+
+/// The parsed `baude worktrees` command line.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct WorktreesOptions {
     json: bool,
@@ -459,19 +499,512 @@ struct WorktreesOptions {
     yes: bool,
 }
 
-/// RED stub — fail closed.
+/// What the command line asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorktreesRequest {
+    Help,
+    Scan(WorktreesOptions),
+}
+
+/// Parse the tokens following `baude worktrees`.
 ///
-/// Reads nothing, prints no preview an operator could mistake for one, and
-/// removes nothing. Replaced wholesale by the GREEN commit.
-#[allow(dead_code)]
+/// Hand-written rather than pulled from an argument crate, and deliberately
+/// strict: an unknown option, a repeated one, or a missing value is refused
+/// outright instead of being ignored. The whole point of the two opt-ins is
+/// that they are hard to type by accident, which a parser that silently skips
+/// what it does not recognize would undo.
+fn parse_worktrees_args(rest: &[String]) -> Result<WorktreesRequest, String> {
+    let mut tokens = rest.iter().map(String::as_str);
+    let Some(verb) = tokens.next() else {
+        return Err("expected a subcommand; the only one is `scan`".to_string());
+    };
+    if matches!(verb, "--help" | "-h" | "help") {
+        return Ok(WorktreesRequest::Help);
+    }
+    if verb != "scan" {
+        return Err(format!(
+            "`{verb}` is not a worktrees subcommand; the only one is `scan` \
+             (`prune` is an option on `scan`, never a verb of its own)"
+        ));
+    }
+
+    let mut options = WorktreesOptions::default();
+    let mut seen: Vec<&str> = Vec::new();
+    let once = |flag: &'static str, seen: &mut Vec<&str>| -> Result<(), String> {
+        if seen.contains(&flag) {
+            return Err(format!("`{flag}` was given more than once"));
+        }
+        seen.push(flag);
+        Ok(())
+    };
+    while let Some(token) = tokens.next() {
+        match token {
+            "--help" | "-h" => return Ok(WorktreesRequest::Help),
+            "--json" => {
+                once("--json", &mut seen)?;
+                options.json = true;
+            }
+            "--prune" => {
+                once("--prune", &mut seen)?;
+                options.prune = true;
+            }
+            "--yes" => {
+                once("--yes", &mut seen)?;
+                options.yes = true;
+            }
+            "--report" => {
+                once("--report", &mut seen)?;
+                let value = tokens
+                    .next()
+                    .ok_or_else(|| "`--report` needs the path of a saved report".to_string())?;
+                options.report = Some(std::path::PathBuf::from(value));
+            }
+            other => return Err(format!("`{other}` is not an option of `worktrees scan`")),
+        }
+    }
+
+    // The three ways a partially typed removal could be read as an authorized
+    // one. Each is refused before any root is opened.
+    if options.yes && !options.prune {
+        return Err("`--yes` confirms a `--prune`; on its own it authorizes nothing".to_string());
+    }
+    if options.report.is_some() && !options.prune {
+        return Err(
+            "`--report` names the set a `--prune` acts on; a scan builds its own \
+             and never reads one"
+                .to_string(),
+        );
+    }
+    if options.prune && options.report.is_none() {
+        return Err(
+            "`--prune` needs `--report <file>`: the removal set comes from a \
+             preview you have already read, never from a fresh scan"
+                .to_string(),
+        );
+    }
+    // The prune account is a record of actions taken, not the scan report that
+    // `--json` names, so the combination has no single meaning to serialize.
+    if options.json && options.prune {
+        return Err(
+            "`--json` writes a scan report; it cannot be combined with `--prune`. \
+             Save the preview first, then prune from it"
+                .to_string(),
+        );
+    }
+    Ok(WorktreesRequest::Scan(options))
+}
+
+/// One observed signal, in words.
+fn evidence_phrase(evidence: &baude_core::worktree_scan::Evidence) -> String {
+    use baude_core::worktree_scan::Evidence;
+    match evidence {
+        Evidence::ShapeMatch => "managed shape".to_string(),
+        Evidence::NotReferencedByState {
+            workspaces_checked,
+            files_checked,
+            files_absent,
+        } => format!(
+            "no state reference ({} workspace(s), {} file(s) read, {} absent)",
+            workspaces_checked.len(),
+            files_checked.len() - files_absent.len(),
+            files_absent.len()
+        ),
+        Evidence::NoGitdir => "no gitdir".to_string(),
+        Evidence::Empty => "empty".to_string(),
+        Evidence::GitDisownsIt { owning_repository } => format!(
+            "git disowns it (repository {})",
+            owning_repository.display()
+        ),
+        Evidence::ContainsCheckout { entries } => {
+            format!("contains a checkout ({entries} entr(y/ies))")
+        }
+        Evidence::ReferencedByState {
+            workspace,
+            repository_key,
+            matched,
+        } => {
+            let key = repository_key
+                .map(|key| format!("key {key}"))
+                .unwrap_or_else(|| "no key".to_string());
+            format!("referenced by state (workspace {workspace}, {key}, {matched:?} match)")
+        }
+        Evidence::IsSymlink => "is itself a symlink".to_string(),
+        Evidence::StateUnreadable {
+            source,
+            workspace,
+            detail,
+        } => format!(
+            "state unreadable ({}, workspace {workspace}: {detail})",
+            source.display()
+        ),
+    }
+}
+
+/// A verdict and the facts behind it, in one line.
+fn verdict_phrase(verdict: &baude_core::worktree_scan::Verdict) -> String {
+    use baude_core::worktree_scan::{ClearingSignal, Verdict};
+    let phrases = |evidence: &[baude_core::worktree_scan::Evidence]| {
+        evidence
+            .iter()
+            .map(evidence_phrase)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match verdict {
+        Verdict::Live { evidence } => format!("live — {}", phrases(evidence)),
+        Verdict::Indeterminate { evidence } => {
+            let facts = phrases(evidence);
+            if facts.is_empty() {
+                "indeterminate — nothing observed".to_string()
+            } else {
+                format!("indeterminate — {facts}")
+            }
+        }
+        Verdict::Removable { proof } => {
+            let clearing = match &proof.clearing {
+                ClearingSignal::Empty => "empty".to_string(),
+                ClearingSignal::GitDisownsIt { owning_repository } => {
+                    format!("git disowns it ({})", owning_repository.display())
+                }
+            };
+            format!(
+                "removable — cleared by {clearing}, {} workspace(s) checked",
+                proof.workspaces_checked.len()
+            )
+        }
+    }
+}
+
+/// The one-word bucket a verdict falls in, used for the grouped counts.
+fn verdict_label(verdict: &baude_core::worktree_scan::Verdict) -> &'static str {
+    use baude_core::worktree_scan::Verdict;
+    match verdict {
+        Verdict::Live { .. } => "live",
+        Verdict::Indeterminate { .. } => "indeterminate",
+        Verdict::Removable { .. } => "removable",
+    }
+}
+
+/// Print the human-readable preview: candidates grouped by workspace, each one
+/// named with the verdict and the facts that produced it, then a total.
+fn print_scan_summary(
+    report: &baude_core::worktree_scan::ScanReport,
+    out: &mut dyn std::io::Write,
+) {
+    let _ = writeln!(
+        out,
+        "baude worktrees scan — preview only, nothing was removed\n"
+    );
+    let _ = writeln!(
+        out,
+        "  worktrees base: {}",
+        report.worktrees_base.to_path_buf().display()
+    );
+    let _ = writeln!(
+        out,
+        "  config dir:     {}",
+        report.config_dir.to_path_buf().display()
+    );
+    let inventory = &report.state_inventory;
+    let _ = writeln!(
+        out,
+        "  state inventory: {} — {} workspace(s), {} state file(s), {} absent",
+        if inventory.complete {
+            "complete"
+        } else {
+            "INCOMPLETE — no candidate can be cleared"
+        },
+        inventory.workspaces_checked.len(),
+        inventory.files_checked.len(),
+        inventory.files_absent.len()
+    );
+
+    let mut workspaces: Vec<&str> = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.workspace.as_str())
+        .collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+
+    let mut removable = 0usize;
+    let mut live = 0usize;
+    let mut indeterminate = 0usize;
+    for workspace in workspaces {
+        let mut group: Vec<&baude_core::worktree_scan::Candidate> = report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.workspace == workspace)
+            .collect();
+        group.sort_by_key(|candidate| candidate.repository_key);
+        let count = |label: &str| {
+            group
+                .iter()
+                .filter(|candidate| verdict_label(&candidate.verdict) == label)
+                .count()
+        };
+        let (group_removable, group_live, group_indeterminate) =
+            (count("removable"), count("live"), count("indeterminate"));
+        removable += group_removable;
+        live += group_live;
+        indeterminate += group_indeterminate;
+        let _ = writeln!(
+            out,
+            "\nworkspace {workspace} — {} candidate(s): {group_removable} removable, \
+             {group_live} live, {group_indeterminate} indeterminate",
+            group.len()
+        );
+        for candidate in group {
+            let _ = writeln!(
+                out,
+                "  {:<13} {}  [{}]",
+                verdict_label(&candidate.verdict),
+                candidate.relative.join("/"),
+                verdict_phrase(&candidate.verdict)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "\ntotal: {} candidate(s) — {removable} removable, {live} live, \
+         {indeterminate} indeterminate",
+        report.candidates.len()
+    );
+    let _ = writeln!(
+        out,
+        "Nothing was removed: this command only reads. To act on this preview, \
+         save it and hand it back:\n  \
+         baude worktrees scan --json > preview.json\n  \
+         baude worktrees scan --prune --report preview.json        # re-verify only\n  \
+         baude worktrees scan --prune --report preview.json --yes  # and remove"
+    );
+}
+
+/// Why one candidate was not removed, in words. Every refusal names its reason:
+/// an account that says only "refused" is the one an operator works around
+/// (T-08-15).
+fn refusal_phrase(reason: &baude_core::worktree_scan::RefusalReason) -> String {
+    use baude_core::worktree_scan::RefusalReason;
+    match reason {
+        RefusalReason::NotRemovableNow { verdict } => {
+            format!(
+                "re-derivation no longer clears it: {}",
+                verdict_phrase(verdict)
+            )
+        }
+        RefusalReason::ProofChanged {
+            approved,
+            rederived,
+        } => format!(
+            "the re-derived proof is not the approved proof — approved {} workspace(s) \
+             checked, re-derived {}; approved evidence {} item(s), re-derived {}",
+            approved.workspaces_checked.len(),
+            rederived.workspaces_checked.len(),
+            approved.observed.len(),
+            rederived.observed.len()
+        ),
+        RefusalReason::Vanished => "gone since the approved scan — nothing to remove".to_string(),
+        RefusalReason::BecameSymlink => {
+            "a symlink stands where the directory was; refused without resolving it".to_string()
+        }
+        RefusalReason::NotADirectory => "not a directory any more".to_string(),
+        RefusalReason::GitdirPresent { holder } => format!(
+            "a gitdir is present ({}) — this is git's to remove, not ours",
+            holder.display()
+        ),
+        RefusalReason::RemovalFailed { detail } => format!("the removal failed: {detail}"),
+    }
+}
+
+/// Print the complete account of a prune: every approved record, every refusal
+/// with its reason, and everything found on disk that the report never named.
+fn print_prune_account(
+    report: &baude_core::worktree_scan::PruneReport,
+    out: &mut dyn std::io::Write,
+) {
+    use baude_core::worktree_scan::PruneDisposition;
+    let _ = writeln!(
+        out,
+        "baude worktrees scan --prune — {}\n",
+        if report.confirmed {
+            "confirmed: re-verified candidates that still match their approved proof were removed"
+        } else {
+            "re-verification only, nothing was removed"
+        }
+    );
+
+    let mut removed = 0usize;
+    let mut would = 0usize;
+    let mut refused = 0usize;
+    let mut untouched = 0usize;
+    for outcome in &report.outcomes {
+        let path = outcome.relative.join("/");
+        let line = match &outcome.disposition {
+            PruneDisposition::NotApproved => {
+                untouched += 1;
+                "not approved  (named by the report, but not as removable)".to_string()
+            }
+            PruneDisposition::Unapproved => {
+                untouched += 1;
+                "not approved  (found on disk, absent from the report — never this run's to remove)"
+                    .to_string()
+            }
+            PruneDisposition::WouldRemove => {
+                would += 1;
+                "would remove  (re-verified and still matching; awaiting --yes)".to_string()
+            }
+            PruneDisposition::Removed => {
+                removed += 1;
+                "removed".to_string()
+            }
+            PruneDisposition::Refused { reason } => {
+                refused += 1;
+                format!("refused       ({})", refusal_phrase(reason))
+            }
+        };
+        let _ = writeln!(out, "  {path}  {line}");
+    }
+
+    let _ = writeln!(
+        out,
+        "\ntotal: {} record(s) — {removed} removed, {would} would remove, \
+         {refused} refused, {untouched} left alone",
+        report.outcomes.len()
+    );
+    if !report.confirmed {
+        let _ = writeln!(
+            out,
+            "Nothing was removed. Re-run the same command with --yes to act on it."
+        );
+    }
+}
+
+/// Run `baude worktrees <args>` against explicit roots.
+///
+/// The roots and the sinks are parameters so a test drives the real command
+/// path without a developer directory anywhere near it, and so `main` stays the
+/// only place a real root is resolved.
 fn run_worktrees_at(
-    _rest: &[String],
-    _roots: &baude_core::worktree_scan::ScanRoots,
-    _out: &mut dyn std::io::Write,
+    rest: &[String],
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> i32 {
-    let _ = writeln!(err, "baude worktrees: not implemented");
-    WORKTREES_EXIT_FAILED
+    let options = match parse_worktrees_args(rest) {
+        Ok(WorktreesRequest::Help) => {
+            let _ = writeln!(out, "{}", worktrees_help_text());
+            return WORKTREES_EXIT_OK;
+        }
+        Ok(WorktreesRequest::Scan(options)) => options,
+        Err(message) => {
+            let _ = writeln!(err, "baude worktrees: {message}");
+            let _ = writeln!(err, "\n{}", worktrees_help_text());
+            return WORKTREES_EXIT_USAGE;
+        }
+    };
+
+    if options.prune {
+        run_worktrees_prune(&options, roots, out, err)
+    } else {
+        run_worktrees_scan(&options, roots, out, err)
+    }
+}
+
+/// The preview path. Reads, prints, exits.
+fn run_worktrees_scan(
+    options: &WorktreesOptions,
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let report = match baude_core::worktree_scan::scan_at(roots) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(err, "baude worktrees: {error}");
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    if options.json {
+        // In `--json` mode stdout is the report and nothing else, byte for
+        // byte: it is meant to be redirected to a file and handed back to
+        // `--prune`. Every diagnostic goes to stderr.
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => {
+                let _ = writeln!(out, "{text}");
+                WORKTREES_EXIT_OK
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "baude worktrees: the report could not be written: {error}"
+                );
+                WORKTREES_EXIT_FAILED
+            }
+        }
+    } else {
+        print_scan_summary(&report, out);
+        WORKTREES_EXIT_OK
+    }
+}
+
+/// The prune path: load the approved report, hand it to the core unchanged, and
+/// print the account.
+///
+/// The report is loaded and deserialized here and passed through verbatim. It
+/// is comparison data: `prune_at` re-derives every fact for itself against the
+/// roots THIS process resolved, and removes only what still matches (D-15).
+fn run_worktrees_prune(
+    options: &WorktreesOptions,
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let Some(path) = options.report.as_deref() else {
+        // Unreachable: the parser refuses `--prune` without `--report`. Kept as
+        // a refusal rather than a panic so the failure mode of a future parser
+        // change is "removes nothing", not "removes the wrong set".
+        let _ = writeln!(err, "baude worktrees: no approved report was given");
+        return WORKTREES_EXIT_USAGE;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: the approved report {} could not be read: {error}\n\
+                 Nothing was removed.",
+                path.display()
+            );
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    let approved: baude_core::worktree_scan::ScanReport = match serde_json::from_slice(&bytes) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: {} is not a report this build can act on: {error}\n\
+                 Nothing was removed.",
+                path.display()
+            );
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    match baude_core::worktree_scan::prune_at(roots, &approved, options.yes) {
+        Ok(report) => {
+            print_prune_account(&report, out);
+            WORKTREES_EXIT_OK
+        }
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: the approved report was refused: {error}\n\
+                 Nothing was removed."
+            );
+            WORKTREES_EXIT_FAILED
+        }
+    }
 }
 
 #[cfg(test)]
