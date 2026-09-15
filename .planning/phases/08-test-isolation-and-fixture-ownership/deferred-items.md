@@ -50,3 +50,38 @@ fixture provenance. Same pattern as `c860e26`.
 `scripts/assert-real-roots-untouched.sh` + CI gate and cannot go green while
 these five fail. If 08-06's budget will not absorb it, this needs its own plan
 before the phase can claim a clean `cargo test -p baude-core --lib`.
+
+## `App::open_editor` spawns the developer's editor uncontained (found: 08-08)
+
+**Discovered during:** 08-08 task 2, rechecking the plan's `<worker_inventory>`
+for newly test-reachable ambient callers.
+
+**Symptom:** `baude/src/app.rs:5077` runs `sh -c '<editor_cmd> "$1"'` with the
+inherited environment. `editor_cmd()` reads the user's configured editor, so a
+test that reached this path would launch the developer's real editor against a
+fixture path — outside every redirect, exactly like the `ccusage` and login-shell
+escapes this plan closed.
+
+**Not currently reachable from a test:** the only callers are
+`open_editor_for_selection` (key handler, `app.rs:3863`) and
+`SidebarAction::Editor` dispatch (`app.rs:4317`). Every test reference to
+`SidebarAction::Editor` (`app.rs:6390`–`6515`) asserts the pure key→action
+mapping and stops there; nothing in the harness invokes `open_editor`. Verified
+by inspection, not by a guard — there is no mechanism preventing a future test
+from calling it.
+
+**Why deferred:** the fix is a `cfg(test)` inert branch of the same shape as
+this plan's `UsagePoller::start`, but `open_editor` is not in this plan's
+`<behavior>`, `<action>` or `must_haves`. Adding it would be unbudgeted scope
+in a file another plan may still restructure.
+
+**Containment status:** SAFE TODAY, unguarded tomorrow. No current test reaches
+it; nothing stops one from being written.
+
+**Fix shape:** `cfg(test)` branch that records the intended command on the App
+(so a fixture can assert the decision) and spawns nothing, mirroring
+`usage.rs`'s split. Same treatment likely warranted for the `pbcopy` spawn at
+`app.rs:5442`, which is also key-handler-only.
+
+**Suggested owner:** plan 08-06, whose broad-suite gate is the first run that
+could surface a test reaching either path.

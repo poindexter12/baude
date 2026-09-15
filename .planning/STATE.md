@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 08
 current_phase_name: Test Isolation and Fixture Ownership
 status: executing
-stopped_at: Completed 08-04-PLAN.md
-last_updated: "2026-09-15T15:13:43.916Z"
+stopped_at: Completed 08-08-PLAN.md
+last_updated: "2026-09-15T15:41:28.599Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: 5a89a0fee3865eff96956fdd976f6ee4677df392
+state_head: 40b4fe3517f43f42624164c535003ebdb8cd5ac3
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
-Plan: 5 of 8
+Plan: 6 of 8
 Status: Ready to execute
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
@@ -74,6 +74,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P02 | 16min | 2 tasks | 2 files |
 | Phase 08 P03 | 45min | 2 tasks | 9 files |
 | Phase 08 P04 | 70min | 3 tasks | 4 files |
+| Phase 08 P08 | ~3h | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -150,6 +151,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: 08-04: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
 - [Phase 08]: 08-04: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
 - [Phase 08]: 08-04: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
+- [Phase 08]: 08-08: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
+- [Phase 08]: 08-08: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
+- [Phase 08]: 08-08: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
+- [Phase 08]: 08-08: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
 
 ### Pending Todos
 
@@ -166,6 +171,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - TISO-01 and TISO-03 remain PARTIAL after 08-01: requirements.mark-complete reports both not_found in REQUIREMENTS.md (entries carry a '(partial)' suffix) and neither is fully delivered until plans 02/03/06 migrate the remaining consumers. Do not check them off before plan 06.
 - Five baude-core/src/lifecycle.rs tests fail plan-01 containment (no TestRedirect held); measured pre-existing at 08-03's RED commit f6a3b1c. lifecycle.rs is in no phase-08 plan's files_modified — deferred to 08-06, which cannot go green until they hold a root and a literal identity. See 08 deferred-items.md.
 - ui::tests::ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are committed #[ignore]d: they build an App whose UsagePoller is uncontained until 08-08. Plan 08-08 task 1 must remove the attribute and run them.
+- 08-08 left the full workspace test suite unrun (plan forbids broad runs before 08-06 task 1 completes manager ownership). Real pass/fail numbers for the whole suite are owed by 08-06 task 2.
 
 ## Deferred Items
 
@@ -182,8 +188,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T15:13:43.893Z
-Stopped at: Completed 08-04-PLAN.md
+Last session: 2026-09-15T15:41:19.286Z
+Stopped at: Completed 08-08-PLAN.md
 Resume file: None
 
 ## Deferred Items

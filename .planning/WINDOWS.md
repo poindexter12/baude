@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 4
+open_count: 6
 waived_count: 0
 fixed_count: 0
-total_count: 4
-last_updated: 2026-09-15T15:13:59.247Z
+total_count: 6
+last_updated: 2026-09-15T15:38:12.573Z
 ---
 
 # Broken Windows Ledger
@@ -19,6 +19,8 @@ last_updated: 2026-09-15T15:13:59.247Z
 | 2 | 08 | unmet-truth | baude-core/src/lifecycle.rs |  | five lifecycle::tests::* fixtures hold no TestRedirect and fail plan-01 containment; deferred to plan 08-06 | open |  | 2026-09-15T14:49:18.921Z |  |
 | 3 | 08 | deviation | baude-core/src/git.rs |  | 08-04: worktree_inventory extracted from discover_repository (Rule 3) — discover_repository cannot answer the disownment question, so GitDisownsIt would have been unreachable | open |  | 2026-09-15T15:13:58.758Z |  |
 | 4 | 08 | deviation | baude-core/src/git.rs |  | 08-04 v2.2 FOLLOW-UP: empty-parent worktree leak is a LIVE production defect in ensure_default_worktree and activate_branch_with_post_add_hook — nothing removes the repository-<key> parent on failure; 'zero candidates' must never be an exit criterion | open |  | 2026-09-15T15:13:59.247Z |  |
+| 5 | 08 | unrun-verify | .planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md |  | Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership | open |  | 2026-09-15T15:38:04.984Z |  |
+| 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it | open |  | 2026-09-15T15:38:12.573Z |  |
 
 ````json
 [
@@ -71,6 +73,32 @@ last_updated: 2026-09-15T15:13:59.247Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-15T15:13:59.247Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 5,
+    "kind": "unrun-verify",
+    "phase": "08",
+    "file": ".planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md",
+    "line": null,
+    "description": "Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-15T15:38:04.984Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 6,
+    "kind": "deviation",
+    "phase": "08",
+    "file": "baude/src/app.rs",
+    "line": 5077,
+    "description": "App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-15T15:38:12.573Z",
     "resolved_at": null,
     "milestone": "v2.2"
   }
