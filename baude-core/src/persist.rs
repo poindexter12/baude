@@ -1047,7 +1047,15 @@ pub fn save_named(file: &str, state: &StateFile) -> Result<()> {
     save_current_at(&config_base(), file, state)
 }
 
-fn load_named_at(
+/// Strict, **non-locking** read of one named state file under an explicit root.
+///
+/// Widened from private for the leak scanner
+/// ([`crate::worktree_scan`]), whose state cross-reference has to read every
+/// workspace's state file without writing anything —
+/// [`load_for_workspace_strict_at`] calls `hold_state_lock`, which creates or
+/// opens a lock file and would violate the scan's no-write contract (D-16).
+/// Kept `pub(crate)`: an internal seam, not crate API.
+pub(crate) fn load_named_at(
     root: &std::path::Path,
     file: &str,
 ) -> std::result::Result<LoadOutcome, LoadError> {

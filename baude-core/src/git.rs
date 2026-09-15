@@ -288,6 +288,36 @@ fn parse_worktree_porcelain(
     Ok(records)
 }
 
+/// Git's own worktree inventory for the repository containing `path`, with
+/// every record canonicalized. Main worktree first, as Git reports it.
+///
+/// Split out of [`discover_repository`] for the leak scanner, which has to ask
+/// the inventory about a path that may be **absent** from it — that absence is
+/// exactly what disownment means, and `discover_repository` rejects it with
+/// [`RepositoryDiscoveryError::SelectedWorktreeMissing`] rather than answering.
+/// Kept `pub(crate)`: this is an internal seam, not crate API.
+pub(crate) fn worktree_inventory(
+    path: &Path,
+) -> std::result::Result<Vec<WorktreeRecord>, RepositoryDiscoveryError> {
+    let inventory_output = git_bytes(
+        path,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("list"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+        ],
+        "worktree inventory",
+    )?;
+    let mut worktrees = parse_worktree_porcelain(&inventory_output.stdout)?;
+    for record in &mut worktrees {
+        if let Ok(canonical) = record.path.canonicalize() {
+            record.path = canonical;
+        }
+    }
+    Ok(worktrees)
+}
+
 /// Discover canonical repository membership without reading Git's on-disk layout.
 pub fn discover_repository(
     path: &Path,
@@ -322,22 +352,7 @@ pub fn discover_repository(
             source,
         })?;
 
-    let inventory_output = git_bytes(
-        &canonical_input,
-        &[
-            OsStr::new("worktree"),
-            OsStr::new("list"),
-            OsStr::new("--porcelain"),
-            OsStr::new("-z"),
-        ],
-        "worktree inventory",
-    )?;
-    let mut worktrees = parse_worktree_porcelain(&inventory_output.stdout)?;
-    for record in &mut worktrees {
-        if let Ok(canonical) = record.path.canonicalize() {
-            record.path = canonical;
-        }
-    }
+    let worktrees = worktree_inventory(&canonical_input)?;
     let main_worktree = worktrees
         .first()
         .expect("parser rejects an empty inventory")
