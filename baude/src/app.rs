@@ -719,12 +719,39 @@ impl App {
         let config = persist::load_config();
         let config_notify = config.desktop_notifications;
         let folder_context_enabled = config.folder_context_enabled();
+        // Production precedence, verbatim: BAUDE_DAEMON_URL, then the active
+        // workspace's daemon_url, then config.
+        #[cfg(not(test))]
         let remote = std::env::var("BAUDE_DAEMON_URL")
             .ok()
             .or_else(|| baude_core::workspace::active().daemon_url.clone())
             .or_else(|| config.daemon_url.clone())
             .filter(|u| !u.trim().is_empty())
             .map(RemotePoller::start);
+        // The selection EXPRESSION is what is disabled, not its result. A
+        // detached `RemotePoller` worker outlives the handle, so assigning
+        // `app.remote = None` after construction does not stop one — by then it
+        // has already been started against whatever daemon the developer's
+        // environment named. Tests that want a remote attach their own
+        // synthetic loopback poller after construction.
+        #[cfg(test)]
+        let remote: Option<RemotePoller> = None;
+
+        // Notifications post through an OS subprocess from `tick`. Disabled
+        // here so an ordinary fixture cannot reach it; the pure notifier
+        // decision tests call the tick logic directly and are unaffected.
+        #[cfg(not(test))]
+        let desktop_notify_enabled = std::env::var("BAUDE_NOTIFY")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .or(config_notify)
+            .unwrap_or(true);
+        #[cfg(test)]
+        let desktop_notify_enabled = {
+            let _ = config_notify;
+            false
+        };
+
         App {
             sessions: Vec::new(),
             selected_id: None,
@@ -753,11 +780,7 @@ impl App {
             folder_context_enabled_for_test: false,
             pending_clones: Vec::new(),
             desktop_notifier: DesktopNotifier::default(),
-            desktop_notify_enabled: std::env::var("BAUDE_NOTIFY")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false"))
-                .or(config_notify)
-                .unwrap_or(true),
+            desktop_notify_enabled,
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
