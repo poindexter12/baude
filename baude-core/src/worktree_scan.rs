@@ -1493,27 +1493,39 @@ fn prune_one(
         };
     }
 
+    let path = candidate.resolve(base);
+
     if !confirmed {
         // The default path, and the one this whole phase runs in (D-16,
-        // T-08-18). The re-verification above has already happened in full.
-        return PruneDisposition::WouldRemove;
+        // T-08-18). The re-verification above has already happened in full, and
+        // the last-window gate runs here too: `WouldRemove` is a promise about
+        // what `--yes` would do, so it must be made by the same checks `--yes`
+        // makes. Reporting `WouldRemove` for a path the confirmed run would
+        // refuse — a gitdir-bearing candidate, most often — makes the preview
+        // lie about the only thing it exists to predict (#72, CR-02).
+        return match removal_gate(&path) {
+            Ok(()) => PruneDisposition::WouldRemove,
+            Err(reason) => PruneDisposition::Refused { reason },
+        };
     }
 
-    remove_verified(&candidate.resolve(base))
+    remove_verified(&path)
 }
 
-/// The last window. Everything here is re-checked immediately before the removal
-/// call, on the path itself, with non-following metadata.
-fn remove_verified(path: &Path) -> PruneDisposition {
-    let refused = |reason| PruneDisposition::Refused { reason };
-
+/// The last window: everything re-checked immediately before the removal call,
+/// on the path itself, with non-following metadata.
+///
+/// Extracted so the preview and the removal cannot drift. Both callers run it,
+/// and it is deliberately read-only — nothing here creates, opens, or follows
+/// anything, which is what makes it safe to run on the unconfirmed path.
+fn removal_gate(path: &Path) -> Result<(), RefusalReason> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return refused(RefusalReason::Vanished);
+            return Err(RefusalReason::Vanished);
         }
         Err(error) => {
-            return refused(RefusalReason::RemovalFailed {
+            return Err(RefusalReason::RemovalFailed {
                 detail: format!("{} could not be examined: {error}", path.display()),
             });
         }
@@ -1522,21 +1534,31 @@ fn remove_verified(path: &Path) -> PruneDisposition {
     // properties while the removal acts on the link is how a deletion escapes
     // the base entirely (T-08-04).
     if metadata.file_type().is_symlink() {
-        return refused(RefusalReason::BecameSymlink);
+        return Err(RefusalReason::BecameSymlink);
     }
     if !metadata.is_dir() {
-        return refused(RefusalReason::NotADirectory);
+        return Err(RefusalReason::NotADirectory);
     }
     // A gitdir means git owns this directory, and git's verified-removal path
     // owns its deletion. This module refuses rather than substituting its own
     // removal for that one.
     if let Some(holder) = gitdir_holder(path) {
-        return refused(RefusalReason::GitdirPresent { holder });
+        return Err(RefusalReason::GitdirPresent { holder });
+    }
+    Ok(())
+}
+
+/// Run the gate, then remove what it cleared.
+fn remove_verified(path: &Path) -> PruneDisposition {
+    if let Err(reason) = removal_gate(path) {
+        return PruneDisposition::Refused { reason };
     }
 
     match remove_empty_tree(path, MAX_EMPTY_DEPTH) {
         Ok(()) => PruneDisposition::Removed,
-        Err(detail) => refused(RefusalReason::RemovalFailed { detail }),
+        Err(detail) => PruneDisposition::Refused {
+            reason: RefusalReason::RemovalFailed { detail },
+        },
     }
 }
 
@@ -1841,6 +1863,23 @@ mod tests {
             git_ok(&repo, &["add", "tracked.txt"]);
             git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
             repo.canonicalize().expect("canonicalize fixture repo")
+        }
+
+        /// Make the fixture root itself a repository, so a candidate nested
+        /// beneath it has a git ancestor to be disowned *by*.
+        ///
+        /// `git` walks up past a `.git` it cannot use, so a candidate carrying
+        /// an unusable gitdir still resolves to this repository and is reported
+        /// as absent from its inventory — which is the only way to build a
+        /// candidate that is gitdir-bearing and git-disowned at once.
+        fn git_init_root(&self) -> PathBuf {
+            git_ok(&self.root, &["init", "-q", "."]);
+            git_ok(&self.root, &["config", "user.name", "Baude Test"]);
+            git_ok(&self.root, &["config", "user.email", "baude@example.invalid"]);
+            std::fs::write(self.root.join("tracked.txt"), b"fixture\n").expect("write root file");
+            git_ok(&self.root, &["add", "tracked.txt"]);
+            git_ok(&self.root, &["commit", "-q", "-m", "fixture"]);
+            self.root.canonicalize().expect("canonicalize fixture root")
         }
     }
 
@@ -3459,6 +3498,72 @@ mod tests {
                 "{pruned:?}"
             );
             assert!(checkout.join(".git").exists());
+        }
+
+        /// The preview and the removal must answer the same question.
+        ///
+        /// `WouldRemove` is the only prediction `--prune` makes, so it has to be
+        /// made by the checks `--yes` actually runs. Before #72/CR-02 the
+        /// last-window gate lived inside `remove_verified` and the unconfirmed
+        /// path skipped it entirely, so this candidate previewed as
+        /// `WouldRemove` and then refused on the confirmed run — the preview
+        /// naming a directory the tool would never delete.
+        ///
+        /// Built deliberately: every entry beneath the candidate is a directory,
+        /// so the emptiness walk still clears it (a `.git` *file* would be a
+        /// non-directory entry and land on `ContainsCheckout`, never reaching
+        /// the gate at all), while the unusable `.git` directory makes `git`
+        /// walk up to the fixture root and report a repository whose inventory
+        /// does not list this path.
+        #[test]
+        fn a_gitdir_bearing_candidate_is_refused_identically_with_and_without_yes() {
+            let fixture = ScanFixture::new();
+            let owner = fixture.git_init_root();
+            let path = approved(&fixture, "claude", "repository-9");
+            let checkout = path.join("primary-9");
+            std::fs::create_dir_all(checkout.join(".git").join("objects"))
+                .expect("create a directory-only gitdir");
+
+            let report = scan_ok(&fixture);
+            let found = candidate(&report, "claude", "repository-9");
+            assert!(
+                matches!(found.verdict, Verdict::Removable { .. }),
+                "the candidate must clear the predicate, or the gate is never \
+                 reached and this case proves nothing: {found:?}"
+            );
+            assert!(
+                evidence(found).iter().any(|item| matches!(
+                    item,
+                    Evidence::GitDisownsIt { owning_repository } if owning_repository == &owner
+                )),
+                "the candidate must be genuinely disowned by the root repository: {found:?}"
+            );
+
+            let previewed = prune_ok(&fixture, &report, false);
+            let before = tree_snapshot(&fixture.base());
+            let confirmed = prune_ok(&fixture, &report, true);
+
+            let previewed = disposition(&previewed, "claude", "repository-9");
+            let confirmed = disposition(&confirmed, "claude", "repository-9");
+            assert_eq!(
+                previewed, confirmed,
+                "the preview must predict what the confirmed run does"
+            );
+            assert!(
+                matches!(
+                    previewed,
+                    PruneDisposition::Refused {
+                        reason: RefusalReason::GitdirPresent { .. }
+                    }
+                ),
+                "{previewed:?}"
+            );
+            assert_eq!(
+                tree_snapshot(&fixture.base()),
+                before,
+                "neither run may touch the tree"
+            );
+            assert!(checkout.join(".git").join("objects").exists());
         }
 
         // ---- the account -------------------------------------------------
