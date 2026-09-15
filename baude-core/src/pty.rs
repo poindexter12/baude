@@ -130,10 +130,8 @@ impl TestChildRoots {
 /// this is the single place child-environment policy lives: `App`, `Manager`
 /// and direct PTY tests are all covered without any caller repeating it.
 ///
-/// Order is the policy. The caller's explicit env goes in FIRST so opaque
-/// launch-plan values (resume ids and the like) reach the child, and the
-/// protected root/shell/gate keys go in LAST so no caller — and no inherited
-/// value — can name a root or a startup file.
+/// The ordering rule this follows is stated once, on [`build_gate_command`],
+/// because both branches obey it.
 #[cfg(any(test, feature = "test-support"))]
 fn configure_test_child(cmd: &mut CommandBuilder, env: &[(String, String)], command: Option<&str>) {
     let roots = TestChildRoots::resolve();
@@ -182,6 +180,21 @@ fn gate_mode(command: Option<&str>) -> &'static str {
 /// Assemble the gate command, including (in support builds) the child's whole
 /// environment. Separated from the spawn so it can run — and abort — before any
 /// PTY exists, and so a test can inspect the finished map deterministically.
+///
+/// **Order is the policy, in both branches.** The caller's explicit env goes in
+/// FIRST so opaque launch-plan values (resume ids and the like) reach the child,
+/// and the protected root/shell/gate keys go in LAST so no caller — and no
+/// inherited value — can name a root or a startup file.
+///
+/// The production branch used to do the reverse, which mattered: `GATE_SCRIPT`
+/// execs `"$BAUDE_GATE_SHELL" -il -c "$BAUDE_GATE_COMMAND"`, so a launch-plan
+/// entry named `BAUDE_GATE_COMMAND` or `BAUDE_GATE_SHELL` replaced the command
+/// the gate was built to run, and one named `BAUDE_GATE_TOKEN` broke the
+/// handshake. `env` comes from backend launch plans derived from `config.json`
+/// rather than from any request body, so that was defense in depth rather than a
+/// remote vector — but it contradicted the invariant stated three lines away
+/// from it, and the daemon's config is exactly the sort of thing that grows a
+/// remote-write endpoint later (#72, WR-04).
 fn build_gate_command(
     command: Option<&str>,
     env: &[(String, String)],
@@ -194,15 +207,15 @@ fn build_gate_command(
     #[cfg(not(any(test, feature = "test-support")))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("BAUDE_GATE_TOKEN", GATE_TOKEN);
         cmd.env("BAUDE_GATE_SHELL", &shell);
         cmd.env("BAUDE_GATE_MODE", gate_mode(command));
         cmd.env("BAUDE_GATE_COMMAND", command.unwrap_or_default());
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
     }
     #[cfg(any(test, feature = "test-support"))]
     configure_test_child(&mut cmd, env, command);
@@ -717,6 +730,15 @@ mod tests {
                 ("ZDOTDIR".into(), hostile.clone()),
                 ("ENV".into(), sentinel.clone()),
                 ("BASH_ENV".into(), sentinel.clone()),
+                // The gate's own keys. `GATE_SCRIPT` execs
+                // `"$BAUDE_GATE_SHELL" … -c "$BAUDE_GATE_COMMAND"`, so a caller
+                // that could set these would choose what the child runs
+                // outright, and one that could set the token would break the
+                // handshake (#72, WR-04).
+                ("BAUDE_GATE_COMMAND".into(), "touch /tmp/pwned".into()),
+                ("BAUDE_GATE_SHELL".into(), sentinel.clone()),
+                ("BAUDE_GATE_TOKEN".into(), "not-the-token".into()),
+                ("BAUDE_GATE_MODE".into(), "interactive".into()),
             ];
 
             // Deterministic control: inspect the finished builder map rather
@@ -786,6 +808,21 @@ mod tests {
                 env_of("TERM").as_deref(),
                 Some("xterm-256color"),
                 "terminal type is unchanged"
+            );
+            assert_eq!(
+                env_of("BAUDE_GATE_COMMAND").as_deref(),
+                Some("true"),
+                "the caller must not choose what the gate execs"
+            );
+            assert_eq!(
+                env_of("BAUDE_GATE_MODE").as_deref(),
+                Some("command"),
+                "the caller must not flip the gate's mode"
+            );
+            assert_eq!(
+                env_of("BAUDE_GATE_TOKEN").as_deref(),
+                Some(GATE_TOKEN),
+                "the caller must not break the handshake token"
             );
 
             // Now an ACTUAL PTY child, launched with the same hostile explicit
