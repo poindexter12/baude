@@ -5509,6 +5509,34 @@ mod tests {
         }
     }
 
+    /// The `test-support` cargo feature must reach THIS binary's test build.
+    ///
+    /// `cfg(test)` is set per crate by `rustc --test`, so a `#[cfg(test)]`-only
+    /// guard inside `baude-core` would be absent from exactly the two binaries
+    /// that leaked worktrees (#72). This observes the dependency's gated code
+    /// through its public resolver rather than evaluating a feature predicate
+    /// locally: it fails to COMPILE if the dev-dependency feature wiring is
+    /// removed, and fails its assertions if the redirect wiring is broken.
+    ///
+    /// Deliberately touches no filesystem, no identity, and no git — it is a
+    /// pure path resolution through the gate.
+    #[test]
+    fn test_support_gate_is_active() {
+        let outer = PathBuf::from("/nonexistent/baude-gate-outer");
+        let inner = PathBuf::from("/nonexistent/baude-gate-inner");
+        let _outer = baude_core::testing::TestRedirect::new(&outer);
+        assert_eq!(persist::config_dir(), outer.join("config"));
+        {
+            let _inner = baude_core::testing::TestRedirect::new(&inner);
+            assert_eq!(persist::config_dir(), inner.join("config"));
+        }
+        assert_eq!(
+            persist::config_dir(),
+            outer.join("config"),
+            "dropping the inner redirect must restore the outer one"
+        );
+    }
+
     fn pid_is_live(pid: u32) -> bool {
         Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "stat="])

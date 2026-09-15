@@ -837,12 +837,29 @@ pub struct SavedSession {
     pub archived_by_user: bool,
 }
 
-fn config_base() -> PathBuf {
+/// The real config root, with no test redirect and no containment check.
+///
+/// Kept verbatim from the pre-redirect `config_base`. Note the terminal
+/// fallback is `"."` here and `/tmp` in [`crate::git`]'s worktrees resolver —
+/// the four real-root resolvers in this crate share a shape but not their
+/// tails, so they must not be collapsed into one helper.
+fn real_config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("baude")
+}
+
+fn config_base() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(base) = crate::testing::config_dir_override() {
+        return base;
+    }
+    let real = real_config_base();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "config dir");
+    real
 }
 
 /// The config directory (`~/.config/baude`), for sibling stores that live
@@ -1061,6 +1078,22 @@ mod tests {
         RuntimeGeneration, SavedCheckout, SavedRepository, SavedStandaloneSession, ShellOwnership,
         StandaloneLifecycle, UnavailableCause,
     };
+
+    /// `config_dir()` follows the thread's redirect, and a nested scope restores
+    /// the outer value when it ends. Pure path resolution — no filesystem, no
+    /// identity, no consumers that later plans still have to isolate.
+    #[test]
+    fn config_dir_honours_redirect() {
+        let outer = PathBuf::from("/nonexistent/baude-persist-redirect-outer");
+        let inner = PathBuf::from("/nonexistent/baude-persist-redirect-inner");
+        let _outer = crate::testing::TestRedirect::new(&outer);
+        assert_eq!(config_dir(), outer.join("config"));
+        {
+            let _inner = crate::testing::TestRedirect::new(&inner);
+            assert_eq!(config_dir(), inner.join("config"));
+        }
+        assert_eq!(config_dir(), outer.join("config"));
+    }
 
     fn isolated_root(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

@@ -25,6 +25,11 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
+# Re-declares only the feature; path/version are inherited from the workspace
+# dependency. Dev-dependency features are unified into the build graph only when
+# a test target is in play, so `cargo build --release` still ships without the
+# guard (#72, D-12).
+baude-core = { workspace = true, features = ["test-support"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
