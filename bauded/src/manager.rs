@@ -2838,7 +2838,7 @@ mod tests {
         git(&repo, &["checkout", "-b", "changed"]);
 
         let mut manager = Manager::new("true".into(), true);
-        assert_eq!(manager.restore_at(&state_root, &workspace), 0);
+        assert_eq!(manager.restore_at(&state_root, workspace), 0);
         assert!(manager.sessions.is_empty());
         assert!(matches!(
             manager.repository_state.checkouts[0].health(),
@@ -2862,9 +2862,9 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let mut manager = Manager::new("true".into(), true);
-        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert_eq!(manager.restore_at(&root, workspace), 0);
         assert!(manager.persistence_blocked);
-        manager.save_at(&root, &workspace);
+        manager.save_at(&root, workspace);
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(manager.create("/tmp", None, None).is_err());
         assert!(manager.sessions.is_empty());
@@ -2891,7 +2891,7 @@ mod tests {
         std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
 
         let mut manager = Manager::new("true".into(), true);
-        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert_eq!(manager.restore_at(&root, workspace), 0);
         assert!(!manager.persistence_blocked);
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         let retained = &manager.repository_state.checkouts[0].session;
@@ -2902,7 +2902,7 @@ mod tests {
         assert!(retained.archived);
         assert!(retained.archived_by_user);
         let first = manager.repository_state.clone();
-        assert_eq!(manager.restore_at(&root, &workspace), 0);
+        assert_eq!(manager.restore_at(&root, workspace), 0);
         assert_eq!(manager.repository_state, first);
         assert_eq!(
             std::fs::read(&legacy_path).unwrap(),
@@ -2996,7 +2996,7 @@ mod tests {
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + offset;
-        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.persist_at_for_test(&state_root, workspace, None);
         let created = manager
             .activate_branch_worktree(&repo, &format!("feature/{label}"), None)
             .unwrap();
@@ -3025,7 +3025,7 @@ mod tests {
         let root = fixture.root().to_path_buf();
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+        manager.persist_at_for_test(&root, workspace, Some(persist::AtomicFailure::Rename));
 
         assert!(manager.create("/tmp", None, Some("pre")).is_err());
         assert!(manager.repository_state.checkouts.is_empty());
@@ -3034,14 +3034,14 @@ mod tests {
 
         manager.persist_at_for_test(
             &root,
-            &workspace,
+            workspace,
             Some(persist::AtomicFailure::DirectorySync),
         );
         assert!(manager.create("/tmp", None, Some("post")).is_err());
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
-        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        assert_eq!(persisted_at(&root, workspace), manager.repository_state);
     }
 
     #[test]
@@ -3070,7 +3070,7 @@ mod tests {
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id());
-        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.persist_at_for_test(&state_root, workspace, None);
 
         let created = manager
             .activate_branch_worktree(&repo, "feature/manager-contract", None)
@@ -3089,7 +3089,7 @@ mod tests {
             HashMap::from([(checkout, runtime)])
         );
         assert_eq!(
-            persisted_at(&state_root, &workspace),
+            persisted_at(&state_root, workspace),
             manager.repository_state
         );
 
@@ -3170,11 +3170,7 @@ mod tests {
         let workspace = fixture.workspace();
         let mut manager = Manager::new("true".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 20_000;
-        manager.persist_at_for_test(
-            &state_root,
-            &workspace,
-            Some(persist::AtomicFailure::Rename),
-        );
+        manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
         let before = manager.repository_state.clone();
 
         let result = manager.activate_branch_worktree(&repo, "feature/manager-rollback", None);
@@ -3241,7 +3237,7 @@ mod tests {
         let workspace = fixture.workspace();
         let snapshot = git::discover_repository(&repo).unwrap();
         let mut crashed = Manager::new("sh -c 'sleep 30'".into(), true);
-        crashed.persist_at_for_test(&state_root, &workspace, None);
+        crashed.persist_at_for_test(&state_root, workspace, None);
         let prepared = lifecycle::prepare_activation(
             &mut crashed.repository_state,
             &snapshot,
@@ -3253,7 +3249,7 @@ mod tests {
         crashed.save_checked().unwrap();
 
         let mut restarted = Manager::new("sh -c 'sleep 30'".into(), true);
-        assert_eq!(restarted.restore_at(&state_root, &workspace), 1);
+        assert_eq!(restarted.restore_at(&state_root, workspace), 1);
         assert_eq!(restarted.repository_state.checkouts.len(), 1);
         let recovered = &restarted.repository_state.checkouts[0];
         assert_eq!(
@@ -3306,7 +3302,7 @@ mod tests {
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 40_000;
         manager.persist_at_for_test(
             &state_root,
-            &workspace,
+            workspace,
             Some(persist::AtomicFailure::DirectorySync),
         );
 
@@ -3315,14 +3311,14 @@ mod tests {
             .is_err());
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(
-            persisted_at(&state_root, &workspace),
+            persisted_at(&state_root, workspace),
             manager.repository_state
         );
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.repository_state.has_pending_activation());
 
         let mut reloaded = Manager::new("true".into(), true);
-        assert_eq!(reloaded.restore_at(&state_root, &workspace), 0);
+        assert_eq!(reloaded.restore_at(&state_root, workspace), 0);
         assert!(!reloaded.repository_state.has_pending_activation());
         assert!(reloaded.repository_state.checkouts.is_empty());
         assert!(reloaded
@@ -3354,7 +3350,7 @@ mod tests {
             let root = fixture.root().to_path_buf();
             let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-            manager.persist_at_for_test(&root, &workspace, None);
+            manager.persist_at_for_test(&root, workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
             manager.session_id_for_test(id, &format!("opaque-{label}"));
             manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
@@ -3370,7 +3366,7 @@ mod tests {
                 .unwrap();
             assert!(pid_is_live(original_pid));
             assert!(pid_is_live(original_shell_pid));
-            manager.persist_at_for_test(&root, &workspace, Some(failure));
+            manager.persist_at_for_test(&root, workspace, Some(failure));
 
             let close_error = manager.remove(id).unwrap_err().to_string();
             assert_eq!(manager.repository_state.repositories.len(), 1);
@@ -3380,7 +3376,7 @@ mod tests {
                 !committed
             );
             assert_eq!(
-                persisted_at(&root, &workspace).checkouts[0].active_intent(),
+                persisted_at(&root, workspace).checkouts[0].active_intent(),
                 !committed
             );
             if committed {
@@ -3434,7 +3430,7 @@ mod tests {
         let root = fixture.root().to_path_buf();
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-        manager.persist_at_for_test(&root, &workspace, None);
+        manager.persist_at_for_test(&root, workspace, None);
         let id = manager
             .create("/tmp", None, Some("retained daemon"))
             .unwrap()
@@ -3475,7 +3471,7 @@ mod tests {
         ));
 
         let mut restarted = Manager::new("sh -c 'sleep 30'".into(), true);
-        assert_eq!(restarted.restore_at(&root, &workspace), 0);
+        assert_eq!(restarted.restore_at(&root, workspace), 0);
         assert!(restarted.sessions.is_empty());
         assert!(restarted.runtime_checkouts.is_empty());
         assert!(!restarted.repository_state.checkouts[0].active_intent());
@@ -3514,7 +3510,7 @@ mod tests {
             retained.session.resume_id.as_deref(),
             Some("opaque-daemon-before-poll")
         );
-        assert_eq!(persisted_at(&root, &workspace), manager.repository_state);
+        assert_eq!(persisted_at(&root, workspace), manager.repository_state);
     }
 
     #[test]
@@ -3531,7 +3527,7 @@ mod tests {
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-        manager.persist_at_for_test(&root, &workspace, None);
+        manager.persist_at_for_test(&root, workspace, None);
         let runtime = manager
             .create(repo.to_str().unwrap(), None, Some("retained daemon"))
             .unwrap()
@@ -3564,7 +3560,7 @@ mod tests {
         assert_eq!(manager.runtime_checkouts.len(), 1);
 
         manager.remove(reopened_runtime).unwrap();
-        manager.persist_at_for_test(&root, &workspace, Some(persist::AtomicFailure::Rename));
+        manager.persist_at_for_test(&root, workspace, Some(persist::AtomicFailure::Rename));
         assert!(manager.reopen_checkout(checkout).is_err());
         assert!(!manager.repository_state.checkouts[0].active_intent());
         assert!(manager.runtime_checkouts.is_empty());
@@ -3595,7 +3591,7 @@ mod tests {
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::from(std::process::id()) + 110_000;
-        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.persist_at_for_test(&state_root, workspace, None);
         let created = manager
             .activate_branch_worktree(&repo, "feature/safe-remove-manager", None)
             .unwrap();
@@ -3611,11 +3607,7 @@ mod tests {
             .observed_path
             .to_path_buf();
 
-        manager.persist_at_for_test(
-            &state_root,
-            &workspace,
-            Some(persist::AtomicFailure::Rename),
-        );
+        manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
         let error = manager
             .confirm_remove_worktree(confirmation)
@@ -3633,13 +3625,13 @@ mod tests {
             Some("fresh-manager-removal-target")
         );
         assert_eq!(
-            persisted_at(&state_root, &workspace).checkouts[0]
+            persisted_at(&state_root, workspace).checkouts[0]
                 .session
                 .resume_id
                 .as_deref(),
             None
         );
-        manager.persist_at_for_test(&state_root, &workspace, None);
+        manager.persist_at_for_test(&state_root, workspace, None);
         manager.save_checked().unwrap();
         let before = manager.repository_state.clone();
 
@@ -3654,7 +3646,7 @@ mod tests {
         assert!(manager.runtime_checkouts.is_empty());
         assert!(manager.sessions.is_empty());
         assert_eq!(
-            persisted_at(&state_root, &workspace),
+            persisted_at(&state_root, workspace),
             manager.repository_state
         );
         assert!(Command::new("git")
@@ -3714,7 +3706,7 @@ mod tests {
                 CheckoutHealth::Unavailable(UnavailableCause::TeardownPending { .. })
             ));
             assert_eq!(
-                persisted_at(&state_root, &workspace),
+                persisted_at(&state_root, workspace),
                 manager.repository_state
             );
 
@@ -3738,16 +3730,14 @@ mod tests {
             let root = fixture.root().to_path_buf();
             let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-            manager.persist_at_for_test(&root, &workspace, None);
+            manager.persist_at_for_test(&root, workspace, None);
             let id = manager.create("/tmp", None, Some(label)).unwrap().id;
-            manager.persist_at_for_test(&root, &workspace, Some(failure));
+            manager.persist_at_for_test(&root, workspace, Some(failure));
 
             assert!(manager.set_archived(id, true).is_err());
             assert_eq!(manager.info(id).unwrap().archived, committed);
             assert_eq!(
-                persisted_at(&root, &workspace).checkouts[0]
-                    .session
-                    .archived,
+                persisted_at(&root, workspace).checkouts[0].session.archived,
                 committed
             );
             manager.kill_all();

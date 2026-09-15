@@ -1307,7 +1307,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("post-event");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         // Pin a deterministic claude session_id so the /tmp path is isolated.
         let sid = format!("api-event-test-{}", std::process::id());
@@ -1353,7 +1353,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("activity-events");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let sid = format!("api-activity-test-{}", std::process::id());
         let path = baude_core::hook::event_path(&sid);
@@ -1430,7 +1430,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("activity-stream");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1461,7 +1461,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-round-trip");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1563,7 +1563,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-deny");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
@@ -1609,7 +1609,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-long-poll");
-        let state =Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
