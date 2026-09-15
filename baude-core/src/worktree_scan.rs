@@ -1871,7 +1871,10 @@ mod tests {
         fn git_init_root(&self) -> PathBuf {
             git_ok(&self.root, &["init", "-q", "."]);
             git_ok(&self.root, &["config", "user.name", "Baude Test"]);
-            git_ok(&self.root, &["config", "user.email", "baude@example.invalid"]);
+            git_ok(
+                &self.root,
+                &["config", "user.email", "baude@example.invalid"],
+            );
             std::fs::write(self.root.join("tracked.txt"), b"fixture\n").expect("write root file");
             git_ok(&self.root, &["add", "tracked.txt"]);
             git_ok(&self.root, &["commit", "-q", "-m", "fixture"]);
