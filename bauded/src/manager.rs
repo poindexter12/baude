@@ -2912,6 +2912,7 @@ mod tests {
 
     #[test]
     fn create_list_info_remove() {
+        let _fixture = ManagerFixture::new("create-list-info-remove");
         let mut m = mgr();
         let info = m.create("/tmp", None, Some("t1")).unwrap();
         assert_eq!(info.name, "t1");
@@ -2926,6 +2927,7 @@ mod tests {
 
     #[test]
     fn exhausted_durable_counter_rejects_create_before_spawn() {
+        let _fixture = ManagerFixture::new("exhausted-durable-counter-rejects-create-before-spawn");
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.repository_state.next_repository_key = u64::MAX - 1;
 
@@ -3754,6 +3756,7 @@ mod tests {
 
     #[test]
     fn event_path_resolves_per_sid_and_404s_unknown() {
+        let _fixture = ManagerFixture::new("event-path-resolves-per-sid-and-404s-unknown");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // No sid resolved yet → Ok(None).
@@ -3773,6 +3776,7 @@ mod tests {
 
     #[test]
     fn activity_returns_recent_slice_and_404s_unknown() {
+        let _fixture = ManagerFixture::new("activity-returns-recent-slice-and-404s-unknown");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         let sid = format!("mgr-activity-{}", std::process::id());
@@ -3815,6 +3819,7 @@ mod tests {
 
     #[test]
     fn duplicate_names_get_suffixed() {
+        let _fixture = ManagerFixture::new("duplicate-names-get-suffixed");
         let mut m = mgr();
         let a = m.create("/tmp", None, None).unwrap();
         let b = m.create("/tmp", None, None).unwrap();
@@ -3825,6 +3830,7 @@ mod tests {
 
     #[test]
     fn message_rejected_while_starting() {
+        let _fixture = ManagerFixture::new("message-rejected-while-starting");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // The stub never writes a sessions/<pid>.json, so the daemon must
@@ -3836,6 +3842,7 @@ mod tests {
 
     #[test]
     fn keys_drive_a_shell_and_screen_reads_back() {
+        let _fixture = ManagerFixture::new("keys-drive-a-shell-and-screen-reads-back");
         // Wrap the shell so the spawn-site permission flag (appended to the
         // base cmd by `spawn`, default `--dangerously-skip-permissions`) lands
         // as the harmless `$0` of `sh -c` instead of breaking bash's arg
@@ -3861,6 +3868,7 @@ mod tests {
 
     #[test]
     fn restart_requires_exited() {
+        let _fixture = ManagerFixture::new("restart-requires-exited");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.restart(id).unwrap_err().to_string();
@@ -3870,6 +3878,7 @@ mod tests {
 
     #[test]
     fn restart_respawns_an_exited_session() {
+        let _fixture = ManagerFixture::new("restart-respawns-an-exited-session");
         let mut m = Manager::new("true".into(), false);
         let id = m.create("/tmp", None, None).unwrap().id;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3883,6 +3892,7 @@ mod tests {
 
     #[test]
     fn archive_toggles() {
+        let _fixture = ManagerFixture::new("archive-toggles");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         assert!(!m.info(id).unwrap().archived);
@@ -3896,6 +3906,7 @@ mod tests {
 
     #[test]
     fn manual_unarchive_survives_the_auto_archive_tick() {
+        let _fixture = ManagerFixture::new("manual-unarchive-survives-the-auto-archive-tick");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // Fake a session that went idle well past the threshold.
@@ -3928,6 +3939,7 @@ mod tests {
 
     #[test]
     fn ingest_event_appends_to_resolved_tmp_file() {
+        let _fixture = ManagerFixture::new("ingest-event-appends-to-resolved-tmp-file");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // Pin a deterministic claude session_id so the /tmp path is isolated.
@@ -3958,6 +3970,8 @@ mod tests {
 
     #[test]
     fn ingest_event_errors_on_unknown_id_and_missing_session_id() {
+        let _fixture =
+            ManagerFixture::new("ingest-event-errors-on-unknown-id-and-missing-session-id");
         let mut m = mgr();
         // Unknown id -> Err (not panic).
         let err = m.ingest_event(999, "{}").unwrap_err().to_string();
@@ -3972,6 +3986,8 @@ mod tests {
 
     #[test]
     fn ingest_event_uses_body_session_id_before_meta_resolves() {
+        let _fixture =
+            ManagerFixture::new("ingest-event-uses-body-session-id-before-meta-resolves");
         // A real session's earliest hook events arrive before the poll loop has
         // resolved meta.session_id. The POSTed line carries the authoritative
         // session_id, so ingest must use it and land the event in the correct
@@ -4005,6 +4021,7 @@ mod tests {
 
     #[test]
     fn session_info_carries_state_source_and_last_tool() {
+        let _fixture = ManagerFixture::new("session-info-carries-state-source-and-last-tool");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         let info = m.info(id).unwrap();
@@ -4024,6 +4041,7 @@ mod tests {
 
     #[test]
     fn session_info_sets_waiting_reason_permission() {
+        let _fixture = ManagerFixture::new("session-info-sets-waiting-reason-permission");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // No notification yet -> no permission signal (a fresh stub is not
@@ -4071,6 +4089,7 @@ mod tests {
 
     #[test]
     fn set_pending_and_read_round_trip() {
+        let _fixture = ManagerFixture::new("set-pending-and-read-round-trip");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         // No pending initially.
@@ -4085,6 +4104,7 @@ mod tests {
 
     #[test]
     fn set_and_pending_404_on_unknown_id() {
+        let _fixture = ManagerFixture::new("set-and-pending-404-on-unknown-id");
         let mut m = mgr();
         assert!(m.set_pending(9999, pending("x", "Bash")).is_err());
         assert!(m.pending(9999).is_err());
@@ -4093,6 +4113,7 @@ mod tests {
 
     #[test]
     fn resolve_clears_pending_and_records_decision() {
+        let _fixture = ManagerFixture::new("resolve-clears-pending-and-records-decision");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         m.set_pending(id, pending("r1", "Bash")).unwrap();
@@ -4109,6 +4130,7 @@ mod tests {
 
     #[test]
     fn resolve_deny_records_deny() {
+        let _fixture = ManagerFixture::new("resolve-deny-records-deny");
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
         m.set_pending(id, pending("r2", "Write")).unwrap();
@@ -4119,6 +4141,7 @@ mod tests {
 
     #[test]
     fn setting_new_pending_clears_a_stale_decision() {
+        let _fixture = ManagerFixture::new("setting-new-pending-clears-a-stale-decision");
         // A fresh permission request must not read the previous turn's decision.
         let mut m = mgr();
         let id = m.create("/tmp", None, None).unwrap().id;
@@ -4157,6 +4180,7 @@ mod tests {
 
     #[test]
     fn resolve_notifies_a_registered_waiter() {
+        let _fixture = ManagerFixture::new("resolve-notifies-a-registered-waiter");
         // Pitfall 4: a waiter registered before the resolve observes the wake.
         // The per-session Notify fires on resolve so a bounded poll/await is
         // promptly woken (the await happens OUTSIDE the manager lock).
