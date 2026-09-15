@@ -2543,6 +2543,7 @@ mod tests {
     use super::*;
     use baude_core::lifecycle::LifecycleOutcome;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2626,6 +2627,140 @@ mod tests {
                         .next()
                         .is_some_and(|state| !state.starts_with('Z'))
             })
+    }
+
+    static NEXT_MANAGER_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    /// A literal fixture config: no file is read, no environment variable is
+    /// consulted, and the workspace/backend choice is written down in the
+    /// source of the test that made it (D-06).
+    fn fixture_config(workspace_name: &str) -> baude_core::persist::Config {
+        baude_core::persist::Config {
+            workspace: Some(workspace_name.to_string()),
+            ..baude_core::persist::Config::default()
+        }
+    }
+
+    /// One construction that establishes everything a `bauded` manager fixture
+    /// needs: a process-unique root, the unified redirect guard bound to that
+    /// root, and a literal per-fixture workspace identity.
+    ///
+    /// It replaces ten copies of the same twelve-line preamble. The copies were
+    /// how the original leak (#72) stayed easy to reintroduce: an eleventh copy
+    /// that forgot the guard reads and writes the developer's real roots while
+    /// looking exactly like its neighbours.
+    struct ManagerFixture {
+        root: PathBuf,
+        workspace: baude_core::workspace::Workspace,
+    }
+
+    impl ManagerFixture {
+        /// The default (`claude`) workspace — what all ten preambles resolved.
+        #[must_use = "the fixture owns this case's root, redirects and identity; bind it to a \
+                      named local that outlives every Manager, session and PTY it isolates"]
+        fn new(label: &str) -> Self {
+            Self::with_workspace_name(label, baude_core::workspace::DEFAULT)
+        }
+
+        #[must_use = "the fixture owns this case's root, redirects and identity; bind it to a \
+                      named local that outlives every Manager, session and PTY it isolates"]
+        fn with_workspace_name(label: &str, workspace_name: &str) -> Self {
+            let sequence = NEXT_MANAGER_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("bauded-{label}-{}-{sequence}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create unique manager fixture root");
+            let config = fixture_config(workspace_name);
+            let workspace =
+                baude_core::workspace::resolve(Some(workspace_name), None, &config, |_| {});
+            Self { root, workspace }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn workspace(&self) -> &baude_core::workspace::Workspace {
+            &self.workspace
+        }
+
+        /// A created subdirectory of the fixture root, for the scenario-specific
+        /// `repo` / `origin.git` / `state` trees the preambles built by hand.
+        fn subdir(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(&path).expect("create manager fixture subdirectory");
+            path
+        }
+    }
+
+    impl Drop for ManagerFixture {
+        fn drop(&mut self) {
+            // Swallowed like `GitFixture::drop`: a cleanup failure must not
+            // mask the assertion failure that is the reason the test matters.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn fixture_isolation_two_fixtures_have_distinct_roots() {
+        let first = ManagerFixture::new("distinct-roots");
+        let second = ManagerFixture::new("distinct-roots");
+        assert_ne!(first.root(), second.root());
+        assert!(first.root().is_dir());
+        assert!(second.root().is_dir());
+    }
+
+    #[test]
+    fn fixture_isolation_redirect_outlives_the_construction_statement() {
+        let fixture = ManagerFixture::new("redirect-lifetime");
+        // Resolved AFTER the constructor returned. A guard that was constructed
+        // and dropped inside `new` arms and disarms in the same statement, so
+        // this line would run entirely unredirected while the fixture still
+        // looks correct at the call site.
+        let config_dir = baude_core::persist::config_dir();
+        assert!(
+            config_dir.starts_with(fixture.root()),
+            "config dir {config_dir:?} escaped the fixture root {:?}",
+            fixture.root()
+        );
+        let claude_dir = baude_core::meta::claude_config_dir();
+        assert!(
+            claude_dir.starts_with(fixture.root()),
+            "Claude config dir {claude_dir:?} escaped the fixture root {:?}",
+            fixture.root()
+        );
+    }
+
+    #[test]
+    fn fixture_isolation_installs_a_literal_workspace_identity() {
+        let fixture = ManagerFixture::new("identity");
+        assert_eq!(
+            baude_core::workspace::active().name,
+            fixture.workspace().name
+        );
+    }
+
+    #[test]
+    fn fixture_isolation_nested_drop_restores_the_enclosing_fixture() {
+        let outer = ManagerFixture::new("nested-outer");
+        {
+            let inner = ManagerFixture::with_workspace_name("nested-inner", "opencode");
+            assert!(baude_core::persist::config_dir().starts_with(inner.root()));
+            assert_eq!(baude_core::workspace::active().name, "opencode");
+        }
+        assert!(baude_core::persist::config_dir().starts_with(outer.root()));
+        assert_eq!(baude_core::workspace::active().name, outer.workspace().name);
+    }
+
+    #[test]
+    fn fixture_isolation_drop_removes_its_root() {
+        let root = {
+            let fixture = ManagerFixture::new("drop-cleanup");
+            let root = fixture.root().to_path_buf();
+            assert!(root.is_dir());
+            root
+        };
+        assert!(!root.exists(), "fixture root {root:?} survived its owner");
     }
 
     #[test]
