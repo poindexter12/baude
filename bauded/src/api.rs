@@ -707,14 +707,31 @@ mod tests {
             .success());
     }
 
-    fn initialized_repo(root: &Path, name: &str) -> std::path::PathBuf {
+    /// A fixture repository together with the redirect that contains it.
+    ///
+    /// The redirect is thread-local and drops with this value, so the owner must
+    /// be held in a NAMED binding for the whole test body — including across
+    /// every handler `await`, since that is where session creation reaches
+    /// managed worktree allocation. Returning a bare `TestRedirect` from the
+    /// helper, or letting the owner live only as a temporary, would compile and
+    /// leave the fixture running completely unredirected (issue #72).
+    struct FixtureRepo {
+        repo: std::path::PathBuf,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl FixtureRepo {
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+    }
+
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn initialized_repo(root: &Path, name: &str) -> FixtureRepo {
         // Contain managed worktree allocation (issue #72): every API test that
         // restarts or activates a session can reach worktree creation.
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let redirect = baude_core::testing::TestRedirect::new(root);
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -723,7 +740,10 @@ mod tests {
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
-        repo
+        FixtureRepo {
+            repo,
+            _redirect: redirect,
+        }
     }
 
     fn exited_tracked_manager(repo: &Path) -> (crate::manager::Shared, u64) {
@@ -756,7 +776,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let repo = initialized_repo(&root, "repo").canonicalize().unwrap();
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().canonicalize().unwrap();
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -1006,7 +1027,8 @@ mod tests {
             let restart_root = std::env::temp_dir().join(format!("bauded-api-restart-{suffix}"));
             let _ = std::fs::remove_dir_all(&restart_root);
             std::fs::create_dir_all(&restart_root).unwrap();
-            let repo = initialized_repo(&restart_root, "repo");
+            let restart_fixture = initialized_repo(&restart_root, "repo");
+            let repo = restart_fixture.path().to_path_buf();
             let restart_state = Arc::new(Mutex::new(Manager::new("true".into(), true)));
             let restart_id = {
                 let mut manager = crate::manager::lock(&restart_state);
@@ -1058,7 +1080,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bauded-api-restart-branch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let repo = initialized_repo(&root, "repo");
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().to_path_buf();
         let (state, id) = exited_tracked_manager(&repo);
         git(&repo, &["checkout", "-b", "changed"]);
 
@@ -1084,8 +1107,10 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let repo = initialized_repo(&root, "repo");
-        let replacement = initialized_repo(&root, "replacement");
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().to_path_buf();
+        let replacement_fixture = initialized_repo(&root, "replacement");
+        let replacement = replacement_fixture.path().to_path_buf();
         let (state, id) = exited_tracked_manager(&repo);
         std::fs::rename(&repo, root.join("original")).unwrap();
         symlink(&replacement, &repo).unwrap();

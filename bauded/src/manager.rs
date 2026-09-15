@@ -2612,11 +2612,7 @@ mod tests {
         let repo = root.join("repo");
         let state_root = root.join("state");
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&state_root).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -2695,11 +2691,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bauded-manager-persistence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         std::fs::create_dir_all(&root).unwrap();
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
@@ -2726,11 +2718,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bauded-manager-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         std::fs::create_dir_all(&root).unwrap();
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
@@ -2808,11 +2796,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bauded-transaction-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         std::fs::create_dir_all(&root).unwrap();
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
@@ -2840,11 +2824,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         // Contain managed worktree allocation (issue #72) before the manager
         // can activate a branch and create one under the real data dir.
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let origin = root.join("origin.git");
         let state_root = root.join("state");
@@ -2930,11 +2910,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let state_root = root.join("state");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3046,11 +3022,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let state_root = root.join("state");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3133,11 +3105,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let state_root = root.join("state");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3212,11 +3180,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let state_root = root.join("state");
         std::fs::create_dir_all(&repo).unwrap();
@@ -3518,11 +3482,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
         let repo = root.join("repo");
         let origin = root.join("origin.git");
         let state_root = root.join("state");

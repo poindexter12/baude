@@ -548,9 +548,14 @@ fn lock_holder_pid(path: &std::path::Path) -> Option<u32> {
 }
 
 /// Drop this process's claim on a lock so a fixture root can be reused or
-/// removed. Tests only — the real lock is held for the life of the process.
-#[cfg(test)]
-fn release_state_lock_for_test(destination: &std::path::Path) {
+/// removed. Test support only — the real lock is held for the life of the
+/// process.
+///
+/// Gated on the `test-support` feature as well as `cfg(test)` so `baude` and
+/// `bauded` fixtures can actually reach it; it was private and `test`-gated,
+/// which made it unreachable from the two crates that need it most.
+#[cfg(any(test, feature = "test-support"))]
+pub fn release_state_lock_for_test(destination: &std::path::Path) {
     let path = lock_path(destination);
     if let Some(locks) = HELD_STATE_LOCKS.get() {
         let mut locks = locks

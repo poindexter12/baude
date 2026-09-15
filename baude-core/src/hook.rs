@@ -24,7 +24,6 @@
 //! Re-verify `claude --version` at execution time and update this comment if
 //! it advances past 2.1.177.
 
-use std::cell::RefCell;
 use std::io::Write;
 
 use serde_json::{json, Value};
@@ -78,34 +77,23 @@ pub const FALLBACK_HOOK_COMMAND: &str = "baude hook";
 /// bare `baude hook` string could silently never fire). Falls back to
 /// [`FALLBACK_HOOK_COMMAND`] if `current_exe()` fails. This string IS the
 /// idempotency sentinel for [`merge_hook_settings`].
+///
+/// Under a test harness `current_exe()` is `target/debug/deps/baude-<hash>`,
+/// whose file stem is not `baude`, so anything seeded from it is not
+/// recognizable by [`is_seeded_hook_command`] — the divergence that let a
+/// fixture look unlike anything production writes, and that kept the pruning
+/// path (#70) beyond the reach of app-level tests. Fixtures therefore hold a
+/// [`crate::testing::TestRedirect`], which supplies a production-shaped
+/// `<absolute path>/baude hook`.
 pub fn baude_hook_command() -> String {
-    if let Some(command) = HOOK_COMMAND_OVERRIDE.with(|cell| cell.borrow().clone()) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(command) = crate::testing::hook_command_override() {
         return command;
     }
     match std::env::current_exe() {
         Ok(p) => format!("{} hook", p.display()),
         Err(_) => FALLBACK_HOOK_COMMAND.to_string(),
     }
-}
-
-thread_local! {
-    /// Test-only override for [`baude_hook_command`]. Thread-local so parallel
-    /// cases cannot decide each other's seeded command.
-    static HOOK_COMMAND_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// Seed `command` instead of the resolved `current_exe()` on the CURRENT
-/// THREAD. Test support only.
-///
-/// Under a test harness `current_exe()` is `target/debug/deps/baude-<hash>`,
-/// whose file stem is not `baude`, so a seeded file is not recognizable by
-/// [`is_seeded_hook_command`] — the divergence that let a fixture look unlike
-/// anything production writes, and that kept the pruning path (#70) beyond the
-/// reach of app-level tests. Fixtures call this with a production-shaped
-/// `<absolute path>/baude hook` so what they seed is what baude really writes.
-pub fn set_hook_command_for_test(command: impl Into<String>) {
-    let command = command.into();
-    HOOK_COMMAND_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(command));
 }
 
 /// True iff `command` is one this module previously seeded from a resolved
@@ -796,8 +784,9 @@ mod tests {
         assert!(!is_pure_seed_settings(&user_hook));
         // Including the harness's own `target/debug/deps/baude-<hash>`: it is
         // not a shape production ever writes, so fixtures seed a real
-        // `<abs>/baude hook` via `set_hook_command_for_test` instead of
-        // widening this predicate to accept it.
+        // `<abs>/baude hook` via the scoped
+        // `baude_core::testing::TestRedirect` guard instead of widening this
+        // predicate to accept it.
         let harness = merge_hook_settings(&seed, "/t/target/debug/deps/baude-9f2c hook");
         assert!(!is_pure_seed_settings(&harness));
         let mut unknown_event = seed.clone();

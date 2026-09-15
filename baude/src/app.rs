@@ -5576,28 +5576,62 @@ mod tests {
             .success());
     }
 
-    fn admission_repo(name: &str) -> PathBuf {
+    /// A fixture repository, the temp root that contains it, and the redirect
+    /// that keeps every path baude resolves inside that root.
+    ///
+    /// The redirect is thread-local and drops with this value, so every caller
+    /// must retain the owner in a NAMED binding that outlives the test body. A
+    /// helper returning only the repository path would still compile and leave
+    /// the fixture completely unredirected — a miss that is invisible locally
+    /// (the tests stay green) and shows up as hundreds of stale
+    /// `repository-<pid>` directories in the developer's real data dir (#72).
+    struct AdmissionRepo {
+        root: PathBuf,
+        repo: PathBuf,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl AdmissionRepo {
+        /// The checkout this fixture selected — the pushed repository, or the
+        /// clone for [`admission_repo_cloned`].
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+
+        /// The fixture root every redirected path is contained by.
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// Select a different checkout inside the SAME fixture root, retaining
+        /// the redirect that contains it.
+        fn with_path(self, repo: PathBuf) -> Self {
+            Self { repo, ..self }
+        }
+    }
+
+    #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives the test body"]
+    fn admission_repo(name: &str) -> AdmissionRepo {
         let root = std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
             });
         let _ = std::fs::remove_dir_all(&root);
-        // Managed worktrees are allocated under the data dir, so pin that to
-        // the fixture root before anything can create one. Without this the
+        // Managed worktrees are allocated under the data dir and the hook seed
+        // is derived from the binary path, so one redirect pins both to the
+        // fixture root before anything can create either. Without this the
         // suite seeds the developer's real ~/.local/share/baude/worktrees.
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        // Seed the shape production seeds. Under the harness `current_exe()` is
-        // `target/debug/deps/baude-<hash>`, whose stem is not `baude`, so
-        // everything seeded here would be unrecognizable as baude's own — the
-        // divergence that hid #78 and kept #70's pruning path untested at this
-        // level.
+        //
+        // The seeded command is the shape production seeds. Under the harness
+        // `current_exe()` is `target/debug/deps/baude-<hash>`, whose stem is not
+        // `baude`, so everything seeded here would be unrecognizable as baude's
+        // own — the divergence that hid #78 and kept #70's pruning path
+        // untested at this level.
+        let redirect = baude_core::testing::TestRedirect::new(&root);
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            bin.join("baude").display()
-        ));
         let origin = root.join("origin.git");
         let repo = root.join("repo");
         std::fs::create_dir_all(&origin).unwrap();
@@ -5617,14 +5651,20 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        repo
+        AdmissionRepo {
+            root,
+            repo,
+            _redirect: redirect,
+        }
     }
 
     /// The post-`git clone` shape, so the admission matrix covers repositories that already
     /// carry `refs/remotes/origin/HEAD` as well as those that never will.
-    fn admission_repo_cloned(name: &str) -> PathBuf {
+    #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives the test body"]
+    fn admission_repo_cloned(name: &str) -> AdmissionRepo {
         let pushed = admission_repo(name);
-        let root = pushed.parent().unwrap().to_path_buf();
+        let root = pushed.root().to_path_buf();
         let origin = root.join("origin.git");
         let clone = root.join("clone");
         let _ = std::fs::remove_dir_all(&clone);
@@ -5632,7 +5672,9 @@ mod tests {
             &root,
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
-        clone
+        // Retain the pushed fixture's owner: only the selected checkout
+        // changes, and dropping it here would un-redirect the clone.
+        pushed.with_path(clone)
     }
 
     /// Guards the fixture itself: `admission_repo` must keep the pushed shape. Repairing
@@ -5640,7 +5682,8 @@ mod tests {
     /// `gh repo create` repositories were being refused.
     #[test]
     fn admission_fixture_records_no_remote_head() {
-        let repo = admission_repo("shape-guard");
+        let fixture = admission_repo("shape-guard");
+        let repo = fixture.path().to_path_buf();
         let probe = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -5661,8 +5704,8 @@ mod tests {
     /// data dir (issue #72).
     #[test]
     fn admission_fixture_contains_managed_worktrees() {
-        let repo = admission_repo("containment-guard");
-        let root = repo.parent().unwrap().to_path_buf();
+        let fixture = admission_repo("containment-guard");
+        let root = fixture.root().to_path_buf();
         let allocated = baude_core::git::managed_default_worktree_path(1, 2);
         assert!(
             allocated.starts_with(&root),
@@ -5680,7 +5723,8 @@ mod tests {
     /// pruning path had no app-level coverage.
     #[test]
     fn activation_seeds_a_recognizable_command_and_reseeding_prunes_the_old_one() {
-        let (_app, _repo, root, _checkout, _runtime, path) = removal_app("seed-shape", 260_000);
+        let (_fixture, _app, _repo, root, _checkout, _runtime, path) =
+            removal_app("seed-shape", 260_000);
         let settings = path.join(".claude").join("settings.local.json");
         let seeded: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
@@ -5691,20 +5735,58 @@ mod tests {
 
         // A second install seeds over the first: one group per event, pointing
         // at the newcomer. The old path is pruned, not stacked beside it.
+        let original = baude_core::hook::baude_hook_command();
+        let config_before = baude_core::testing::config_dir_override();
+        let worktrees_before = baude_core::testing::worktrees_base_override();
+        let workspace_before = baude_core::testing::workspace_override().is_some();
         let newer = format!("{} hook", root.join("bin2").join("baude").display());
-        baude_core::hook::set_hook_command_for_test(&newer);
-        baude_core::hook::seed_settings(&path);
-        let reseeded: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        for (event, groups) in reseeded["hooks"].as_object().unwrap() {
-            let groups = groups.as_array().unwrap();
-            assert_eq!(groups.len(), 1, "{event} kept {} groups", groups.len());
-            assert_eq!(
-                groups[0]["hooks"][0]["command"].as_str().unwrap(),
-                newer,
-                "{event} still points at the superseded install"
-            );
+        assert_ne!(
+            newer, original,
+            "the second install must be a distinct path"
+        );
+        {
+            // Bound for the whole reseed-and-reconcile window: a temporary here
+            // would restore the first install's command before `seed_settings`
+            // ever ran, and the reconciliation below would assert against the
+            // command it was supposed to supersede.
+            let _newer_hook = baude_core::testing::TestRedirect::with_hook_command(&newer);
+            baude_core::hook::seed_settings(&path);
+            let reseeded: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+            for (event, groups) in reseeded["hooks"].as_object().unwrap() {
+                let groups = groups.as_array().unwrap();
+                assert_eq!(groups.len(), 1, "{event} kept {} groups", groups.len());
+                assert_eq!(
+                    groups[0]["hooks"][0]["command"].as_str().unwrap(),
+                    newer,
+                    "{event} still points at the superseded install"
+                );
+            }
         }
+
+        // Dropping the hook-only scope restores the enclosing fixture exactly:
+        // the first install's command returns and no path or identity redirect
+        // moved, so the next assertion in any caller still runs contained.
+        assert_eq!(
+            baude_core::hook::baude_hook_command(),
+            original,
+            "dropping the second-install scope must restore the fixture's command"
+        );
+        assert_eq!(
+            baude_core::testing::config_dir_override(),
+            config_before,
+            "a hook-only scope must not disturb the config redirect"
+        );
+        assert_eq!(
+            baude_core::testing::worktrees_base_override(),
+            worktrees_before,
+            "a hook-only scope must not disturb the worktrees redirect"
+        );
+        assert_eq!(
+            baude_core::testing::workspace_override().is_some(),
+            workspace_before,
+            "a hook-only scope must not disturb the workspace identity"
+        );
     }
 
     // Both provisioning shapes are covered at admission level: `admission_repo` is the
@@ -5712,12 +5794,26 @@ mod tests {
     // cloned_shape` covers the cloned one. Resolve-level adoption — including the default
     // branch living in a linked worktree — is pinned in baude-core::git::tests::default_branch.
 
+    /// The leading `AdmissionRepo` is the fixture's redirect owner. Destructure
+    /// it into a NAMED binding (`_fixture` is fine, a bare `_` is not): binding
+    /// it to `_` drops the redirect immediately and hands the rest of the test
+    /// the developer's real data dir.
+    #[must_use = "the leading AdmissionRepo owns the redirect that contains this fixture"]
     fn removal_app(
         label: &str,
         key_offset: u64,
-    ) -> (App, PathBuf, PathBuf, CheckoutKey, u64, PathBuf) {
-        let repo = admission_repo(label);
-        let root = repo.parent().unwrap().to_path_buf();
+    ) -> (
+        AdmissionRepo,
+        App,
+        PathBuf,
+        PathBuf,
+        CheckoutKey,
+        u64,
+        PathBuf,
+    ) {
+        let fixture = admission_repo(label);
+        let repo = fixture.path().to_path_buf();
+        let root = fixture.root().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
         let mut app = App::new(repo.clone());
@@ -5739,7 +5835,7 @@ mod tests {
         let path = app.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
-        (app, repo, root, checkout, runtime, path)
+        (fixture, app, repo, root, checkout, runtime, path)
     }
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
@@ -6238,7 +6334,7 @@ mod tests {
         assert_eq!(app.ordered_ids(), hidden_order);
         std::fs::remove_dir_all(action_state_root).unwrap();
 
-        let (mut app, repo, root, checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, root, checkout, runtime, worktree_path) =
             removal_app("hierarchy-action-matrix", 180_000);
         let repository = app.repository_state.checkouts[0].repository_key;
         let baseline_state = app.repository_state.clone();
@@ -6581,7 +6677,7 @@ mod tests {
             Some("shell hidden at this terminal height — resize to 13+ rows; session input is paused")
         );
 
-        let (mut app, repo, root, _checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, root, _checkout, runtime, worktree_path) =
             removal_app("tiny-resize", 185_000);
         app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
         let before = app
@@ -6695,7 +6791,8 @@ mod tests {
 
     #[test]
     fn production_admission_retains_intent_without_runtime_on_save_failure() {
-        let repo = admission_repo("save-failure");
+        let fixture = admission_repo("save-failure");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let blocked_root = root.join("persistence-root");
         std::fs::write(&blocked_root, b"not a directory").unwrap();
@@ -6718,7 +6815,8 @@ mod tests {
 
     #[test]
     fn production_admission_retains_saved_intent_on_spawn_failure() {
-        let repo = admission_repo("spawn-failure");
+        let fixture = admission_repo("spawn-failure");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6756,7 +6854,8 @@ mod tests {
 
     #[test]
     fn active_launch_repository_restart_focuses_restored_runtime_without_duplicate_spawn() {
-        let repo = admission_repo("active-launch-restart");
+        let fixture = admission_repo("active-launch-restart");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6791,7 +6890,8 @@ mod tests {
 
     #[test]
     fn admit_repository_populates_existing_worktrees_as_inactive_rows() {
-        let repo = admission_repo("worktree-autopopulate");
+        let fixture = admission_repo("worktree-autopopulate");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6864,7 +6964,8 @@ mod tests {
         // default lives in a linked worktree, so the linked worktree's upstream is the
         // only local evidence of the default. Resolution covers that now (#73); the
         // cloned shape has its own coverage in `admit_repository_admits_cloned_shape`.
-        let repo = admission_repo("worktree-main-role");
+        let fixture = admission_repo("worktree-main-role");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6923,7 +7024,8 @@ mod tests {
     /// shape, so this is what keeps the recorded-remote-HEAD path covered.
     #[test]
     fn admit_repository_admits_cloned_shape() {
-        let repo = admission_repo_cloned("cloned-shape");
+        let fixture = admission_repo_cloned("cloned-shape");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6965,7 +7067,8 @@ mod tests {
 
     #[test]
     fn lifecycle_create_activate_local_persists_once_and_reuses_runtime() {
-        let repo = admission_repo("branch-activation");
+        let fixture = admission_repo("branch-activation");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7130,7 +7233,8 @@ mod tests {
 
     #[test]
     fn lifecycle_creation_rollback_local_precommit_save_failure_has_no_partial_child() {
-        let repo = admission_repo("branch-rollback");
+        let fixture = admission_repo("branch-rollback");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let blocked_root = root.join("blocked-state-root");
         std::fs::write(&blocked_root, b"not a directory").unwrap();
@@ -7189,7 +7293,8 @@ mod tests {
 
     #[test]
     fn activation_recovery_reuses_unchanged_preexisting_worktree_after_pending_save_crash() {
-        let repo = admission_repo("occupied-pending-recovery");
+        let fixture = admission_repo("occupied-pending-recovery");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7273,7 +7378,8 @@ mod tests {
                 "runtime spawn",
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -7349,7 +7455,8 @@ mod tests {
 
     #[test]
     fn lifecycle_close_local_snapshots_resume_context_and_retains_hierarchy() {
-        let repo = admission_repo("retained-close");
+        let fixture = admission_repo("retained-close");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7492,7 +7599,8 @@ mod tests {
                 true,
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -7595,7 +7703,8 @@ mod tests {
 
     #[test]
     fn lifecycle_reopen_local_targets_retained_checkout_once_and_obeys_save_boundary() {
-        let repo = admission_repo("retained-reopen");
+        let fixture = admission_repo("retained-reopen");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7781,7 +7890,8 @@ mod tests {
             std::env::var_os("HOME"),
             Some(configured_root.join("home").into_os_string())
         );
-        let repo = admission_repo("restart-dedup").canonicalize().unwrap();
+        let fixture = admission_repo("restart-dedup");
+        let repo = fixture.path().canonicalize().unwrap();
         let root = configured_root.canonicalize().unwrap();
         assert_eq!(repo.parent(), Some(root.as_path()));
         let state_root = root.join("state");
@@ -7961,7 +8071,8 @@ mod tests {
 
     #[test]
     fn lifecycle_remove_clean_local_rechecks_after_stop_and_compensates_a_race() {
-        let repo = admission_repo("safe-remove-local");
+        let fixture = admission_repo("safe-remove-local");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -8046,7 +8157,8 @@ mod tests {
                 true,
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -8127,7 +8239,7 @@ mod tests {
 
     #[test]
     fn lifecycle_remove_clean_local_stop_git_and_compensation_failures_preserve_context() {
-        let (mut app, repo, root, checkout, runtime, path) =
+        let (_fixture, mut app, repo, root, checkout, runtime, path) =
             removal_app("safe-remove-stop-refusal", 150_000);
         let before = app.repository_state.clone();
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
@@ -8175,7 +8287,7 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
 
-        let (mut app, repo, root, checkout, _, path) =
+        let (_fixture, mut app, repo, root, checkout, _, path) =
             removal_app("safe-remove-compensation-failure", 160_000);
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
         app.remove_git_refusal_for_test = true;
@@ -8210,7 +8322,8 @@ mod tests {
             ("remove-agent-partial", true, 170_000),
             ("remove-shell-partial", false, 180_000),
         ] {
-            let (mut app, repo, root, checkout, runtime, path) = removal_app(label, offset);
+            let (_fixture, mut app, repo, root, checkout, runtime, path) =
+                removal_app(label, offset);
             app.session_mut(runtime).unwrap().open_shell(5, 40).unwrap();
             if fail_agent {
                 app.session(runtime)
@@ -8253,7 +8366,8 @@ mod tests {
 
     #[test]
     fn remove_confirmation_is_distinct_targeted_and_cancel_is_non_mutating() {
-        let repo = admission_repo("remove-confirmation");
+        let fixture = admission_repo("remove-confirmation");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
