@@ -296,7 +296,7 @@ fn main() -> Result<()> {
         Some(&memory_root),
         &launch_dir,
     );
-    let workspace = baude_core::workspace::initialize(plan.hint.as_deref());
+    let workspace = baude_core::workspace::initialize(&config, plan.hint.as_deref());
 
     // One writer per workspace. Claim the state lock BEFORE the terminal, the
     // daemon, or any folder-memory write: a second baude on a held lock used

@@ -965,7 +965,28 @@ impl Config {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many times [`load_config`] has executed ON THIS THREAD.
+    ///
+    /// Thread-local, not a process counter: the harness runs cases in
+    /// parallel, so a global count would be moved by unrelated tests and could
+    /// not distinguish "the identity path read config" from "some other case
+    /// did". Only a DELTA measured around the calls under test is meaningful.
+    static CONFIG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Instrumentation for the "identity resolution reads no config" assertion
+/// (D-06, T-08-24). Measure a delta around the calls under test — the absolute
+/// value carries no meaning.
+#[cfg(any(test, feature = "test-support"))]
+pub fn config_read_count_for_test() -> usize {
+    CONFIG_READS.with(std::cell::Cell::get)
+}
+
 pub fn load_config() -> Config {
+    #[cfg(any(test, feature = "test-support"))]
+    CONFIG_READS.with(|reads| reads.set(reads.get() + 1));
     std::fs::read_to_string(config_base().join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
