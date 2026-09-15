@@ -886,7 +886,18 @@ pub fn config_dir() -> PathBuf {
 /// terminal fallback included: `dirs::home_dir()` yields `None` only when
 /// neither `$HOME` nor a passwd entry supplies one, and `/` is what those
 /// helpers substituted.
-pub fn real_home_dir() -> PathBuf {
+///
+/// Private on purpose, and unlike [`real_config_base`] or
+/// [`crate::git::real_worktrees_base`] it has no external consumer to justify
+/// publishing it. Those two are public because the leak *scanner* genuinely
+/// needs the real tree; this one exists only so [`home_dir`] has something to
+/// guard. Published, it would be the unguarded resolver CR-01 removed from
+/// `baude` and `bauded` — a `persist::real_home_dir().join(".config")` in
+/// either binary would compile, pass clippy, and silently re-create #72. The
+/// module boundary is what makes "every home resolution goes through
+/// `home_dir`" a property the compiler enforces rather than a convention
+/// (#72, WR-01).
+fn real_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
