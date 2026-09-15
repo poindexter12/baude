@@ -6355,6 +6355,9 @@ mod tests {
 
     #[test]
     fn hierarchy_action_matrix_dispatches_only_authorized_local_actions() {
+        // Bound first so it outlives both `App`s below — each `App::new` reads
+        // the ambient config dir, and an unowned read resolves to the real one.
+        let _scope = isolation_scope("hierarchy-action-matrix");
         use super::{SidebarAction, SidebarRefusal};
         use crate::hierarchy::{action_view, ActionSelection};
         use baude_core::lifecycle::LifecycleCapability;
@@ -7086,6 +7089,9 @@ mod tests {
 
     #[test]
     fn hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus() {
+        // The `paused` App below is built before `removal_app` installs its own
+        // fixture, so this case needs its own owner for that first read.
+        let _scope = isolation_scope("hierarchy-resize");
         let mut paused = App::new(PathBuf::from("/not-a-repository"));
         paused.remote = None;
         paused.focus = super::Focus::Shell;
@@ -8900,8 +8906,14 @@ mod tests {
         app.remote = Some(crate::remote::RemotePoller::start(
             "http://127.0.0.1:9".into(),
         ));
-        app.config.claude_cmd = Some("sleep 30".into());
-        app.config.opencode_cmd = Some("sleep 30".into());
+        // Wrapped in `sh -c` like every other stand-in in this file: the spawn
+        // appends `--dangerously-skip-permissions`, and a BARE `sleep 30` takes
+        // that as a second operand, fails usage, and exits at once. The dedup
+        // assertion below only ever saw a live runtime because it raced the
+        // child's death; the wrapper swallows the flag as an ignored positional
+        // so the stand-in stays alive for the lifecycle this case asserts.
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         app.persistence_root_for_test = Some(state_root.clone());
 
         app.open_repo_session_via(folder.clone(), LocalAdmissionRoute::Open);
