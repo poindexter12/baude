@@ -2,18 +2,18 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 8
-current_phase_name: Test Isolation and Fixture Ownership
-status: planning
+current_phase: 11
+current_phase_name: Negotiated Multiline Input
+status: executing
 stopped_at: Phase 10 complete, ready to plan Phase 8
-last_updated: "2026-09-16T13:19:56.752Z"
+last_updated: "2026-09-16T14:05:01.279Z"
 last_activity: 2026-09-16
 last_activity_desc: Phase 10 complete, transitioned to Phase 8
-state_head: 8cd42fb516a7e2bc4dfaa43e5936d88228257af9
+state_head: a4c89ec3155cf4e57cd2be686b1b88b03657c97c
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 16
+  total_plans: 20
   completed_plans: 16
   percent: 40
 ---
@@ -29,9 +29,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 8 — Test Isolation and Fixture Ownership
+Phase: 11 (Negotiated Multiline Input) — READY TO EXECUTE
 Plan: Not started
-Status: Ready to plan
+Status: Ready to execute
 Last activity: 2026-09-16 — Phase 10 complete, transitioned to Phase 8
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.

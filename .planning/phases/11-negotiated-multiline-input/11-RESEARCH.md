@@ -626,7 +626,7 @@ by locked decision, and empirically broken — Alacritty reports
 | A4 | Claude Code will not enable kitty on the inner PTY because its probe goes unanswered, even with an allow-listed `TERM_PROGRAM` inherited | Q3/Q4 | If a Claude Code version pushes WITHOUT probe confirmation, baude's new observation mechanism catches it and passthrough applies — the design self-corrects |
 | A5 | Unrecognized `CSI < 1 u` written to a non-kitty terminal is silently ignored (relevant only if planner chooses unconditional pop; recommended design pops conditionally, making this moot) | Patterns | Cosmetic garbage on exit in exotic terminals — avoided entirely by the conditional pop |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Exact `EncodeCtx` shape and where `to_shell` folds in**
    - What we know: `forward_key` already distinguishes shell vs claude and reads per-child parser modes.
@@ -731,3 +731,5 @@ tests with injected seams, never live spawns.
 
 **Research date:** 2026-09-16
 **Valid until:** ~2026-10-16 (crossterm/ratatui pinned by lockfile; Claude Code/OpenCode input handling is the fast-moving edge — re-verify A1/A2 at Phase 12 smoke)
+
+> RESOLVED dispositions: Q1 (EncodeCtx shape) — plan 11-01 assumption_delta promotes the struct; Q2 (guidance wording/placement) — plan 11-03 Tasks 1-2; Q3 (subscribe kitty replay) — plan 11-04 Task 2 includes it.
