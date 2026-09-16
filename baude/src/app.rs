@@ -5259,7 +5259,11 @@ impl App {
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
         let plan = be.spawn_plan(&base, None, mode);
-        be.prepare_cwd(&cwd);
+        // HREG-03/D-02: surface seed warnings exactly like the add-session
+        // path — restart is a spawn path too.
+        for warning in be.prepare_cwd(&cwd) {
+            self.warn_seed_failure(&warning);
+        }
         let checkout = checkout_for_runtime(&self.runtime_checkouts, id);
         let mut pty = if let Some(checkout) = checkout {
             let generation = self

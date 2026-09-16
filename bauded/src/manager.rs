@@ -1154,8 +1154,13 @@ impl Manager {
         // the `.claude/settings.local.json` hook seed plus the prompt-mode
         // `.mcp.json` — best-effort, idempotent, non-clobbering. Idempotency
         // matters because `restore()` re-spawns every persisted session on
-        // each daemon startup.
-        be.prepare_cwd(&cwd);
+        // each daemon startup. HREG-03/D-02: warnings surface on stderr (the
+        // `save state:` precedent — bauded has no logging crate) and never
+        // block the spawn (D-04); a repeat per re-spawn is the signal, so no
+        // dedup across the restore loop.
+        for warning in be.prepare_cwd(&cwd) {
+            eprintln!("seed warning: {warning}");
+        }
 
         // PERM-01: resolve the permission flag (default skip preserves today's
         // unattended `--dangerously-skip-permissions`; `prompt` is opt-in via
@@ -2133,7 +2138,11 @@ impl Manager {
             .iter()
             .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key));
         let cwd = self.session(id)?.cwd.clone();
-        be.prepare_cwd(&cwd);
+        // HREG-03/D-02: same stderr surface as spawn_with_mode_internal —
+        // restart is a spawn path too; warnings never block (D-04).
+        for warning in be.prepare_cwd(&cwd) {
+            eprintln!("seed warning: {warning}");
+        }
         let mut replacement = if let Some(checkout) = checkout {
             let generation = self
                 .repository_state
