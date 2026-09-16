@@ -470,6 +470,58 @@ workspace. `auto_daemon` runs one daemon per workspace on its own port
 workspace reads the legacy un-suffixed state files on first run, so existing
 session lists survive the upgrade.
 
+### When a workspace is already open
+
+A workspace admits exactly one writer. A second baude on the same workspace
+refuses to start rather than come up degraded, and says so on stderr:
+
+```
+baude: workspace claude is already open in another baude (pid 41337).
+       Quit that instance, or run this one in another workspace: BAUDE_WORKSPACE=<name> baude
+       lock: /Users/you/.config/baude/.state-claude.json.lock
+```
+
+If the holder never recorded its pid you get the anonymous form of the same
+message:
+
+```
+baude: workspace claude is already open in another baude.
+```
+
+**Where the lock lives.** It is a dotted sibling of the workspace's state
+file: `state-<workspace>.json` is locked by `.state-<workspace>.json.lock` in
+the same directory, so the `claude` workspace locks
+`~/.config/baude/.state-claude.json.lock`. The daemon's
+`daemon-state-<workspace>.json` follows the same shape.
+
+**What the pid means.** The holder stamps its pid into the lock file best
+effort, *after* it has already won the lock. A message with no pid does not
+mean the lock is stale — it means the stamp failed, or the file predates pid
+stamping. The lock is genuinely held either way.
+
+**Never delete the lock file.** This is an OS advisory lock held on an open
+file descriptor, not a pid-file sentinel: the kernel releases it when the
+holding process exits, so a crashed baude never wedges a workspace and there is
+nothing left behind to clean up. Deleting the file while another baude is
+running does not release that process's lock — it only lets a second baude
+create a fresh file, win that one, and start writing. Two writers on one state
+file is the exact corruption the single-writer design exists to prevent.
+
+Recovery, in order:
+
+1. Read the pid out of the message and identify the other instance:
+   `ps -p 41337`.
+2. Quit it the normal way — `ctrl+q` to reach its sidebar, then `q`. Signal it
+   only if it is genuinely wedged (`kill 41337`).
+3. Or sidestep it and run this instance elsewhere, which is what the message
+   itself suggests: `BAUDE_WORKSPACE=other baude`.
+4. If the message showed no pid, find the holder from the printed lock path:
+   `lsof ~/.config/baude/.state-claude.json.lock`.
+
+`bauded` does not claim the lock at startup, so a daemon contending for a
+workspace surfaces the same pid-and-path diagnostic at its first state save
+rather than at launch.
+
 ## opencode backend
 
 Setting `backend` to `opencode` (or `BAUDE_BACKEND=opencode`) runs
