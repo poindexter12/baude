@@ -118,6 +118,12 @@ if uri.is_empty() || raw_len >= VTE_MAX_OSC_RAW || params.len() >= VTE_MAX_OSC_P
 fail-closed trade already accepted at the 1024-byte boundary.) Add a
 regression test with a ≥14-semicolon URI asserting no link is interned.
 
+**Resolution:** FIXED in `dac2658` — `params.len() >= VTE_MAX_OSC_PARAMS`
+guard added alongside the raw-length guard; regression tests
+`param_saturated_uri_is_not_a_link` (15-semicolon URI, no intern, parsing
+continues) and `uri_below_param_cap_still_interns_intact` (boundary control)
+added to `vendor/vt100/tests/link_fidelity.rs`.
+
 ## Warnings
 
 ### WR-01: Paste bytes reach the child while the LinkHints overlay is open
@@ -137,6 +143,11 @@ suspended.
 `modal_open_swallows_every_key_from_the_child` with a paste leg asserting
 `rx.try_recv().is_err()` after `handle_paste` while the overlay is open.
 
+**Resolution:** FIXED in `8f354a2` — `handle_paste` swallows paste for any
+non-`None`, non-`Input` modal (the defensive variant); the LINK-04 swallow
+test gained a paste leg while the overlay is open plus a forwarded-paste
+control leg once it closes.
+
 ### WR-02: c/y copy reports "copied …" unconditionally; clipboard sink is macOS-only
 
 **File:** `baude/src/app.rs` (handle_link_hints_key copy arm; sink at app.rs:5497-5509)
@@ -152,6 +163,13 @@ routes a headline feature through it and asserts success it cannot observe.
 mirroring the opener seam), gate the binary per-OS like `OPENER`
 (`pbcopy`/`wl-copy` or `xclip`), and message `copy failed: {e}` on `Err` —
 the same non-fatal surface pattern `activate_link` already uses.
+
+**Resolution:** FIXED in `0849269` — copy sink is now
+`FnOnce(&str) -> io::Result<()>`; `copy_to_clipboard` is cfg-gated
+(`pbcopy` on macOS; `wl-copy` with `xclip` fallback elsewhere), waits and
+checks exit status, and returns errors; c/y messages `copy failed: {e}` on
+`Err` and the mouse selection-copy path surfaces failure too. New test
+`copy_error_surfaces_failure_not_success`; injected-sink seam intact.
 
 ### WR-03: Wide characters inside a link break the recorded span (`end_col` wrong)
 
@@ -171,6 +189,15 @@ is wrong precisely where it will matter, with no test covering wide chars.
 the continuation cell's `attrs.link` from the base cell at
 screen.rs:1047-1048). Add a detection test with a CJK label asserting the full
 span.
+
+**Resolution:** FIXED in `84e0c87` — took the grid-layer variant: the wide
+continuation spacer now carries the base cell's link id (new crate-private
+`Cell::set_link`, applied at the spacer write in screen.rs), so per-cell ids
+are contiguous and every consumer sees the true span; erase paths still
+strip it via `Cell::clear`. Fork test
+`wide_char_label_keeps_contiguous_link_ids` (incl. overwrite-strips leg) and
+detection test `wide_char_label_records_full_span` (span `(0,0,3)` for
+`a中b`) added.
 
 ## Info
 
