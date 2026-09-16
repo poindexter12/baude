@@ -2,18 +2,18 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 08
-current_phase_name: Test Isolation and Fixture Ownership
-status: verifying
-stopped_at: Completed 08-07-PLAN.md
-last_updated: "2026-09-15T18:04:58.389Z"
+current_phase: 9
+current_phase_name: Hook Seeding Safety
+status: executing
+stopped_at: context exhaustion at 90% (2026-09-16)
+last_updated: "2026-09-16T04:20:05.240Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 08 execution started
-state_head: b3e905c93f81938255c633c8b49f07ec44f88ca5
+state_head: f123e8213b9aa5079ef446d430c383fc757e93eb
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 8
+  total_plans: 12
   completed_plans: 8
   percent: 0
 ---
@@ -29,9 +29,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 08 (Test Isolation and Fixture Ownership) — EXECUTING
+Phase: 9 (Hook Seeding Safety) — READY TO EXECUTE
 Plan: 8 of 8
-Status: Phase complete — ready for verification
+Status: Ready to execute
 Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
@@ -200,8 +200,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-15T18:04:58.373Z
-Stopped at: Completed 08-07-PLAN.md
+Last session: 2026-09-16T03:43:18.813Z
+Stopped at: context exhaustion at 90% (2026-09-16)
 Resume file: None
 
 ## Deferred Items

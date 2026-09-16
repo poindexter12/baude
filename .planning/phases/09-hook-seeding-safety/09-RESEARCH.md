@@ -334,14 +334,14 @@ Nothing version-sensitive. `File::try_lock` / `std::fs::TryLockError` (stabilize
 | A3 | bauded's "warn-level logging" per CONTEXT.md is realized as prefixed `eprintln!` (no logging crate exists in bauded) | Responsibility map | If the planner instead wants a logging crate, that is new scope; recommend against |
 | A4 | Official hooks docs describe hook `command` as shell-executed (training knowledge of docs.claude.com; the load-bearing fact is independently project-verified 2026-09-13 in REQUIREMENTS.md:42) | Pattern 3 | None material — the project's own empirical verification governs |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **bauded held-lock test: assert existing first-save behavior or add a startup claim first?**
+1. **bauded held-lock test: assert existing first-save behavior or add a startup claim first?** — RESOLVED: option (a) adopted and locked by plan 09-02 Task 2 (assert the existing `StateLockError::Held` surface; startup claim out of scope).
    - What we know: bauded never calls `claim_workspace_state_lock`; contention surfaces as `SaveError` wrapping `StateLockError::Held` at first save; phase boundary says "no change to the WLOCK contract beyond adding tests."
    - What's unclear: whether "refuses with the pid diagnostic and recovery guidance" (CONTEXT wording) is satisfiable by testing the `Held` Display alone (pid + lock path, no recovery sentence in bauded today).
    - Recommendation: test option (a) — assert `StateLockError::Held { holder: Some(pid) }` reaches bauded's error surface; note in the plan that a startup claim for bauded is out of scope (WLOCK-01's documented residual).
 
-2. **Warning dedup across restore loops.** `bauded`'s `restore()` re-spawns every persisted session at startup (comment at `manager.rs:1150-1157`); a malformed settings file in one cwd would warn once per restart per session. Harmless but noisy; the planner may add a per-path once-guard mirroring `WARNED` in `app.rs:3597`. Discretion area.
+2. **Warning dedup across restore loops.** — RESOLVED: plan 09-04 Task 2 declines dedup (noise accepted over hidden state, matching the `save state:` precedent). `bauded`'s `restore()` re-spawns every persisted session at startup (comment at `manager.rs:1150-1157`); a malformed settings file in one cwd would warn once per restart per session. Harmless but noisy; the planner may add a per-path once-guard mirroring `WARNED` in `app.rs:3597`. Discretion area.
 
 ## Environment Availability
 
