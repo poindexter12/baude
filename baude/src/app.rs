@@ -5706,15 +5706,17 @@ impl App {
 }
 
 /// Derive the per-keystroke encode context from the child's observed screen
-/// state: DECCKM for cursor keys, and the kitty keyboard stack for the D-04
-/// child-verification leg. Single producer for BOTH forward_key branches so
-/// local and remote-attach sessions cannot diverge (TKEY-02 parity).
+/// state: DECCKM for cursor keys (the `application_cursor()` precedent), and
+/// the kitty keyboard stack for the D-04 child-verification leg —
+/// `kitty_child` is true only while the child's own kitty push is active on
+/// its parser (`kitty_keyboard() != 0`); a fresh parser or fully-popped stack
+/// reads 0 and stays legacy (fail-closed). Single producer for BOTH
+/// forward_key branches so local and remote-attach sessions cannot diverge
+/// (TKEY-02 parity).
 fn encode_ctx(screen: &baude_core::vt100::Screen, to_shell: bool) -> EncodeCtx {
     EncodeCtx {
         app_cursor: screen.application_cursor(),
-        // RED stub — GREEN reads the observed child push:
-        // screen.kitty_keyboard() != 0 (fail-closed 0 = legacy).
-        kitty_child: false,
+        kitty_child: screen.kitty_keyboard() != 0,
         to_shell,
     }
 }
