@@ -72,9 +72,9 @@ impl Backend for ClaudeBackend {
     /// and a TUI one wires `baude` (the Pitfall-2 reason both binaries carry
     /// the `hook`/`permission-mcp` arms).
     fn prepare_cwd(&self, cwd: &Path) -> Vec<crate::hook::SeedWarning> {
-        let warnings = crate::hook::seed_settings(cwd);
+        let mut warnings = crate::hook::seed_settings(cwd);
         if crate::permission::is_prompt_mode() {
-            seed_mcp_config(cwd);
+            warnings.extend(seed_mcp_config(cwd));
         }
         warnings
     }
@@ -108,19 +108,36 @@ impl Backend for ClaudeBackend {
 /// sibling MCP servers (idempotent — the command is the sentinel). Previously
 /// duplicated byte-identically in `baude/src/app.rs` and `bauded/src/manager.rs`;
 /// this is now the single copy.
+///
+/// Guarded like [`crate::hook::seed_settings`] (D-03, HREG-03): an existing
+/// `.mcp.json` that cannot be read, parsed, or whose root is not an object is
+/// left byte-identical and reported via [`crate::hook::SeedWarning`] instead
+/// of being replaced with the seed alone. The `command` field stays the RAW
+/// `current_exe()` string — Claude Code spawns stdio MCP servers directly
+/// (no shell), so it is argv data and must never be quoted (D-09).
 fn seed_mcp_config(cwd: &Path) -> Vec<crate::hook::SeedWarning> {
+    use crate::hook::{SeedWarning, SeedWarningReason};
     let exe = match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
         Err(_) => return Vec::new(), // can't resolve the bridge command — best-effort skip.
     };
     let path = crate::permission::mcp_config_path(cwd);
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    // D-03: the identical guard seed_settings uses — on Err the file is user
+    // content we could not safely understand; leave it untouched and report.
+    let existing = match crate::hook::read_settings_guarded(&path) {
+        Ok(existing) => existing,
+        Err(warning) => return vec![warning],
+    };
+    // D-09: `exe` reaches the merge unmodified — argv data for a direct spawn.
     let merged = crate::permission::merge_mcp_config(&existing, &exe);
-    let _ = std::fs::write(&path, merged.to_string());
-    Vec::new()
+    match std::fs::write(&path, merged.to_string()) {
+        Ok(()) => Vec::new(),
+        // D-04: a write failure never aborts the spawn — warn and continue.
+        Err(error) => vec![SeedWarning {
+            file: path,
+            reason: SeedWarningReason::WriteFailed(error),
+        }],
+    }
 }
 
 #[cfg(test)]
