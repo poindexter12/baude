@@ -44,6 +44,7 @@ One warning on the TUI warning-surface losing warnings, plus four informational 
 
 ### WR-01: Multi-warning spawns lose warnings on both TUI and stderr surfaces
 
+**Status:** FIXED (commit 0f84e41) — `warn_seed_failure` replaced by `warn_seed_failures(&[SeedWarning])`: one aggregate `set_message` joining every warning with `" | "` (no last-wins loss), and the stderr once-guard re-keyed per affected file via a `Mutex<BTreeSet<PathBuf>>` (a later warning about a different file always reaches stderr). Both call sites (~2841, ~5262) updated; `seed_warning_` integration tests green unchanged in substance.
 **File:** `baude/src/app.rs:3607-3618` (also call sites at ~2841 and ~5262)
 **Issue:** `warn_seed_failure` has two lossy behaviors that compound when one `prepare_cwd` returns more than one warning (possible in prompt mode: a `settings.local.json` warning AND a `.mcp.json` warning in the same spawn):
 
