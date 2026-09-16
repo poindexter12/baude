@@ -110,6 +110,49 @@ mod kitty_keyboard {
         assert_eq!(parser.screen().contents(), "");
     }
 
+    /// WR-02 (per-screen stacks): a push made on the alternate screen dies
+    /// with the alternate screen. An alt-screen app killed WITHOUT popping
+    /// must not poison main-screen input — after exit, `kitty_keyboard()`
+    /// reads the main screen's (empty) stack (fail-closed).
+    #[test]
+    fn alt_screen_push_does_not_survive_alt_exit() {
+        let mut parser = vt100::Parser::new(4, 8, 0);
+        parser.process(b"\x1b[?1049h\x1b[>1u");
+        assert_eq!(parser.screen().kitty_keyboard(), 1);
+        parser.process(b"\x1b[?1049l");
+        assert_eq!(
+            parser.screen().kitty_keyboard(),
+            0,
+            "unpopped alt-screen push must not leak onto the main screen"
+        );
+    }
+
+    /// WR-02: main-screen flags pushed before entering the alternate
+    /// screen are untouched by alt-screen push/exit — restored on return,
+    /// matching kitty's independent per-screen stacks.
+    #[test]
+    fn main_screen_flags_restored_after_alt_screen() {
+        let mut parser = vt100::Parser::new(4, 8, 0);
+        parser.process(b"\x1b[>1u\x1b[?1049h\x1b[>5u");
+        assert_eq!(parser.screen().kitty_keyboard(), 5);
+        parser.process(b"\x1b[?1049l");
+        assert_eq!(
+            parser.screen().kitty_keyboard(),
+            1,
+            "main-screen flags must be restored on alternate-screen exit"
+        );
+    }
+
+    /// WR-02: the alternate stack is emptied on (re-)activation — a fresh
+    /// alt-screen session always starts legacy, even after a prior alt
+    /// app left unpopped residue.
+    #[test]
+    fn alt_stack_emptied_on_reentry() {
+        let mut parser = vt100::Parser::new(4, 8, 0);
+        parser.process(b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[?1049h");
+        assert_eq!(parser.screen().kitty_keyboard(), 0);
+    }
+
     /// Same `>` intermediate but a different final (CSI > 0 c, secondary
     /// device attributes) is NOT a kitty push — it keeps falling through
     /// to the existing debug-log path.

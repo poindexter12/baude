@@ -102,9 +102,15 @@ pub struct Screen {
     links: Vec<(String, String)>,
 
     /// BAUDE FORK (kitty keyboard): the child's kitty keyboard-protocol
-    /// flag stack, tracked from `CSI > u` / `CSI < u` / `CSI = u`. Bounded
-    /// at `KITTY_STACK_MAX`; the top entry is the active flags value.
+    /// flag stacks, tracked from `CSI > u` / `CSI < u` / `CSI = u` — one
+    /// per screen (main/alternate), matching kitty's per-screen isolation
+    /// so an alt-screen app that dies without popping cannot poison
+    /// main-screen input. Each bounded at `KITTY_STACK_MAX`; the top entry
+    /// of the ACTIVE screen's stack is the active flags value. The
+    /// alternate stack is emptied whenever the alternate screen is
+    /// entered, so alt-screen apps always start legacy.
     kitty_stack: Vec<u16>,
+    kitty_alternate_stack: Vec<u16>,
 }
 
 impl Screen {
@@ -133,6 +139,7 @@ impl Screen {
             links: Vec::new(),
 
             kitty_stack: Vec::new(),
+            kitty_alternate_stack: Vec::new(),
         }
     }
 
@@ -709,15 +716,33 @@ impl Screen {
     /// kitty keyboard-protocol flags (`0` = inactive/legacy — the default
     /// for a fresh parser and after a full pop).
     ///
-    /// Deliberate divergence from kitty: this is a single tracking stack,
-    /// not kitty's per-screen (main/alternate) stacks. The fork only
-    /// observes "did this child ask for CSI-u encodings" (the TKEY-05
-    /// child-verification signal consumed by `forward_key`); it does not
-    /// emulate the protocol, and the child's `CSI ? u` query probe is
-    /// never answered.
+    /// Reads the ACTIVE screen's stack: main and alternate screens carry
+    /// independent stacks, matching kitty, so an alt-screen app that
+    /// pushes flags and is killed without popping leaves the main screen
+    /// legacy (fail-closed) once the alternate screen exits. The fork
+    /// only observes "did this child ask for CSI-u encodings" (the
+    /// TKEY-05 child-verification signal consumed by `forward_key`); it
+    /// does not emulate the protocol, and the child's `CSI ? u` query
+    /// probe is never answered.
     #[must_use]
     pub fn kitty_keyboard(&self) -> u16 {
-        self.kitty_stack.last().copied().unwrap_or(0)
+        self.active_kitty_stack().last().copied().unwrap_or(0)
+    }
+
+    fn active_kitty_stack(&self) -> &Vec<u16> {
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            &self.kitty_alternate_stack
+        } else {
+            &self.kitty_stack
+        }
+    }
+
+    fn active_kitty_stack_mut(&mut self) -> &mut Vec<u16> {
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            &mut self.kitty_alternate_stack
+        } else {
+            &mut self.kitty_stack
+        }
     }
 
     /// Returns the currently active `MouseProtocolMode`
@@ -792,6 +817,11 @@ impl Screen {
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        // BAUDE FORK (kitty keyboard): per-screen stack isolation — the
+        // alternate screen's stack is emptied on activation (kitty's
+        // documented behavior), so a fresh alt-screen session always
+        // starts legacy even if a prior alt app left unpopped residue.
+        self.kitty_alternate_stack.clear();
     }
 
     fn exit_alternate_grid(&mut self) {
@@ -1336,38 +1366,41 @@ impl Screen {
     }
 
     // BAUDE FORK (kitty keyboard): CSI > flags u — push `flags` onto the
-    // tracked stack. Fail-closed posture copies the OSC 8 precedent: named
-    // const cap, no allocation proportional to attacker-controlled params.
-    // At the cap the OLDEST entry is dropped per the kitty spec's eviction
-    // rule, then the new entry is pushed.
+    // ACTIVE screen's tracked stack. Fail-closed posture copies the OSC 8
+    // precedent: named const cap, no allocation proportional to
+    // attacker-controlled params. At the cap the OLDEST entry is dropped
+    // per the kitty spec's eviction rule, then the new entry is pushed.
     fn kitty_push(&mut self, flags: u16) {
-        if self.kitty_stack.len() >= KITTY_STACK_MAX {
-            self.kitty_stack.remove(0);
+        let stack = self.active_kitty_stack_mut();
+        if stack.len() >= KITTY_STACK_MAX {
+            stack.remove(0);
         }
-        self.kitty_stack.push(flags);
+        stack.push(flags);
     }
 
-    // BAUDE FORK (kitty keyboard): CSI < n u — pop `n` entries,
-    // saturating: a hostile `n` larger than the stack simply empties it
-    // (no panic, no underflow).
+    // BAUDE FORK (kitty keyboard): CSI < n u — pop `n` entries from the
+    // ACTIVE screen's stack, saturating: a hostile `n` larger than the
+    // stack simply empties it (no panic, no underflow).
     fn kitty_pop(&mut self, n: u16) {
-        let n = usize::from(n).min(self.kitty_stack.len());
-        let new_len = self.kitty_stack.len() - n;
-        self.kitty_stack.truncate(new_len);
+        let stack = self.active_kitty_stack_mut();
+        let n = usize::from(n).min(stack.len());
+        let new_len = stack.len() - n;
+        stack.truncate(new_len);
     }
 
     // BAUDE FORK (kitty keyboard): CSI = flags ; mode u — set the current
-    // flags on the TOP entry (mode 1 replace, 2 OR, 3 AND-NOT), or
-    // establish the active entry when the stack is empty. Unknown modes
-    // are ignored (fail closed — no state change).
+    // flags on the ACTIVE screen's TOP entry (mode 1 replace, 2 OR,
+    // 3 AND-NOT), or establish the active entry when the stack is empty.
+    // Unknown modes are ignored (fail closed — no state change).
     fn kitty_set(&mut self, flags: u16, mode: u16) {
         if !matches!(mode, 1..=3) {
             return;
         }
-        if self.kitty_stack.is_empty() {
-            self.kitty_stack.push(0);
+        let stack = self.active_kitty_stack_mut();
+        if stack.is_empty() {
+            stack.push(0);
         }
-        if let Some(top) = self.kitty_stack.last_mut() {
+        if let Some(top) = stack.last_mut() {
             match mode {
                 2 => *top |= flags,
                 3 => *top &= !flags,
