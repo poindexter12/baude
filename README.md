@@ -150,8 +150,9 @@ readline (end-of-line, next-history) or the AI CLI.
 
 Inserting a newline with `shift+enter` is negotiated at startup through the
 kitty keyboard protocol: baude asks the terminal whether it can report the
-Shift modifier on Enter and only changes behavior when it answers yes.
-Verified to work in Ghostty, kitty, iTerm2, WezTerm, foot, and Alacritty.
+Shift modifier on Enter and only changes behavior when it answers yes. See
+[Tested terminals](#tested-terminals) below for where that negotiation is
+exercised.
 
 On terminals without the protocol, nothing changes: the terminal reports
 Shift+Enter as plain Enter, so it submits — exactly the pre-existing
@@ -193,6 +194,40 @@ and the session keeps running.
 
 Because baude intercepts `ctrl+o`, the chord no longer reaches the child
 program.
+
+### Mouse, selection, and scrollback
+
+baude turns mouse capture on at startup, unconditionally, and consumes the
+events itself — so your terminal's own drag-to-select is suppressed for as long
+as baude is running. Click and drag inside a pane is baude's own selection
+instead: releasing copies the selected region to the system clipboard
+(`pbcopy` on macOS, `wl-copy` or `xclip` on Linux), and a copy that fails says
+so rather than looking like success. When you want the terminal's native
+selection anyway — to grab text spanning both panes, or to use the terminal's
+own selection buffer — hold your terminal's override modifier while you drag.
+Which key that is belongs to the terminal, not to baude: Shift is the common
+one, and some macOS terminals use Option.
+
+The wheel scrolls whichever pane the pointer is over. When the child program in
+that pane has its own mouse mode on — a full-screen editor or pager — baude
+forwards the scroll to it instead, so those programs keep scrolling themselves.
+
+baude also runs on the alternate screen: it enters at startup and leaves on
+exit. Session output therefore never enters your host terminal's scrollback,
+and scrolling back through a session is baude's own handling inside the pane
+rather than your terminal's. On exit baude puts back everything it changed —
+mouse reporting off, bracketed paste off, alternate screen left — and whatever
+your terminal was showing before baude started is still there.
+
+### Tested terminals
+
+The negotiated gestures — `shift+enter` newlines, `ctrl+o` link hints, and
+mouse capture with its selection and scrolling — are exercised together in
+Ghostty, kitty, iTerm2, WezTerm, foot, and Alacritty. "Verified" means exactly
+that: the gestures were driven by hand in those terminals, not that
+compatibility is guaranteed anywhere else. Each release records the exact
+terminal identities and OS versions the gestures were observed in, in that
+release's smoke evidence.
 
 ## Status icons
 
