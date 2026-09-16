@@ -1677,6 +1677,52 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// WLOCK-04: contention is decided by `try_lock`, never by lock-file
+    /// existence. A prior owner that exited leaves its lock FILE (and a stale
+    /// pid stamp) on disk, but the OS lock died with the process — reopening
+    /// must succeed and re-stamp the current pid, without anyone ever having
+    /// to delete the leftover file (D-12).
+    #[test]
+    fn reopen_claims_lock_when_leftover_file_outlives_released_os_lock() {
+        let root = isolated_root("leftover-lock");
+        let workspace = test_workspace("claude");
+        let destination = root.join(workspace.state_file("state"));
+        let lock_path = lock_path(&destination);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        // Simulate the PRIOR owner with a RAW file handle, never via
+        // hold_state_lock: the re-entrant cache would return Ok early and the
+        // test would exercise the cache, not the leftover-file path.
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+        writeln!(lock, "999999").unwrap();
+        lock.flush().unwrap();
+
+        // The prior owner exits: the OS lock evaporates, the file stays.
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "lock file must survive the OS lock release"
+        );
+        assert_eq!(lock_holder_pid(&lock_path), Some(999_999));
+
+        // Reopen succeeds despite the leftover file and re-stamps our pid.
+        hold_state_lock(&destination).expect("leftover lock file must not block reopen");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+
+        release_state_lock_for_test(&destination);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn atomic_replacement_preserves_old_bytes_and_owned_temp_only() {
         let root = isolated_root("atomic-replace");
