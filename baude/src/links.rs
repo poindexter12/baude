@@ -14,7 +14,6 @@ pub enum LinkSource {
     /// never the visible label (LINK-01).
     Osc8,
     /// A bare `http(s)://` URL scanned out of rendered text (plan 10-03).
-    #[allow(dead_code)] // constructed by the 10-03 bare-URL pass
     Bare,
 }
 
@@ -24,10 +23,16 @@ pub enum LinkSource {
 #[derive(Clone, Debug)]
 pub struct DetectedLink {
     pub destination: url::Url,
-    /// Anchor span of the link's first visible fragment.
+    /// Anchor span of the link's first visible fragment. `row`/`start_col`
+    /// order the hint overlay top-to-bottom (app.rs open_link_hints).
     pub row: u16,
     pub start_col: u16,
+    /// Span end and provenance: asserted by the detection tests; kept as
+    /// the hit-testing surface for pointer activation if modifier-click
+    /// ever ships (CONTEXT: deliberately NOT in v2.2).
+    #[allow(dead_code)]
     pub end_col: u16,
+    #[allow(dead_code)]
     pub source: LinkSource,
 }
 

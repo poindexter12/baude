@@ -5524,7 +5524,14 @@ impl App {
             Focus::Claude => (
                 self.claude_scroll,
                 match self.selected_id {
-                    Some(SelId::Remote(_)) => self.attach.as_ref().map(|a| &a.parser),
+                    // Render parity: only the attach the render path would
+                    // draw serves links (ui.rs draw_remote_content filters
+                    // on remote_id + liveness the same way).
+                    Some(SelId::Remote(id)) => self
+                        .attach
+                        .as_ref()
+                        .filter(|a| a.remote_id == id && !a.is_closed())
+                        .map(|a| &a.parser),
                     _ => self.selected().map(|s| &s.claude.parser),
                 },
             ),
@@ -5532,8 +5539,11 @@ impl App {
         };
         let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
             p.set_scrollback(scroll);
-            let links = crate::links::collect_links(p.screen());
+            let mut links = crate::links::collect_links(p.screen());
             p.set_scrollback(0);
+            // Top-to-bottom, left-to-right — hint letters label links in
+            // visual order regardless of which pass found them.
+            links.sort_by_key(|l| (l.row, l.start_col));
             links
         });
         match links {
