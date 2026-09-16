@@ -38,14 +38,50 @@ pub struct DetectedLink {
 /// `Screen::link_target(id)` — cell label text is never consulted — then
 /// gate every candidate through [`validate_http_url`]. Candidates that fail
 /// validation are simply not collected (they stay plain rendered text).
-pub fn collect_links(_screen: &vt100::Screen) -> Vec<DetectedLink> {
-    Vec::new()
+pub fn collect_links(screen: &vt100::Screen) -> Vec<DetectedLink> {
+    let (rows, cols) = screen.size();
+    let mut out: Vec<DetectedLink> = Vec::new();
+    let mut seen: Vec<u16> = Vec::new();
+    for row in 0..rows {
+        let mut col = 0;
+        while col < cols {
+            let Some(id) = screen.cell(row, col).and_then(|c| c.link_id()) else {
+                col += 1;
+                continue;
+            };
+            // Maximal run of cells sharing this link id on this row.
+            let start_col = col;
+            let mut end_col = col;
+            while col < cols && screen.cell(row, col).and_then(|c| c.link_id()) == Some(id) {
+                end_col = col;
+                col += 1;
+            }
+            if seen.contains(&id) {
+                continue; // wrapped fragment / repeat of an interned entry
+            }
+            seen.push(id);
+            let Some(raw) = screen.link_target(id) else {
+                continue;
+            };
+            let Some(destination) = validate_http_url(raw) else {
+                continue; // fail closed: not activatable, not collected
+            };
+            out.push(DetectedLink {
+                destination,
+                row,
+                start_col,
+                end_col,
+                source: LinkSource::Osc8,
+            });
+        }
+    }
+    out.extend(collect_bare_links(screen));
+    out
 }
 
 /// Bare-URL pass seam: scheme-anchored scan with wrap-joining and trailing
 /// punctuation trimming. Implemented in plan 10-03; until then no bare
 /// candidates are produced.
-#[allow(dead_code)]
 fn collect_bare_links(_screen: &vt100::Screen) -> Vec<DetectedLink> {
     Vec::new()
 }
@@ -83,12 +119,18 @@ mod tests {
     #[test]
     fn tracer_end_to_end() {
         let mut parser = vt100::Parser::new(4, 8, 50);
-        parser.process(
-            b"\x1b]8;;https://real.example/x\x1b\\click here\x1b]8;;\x1b\\",
-        );
+        parser.process(b"\x1b]8;;https://real.example/x\x1b\\click here\x1b]8;;\x1b\\");
         let links = collect_links(parser.screen());
         assert_eq!(links.len(), 1, "exactly one OSC8 link collected");
         assert_eq!(links[0].destination.as_str(), "https://real.example/x");
+        // Anchor span: the first visible fragment ("click he", row 0 of the
+        // 8-col screen); the wrapped row-1 fragment shares the interned id
+        // and must NOT produce a second entry.
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (0, 0, 7)
+        );
+        assert_eq!(links[0].source, super::LinkSource::Osc8);
 
         // Activation path with a spy: records argv, spawns nothing.
         // Phase-8 containment: App::new resolves the config dir, so the test

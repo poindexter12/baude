@@ -11,9 +11,7 @@ mod hyperlink {
     fn target_not_label_and_wrap_survival() {
         // 8 cols so the 10-char label "click here" soft-wraps onto row 1.
         let mut parser = vt100::Parser::new(4, 8, 50);
-        parser.process(
-            b"\x1b]8;;https://real.example/x\x1b\\click here\x1b]8;;\x1b\\done",
-        );
+        parser.process(b"\x1b]8;;https://real.example/x\x1b\\click here\x1b]8;;\x1b\\done");
         let screen = parser.screen();
         let id = screen
             .cell(0, 0)

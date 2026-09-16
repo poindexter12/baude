@@ -402,6 +402,13 @@ pub enum Modal {
     ConfirmKill {
         id: SelId,
     },
+    /// Link-hint mode: the visible, validated link destinations of the
+    /// focused pane. The overlay always shows each link's actual destination
+    /// (never its label) before Enter can open it (LINK-04/LINK-05).
+    LinkHints {
+        links: Vec<crate::links::DetectedLink>,
+        selected: usize,
+    },
     ConfirmCloseWorktree {
         id: u64,
     },
@@ -3899,6 +3906,13 @@ impl App {
             self.open_new_session_modal();
             return;
         }
+        if ctrl && matches!(key.code, KeyCode::Char('o')) {
+            // Link-hint mode: the explicit gesture for inspecting/opening
+            // visible links (LINK-04). ctrl+o is collision-checked against
+            // the occupied chord set above.
+            self.open_link_hints();
+            return;
+        }
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
             Focus::Claude => self.forward_key(key, false),
@@ -4376,6 +4390,9 @@ impl App {
             Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
             }
+            // Production call site injects the real platform opener; tests
+            // inject a closure spy via handle_link_hints_key directly.
+            Modal::LinkHints { .. } => self.handle_link_hints_key(key, spawn_opener),
             Modal::Input {
                 kind,
                 buf,
@@ -5487,6 +5504,65 @@ impl App {
         }
     }
 
+    /// Open link-hint mode for the focused content pane (LINK-04's explicit
+    /// gesture — the ONLY entry path into hint mode). Collects links from
+    /// the pane's parser at its current scroll offset; the scrollback
+    /// bracket and lock are dropped BEFORE any modal state changes (same
+    /// split as selection copy).
+    fn open_link_hints(&mut self) {
+        let (scroll, parser) = match self.focus {
+            Focus::Shell => (
+                self.shell_scroll,
+                self.selected()
+                    .and_then(|s| s.shell.as_ref())
+                    .map(|p| &p.parser),
+            ),
+            Focus::Claude => (
+                self.claude_scroll,
+                match self.selected_id {
+                    Some(SelId::Remote(_)) => self.attach.as_ref().map(|a| &a.parser),
+                    _ => self.selected().map(|s| &s.claude.parser),
+                },
+            ),
+            Focus::Sidebar => (0, None),
+        };
+        let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
+            p.set_scrollback(scroll);
+            let links = crate::links::collect_links(p.screen());
+            p.set_scrollback(0);
+            links
+        });
+        match links {
+            Some(links) if !links.is_empty() => {
+                self.modal = Modal::LinkHints { links, selected: 0 };
+            }
+            _ => self.set_message("no links visible".into()),
+        }
+    }
+
+    /// Keys inside link-hint mode. Enter opens the selected destination via
+    /// the injected `open`; Esc dismisses. (Navigation and `c`/`y` copy land
+    /// in plan 10-04.) The modal is taken via `mem::replace` so the borrow
+    /// of `self.modal` ends before `&mut self` methods run.
+    fn handle_link_hints_key<F: FnOnce(&str) -> std::io::Result<()>>(
+        &mut self,
+        key: KeyEvent,
+        open: F,
+    ) {
+        match key.code {
+            KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Enter => {
+                let modal = std::mem::replace(&mut self.modal, Modal::None);
+                if let Modal::LinkHints { links, selected } = modal {
+                    if let Some(link) = links.get(selected) {
+                        self.activate_link(&link.destination, open);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Open a validated link destination. `open` is injected so activation is
     /// unit-testable without opening anything — the same seam shape as
     /// hook::route_event's injected `post` (hook.rs:431-433). The production
@@ -5505,6 +5581,29 @@ impl App {
     }
 }
 
+#[cfg(target_os = "macos")]
+const OPENER: &str = "open";
+#[cfg(not(target_os = "macos"))]
+const OPENER: &str = "xdg-open";
+
+/// LINK-08: the URL is a single argv argument — never shell text. Detached,
+/// stdio null on all three handles (open_editor precedent, minus its shell
+/// indirection); a reaper thread waits on the child so it never lingers as
+/// a zombie. Not test-reachable: every test injects a closure spy instead
+/// (WINDOWS entry 6 discipline).
+fn spawn_opener(url: &str) -> std::io::Result<()> {
+    let mut child = Command::new(OPENER)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Middle-truncate a URL for the transient message line. Display only — the
 /// full `Url::as_str()` is always what the opener receives.
 fn display_truncated(url: &url::Url) -> String {
@@ -5514,7 +5613,14 @@ fn display_truncated(url: &url::Url) -> String {
         return s.to_string();
     }
     let head: String = s.chars().take(40).collect();
-    let tail: String = s.chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(16)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}…{tail}")
 }
 

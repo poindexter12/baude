@@ -80,6 +80,11 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    /// BAUDE FORK (OSC 8): interned `(id-param, URI)` link table. Cell attrs
+    /// store a `u16` index into this table; entries are append-only so ids
+    /// referenced from scrollback stay valid. (Caps land in plan 10-02.)
+    links: Vec<(String, String)>,
 }
 
 impl Screen {
@@ -104,6 +109,8 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            links: Vec::new(),
         }
     }
 
@@ -546,8 +553,21 @@ impl Screen {
     /// BAUDE FORK (OSC 8): resolves an interned link id (from
     /// [`crate::Cell::link_id`]) to its destination URI.
     #[must_use]
-    pub fn link_target(&self, _id: u16) -> Option<&str> {
-        None
+    pub fn link_target(&self, id: u16) -> Option<&str> {
+        self.links.get(usize::from(id)).map(|(_, uri)| uri.as_str())
+    }
+
+    /// BAUDE FORK (OSC 8): intern a link, deduplicated by `(id, uri)` (the
+    /// spec's grouping rule — this is also how soft-wrapped OSC 8 fragments
+    /// unify). Returns `None` once the `u16` index space is exhausted, so
+    /// overflow degrades to "not a link" rather than corrupting ids.
+    fn intern_link(&mut self, id: String, uri: String) -> Option<u16> {
+        if let Some(pos) = self.links.iter().position(|(i, u)| *i == id && *u == uri) {
+            return u16::try_from(pos).ok();
+        }
+        let idx = u16::try_from(self.links.len()).ok()?;
+        self.links.push((id, uri));
+        Some(idx)
     }
 
     /// Returns whether the text in row `row` should wrap to the next line.
@@ -1309,7 +1329,11 @@ impl Screen {
         // instance with a 0 in it, but vte doesn't allow creating new Params
         // instances
         if params.is_empty() {
+            // BAUDE FORK (OSC 8): SGR reset must not close a hyperlink —
+            // link runs end only via an empty-URI OSC 8 (or a link switch).
+            let link = self.attrs.link;
             self.attrs = crate::attrs::Attrs::default();
+            self.attrs.link = link;
             return;
         }
 
@@ -1346,7 +1370,13 @@ impl Screen {
 
         loop {
             match next_param!() {
-                &[0] => self.attrs = crate::attrs::Attrs::default(),
+                // BAUDE FORK (OSC 8): SGR 0 resets colors/modes but must not
+                // close a hyperlink (see the `params.is_empty()` branch).
+                &[0] => {
+                    let link = self.attrs.link;
+                    self.attrs = crate::attrs::Attrs::default();
+                    self.attrs.link = link;
+                }
                 &[1] => self.attrs.set_bold(true),
                 &[3] => self.attrs.set_italic(true),
                 &[4] => self.attrs.set_underline(true),
@@ -1588,6 +1618,20 @@ impl vte::Perform for Screen {
             (Some(&b"0"), Some(s)) => self.osc0(s),
             (Some(&b"1"), Some(s)) => self.osc1(s),
             (Some(&b"2"), Some(s)) => self.osc2(s),
+            // BAUDE FORK (OSC 8): `ESC ] 8 ; params ; URI ST` — the URI is
+            // the destination; the visible label is ordinary cell text
+            // (LINK-01). vte split the OSC string on `;`, so everything from
+            // index 2 on is the URI and must be rejoined.
+            (Some(&b"8"), Some(link_params)) => {
+                let uri: Vec<u8> = params[2..].join(&b';');
+                if uri.is_empty() {
+                    // `OSC 8 ; ; ST` closes the link run.
+                    self.attrs.link = None;
+                } else if let Ok(uri) = String::from_utf8(uri) {
+                    let id = parse_id_param(link_params);
+                    self.attrs.link = self.intern_link(id, uri);
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!("unhandled osc sequence: OSC {}", osc_param_str(params),);
@@ -1671,6 +1715,17 @@ fn param_str(params: &vte::Params) -> String {
         })
         .collect();
     strs.join(" ; ")
+}
+
+/// BAUDE FORK (OSC 8): extract the `id=` value from the `:`-separated
+/// key=value params field (`"id=x:foo=y"` -> `"x"`); empty when absent.
+fn parse_id_param(link_params: &[u8]) -> String {
+    link_params
+        .split(|&b| b == b':')
+        .find_map(|kv| kv.strip_prefix(b"id="))
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn osc_param_str(params: &[&[u8]]) -> String {

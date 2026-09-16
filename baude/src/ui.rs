@@ -2111,6 +2111,37 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 rect,
             );
         }
+        Modal::LinkHints { links, selected } => {
+            // Minimal tracer render; layout polish and hint labels land in
+            // plan 10-04. Each row shows the link's ACTUAL destination —
+            // never its label (LINK-01/LINK-05).
+            let height = (links.len() as u16 + 4).min(20);
+            let rect = centered(area, 70, height);
+            frame.render_widget(Clear, rect);
+            let dim = Style::default().fg(Color::DarkGray);
+            let mut lines = Vec::with_capacity(links.len() + 2);
+            for (i, link) in links.iter().enumerate() {
+                let text = format!("  {}", link.destination);
+                if i == *selected {
+                    lines.push(Line::from(Span::styled(
+                        text,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                } else {
+                    lines.push(Line::raw(text));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("enter opens · esc closes", dim)));
+            let p = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" links "),
+            );
+            frame.render_widget(p, rect);
+        }
         Modal::Help => {
             let rect = centered(area, 60, 35);
             frame.render_widget(Clear, rect);
