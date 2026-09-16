@@ -2554,6 +2554,22 @@ mod tests {
         assert!(rendered.contains("X removes"), "{rendered}");
     }
 
+    /// D-12/TKEY-03: the help overlay's global section documents the
+    /// shift+enter newline binding and points at the README for terminal
+    /// support detail. The tall backend lets the overlay render at its full
+    /// fixed height, so a missing closing line means the paragraph outgrew
+    /// the `centered()` height argument (clipping regression guard).
+    #[test]
+    fn help_overlay_lists_shift_enter() {
+        let (_fixture, mut app, _) = hierarchy_fixture();
+        app.focus = Focus::Sidebar;
+        app.modal = Modal::Help;
+        let (rendered, _) = render(&app, 80, 45);
+        assert!(rendered.contains("shift+enter"), "{rendered}");
+        assert!(rendered.contains("see README"), "{rendered}");
+        assert!(rendered.contains("press any key to close"), "{rendered}");
+    }
+
     #[test]
     fn archived_rows_hide_behind_z_and_fully_archived_repository_collapses() {
         // Mixed repository: the archived child hides, the footer counts it,
