@@ -9427,4 +9427,94 @@ mod tests {
         holder.unlock().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    // ---- seed warning surface (HREG-03 / D-10, app-level) ----------------
+
+    /// D-10 (app half): a REAL App spawn attempt over a malformed
+    /// `.claude/settings.local.json` leaves the file byte-identical and
+    /// surfaces a TUI message naming it. Drives the standalone spawn entry
+    /// point (never `prepare_cwd` directly — that would not be an app-level
+    /// spawn test) under the Phase-8 guarded fixture.
+    fn assert_seed_warning_survives_spawn_attempt(tag: &str, malformed: &[u8]) {
+        let root = std::env::temp_dir().join(format!(
+            "baude-seed-warning-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let _identity = baude_core::workspace::override_for_test(
+            &persist::Config {
+                workspace: Some(format!("seed-warning-{tag}")),
+                ..persist::Config::default()
+            },
+            None,
+        );
+        // Production-shaped hook command override (legacy unquoted form —
+        // both forms are recognized after 09-03, and these assertions do not
+        // depend on quoting).
+        let _hook = baude_core::testing::TestRedirect::with_hook_command(format!(
+            "{} hook",
+            root.join("bin").join("baude").display()
+        ));
+
+        // Session cwd inside the fixture root with a malformed settings file.
+        let cwd = root.join("session");
+        let settings_dir = cwd.join(".claude");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings = settings_dir.join("settings.local.json");
+        std::fs::write(&settings, malformed).unwrap();
+
+        let mut app = App::new(cwd.clone());
+        app.remote = None;
+        // Stub command per the manager-test convention.
+        app.config.claude_cmd = Some("true".into());
+        let key = app
+            .repository_state
+            .allocate_standalone_key()
+            .expect("fresh state allocates a standalone key");
+
+        // A REAL spawn entry point that reaches `be.prepare_cwd(&cwd)`. The
+        // attempt MAY return Err after seeding (PTY/backend constraints in a
+        // test process) — the assertions bind to the seeding effects, not
+        // spawn success (D-04: the warning never blocks the spawn path).
+        let _ = app.add_standalone_session_with_mode(
+            key,
+            cwd.clone(),
+            baude_core::backend::SpawnMode::Fresh,
+            false,
+        );
+
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            malformed.to_vec(),
+            "malformed settings must remain byte-identical after a spawn attempt"
+        );
+        let message = app
+            .message
+            .clone()
+            .expect("warn_seed_failure must set a TUI message")
+            .0;
+        assert!(
+            message.contains(&settings.display().to_string()),
+            "TUI message must name the settings file, got: {message}"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_warning_malformed_settings_survives_spawn_attempt() {
+        assert_seed_warning_survives_spawn_attempt("unparseable", b"{not json");
+    }
+
+    #[test]
+    fn seed_warning_non_object_settings_survives_spawn_attempt() {
+        assert_seed_warning_survives_spawn_attempt("non-object", b"[1,2]");
+    }
 }
