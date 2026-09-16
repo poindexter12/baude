@@ -414,6 +414,15 @@ impl Pty {
                 if screen.hide_cursor() {
                     bytes.extend_from_slice(b"\x1b[?25l");
                 }
+                // An active kitty keyboard push (BAUDE FORK accessor): replay
+                // one push carrying the current flags — a fresh mirror parser
+                // has an empty stack, so this converges it on the same
+                // top-of-stack value (TKEY-05 across attach). Inactive (0)
+                // adds nothing.
+                let kitty = screen.kitty_keyboard();
+                if kitty != 0 {
+                    bytes.extend_from_slice(format!("\x1b[>{kitty}u").as_bytes());
+                }
                 bytes
             }
             Err(_) => Vec::new(),
@@ -1194,6 +1203,10 @@ mod tests {
         }
         if screen.hide_cursor() {
             bytes.extend_from_slice(b"\x1b[?25l");
+        }
+        let kitty = screen.kitty_keyboard();
+        if kitty != 0 {
+            bytes.extend_from_slice(format!("\x1b[>{kitty}u").as_bytes());
         }
         bytes
     }
