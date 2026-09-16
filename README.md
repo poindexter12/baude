@@ -117,6 +117,7 @@ through to Claude.
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
+| `ctrl+o` | anywhere | link hints (inspect/copy/open urls) |
 | `shift+enter` | claude pane | insert a newline without submitting |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
@@ -164,6 +165,34 @@ Inside tmux or screen, the negotiation talks to the multiplexer, not your
 outer terminal — tmux passes Shift+Enter through only with its
 `extended-keys` option enabled (e.g. `set -s extended-keys on` in
 `.tmux.conf`).
+
+### Link hints
+
+`ctrl+o` opens a hint overlay listing the links currently visible in the
+focused pane — OSC 8 hyperlinks and bare `http(s)://` urls alike. Each row is
+lettered and shows the link's **actual destination**, never its display label.
+That is the whole point of the preview: a link rendered as `docs` shows you the
+url it would really send you to before you open it. Long destinations are
+middle-truncated to fit the pane width only, so the scheme and host stay
+visible, and the full url is what gets copied or opened.
+
+The overlay footer names every gesture it accepts:
+
+```
+enter opens · c/y copies · j/k moves · esc closes — 7 links
+```
+
+At most ten rows are listed at a time; `j/k` moves through the rest.
+
+Only validated HTTP(S) destinations are collected, so every row in the overlay
+is activatable. Unsupported schemes, malformed targets, and anything carrying
+control characters stay ordinary, non-activatable text. Session output alone
+never opens a link — activation is always this explicit gesture. If the system
+opener fails, baude reports it honestly (`open failed: … — session unaffected`)
+and the session keeps running.
+
+Because baude intercepts `ctrl+o`, the chord no longer reaches the child
+program.
 
 ## Status icons
 
