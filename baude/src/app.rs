@@ -3932,18 +3932,18 @@ impl App {
                 if a.remote_id != id {
                     return;
                 }
-                let app_cursor = a
+                // Same derivation as the local branch below — one helper, so
+                // remote sessions cannot diverge (TKEY-02 parity). A poisoned
+                // lock degrades to legacy (fail-closed, D-04).
+                let ctx = a
                     .parser
                     .lock()
-                    .map(|p| p.screen().application_cursor())
-                    .unwrap_or(false);
-                // kitty_child is fail-closed false until the child-push
-                // observation accessor lands (D-04, plan 11-04).
-                let ctx = EncodeCtx {
-                    app_cursor,
-                    kitty_child: false,
-                    to_shell,
-                };
+                    .map(|p| encode_ctx(p.screen(), to_shell))
+                    .unwrap_or(EncodeCtx {
+                        app_cursor: false,
+                        kitty_child: false,
+                        to_shell,
+                    });
                 a.write_input(&encode_key(&key, ctx));
                 return;
             }
@@ -3957,18 +3957,17 @@ impl App {
         } else {
             &mut s.claude
         };
-        let app_cursor = pty
+        // Single ctx producer with the remote-attach branch above; a
+        // poisoned lock degrades to legacy (fail-closed, D-04).
+        let ctx = pty
             .parser
             .lock()
-            .map(|p| p.screen().application_cursor())
-            .unwrap_or(false);
-        // kitty_child is fail-closed false until the child-push observation
-        // accessor lands (D-04, plan 11-04).
-        let ctx = EncodeCtx {
-            app_cursor,
-            kitty_child: false,
-            to_shell,
-        };
+            .map(|p| encode_ctx(p.screen(), to_shell))
+            .unwrap_or(EncodeCtx {
+                app_cursor: false,
+                kitty_child: false,
+                to_shell,
+            });
         let bytes = encode_key(&key, ctx);
         pty.write_input(&bytes);
         if !to_shell && s.unarchive_on_input() {
@@ -5706,6 +5705,20 @@ impl App {
     }
 }
 
+/// Derive the per-keystroke encode context from the child's observed screen
+/// state: DECCKM for cursor keys, and the kitty keyboard stack for the D-04
+/// child-verification leg. Single producer for BOTH forward_key branches so
+/// local and remote-attach sessions cannot diverge (TKEY-02 parity).
+fn encode_ctx(screen: &baude_core::vt100::Screen, to_shell: bool) -> EncodeCtx {
+    EncodeCtx {
+        app_cursor: screen.application_cursor(),
+        // RED stub — GREEN reads the observed child push:
+        // screen.kitty_keyboard() != 0 (fail-closed 0 = legacy).
+        kitty_child: false,
+        to_shell,
+    }
+}
+
 #[cfg(target_os = "macos")]
 const OPENER: &str = "open";
 #[cfg(not(target_os = "macos"))]
@@ -5762,6 +5775,84 @@ pub(crate) fn display_truncated_width(url: &url::Url, max: usize) -> String {
         rest.chars().skip(count - tail_n).collect()
     };
     format!("{prefix}{head}…{tail}")
+}
+
+/// TKEY-01/TKEY-05 ctx derivation: pure byte-in/state-out over a directly-fed
+/// vt100 parser (the clipboard_tests precedent) — no PTY, no App. Proves the
+/// observed-push gate (D-04), pop-returns-to-unverified, DECCKM independence,
+/// and the full Shift+Enter decision matrix composed through the REAL
+/// derivation path (encode_ctx → encode_key, D-09).
+#[cfg(test)]
+mod forward_ctx_tests {
+    use super::encode_ctx;
+    use crate::keys::encode_key;
+    use baude_core::vt100;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn parser_fed(bytes: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(bytes);
+        parser
+    }
+
+    #[test]
+    fn observed_push_yields_kitty_child_true_fresh_parser_false() {
+        let pushed = parser_fed(b"\x1b[>1u");
+        assert!(
+            encode_ctx(pushed.screen(), false).kitty_child,
+            "observed CSI > 1 u push must verify the child"
+        );
+        let fresh = vt100::Parser::new(6, 60, 0);
+        assert!(
+            !encode_ctx(fresh.screen(), false).kitty_child,
+            "fresh parser must stay unverified (fail-closed default)"
+        );
+    }
+
+    #[test]
+    fn pop_returns_kitty_child_to_unverified() {
+        let popped = parser_fed(b"\x1b[>1u\x1b[<1u");
+        assert!(
+            !encode_ctx(popped.screen(), false).kitty_child,
+            "push then pop must return to unverified"
+        );
+    }
+
+    #[test]
+    fn app_cursor_and_kitty_child_are_independent_modes() {
+        let decckm = parser_fed(b"\x1b[?1h");
+        let ctx = encode_ctx(decckm.screen(), false);
+        assert!(ctx.app_cursor, "DECCKM set must read app_cursor true");
+        assert!(
+            !ctx.kitty_child,
+            "DECCKM alone must not verify the kitty child"
+        );
+    }
+
+    #[test]
+    fn composed_shift_enter_matrix_through_real_derivation() {
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        // Verified child: enhanced passthrough (D-09).
+        let pushed = parser_fed(b"\x1b[>1u");
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(pushed.screen(), false)),
+            b"\x1b[13;2u".to_vec(),
+            "pushed child must receive the enhanced sequence"
+        );
+        // Unverified child, Claude pane: documented fallback insert.
+        let fresh = vt100::Parser::new(6, 60, 0);
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(fresh.screen(), false)),
+            b"\x1b\r".to_vec(),
+            "legacy Claude-pane fallback must be ESC CR"
+        );
+        // Unverified child, shell pane: degrades to plain Enter.
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(fresh.screen(), true)),
+            b"\r".to_vec(),
+            "legacy shell-pane fallback must be plain CR"
+        );
+    }
 }
 
 #[cfg(test)]
