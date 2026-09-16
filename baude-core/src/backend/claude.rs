@@ -435,9 +435,8 @@ mod tests {
             "fresh seed must not warn, got {warnings:?}"
         );
         let path = crate::permission::mcp_config_path(&cwd);
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
-                .expect("fresh seed wrote valid JSON");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("fresh seed wrote valid JSON");
         assert!(
             v["mcpServers"]["baude"]["command"].is_string(),
             "fresh seed must register mcpServers.baude.command, got {v}"
