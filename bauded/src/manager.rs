@@ -3019,6 +3019,76 @@ mod tests {
             .state
     }
 
+    /// WLOCK-01/03 test debt (D-12): bauded never claims the workspace lock at
+    /// startup, so its existing contention surface is the FIRST SAVE. A held
+    /// lock must surface `StateLockError::Held`'s pid + lock-path diagnostic
+    /// through `save_checked`, and the refused save must leave the other
+    /// owner's lock file untouched (WLOCK-02).
+    #[test]
+    fn held_lock_save_refuses_with_pid_diagnostic() {
+        use std::io::Write as _;
+
+        let fixture = ManagerFixture::new("held-lock");
+        let state_root = fixture.subdir("state");
+        let mut manager = Manager::new("true".into(), true);
+        manager.persist_at_for_test(&state_root, fixture.workspace(), None);
+
+        // Mirror persist's private lock_path shape: ".{file_name}.lock"
+        // sibling of the destination the save will contend on.
+        let destination = state_root.join(fixture.workspace().state_file(STATE_BASE));
+        let file_name = destination
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let lock_path = destination.with_file_name(format!(".{file_name}.lock"));
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        // Simulate ANOTHER owner with a raw handle: two file descriptions in
+        // one process DO conflict under try_lock. The handle stays alive
+        // across the save attempt.
+        let mut holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+        writeln!(holder, "424242").unwrap();
+        holder.flush().unwrap();
+
+        let error = manager.save_checked().unwrap_err();
+        assert!(
+            !error.replacement_committed(),
+            "refusal must happen before any replacement"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("already owns this workspace"),
+            "message must carry the ownership phrase: {message}"
+        );
+        assert!(
+            message.contains("pid 424242"),
+            "message must carry the holder pid: {message}"
+        );
+        assert!(
+            message.contains(lock_path.file_name().unwrap().to_str().unwrap()),
+            "message must name the lock file: {message}"
+        );
+
+        // WLOCK-02: the refused save removed nothing — the other owner's lock
+        // file survives with its stamp intact.
+        assert!(lock_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap().trim(),
+            "424242"
+        );
+
+        drop(holder);
+        // ManagerFixture::drop removes the root.
+    }
+
     #[test]
     fn create_persistence_failure_keeps_memory_process_and_disk_consistent() {
         let fixture = persistence_fixture("create");
