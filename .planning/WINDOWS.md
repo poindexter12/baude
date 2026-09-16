@@ -20,7 +20,7 @@ last_updated: 2026-09-15T18:05:06.320Z
 | 3 | 08 | deviation | baude-core/src/git.rs |  | 08-04: worktree_inventory extracted from discover_repository (Rule 3) — discover_repository cannot answer the disownment question, so GitDisownsIt would have been unreachable | open |  | 2026-09-15T15:13:58.758Z |  |
 | 4 | 08 | deviation | baude-core/src/git.rs |  | 08-04 v2.2 FOLLOW-UP: empty-parent worktree leak is a LIVE production defect in ensure_default_worktree and activate_branch_with_post_add_hook — nothing removes the repository-<key> parent on failure; 'zero candidates' must never be an exit criterion | open |  | 2026-09-15T15:13:59.247Z |  |
 | 5 | 08 | unrun-verify | .planning/phases/08-test-isolation-and-fixture-ownership/08-08-PLAN.md |  | Full workspace test suite deliberately not run in 08-08: the plan forbids broad runs before 08-06 task 1 completes manager ownership | fixed |  | 2026-09-15T15:38:04.984Z | 2026-09-15T17:34:26.610Z |
-| 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it | open |  | 2026-09-15T15:38:12.573Z |  |
+| 6 | 08 | deviation | baude/src/app.rs | 5077 | App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it. 10-01 adds the link opener (spawn_opener) as a third member: injected-by-construction — production call site passes spawn_opener; every test passes a closure spy; not test-reachable | open |  | 2026-09-15T15:38:12.573Z |  |
 | 7 | 08 | deviation | baude-core/src/worktree_scan.rs |  | 08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path | open |  | 2026-09-15T16:31:45.745Z |  |
 | 8 | 08 | deviation | .planning/REQUIREMENTS.md |  | 08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises | open |  | 2026-09-15T16:31:46.217Z |  |
 | 9 | 08 | stub | baude/src/main.rs |  | `--json --prune` rejection path is fail-closed but untested; a future serializable prune account should replace the rejection and test both | open |  | 2026-09-15T18:05:06.320Z |  |
@@ -98,7 +98,7 @@ last_updated: 2026-09-15T18:05:06.320Z
     "phase": "08",
     "file": "baude/src/app.rs",
     "line": 5077,
-    "description": "App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it",
+    "description": "App::open_editor (and the pbcopy spawn at 5442) still spawn uncontained subprocesses with the inherited environment; not test-reachable today, no guard prevents it. 10-01 adds the link opener (spawn_opener) as a third member: injected-by-construction — production call site passes spawn_opener; every test passes a closure spy; not test-reachable",
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-15T15:38:12.573Z",
