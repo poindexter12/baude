@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 10
 current_phase_name: Clickable Terminal Links
 status: executing
-stopped_at: Completed 10-01-PLAN.md
-last_updated: "2026-09-16T07:26:51.764Z"
+stopped_at: Completed 10-02-PLAN.md
+last_updated: "2026-09-16T07:47:49.399Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 10 execution started
-state_head: 1d9008ff3389060adaa758487dd243fc27360265
+state_head: 00f670535d07ec7923e1fcee7c496675a894494f
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 16
-  completed_plans: 13
+  completed_plans: 14
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 10 (Clickable Terminal Links) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-09-15 — Phase 10 execution started
 
@@ -84,6 +84,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 09 P03 | 8min | 2 tasks | 1 files |
 | Phase 09 P04 | 15 min | 3 tasks | 3 files |
 | Phase 10 P01 | 33 min | 2 tasks | 23 files |
+| Phase 10 P02 | 16 min | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -182,6 +183,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 09]: bauded seed warnings repeat per re-spawn in the restore loop by design — noise accepted over hidden state
 - [Phase 10]: 10-01: ctrl+o adopted as the link-hint chord (collision-checked); vendored vt100 0.15.2 fork carries OSC8 as a per-cell Attrs link id
 - [Phase 10]: 10-01: SGR reset preserves the open link in the fork — link runs end only via empty-URI OSC8
+- [Phase 10]: vte 0.11 default no_std caps OSC at 1024 bytes — truncated OSC8 refused instead of interning truncated URIs (10-02)
+- [Phase 10]: OSC8 re-emission at single point Attrs::write_escape_code_diff with intern table threaded through all fork writers (10-02)
 
 ### Pending Todos
 
@@ -215,8 +218,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T07:26:51.721Z
-Stopped at: Completed 10-01-PLAN.md
+Last session: 2026-09-16T07:47:49.371Z
+Stopped at: Completed 10-02-PLAN.md
 Resume file: None
 
 ## Deferred Items
