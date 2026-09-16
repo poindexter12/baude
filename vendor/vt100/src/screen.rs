@@ -692,6 +692,21 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// BAUDE FORK (kitty keyboard): returns the child's currently active
+    /// kitty keyboard-protocol flags (`0` = inactive/legacy — the default
+    /// for a fresh parser and after a full pop).
+    ///
+    /// Deliberate divergence from kitty: this is a single tracking stack,
+    /// not kitty's per-screen (main/alternate) stacks. The fork only
+    /// observes "did this child ask for CSI-u encodings" (the TKEY-05
+    /// child-verification signal consumed by `forward_key`); it does not
+    /// emulate the protocol, and the child's `CSI ? u` query probe is
+    /// never answered.
+    #[must_use]
+    pub fn kitty_keyboard(&self) -> u16 {
+        0
+    }
+
     /// Returns the currently active `MouseProtocolMode`
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
