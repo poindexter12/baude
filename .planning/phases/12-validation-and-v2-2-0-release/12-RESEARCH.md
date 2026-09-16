@@ -1308,7 +1308,7 @@ should re-review rather than trust the allow.
 | A4 | A `[lints]` table in `vendor/vt100/Cargo.toml` cannot override the in-source `#![warn(clippy::cargo)]`, because source-level attributes beat CLI-provided lint levels. | Standard Stack → Alternatives | LOW. Only affects which of two fix routes is chosen; the recommended route (lib.rs edit) was empirically proven to work this session. |
 | A5 | release-please's default changelog sections exclude `docs`/`test`/`style`/`refactor`, so a merge-commit release would show 33 Features + 19 Bug Fixes. | Branch and Merge State | LOW. `CHANGELOG.md`'s existing entries show only `### Features` / `### Bug Fixes` / `### Miscellaneous Chores` sections, consistent with the default. Worst case the notes are longer than expected. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Squash vs merge commit for the phase PR.**
    - What we know: both are enabled; merge commit yields per-commit changelog
@@ -1422,3 +1422,5 @@ should re-review rather than trust the allow.
 **Valid until:** 2026-09-23 (7 days — the branch is 165 commits ahead of a moving
 `main`, the clippy surface moves with the runner's toolchain, and the release PR
 state is live).
+
+> RESOLVED dispositions: Q1 (merge vs squash) — merge commit, adopted in 12-05 Task 1. Q2 (Linux terminal availability) — DEFERRED-with-signed-sign-off design, 12-03. Q3 (fork lint scope) — group allow at the fork crate root with a fork-marker comment, 12-01 Task 1. Q4 (phase-8 ROADMAP/STATE correction) — two explicit checklist items, 12-04 Task 3.
