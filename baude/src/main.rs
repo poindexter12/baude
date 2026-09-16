@@ -89,7 +89,7 @@ use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
+use ratatui::crossterm::{execute, queue};
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -111,22 +111,33 @@ fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
     matches!(probe(), Ok(true))
 }
 
+/// Single restore-emission path (D-07/D-08): queues the conditional keyboard
+/// pop FIRST — kitty keyboard stacks are per-screen, so the pop must land on
+/// the alternate screen before LeaveAlternateScreen switches away — then the
+/// pre-phase teardown, then one flush.
+fn write_restore_sequence<W: std::io::Write>(w: &mut W, pop_enhanced: bool) -> std::io::Result<()> {
+    if pop_enhanced {
+        queue!(w, PopKeyboardEnhancementFlags)?;
+    }
+    queue!(
+        w,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    w.flush()
+}
+
 fn restore_terminal() {
     // Swap so a double restore (panic during the exit path) pops exactly once.
     let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
     let _ = disable_raw_mode();
-    if popped {
-        // Pop BEFORE LeaveAlternateScreen: kitty keyboard stacks are
-        // per-screen, so the pop must hit the same (alternate) screen the
-        // push landed on.
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = execute!(
-        stdout(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
+    // Suspend note (D-06, RESEARCH Q5): baude has no SIGTSTP/suspend
+    // handling, so the suspend/resume leg of TKEY-04 is vacuous this phase.
+    // Any future suspend feature must pop the keyboard flags before handing
+    // the terminal back and re-push on resume WITHOUT re-querying — outer
+    // support cannot change mid-session.
+    let _ = write_restore_sequence(&mut stdout(), popped);
 }
 
 /// `<binary> hook` — Claude Code lifecycle-event hook, no TUI. Claude invokes it
@@ -1871,6 +1882,93 @@ mod worktrees_cli_tests {
         assert!(
             stdout.contains("--yes"),
             "the separate confirmation: {stdout}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_negotiation_tests {
+    use super::*;
+
+    /// Byte-subsequence offset finder: the pop bytes are pure ASCII, but
+    /// offset comparison on `&[u8]` avoids lossy string conversion questions.
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// `PopKeyboardEnhancementFlags` wire form: CSI < 1 u.
+    const POP: &[u8] = b"\x1b[<1u";
+    /// `LeaveAlternateScreen` wire form: CSI ? 1049 l.
+    const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+    #[test]
+    fn probe_failure_and_refusal_are_legacy_never_fatal() {
+        // D-02/D-03 (TKEY-05): Ok(false) and Err (crossterm's internal 2 s
+        // deadline, no tty, Windows) both mean unsupported means legacy —
+        // no panic, no propagated error.
+        assert!(!negotiate_keyboard(|| Ok(false)));
+        assert!(!negotiate_keyboard(|| Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timed out"
+        ))));
+        assert!(negotiate_keyboard(|| Ok(true)));
+    }
+
+    #[test]
+    fn pop_precedes_alternate_screen_leave_when_pushed() {
+        // D-07: per-screen kitty stacks — the pop must land on the alternate
+        // screen before LeaveAlternateScreen switches away.
+        let mut out: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut out, true).unwrap();
+        let pop = find_subsequence(&out, POP).expect("pop bytes missing from restore output");
+        let leave =
+            find_subsequence(&out, LEAVE_ALT).expect("alt-screen leave missing from restore");
+        assert!(
+            pop < leave,
+            "pop offset {pop} must precede alt-screen leave offset {leave}"
+        );
+    }
+
+    #[test]
+    fn legacy_restore_emits_no_pop_and_matches_pre_phase_bytes() {
+        // D-03: on a legacy terminal the restore emission is byte-identical
+        // to the pre-phase sequence (built here from the same commands the
+        // pre-phase restore_terminal executed).
+        let mut out: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut out, false).unwrap();
+        assert!(
+            find_subsequence(&out, POP).is_none(),
+            "legacy restore must not emit the pop"
+        );
+        let mut expected: Vec<u8> = Vec::new();
+        queue!(
+            expected,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
+        .unwrap();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn double_restore_pops_exactly_once() {
+        // Panic during the exit path drives restore_terminal twice; the
+        // AtomicBool swap must make the second pass a no-op for the pop.
+        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        let mut first: Vec<u8> = Vec::new();
+        let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
+        write_restore_sequence(&mut first, popped).unwrap();
+        let mut second: Vec<u8> = Vec::new();
+        let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
+        write_restore_sequence(&mut second, popped).unwrap();
+        assert!(
+            find_subsequence(&first, POP).is_some(),
+            "first restore must pop"
+        );
+        assert!(
+            find_subsequence(&second, POP).is_none(),
+            "second restore must not re-emit the pop"
         );
     }
 }
