@@ -166,14 +166,14 @@ Plans:
 4. The prior outer-terminal keyboard mode is restored on controlled exit, failure, and suspend paths, then re-established on resume.
 5. Negotiation cannot block startup/input indefinitely, and enhanced sequences are sent only on a verified outer-terminal/child-input path.
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 
 Plans:
 **Wave 1**
 
 - [x] 11-01-PLAN.md — Tracer: bounded probe seam, gated push/pop through restore_terminal, EncodeCtx-conditional Shift+Enter arm, legacy byte corpus (wave 1)
 - [x] 11-02-PLAN.md — TDD: vt100 fork kitty keyboard-mode tracking + kitty_keyboard() accessor (wave 1)
-- [ ] 11-03-PLAN.md — Help overlay + README supported-terminals/fallback guidance (wave 1)
+- [x] 11-03-PLAN.md — Help overlay + README supported-terminals/fallback guidance (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -203,7 +203,7 @@ Plans:
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
 | 10. Clickable Terminal Links | 4/4 | Complete    | 2026-09-16 |
-| 11. Negotiated Multiline Input | 2/4 | In Progress|  |
+| 11. Negotiated Multiline Input | 3/4 | In Progress|  |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
 
 ## Planning Notes

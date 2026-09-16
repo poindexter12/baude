@@ -62,7 +62,7 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 - [ ] **TKEY-01**: A user can press Shift+Enter to insert a newline without submitting in Claude/claudex prompts on documented, tested terminal paths that report the modifier distinctly.
 - [ ] **TKEY-02**: Ordinary Enter, Ctrl-C, navigation keys, and existing baude shortcuts retain their behavior after enhanced keyboard handling is enabled.
-- [ ] **TKEY-03**: A user of a terminal that cannot distinguish Shift+Enter retains legacy input behavior and receives documented multiline-input setup or fallback guidance; baude does not guess a missing modifier.
+- [x] **TKEY-03**: A user of a terminal that cannot distinguish Shift+Enter retains legacy input behavior and receives documented multiline-input setup or fallback guidance; baude does not guess a missing modifier.
 - [x] **TKEY-04**: The outer terminal's previous keyboard mode is restored on normal exit and application-controlled failure/suspend paths, and correctly re-established on resume.
 - [ ] **TKEY-05**: Keyboard capability negotiation cannot indefinitely block startup or input, and enhanced sequences are sent only on a verified supported outer-terminal/child input path.
 
@@ -126,7 +126,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | LINK-08 | Phase 10 | Complete |
 | TKEY-01 | Phase 11 | Pending |
 | TKEY-02 | Phase 11 | Pending |
-| TKEY-03 | Phase 11 | Pending |
+| TKEY-03 | Phase 11 | Complete |
 | TKEY-04 | Phase 11 | Complete |
 | TKEY-05 | Phase 11 | Pending |
 | SHIP-01 | Phase 12 | Pending |
