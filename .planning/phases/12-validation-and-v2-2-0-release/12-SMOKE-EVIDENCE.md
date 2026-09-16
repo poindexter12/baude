@@ -19,11 +19,28 @@ whose provenance header and honest-gaps closer this file reuses.
 
 ## Session: 2026-09-16 — macOS / TERMINAL_PENDING
 
-**Commit:** PENDING (stamped in Task 2)
-**Host/toolchain:** PENDING (stamped in Task 2)
-**Binary under test:** PENDING (stamped in Task 2)
+**Commit:** e94aeed18fdbbc472ba254e79ef501ef68bfd2a6 (dirty)
+**Host/toolchain:** Darwin JoeSeMacBook 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:02:59 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T8142 arm64; rustc 1.98.1 (48a229cea 2026-09-01); cargo 1.98.1 (797e8a9bc 2026-08-05)
+**Binary under test:** `target/release/baude` — reported: baude 2.1.5
 **Terminal identity:** PENDING — confirmed by the observer at fill time
 **Observer:** PENDING — confirmed by the observer at fill time
+
+**What "dirty" means here.** `git status --porcelain` was not empty at stamp
+time. The only uncommitted paths are GSD orchestrator state — modified
+`.planning/config.json`, untracked `.gsd/`, untracked `.planning/milestone.lock`.
+No source file, manifest, or lockfile differs from commit `e94aeed`, so the
+binary below is a faithful build of that commit. Recorded as `dirty` because a
+true dirty stamp is worth more than a convenient clean one.
+
+**Build:** `cargo build --workspace --release`, exit 0. The companion daemon in
+the same build reported `bauded 2.1.5`.
+
+**On the reported version.** The binary reports `baude 2.1.5`, not `2.2.0`. That
+is expected and not a mismatch: `2.2.0` is cut by release-please from the merged
+phase branch, so no pre-release commit can report it. This session certifies the
+`2.1.5`-versioned build at `e94aeed` — the code that becomes v2.2.0 — exactly as
+`ci.yml:118-122` asserts a tarball's binary against the version it was built
+from.
 
 | # | Leg | What to do | What to look for | Observed (verbatim) | Result |
 |---|-----|------------|------------------|---------------------|--------|
