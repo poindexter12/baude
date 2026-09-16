@@ -103,6 +103,278 @@ pub fn validate_http_url(raw: &str) -> Option<url::Url> {
     matches!(parsed.scheme(), "http" | "https").then_some(parsed)
 }
 
+/// LINK-02 bare-URL pass: logical-line joining over `row_wrapped`, scheme-
+/// anchored scan, punctuation trim, span anchoring, OSC8 exclusion, and the
+/// bounded off-screen continuation (RESEARCH Open Question 2 resolution).
+#[cfg(test)]
+mod bare_url {
+    use super::{collect_links, DetectedLink, LinkSource};
+    use baude_core::vt100;
+
+    /// Pure-parser shape (app.rs `clipboard_tests` precedent): feed bytes,
+    /// call the pure function on `parser.screen()`.
+    fn links_on(input: &[u8], rows: u16, cols: u16) -> Vec<DetectedLink> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(input);
+        collect_links(parser.screen())
+    }
+
+    fn url(s: &str) -> url::Url {
+        url::Url::parse(s).expect("test expectation URL parses")
+    }
+
+    #[test]
+    fn detects_url_embedded_in_prose_with_span() {
+        let links = links_on(b"see https://example.com/path today", 2, 40);
+        assert_eq!(links.len(), 1, "exactly one bare URL detected");
+        assert_eq!(links[0].destination.as_str(), "https://example.com/path");
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (0, 4, 27),
+            "span covers exactly the URL cells"
+        );
+        assert_eq!(links[0].source, LinkSource::Bare);
+    }
+
+    /// The named RED target: a URL soft-wrapped across rows (row_wrapped
+    /// true) is joined into ONE complete URL via the grid's wrap metadata —
+    /// the same authority selection copy trusts (app.rs:5460-5462).
+    #[test]
+    fn soft_wrapped_url_joined_via_row_wrapped() {
+        // "https://ex.com/abc" (18 chars) wraps 8/8/2 on an 8-col screen.
+        let mut parser = vt100::Parser::new(4, 8, 0);
+        parser.process(b"https://ex.com/abc");
+        assert!(parser.screen().row_wrapped(0), "precondition: row 0 wraps");
+        assert!(parser.screen().row_wrapped(1), "precondition: row 1 wraps");
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1, "wrapped fragments join to one URL");
+        assert_eq!(links[0].destination.as_str(), "https://ex.com/abc");
+        // Anchor span: the first visible fragment (row 0, full width).
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (0, 0, 7)
+        );
+        assert_eq!(links[0].source, LinkSource::Bare);
+    }
+
+    #[test]
+    fn explicit_newline_is_never_joined() {
+        // row_wrapped(0) is false across a real newline: the two sides are
+        // scanned independently — the row-0 URL stands alone and "yz" never
+        // becomes part of it.
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(b"https://a.example/x\r\nyz");
+        assert!(!parser.screen().row_wrapped(0), "precondition: no wrap flag");
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].destination.as_str(), "https://a.example/x");
+    }
+
+    #[test]
+    fn unbalanced_trailing_paren_stripped_balanced_retained() {
+        let links = links_on(b"(https://en.wikipedia.org/wiki/Foo_(bar))", 2, 60);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].destination,
+            url("https://en.wikipedia.org/wiki/Foo_(bar)"),
+            "outer ) stripped once (unbalanced); inner balanced pair kept"
+        );
+    }
+
+    #[test]
+    fn trailing_prose_punctuation_stripped() {
+        let links = links_on(b"https://example.com/a., end", 2, 40);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].destination.as_str(), "https://example.com/a");
+    }
+
+    #[test]
+    fn case_insensitive_scheme_detected_and_normalized() {
+        let links = links_on(b"HTTPS://EXAMPLE.COM/A and Http://ex.com/b", 2, 50);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0].destination,
+            url("HTTPS://EXAMPLE.COM/A"),
+            "uppercase scheme/host detected; parse normalizes"
+        );
+        assert_eq!(links[1].destination, url("Http://ex.com/b"));
+    }
+
+    #[test]
+    fn percent_encoded_utf8_survives_detection_intact() {
+        let links = links_on(b"get https://ex.com/%E2%9C%93 now", 2, 40);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].destination, url("https://ex.com/%E2%9C%93"));
+    }
+
+    /// Off-screen tail (RESEARCH Open Question 2): the view is scrolled back
+    /// so the wrapped URL's last row sits below the view edge; the bounded
+    /// continuation joins it, and the anchor stays on the visible fragment.
+    #[test]
+    fn offscreen_tail_joined_via_bounded_continuation() {
+        let mut parser = vt100::Parser::new(4, 8, 50);
+        // 5 logical rows: "one", "two", then the URL wrapping 8/8/6.
+        parser.process(b"one\r\ntwo\r\nhttps://e.com/abcdefgh");
+        parser.set_scrollback(1);
+        // Visible: one / two / https:// / e.com/ab — tail "cdefgh" is below
+        // the edge, reachable only through the wrap flag on the bottom row.
+        assert!(parser.screen().row_wrapped(3), "precondition: bottom row wraps");
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1, "off-screen tail joined into one URL");
+        assert_eq!(links[0].destination.as_str(), "https://e.com/abcdefgh");
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (2, 0, 7),
+            "anchor span stays on the visible fragment"
+        );
+    }
+
+    /// A continuation chain longer than the bound (4 rows past the edge)
+    /// yields the truncated candidate — which is collected only because it
+    /// still validates.
+    #[test]
+    fn continuation_chain_longer_than_bound_truncates() {
+        let mut parser = vt100::Parser::new(4, 8, 50);
+        // 6 filler rows, then a 66-char URL spanning 9 rows (8/8/.../2).
+        let mut input = Vec::new();
+        for f in ["f1", "f2", "f3", "f4", "f5", "f6"] {
+            input.extend_from_slice(f.as_bytes());
+            input.extend_from_slice(b"\r\n");
+        }
+        input.extend_from_slice(b"https://e.com/");
+        input.extend_from_slice("a".repeat(52).as_bytes());
+        parser.process(&input);
+        // Offset 8: visible = f4/f5/f6/"https://"; 8 URL rows below the edge.
+        parser.set_scrollback(8);
+        assert!(parser.screen().row_wrapped(3), "precondition: bottom row wraps");
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1, "truncated candidate still validates");
+        // Visible row + 4 continuation rows: "https://e.com/" + 26 a's.
+        let expected = format!("https://e.com/{}", "a".repeat(26));
+        assert_eq!(links[0].destination.as_str(), expected);
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (3, 0, 7)
+        );
+    }
+
+    /// A program printing its URL as its own OSC8 label yields ONE link:
+    /// cells inside an OSC8 run are excluded from the bare pass.
+    #[test]
+    fn osc8_run_cells_excluded_from_bare_pass() {
+        let mut parser = vt100::Parser::new(2, 30, 0);
+        parser
+            .process(b"\x1b]8;;https://printed.example\x1b\\https://printed.example\x1b]8;;\x1b\\");
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1, "one link, not an OSC8 + bare duplicate");
+        assert_eq!(links[0].source, LinkSource::Osc8, "the explicit link wins");
+        assert_eq!(links[0].destination, url("https://printed.example"));
+    }
+
+    #[test]
+    fn screen_without_urls_yields_empty() {
+        assert!(
+            links_on(b"plain text, no links here at all", 2, 40).is_empty(),
+            "feeds 10-04's 'no links visible' state"
+        );
+    }
+}
+
+/// LINK-07 validation matrix: exhaustive acceptance/rejection table for
+/// `validate_http_url` (string-table test — regression coverage of the
+/// 10-01 implementation; failing rows become GREEN obligations).
+#[cfg(test)]
+mod validate {
+    use super::validate_http_url;
+
+    const ACCEPT: &[&str] = &[
+        "https://example.com",
+        "http://example.com:8080/a?b=c#d",
+        "https://ex.com/%E2%9C%93",
+        "http://user@host/p",
+    ];
+
+    #[test]
+    fn accepts_wellformed_http_and_https() {
+        for raw in ACCEPT {
+            assert!(
+                validate_http_url(raw).is_some(),
+                "must accept: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_normalized_form_is_returned() {
+        // The collected destination is the parsed normalized form that will
+        // be displayed and passed to argv (percent-encoded UTF-8 survives).
+        let parsed = validate_http_url("https://ex.com/%E2%9C%93")
+            .expect("percent-encoded UTF-8 accepted");
+        assert_eq!(parsed, url::Url::parse("https://ex.com/%E2%9C%93").unwrap());
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        for raw in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html;x",
+            "ftp://x",
+            "mailto:a@b",
+        ] {
+            assert!(validate_http_url(raw).is_none(), "must reject: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_raw_control_chars_and_whitespace() {
+        for raw in [
+            "https://a\x07b",
+            "https://a\x1bb",
+            "https://a b",
+            "https://a\tb",
+            "https://a\nb",
+        ] {
+            assert!(validate_http_url(raw).is_none(), "must reject: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_percent_encoded_controls_post_decode() {
+        for raw in [
+            "https://ex.com/%00",
+            "https://ex.com/%0A",
+            "https://ex.com/%1B",
+        ] {
+            assert!(validate_http_url(raw).is_none(), "must reject: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_malformed() {
+        for raw in ["", "https://", "http:/one-slash", "not-a-url"] {
+            assert!(validate_http_url(raw).is_none(), "must reject: {raw:?}");
+        }
+    }
+
+    /// Property: every accepted input yields a URL whose serialized form
+    /// contains no control chars and whose scheme is exactly http or https.
+    #[test]
+    fn accepted_urls_are_control_free_and_http_only() {
+        for raw in ACCEPT {
+            let parsed = validate_http_url(raw).expect("accept-list row");
+            assert!(
+                !parsed.as_str().chars().any(char::is_control),
+                "no control chars in serialized form: {raw:?}"
+            );
+            assert!(
+                matches!(parsed.scheme(), "http" | "https"),
+                "scheme allowlist holds: {raw:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{collect_links, validate_http_url};
