@@ -26,7 +26,7 @@ use baude_core::session::{Session, Status};
 use crate::hierarchy::{
     self, ActionKind, ActionView, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
 };
-use crate::keys::encode_key;
+use crate::keys::{encode_key, EncodeCtx};
 use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
 use crate::usage::{UsageCosts, UsagePoller};
@@ -3937,7 +3937,14 @@ impl App {
                     .lock()
                     .map(|p| p.screen().application_cursor())
                     .unwrap_or(false);
-                a.write_input(&encode_key(&key, app_cursor));
+                // kitty_child is fail-closed false until the child-push
+                // observation accessor lands (D-04, plan 11-04).
+                let ctx = EncodeCtx {
+                    app_cursor,
+                    kitty_child: false,
+                    to_shell,
+                };
+                a.write_input(&encode_key(&key, ctx));
                 return;
             }
         }
@@ -3955,7 +3962,14 @@ impl App {
             .lock()
             .map(|p| p.screen().application_cursor())
             .unwrap_or(false);
-        let bytes = encode_key(&key, app_cursor);
+        // kitty_child is fail-closed false until the child-push observation
+        // accessor lands (D-04, plan 11-04).
+        let ctx = EncodeCtx {
+            app_cursor,
+            kitty_child: false,
+            to_shell,
+        };
+        let bytes = encode_key(&key, ctx);
         pty.write_input(&bytes);
         if !to_shell && s.unarchive_on_input() {
             self.save();

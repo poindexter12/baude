@@ -1,9 +1,26 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Per-keystroke encode context: the child's input mode plus the destination
+/// pane. Generalizes the former `app_cursor: bool` parameter so call sites
+/// thread one named struct instead of sibling positional bools.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodeCtx {
+    /// DECCKM state of the child: selects SS3 (`ESC O`) vs CSI (`ESC [`)
+    /// encoding for cursor keys.
+    pub app_cursor: bool,
+    /// True only when the child itself pushed kitty keyboard-enhancement
+    /// flags on its PTY (observed push — fail-closed false until verified).
+    pub kitty_child: bool,
+    /// True when the destination pane is the shell pane rather than the
+    /// Claude pane.
+    pub to_shell: bool,
+}
+
 /// Encode a crossterm key event into the byte sequence a terminal would send.
-/// `app_cursor` selects SS3 (`ESC O`) vs CSI (`ESC [`) encoding for cursor
+/// `ctx.app_cursor` selects SS3 (`ESC O`) vs CSI (`ESC [`) encoding for cursor
 /// keys, matching DECCKM as set by the inner application.
-pub fn encode_key(key: &KeyEvent, app_cursor: bool) -> Vec<u8> {
+pub fn encode_key(key: &KeyEvent, ctx: EncodeCtx) -> Vec<u8> {
+    let app_cursor = ctx.app_cursor;
     let mods = key.modifiers;
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
@@ -124,5 +141,56 @@ fn tilde_key(out: &mut Vec<u8>, num: u8, mods: KeyModifiers) {
         out.extend_from_slice(format!("\x1b[{num};{m}~").as_bytes());
     } else {
         out.extend_from_slice(format!("\x1b[{num}~").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::negotiate_keyboard;
+
+    fn shift_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    fn ctx(kitty_child: bool, to_shell: bool) -> EncodeCtx {
+        EncodeCtx {
+            app_cursor: false,
+            kitty_child,
+            to_shell,
+        }
+    }
+
+    #[test]
+    fn shift_enter_legacy_child_claude_pane_inserts_esc_cr() {
+        // TKEY-01 fallback insert (D-09): the child never negotiated kitty
+        // mode, so the Claude pane gets the documented ESC CR insert.
+        assert_eq!(encode_key(&shift_enter(), ctx(false, false)), b"\x1b\r");
+    }
+
+    #[test]
+    fn shift_enter_legacy_child_shell_pane_degrades_to_plain_cr() {
+        // ESC CR is meta-CR to readline and must not reach bash: Shift
+        // degrades to plain Enter on the shell pane.
+        assert_eq!(encode_key(&shift_enter(), ctx(false, true)), b"\r");
+    }
+
+    #[test]
+    fn shift_enter_kitty_child_gets_csi_u_passthrough() {
+        // The child enabled the kitty protocol itself — pass the enhanced
+        // sequence through (frozen row; D-09).
+        assert_eq!(encode_key(&shift_enter(), ctx(true, false)), b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn negotiate_keyboard_gates_on_probe_result() {
+        // D-01/D-02: only an affirmative probe enables enhanced mode;
+        // Ok(false) and Err (timeout, no tty, Windows) both mean legacy.
+        assert!(negotiate_keyboard(|| Ok(true)));
+        assert!(!negotiate_keyboard(|| Ok(false)));
+        assert!(!negotiate_keyboard(|| Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timed out"
+        ))));
     }
 }

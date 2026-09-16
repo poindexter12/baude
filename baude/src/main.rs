@@ -95,6 +95,13 @@ use ratatui::crossterm::terminal::{
 
 use app::App;
 
+/// RED stub — the real probe seam lands with the GREEN commit. Always legacy
+/// until negotiation is implemented.
+fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
+    let _ = probe;
+    false
+}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
