@@ -87,23 +87,40 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
 }
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use app::App;
 
-/// RED stub — the real probe seam lands with the GREEN commit. Always legacy
-/// until negotiation is implemented.
+/// True iff keyboard-enhancement flags were successfully pushed onto the outer
+/// terminal and must be popped on restore. A module-level static (not App
+/// state) because the panic hook is a `'static` closure that cannot see App.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+/// Bounded outer-terminal kitty-keyboard negotiation (D-01, D-02): only an
+/// affirmative probe enables enhanced mode. `Err` — crossterm's internal 2 s
+/// deadline elapsing, no tty, Windows — means unsupported means legacy; probe
+/// failures never kill a session (TKEY-05).
 fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
-    let _ = probe;
-    false
+    matches!(probe(), Ok(true))
 }
 
 fn restore_terminal() {
+    // Swap so a double restore (panic during the exit path) pops exactly once.
+    let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
     let _ = disable_raw_mode();
+    if popped {
+        // Pop BEFORE LeaveAlternateScreen: kitty keyboard stacks are
+        // per-screen, so the pop must hit the same (alternate) screen the
+        // push landed on.
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         stdout(),
         DisableMouseCapture,
@@ -403,6 +420,21 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Single-shot keyboard negotiation (TKEY-05): runs exactly once, in this
+    // single-threaded pre-loop window where the probe owns the event source,
+    // bounded by crossterm's internal 2 s deadline. Pushed AFTER
+    // EnterAlternateScreen so push and pop hit the same per-screen kitty
+    // stack. DISAMBIGUATE only — the REPORT_* flags change other keys' wire
+    // forms and would break the TKEY-02 byte freeze.
+    if negotiate_keyboard(supports_keyboard_enhancement) {
+        let pushed = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        if pushed.is_ok() {
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        }
+    }
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(launch_dir);

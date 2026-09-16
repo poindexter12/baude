@@ -59,7 +59,19 @@ pub fn encode_key(key: &KeyEvent, ctx: EncodeCtx) -> Vec<u8> {
         }
         KeyCode::Enter => {
             if shift && !alt && !ctrl {
-                out.extend_from_slice(b"\x1b[13;2u");
+                if ctx.kitty_child {
+                    // The child itself enabled the kitty protocol on its PTY:
+                    // pass the enhanced sequence through (D-09).
+                    out.extend_from_slice(b"\x1b[13;2u");
+                } else if !ctx.to_shell {
+                    // Claude pane, legacy child: documented fallback newline
+                    // insert (D-09, RESEARCH Q3).
+                    out.extend_from_slice(b"\x1b\r");
+                } else {
+                    // Shell pane: ESC CR is meta-CR to readline and must not
+                    // reach bash — Shift degrades to plain Enter.
+                    out.push(b'\r');
+                }
             } else {
                 if alt {
                     out.push(0x1b);
