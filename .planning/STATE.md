@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 12
-current_phase_name: Validation and v2.2.0 Release
-status: executing
-stopped_at: Completed 12-02-PLAN.md
-last_updated: "2026-09-16T17:59:24.959Z"
+current_phase: 09
+current_phase_name: Hook Seeding Safety
+status: planning
+stopped_at: Phase 8 complete, ready to plan Phase 09
+last_updated: "2026-09-16T18:47:53.517Z"
 last_activity: 2026-09-16
-last_activity_desc: Phase 12 execution started
-state_head: 456904adcda6fda640e213f8bb2d865105ba2aa8
+last_activity_desc: Phase 8 complete, transitioned to Phase 09
+state_head: 8ca3d42f3ef2dffc2a7717bc7f7e579c8098887b
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 25
   completed_plans: 22
-  percent: 60
+  percent: 80
 ---
 
 # Project State
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 12 (Validation and v2.2.0 Release) — EXECUTING
-Plan: 3 of 5
-Status: Ready to execute
-Last activity: 2026-09-16 — Phase 12 execution started
+Phase: 09 — Hook Seeding Safety
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-09-16 — Phase 8 complete, transitioned to Phase 09
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -53,6 +53,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | 9 | 4 | - | - |
 | 10 | 4 | - | - |
 | 11 | 4 | - | - |
+| 8 | 8 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -248,7 +249,7 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 ## Session Continuity
 
 Last session: 2026-09-16T17:59:24.577Z
-Stopped at: Completed 12-02-PLAN.md
+Stopped at: Phase 8 complete, ready to plan Phase 09
 Resume file: None
 
 ## Deferred Items

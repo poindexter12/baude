@@ -1,6 +1,6 @@
 ---
 phase: 08-test-isolation-and-fixture-ownership
-verified: 2026-09-15T20:11:43Z
+verified: 2026-09-16T18:42:00Z
 status: passed
 score: 4/4 must-haves verified
 covered_files:
@@ -44,7 +44,7 @@ covered_files:
   - "bauded/src/manager.rs"
   - "bauded/src/push.rs"
   - "scripts/assert-real-roots-untouched.sh"
-covered_digest: "v1:sha256:b4d04dcd1541abd269796a81eb247bf56b6835476a2d8ab264fce0cd667190c7"
+covered_digest: "v1:sha256:ba10cb18c916da2d5e656004fa6ecae00bc8d84e8f924fbba8bb9f7116974a02"
 behavior_unverified: 0
 overrides_applied: 0
 human_verification:
@@ -65,7 +65,7 @@ deferred:
 **Phase Goal:** Running the suite cannot read or write the developer's real config, state, or `~/.claude`, and suspected historical leaks can be inspected before anyone deletes anything.
 
 **Verified:** 2026-09-15T20:11:43Z
-**Status:** human_needed
+**Status:** passed (human verification completed 2026-09-16 — see 08-UAT.md)
 **Re-verification:** No — initial verification
 
 ## Evidence Basis
