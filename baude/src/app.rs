@@ -3964,6 +3964,15 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) {
+        // LINK-04 at byte granularity: while any non-input modal (the link-
+        // hint overlay, help, confirms, …) is open, input to the child is
+        // suspended — a paste must not slip behind the overlay into the
+        // child. Mirrors the modal-first routing in handle_key (the
+        // handle_modal_key branch above); Modal::Input keeps its dedicated
+        // paste path below.
+        if !matches!(self.modal, Modal::None | Modal::Input { .. }) {
+            return;
+        }
         let to_shell = match self.focus {
             Focus::Shell => true,
             Focus::Claude => false,
@@ -6161,6 +6170,13 @@ mod link_hints {
                 "modal survives swallowed key {key:?}"
             );
         }
+        // WR-01 regression: LINK-04 is byte-level, not key-level — a paste
+        // while the overlay is open is swallowed too.
+        app.handle_paste("pasted-behind-overlay".into());
+        assert!(
+            matches!(app.modal, Modal::LinkHints { .. }),
+            "modal survives a swallowed paste"
+        );
         // Enter is consumed by the modal too (empty list: nothing to open,
         // nothing spawned — the overlay simply closes).
         app.modal = Modal::LinkHints { links: vec![], selected: 0 };
@@ -6176,6 +6192,13 @@ mod link_hints {
         assert!(
             matches!(rx.try_recv(), Ok(AttachInput::Bytes(b)) if b == b"x"),
             "modal closed: keys forward to the child again"
+        );
+        // Paste control leg: the SAME paste is forwarded once the modal is
+        // closed, so the swallow assertion above is not vacuous.
+        app.handle_paste("pasted".into());
+        assert!(
+            matches!(rx.try_recv(), Ok(AttachInput::Bytes(b)) if b == b"pasted"),
+            "modal closed: paste forwards to the child again"
         );
     }
 }
