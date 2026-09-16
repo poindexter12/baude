@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 09
-current_phase_name: Hook Seeding Safety
-status: verifying
-stopped_at: Completed 09-04-PLAN.md (phase 09 complete)
-last_updated: "2026-09-16T05:20:14.545Z"
+current_phase: 8
+current_phase_name: Test Isolation and Fixture Ownership
+status: planning
+stopped_at: Phase 9 complete, ready to plan Phase 8
+last_updated: "2026-09-16T05:49:06.645Z"
 last_activity: 2026-09-15
-last_activity_desc: Phase 09 execution started
-state_head: 218cf345f084e9e265f4fc31d7598014c9fc308b
+last_activity_desc: Phase 9 complete, transitioned to Phase 8
+state_head: 3f3703943cca63861446fc361b0f5458fe1b85b3
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 12
   completed_plans: 12
-  percent: 0
+  percent: 20
 ---
 
 # Project State
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 09 (Hook Seeding Safety) — EXECUTING
-Plan: 4 of 4
-Status: Phase complete — ready for verification
-Last activity: 2026-09-15 — Phase 09 execution started
+Phase: 8 — Test Isolation and Fixture Ownership
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-09-15 — Phase 9 complete, transitioned to Phase 8
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -50,6 +50,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
 | 7. Local TUI Dogfood Release | 6/6 locally implemented | 118 min | 20 min |
+| 9 | 4 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -212,7 +213,7 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 ## Session Continuity
 
 Last session: 2026-09-16T05:20:14.515Z
-Stopped at: Completed 09-04-PLAN.md (phase 09 complete)
+Stopped at: Phase 9 complete, ready to plan Phase 8
 Resume file: None
 
 ## Deferred Items

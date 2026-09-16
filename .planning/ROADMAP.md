@@ -42,7 +42,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 ## v2.2 Reliability and Terminal Usability
 
 - [ ] **Phase 8: Test Isolation and Fixture Ownership** (narrowed): Close the config, workspace-identity, escape-guard and leak-preview gaps left after v2.1.4.
-- [ ] **Phase 9: Hook Seeding Safety** (narrowed): Stop silently replacing unparseable settings and seed a shell-safe executable path.
+- [x] **Phase 9: Hook Seeding Safety** (narrowed): Stop silently replacing unparseable settings and seed a shell-safe executable path. (completed 2026-09-15)
 - [ ] **Phase 10: Clickable Terminal Links**: Expose safe link activation, destination preview, and copy using authoritative screen metadata.
 - [ ] **Phase 11: Negotiated Multiline Input**: Support Shift+Enter where capability is verified, with honest fallback elsewhere.
 - [ ] **Phase 12: Validation and v2.2.0 Release**: Complete regression, CI, terminal smoke, documentation, and release validation.
@@ -175,7 +175,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
-| 9. Hook Seeding Safety (narrowed) | 4/4 | In Progress|  |
+| 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
