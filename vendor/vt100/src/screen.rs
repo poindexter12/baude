@@ -1666,9 +1666,24 @@ impl vte::Perform for Screen {
                 // 2083-byte check in `intern_link` stays as defense in depth
                 // should a rebase change vte's buffering.
                 const VTE_MAX_OSC_RAW: usize = 1024;
+                // vte has a SECOND, independent truncation vector:
+                // MAX_OSC_PARAMS (16). Once 16 params are recorded, every
+                // later `;` separator hits the `MAX_OSC_PARAMS => return`
+                // arm in Action::OscPut and the tail is silently dropped —
+                // a many-semicolon URI arrives cut at a `;` boundary while
+                // `raw_len` (summed over the DISPATCHED params only) never
+                // reaches the byte cap. A saturated param table is
+                // indistinguishable from a truncated one: fail closed, same
+                // boundary semantics as the raw-length guard. (Cost: a
+                // legitimate URI with exactly 13 semicolons is refused —
+                // the same trade already accepted at the 1024-byte cap.)
+                const VTE_MAX_OSC_PARAMS: usize = 16;
                 let raw_len: usize = params.iter().map(|p| p.len()).sum();
                 let uri: Vec<u8> = params[2..].join(&b';');
-                if uri.is_empty() || raw_len >= VTE_MAX_OSC_RAW {
+                if uri.is_empty()
+                    || raw_len >= VTE_MAX_OSC_RAW
+                    || params.len() >= VTE_MAX_OSC_PARAMS
+                {
                     // `OSC 8 ; ; ST` closes the link run; a truncated
                     // sequence degrades to "not a link".
                     self.attrs.link = None;

@@ -200,6 +200,63 @@ mod link_fidelity {
         assert_eq!(screen.link_target(9999), Some("https://e9999.example/"));
     }
 
+    /// CR-01 — guaranteed-RED target: vte's SECOND truncation vector,
+    /// MAX_OSC_PARAMS (16). A URI with >=14 literal semicolons saturates the
+    /// param table; vte drops everything after the 16th param at a `;`
+    /// boundary, and the dispatched params sum to well under the 1024-byte
+    /// raw cap — so without a param-count guard the truncated (but
+    /// well-formed, still-openable) prefix would intern as a WRONG
+    /// destination. A saturated table must fail closed: no link id, and
+    /// parsing continues.
+    #[test]
+    fn param_saturated_uri_is_not_a_link() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        // 15 semicolons in the URI: "8" + "" + 16 URI pieces = 18 params,
+        // truncated by vte to 16 — "/TAIL" (and more) silently dropped.
+        parser.process(
+            b"\x1b]8;;https://evil.example/a;b;c;d;e;f;g;h;i;j;k;l;m;n;o;p/TAIL\x1b\\x\x1b]8;;\x1b\\",
+        );
+        let screen = parser.screen();
+        assert_eq!(
+            screen.cell(0, 0).unwrap().link_id(),
+            None,
+            "a param-saturated (possibly truncated) URI must not intern"
+        );
+        assert_eq!(
+            screen.cell(0, 0).unwrap().contents(),
+            "x",
+            "parsing continues after the refused link"
+        );
+        // A valid link afterwards still interns.
+        parser.process(b"\r\n\x1b]8;;https://ok.example/\x1b\\ok\x1b]8;;\x1b\\");
+        let screen = parser.screen();
+        let id = screen
+            .cell(1, 0)
+            .unwrap()
+            .link_id()
+            .expect("a valid link after a saturated one still interns");
+        assert_eq!(screen.link_target(id), Some("https://ok.example/"));
+    }
+
+    /// CR-01 boundary control: 12 semicolons (15 dispatched params) stay
+    /// below vte's cap and intern intact — the fail-closed guard is not
+    /// over-broad.
+    #[test]
+    fn uri_below_param_cap_still_interns_intact() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b]8;;https://ok.example/a;b;c;d;e;f;g;h;i;j;k;l\x1b\\x\x1b]8;;\x1b\\");
+        let screen = parser.screen();
+        let id = screen
+            .cell(0, 0)
+            .unwrap()
+            .link_id()
+            .expect("an in-cap multi-semicolon URI interns");
+        assert_eq!(
+            screen.link_target(id),
+            Some("https://ok.example/a;b;c;d;e;f;g;h;i;j;k;l")
+        );
+    }
+
     /// LINK-01 edge (Pitfall 2 regression): a URI with two literal
     /// semicolons is reconstructed intact from vte's split params.
     #[test]
