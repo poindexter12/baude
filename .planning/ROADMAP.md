@@ -192,13 +192,13 @@ Plans:
 3. Real macOS/Linux terminal smoke evidence covers links, selection, scrollback, mouse behavior, Shift+Enter, ordinary Enter, and restoration.
 4. v2.2.0 can be published through the existing release workflow with matching versions, release notes, and supported binary/container outputs, only after verification passes.
 
-**Plans**: 1/5 plans executed
+**Plans**: 2/5 plans executed
 
 Plans:
 **Wave 1**
 
 - [x] 12-01-PLAN.md — Clippy remediation (3 proven edits) and the full local CI-parity bracket, before any push [SHIP-01]
-- [ ] 12-02-PLAN.md — README gap-fill: link hints, mouse/selection/scrollback, tested terminals, workspace-lock recovery [SHIP-02]
+- [x] 12-02-PLAN.md — README gap-fill: link hints, mouse/selection/scrollback, tested terminals, workspace-lock recovery [SHIP-02]
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -222,7 +222,7 @@ Plans:
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
 | 10. Clickable Terminal Links | 4/4 | Complete    | 2026-09-16 |
 | 11. Negotiated Multiline Input | 4/4 | Complete    | 2026-09-16 |
-| 12. Validation and v2.2.0 Release | 1/5 | In Progress|  |
+| 12. Validation and v2.2.0 Release | 2/5 | In Progress|  |
 
 ## Planning Notes
 

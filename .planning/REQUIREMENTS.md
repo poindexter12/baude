@@ -69,7 +69,7 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 ### Verification and Release
 
 - [ ] **SHIP-01**: A maintainer can run focused regression tests plus workspace tests, fmt, clippy, and the existing supported-platform CI checks successfully after test isolation is in place.
-- [ ] **SHIP-02**: A user can find documented link activation/preview/copy gestures, tested terminal support, Shift+Enter setup or fallback, and workspace-lock recovery instructions.
+- [x] **SHIP-02**: A user can find documented link activation/preview/copy gestures, tested terminal support, Shift+Enter setup or fallback, and workspace-lock recovery instructions.
 - [ ] **SHIP-03**: A maintainer has recorded real macOS/Linux terminal smoke evidence covering links, selection/scrollback, mouse interaction, Shift+Enter, ordinary Enter, and terminal restoration before release approval.
 - [ ] **SHIP-04**: A maintainer can publish v2.2.0 through the existing release workflow after verification passes, with matching release notes/version metadata and the existing supported binary/container distribution outputs.
 
@@ -130,7 +130,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | TKEY-04 | Phase 11 | Complete |
 | TKEY-05 | Phase 11 | Complete |
 | SHIP-01 | Phase 12 | Pending |
-| SHIP-02 | Phase 12 | Pending |
+| SHIP-02 | Phase 12 | Complete |
 | SHIP-03 | Phase 12 | Pending |
 | SHIP-04 | Phase 12 | Pending |
 

@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 12
 current_phase_name: Validation and v2.2.0 Release
 status: executing
-stopped_at: Completed 12-01-PLAN.md
-last_updated: "2026-09-16T17:47:42.828Z"
+stopped_at: Completed 12-02-PLAN.md
+last_updated: "2026-09-16T17:59:24.959Z"
 last_activity: 2026-09-16
 last_activity_desc: Phase 12 execution started
-state_head: 8ce0e2610fc8afb38d289742cd42e06b4d209ca9
+state_head: 456904adcda6fda640e213f8bb2d865105ba2aa8
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 25
-  completed_plans: 21
+  completed_plans: 22
   percent: 60
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 12 (Validation and v2.2.0 Release) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-09-16 — Phase 12 execution started
 
@@ -94,6 +94,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 11 P03 | 9 min | 2 tasks | 2 files |
 | Phase 11 P04 | 9 min | 2 tasks | 2 files |
 | Phase 12 P01 | 21 min | 3 tasks | 4 files |
+| Phase 12 P02 | 7 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -209,6 +210,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 12]: Relaxed the vendored vt100 fork clippy group opt-ins inside one commented FORK (baude) block rather than rewriting 30 upstream sites or adding publishing metadata to three never-published manifests — D-04/D-14; the fork compile failure was masking two real baude lints, and the narrow fix keeps the diff-vs-upstream surface auditable
 - [Phase 12]: Used clippy group allows in the fork instead of the ten named lints — A named list drifts each time the runner clippy advances, and this fork is frozen against upstream
 - [Phase 12]: The locked release build is the packaging verification, in place of any packaging rework — D-10; proves the vendored path dependency survives cargo build --workspace --release --locked
+- [Phase 12]: Relocated the tested-terminal list into its own README subsection so one statement covers links, mouse, and Shift+Enter — Restating it in place would have left the list inside the kitty-keyboard-protocol paragraph, which is the Shift+Enter-only scoping SHIP-02 flagged
+- [Phase 12]: README documents baude's own pane selection (click-drag copies on release) alongside the suppression of native drag-select — Documenting only the suppression would report a lost capability that was in fact replaced (app.rs:5446-5519)
+- [Phase 12]: The native-selection workaround is phrased as the terminal's override modifier, with Shift and Option as examples only — The binding belongs to the terminal, not to baude; naming a specific key would be a promise baude cannot keep
+- [Phase 12]: README never advises deleting the workspace lock file; recovery is quit the holder, signal it, or switch workspace — It is an OS advisory lock on an open fd released by the kernel on exit; deleting it while a holder lives yields two writers on one state file (T-12-04)
 
 ### Pending Todos
 
@@ -242,8 +247,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T17:46:59.726Z
-Stopped at: Completed 12-01-PLAN.md
+Last session: 2026-09-16T17:59:24.577Z
+Stopped at: Completed 12-02-PLAN.md
 Resume file: None
 
 ## Deferred Items
