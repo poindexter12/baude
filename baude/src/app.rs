@@ -5996,6 +5996,178 @@ mod link_hints {
         assert_eq!(out, "https://example.com/ok");
         assert!(!out.contains('…'));
     }
+
+    // ------- gesture integration (Task 2): the chord call site over a real
+    // parser, via the remote-attach stub — the same parser the render path
+    // draws (ui.rs draw_remote_content), with the test holding the input
+    // channel so "no byte reached the child" is a deterministic assertion.
+
+    use crate::remote::{AttachInput, RemoteAttach};
+    use baude_core::vt100;
+    use std::sync::{Arc, Mutex};
+
+    /// App wired to a stub remote attach whose parser processed `feed`.
+    /// Returns the redirect first so it outlives the App.
+    fn attached_app(
+        feed: &[u8],
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+    ) -> (
+        baude_core::testing::TestRedirect,
+        App,
+        Arc<Mutex<vt100::Parser>>,
+        std::sync::mpsc::Receiver<AttachInput>,
+    ) {
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
+        parser.lock().unwrap().process(feed);
+        let (attach, rx) = RemoteAttach::test_stub(7, Arc::clone(&parser));
+        app.attach = Some(attach);
+        app.selected_id = Some(super::SelId::Remote(7));
+        app.focus = Focus::Claude;
+        (redirect, app, parser, rx)
+    }
+
+    fn chord() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
+    }
+
+    /// The chord at a scrolled-back offset collects links from the VIEWED
+    /// rows (set_scrollback bracket) and restores the offset to 0 — with the
+    /// modal set only after the lock is dropped (LINK-04 remote leg: the
+    /// chord resolves the remote-attach parser, same as the render path).
+    #[test]
+    fn chord_at_scrolled_offset_collects_viewed_rows_and_restores_bracket() {
+        // 13 content lines: the URL line scrolls 9 rows back of a 5-row view.
+        let mut feed = b"https://scrolled.example.com/x\r\n".to_vec();
+        for i in 1..=12 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (_rd, mut app, parser, _rx) = attached_app(&feed, 5, 80, 100);
+        app.claude_scroll = 9;
+        app.handle_key(chord());
+        match &app.modal {
+            Modal::LinkHints { links, selected } => {
+                assert_eq!(*selected, 0);
+                assert_eq!(links.len(), 1, "the viewed rows hold exactly one link");
+                assert_eq!(links[0].destination.as_str(), "https://scrolled.example.com/x");
+            }
+            _ => panic!("chord over a scrolled-back link must open the modal"),
+        }
+        assert_eq!(
+            parser.lock().unwrap().screen().scrollback(),
+            0,
+            "scrollback offset restored to 0 after collection"
+        );
+    }
+
+    /// Both detection passes feed the modal — one OSC8 link and one bare URL
+    /// yield two entries — ordered top-to-bottom by screen position so hint
+    /// letters read in visual order.
+    #[test]
+    fn chord_collects_both_passes_ordered_top_to_bottom() {
+        let feed =
+            b"see https://bare.example.org/x\r\n\r\n\x1b]8;;https://osc.example.com/\x1b\\click\x1b]8;;\x1b\\";
+        let (_rd, mut app, _parser, _rx) = attached_app(feed, 5, 80, 0);
+        app.handle_key(chord());
+        match &app.modal {
+            Modal::LinkHints { links, .. } => {
+                assert_eq!(links.len(), 2, "OSC8 pass + bare pass both collect");
+                assert_eq!(
+                    links[0].destination.as_str(),
+                    "https://bare.example.org/x",
+                    "row-0 bare link is labeled first (top-to-bottom order)"
+                );
+                assert_eq!(links[1].destination.as_str(), "https://osc.example.com/");
+            }
+            _ => panic!("chord over a linked screen must open the modal"),
+        }
+    }
+
+    /// A parser whose screen has zero links: message set, modal stays None,
+    /// and the scrollback bracket is restored even on the empty path.
+    #[test]
+    fn chord_with_zero_links_sets_message_and_restores_bracket() {
+        let mut feed = Vec::new();
+        for i in 1..=12 {
+            feed.extend_from_slice(format!("plain text {i}\r\n").as_bytes());
+        }
+        let (_rd, mut app, parser, _rx) = attached_app(&feed, 5, 80, 100);
+        app.claude_scroll = 3;
+        app.handle_key(chord());
+        assert!(matches!(app.modal, Modal::None), "no modal without links");
+        let (msg, _) = app.message.as_ref().expect("zero links surfaces a message");
+        assert!(msg.contains("no links"), "message names the outcome: {msg}");
+        assert_eq!(
+            parser.lock().unwrap().screen().scrollback(),
+            0,
+            "bracket restored on the empty-result path too"
+        );
+    }
+
+    /// Render parity (LINK-04 remote leg): the chord resolves the attach
+    /// parser only when it is the one the render path would draw — an attach
+    /// for a DIFFERENT remote id must not serve links for this pane.
+    #[test]
+    fn chord_ignores_attach_for_a_different_remote() {
+        let feed = b"see https://bare.example.org/x\r\n";
+        let (_rd, mut app, _parser, _rx) = attached_app(feed, 5, 80, 0);
+        app.selected_id = Some(super::SelId::Remote(9)); // attach is remote 7
+        app.handle_key(chord());
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a mismatched attach must not open the modal"
+        );
+        assert!(app.message.is_some(), "falls back to the no-links message");
+    }
+
+    /// LINK-04 structural guarantee at handle_key granularity: while the
+    /// hints overlay is open, EVERY key — printable, ctrl chords, Enter — is
+    /// handled or swallowed by the modal path; no byte reaches the child.
+    /// The stub's channel makes the proof deterministic (no IO thread), and
+    /// a control leg proves the same key IS forwarded once the modal closes.
+    #[test]
+    fn modal_open_swallows_every_key_from_the_child() {
+        let feed = b"see https://bare.example.org/x\r\n";
+        let (_rd, mut app, _parser, rx) = attached_app(feed, 5, 80, 0);
+        app.modal = Modal::LinkHints {
+            links: vec![test_link("https://a.example.com/")],
+            selected: 0,
+        };
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            app.handle_key(key);
+            assert!(
+                matches!(app.modal, Modal::LinkHints { .. }),
+                "modal survives swallowed key {key:?}"
+            );
+        }
+        // Enter is consumed by the modal too (empty list: nothing to open,
+        // nothing spawned — the overlay simply closes).
+        app.modal = Modal::LinkHints { links: vec![], selected: 0 };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None), "Enter consumed by modal");
+        assert!(
+            rx.try_recv().is_err(),
+            "no byte reached the child while the overlay was open"
+        );
+        // Control: with the modal closed the SAME key is forwarded — the
+        // spy channel is live, so the assertions above are not vacuous.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            matches!(rx.try_recv(), Ok(AttachInput::Bytes(b)) if b == b"x"),
+            "modal closed: keys forward to the child again"
+        );
+    }
 }
 
 #[cfg(test)]
