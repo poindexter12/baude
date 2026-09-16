@@ -60,6 +60,11 @@ impl Cell {
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
         self.len = 0;
         self.attrs = attrs;
+        // BAUDE FORK (OSC 8): a cleared cell must never inherit the current
+        // drawing link — erase fills carry bgcolor semantics only, and a
+        // phantom link on a blank cell would surface in hint mode
+        // (Pitfall 4). Stripping here covers every clear/fill call site.
+        self.attrs.link = None;
     }
 
     /// Returns the text contents of the cell.

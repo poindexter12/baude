@@ -34,11 +34,13 @@ import remain unchanged.
 
 | File | Change |
 |------|--------|
-| `src/attrs.rs` | `Attrs.link: Option<u16>` — per-cell interned link id (rides on `Attrs`, so grid behaviors inherit correctness) |
-| `src/screen.rs` | OSC 8 arm in `osc_dispatch` (`params[2..]` rejoined with `;`); per-`Screen` `(id, uri)` intern table (`intern_link`, `parse_id_param`); `Screen::link_target(id)`; SGR reset preserves the open link (link runs end only via an empty-URI OSC 8) |
-| `src/cell.rs` | `Cell::link_id()` accessor |
-| `src/grid.rs` | OSC 8 re-emission in formatted output — lands in plan 10-02 (remote-attach snapshot fidelity) |
+| `src/attrs.rs` | `Attrs.link: Option<u16>` — per-cell interned link id (rides on `Attrs`, so grid behaviors inherit correctness); OSC 8 open/close re-emission in `write_escape_code_diff` (the single hyperlink-transition point for all formatted/diff output, preserving the `id=` param) |
+| `src/screen.rs` | OSC 8 arm in `osc_dispatch` (`params[2..]` rejoined with `;`; truncation guard — vte's default `no_std` feature caps the OSC buffer at 1024 bytes, so a sequence that filled it degrades to "not a link" instead of interning a truncated URI); per-`Screen` `(id, uri)` intern table (`intern_link`, `parse_id_param`) capped at 2083-byte URIs / 10 000 entries; `Screen::link_target(id)`; SGR reset preserves the open link (link runs end only via an empty-URI OSC 8); intern table threaded into all formatted writers |
+| `src/cell.rs` | `Cell::link_id()` accessor; `Cell::clear` strips the link from fill attrs (a cleared cell never inherits the current drawing link) |
+| `src/grid.rs` | Intern table threaded through `write_contents_formatted` / `write_contents_diff` / `write_cursor_position_formatted` for OSC 8 re-emission (remote-attach snapshot fidelity) |
+| `src/row.rs` | Intern table threaded through `write_contents_formatted` / `write_contents_diff` (same re-emission path) |
 | `tests/hyperlink.rs` | New hyperlink behavior tests (target-vs-label, wrap survival, empty-URI close, `;`-in-URI rejoin) |
+| `tests/link_fidelity.rs` | Grid-fidelity suite (scrollback/wrap/resize/overwrite/erase), intern caps, formatted-output round-trips (targets, `id=` grouping, open-run continuation) |
 | `Cargo.toml` | Upstream `[dev-dependencies]` stripped — see note below |
 
 All fork edits are marked with `BAUDE FORK (OSC 8)` comments in the source.

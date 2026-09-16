@@ -128,6 +128,8 @@ impl Row {
         }
     }
 
+    // BAUDE FORK (OSC 8): `links` is the Screen's interned link table,
+    // threaded through to the attrs writers for hyperlink re-emission.
     pub fn write_contents_formatted(
         &self,
         contents: &mut Vec<u8>,
@@ -137,6 +139,7 @@ impl Row {
         wrapping: bool,
         prev_pos: Option<crate::grid::Pos>,
         prev_attrs: Option<crate::attrs::Attrs>,
+        links: &[(String, String)],
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
         let mut prev_was_wide = false;
         let default_cell = crate::cell::Cell::default();
@@ -157,7 +160,7 @@ impl Row {
         if wrapping && first_cell == &default_cell {
             let default_attrs = default_cell.attrs();
             if &prev_attrs != default_attrs {
-                default_attrs.write_escape_code_diff(contents, &prev_attrs);
+                default_attrs.write_escape_code_diff(contents, &prev_attrs, links);
                 prev_attrs = *default_attrs;
             }
             contents.push(b' ');
@@ -198,7 +201,7 @@ impl Row {
                     }
                     prev_pos = new_pos;
                     if &prev_attrs != attrs {
-                        attrs.write_escape_code_diff(contents, &prev_attrs);
+                        attrs.write_escape_code_diff(contents, &prev_attrs, links);
                         prev_attrs = *attrs;
                     }
                     crate::term::EraseChar::new(pos.col - prev_col).write_buf(contents);
@@ -221,7 +224,7 @@ impl Row {
                     }
 
                     if &prev_attrs != attrs {
-                        attrs.write_escape_code_diff(contents, &prev_attrs);
+                        attrs.write_escape_code_diff(contents, &prev_attrs, links);
                         prev_attrs = *attrs;
                     }
 
@@ -247,7 +250,7 @@ impl Row {
             }
             prev_pos = new_pos;
             if &prev_attrs != attrs {
-                attrs.write_escape_code_diff(contents, &prev_attrs);
+                attrs.write_escape_code_diff(contents, &prev_attrs, links);
                 prev_attrs = *attrs;
             }
             crate::term::ClearRowForward::default().write_buf(contents);
@@ -259,6 +262,8 @@ impl Row {
     // while it's true that most of the logic in this is identical to
     // write_contents_formatted, i can't figure out how to break out the
     // common parts without making things noticeably slower.
+    // BAUDE FORK (OSC 8): `links` threaded through (see
+    // write_contents_formatted).
     pub fn write_contents_diff(
         &self,
         contents: &mut Vec<u8>,
@@ -270,6 +275,7 @@ impl Row {
         prev_wrapping: bool,
         mut prev_pos: crate::grid::Pos,
         mut prev_attrs: crate::attrs::Attrs,
+        links: &[(String, String)],
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
         let mut prev_was_wide = false;
 
@@ -283,7 +289,7 @@ impl Row {
         {
             let first_cell_attrs = first_cell.attrs();
             if &prev_attrs != first_cell_attrs {
-                first_cell_attrs.write_escape_code_diff(contents, &prev_attrs);
+                first_cell_attrs.write_escape_code_diff(contents, &prev_attrs, links);
                 prev_attrs = *first_cell_attrs;
             }
             let mut cell_contents = prev_first_cell.contents();
@@ -337,7 +343,7 @@ impl Row {
                     }
                     prev_pos = new_pos;
                     if &prev_attrs != attrs {
-                        attrs.write_escape_code_diff(contents, &prev_attrs);
+                        attrs.write_escape_code_diff(contents, &prev_attrs, links);
                         prev_attrs = *attrs;
                     }
                     crate::term::EraseChar::new(pos.col - prev_col).write_buf(contents);
@@ -360,7 +366,7 @@ impl Row {
                     }
 
                     if &prev_attrs != attrs {
-                        attrs.write_escape_code_diff(contents, &prev_attrs);
+                        attrs.write_escape_code_diff(contents, &prev_attrs, links);
                         prev_attrs = *attrs;
                     }
 
@@ -385,7 +391,7 @@ impl Row {
             }
             prev_pos = new_pos;
             if &prev_attrs != attrs {
-                attrs.write_escape_code_diff(contents, &prev_attrs);
+                attrs.write_escape_code_diff(contents, &prev_attrs, links);
                 prev_attrs = *attrs;
             }
             crate::term::ClearRowForward::default().write_buf(contents);
@@ -417,7 +423,7 @@ impl Row {
             if end_cell.has_contents() {
                 let attrs = end_cell.attrs();
                 if &prev_attrs != attrs {
-                    attrs.write_escape_code_diff(contents, &prev_attrs);
+                    attrs.write_escape_code_diff(contents, &prev_attrs, links);
                     prev_attrs = *attrs;
                 }
                 contents.extend(end_cell.contents().as_bytes());

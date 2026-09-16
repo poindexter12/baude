@@ -7,6 +7,15 @@ const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
 
+/// BAUDE FORK (OSC 8): maximum accepted URI length in bytes, matching the
+/// VTE/iTerm2 precedent. Longer URIs degrade to plain text (Pitfall 6).
+const MAX_LINK_URI_LEN: usize = 2083;
+
+/// BAUDE FORK (OSC 8): maximum interned `(id, uri)` entries per screen.
+/// Well inside the `u16` index space; once full, new pairs degrade to
+/// plain text while existing ids keep resolving (Pitfall 6).
+const MAX_LINKS: usize = 10_000;
+
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MouseProtocolMode {
@@ -266,8 +275,8 @@ impl Screen {
 
     fn write_contents_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
-        let prev_attrs = self.grid().write_contents_formatted(contents);
-        self.attrs.write_escape_code_diff(contents, &prev_attrs);
+        let prev_attrs = self.grid().write_contents_formatted(contents, &self.links);
+        self.attrs.write_escape_code_diff(contents, &prev_attrs, &self.links);
     }
 
     /// Returns the formatted visible contents of the terminal by row,
@@ -289,7 +298,16 @@ impl Screen {
             // visible_rows can never return enough rows to overflow here
             let i = i.try_into().unwrap();
             let mut contents = vec![];
-            row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
+            row.write_contents_formatted(
+                &mut contents,
+                start,
+                width,
+                i,
+                wrapping,
+                None,
+                None,
+                &self.links,
+            );
             if start == 0 && width == self.grid.size().cols {
                 wrapping = row.wrapped();
             }
@@ -320,8 +338,8 @@ impl Screen {
         }
         let prev_attrs = self
             .grid()
-            .write_contents_diff(contents, prev.grid(), prev.attrs);
-        self.attrs.write_escape_code_diff(contents, &prev_attrs);
+            .write_contents_diff(contents, prev.grid(), prev.attrs, &self.links);
+        self.attrs.write_escape_code_diff(contents, &prev_attrs, &self.links);
     }
 
     /// Returns a sequence of terminal byte streams sufficient to turn the
@@ -359,6 +377,7 @@ impl Screen {
                     false,
                     crate::grid::Pos { row: i, col: start },
                     crate::attrs::Attrs::default(),
+                    &self.links,
                 );
                 contents
             })
@@ -496,7 +515,7 @@ impl Screen {
     fn write_attributes_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::ClearAttrs::default().write_buf(contents);
         self.attrs
-            .write_escape_code_diff(contents, &crate::attrs::Attrs::default());
+            .write_escape_code_diff(contents, &crate::attrs::Attrs::default(), &self.links);
     }
 
     /// Returns the current cursor position of the terminal.
@@ -533,7 +552,7 @@ impl Screen {
     fn write_cursor_state_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         self.grid()
-            .write_cursor_position_formatted(contents, None, None);
+            .write_cursor_position_formatted(contents, None, None, &self.links);
 
         // we don't just call write_attributes_formatted here, because that
         // would still be confusing - consider the case where the user sets
@@ -559,11 +578,20 @@ impl Screen {
 
     /// BAUDE FORK (OSC 8): intern a link, deduplicated by `(id, uri)` (the
     /// spec's grouping rule — this is also how soft-wrapped OSC 8 fragments
-    /// unify). Returns `None` once the `u16` index space is exhausted, so
-    /// overflow degrades to "not a link" rather than corrupting ids.
+    /// unify). Returns `None` — degrading to "not a link" rather than
+    /// corrupting ids or growing without bound — when the URI exceeds
+    /// [`MAX_LINK_URI_LEN`] or the table already holds [`MAX_LINKS`] entries
+    /// (Pitfall 6: untrusted output must not grow memory proportionally to
+    /// unique URLs printed).
     fn intern_link(&mut self, id: String, uri: String) -> Option<u16> {
+        if uri.len() > MAX_LINK_URI_LEN {
+            return None;
+        }
         if let Some(pos) = self.links.iter().position(|(i, u)| *i == id && *u == uri) {
             return u16::try_from(pos).ok();
+        }
+        if self.links.len() >= MAX_LINKS {
+            return None;
         }
         let idx = u16::try_from(self.links.len()).ok()?;
         self.links.push((id, uri));
@@ -1623,9 +1651,20 @@ impl vte::Perform for Screen {
             // (LINK-01). vte split the OSC string on `;`, so everything from
             // index 2 on is the URI and must be rejoined.
             (Some(&b"8"), Some(link_params)) => {
+                // vte's default `no_std` feature stores the whole OSC string
+                // in an ArrayVec capped at 1024 bytes (MAX_OSC_RAW) and
+                // silently drops the rest — a longer URI arrives TRUNCATED,
+                // and interning it would produce a wrong (but well-formed,
+                // still-openable) destination. When the accumulation buffer
+                // hit its cap, refuse the link instead (fail closed); the
+                // 2083-byte check in `intern_link` stays as defense in depth
+                // should a rebase change vte's buffering.
+                const VTE_MAX_OSC_RAW: usize = 1024;
+                let raw_len: usize = params.iter().map(|p| p.len()).sum();
                 let uri: Vec<u8> = params[2..].join(&b';');
-                if uri.is_empty() {
-                    // `OSC 8 ; ; ST` closes the link run.
+                if uri.is_empty() || raw_len >= VTE_MAX_OSC_RAW {
+                    // `OSC 8 ; ; ST` closes the link run; a truncated
+                    // sequence degrades to "not a link".
                     self.attrs.link = None;
                 } else if let Ok(uri) = String::from_utf8(uri) {
                     let id = parse_id_param(link_params);

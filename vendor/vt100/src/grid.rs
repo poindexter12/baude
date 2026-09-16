@@ -189,7 +189,13 @@ impl Grid {
         }
     }
 
-    pub fn write_contents_formatted(&self, contents: &mut Vec<u8>) -> crate::attrs::Attrs {
+    // BAUDE FORK (OSC 8): `links` is the Screen's interned link table,
+    // threaded through to the attrs writers for hyperlink re-emission.
+    pub fn write_contents_formatted(
+        &self,
+        contents: &mut Vec<u8>,
+        links: &[(String, String)],
+    ) -> crate::attrs::Attrs {
         crate::term::ClearAttrs::default().write_buf(contents);
         crate::term::ClearScreen::default().write_buf(contents);
 
@@ -208,22 +214,26 @@ impl Grid {
                 wrapping,
                 Some(prev_pos),
                 Some(prev_attrs),
+                links,
             );
             prev_pos = new_pos;
             prev_attrs = new_attrs;
             wrapping = row.wrapped();
         }
 
-        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs), links);
 
         prev_attrs
     }
 
+    // BAUDE FORK (OSC 8): `links` threaded through (see
+    // write_contents_formatted).
     pub fn write_contents_diff(
         &self,
         contents: &mut Vec<u8>,
         prev: &Self,
         mut prev_attrs: crate::attrs::Attrs,
+        links: &[(String, String)],
     ) -> crate::attrs::Attrs {
         let mut prev_pos = prev.pos;
         let mut wrapping = false;
@@ -242,6 +252,7 @@ impl Grid {
                 prev_wrapping,
                 prev_pos,
                 prev_attrs,
+                links,
             );
             prev_pos = new_pos;
             prev_attrs = new_attrs;
@@ -249,16 +260,19 @@ impl Grid {
             prev_wrapping = prev_row.wrapped();
         }
 
-        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs));
+        self.write_cursor_position_formatted(contents, Some(prev_pos), Some(prev_attrs), links);
 
         prev_attrs
     }
 
+    // BAUDE FORK (OSC 8): `links` threaded through (see
+    // write_contents_formatted).
     pub fn write_cursor_position_formatted(
         &self,
         contents: &mut Vec<u8>,
         prev_pos: Option<Pos>,
         prev_attrs: Option<crate::attrs::Attrs>,
+        links: &[(String, String)],
     ) {
         let prev_attrs = prev_attrs.unwrap_or_default();
         // writing a character to the last column of a row doesn't wrap the
@@ -294,9 +308,9 @@ impl Grid {
                 } else {
                     crate::term::MoveTo::new(pos).write_buf(contents);
                 }
-                cell.attrs().write_escape_code_diff(contents, &prev_attrs);
+                cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
                 contents.extend(cell.contents().as_bytes());
-                prev_attrs.write_escape_code_diff(contents, cell.attrs());
+                prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
             } else {
                 // if the cell doesn't have contents, we can't have gotten
                 // here by drawing a character in the last column. this means
@@ -335,15 +349,15 @@ impl Grid {
                         if let Some(prev_pos) = prev_pos {
                             if prev_pos.row != i || prev_pos.col < self.size.cols {
                                 crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
-                                cell.attrs().write_escape_code_diff(contents, &prev_attrs);
+                                cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
                                 contents.extend(cell.contents().as_bytes());
-                                prev_attrs.write_escape_code_diff(contents, cell.attrs());
+                                prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
                             }
                         } else {
                             crate::term::MoveTo::new(pos).write_buf(contents);
-                            cell.attrs().write_escape_code_diff(contents, &prev_attrs);
+                            cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
                             contents.extend(cell.contents().as_bytes());
-                            prev_attrs.write_escape_code_diff(contents, cell.attrs());
+                            prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
                         }
                         contents.extend("\n".repeat(usize::from(self.pos.row - i)).as_bytes());
                         found = true;
@@ -377,12 +391,12 @@ impl Grid {
                         .unwrap();
                     end_cell
                         .attrs()
-                        .write_escape_code_diff(contents, &prev_attrs);
+                        .write_escape_code_diff(contents, &prev_attrs, links);
                     crate::term::SaveCursor::default().write_buf(contents);
                     crate::term::Backspace::default().write_buf(contents);
                     crate::term::EraseChar::new(1).write_buf(contents);
                     crate::term::RestoreCursor::default().write_buf(contents);
-                    prev_attrs.write_escape_code_diff(contents, end_cell.attrs());
+                    prev_attrs.write_escape_code_diff(contents, end_cell.attrs(), links);
                 }
             }
         } else if let Some(prev_pos) = prev_pos {

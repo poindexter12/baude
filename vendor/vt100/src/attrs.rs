@@ -85,7 +85,37 @@ impl Attrs {
         }
     }
 
-    pub fn write_escape_code_diff(&self, contents: &mut Vec<u8>, other: &Self) {
+    /// BAUDE FORK (OSC 8): `links` is the owning `Screen`'s interned
+    /// `(id, uri)` table, threaded down from every formatted/diff writer so
+    /// hyperlink transitions re-emit as real OSC 8 sequences. Without this,
+    /// `contents_formatted()` reconstructs SGR only and the remote-attach
+    /// snapshot (pty.rs subscribe) loses every pre-attach link (Pitfall 3).
+    pub fn write_escape_code_diff(
+        &self,
+        contents: &mut Vec<u8>,
+        other: &Self,
+        links: &[(String, String)],
+    ) {
+        // BAUDE FORK (OSC 8): emit the hyperlink transition first — an open
+        // sequence (preserving the id= param) when entering a link, the
+        // empty-URI close when leaving one. SGR bytes below never carry
+        // link state.
+        if self.link != other.link {
+            match self.link.and_then(|idx| links.get(usize::from(idx))) {
+                Some((id, uri)) => {
+                    contents.extend_from_slice(b"\x1b]8;");
+                    if !id.is_empty() {
+                        contents.extend_from_slice(b"id=");
+                        contents.extend_from_slice(id.as_bytes());
+                    }
+                    contents.push(b';');
+                    contents.extend_from_slice(uri.as_bytes());
+                    contents.extend_from_slice(b"\x1b\\");
+                }
+                None => contents.extend_from_slice(b"\x1b]8;;\x1b\\"),
+            }
+        }
+
         if self != other && self == &Self::default() {
             crate::term::ClearAttrs::default().write_buf(contents);
             return;
