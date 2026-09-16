@@ -106,13 +106,13 @@ Plans:
 3. The seed recognizer matches the quoted form, so quoting does not reintroduce the per-path accumulation that HREG-01 fixed.
 4. Regression tests cover a malformed settings file, a spaced install path end to end, and the two behaviors verified by inspection only in v2.1.3: reopening a workspace whose lock file remains after the OS lock released, and `bauded` encountering a held lock.
 
-**Plans**: 4 plans
+**Plans**: 1/4 plans executed
 
 Plans:
 
 **Wave 1**
 
-- [ ] 09-01-PLAN.md — Tracer: guarded `seed_settings` + `SeedWarning` seam end to end (trait ripple, TUI add-session surface)
+- [x] 09-01-PLAN.md — Tracer: guarded `seed_settings` + `SeedWarning` seam end to end (trait ripple, TUI add-session surface)
 - [ ] 09-02-PLAN.md — Lock regression tests: leftover-lock-file reopen (persist) + bauded held-lock pid diagnostic
 
 **Wave 2**
@@ -175,7 +175,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
-| 9. Hook Seeding Safety (narrowed) | 0/4 | Planned | - |
+| 9. Hook Seeding Safety (narrowed) | 1/4 | In Progress|  |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |

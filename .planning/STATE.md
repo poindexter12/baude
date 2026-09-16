@@ -2,19 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 9
+current_phase: 09
 current_phase_name: Hook Seeding Safety
 status: executing
-stopped_at: context exhaustion at 90% (2026-09-16)
-last_updated: "2026-09-16T04:20:05.240Z"
+stopped_at: Completed 09-01-PLAN.md
+last_updated: "2026-09-16T04:37:12.545Z"
 last_activity: 2026-09-15
-last_activity_desc: Phase 08 execution started
-state_head: f123e8213b9aa5079ef446d430c383fc757e93eb
+last_activity_desc: Phase 09 execution started
+state_head: 2dd0c867d3bdf438ea369b4e2f55a01d002778d9
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 12
-  completed_plans: 8
+  completed_plans: 9
   percent: 0
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 08 — Test Isolation and Fixture Ownership
+**Current focus:** Phase 09 — Hook Seeding Safety
 
 ## Current Position
 
-Phase: 9 (Hook Seeding Safety) — READY TO EXECUTE
-Plan: 8 of 8
+Phase: 09 (Hook Seeding Safety) — EXECUTING
+Plan: 2 of 4
 Status: Ready to execute
-Last activity: 2026-09-15 — Plans 01-03 complete (per-fixture workspace identity landed)
+Last activity: 2026-09-15 — Phase 09 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -78,6 +78,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P05 | 39min | 3 tasks | 1 files |
 | Phase 08 P06 | 58min | 2 tasks | 6 files |
 | Phase 08 P07 | 25min | 1 tasks | 1 files |
+| Phase 09 P01 | 10min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -167,6 +168,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
 - [Phase 08]: 08-07: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
 - [Phase 08]: 08-07: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
+- [Phase 09]: Seed warnings are return values crossing the crate seam (SeedWarning{file,reason}); binaries own presentation — TUI set_message every time, stderr once per process.
+- [Phase 09]: read_settings_guarded four-way disposition is one shared pub(crate) helper: NotFound = fresh seed; unreadable/unparseable/non-object root = refuse byte-identical + warn, never overwrite.
 
 ### Pending Todos
 
@@ -200,8 +203,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T03:43:18.813Z
-Stopped at: context exhaustion at 90% (2026-09-16)
+Last session: 2026-09-16T04:37:12.522Z
+Stopped at: Completed 09-01-PLAN.md
 Resume file: None
 
 ## Deferred Items
