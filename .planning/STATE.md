@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 11
 current_phase_name: Negotiated Multiline Input
 status: executing
-stopped_at: Completed 11-01-PLAN.md
-last_updated: "2026-09-16T14:36:15.355Z"
+stopped_at: Completed 11-02-PLAN.md
+last_updated: "2026-09-16T14:46:51.503Z"
 last_activity: 2026-09-16
 last_activity_desc: Phase 11 execution started
-state_head: 0e2271d1c7c90d9f9d2b2cbcf9b1a39bd1219591
+state_head: 53a3287cc7a36aae7b42ed36f3df701394d08c3c
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 20
-  completed_plans: 17
+  completed_plans: 18
   percent: 40
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 11 (Negotiated Multiline Input) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-09-16 — Phase 11 execution started
 
@@ -89,6 +89,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 10 P03 | 16 min | 2 tasks | 3 files |
 | Phase 10 P04 | 23 min | 3 tasks | 4 files |
 | Phase 11 P01 | 28 min | 3 tasks | 3 files |
+| Phase 11 P02 | 6 min | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -196,6 +197,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 10]: Chord resolves the remote-attach parser under the same remote_id+liveness predicate the render path uses; links sorted (row, start_col)
 - [Phase 11]: Shift+Enter encoding: CSI-u only under observed kitty child; ESC CR fallback to Claude pane; plain CR to shell pane (readline meta-CR hazard)
 - [Phase 11]: RED-phase scaffolding in test commit (behavior-preserving) so TDD RED fails on assertions, not compile errors (#3770)
+- [Phase 11]: 11-02: unknown CSI = set-modes ignored fail-closed in the vt100 kitty stack; depth cap proven behaviorally since the stack is private
 
 ### Pending Todos
 
@@ -229,8 +231,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T14:36:15.324Z
-Stopped at: Completed 11-01-PLAN.md
+Last session: 2026-09-16T14:46:51.471Z
+Stopped at: Completed 11-02-PLAN.md
 Resume file: None
 
 ## Deferred Items
