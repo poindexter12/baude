@@ -1171,4 +1171,73 @@ mod tests {
             .expect("local pre-attach cell carries a link id");
         assert_eq!(screen.link_target(id), Some("https://pre.example/attach"));
     }
+
+    /// Mirror the snapshot construction in subscribe() byte-for-byte (the
+    /// pre-attach-links precedent above): drift between this mirror and the
+    /// production construction is the failure mode being guarded. Pure — no
+    /// real PTY.
+    fn subscribe_snapshot_bytes(screen: &vt100::Screen) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if screen.alternate_screen() {
+            bytes.extend_from_slice(b"\x1b[?1049h");
+        }
+        bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+        bytes.extend_from_slice(&screen.contents_formatted());
+        if screen.application_cursor() {
+            bytes.extend_from_slice(b"\x1b[?1h");
+        }
+        if screen.application_keypad() {
+            bytes.extend_from_slice(b"\x1b=");
+        }
+        if screen.bracketed_paste() {
+            bytes.extend_from_slice(b"\x1b[?2004h");
+        }
+        if screen.hide_cursor() {
+            bytes.extend_from_slice(b"\x1b[?25l");
+        }
+        bytes
+    }
+
+    /// TKEY-05 across attach: a child that pushed kitty flags before a remote
+    /// attach must have that push replayed in the subscribe snapshot so the
+    /// mirror parser converges on the same child kitty state.
+    #[test]
+    fn subscribe_snapshot_replays_active_kitty_push() {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(b"\x1b[>1uordinary text before attach");
+        let screen = parser.screen();
+        assert_eq!(screen.kitty_keyboard(), 1, "source observed the push");
+
+        let bytes = subscribe_snapshot_bytes(screen);
+        let mut remote = vt100::Parser::new(6, 60, 0);
+        remote.process(&bytes);
+        assert_eq!(
+            remote.screen().kitty_keyboard(),
+            1,
+            "mirror must converge on the child's active kitty flags"
+        );
+    }
+
+    /// Inactive child kitty state adds zero bytes: snapshots for non-kitty
+    /// children stay byte-identical to the pre-phase construction.
+    #[test]
+    fn subscribe_snapshot_inactive_kitty_adds_no_bytes() {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(b"plain child, no kitty push");
+        let screen = parser.screen();
+        assert_eq!(screen.kitty_keyboard(), 0);
+
+        let bytes = subscribe_snapshot_bytes(screen);
+        assert!(
+            !bytes.windows(3).any(|w| w == b"\x1b[>"),
+            "no CSI > u replay bytes may leak into a non-kitty snapshot"
+        );
+        let mut remote = vt100::Parser::new(6, 60, 0);
+        remote.process(&bytes);
+        assert_eq!(
+            remote.screen().kitty_keyboard(),
+            0,
+            "mirror of a non-kitty child must stay legacy"
+        );
+    }
 }

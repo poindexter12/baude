@@ -1,0 +1,8 @@
+{
+  "command": "cargo test -p baude-core snapshot_",
+  "exitCode": 101,
+  "output": "TAP version 13\nnot ok 1 - pty::tests::subscribe_snapshot_replays_active_kitty_push\nok 2 - pty::tests::subscribe_snapshot_inactive_kitty_adds_no_bytes\nok 3 - pty::tests::subscribe_snapshot_replays_pre_attach_links\nok 4 - pty::tests::subscribe_snapshot_then_live_bytes\nok 5 - lifecycle::tests::close_preserves_hierarchy_and_orders_snapshot_save_before_stop\n# tests 5\n# pass 4\n# fail 1\n# raw: cargo test -p baude-core snapshot_ -> exit 101; 'test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 354 filtered out'\n# raw: subscribe_snapshot_replays_active_kitty_push: assertion `left == right` failed: mirror must converge on the child's active kitty flags -- left: 0, right: 1 (pty.rs:1214)\n# raw: RED shape: the test's subscribe_snapshot_bytes helper mirrors subscribe()'s CURRENT construction (mode-replay list ending at hide_cursor, no kitty replay), so the mirror parser reports 0 -- a genuine assertion on the planned convergence behavior, not a compile error (#3770). The inactive-state test passes vacuously and pins that non-kitty snapshots stay byte-identical.",
+  "targetTest": "pty::tests::subscribe_snapshot_replays_active_kitty_push",
+  "expected": "a source parser fed b\"\\x1b[>1u\" plus ordinary text, snapshotted the way subscribe() builds its redraw snapshot, converges a fresh mirror parser on kitty_keyboard() == 1 (child kitty state rides the snapshot, TKEY-05 across attach)",
+  "actual": "assertion `left == right` failed -- left: 0, right: 1; subscribe()'s mode-replay list (which the test mirrors) lacks a CSI > flags u replay conditioned on screen.kitty_keyboard(), so the snapshot carries no push and the mirror stays legacy"
+}
