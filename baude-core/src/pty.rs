@@ -395,6 +395,21 @@ impl Pty {
                 }
                 let screen = p.screen();
                 let mut bytes = Vec::new();
+                // Kitty keyboard replay, full depth (BAUDE FORK accessors):
+                // one push per stack entry, oldest first, so post-attach pops
+                // from a nested-push child decrement the mirror identically
+                // to the source — a single top-of-stack push would collapse
+                // an N-deep stack to depth 1 and the next CSI < 1 u would
+                // empty the mirror while the source stays kitty. Main-screen
+                // pushes go out BEFORE the alternate-screen switch so each
+                // stack lands on its own per-screen mirror stack (entering
+                // the alternate screen empties its stack); the alternate
+                // stack is replayed after the switch, below. An inactive
+                // child (both stacks empty) adds zero bytes — the snapshot
+                // stays byte-identical to the pre-phase construction.
+                for flags in screen.kitty_main_stack() {
+                    bytes.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+                }
                 if screen.alternate_screen() {
                     bytes.extend_from_slice(b"\x1b[?1049h");
                 }
@@ -414,14 +429,16 @@ impl Pty {
                 if screen.hide_cursor() {
                     bytes.extend_from_slice(b"\x1b[?25l");
                 }
-                // An active kitty keyboard push (BAUDE FORK accessor): replay
-                // one push carrying the current flags — a fresh mirror parser
-                // has an empty stack, so this converges it on the same
-                // top-of-stack value (TKEY-05 across attach). Inactive (0)
-                // adds nothing.
-                let kitty = screen.kitty_keyboard();
-                if kitty != 0 {
-                    bytes.extend_from_slice(format!("\x1b[>{kitty}u").as_bytes());
+                // Alternate-screen kitty stack (TKEY-05 across attach): must
+                // come after the `?1049h` above so the pushes land on the
+                // mirror's alternate stack. Skipped on the main screen —
+                // alternate-stack residue is unreachable there (only readable
+                // while the alternate screen is active, and re-entry empties
+                // it on both sides).
+                if screen.alternate_screen() {
+                    for flags in screen.kitty_alternate_stack() {
+                        bytes.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+                    }
                 }
                 bytes
             }
@@ -1187,6 +1204,9 @@ mod tests {
     /// real PTY.
     fn subscribe_snapshot_bytes(screen: &vt100::Screen) -> Vec<u8> {
         let mut bytes = Vec::new();
+        for flags in screen.kitty_main_stack() {
+            bytes.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+        }
         if screen.alternate_screen() {
             bytes.extend_from_slice(b"\x1b[?1049h");
         }
@@ -1204,9 +1224,10 @@ mod tests {
         if screen.hide_cursor() {
             bytes.extend_from_slice(b"\x1b[?25l");
         }
-        let kitty = screen.kitty_keyboard();
-        if kitty != 0 {
-            bytes.extend_from_slice(format!("\x1b[>{kitty}u").as_bytes());
+        if screen.alternate_screen() {
+            for flags in screen.kitty_alternate_stack() {
+                bytes.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+            }
         }
         bytes
     }
@@ -1228,6 +1249,59 @@ mod tests {
             remote.screen().kitty_keyboard(),
             1,
             "mirror must converge on the child's active kitty flags"
+        );
+    }
+
+    /// WR-03: an N-deep source stack replays at full depth. The next
+    /// CSI < 1 u from a nested-push child (push, then nested push — e.g.
+    /// Claude Code plus an inner tool) must leave both source and mirror
+    /// at the prior nonzero entry instead of emptying the mirror and
+    /// permanently degrading remote Shift+Enter.
+    #[test]
+    fn subscribe_snapshot_replays_full_stack_depth() {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(b"\x1b[>1u\x1b[>5u");
+        assert_eq!(parser.screen().kitty_keyboard(), 5);
+
+        let bytes = subscribe_snapshot_bytes(parser.screen());
+        let mut remote = vt100::Parser::new(6, 60, 0);
+        remote.process(&bytes);
+        assert_eq!(remote.screen().kitty_keyboard(), 5);
+
+        // Post-attach pop from the child reaches both parsers.
+        parser.process(b"\x1b[<1u");
+        remote.process(b"\x1b[<1u");
+        assert_eq!(parser.screen().kitty_keyboard(), 1);
+        assert_eq!(
+            remote.screen().kitty_keyboard(),
+            1,
+            "mirror stack must pop in lockstep with the source, not empty"
+        );
+    }
+
+    /// WR-03 x WR-02: per-screen stacks replay onto their own mirror
+    /// stacks — a child attached mid-alt-screen converges on both the
+    /// alternate flags AND the main-screen flags it returns to on exit.
+    #[test]
+    fn subscribe_snapshot_replays_per_screen_stacks() {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(b"\x1b[>1u\x1b[?1049h\x1b[>5u");
+        assert_eq!(parser.screen().kitty_keyboard(), 5);
+
+        let bytes = subscribe_snapshot_bytes(parser.screen());
+        let mut remote = vt100::Parser::new(6, 60, 0);
+        remote.process(&bytes);
+        assert_eq!(remote.screen().kitty_keyboard(), 5);
+
+        // Child exits the alternate screen post-attach on both sides: the
+        // mirror must restore the same main-screen flags as the source.
+        parser.process(b"\x1b[?1049l");
+        remote.process(b"\x1b[?1049l");
+        assert_eq!(parser.screen().kitty_keyboard(), 1);
+        assert_eq!(
+            remote.screen().kitty_keyboard(),
+            1,
+            "mirror must restore the source's main-screen flags on alt exit"
         );
     }
 

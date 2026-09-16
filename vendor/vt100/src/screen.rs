@@ -729,6 +729,23 @@ impl Screen {
         self.active_kitty_stack().last().copied().unwrap_or(0)
     }
 
+    /// BAUDE FORK (kitty keyboard): the main screen's full kitty flag
+    /// stack, oldest first. Subscribe replay re-emits one push per entry
+    /// so post-attach pops decrement a mirror parser identically to the
+    /// source (an N-deep stack must not collapse to depth 1).
+    #[must_use]
+    pub fn kitty_main_stack(&self) -> &[u16] {
+        &self.kitty_stack
+    }
+
+    /// BAUDE FORK (kitty keyboard): the alternate screen's full kitty
+    /// flag stack, oldest first (empty unless the child pushed while the
+    /// alternate screen was active; emptied on alternate-screen entry).
+    #[must_use]
+    pub fn kitty_alternate_stack(&self) -> &[u16] {
+        &self.kitty_alternate_stack
+    }
+
     fn active_kitty_stack(&self) -> &Vec<u16> {
         if self.mode(MODE_ALTERNATE_SCREEN) {
             &self.kitty_alternate_stack
