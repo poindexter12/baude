@@ -319,7 +319,8 @@ impl Grid {
                 } else {
                     crate::term::MoveTo::new(pos).write_buf(contents);
                 }
-                cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
+                cell.attrs()
+                    .write_escape_code_diff(contents, &prev_attrs, links);
                 contents.extend(cell.contents().as_bytes());
                 prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
             } else {
@@ -360,13 +361,15 @@ impl Grid {
                         if let Some(prev_pos) = prev_pos {
                             if prev_pos.row != i || prev_pos.col < self.size.cols {
                                 crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
-                                cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
+                                cell.attrs()
+                                    .write_escape_code_diff(contents, &prev_attrs, links);
                                 contents.extend(cell.contents().as_bytes());
                                 prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
                             }
                         } else {
                             crate::term::MoveTo::new(pos).write_buf(contents);
-                            cell.attrs().write_escape_code_diff(contents, &prev_attrs, links);
+                            cell.attrs()
+                                .write_escape_code_diff(contents, &prev_attrs, links);
                             contents.extend(cell.contents().as_bytes());
                             prev_attrs.write_escape_code_diff(contents, cell.attrs(), links);
                         }

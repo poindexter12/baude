@@ -5517,8 +5517,7 @@ impl App {
         #[cfg(target_os = "macos")]
         const CLIPBOARD_CMDS: &[&[&str]] = &[&["pbcopy"]];
         #[cfg(not(target_os = "macos"))]
-        const CLIPBOARD_CMDS: &[&[&str]] =
-            &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
+        const CLIPBOARD_CMDS: &[&[&str]] = &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
         let mut last_err: Option<std::io::Error> = None;
         for argv in CLIPBOARD_CMDS {
             match Command::new(argv[0])
@@ -5554,8 +5553,7 @@ impl App {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| std::io::Error::other("no clipboard command available")))
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no clipboard command available")))
     }
 
     /// Open link-hint mode for the focused content pane (LINK-04's explicit
@@ -6153,7 +6151,10 @@ mod link_hints {
             Modal::LinkHints { links, selected } => {
                 assert_eq!(*selected, 0);
                 assert_eq!(links.len(), 1, "the viewed rows hold exactly one link");
-                assert_eq!(links[0].destination.as_str(), "https://scrolled.example.com/x");
+                assert_eq!(
+                    links[0].destination.as_str(),
+                    "https://scrolled.example.com/x"
+                );
             }
             _ => panic!("chord over a scrolled-back link must open the modal"),
         }
@@ -6260,7 +6261,10 @@ mod link_hints {
         );
         // Enter is consumed by the modal too (empty list: nothing to open,
         // nothing spawned — the overlay simply closes).
-        app.modal = Modal::LinkHints { links: vec![], selected: 0 };
+        app.modal = Modal::LinkHints {
+            links: vec![],
+            selected: 0,
+        };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.modal, Modal::None), "Enter consumed by modal");
         assert!(

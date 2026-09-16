@@ -33,7 +33,8 @@ mod link_fidelity {
     #[test]
     fn scroll_into_scrollback_retains_link() {
         let mut parser = vt100::Parser::new(3, 20, 50);
-        parser.process(b"\x1b]8;;https://s.example/\x1b\\LINK\x1b]8;;\x1b\\\r\nrow1\r\nrow2\r\nrow3");
+        parser
+            .process(b"\x1b]8;;https://s.example/\x1b\\LINK\x1b]8;;\x1b\\\r\nrow1\r\nrow2\r\nrow3");
         // The LINK row scrolled into scrollback; bring it back into view.
         parser.set_scrollback(1);
         let screen = parser.screen();
@@ -55,7 +56,11 @@ mod link_fidelity {
         parser.process(b"\x1b]8;;https://w.example/\x1b\\click here\x1b]8;;\x1b\\");
         let screen = parser.screen();
         assert!(screen.row_wrapped(0));
-        let id = screen.cell(0, 0).unwrap().link_id().expect("first fragment linked");
+        let id = screen
+            .cell(0, 0)
+            .unwrap()
+            .link_id()
+            .expect("first fragment linked");
         assert_eq!(screen.cell(1, 0).unwrap().link_id(), Some(id));
         assert_eq!(screen.link_target(id), Some("https://w.example/"));
     }
@@ -349,8 +354,16 @@ mod link_fidelity {
         let mut b = vt100::Parser::new(2, 20, 0);
         b.process(&a_screen.contents_formatted());
         let b_screen = b.screen();
-        let bx = b_screen.cell(0, 0).unwrap().link_id().expect("X linked after round-trip");
-        let by = b_screen.cell(0, 1).unwrap().link_id().expect("Y linked after round-trip");
+        let bx = b_screen
+            .cell(0, 0)
+            .unwrap()
+            .link_id()
+            .expect("X linked after round-trip");
+        let by = b_screen
+            .cell(0, 1)
+            .unwrap()
+            .link_id()
+            .expect("Y linked after round-trip");
         assert_ne!(bx, by, "id= grouping must survive the round-trip");
         assert_eq!(b_screen.link_target(bx), Some("https://same.example/"));
         assert_eq!(b_screen.link_target(by), Some("https://same.example/"));

@@ -177,11 +177,7 @@ fn push_row_text(
 
 /// Scan one logical line for scheme-anchored candidates and collect every
 /// one that survives trimming and validation.
-fn scan_line_for_urls(
-    chars: &[char],
-    cells: &[Option<(u16, u16)>],
-    out: &mut Vec<DetectedLink>,
-) {
+fn scan_line_for_urls(chars: &[char], cells: &[Option<(u16, u16)>], out: &mut Vec<DetectedLink>) {
     let mut i = 0;
     while i < chars.len() {
         if !(starts_with_ci(chars, i, "http://") || starts_with_ci(chars, i, "https://")) {
@@ -384,7 +380,10 @@ mod bare_url {
         // becomes part of it.
         let mut parser = vt100::Parser::new(2, 40, 0);
         parser.process(b"https://a.example/x\r\nyz");
-        assert!(!parser.screen().row_wrapped(0), "precondition: no wrap flag");
+        assert!(
+            !parser.screen().row_wrapped(0),
+            "precondition: no wrap flag"
+        );
         let links = collect_links(parser.screen());
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].destination.as_str(), "https://a.example/x");
@@ -438,7 +437,10 @@ mod bare_url {
         parser.set_scrollback(1);
         // Visible: one / two / https:// / e.com/ab — tail "cdefgh" is below
         // the edge, reachable only through the wrap flag on the bottom row.
-        assert!(parser.screen().row_wrapped(3), "precondition: bottom row wraps");
+        assert!(
+            parser.screen().row_wrapped(3),
+            "precondition: bottom row wraps"
+        );
         let links = collect_links(parser.screen());
         assert_eq!(links.len(), 1, "off-screen tail joined into one URL");
         assert_eq!(links[0].destination.as_str(), "https://e.com/abcdefgh");
@@ -466,7 +468,10 @@ mod bare_url {
         parser.process(&input);
         // Offset 8: visible = f4/f5/f6/"https://"; 8 URL rows below the edge.
         parser.set_scrollback(8);
-        assert!(parser.screen().row_wrapped(3), "precondition: bottom row wraps");
+        assert!(
+            parser.screen().row_wrapped(3),
+            "precondition: bottom row wraps"
+        );
         let links = collect_links(parser.screen());
         assert_eq!(links.len(), 1, "truncated candidate still validates");
         // Visible row + 4 continuation rows: "https://e.com/" + 26 a's.
@@ -517,10 +522,7 @@ mod validate {
     #[test]
     fn accepts_wellformed_http_and_https() {
         for raw in ACCEPT {
-            assert!(
-                validate_http_url(raw).is_some(),
-                "must accept: {raw:?}"
-            );
+            assert!(validate_http_url(raw).is_some(), "must accept: {raw:?}");
         }
     }
 
@@ -528,8 +530,8 @@ mod validate {
     fn accepted_normalized_form_is_returned() {
         // The collected destination is the parsed normalized form that will
         // be displayed and passed to argv (percent-encoded UTF-8 survives).
-        let parsed = validate_http_url("https://ex.com/%E2%9C%93")
-            .expect("percent-encoded UTF-8 accepted");
+        let parsed =
+            validate_http_url("https://ex.com/%E2%9C%93").expect("percent-encoded UTF-8 accepted");
         assert_eq!(parsed, url::Url::parse("https://ex.com/%E2%9C%93").unwrap());
     }
 

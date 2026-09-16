@@ -282,7 +282,8 @@ impl Screen {
     fn write_contents_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         let prev_attrs = self.grid().write_contents_formatted(contents, &self.links);
-        self.attrs.write_escape_code_diff(contents, &prev_attrs, &self.links);
+        self.attrs
+            .write_escape_code_diff(contents, &prev_attrs, &self.links);
     }
 
     /// Returns the formatted visible contents of the terminal by row,
@@ -342,10 +343,11 @@ impl Screen {
         if self.hide_cursor() != prev.hide_cursor() {
             crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         }
-        let prev_attrs = self
-            .grid()
-            .write_contents_diff(contents, prev.grid(), prev.attrs, &self.links);
-        self.attrs.write_escape_code_diff(contents, &prev_attrs, &self.links);
+        let prev_attrs =
+            self.grid()
+                .write_contents_diff(contents, prev.grid(), prev.attrs, &self.links);
+        self.attrs
+            .write_escape_code_diff(contents, &prev_attrs, &self.links);
     }
 
     /// Returns a sequence of terminal byte streams sufficient to turn the
