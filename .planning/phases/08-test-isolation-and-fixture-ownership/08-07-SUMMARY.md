@@ -317,3 +317,12 @@ TISO-04 is complete: a developer can preview suspected historical leaks without 
 - `baude/src/main.rs` present and modified (52 `worktrees` references).
 - `.planning/phases/08-test-isolation-and-fixture-ownership/08-07-SUMMARY.md` present.
 - Commits `cab9c45` (RED) and `b3e905c` (GREEN) present in history.
+
+## Manual Validation Observed (2026-09-15, operator-authorized session run)
+
+`cargo run -p baude -- worktrees scan` (read-only) against the real
+`~/.local/share/baude/worktrees`: exit 0, grouped summary printed,
+**1433 candidates — 0 removable, 150 live, 1283 indeterminate**, matching the
+attested run. Sentinels: `claude/repository-1` and `claude/repository-5` blocked as
+referenced by state (Key match); `claude/repository-2` and `claude/repository-14`
+live, not removable. Legacy-format state files fail closed as designed. Nothing removed.

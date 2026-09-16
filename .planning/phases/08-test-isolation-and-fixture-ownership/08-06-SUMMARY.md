@@ -400,3 +400,21 @@ prune, and the historical leak candidates are untouched.
 - Commits `26560d8`, `6003652`, `f277afc`, `54e2c68`, `bb3ccf0`, `3f98851`, `2ad1e61`, `fb849b5`,
   `5777f75` — all FOUND in `git log`
 - `git rev-list --count 8a92712..HEAD` = **9**, matching `commits:` in the frontmatter
+
+## Manual Validation Observed (2026-09-15, operator-authorized session run)
+
+`assert-real-roots-untouched.sh before` → `cargo test -- --test-threads=1` → `after` executed
+three times on the developer machine (real populated roots, no env redirects):
+
+- Run 1 (19:30 PDT): suite exit 0, 527 passed / 0 failed. `after` flagged
+  `~/.config/baude/breadcrumbs-claude.json` — attributed to a production
+  `baude worktrees scan` run inside the measurement window (write at 19:31:06,
+  scan path confirmed; 90 s idle control window afterwards showed no ambient writes).
+- Run 2 (19:36 PDT): suite exit 0, 527 passed / 0 failed. Config, Claude and
+  worktrees roots unchanged. `after` flagged `~/Code/.../loadout` — attributed to a
+  concurrent Claude session committing in that repo (loadout reflog 19:32:16,
+  `.git` mtime 19:38, matching live `claude --resume` processes).
+- Run 3 (19:39–19:42 PDT): **PASS — all four real roots unchanged**, suite exit 0.
+
+Verdict: the suite leaves the real roots untouched. Both earlier deltas traced to
+identified non-suite writers; nothing was loosened in the script.
