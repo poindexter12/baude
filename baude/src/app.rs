@@ -5486,6 +5486,36 @@ impl App {
             }
         }
     }
+
+    /// Open a validated link destination. `open` is injected so activation is
+    /// unit-testable without opening anything — the same seam shape as
+    /// hook::route_event's injected `post` (hook.rs:431-433). The production
+    /// call site passes `spawn_opener`; tests pass a recording closure.
+    /// Both arms resolve to `set_message`: opener failure never kills the
+    /// session (LINK-08).
+    pub(crate) fn activate_link<F: FnOnce(&str) -> std::io::Result<()>>(
+        &mut self,
+        url: &url::Url,
+        open: F,
+    ) {
+        match open(url.as_str()) {
+            Ok(()) => self.set_message(format!("opening {}", display_truncated(url))),
+            Err(e) => self.set_message(format!("open failed: {e} — session unaffected")),
+        }
+    }
+}
+
+/// Middle-truncate a URL for the transient message line. Display only — the
+/// full `Url::as_str()` is always what the opener receives.
+fn display_truncated(url: &url::Url) -> String {
+    const MAX: usize = 60;
+    let s = url.as_str();
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(40).collect();
+    let tail: String = s.chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}…{tail}")
 }
 
 #[cfg(test)]
@@ -5519,6 +5549,32 @@ mod clipboard_tests {
         assert_eq!(
             selected("tab\tvalue\r\ne\u{301} and 界\r\nnext", 5, 20, 2, 4),
             "tab     value\ne\u{301} and 界\nnext"
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_hints {
+    use super::{App, Focus, Modal};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    /// The hint chord with no live session must not panic, must not open the
+    /// hints modal, and must surface the "no links" outcome via the message
+    /// path — nothing is spawned (LINK-04).
+    #[test]
+    fn chord_without_session_sets_message() {
+        // Phase-8 containment: App::new resolves the config dir, so the test
+        // holds a fixture redirect (never the real user paths).
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.focus = Focus::Claude;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::None), "modal stays closed");
+        assert!(
+            app.message.is_some(),
+            "chord without a session surfaces a message"
         );
     }
 }

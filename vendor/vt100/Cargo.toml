@@ -1,0 +1,28 @@
+# Vendored fork of vt100 0.15.2 (see README.md for provenance and diff surface).
+# Upstream [dev-dependencies] (nix, quickcheck, rand, serde, serde_json,
+# terminal_size, vte) are stripped: the registry package ships no tests/, so
+# they would only pull new, unaudited packages into Cargo.lock (T-10-SC).
+[package]
+edition = "2021"
+name = "vt100"
+version = "0.15.2"
+authors = ["Jesse Luehrs <doy@tozt.net>"]
+description = "Library for parsing terminal data"
+homepage = "https://github.com/doy/vt100-rust"
+readme = "README.md"
+keywords = ["terminal", "vt100"]
+categories = ["command-line-interface", "encoding"]
+license = "MIT"
+repository = "https://github.com/doy/vt100-rust"
+
+[dependencies.itoa]
+version = "1.0.5"
+
+[dependencies.log]
+version = "0.4.17"
+
+[dependencies.unicode-width]
+version = "0.1.10"
+
+[dependencies.vte]
+version = "0.11.0"

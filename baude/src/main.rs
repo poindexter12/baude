@@ -1,6 +1,7 @@
 mod app;
 mod hierarchy;
 mod keys;
+mod links;
 mod notify_desktop;
 mod remote;
 mod ui;
