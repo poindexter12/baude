@@ -2112,27 +2112,55 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             );
         }
         Modal::LinkHints { links, selected } => {
-            // Minimal tracer render; layout polish and hint labels land in
-            // plan 10-04. Each row shows the link's ACTUAL destination —
-            // never its label (LINK-01/LINK-05).
-            let height = (links.len() as u16 + 4).min(20);
-            let rect = centered(area, 70, height);
+            // Bottom-anchored list panel (RESEARCH Pattern 3). Each row is
+            // `[a] destination` — always the link's ACTUAL destination, never
+            // its label (LINK-01/LINK-05); the destination is middle-truncated
+            // for width ONLY (scheme+host always visible, T-10-15) while the
+            // model, copy, and open all keep the full URL.
+            let list_rows = links.len().min(10).max(1);
+            let height = ((list_rows as u16) + 3).min(area.height);
+            let rect = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(height),
+                width: area.width,
+                height,
+            };
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
-            let mut lines = Vec::with_capacity(links.len() + 2);
-            for (i, link) in links.iter().enumerate() {
-                let text = format!("  {}", link.destination);
+            // Viewport scrolling: the selected row is always visible, even
+            // past 26 entries (rows beyond `z` carry no letter and are
+            // reached with j/k).
+            let visible = (rect.height.saturating_sub(3) as usize).max(1);
+            let first = (*selected + 1).saturating_sub(visible);
+            // "[a] " prefix (4) + borders (2)
+            let url_width = rect.width.saturating_sub(6) as usize;
+            let mut lines = Vec::with_capacity(visible + 1);
+            for (i, link) in links.iter().enumerate().skip(first).take(visible) {
+                let label = if i < 26 {
+                    format!("[{}] ", (b'a' + i as u8) as char)
+                } else {
+                    "    ".to_string()
+                };
+                let text = format!(
+                    "{label}{}",
+                    crate::app::display_truncated_width(&link.destination, url_width)
+                );
                 if i == *selected {
                     lines.push(Line::from(Span::styled(
                         text,
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
                     )));
                 } else {
                     lines.push(Line::raw(text));
                 }
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled("enter opens · esc closes", dim)));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "enter opens · c/y copies · j/k moves · esc closes — {} links",
+                    links.len()
+                ),
+                dim,
+            )));
             let p = Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)

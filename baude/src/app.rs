@@ -5551,11 +5551,12 @@ impl App {
     /// swallowed — no byte ever reaches the child while the overlay is open
     /// (LINK-04). The modal is taken via `mem::replace` so the borrow of
     /// `self.modal` ends before `&mut self` methods run.
-    fn handle_link_hints_key<F, C>(&mut self, key: KeyEvent, open: F, _copy: C)
+    fn handle_link_hints_key<F, C>(&mut self, key: KeyEvent, open: F, copy: C)
     where
         F: FnOnce(&str) -> std::io::Result<()>,
         C: FnOnce(&str),
     {
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         match key.code {
             KeyCode::Esc => self.modal = Modal::None,
             KeyCode::Enter => {
@@ -5566,6 +5567,44 @@ impl App {
                     }
                 }
             }
+            // LINK-06: copy the selected destination WITHOUT opening it. The
+            // sink receives the full normalized URL; display truncation is
+            // message-only.
+            KeyCode::Char('c') | KeyCode::Char('y') if plain => {
+                let modal = std::mem::replace(&mut self.modal, Modal::None);
+                if let Modal::LinkHints { links, selected } = modal {
+                    if let Some(link) = links.get(selected) {
+                        copy(link.destination.as_str());
+                        self.set_message(format!(
+                            "copied {}",
+                            display_truncated(&link.destination)
+                        ));
+                    }
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down if plain || key.code == KeyCode::Down => {
+                if let Modal::LinkHints { links, selected } = &mut self.modal {
+                    *selected = (*selected + 1).min(links.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up if plain || key.code == KeyCode::Up => {
+                if let Modal::LinkHints { selected, .. } = &mut self.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            // Hint-letter jump: a-z select their labeled row directly.
+            // c/y/j/k are shadowed by the action arms above; those rows stay
+            // reachable via j/k navigation.
+            KeyCode::Char(ch) if plain && ch.is_ascii_lowercase() => {
+                if let Modal::LinkHints { links, selected } = &mut self.modal {
+                    let idx = (ch as u8 - b'a') as usize;
+                    if idx < links.len().min(26) {
+                        *selected = idx;
+                    }
+                }
+            }
+            // Everything else is swallowed: the modal stays as-is and no
+            // byte ever reaches the child (LINK-04).
             _ => {}
         }
     }
@@ -5622,8 +5661,28 @@ fn display_truncated(url: &url::Url) -> String {
 /// must never let ellipses hide the real origin). The model — and copy and
 /// open — always use the full normalized `Url::as_str()` (LINK-05).
 pub(crate) fn display_truncated_width(url: &url::Url, max: usize) -> String {
-    let _ = max;
-    url.as_str().to_string()
+    let s = url.as_str();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    // scheme://[user@]host[:port] stays fully visible, whatever the budget.
+    let prefix = &url[..url::Position::BeforePath];
+    let rest = &s[prefix.len()..];
+    let budget = max.saturating_sub(prefix.chars().count());
+    if budget < 2 {
+        return format!("{prefix}…");
+    }
+    let keep = budget - 1; // one char reserved for the ellipsis
+    let head_n = keep - keep / 2;
+    let tail_n = keep / 2;
+    let head: String = rest.chars().take(head_n).collect();
+    let tail: String = if tail_n == 0 {
+        String::new()
+    } else {
+        let count = rest.chars().count();
+        rest.chars().skip(count - tail_n).collect()
+    };
+    format!("{prefix}{head}…{tail}")
 }
 
 #[cfg(test)]
@@ -5818,7 +5877,7 @@ mod link_hints {
         let (_rd, mut app) = hinted(&urls, 0);
         let copied = RefCell::new(Vec::<String>::new());
         let opened = RefCell::new(Vec::<String>::new());
-        let mut press = |app: &mut App, ch: char| {
+        let press = |app: &mut App, ch: char| {
             app.handle_link_hints_key(
                 key(KeyCode::Char(ch)),
                 |u| {
