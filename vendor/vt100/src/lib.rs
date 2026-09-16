@@ -33,9 +33,15 @@
 //! );
 //! ```
 
-#![warn(clippy::cargo)]
-#![warn(clippy::pedantic)]
-#![warn(clippy::nursery)]
+// FORK (baude): upstream's lint header predates several clippy lints that now
+// fire on unmodified upstream code, and `clippy::cargo` leaks package-metadata
+// lints onto baude's own crates. This repo lints its OWN crates at -D warnings;
+// it does not gate CI on the vendored fork's style. Diff surface: this block
+// only. See vendor/vt100/README.md.
+#![allow(clippy::all)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::nursery)]
+#![allow(clippy::cargo)]
 #![warn(clippy::as_conversions)]
 #![warn(clippy::get_unwrap)]
 #![allow(clippy::cognitive_complexity)]

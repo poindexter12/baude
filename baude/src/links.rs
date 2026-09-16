@@ -198,11 +198,9 @@ fn scan_line_for_urls(chars: &[char], cells: &[Option<(u16, u16)>], out: &mut Ve
                 // (hints label visible links only).
                 if let Some((row, start_col)) = cells[i] {
                     let mut end_col = start_col;
-                    for cell in &cells[i..end] {
-                        if let Some((r, c)) = cell {
-                            if *r == row {
-                                end_col = *c;
-                            }
+                    for (r, c) in cells[i..end].iter().flatten() {
+                        if *r == row {
+                            end_col = *c;
                         }
                     }
                     out.push(DetectedLink {

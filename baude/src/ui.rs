@@ -2117,7 +2117,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             // its label (LINK-01/LINK-05); the destination is middle-truncated
             // for width ONLY (scheme+host always visible, T-10-15) while the
             // model, copy, and open all keep the full URL.
-            let list_rows = links.len().min(10).max(1);
+            let list_rows = links.len().clamp(1, 10);
             let height = ((list_rows as u16) + 3).min(area.height);
             let rect = Rect {
                 x: area.x,
