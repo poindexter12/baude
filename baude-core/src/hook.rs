@@ -321,16 +321,56 @@ impl std::fmt::Display for SeedWarning {
 /// byte-identical and reported instead of being replaced with the seed alone.
 pub fn seed_settings(cwd: &std::path::Path) -> Vec<SeedWarning> {
     let dir = cwd.join(".claude");
+    // Best-effort: a create_dir_all failure surfaces as the write failure.
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("settings.local.json");
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| json!({}));
+    let existing = match read_settings_guarded(&path) {
+        Ok(existing) => existing,
+        // D-01: the file is user content we could not safely understand —
+        // leave it byte-identical and report, never overwrite with the seed.
+        Err(warning) => return vec![warning],
+    };
     let command = baude_hook_command();
     let merged = merge_hook_settings(&existing, &command);
-    let _ = std::fs::write(&path, merged.to_string());
-    Vec::new()
+    match std::fs::write(&path, merged.to_string()) {
+        Ok(()) => Vec::new(),
+        // D-04: a write failure never aborts the spawn — warn and continue.
+        Err(error) => vec![SeedWarning {
+            file: path,
+            reason: SeedWarningReason::WriteFailed(error),
+        }],
+    }
+}
+
+/// Guarded read of a JSON settings file for seeding (D-01, HREG-03).
+///
+/// Four-way disposition:
+/// - missing file (`NotFound`) → `Ok(json!({}))`: the normal fresh-seed path;
+/// - any other read error → `Err(Unreadable)`;
+/// - JSON parse failure → `Err(Unparseable)`;
+/// - parses but the root is not an object → `Err(NonObjectRoot)`.
+///
+/// On `Err` the caller must NOT touch the file — the warning names it so the
+/// operator can fix or remove it. `pub(crate)` so `seed_mcp_config`
+/// (backend/claude.rs) shares the same guard for `.mcp.json` (D-03).
+pub(crate) fn read_settings_guarded(path: &std::path::Path) -> Result<Value, SeedWarning> {
+    let warn = |reason| SeedWarning {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(error) => return Err(warn(SeedWarningReason::Unreadable(error))),
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => return Err(warn(SeedWarningReason::Unparseable(error))),
+    };
+    if !value.is_object() {
+        return Err(warn(SeedWarningReason::NonObjectRoot));
+    }
+    Ok(value)
 }
 
 /// Route one normalized event line to its transport, never losing the event.

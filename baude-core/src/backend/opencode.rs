@@ -169,8 +169,11 @@ impl Backend for OpencodeBackend {
     }
 
     /// Nothing to seed: permission policy rides the spawn command (`--auto` /
-    /// `OPENCODE_CONFIG_CONTENT`), and there are no hooks to wire.
-    fn prepare_cwd(&self, _cwd: &Path) {}
+    /// `OPENCODE_CONFIG_CONTENT`), and there are no hooks to wire — so there
+    /// is never a seed warning to report.
+    fn prepare_cwd(&self, _cwd: &Path) -> Vec<crate::hook::SeedWarning> {
+        Vec::new()
+    }
 
     fn poll_meta(
         &self,

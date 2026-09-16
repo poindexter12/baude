@@ -2837,8 +2837,11 @@ impl App {
         // Wire the session cwd before the CLI starts (for Claude: the
         // settings.local.json hook seed, plus the prompt-mode .mcp.json).
         // Best-effort: a seeding failure must NOT abort the spawn — the session
-        // simply falls back to the silence path (no regression).
-        be.prepare_cwd(&cwd);
+        // simply falls back to the silence path (no regression) — but the
+        // operator must SEE it (HREG-03/D-02): surface every warning.
+        for warning in be.prepare_cwd(&cwd) {
+            self.warn_seed_failure(&warning);
+        }
 
         if baude_core::permission::is_prompt_mode() && be.prompt_mode_needs_daemon() {
             // WR-01: claude's permission approval is inherently daemon+PWA-
@@ -3599,6 +3602,20 @@ impl App {
             eprintln!("baude: {MSG}");
         }
         self.set_message(MSG.into());
+    }
+
+    /// HREG-03/D-02: surface one seed warning from a spawn path's
+    /// `prepare_cwd` — visibly in the TUI every time, and once per process to
+    /// stderr (the once-flag is shared by ALL seed warnings; only the stderr
+    /// echo is deduplicated). The warning names the affected file so the
+    /// operator can fix or remove it; seeding stays best-effort and the spawn
+    /// continues regardless (D-04).
+    fn warn_seed_failure(&mut self, warning: &baude_core::hook::SeedWarning) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("baude: {warning}");
+        }
+        self.set_message(warning.to_string());
     }
 
     /// Feed the desktop-banner state machine one snapshot of every sidebar

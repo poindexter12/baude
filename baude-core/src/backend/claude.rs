@@ -71,11 +71,12 @@ impl Backend for ClaudeBackend {
     /// resolve `current_exe()`, so a daemon-spawned session wires `bauded`
     /// and a TUI one wires `baude` (the Pitfall-2 reason both binaries carry
     /// the `hook`/`permission-mcp` arms).
-    fn prepare_cwd(&self, cwd: &Path) {
-        crate::hook::seed_settings(cwd);
+    fn prepare_cwd(&self, cwd: &Path) -> Vec<crate::hook::SeedWarning> {
+        let warnings = crate::hook::seed_settings(cwd);
         if crate::permission::is_prompt_mode() {
             seed_mcp_config(cwd);
         }
+        warnings
     }
 
     fn poll_meta(
