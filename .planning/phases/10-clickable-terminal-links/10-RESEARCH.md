@@ -469,17 +469,17 @@ Not a rename/refactor/migration phase — section not required. For completeness
 | A4 | vte's >16-param OSC behavior merges subsequent bytes into the last param with separators dropped | Pitfall 2 | Low — `MAX_OSC_PARAMS`/`return` verified in source; only the precise merge shape is inferred. Worst case: a ≥14-semicolon URI validates to a wrong-but-still-validated URL; preview shows it before open |
 | A5 | Dockerfile's runtime image lacks `xdg-open` | Environment | None — container runs bauded (opening is TUI-local by locked decision); TUI-in-container hits the non-fatal LINK-08 error path |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Ship the `contents_formatted` OSC 8 re-emission in this phase, or accept the pre-attach remote gap?**
+1. **Ship the `contents_formatted` OSC 8 re-emission in this phase, or accept the pre-attach remote gap?** — RESOLVED: shipped this phase — plan 10-02 (contents_formatted OSC8 re-emission + pty snapshot round-trip).
    - What we know: live attach bytes carry OSC 8 correctly; only the join-snapshot path loses them (pty.rs:402). Success criterion 3 names "attached remote" explicitly.
    - What's unclear: whether the criterion is read as "links printed while attached" (satisfied without it) or "any visible link after attach" (requires it).
    - Recommendation: ship it — it is ~30 lines in the fork's formatted-writer plus one round-trip test, and it makes the remote path unconditionally equivalent.
-2. **Scan extent for bare URLs: visible rows only, or visible + wrapped continuations crossing the view edge?**
+2. **Scan extent for bare URLs: visible rows only, or visible + wrapped continuations crossing the view edge?** — RESOLVED: bounded off-screen wrap continuation adopted — plan 10-03.
    - What we know: hints label *visible* links; a URL soft-wrapped across the bottom edge has an off-screen tail; `set_scrollback` can address any scrollback row.
    - Recommendation: scan the visible window, but follow `row_wrapped` continuations beyond the edge (bounded, e.g. ≤4 extra rows) so the joined URL is complete even when its tail is off-screen; hint anchors stay on the visible fragment.
-3. **Exact keybind** — ctrl+o recommended; final choice is planner/user discretion (must be documented in the help overlay and must not collide with the verified occupied set: ctrl+q, ctrl+\/ctrl+4, ctrl+e, ctrl+n, alt+←/→).
-4. **Fork hygiene in CI** — vendored crate as workspace member means `cargo fmt`/`clippy` touch it. Recommendation: run fmt once on vendored code at import, keep upstream tests, add a `vendor/vt100/README.md` recording the upstream commit/version and the baude-specific diff surface.
+3. **Exact keybind** — ctrl+o recommended; final choice is planner/user discretion (must be documented in the help overlay and must not collide with the verified occupied set: ctrl+q, ctrl+\/ctrl+4, ctrl+e, ctrl+n, alt+←/→). — RESOLVED: ctrl+o adopted, collision-checked — plan 10-01.
+4. **Fork hygiene in CI** — vendored crate as workspace member means `cargo fmt`/`clippy` touch it. Recommendation: run fmt once on vendored code at import, keep upstream tests, add a `vendor/vt100/README.md` recording the upstream commit/version and the baude-specific diff surface. — RESOLVED: fmt-at-import + fork README provenance — plan 10-01 Task 2.
 
 ## Environment Availability
 

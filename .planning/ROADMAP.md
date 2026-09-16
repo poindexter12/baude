@@ -134,8 +134,23 @@ Plans:
 4. A documented explicit gesture activates links while selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
 5. Unsupported, malformed, or control-bearing targets remain non-activatable; allowed targets are passed as data to the opener, and failures leave the session running with a useful error.
 
-**Plans**: TBD
+**Plans**: 4 plans
 **UI hint**: yes
+
+Plans:
+
+**Wave 1**
+
+- [ ] 10-01-PLAN.md — Tracer: vendored vt100 fork + end-to-end OSC8 slice (ctrl+o → overlay shows destination → validated open via injected opener seam); gesture docs + fork provenance
+
+**Wave 2** (10-02 and 10-03 run in parallel — no file overlap)
+
+- [ ] 10-02-PLAN.md — TDD: fork grid fidelity (scroll/wrap/resize/overwrite/erase-strip, intern caps, `;` rejoin) + contents_formatted OSC8 re-emission with snapshot round-trip (remote parity)
+- [ ] 10-03-PLAN.md — TDD: bare-URL wrap-join detection with punctuation trim + full validate_http_url matrix (pure links.rs)
+
+**Wave 3**
+
+- [ ] 10-04-PLAN.md — Overlay completion (navigation, copy via injected sink, no-links state), gesture call-site integration incl. remote attach, LINK-04 non-interference proof, opener failure surface + phase-gate full suite
 
 ### Phase 11: Negotiated Multiline Input
 

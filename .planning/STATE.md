@@ -2,18 +2,18 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 8
-current_phase_name: Test Isolation and Fixture Ownership
-status: planning
+current_phase: 10
+current_phase_name: Clickable Terminal Links
+status: executing
 stopped_at: Phase 9 complete, ready to plan Phase 8
-last_updated: "2026-09-16T05:49:06.645Z"
+last_updated: "2026-09-16T06:49:08.814Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 9 complete, transitioned to Phase 8
-state_head: 3f3703943cca63861446fc361b0f5458fe1b85b3
+state_head: ac16d3d8f74ec05505424272780b0e9cbc2495f8
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 12
+  total_plans: 16
   completed_plans: 12
   percent: 20
 ---
@@ -29,9 +29,9 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 ## Current Position
 
-Phase: 8 — Test Isolation and Fixture Ownership
+Phase: 10 (Clickable Terminal Links) — READY TO EXECUTE
 Plan: Not started
-Status: Ready to plan
+Status: Ready to execute
 Last activity: 2026-09-15 — Phase 9 complete, transitioned to Phase 8
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
