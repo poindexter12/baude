@@ -4,17 +4,17 @@ milestone: v2.2
 milestone_name: Reliability and Terminal Usability
 current_phase: 11
 current_phase_name: Negotiated Multiline Input
-status: executing
-stopped_at: Completed 11-03-PLAN.md
-last_updated: "2026-09-16T14:58:51.447Z"
+status: verifying
+stopped_at: Completed 11-04-PLAN.md
+last_updated: "2026-09-16T15:11:25.520Z"
 last_activity: 2026-09-16
 last_activity_desc: Phase 11 execution started
-state_head: 9277c36186439439c66e010f7a6a4ffade850978
+state_head: "0b28388ecef9373143c8a32588ca1465468716f2"
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 20
-  completed_plans: 19
+  completed_plans: 20
   percent: 40
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 Phase: 11 (Negotiated Multiline Input) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-09-16 — Phase 11 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
@@ -91,6 +91,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 11 P01 | 28 min | 3 tasks | 3 files |
 | Phase 11 P02 | 6 min | 1 tasks | 2 files |
 | Phase 11 P03 | 9 min | 2 tasks | 2 files |
+| Phase 11 P04 | 9 min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -201,6 +202,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 11]: 11-02: unknown CSI = set-modes ignored fail-closed in the vt100 kitty stack; depth cap proven behaviorally since the stack is private
 - [Phase 11]: Help overlay height 35->39: pre-existing 2-row clip fixed alongside the shift+enter rows; test guards the closing line
 - [Phase 11]: README shift+enter guidance uses 'verified to work' framing — no TERM/terminal-name detection claims (D-01)
+- [Phase 11]: encode_ctx is the single EncodeCtx producer for both forward_key branches; kitty_child reads the vt100 observed-push accessor with every fallback fail-closed to legacy (D-04)
+- [Phase 11]: subscribe() replays one CSI > flags u push conditioned on kitty_keyboard() so remote mirrors converge; inactive children keep byte-identical snapshots
 
 ### Pending Todos
 
@@ -234,8 +237,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T14:58:51.415Z
-Stopped at: Completed 11-03-PLAN.md
+Last session: 2026-09-16T15:11:25.469Z
+Stopped at: Completed 11-04-PLAN.md
 Resume file: None
 
 ## Deferred Items

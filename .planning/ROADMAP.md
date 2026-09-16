@@ -166,7 +166,7 @@ Plans:
 4. The prior outer-terminal keyboard mode is restored on controlled exit, failure, and suspend paths, then re-established on resume.
 5. Negotiation cannot block startup/input indefinitely, and enhanced sequences are sent only on a verified outer-terminal/child-input path.
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans executed
 
 Plans:
 **Wave 1**
@@ -177,7 +177,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 11-04-PLAN.md — Child-verification wiring: forward_key observed-push gate + subscribe() kitty replay (wave 2)
+- [x] 11-04-PLAN.md — Child-verification wiring: forward_key observed-push gate + subscribe() kitty replay (wave 2)
 
 ### Phase 12: Validation and v2.2.0 Release
 
@@ -203,7 +203,7 @@ Plans:
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
 | 10. Clickable Terminal Links | 4/4 | Complete    | 2026-09-16 |
-| 11. Negotiated Multiline Input | 3/4 | In Progress|  |
+| 11. Negotiated Multiline Input | 4/4 | In Progress|  |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
 
 ## Planning Notes
