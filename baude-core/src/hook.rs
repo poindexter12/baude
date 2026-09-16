@@ -906,7 +906,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
         std::fs::create_dir_all(&cwd).unwrap();
 
-        seed_settings(&cwd);
+        let fresh_warnings = seed_settings(&cwd);
+        assert!(
+            fresh_warnings.is_empty(),
+            "fresh seed must not warn, got {fresh_warnings:?}"
+        );
         let path = cwd.join(".claude").join("settings.local.json");
         let first = std::fs::read_to_string(&path).expect("seed wrote settings file");
         let v: Value = serde_json::from_str(&first).expect("seed wrote valid JSON");
@@ -919,7 +923,11 @@ mod tests {
         }
 
         // Re-seeding is a no-op on the merged content (idempotent).
-        seed_settings(&cwd);
+        let reseed_warnings = seed_settings(&cwd);
+        assert!(
+            reseed_warnings.is_empty(),
+            "idempotent re-seed must not warn, got {reseed_warnings:?}"
+        );
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second, "re-seed must be idempotent");
 
@@ -1014,6 +1022,133 @@ mod tests {
         assert!(
             rendered.contains(&path.display().to_string()),
             "Display must contain the full settings path, got: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_unreadable_path_left_untouched() {
+        // D-01: a settings path that exists but cannot be read (here: it is a
+        // DIRECTORY, so read_to_string fails with a non-NotFound error on
+        // every supported platform) warns Unreadable and is left alone.
+        let cwd = seed_guard_cwd("unreadable");
+        let path = cwd.join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::Unreadable(_)),
+            "expected Unreadable, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert!(path.is_dir(), "the directory must still exist");
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            0,
+            "the directory must still be empty — nothing written into it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_non_object_root_left_untouched() {
+        // D-01: valid JSON whose root is not an object is user content too —
+        // never coerced to {} and overwritten.
+        let cwd = seed_guard_cwd("non-object");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "[1,2]").unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::NonObjectRoot),
+            "expected NonObjectRoot, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[1,2]".to_vec(),
+            "non-object file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_guard_write_failure_warns_and_preserves_original() {
+        // D-04: read + merge succeed but the write-back fails — exactly one
+        // WriteFailed warning, the original bytes intact, and no panic/abort.
+        // The file itself is made read-only (0o444): directory write
+        // permission alone does not block truncating an EXISTING entry, so
+        // the dir 0o555 chmod is belt-and-braces, not the trigger.
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = seed_guard_cwd("write-fail");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        let original: &[u8] = br#"{"user":true}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        // Restore permissions (0o755/0o644) before asserting so cleanup
+        // succeeds even if an assertion fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::WriteFailed(_)),
+            "expected WriteFailed, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original.to_vec(),
+            "original bytes must be intact after a failed write"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_refusal_repeats_byte_stable() {
+        // Edge-probe idempotency lift: a refused file stays byte-identical
+        // across REPEATED seed attempts — both calls warn, bytes never move.
+        let cwd = seed_guard_cwd("repeat-refusal");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let first = seed_settings(&cwd);
+        assert_eq!(first.len(), 1, "first attempt must warn");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json".to_vec());
+
+        let second = seed_settings(&cwd);
+        assert_eq!(second.len(), 1, "second attempt must warn again");
+        assert!(
+            matches!(second[0].reason, SeedWarningReason::Unparseable(_)),
+            "expected Unparseable on repeat, got {:?}",
+            second[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json".to_vec(),
+            "refused file must stay byte-identical across repeated attempts"
         );
 
         let _ = std::fs::remove_dir_all(&cwd);
