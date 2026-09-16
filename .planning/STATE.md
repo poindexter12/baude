@@ -4,17 +4,17 @@ milestone: v2.2
 milestone_name: Reliability and Terminal Usability
 current_phase: 10
 current_phase_name: Clickable Terminal Links
-status: executing
-stopped_at: Completed 10-03-PLAN.md
-last_updated: "2026-09-16T08:07:28.666Z"
+status: verifying
+stopped_at: Completed 10-04-PLAN.md
+last_updated: "2026-09-16T08:33:57.737Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 10 execution started
-state_head: cf401580caf3bb22c9e86931381fa5ce624c3355
+state_head: cc894460d641cd5ddb2eaaadaa994e522cb72e0a
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 16
-  completed_plans: 15
+  completed_plans: 16
   percent: 20
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 Phase: 10 (Clickable Terminal Links) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-09-15 — Phase 10 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
@@ -86,6 +86,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 10 P01 | 33 min | 2 tasks | 23 files |
 | Phase 10 P02 | 16 min | 2 tasks | 9 files |
 | Phase 10 P03 | 16 min | 2 tasks | 3 files |
+| Phase 10 P04 | 23 min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -188,6 +189,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 10]: OSC8 re-emission at single point Attrs::write_escape_code_diff with intern table threaded through all fork writers (10-02)
 - [Phase 10]: validate_http_url requires canonical http(s):// raw prefix (WHATWG accepts http:/one-slash; fail closed)
 - [Phase 10]: off-screen wrap continuation read via cloned Screen with shifted view window; fork Screen::set_scrollback made public (upstream 0.16 parity)
+- [Phase 10]: Action keys c/y/j/k shadow their hint letters in link-hint mode; shadowed rows reachable via j/k navigation
+- [Phase 10]: Link-hint display truncation anchors on url Position::BeforePath so scheme+host survive any width budget (T-10-15)
+- [Phase 10]: Chord resolves the remote-attach parser under the same remote_id+liveness predicate the render path uses; links sorted (row, start_col)
 
 ### Pending Todos
 
@@ -221,8 +225,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T08:07:28.640Z
-Stopped at: Completed 10-03-PLAN.md
+Last session: 2026-09-16T08:33:57.708Z
+Stopped at: Completed 10-04-PLAN.md
 Resume file: None
 
 ## Deferred Items

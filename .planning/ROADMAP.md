@@ -134,7 +134,7 @@ Plans:
 4. A documented explicit gesture activates links while selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
 5. Unsupported, malformed, or control-bearing targets remain non-activatable; allowed targets are passed as data to the opener, and failures leave the session running with a useful error.
 
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans executed
 **UI hint**: yes
 
 Plans:
@@ -150,7 +150,7 @@ Plans:
 
 **Wave 3**
 
-- [ ] 10-04-PLAN.md — Overlay completion (navigation, copy via injected sink, no-links state), gesture call-site integration incl. remote attach, LINK-04 non-interference proof, opener failure surface + phase-gate full suite
+- [x] 10-04-PLAN.md — Overlay completion (navigation, copy via injected sink, no-links state), gesture call-site integration incl. remote attach, LINK-04 non-interference proof, opener failure surface + phase-gate full suite
 
 ### Phase 11: Negotiated Multiline Input
 
@@ -191,7 +191,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
-| 10. Clickable Terminal Links | 3/4 | In Progress|  |
+| 10. Clickable Terminal Links | 4/4 | In Progress|  |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
 
