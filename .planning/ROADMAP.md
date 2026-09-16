@@ -134,7 +134,7 @@ Plans:
 4. A documented explicit gesture activates links while selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
 5. Unsupported, malformed, or control-bearing targets remain non-activatable; allowed targets are passed as data to the opener, and failures leave the session running with a useful error.
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 **UI hint**: yes
 
 Plans:
@@ -146,7 +146,7 @@ Plans:
 **Wave 2** (10-02 and 10-03 run in parallel — no file overlap)
 
 - [x] 10-02-PLAN.md — TDD: fork grid fidelity (scroll/wrap/resize/overwrite/erase-strip, intern caps, `;` rejoin) + contents_formatted OSC8 re-emission with snapshot round-trip (remote parity)
-- [ ] 10-03-PLAN.md — TDD: bare-URL wrap-join detection with punctuation trim + full validate_http_url matrix (pure links.rs)
+- [x] 10-03-PLAN.md — TDD: bare-URL wrap-join detection with punctuation trim + full validate_http_url matrix (pure links.rs)
 
 **Wave 3**
 
@@ -191,7 +191,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
-| 10. Clickable Terminal Links | 2/4 | In Progress|  |
+| 10. Clickable Terminal Links | 3/4 | In Progress|  |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
 

@@ -50,12 +50,12 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 ### Clickable Terminal Links
 
 - [x] **LINK-01**: A user can activate a labeled OSC8 HTTP(S) link emitted in an agent or shell pane, opening its target rather than interpreting its visible label as a URL.
-- [ ] **LINK-02**: A user can activate a bare HTTP(S) URL, including one soft-wrapped across terminal rows, without adding surrounding prose punctuation or dropping valid URL characters.
+- [x] **LINK-02**: A user can activate a bare HTTP(S) URL, including one soft-wrapped across terminal rows, without adding surrounding prose punctuation or dropping valid URL characters.
 - [x] **LINK-03**: Links remain associated with the correct rendered cells through scrolling, scrollback, wrapping, resizing, overwrites, and erasure, in both local and attached remote TUI terminals.
 - [ ] **LINK-04**: A user can activate links with a documented explicit gesture while ordinary text selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
 - [ ] **LINK-05**: A user can inspect the actual destination of a labeled link before opening it.
 - [ ] **LINK-06**: A user can copy a link's actual destination without opening it.
-- [ ] **LINK-07**: A user sees unsupported, malformed, or control-character-bearing targets as non-activatable text; v2.2 opens only validated HTTP(S) destinations.
+- [x] **LINK-07**: A user sees unsupported, malformed, or control-character-bearing targets as non-activatable text; v2.2 opens only validated HTTP(S) destinations.
 - [ ] **LINK-08**: Opening an allowed link passes the target as data to the platform opener, never shell code, and an opener failure leaves the session running with a useful error.
 
 ### Multiline Input
@@ -117,12 +117,12 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | WLOCK-03 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-04 | Phase 9 | Delivered v2.1.3 |
 | LINK-01 | Phase 10 | Complete |
-| LINK-02 | Phase 10 | Pending |
+| LINK-02 | Phase 10 | Complete |
 | LINK-03 | Phase 10 | Complete |
 | LINK-04 | Phase 10 | Pending |
 | LINK-05 | Phase 10 | Pending |
 | LINK-06 | Phase 10 | Pending |
-| LINK-07 | Phase 10 | Pending |
+| LINK-07 | Phase 10 | Complete |
 | LINK-08 | Phase 10 | Pending |
 | TKEY-01 | Phase 11 | Pending |
 | TKEY-02 | Phase 11 | Pending |
