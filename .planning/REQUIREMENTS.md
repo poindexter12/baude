@@ -35,7 +35,7 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 - [x] **HREG-01** (delivered v2.1.2): Opening or reopening sessions from different baude/bauded executable paths converges each of the four lifecycle events to one recognized baude-owned registration using the current executable.
 - [x] **HREG-02** (delivered v2.1.2): A user's custom hooks, mixed groups, ambiguous registrations, and unrelated settings remain unchanged during owned-registration reconciliation.
-- [ ] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
+- [x] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
   - `seed_settings` degrades an unparseable file to `json!({})` and overwrites it (`hook.rs:282-288`); every fs call is `let _ =` and no warning path exists. `backend/claude.rs:114-121` repeats the pattern for `.mcp.json`.
 - [x] **HREG-04** (delivered plan 09-03): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
   - `baude_hook_command` now emits the POSIX single-quoted canonical form via `quote_posix_single`; `is_seeded_hook_command` accepts quoted (strict round-trip) and legacy forms; `sh -c` E2E proves exact-executable invocation on a space/`$`/`;`/backtick/embedded-`'` path.
@@ -110,7 +110,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | TISO-04 | Phase 8 | Delivered plan 08-07 |
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
-| HREG-03 | Phase 9 | Pending |
+| HREG-03 | Phase 9 | Complete |
 | HREG-04 | Phase 9 | Delivered plan 09-03 |
 | WLOCK-01 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-02 | Phase 9 | Delivered v2.1.3 |
@@ -135,6 +135,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | SHIP-04 | Phase 12 | Pending |
 
 **Coverage:**
+
 - v2.2 requirements: 29 total
 - Mapped to phases: 29
 - Unmapped: 0

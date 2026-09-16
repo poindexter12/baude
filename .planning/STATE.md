@@ -4,17 +4,17 @@ milestone: v2.2
 milestone_name: Reliability and Terminal Usability
 current_phase: 09
 current_phase_name: Hook Seeding Safety
-status: executing
-stopped_at: Completed 09-03-PLAN.md
-last_updated: "2026-09-16T05:00:31.727Z"
+status: verifying
+stopped_at: Completed 09-04-PLAN.md (phase 09 complete)
+last_updated: "2026-09-16T05:20:14.545Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 09 execution started
-state_head: b3d63cfa893fa2dd3f4b6f47594b07ccc2465328
+state_head: 218cf345f084e9e265f4fc31d7598014c9fc308b
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 12
-  completed_plans: 11
+  completed_plans: 12
   percent: 0
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 
 Phase: 09 (Hook Seeding Safety) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-09-15 — Phase 09 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
@@ -81,6 +81,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 09 P01 | 10min | 2 tasks | 5 files |
 | Phase 09 P02 | 5min | 2 tasks | 2 files |
 | Phase 09 P03 | 8min | 2 tasks | 1 files |
+| Phase 09 P04 | 15 min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -175,6 +176,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 09]: bauded held-lock test asserts the existing first-save contention surface (option a); no startup claim added - WLOCK contract unchanged beyond tests
 - [Phase 09]: Lock regression tests simulate the foreign owner with raw OpenOptions + try_lock, never hold_state_lock, so the re-entrant cache is never the thing under test
 - [Phase 09]: POSIX single-quoted hook command is the canonical seeded form; recognizer accepts quoted form only via strict round-trip (re-quote must reproduce input), legacy unquoted form via the old arm - look-alike quotings never claimed (#78)
+- [Phase 09]: .mcp.json command field stays raw current_exe() argv data — direct spawn, no shell (D-09); quoting it would break the MCP server launch
+- [Phase 09]: bauded seed warnings repeat per re-spawn in the restore loop by design — noise accepted over hidden state
 
 ### Pending Todos
 
@@ -208,8 +211,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T05:00:31.693Z
-Stopped at: Completed 09-03-PLAN.md
+Last session: 2026-09-16T05:20:14.515Z
+Stopped at: Completed 09-04-PLAN.md (phase 09 complete)
 Resume file: None
 
 ## Deferred Items
