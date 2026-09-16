@@ -1109,4 +1109,66 @@ mod tests {
         // holding the fixture root as its cwd after the fixture removed it.
         pty.kill_and_wait().unwrap();
     }
+
+    /// LINK-03 remote parity (Pitfall 3): a subscriber attaching AFTER links
+    /// were printed must reconstruct identical link targets from the redraw
+    /// snapshot. Pure — this builds the snapshot bytes exactly the way
+    /// `subscribe()` does (alternate-screen preamble + clear + home +
+    /// `contents_formatted` + mode replay) and feeds them to a fresh parser;
+    /// no real PTY is involved.
+    #[test]
+    fn subscribe_snapshot_replays_pre_attach_links() {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(
+            b"\x1b]8;;https://pre.example/attach\x1b\\pre-attach link\x1b]8;;\x1b\\ plain tail",
+        );
+        let screen = parser.screen();
+
+        // Mirror the snapshot construction in subscribe().
+        let mut bytes = Vec::new();
+        if screen.alternate_screen() {
+            bytes.extend_from_slice(b"\x1b[?1049h");
+        }
+        bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+        bytes.extend_from_slice(&screen.contents_formatted());
+        if screen.application_cursor() {
+            bytes.extend_from_slice(b"\x1b[?1h");
+        }
+        if screen.application_keypad() {
+            bytes.extend_from_slice(b"\x1b=");
+        }
+        if screen.bracketed_paste() {
+            bytes.extend_from_slice(b"\x1b[?2004h");
+        }
+        if screen.hide_cursor() {
+            bytes.extend_from_slice(b"\x1b[?25l");
+        }
+
+        let mut remote = vt100::Parser::new(6, 60, 0);
+        remote.process(&bytes);
+        let remote_screen = remote.screen();
+
+        let target = |s: &vt100::Screen, row: u16, col: u16| -> Option<String> {
+            s.cell(row, col)
+                .and_then(|c| c.link_id())
+                .and_then(|id| s.link_target(id))
+                .map(str::to_string)
+        };
+        for row in 0..6 {
+            for col in 0..60 {
+                assert_eq!(
+                    target(screen, row, col),
+                    target(remote_screen, row, col),
+                    "link target parity at ({row},{col})"
+                );
+            }
+        }
+        // Guard against vacuous parity: the pre-attach link actually links.
+        let id = screen
+            .cell(0, 0)
+            .unwrap()
+            .link_id()
+            .expect("local pre-attach cell carries a link id");
+        assert_eq!(screen.link_target(id), Some("https://pre.example/attach"));
+    }
 }
