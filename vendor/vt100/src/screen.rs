@@ -1046,6 +1046,13 @@ impl Screen {
                     .unwrap();
                 next_cell.clear(crate::attrs::Attrs::default());
                 next_cell.set_wide_continuation(true);
+                // BAUDE FORK (OSC 8): the continuation spacer shares the
+                // wide glyph's link id — without this a wide char inside a
+                // label splits the run (`link_id() == None` at the spacer
+                // column) and recorded spans end early (WR-03). Erase paths
+                // still strip it: every clear/fill routes through
+                // `Cell::clear`, which drops links unconditionally.
+                next_cell.set_link(attrs.link);
                 self.grid_mut().col_inc(1);
             }
         }

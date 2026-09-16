@@ -651,4 +651,21 @@ mod tests {
             "non-http OSC8 target is not collected"
         );
     }
+
+    /// WR-03: a wide char inside an OSC 8 label must not split the recorded
+    /// span — the continuation spacer carries the run's id (vendored fork),
+    /// so `end_col` covers the full label through and past the wide glyph.
+    #[test]
+    fn wide_char_label_records_full_span() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process("\x1b]8;;https://wide.example/\x1b\\a中b\x1b]8;;\x1b\\".as_bytes());
+        let links = collect_links(parser.screen());
+        assert_eq!(links.len(), 1, "one link — no split at the wide char");
+        assert_eq!(links[0].destination.as_str(), "https://wide.example/");
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (0, 0, 3),
+            "span extends across the wide continuation to the label's end"
+        );
+    }
 }

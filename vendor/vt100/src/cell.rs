@@ -117,6 +117,15 @@ impl Cell {
         }
     }
 
+    /// BAUDE FORK (OSC 8): carry a link id onto a cell after `clear()` —
+    /// used for the wide-char continuation spacer, which must share the
+    /// base cell's id so a link run stays contiguous across a wide glyph
+    /// (per-cell consumers — run grouping, hit-testing spans — read ids
+    /// cell by cell). `clear()` itself strips links by design (Pitfall 4).
+    pub(crate) fn set_link(&mut self, link: Option<u16>) {
+        self.attrs.link = link;
+    }
+
     pub(crate) fn attrs(&self) -> &crate::attrs::Attrs {
         &self.attrs
     }

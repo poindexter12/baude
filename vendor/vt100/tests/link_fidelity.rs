@@ -60,6 +60,38 @@ mod link_fidelity {
         assert_eq!(screen.link_target(id), Some("https://w.example/"));
     }
 
+    /// WR-03 — a wide char inside a label must not split the run: the
+    /// continuation spacer cell shares the base cell's link id, so per-cell
+    /// ids are contiguous across the whole label.
+    #[test]
+    fn wide_char_label_keeps_contiguous_link_ids() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process("\x1b]8;;https://wide.example/\x1b\\a中b\x1b]8;;\x1b\\".as_bytes());
+        let screen = parser.screen();
+        let id = screen.cell(0, 0).unwrap().link_id().expect("label linked");
+        assert!(
+            screen.cell(0, 2).unwrap().is_wide_continuation(),
+            "precondition: col 2 is the wide glyph's continuation spacer"
+        );
+        for col in 0..4 {
+            assert_eq!(
+                screen.cell(0, col).unwrap().link_id(),
+                Some(id),
+                "contiguous link id at col {col} (incl. the wide spacer)"
+            );
+        }
+        assert_eq!(screen.link_target(id), Some("https://wide.example/"));
+        // Past the label: no id; and an overwrite still strips the spacer's.
+        assert_eq!(screen.cell(0, 4).unwrap().link_id(), None);
+        parser.process(b"\x1b[1;2HXY");
+        let screen = parser.screen();
+        assert_eq!(
+            screen.cell(0, 2).unwrap().link_id(),
+            None,
+            "overwriting the wide glyph strips the spacer's link id too"
+        );
+    }
+
     /// LINK-03 (resize): surviving cells keep their ids across shrink and
     /// grow; nothing panics.
     #[test]
