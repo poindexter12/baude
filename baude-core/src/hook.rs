@@ -252,6 +252,58 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
+/// A non-fatal problem encountered while seeding a session cwd's
+/// configuration (HREG-03). Seeding is best-effort — a warning never aborts a
+/// spawn — but the operator must SEE it: baude-core returns these as values
+/// and the binaries own presentation (TUI `set_message`, daemon `eprintln`)
+/// per the "core does not print" contract (D-02).
+#[derive(Debug)]
+pub struct SeedWarning {
+    /// The affected file — the warning must name it so the operator can act
+    /// on it (D-02).
+    pub file: std::path::PathBuf,
+    pub reason: SeedWarningReason,
+}
+
+/// Why a seed attempt warned instead of completing silently (D-01/D-04).
+#[derive(Debug)]
+pub enum SeedWarningReason {
+    /// The file exists but could not be read (any error other than
+    /// `NotFound`, which is the normal fresh-seed path).
+    Unreadable(std::io::Error),
+    /// The file read but is not valid JSON.
+    Unparseable(serde_json::Error),
+    /// The file parses but its root is not a JSON object — user content too
+    /// (D-01); never coerced to `{}` and overwritten.
+    NonObjectRoot,
+    /// Read + merge succeeded but the merged settings could not be written
+    /// back. The spawn continues without updated hooks (D-04).
+    WriteFailed(std::io::Error),
+}
+
+impl std::fmt::Display for SeedWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = self.file.display();
+        const UNTOUCHED: &str =
+            "existing settings left untouched; fix or remove the file to let baude seed its hooks";
+        match &self.reason {
+            SeedWarningReason::Unreadable(error) => {
+                write!(f, "{file}: could not read settings ({error}) — {UNTOUCHED}")
+            }
+            SeedWarningReason::Unparseable(error) => {
+                write!(f, "{file}: could not parse settings ({error}) — {UNTOUCHED}")
+            }
+            SeedWarningReason::NonObjectRoot => {
+                write!(f, "{file}: settings root is not a JSON object — {UNTOUCHED}")
+            }
+            SeedWarningReason::WriteFailed(error) => write!(
+                f,
+                "{file}: could not write merged settings ({error}) — session continues without updated hooks"
+            ),
+        }
+    }
+}
+
 /// Best-effort, idempotent, non-clobbering seed of a session cwd's
 /// `.claude/settings.local.json` so a managed Claude session fires baude's
 /// hooks. Single source of truth for both the TUI (`baude`) and the daemon
@@ -263,7 +315,11 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
 /// regardless of the session PATH), and [`merge_hook_settings`] is idempotent
 /// and non-clobbering so re-spawn/restart never duplicates entries and a
 /// user's `statusLine`/own hooks survive.
-pub fn seed_settings(cwd: &std::path::Path) {
+///
+/// Returns the [`SeedWarning`]s encountered (HREG-03): an existing file that
+/// cannot be read, parsed, or whose root is not an object is left
+/// byte-identical and reported instead of being replaced with the seed alone.
+pub fn seed_settings(cwd: &std::path::Path) -> Vec<SeedWarning> {
     let dir = cwd.join(".claude");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("settings.local.json");
@@ -274,6 +330,7 @@ pub fn seed_settings(cwd: &std::path::Path) {
     let command = baude_hook_command();
     let merged = merge_hook_settings(&existing, &command);
     let _ = std::fs::write(&path, merged.to_string());
+    Vec::new()
 }
 
 /// Route one normalized event line to its transport, never losing the event.
@@ -825,6 +882,99 @@ mod tests {
         seed_settings(&cwd);
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second, "re-seed must be idempotent");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ---- seed guard (HREG-03) ------------------------------------------
+
+    /// Unique per-test cwd fixture, same shape as
+    /// `seed_settings_writes_idempotent_merge` (temp_dir + pid-suffixed).
+    fn seed_guard_cwd(tag: &str) -> std::path::PathBuf {
+        let cwd =
+            std::env::temp_dir().join(format!("baude-seed-guard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        cwd
+    }
+
+    #[test]
+    fn seed_guard_unparseable_file_left_untouched_and_warned() {
+        // D-01: a settings file that fails JSON parsing is user content —
+        // it survives a seed attempt byte-identical and the caller gets a
+        // structured warning naming the file, never a silent overwrite.
+        let cwd = seed_guard_cwd("unparseable");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            warnings[0].file.ends_with("settings.local.json"),
+            "warning must name the settings file, got {:?}",
+            warnings[0].file
+        );
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::Unparseable(_)),
+            "expected Unparseable, got {:?}",
+            warnings[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json".to_vec(),
+            "unparseable file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_missing_file_fresh_seed_no_warning() {
+        // D-01: a missing settings file is the normal fresh-seed path — all
+        // four events seeded, no warning.
+        let cwd = seed_guard_cwd("missing");
+
+        let warnings = seed_settings(&cwd);
+
+        assert!(
+            warnings.is_empty(),
+            "fresh seed must not warn, got {warnings:?}"
+        );
+        let path = cwd.join(".claude").join("settings.local.json");
+        let raw = std::fs::read_to_string(&path).expect("fresh seed wrote settings file");
+        let v: Value = serde_json::from_str(&raw).expect("fresh seed wrote valid JSON");
+        for ev in EVENTS {
+            assert!(
+                v["hooks"][ev].is_array(),
+                "missing seeded hook array for {ev}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_display_names_file() {
+        // D-02: the rendered warning must name the affected file so the
+        // operator can act on it.
+        let cwd = seed_guard_cwd("display");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let warnings = seed_settings(&cwd);
+        let rendered = warnings
+            .first()
+            .expect("seed over an unparseable file must return a warning")
+            .to_string();
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "Display must contain the full settings path, got: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
