@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 6
+open_count: 7
 waived_count: 0
 fixed_count: 3
-total_count: 9
-last_updated: 2026-09-15T18:05:06.320Z
+total_count: 10
+last_updated: 2026-09-16T07:24:23.865Z
 ---
 
 # Broken Windows Ledger
@@ -24,6 +24,7 @@ last_updated: 2026-09-15T18:05:06.320Z
 | 7 | 08 | deviation | baude-core/src/worktree_scan.rs |  | 08-05: decision C's gitdir-routing clause is structurally unreachable; prune REFUSES a gitdir-bearing candidate instead of routing it to git's verified-removal path | open |  | 2026-09-15T16:31:45.745Z |  |
 | 8 | 08 | deviation | .planning/REQUIREMENTS.md |  | 08-05: TISO-04 left partial, not complete — plan 08-07 still owns the CLI preview surface the requirement's wording promises | open |  | 2026-09-15T16:31:46.217Z |  |
 | 9 | 08 | stub | baude/src/main.rs |  | `--json --prune` rejection path is fail-closed but untested; a future serializable prune account should replace the rejection and test both | open |  | 2026-09-15T18:05:06.320Z |  |
+| 10 | 10 | stub | baude/src/links.rs |  | collect_bare_links is a planned seam returning no candidates until plan 10-03 wires the bare-URL pass (wrap-join + punctuation trim) | open |  | 2026-09-16T07:24:23.865Z |  |
 
 ````json
 [
@@ -141,6 +142,19 @@ last_updated: 2026-09-15T18:05:06.320Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-15T18:05:06.320Z",
+    "resolved_at": null,
+    "milestone": "v2.2"
+  },
+  {
+    "id": 10,
+    "kind": "stub",
+    "phase": "10",
+    "file": "baude/src/links.rs",
+    "line": null,
+    "description": "collect_bare_links is a planned seam returning no candidates until plan 10-03 wires the bare-URL pass (wrap-join + punctuation trim)",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-16T07:24:23.865Z",
     "resolved_at": null,
     "milestone": "v2.2"
   }

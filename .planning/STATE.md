@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 10
 current_phase_name: Clickable Terminal Links
 status: executing
-stopped_at: Phase 9 complete, ready to plan Phase 8
-last_updated: "2026-09-16T06:49:08.814Z"
+stopped_at: Completed 10-01-PLAN.md
+last_updated: "2026-09-16T07:26:51.764Z"
 last_activity: 2026-09-15
-last_activity_desc: Phase 9 complete, transitioned to Phase 8
-state_head: ac16d3d8f74ec05505424272780b0e9cbc2495f8
+last_activity_desc: Phase 10 execution started
+state_head: 1d9008ff3389060adaa758487dd243fc27360265
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 16
-  completed_plans: 12
+  completed_plans: 13
   percent: 20
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 09 — Hook Seeding Safety
+**Current focus:** Phase 10 — Clickable Terminal Links
 
 ## Current Position
 
-Phase: 10 (Clickable Terminal Links) — READY TO EXECUTE
-Plan: Not started
+Phase: 10 (Clickable Terminal Links) — EXECUTING
+Plan: 2 of 4
 Status: Ready to execute
-Last activity: 2026-09-15 — Phase 9 complete, transitioned to Phase 8
+Last activity: 2026-09-15 — Phase 10 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -83,6 +83,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 09 P02 | 5min | 2 tasks | 2 files |
 | Phase 09 P03 | 8min | 2 tasks | 1 files |
 | Phase 09 P04 | 15 min | 3 tasks | 3 files |
+| Phase 10 P01 | 33 min | 2 tasks | 23 files |
 
 ## Accumulated Context
 
@@ -179,6 +180,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 09]: POSIX single-quoted hook command is the canonical seeded form; recognizer accepts quoted form only via strict round-trip (re-quote must reproduce input), legacy unquoted form via the old arm - look-alike quotings never claimed (#78)
 - [Phase 09]: .mcp.json command field stays raw current_exe() argv data — direct spawn, no shell (D-09); quoting it would break the MCP server launch
 - [Phase 09]: bauded seed warnings repeat per re-spawn in the restore loop by design — noise accepted over hidden state
+- [Phase 10]: 10-01: ctrl+o adopted as the link-hint chord (collision-checked); vendored vt100 0.15.2 fork carries OSC8 as a per-cell Attrs link id
+- [Phase 10]: 10-01: SGR reset preserves the open link in the fork — link runs end only via empty-URI OSC8
 
 ### Pending Todos
 
@@ -212,8 +215,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T05:20:14.515Z
-Stopped at: Phase 9 complete, ready to plan Phase 8
+Last session: 2026-09-16T07:26:51.721Z
+Stopped at: Completed 10-01-PLAN.md
 Resume file: None
 
 ## Deferred Items

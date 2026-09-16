@@ -134,14 +134,14 @@ Plans:
 4. A documented explicit gesture activates links while selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
 5. Unsupported, malformed, or control-bearing targets remain non-activatable; allowed targets are passed as data to the opener, and failures leave the session running with a useful error.
 
-**Plans**: 4 plans
+**Plans**: 1/4 plans executed
 **UI hint**: yes
 
 Plans:
 
 **Wave 1**
 
-- [ ] 10-01-PLAN.md — Tracer: vendored vt100 fork + end-to-end OSC8 slice (ctrl+o → overlay shows destination → validated open via injected opener seam); gesture docs + fork provenance
+- [x] 10-01-PLAN.md — Tracer: vendored vt100 fork + end-to-end OSC8 slice (ctrl+o → overlay shows destination → validated open via injected opener seam); gesture docs + fork provenance
 
 **Wave 2** (10-02 and 10-03 run in parallel — no file overlap)
 
@@ -191,7 +191,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
 | 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
-| 10. Clickable Terminal Links | 0/TBD | Not started | - |
+| 10. Clickable Terminal Links | 1/4 | In Progress|  |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |
 
