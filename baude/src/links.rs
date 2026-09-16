@@ -79,17 +79,232 @@ pub fn collect_links(screen: &vt100::Screen) -> Vec<DetectedLink> {
     out
 }
 
-/// Bare-URL pass seam: scheme-anchored scan with wrap-joining and trailing
-/// punctuation trimming. Implemented in plan 10-03; until then no bare
-/// candidates are produced.
-fn collect_bare_links(_screen: &vt100::Screen) -> Vec<DetectedLink> {
-    Vec::new()
+/// How many rows past the view edge a `row_wrapped` continuation is
+/// followed so an off-screen URL tail still joins completely (RESEARCH
+/// Open Question 2 resolution: bounded, <= 4 extra rows). The hint anchor
+/// always stays on the visible fragment.
+const BARE_CONTINUATION_BOUND: usize = 4;
+
+/// Bare-URL pass (LINK-02): build logical lines by joining row `r+1` onto
+/// row `r` while `screen.row_wrapped(r)` — the grid's exact wrap metadata,
+/// the same authority selection copy trusts (app.rs:5460-5462); never a
+/// column-width heuristic. Scan each logical line for case-insensitive
+/// `http(s)://` anchors, extend across the RFC 3986 charset, trim unbalanced
+/// trailing prose punctuation, then gate through [`validate_http_url`].
+/// Cells inside an OSC 8 run are excluded (the explicit link wins).
+fn collect_bare_links(screen: &vt100::Screen) -> Vec<DetectedLink> {
+    let (rows, cols) = screen.size();
+    let mut out = Vec::new();
+    // Logical-line accumulator: one char per grid glyph, with the visible
+    // (row, col) of each char — `None` for off-screen continuation chars
+    // and for OSC8-run placeholders (never anchorable).
+    let mut chars: Vec<char> = Vec::new();
+    let mut cells: Vec<Option<(u16, u16)>> = Vec::new();
+    for row in 0..rows {
+        push_row_text(screen, row, Some(row), cols, &mut chars, &mut cells);
+        if !screen.row_wrapped(row) {
+            scan_line_for_urls(&chars, &cells, &mut out);
+            chars.clear();
+            cells.clear();
+        }
+    }
+    if !chars.is_empty() {
+        // The bottom visible row is wrapped: its continuation rows sit below
+        // the view edge (they exist only when scrolled back — at offset 0
+        // the view bottom IS the grid bottom). Shift a clone's view window
+        // down one row at a time to read them, bounded.
+        let offset = screen.scrollback();
+        let reachable = offset.min(BARE_CONTINUATION_BOUND);
+        if reachable > 0 {
+            let mut peek = screen.clone();
+            for k in 1..=reachable {
+                peek.set_scrollback(offset - k);
+                // The k-th row below the original edge is the bottom row of
+                // the view shifted down by k.
+                push_row_text(&peek, rows - 1, None, cols, &mut chars, &mut cells);
+                if !peek.row_wrapped(rows - 1) {
+                    break;
+                }
+            }
+        }
+        // Flush whatever joined — a chain longer than the bound yields the
+        // truncated candidate, collected only if it still validates.
+        scan_line_for_urls(&chars, &cells, &mut out);
+    }
+    out
+}
+
+/// Append one grid row to the logical-line accumulator. `span_row` is the
+/// visible row index recorded for span anchoring (`None` for off-screen
+/// continuation rows). OSC8-run cells contribute a space placeholder so no
+/// bare candidate can start on or extend through them.
+fn push_row_text(
+    screen: &vt100::Screen,
+    row: u16,
+    span_row: Option<u16>,
+    cols: u16,
+    chars: &mut Vec<char>,
+    cells: &mut Vec<Option<(u16, u16)>>,
+) {
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
+        if cell.link_id().is_some() {
+            chars.push(' ');
+            cells.push(None);
+            continue;
+        }
+        let contents = cell.contents();
+        if contents.is_empty() {
+            // Blank (or wide-continuation) cell: a space terminates any URL
+            // charset run, which is correct — URLs never contain spaces.
+            chars.push(' ');
+            cells.push(span_row.map(|r| (r, col)));
+        } else {
+            for ch in contents.chars() {
+                chars.push(ch);
+                cells.push(span_row.map(|r| (r, col)));
+            }
+        }
+    }
+}
+
+/// Scan one logical line for scheme-anchored candidates and collect every
+/// one that survives trimming and validation.
+fn scan_line_for_urls(
+    chars: &[char],
+    cells: &[Option<(u16, u16)>],
+    out: &mut Vec<DetectedLink>,
+) {
+    let mut i = 0;
+    while i < chars.len() {
+        if !(starts_with_ci(chars, i, "http://") || starts_with_ci(chars, i, "https://")) {
+            i += 1;
+            continue;
+        }
+        // Extend across the RFC 3986 charset.
+        let mut j = i;
+        while j < chars.len() && is_rfc3986_char(chars[j]) {
+            j += 1;
+        }
+        let end = trim_trailing_punctuation(chars, i, j);
+        if end > i {
+            let candidate: String = chars[i..end].iter().collect();
+            if let Some(destination) = validate_http_url(&candidate) {
+                // Anchor span: the first visible fragment. A candidate whose
+                // scheme starts off-screen has no visible anchor — skipped
+                // (hints label visible links only).
+                if let Some((row, start_col)) = cells[i] {
+                    let mut end_col = start_col;
+                    for cell in &cells[i..end] {
+                        if let Some((r, c)) = cell {
+                            if *r == row {
+                                end_col = *c;
+                            }
+                        }
+                    }
+                    out.push(DetectedLink {
+                        destination,
+                        row,
+                        start_col,
+                        end_col,
+                        source: LinkSource::Bare,
+                    });
+                }
+            }
+        }
+        i = j.max(i + 1);
+    }
+}
+
+/// Case-insensitive ASCII prefix match at a char index.
+fn starts_with_ci(chars: &[char], at: usize, prefix: &str) -> bool {
+    let mut idx = at;
+    for p in prefix.chars() {
+        match chars.get(idx) {
+            Some(c) if c.eq_ignore_ascii_case(&p) => idx += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// RFC 3986 URI characters: unreserved / gen-delims / sub-delims / `%`.
+fn is_rfc3986_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
+}
+
+/// Iteratively strip unbalanced trailing prose punctuation (the locked list
+/// `.,;:!?)]}'"`) from `chars[start..end]`. A closing `)`/`]`/`}` is kept
+/// when its matching opener occurs within the candidate (balanced), so
+/// `.../Foo_(bar)` keeps its paren while a wrapping `(...)` loses the outer
+/// one. Returns the new exclusive end index.
+fn trim_trailing_punctuation(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start {
+        let c = chars[end - 1];
+        if !matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
+        ) {
+            break;
+        }
+        if let Some(open) = match c {
+            ')' => Some('('),
+            ']' => Some('['),
+            '}' => Some('{'),
+            _ => None,
+        } {
+            let opens = chars[start..end].iter().filter(|&&x| x == open).count();
+            let closes = chars[start..end].iter().filter(|&&x| x == c).count();
+            if closes <= opens {
+                break; // balanced: this closer matches an opener in the URL
+            }
+        }
+        end -= 1;
+    }
+    end
 }
 
 /// LINK-07: only parsed http/https, no control chars pre- or post-percent-
 /// decode, no whitespace. Returns the normalized URL that will be displayed
 /// AND passed to argv.
 pub fn validate_http_url(raw: &str) -> Option<url::Url> {
+    // WHATWG parsing is more permissive than the raw string (RESEARCH
+    // Pitfall 7): `http:/one-slash` and `http:one-slash` both parse to a
+    // well-formed URL. Require the canonical `http(s)://` prefix on the raw
+    // input so malformed spellings stay plain text (fail closed).
+    let bytes = raw.as_bytes();
+    let canonical_prefix = (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"))
+        || (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"));
+    if !canonical_prefix {
+        return None;
+    }
     if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return None; // pre-decode check on the raw string
     }

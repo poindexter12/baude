@@ -147,7 +147,13 @@ impl Screen {
         self.grid().scrollback()
     }
 
-    pub(crate) fn set_scrollback(&mut self, rows: usize) {
+    /// BAUDE FORK (OSC 8): public (upstream keeps this `pub(crate)` and
+    /// exposes it via `Parser::set_scrollback`; upstream 0.16 moved it to
+    /// `Screen` the same way). The gesture-time bare-URL pass in
+    /// `baude/src/links.rs` clones the `Screen` and shifts the clone's view
+    /// window to read the bounded off-screen wrap continuation below the
+    /// view edge — read-only with respect to the live parser state.
+    pub fn set_scrollback(&mut self, rows: usize) {
         self.grid_mut().set_scrollback(rows);
     }
 

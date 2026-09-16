@@ -120,7 +120,18 @@ impl Grid {
         self.scrollback
             .iter()
             .skip(scrollback_len - self.scrollback_offset)
-            .chain(self.rows.iter().take(rows_len - self.scrollback_offset))
+            // BAUDE FORK (OSC 8): saturating_sub — upstream `rows_len -
+            // scrollback_offset` underflows (debug-build panic) whenever the
+            // view is scrolled back further than the screen height, a legal
+            // state (`set_scrollback` caps at scrollback.len() only). With
+            // offset > rows_len the visible window lies entirely within the
+            // scrollback tail, so zero grid rows is the correct contribution;
+            // consumers read at most the first rows_len elements either way.
+            .chain(
+                self.rows
+                    .iter()
+                    .take(rows_len.saturating_sub(self.scrollback_offset)),
+            )
     }
 
     pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
