@@ -16,6 +16,12 @@ const MAX_LINK_URI_LEN: usize = 2083;
 /// plain text while existing ids keep resolving (Pitfall 6).
 const MAX_LINKS: usize = 10_000;
 
+/// BAUDE FORK (kitty keyboard): maximum tracked push depth, matching the
+/// kitty spec's stack cap. On overflow the OLDEST entry is evicted (spec
+/// behavior), so a hostile child flooding `CSI > flags u` can never grow
+/// state beyond 32 entries.
+const KITTY_STACK_MAX: usize = 32;
+
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MouseProtocolMode {
@@ -94,6 +100,11 @@ pub struct Screen {
     /// store a `u16` index into this table; entries are append-only so ids
     /// referenced from scrollback stay valid. (Caps land in plan 10-02.)
     links: Vec<(String, String)>,
+
+    /// BAUDE FORK (kitty keyboard): the child's kitty keyboard-protocol
+    /// flag stack, tracked from `CSI > u` / `CSI < u` / `CSI = u`. Bounded
+    /// at `KITTY_STACK_MAX`; the top entry is the active flags value.
+    kitty_stack: Vec<u16>,
 }
 
 impl Screen {
@@ -120,6 +131,8 @@ impl Screen {
             errors: 0,
 
             links: Vec::new(),
+
+            kitty_stack: Vec::new(),
         }
     }
 
@@ -704,7 +717,7 @@ impl Screen {
     /// never answered.
     #[must_use]
     pub fn kitty_keyboard(&self) -> u16 {
-        0
+        self.kitty_stack.last().copied().unwrap_or(0)
     }
 
     /// Returns the currently active `MouseProtocolMode`
@@ -1322,6 +1335,47 @@ impl Screen {
         }
     }
 
+    // BAUDE FORK (kitty keyboard): CSI > flags u — push `flags` onto the
+    // tracked stack. Fail-closed posture copies the OSC 8 precedent: named
+    // const cap, no allocation proportional to attacker-controlled params.
+    // At the cap the OLDEST entry is dropped per the kitty spec's eviction
+    // rule, then the new entry is pushed.
+    fn kitty_push(&mut self, flags: u16) {
+        if self.kitty_stack.len() >= KITTY_STACK_MAX {
+            self.kitty_stack.remove(0);
+        }
+        self.kitty_stack.push(flags);
+    }
+
+    // BAUDE FORK (kitty keyboard): CSI < n u — pop `n` entries,
+    // saturating: a hostile `n` larger than the stack simply empties it
+    // (no panic, no underflow).
+    fn kitty_pop(&mut self, n: u16) {
+        let n = usize::from(n).min(self.kitty_stack.len());
+        let new_len = self.kitty_stack.len() - n;
+        self.kitty_stack.truncate(new_len);
+    }
+
+    // BAUDE FORK (kitty keyboard): CSI = flags ; mode u — set the current
+    // flags on the TOP entry (mode 1 replace, 2 OR, 3 AND-NOT), or
+    // establish the active entry when the stack is empty. Unknown modes
+    // are ignored (fail closed — no state change).
+    fn kitty_set(&mut self, flags: u16, mode: u16) {
+        if !matches!(mode, 1..=3) {
+            return;
+        }
+        if self.kitty_stack.is_empty() {
+            self.kitty_stack.push(0);
+        }
+        if let Some(top) = self.kitty_stack.last_mut() {
+            match mode {
+                2 => *top |= flags,
+                3 => *top &= !flags,
+                _ => *top = flags,
+            }
+        }
+    }
+
     // CSI l
     #[allow(clippy::unused_self)]
     fn rm(&mut self, params: &vte::Params) {
@@ -1658,6 +1712,24 @@ impl vte::Perform for Screen {
                     }
                 }
             },
+            // BAUDE FORK (kitty keyboard): track the child's kitty
+            // keyboard-protocol stack ops. Only the final 'u' is handled;
+            // every other final under these intermediates keeps falling
+            // through to the existing debug-log path. The child's query
+            // probe (`CSI ? u`) is deliberately NOT handled above and no
+            // reply path exists anywhere in the fork: baude observes
+            // enhanced-mode pushes without advertising an emulation it
+            // does not implement (T-11-06).
+            Some(b'>') if c == 'u' => {
+                self.kitty_push(canonicalize_params_1(params, 0));
+            }
+            Some(b'<') if c == 'u' => {
+                self.kitty_pop(canonicalize_params_1(params, 1));
+            }
+            Some(b'=') if c == 'u' => {
+                let (flags, mode) = canonicalize_params_2(params, 0, 1);
+                self.kitty_set(flags, mode);
+            }
             Some(i) => {
                 if log::log_enabled!(log::Level::Debug) {
                     log::debug!(
