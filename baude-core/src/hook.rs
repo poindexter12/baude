@@ -91,9 +91,39 @@ pub fn baude_hook_command() -> String {
         return command;
     }
     match std::env::current_exe() {
-        Ok(p) => format!("{} hook", p.display()),
+        // D-05/D-06: always-quote, unconditionally — hook commands run
+        // through a shell, so an unquoted path bearing a space, `$`, `;`, or
+        // a backtick invokes the wrong argv (or worse). One canonical quoted
+        // form keeps the idempotency sentinel deterministic.
+        Ok(p) => format!("{} hook", quote_posix_single(&p.display().to_string())),
         Err(_) => FALLBACK_HOOK_COMMAND.to_string(),
     }
+}
+
+/// Wrap `s` in POSIX single quotes, escaping each embedded `'` as the 4-char
+/// quote–backslash-quote–quote sequence (`'\''`).
+///
+/// Inside single quotes a POSIX shell interprets NOTHING, so this one rule
+/// neutralizes spaces, `$`, `;`, backticks, and every other metacharacter
+/// (D-05). This string is both what [`baude_hook_command`] seeds and the
+/// exact form [`is_seeded_hook_command`]'s strict round-trip check demands —
+/// producer and recognizer share this single rule.
+pub fn quote_posix_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Strict inverse of [`quote_posix_single`]: strip the outer quotes, invert
+/// the `'\''` escape, and return the path ONLY if re-quoting it reproduces
+/// `quoted` byte-for-byte.
+///
+/// The round-trip requirement is the #78 guard: a user command that merely
+/// LOOKS quoted (doubled outer quotes, a raw un-escaped inner quote, bad
+/// escaping) never round-trips, so it is never claimed as baude's seed — and
+/// therefore never pruned or counted toward the worktree-removal exemption.
+fn unquote_posix_single(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
+    let candidate = inner.replace(r"'\''", "'");
+    (quote_posix_single(&candidate) == quoted).then_some(candidate)
 }
 
 /// True iff `command` is one this module previously seeded from a resolved
@@ -109,10 +139,26 @@ pub fn baude_hook_command() -> String {
 /// when `current_exe()` fails): it names no specific install, so it can never go
 /// stale and is never pruned.
 pub fn is_seeded_hook_command(command: &str) -> bool {
-    let Some(path) = command.strip_suffix(" hook") else {
+    let Some(remainder) = command.strip_suffix(" hook") else {
         return false;
     };
-    let path = std::path::Path::new(path);
+    // Two-arm extraction (D-07): the quoted canonical form produced by
+    // [`quote_posix_single`], or the legacy raw absolute path seeded by an
+    // older binary. Unquote BEFORE the `Path` checks — a still-quoted string
+    // is never `is_absolute()`, so a naive check would silently reject the
+    // quoted form and reintroduce per-path accumulation (Pitfall 1).
+    let path = if remainder.len() >= 2 && remainder.starts_with('\'') && remainder.ends_with('\'') {
+        // Strict round-trip: accept ONLY a string quote_posix_single itself
+        // produces. A malformed/user look-alike quoting is not ours (#78) —
+        // and it does NOT fall through to the legacy arm.
+        match unquote_posix_single(remainder) {
+            Some(path) => path,
+            None => return false,
+        }
+    } else {
+        remainder.to_string()
+    };
+    let path = std::path::Path::new(&path);
     path.is_absolute()
         && matches!(
             path.file_stem().and_then(|stem| stem.to_str()),
@@ -1156,13 +1202,38 @@ mod tests {
 
     // ---- POSIX-quoted seeded command (HREG-04, 09-03) --------------------
 
-    /// Test-local POSIX single-quote helper: the rule the production
-    /// `quote_posix_single` adopts in GREEN (single-quote wrap, embedded `'`
-    /// escaped as the 4-char `'\''` sequence). Kept test-local so the RED
-    /// commit compiles against today's code and fails on assertions, never
-    /// on a missing symbol.
-    fn q(s: &str) -> String {
-        format!("'{}'", s.replace('\'', r"'\''"))
+    #[test]
+    fn quote_posix_single_exact_output() {
+        assert_eq!(quote_posix_single("/opt/baude"), "'/opt/baude'");
+        assert_eq!(
+            quote_posix_single("/opt/spa ced/baude"),
+            "'/opt/spa ced/baude'"
+        );
+        // An embedded `'` becomes exactly the 4-char escape sequence.
+        let quoted = quote_posix_single("/opt/qu'ote/baude");
+        assert_eq!(quoted, r"'/opt/qu'\''ote/baude'");
+        assert!(quoted.contains(r"'\''"));
+    }
+
+    #[test]
+    fn quote_unquote_round_trips_every_hostile_class() {
+        for input in [
+            "",
+            "/opt/baude",
+            "/opt/spa ced/baude",
+            "/opt/a$b;c/bauded",
+            "/opt/back`tick/baude",
+            "/opt/qu'ote/baude",
+            "/opt/''double/baude",
+            "'",
+        ] {
+            let quoted = quote_posix_single(input);
+            assert_eq!(
+                unquote_posix_single(&quoted).as_deref(),
+                Some(input),
+                "round-trip must recover {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -1186,7 +1257,7 @@ mod tests {
     fn quoted_seeded_command_embedded_quote_is_recognized() {
         // An embedded `'` in the directory name exercises the producer's
         // quote–backslash-quote–quote escape.
-        let cmd = format!("{} hook", q("/opt/qu'ote/baude"));
+        let cmd = format!("{} hook", quote_posix_single("/opt/qu'ote/baude"));
         assert_eq!(cmd, r"'/opt/qu'\''ote/baude' hook");
         assert!(is_seeded_hook_command(&cmd));
     }
@@ -1275,7 +1346,9 @@ mod tests {
         std::fs::write(&stub, "#!/bin/sh\nprintf ran > \"$MARKER\"\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let cmd = format!("{} hook", q(&stub.display().to_string()));
+        // The SAME rule the production formatter uses — producer, E2E, and
+        // recognizer share quote_posix_single.
+        let cmd = format!("{} hook", quote_posix_single(&stub.display().to_string()));
         // Producer/recognizer contract: the seeded string is ours.
         assert!(
             is_seeded_hook_command(&cmd),
