@@ -2171,7 +2171,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Help => {
-            let rect = centered(area, 60, 35);
+            // 37 paragraph lines + 2 border rows; keep in sync when adding
+            // rows or `help_overlay_lists_shift_enter`'s closing-line assert
+            // fails on the clip.
+            let rect = centered(area, 60, 39);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2209,6 +2212,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  ctrl+o      link hints (inspect/copy/open urls)"),
                 Line::raw("  ctrl+q, x   close session"),
                 Line::raw("  alt+←/→     cycle sessions (skips archived + closed)"),
+                Line::raw("  shift+enter  newline in claude pane"),
+                Line::raw("               (kitty-capable terminals; see README)"),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "status (sidebar sorts alphabetically)",
