@@ -5483,6 +5483,7 @@ impl App {
                             _ => self.selected().map(|s| &s.claude.parser),
                         }
                     };
+                    let mut copy_result = None;
                     if let Some(parser) = parser {
                         if let Ok(mut p) = parser.lock() {
                             p.set_scrollback(scroll);
@@ -5493,9 +5494,13 @@ impl App {
                             let text = screen.contents_between(sr, sc, er, ec + 1);
                             p.set_scrollback(0);
                             if !text.is_empty() {
-                                Self::copy_to_clipboard(&text);
+                                copy_result = Some(Self::copy_to_clipboard(&text));
                             }
                         }
+                    }
+                    // WR-02: a silent no-op copy must not look like success.
+                    if let Some(Err(e)) = copy_result {
+                        self.set_message(format!("copy failed: {e}"));
                     }
                 }
             }
@@ -5503,18 +5508,54 @@ impl App {
         }
     }
 
-    fn copy_to_clipboard(text: &str) {
+    /// Pipe `text` into the platform clipboard writer. Fallible so callers
+    /// can surface failure instead of asserting a success they cannot
+    /// observe (WR-02): `pbcopy` on macOS; `wl-copy` (Wayland) with an
+    /// `xclip` fallback (X11) elsewhere — cfg-gated like `OPENER`.
+    fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
         use std::io::Write;
-        if let Ok(mut child) = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
+        #[cfg(target_os = "macos")]
+        const CLIPBOARD_CMDS: &[&[&str]] = &[&["pbcopy"]];
+        #[cfg(not(target_os = "macos"))]
+        const CLIPBOARD_CMDS: &[&[&str]] =
+            &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
+        let mut last_err: Option<std::io::Error> = None;
+        for argv in CLIPBOARD_CMDS {
+            match Command::new(argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                // Spawned: the command exists, so a failure past this point
+                // is a real copy failure — report it, never fall through.
+                Ok(mut child) => {
+                    let written = match child.stdin.take() {
+                        Some(mut stdin) => stdin.write_all(text.as_bytes()),
+                        None => Err(std::io::Error::other("clipboard stdin unavailable")),
+                    };
+                    // stdin is dropped, so the writer sees EOF; both
+                    // clipboard writers fork/exit promptly after that, and
+                    // waiting here reaps the child (no zombie, no reaper
+                    // thread needed).
+                    let status = child.wait()?;
+                    written?;
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(format!(
+                            "{} exited with {status}",
+                            argv[0]
+                        )))
+                    };
+                }
+                // Spawn failed (binary missing): try the next candidate.
+                Err(e) => last_err = Some(e),
             }
         }
+        Err(last_err
+            .unwrap_or_else(|| std::io::Error::other("no clipboard command available")))
     }
 
     /// Open link-hint mode for the focused content pane (LINK-04's explicit
@@ -5573,7 +5614,7 @@ impl App {
     fn handle_link_hints_key<F, C>(&mut self, key: KeyEvent, open: F, copy: C)
     where
         F: FnOnce(&str) -> std::io::Result<()>,
-        C: FnOnce(&str),
+        C: FnOnce(&str) -> std::io::Result<()>,
     {
         let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         match key.code {
@@ -5593,11 +5634,18 @@ impl App {
                 let modal = std::mem::replace(&mut self.modal, Modal::None);
                 if let Modal::LinkHints { links, selected } = modal {
                     if let Some(link) = links.get(selected) {
-                        copy(link.destination.as_str());
-                        self.set_message(format!(
-                            "copied {}",
-                            display_truncated(&link.destination)
-                        ));
+                        // WR-02: the sink is fallible — claim "copied" only
+                        // when it reports success; failure surfaces the same
+                        // non-fatal way as activate_link's opener errors.
+                        match copy(link.destination.as_str()) {
+                            Ok(()) => self.set_message(format!(
+                                "copied {}",
+                                display_truncated(&link.destination)
+                            )),
+                            Err(e) => {
+                                self.set_message(format!("copy failed: {e}"));
+                            }
+                        }
                     }
                 }
             }
@@ -5818,7 +5866,10 @@ mod link_hints {
                 opened.borrow_mut().push(u.to_string());
                 Ok(())
             },
-            |u| copied.borrow_mut().push(u.to_string()),
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
         );
         assert_eq!(
             copied.borrow().as_slice(),
@@ -5846,7 +5897,10 @@ mod link_hints {
                 opened.borrow_mut().push(u.to_string());
                 Ok(())
             },
-            |u| copied.borrow_mut().push(u.to_string()),
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
         );
         assert_eq!(
             copied.borrow().as_slice(),
@@ -5855,6 +5909,27 @@ mod link_hints {
         );
         assert!(opened.borrow().is_empty(), "y must never open");
         assert!(matches!(app.modal, Modal::None), "y closes the modal");
+    }
+
+    /// WR-02: a failing copy sink surfaces "copy failed: {e}" — never a
+    /// false "copied" success claim — and the modal still closes. The
+    /// session survives, same non-fatal surface as opener errors.
+    #[test]
+    fn copy_error_surfaces_failure_not_success() {
+        let (_rd, mut app) = hinted(&["https://example.com/x"], 0);
+        app.handle_link_hints_key(
+            key(KeyCode::Char('c')),
+            |_| panic!("copy must not open"),
+            |_| Err(std::io::Error::other("no clipboard command available")),
+        );
+        assert!(matches!(app.modal, Modal::None), "modal closes on copy Err");
+        let (msg, _) = app.message.as_ref().expect("copy Err sets a message");
+        assert!(msg.contains("copy failed"), "names the failure: {msg}");
+        assert!(
+            msg.contains("no clipboard command available"),
+            "carries the cause: {msg}"
+        );
+        assert!(!msg.contains("copied "), "no false success claim: {msg}");
     }
 
     /// j/k and Up/Down move `selected` with bounds clamping.
@@ -5866,7 +5941,7 @@ mod link_hints {
             "https://c.example.com/",
         ];
         let (_rd, mut app) = hinted(&urls, 0);
-        let noop = |_: &str| {};
+        let noop = |_: &str| -> std::io::Result<()> { Ok(()) };
         let never = |_: &str| -> std::io::Result<()> { panic!("navigation must not open") };
         app.handle_link_hints_key(key(KeyCode::Char('j')), never, noop);
         assert_eq!(selected_of(&app), 1, "j moves down");
@@ -5903,7 +5978,10 @@ mod link_hints {
                     opened.borrow_mut().push(u.to_string());
                     Ok(())
                 },
-                |u| copied.borrow_mut().push(u.to_string()),
+                |u| {
+                    copied.borrow_mut().push(u.to_string());
+                    Ok(())
+                },
             );
         };
         press(&mut app, 'b');
@@ -5937,7 +6015,10 @@ mod link_hints {
                 opened.borrow_mut().push(u.to_string());
                 Ok(())
             },
-            |u| copied.borrow_mut().push(u.to_string()),
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
         );
         assert_eq!(
             opened.borrow().as_slice(),
@@ -5954,7 +6035,7 @@ mod link_hints {
     fn unhandled_keys_are_swallowed() {
         let (_rd, mut app) = hinted(&["https://a.example.com/"], 0);
         let never_open = |_: &str| -> std::io::Result<()> { panic!("swallowed key opened") };
-        let never_copy = |_: &str| panic!("swallowed key copied");
+        let never_copy = |_: &str| -> std::io::Result<()> { panic!("swallowed key copied") };
         for code in [
             KeyCode::Char('!'),
             KeyCode::Char('C'),
