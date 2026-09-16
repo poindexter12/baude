@@ -2839,9 +2839,8 @@ impl App {
         // Best-effort: a seeding failure must NOT abort the spawn — the session
         // simply falls back to the silence path (no regression) — but the
         // operator must SEE it (HREG-03/D-02): surface every warning.
-        for warning in be.prepare_cwd(&cwd) {
-            self.warn_seed_failure(&warning);
-        }
+        let seed_warnings = be.prepare_cwd(&cwd);
+        self.warn_seed_failures(&seed_warnings);
 
         if baude_core::permission::is_prompt_mode() && be.prompt_mode_needs_daemon() {
             // WR-01: claude's permission approval is inherently daemon+PWA-
@@ -3604,18 +3603,34 @@ impl App {
         self.set_message(MSG.into());
     }
 
-    /// HREG-03/D-02: surface one seed warning from a spawn path's
-    /// `prepare_cwd` — visibly in the TUI every time, and once per process to
-    /// stderr (the once-flag is shared by ALL seed warnings; only the stderr
-    /// echo is deduplicated). The warning names the affected file so the
-    /// operator can fix or remove it; seeding stays best-effort and the spawn
-    /// continues regardless (D-04).
-    fn warn_seed_failure(&mut self, warning: &baude_core::hook::SeedWarning) {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("baude: {warning}");
+    /// HREG-03/D-02: surface every seed warning from a spawn path's
+    /// `prepare_cwd`. The TUI message is a single aggregate naming EVERY
+    /// affected file — `set_message` is last-wins, so per-warning calls would
+    /// drop all but the final warning of a multi-warning spawn (e.g. a
+    /// prompt-mode spawn warning about both `settings.local.json` and
+    /// `.mcp.json`). The stderr echo is deduplicated once per process PER
+    /// affected file (not one flag shared by all warnings), so a later
+    /// warning about a different file is never silently swallowed. Seeding
+    /// stays best-effort and the spawn continues regardless (D-04).
+    fn warn_seed_failures(&mut self, warnings: &[baude_core::hook::SeedWarning]) {
+        if warnings.is_empty() {
+            return;
         }
-        self.set_message(warning.to_string());
+        static WARNED_FILES: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let mut warned = WARNED_FILES.lock().unwrap_or_else(|p| p.into_inner());
+        for warning in warnings {
+            if warned.insert(warning.file.clone()) {
+                eprintln!("baude: {warning}");
+            }
+        }
+        drop(warned);
+        let combined = warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        self.set_message(combined);
     }
 
     /// Feed the desktop-banner state machine one snapshot of every sidebar
@@ -5261,9 +5276,8 @@ impl App {
         let plan = be.spawn_plan(&base, None, mode);
         // HREG-03/D-02: surface seed warnings exactly like the add-session
         // path — restart is a spawn path too.
-        for warning in be.prepare_cwd(&cwd) {
-            self.warn_seed_failure(&warning);
-        }
+        let seed_warnings = be.prepare_cwd(&cwd);
+        self.warn_seed_failures(&seed_warnings);
         let checkout = checkout_for_runtime(&self.runtime_checkouts, id);
         let mut pty = if let Some(checkout) = checkout {
             let generation = self
@@ -9497,7 +9511,7 @@ mod tests {
         let message = app
             .message
             .clone()
-            .expect("warn_seed_failure must set a TUI message")
+            .expect("warn_seed_failures must set a TUI message")
             .0;
         assert!(
             message.contains(&settings.display().to_string()),
