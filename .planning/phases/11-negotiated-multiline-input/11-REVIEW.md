@@ -44,6 +44,7 @@ Remaining findings are two genuine residual-state gaps in the fail-closed story 
 
 ### WR-01: `Terminal::new(...)?` after the keyboard push bypasses `restore_terminal` on Err
 
+**Status:** FIXED — `64550bc` (`Terminal::new` Err now routes through `restore_terminal()` before propagating)
 **File:** `baude/src/main.rs:450` (the `ratatui::Terminal::new(...)?` immediately after the `PushKeyboardEnhancementFlags` block)
 **Issue:** The kitty push executes, `KEYBOARD_ENHANCED` is set, and then `Terminal::new(...)?` can return `Err` and propagate out of `main()` without ever calling `restore_terminal()`. This is a non-panic path, so the panic hook does not fire: the outer terminal is left in raw mode, on the alternate screen, with the keyboard-enhancement flags still pushed. Raw-mode/alt-screen leakage on this path is pre-existing, but the phase added a new piece of leaked terminal state (the pushed flags), and the phase's own invariant is "pop on every controlled exit." T-11-03 (enhanced-flag residue) explicitly targets this failure class.
 **Fix:** Route the error through the restore path instead of `?`:
@@ -60,6 +61,7 @@ let mut terminal = match ratatui::Terminal::new(ratatui::backend::CrosstermBacke
 
 ### WR-02: Single kitty stack survives alternate-screen exit — stale fail-open child verification
 
+**Status:** FIXED — `29bee2d` (per-screen stacks matching kitty: independent main/alternate stacks, alternate stack emptied on activation; `kitty_keyboard()` reads the active screen's stack; 3 new fork tests cover alt-exit fail-closed, main-flag restore, and re-entry reset)
 **File:** `vendor/vt100/src/screen.rs:708-720` (accessor + single `kitty_stack`); consumed at `baude/src/app.rs:5716`
 **Issue:** Real kitty keeps *independent* keyboard-mode stacks for the main and alternate screens precisely so an alt-screen app that dies without popping cannot poison main-screen input. The fork deliberately uses one stack (documented in the accessor docstring), but the docstring does not name the resulting fail-open consequence: a child app (e.g. neovim in the shell pane) enters the alternate screen, pushes `CSI > 1 u`, then is killed or crashes without popping. The screen returns to the main-screen shell, `kitty_keyboard()` still reads nonzero, `kitty_child` stays true, and Shift+Enter now sends `\x1b[13;2u` into a legacy readline — literal `[13;2u` junk typed at the prompt until the user runs `reset` (RIS is the only recovery path that clears the stack). This is a reachable stale-verification path that violates the phase's fail-closed posture; every other residue path (fresh parser, pop, RIS, poison) was closed.
 **Fix:** Clear (or shelve) the kitty stack when the alternate screen is exited, matching kitty's per-screen isolation in the cheapest possible form:
@@ -71,6 +73,7 @@ or track two stacks keyed on `MODE_ALTERNATE_SCREEN` and have `kitty_keyboard()`
 
 ### WR-03: Subscribe replay collapses stack depth — post-attach pop diverges the mirror from the source
 
+**Status:** FIXED — `b49f57f` (full-depth replay via new fork accessors `kitty_main_stack()`/`kitty_alternate_stack()`, one push per entry; main-screen pushes emitted before the `?1049h` switch so each stack lands on its own per-screen mirror stack; nested-push and mid-alt-screen round-trip tests added, inactive-child snapshot stays byte-identical)
 **File:** `baude-core/src/pty.rs:421-426` (kitty replay in `subscribe()`)
 **Issue:** The snapshot replays exactly one push carrying the top-of-stack flags, so a source parser with an N-deep stack produces a mirror with a 1-deep stack. The very next live `CSI < 1 u` from a child that had pushed twice (push, nested push — e.g. Claude Code plus an inner tool) leaves the source at the prior nonzero entry while the mirror's stack empties to 0. From then on the remote-attach `forward_key` branch reads `kitty_child == false` and sends the legacy fallback (`\x1b\r`) to a child that is still in kitty mode. The divergence is in the safe direction (enhanced bytes are never sent to a legacy child), but the mirror permanently loses the child-verification signal for the rest of the attach even though the child still has kitty active — remote Shift+Enter silently degrades relative to local.
 **Fix:** Replay the full stack, one push per entry, so pops decrement identically on both sides. Expose an iterator on the fork (`pub fn kitty_stack(&self) -> &[u16]`) and:
