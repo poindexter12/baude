@@ -117,6 +117,7 @@ through to Claude.
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
+| `shift+enter` | claude pane | insert a newline without submitting |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
 | `t` | sidebar | open shell pane (focuses it) |
@@ -143,6 +144,26 @@ Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
 this chord shadows Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
 and `ctrl+n` are intercepted everywhere, so they never reach the shell pane's
 readline (end-of-line, next-history) or the AI CLI.
+
+### Shift+Enter newlines
+
+Inserting a newline with `shift+enter` is negotiated at startup through the
+kitty keyboard protocol: baude asks the terminal whether it can report the
+Shift modifier on Enter and only changes behavior when it answers yes.
+Verified to work in Ghostty, kitty, iTerm2, WezTerm, foot, and Alacritty.
+
+On terminals without the protocol, nothing changes: the terminal reports
+Shift+Enter as plain Enter, so it submits — exactly the pre-existing
+behavior. baude never guesses a missing modifier.
+
+Without protocol support you can still compose multiline prompts with the
+child program's own bindings: Claude Code accepts backslash-then-Enter (or
+run its `/terminal-setup` command); opencode uses `ctrl+j`.
+
+Inside tmux or screen, the negotiation talks to the multiplexer, not your
+outer terminal — tmux passes Shift+Enter through only with its
+`extended-keys` option enabled (e.g. `set -s extended-keys on` in
+`.tmux.conf`).
 
 ## Status icons
 
