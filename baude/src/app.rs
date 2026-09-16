@@ -4390,9 +4390,13 @@ impl App {
             Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
             }
-            // Production call site injects the real platform opener; tests
-            // inject a closure spy via handle_link_hints_key directly.
-            Modal::LinkHints { .. } => self.handle_link_hints_key(key, spawn_opener),
+            // Production call site injects the real platform opener and the
+            // existing clipboard path (WINDOWS entry 6: reuse, never a second
+            // clipboard spawn); tests inject closure spies via
+            // handle_link_hints_key directly.
+            Modal::LinkHints { .. } => {
+                self.handle_link_hints_key(key, spawn_opener, Self::copy_to_clipboard)
+            }
             Modal::Input {
                 kind,
                 buf,
@@ -5541,14 +5545,17 @@ impl App {
     }
 
     /// Keys inside link-hint mode. Enter opens the selected destination via
-    /// the injected `open`; Esc dismisses. (Navigation and `c`/`y` copy land
-    /// in plan 10-04.) The modal is taken via `mem::replace` so the borrow
-    /// of `self.modal` ends before `&mut self` methods run.
-    fn handle_link_hints_key<F: FnOnce(&str) -> std::io::Result<()>>(
-        &mut self,
-        key: KeyEvent,
-        open: F,
-    ) {
+    /// the injected `open`; `c`/`y` copy it via the injected `copy` sink
+    /// (production: the existing clipboard path); j/k and arrows navigate;
+    /// a hint letter jumps selection; Esc dismisses; everything else is
+    /// swallowed — no byte ever reaches the child while the overlay is open
+    /// (LINK-04). The modal is taken via `mem::replace` so the borrow of
+    /// `self.modal` ends before `&mut self` methods run.
+    fn handle_link_hints_key<F, C>(&mut self, key: KeyEvent, open: F, _copy: C)
+    where
+        F: FnOnce(&str) -> std::io::Result<()>,
+        C: FnOnce(&str),
+    {
         match key.code {
             KeyCode::Esc => self.modal = Modal::None,
             KeyCode::Enter => {
@@ -5607,21 +5614,16 @@ fn spawn_opener(url: &str) -> std::io::Result<()> {
 /// Middle-truncate a URL for the transient message line. Display only — the
 /// full `Url::as_str()` is always what the opener receives.
 fn display_truncated(url: &url::Url) -> String {
-    const MAX: usize = 60;
-    let s = url.as_str();
-    if s.chars().count() <= MAX {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(40).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(16)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}…{tail}")
+    display_truncated_width(url, 60)
+}
+
+/// Middle-ellipsis a URL to at most `max` chars for DISPLAY only, always
+/// keeping the scheme and host fully visible (T-10-15: a truncated display
+/// must never let ellipses hide the real origin). The model — and copy and
+/// open — always use the full normalized `Url::as_str()` (LINK-05).
+pub(crate) fn display_truncated_width(url: &url::Url, max: usize) -> String {
+    let _ = max;
+    url.as_str().to_string()
 }
 
 #[cfg(test)]
@@ -5661,9 +5663,46 @@ mod clipboard_tests {
 
 #[cfg(test)]
 mod link_hints {
-    use super::{App, Focus, Modal};
+    use super::{display_truncated_width, App, Focus, Modal};
+    use crate::links::{DetectedLink, LinkSource};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
     use std::path::PathBuf;
+
+    fn test_link(u: &str) -> DetectedLink {
+        DetectedLink {
+            destination: url::Url::parse(u).expect("test URL parses"),
+            row: 0,
+            start_col: 0,
+            end_col: 0,
+            source: LinkSource::Bare,
+        }
+    }
+
+    /// Session-less App with the hints modal pre-opened on `urls`. The
+    /// redirect is returned FIRST so it outlives the App (Phase-8
+    /// containment: App::new resolves the config dir).
+    fn hinted(urls: &[&str], selected: usize) -> (baude_core::testing::TestRedirect, App) {
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.modal = Modal::LinkHints {
+            links: urls.iter().map(|u| test_link(u)).collect(),
+            selected,
+        };
+        (redirect, app)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn selected_of(app: &App) -> usize {
+        match &app.modal {
+            Modal::LinkHints { selected, .. } => *selected,
+            _ => panic!("expected the LinkHints modal to be open"),
+        }
+    }
 
     /// The hint chord with no live session must not panic, must not open the
     /// hints modal, and must surface the "no links" outcome via the message
@@ -5682,6 +5721,221 @@ mod link_hints {
             app.message.is_some(),
             "chord without a session surfaces a message"
         );
+    }
+
+    /// LINK-06: `c` invokes the injected copy sink with the FULL normalized
+    /// destination — byte-identical to `Url::as_str()` — closes the modal,
+    /// sets a "copied" message, and never touches the opener (CONTEXT locked
+    /// decision: c/y copies, Enter opens, Esc dismisses).
+    #[test]
+    fn c_copies_full_destination_without_opening() {
+        let full = "https://example.com/some/long/path?q=1";
+        let expected = url::Url::parse(full).unwrap().as_str().to_string();
+        let (_rd, mut app) = hinted(&[full], 0);
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Char('c')),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| copied.borrow_mut().push(u.to_string()),
+        );
+        assert_eq!(
+            copied.borrow().as_slice(),
+            std::slice::from_ref(&expected),
+            "copy sink receives exactly Url::as_str()"
+        );
+        assert!(opened.borrow().is_empty(), "copy must never open (LINK-06)");
+        assert!(matches!(app.modal, Modal::None), "copy closes the modal");
+        let (msg, _) = app.message.as_ref().expect("copy sets a message");
+        assert!(msg.contains("copied"), "message names the copy: {msg}");
+    }
+
+    /// `y` behaves exactly like `c`, and copies the SELECTED entry.
+    #[test]
+    fn y_copies_selected_entry() {
+        let (_rd, mut app) = hinted(
+            &["https://first.example.com/", "https://second.example.com/"],
+            1,
+        );
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Char('y')),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| copied.borrow_mut().push(u.to_string()),
+        );
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["https://second.example.com/"],
+            "y copies the selected entry's full destination"
+        );
+        assert!(opened.borrow().is_empty(), "y must never open");
+        assert!(matches!(app.modal, Modal::None), "y closes the modal");
+    }
+
+    /// j/k and Up/Down move `selected` with bounds clamping.
+    #[test]
+    fn navigation_moves_selected_with_bounds() {
+        let urls = [
+            "https://a.example.com/",
+            "https://b.example.com/",
+            "https://c.example.com/",
+        ];
+        let (_rd, mut app) = hinted(&urls, 0);
+        let noop = |_: &str| {};
+        let never = |_: &str| -> std::io::Result<()> { panic!("navigation must not open") };
+        app.handle_link_hints_key(key(KeyCode::Char('j')), never, noop);
+        assert_eq!(selected_of(&app), 1, "j moves down");
+        app.handle_link_hints_key(key(KeyCode::Down), never, noop);
+        assert_eq!(selected_of(&app), 2, "Down moves down");
+        app.handle_link_hints_key(key(KeyCode::Char('j')), never, noop);
+        assert_eq!(selected_of(&app), 2, "j clamps at the last entry");
+        app.handle_link_hints_key(key(KeyCode::Char('k')), never, noop);
+        assert_eq!(selected_of(&app), 1, "k moves up");
+        app.handle_link_hints_key(key(KeyCode::Up), never, noop);
+        assert_eq!(selected_of(&app), 0, "Up moves up");
+        app.handle_link_hints_key(key(KeyCode::Char('k')), never, noop);
+        assert_eq!(selected_of(&app), 0, "k clamps at the first entry");
+    }
+
+    /// Typing a hint letter selects that entry directly — without opening or
+    /// copying. (`c`/`y`/`j`/`k` are action keys and shadow their letters;
+    /// those rows stay reachable via j/k navigation.)
+    #[test]
+    fn hint_letter_jumps_selection() {
+        let urls = [
+            "https://a.example.com/",
+            "https://b.example.com/",
+            "https://c.example.com/",
+            "https://d.example.com/",
+        ];
+        let (_rd, mut app) = hinted(&urls, 0);
+        let copied = RefCell::new(Vec::<String>::new());
+        let opened = RefCell::new(Vec::<String>::new());
+        let mut press = |app: &mut App, ch: char| {
+            app.handle_link_hints_key(
+                key(KeyCode::Char(ch)),
+                |u| {
+                    opened.borrow_mut().push(u.to_string());
+                    Ok(())
+                },
+                |u| copied.borrow_mut().push(u.to_string()),
+            );
+        };
+        press(&mut app, 'b');
+        assert_eq!(selected_of(&app), 1, "b jumps to the second entry");
+        press(&mut app, 'd');
+        assert_eq!(selected_of(&app), 3, "d jumps to the fourth entry");
+        press(&mut app, 'a');
+        assert_eq!(selected_of(&app), 0, "a jumps back to the first entry");
+        press(&mut app, 'z');
+        assert_eq!(selected_of(&app), 0, "out-of-range letter is swallowed");
+        assert!(opened.borrow().is_empty(), "letters never open");
+        assert!(copied.borrow().is_empty(), "letters never copy");
+    }
+
+    /// Enter opens the SELECTED entry only; the copy sink stays untouched.
+    #[test]
+    fn enter_opens_selected_entry_only() {
+        let (_rd, mut app) = hinted(
+            &[
+                "https://a.example.com/",
+                "https://b.example.com/",
+                "https://c.example.com/",
+            ],
+            2,
+        );
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Enter),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| copied.borrow_mut().push(u.to_string()),
+        );
+        assert_eq!(
+            opened.borrow().as_slice(),
+            ["https://c.example.com/"],
+            "Enter opens exactly the selected entry"
+        );
+        assert!(copied.borrow().is_empty(), "Enter never copies");
+        assert!(matches!(app.modal, Modal::None), "Enter closes the modal");
+    }
+
+    /// Any other key while the overlay is open is swallowed: the modal is
+    /// unchanged and neither sink runs (LINK-04).
+    #[test]
+    fn unhandled_keys_are_swallowed() {
+        let (_rd, mut app) = hinted(&["https://a.example.com/"], 0);
+        let never_open = |_: &str| -> std::io::Result<()> { panic!("swallowed key opened") };
+        let never_copy = |_: &str| panic!("swallowed key copied");
+        for code in [
+            KeyCode::Char('!'),
+            KeyCode::Char('C'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::F(5),
+        ] {
+            app.handle_link_hints_key(key(code), never_open, never_copy);
+            assert!(
+                matches!(app.modal, Modal::LinkHints { .. }),
+                "modal survives swallowed key {code:?}"
+            );
+            assert_eq!(selected_of(&app), 0, "selection unchanged by {code:?}");
+        }
+    }
+
+    /// T-10-15: display truncation is render-only middle-ellipsis that never
+    /// drops the scheme or host, and the model keeps the full URL.
+    #[test]
+    fn truncation_preserves_scheme_and_host_at_narrow_width() {
+        let url = url::Url::parse(
+            "https://example.com/very/long/path/segment/with/file.html?query=abcdefghij",
+        )
+        .unwrap();
+        let out = display_truncated_width(&url, 30);
+        assert!(
+            out.starts_with("https://example.com"),
+            "scheme+host retained: {out}"
+        );
+        assert!(out.contains('…'), "long URL is middle-ellipsized: {out}");
+        assert!(out.chars().count() <= 30, "fits the width budget: {out}");
+        // Render-only: the model value is untouched by display truncation.
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/very/long/path/segment/with/file.html?query=abcdefghij"
+        );
+    }
+
+    /// A width narrower than scheme+host still shows them in full — the one
+    /// case display may exceed the budget rather than hide the origin.
+    #[test]
+    fn truncation_below_prefix_width_still_shows_scheme_and_host() {
+        let url =
+            url::Url::parse("https://example.com/very/long/path/that/wont/fit/anywhere").unwrap();
+        let out = display_truncated_width(&url, 10);
+        assert!(
+            out.starts_with("https://example.com"),
+            "scheme+host survive even a too-narrow budget: {out}"
+        );
+        assert!(out.ends_with('…'), "the hidden remainder is marked: {out}");
+    }
+
+    /// A URL that fits is returned verbatim — no ellipsis, no mutation.
+    #[test]
+    fn truncation_is_noop_when_url_fits() {
+        let url = url::Url::parse("https://example.com/ok").unwrap();
+        let out = display_truncated_width(&url, 60);
+        assert_eq!(out, "https://example.com/ok");
+        assert!(!out.contains('…'));
     }
 }
 
