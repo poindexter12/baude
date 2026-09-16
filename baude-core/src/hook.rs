@@ -1153,4 +1153,166 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
+
+    // ---- POSIX-quoted seeded command (HREG-04, 09-03) --------------------
+
+    /// Test-local POSIX single-quote helper: the rule the production
+    /// `quote_posix_single` adopts in GREEN (single-quote wrap, embedded `'`
+    /// escaped as the 4-char `'\''` sequence). Kept test-local so the RED
+    /// commit compiles against today's code and fails on assertions, never
+    /// on a missing symbol.
+    fn q(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+
+    #[test]
+    fn quoted_seeded_command_spaced_path_is_recognized() {
+        // D-05/D-07: the quoted canonical form is baude's own seed.
+        assert!(is_seeded_hook_command("'/opt/spa ced/baude' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_metachar_path_is_recognized() {
+        // `$` and `;` in the directory, `bauded` stem.
+        assert!(is_seeded_hook_command("'/opt/a$b;c/bauded' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_backtick_dir_is_recognized() {
+        assert!(is_seeded_hook_command("'/opt/back`tick/baude' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_embedded_quote_is_recognized() {
+        // An embedded `'` in the directory name exercises the producer's
+        // quote–backslash-quote–quote escape.
+        let cmd = format!("{} hook", q("/opt/qu'ote/baude"));
+        assert_eq!(cmd, r"'/opt/qu'\''ote/baude' hook");
+        assert!(is_seeded_hook_command(&cmd));
+    }
+
+    #[test]
+    fn quoted_look_alikes_and_legacy_forms_keep_their_meaning() {
+        // Legacy unquoted absolute path stays recognized (D-07) — entries
+        // seeded by older binaries must still be pruned.
+        assert!(is_seeded_hook_command("/opt/baude hook"));
+        // The bare fallback names no install and is never pruned (D-08).
+        assert!(!is_seeded_hook_command("baude hook"));
+        // Wrong stem after unquote.
+        assert!(!is_seeded_hook_command("'/opt/vim' hook"));
+        // Relative after unquote.
+        assert!(!is_seeded_hook_command("'relative/baude' hook"));
+        // Doubled outer quotes: strict round-trip fails (#78 look-alike class).
+        assert!(!is_seeded_hook_command("''/opt/baude'' hook"));
+        // Raw un-escaped inner quote: strict round-trip fails.
+        assert!(!is_seeded_hook_command("'/opt/ba'ude' hook"));
+        // Unterminated quote is not the quoted form and not absolute.
+        assert!(!is_seeded_hook_command("'/opt/baude hook"));
+    }
+
+    #[test]
+    fn merge_prunes_stale_quoted_seeds_to_one_group() {
+        // Criterion 3 / D-06: a file seeded by an older QUOTED install
+        // converges to exactly one seeded group per event on re-seed —
+        // quoting must not reintroduce HREG-01's per-path accumulation.
+        let old = merge_hook_settings(&json!({}), "'/old/baude' hook");
+        let new_cmd = "'/new/baude' hook";
+        let merged = merge_hook_settings(&old, new_cmd);
+        for ev in EVENTS {
+            let groups = merged["hooks"][ev].as_array().unwrap();
+            assert_eq!(
+                groups.len(),
+                1,
+                "exactly one seeded group must survive for {ev}"
+            );
+            assert_eq!(seeded_group_command(&groups[0]), Some(new_cmd));
+        }
+        // Idempotent on its own output (Pitfall 2): merge(merge(x)) == merge(x).
+        assert_eq!(
+            merge_hook_settings(&merged, new_cmd),
+            merged,
+            "re-merge of the quoted form must be a no-op"
+        );
+    }
+
+    #[test]
+    fn merge_converges_legacy_unquoted_seed_to_the_quoted_form() {
+        // D-06/D-07: a file seeded by an older UNQUOTED binary re-seeded with
+        // the quoted command also converges to one group per event.
+        let legacy = merge_hook_settings(&json!({}), "/old/baude hook");
+        let new_cmd = "'/new/baude' hook";
+        let merged = merge_hook_settings(&legacy, new_cmd);
+        for ev in EVENTS {
+            let groups = merged["hooks"][ev].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "one group per event for {ev}");
+            assert_eq!(seeded_group_command(&groups[0]), Some(new_cmd));
+        }
+    }
+
+    #[test]
+    fn pure_seed_accepts_quoted_seeds_and_rejects_look_alikes() {
+        // Freshly seeded worktrees keep their removal exemption: a settings
+        // value built by merge with a quoted command is purely baude's.
+        let quoted = merge_hook_settings(&json!({}), "'/opt/spa ced/baude' hook");
+        assert!(is_pure_seed_settings(&quoted));
+        // A malformed look-alike quoting is user content and must keep
+        // blocking removal (#78 stays closed).
+        let look_alike = merge_hook_settings(&json!({}), "''/opt/baude'' hook");
+        assert!(!is_pure_seed_settings(&look_alike));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spaced_metachar_path_seed_executes_exact_stub() {
+        use std::os::unix::fs::PermissionsExt;
+        // D-11 invocation proof: hostile characters live in the DIRECTORY
+        // name (Pitfall 5) — the stub file itself must be named `baude` for
+        // the stem check. Everything stays inside this test's unique cwd.
+        let cwd = seed_guard_cwd("e2e-hostile");
+        let hostile = cwd.join("sp ace$;`tick'quote");
+        std::fs::create_dir_all(&hostile).unwrap();
+        let stub = hostile.join("baude");
+        std::fs::write(&stub, "#!/bin/sh\nprintf ran > \"$MARKER\"\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cmd = format!("{} hook", q(&stub.display().to_string()));
+        // Producer/recognizer contract: the seeded string is ours.
+        assert!(
+            is_seeded_hook_command(&cmd),
+            "seeded quoted command must be recognized: {cmd}"
+        );
+
+        // Seed through the production path with the quoted override.
+        let _redirect = crate::testing::TestRedirect::with_hook_command(cmd.clone());
+        let project = cwd.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let warnings = seed_settings(&project);
+        assert!(warnings.is_empty(), "seed must not warn, got {warnings:?}");
+
+        // Read the command string BACK from the written settings file and
+        // execute it exactly as Claude Code would: through a real shell.
+        let raw =
+            std::fs::read_to_string(project.join(".claude").join("settings.local.json")).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let seeded = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("seeded command present in settings.local.json");
+        assert_eq!(seeded, cmd, "file must carry the quoted canonical form");
+
+        let marker = cwd.join("marker");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(seeded)
+            .env("MARKER", &marker)
+            .status()
+            .expect("sh -c must run");
+        assert!(status.success(), "seeded command must exit 0 through sh -c");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "ran",
+            "exactly the stub under the hostile path must have run"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 }
