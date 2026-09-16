@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 12
 current_phase_name: Validation and v2.2.0 Release
 status: executing
-stopped_at: Phase 11 complete, ready to plan Phase 8
-last_updated: "2026-09-16T17:29:48.605Z"
+stopped_at: Completed 12-01-PLAN.md
+last_updated: "2026-09-16T17:47:42.828Z"
 last_activity: 2026-09-16
-last_activity_desc: Phase 11 complete, transitioned to Phase 8
-state_head: f474f90dd63a78a622c4dac25d14d512ec742bc6
+last_activity_desc: Phase 12 execution started
+state_head: 8ce0e2610fc8afb38d289742cd42e06b4d209ca9
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 25
-  completed_plans: 20
+  completed_plans: 21
   percent: 60
 ---
 
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 11 — Negotiated Multiline Input
+**Current focus:** Phase 12 — Validation and v2.2.0 Release
 
 ## Current Position
 
-Phase: 12 (Validation and v2.2.0 Release) — READY TO EXECUTE
-Plan: Not started
+Phase: 12 (Validation and v2.2.0 Release) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-09-16 — Phase 11 complete, transitioned to Phase 8
+Last activity: 2026-09-16 — Phase 12 execution started
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -93,6 +93,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 11 P02 | 6 min | 1 tasks | 2 files |
 | Phase 11 P03 | 9 min | 2 tasks | 2 files |
 | Phase 11 P04 | 9 min | 2 tasks | 2 files |
+| Phase 12 P01 | 21 min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -205,6 +206,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 11]: README shift+enter guidance uses 'verified to work' framing — no TERM/terminal-name detection claims (D-01)
 - [Phase 11]: encode_ctx is the single EncodeCtx producer for both forward_key branches; kitty_child reads the vt100 observed-push accessor with every fallback fail-closed to legacy (D-04)
 - [Phase 11]: subscribe() replays one CSI > flags u push conditioned on kitty_keyboard() so remote mirrors converge; inactive children keep byte-identical snapshots
+- [Phase 12]: Relaxed the vendored vt100 fork clippy group opt-ins inside one commented FORK (baude) block rather than rewriting 30 upstream sites or adding publishing metadata to three never-published manifests — D-04/D-14; the fork compile failure was masking two real baude lints, and the narrow fix keeps the diff-vs-upstream surface auditable
+- [Phase 12]: Used clippy group allows in the fork instead of the ten named lints — A named list drifts each time the runner clippy advances, and this fork is frozen against upstream
+- [Phase 12]: The locked release build is the packaging verification, in place of any packaging rework — D-10; proves the vendored path dependency survives cargo build --workspace --release --locked
 
 ### Pending Todos
 
@@ -238,8 +242,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T15:11:25.469Z
-Stopped at: Phase 11 complete, ready to plan Phase 8
+Last session: 2026-09-16T17:46:59.726Z
+Stopped at: Completed 12-01-PLAN.md
 Resume file: None
 
 ## Deferred Items
