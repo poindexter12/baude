@@ -6180,6 +6180,101 @@ mod link_hints {
     }
 }
 
+/// LINK-08 failure surface: an opener spawn error resolves to exactly one
+/// `set_message` warning and the session keeps running — never a panic,
+/// never a retry loop, never a real `Command` in tests (WINDOWS entry 6).
+#[cfg(test)]
+mod link_open {
+    use super::{App, Focus, Modal};
+    use crate::links::{DetectedLink, LinkSource};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    fn hinted(url: &str) -> (baude_core::testing::TestRedirect, App) {
+        let root = PathBuf::from("/nonexistent/baude-link-open");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.modal = Modal::LinkHints {
+            links: vec![DetectedLink {
+                destination: url::Url::parse(url).expect("test URL parses"),
+                row: 0,
+                start_col: 0,
+                end_col: 0,
+                source: LinkSource::Osc8,
+            }],
+            selected: 0,
+        };
+        (redirect, app)
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    /// Err from the injected opener: one warning message naming the failure
+    /// and the session's survival; modal closed; the App still processes a
+    /// subsequent key normally (LINK-08 non-fatal failure, CONTEXT locked
+    /// decision: failure surfaces via set_message).
+    #[test]
+    fn opener_error_surfaces_one_warning_and_session_survives() {
+        let (_rd, mut app) = hinted("https://example.com/broken");
+        app.handle_link_hints_key(
+            enter(),
+            |_| Err(std::io::Error::other("browser exploded")),
+            |_| panic!("Err path must not copy"),
+        );
+        assert!(matches!(app.modal, Modal::None), "modal closed after Err");
+        let (msg, _) = app.message.as_ref().expect("Err surfaces one message");
+        assert!(msg.contains("browser exploded"), "names the failure: {msg}");
+        assert!(
+            msg.contains("session unaffected"),
+            "signals the session survives: {msg}"
+        );
+        // Liveness: the very next key is handled normally — the global
+        // ctrl+q chord still moves focus to the sidebar.
+        app.focus = Focus::Claude;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(app.focus, Focus::Sidebar),
+            "session keeps processing events after an opener failure"
+        );
+    }
+
+    /// Ok from the injected opener: the opener received the FULL normalized
+    /// URL as its single argument, and the message shows the truncated
+    /// display form (display-only truncation, LINK-05).
+    #[test]
+    fn opener_ok_sets_opening_message_with_display_form() {
+        let long = "https://example.com/very/long/path/segment/with/file.html?query=abcdefghijklmnopqrstuvwxyz";
+        let (_rd, mut app) = hinted(long);
+        let opened = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            enter(),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |_| panic!("Enter must not copy"),
+        );
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [long],
+            "opener receives the full normalized URL"
+        );
+        let (msg, _) = app.message.as_ref().expect("Ok path sets a message");
+        assert!(msg.starts_with("opening "), "announces the open: {msg}");
+        assert!(
+            msg.contains("https://example.com") && msg.contains('…'),
+            "message shows the truncated display form, origin visible: {msg}"
+        );
+        assert!(
+            !msg.contains(long),
+            "the message line carries the display form, not the full URL"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
