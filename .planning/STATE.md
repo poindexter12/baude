@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 09
 current_phase_name: Hook Seeding Safety
 status: executing
-stopped_at: Completed 09-02-PLAN.md
-last_updated: "2026-09-16T04:46:24.622Z"
+stopped_at: Completed 09-03-PLAN.md
+last_updated: "2026-09-16T05:00:31.727Z"
 last_activity: 2026-09-15
 last_activity_desc: Phase 09 execution started
-state_head: abb51d7273d7bfd1a108d6360b971887cdc3fd40
+state_head: b3d63cfa893fa2dd3f4b6f47594b07ccc2465328
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 12
-  completed_plans: 10
+  completed_plans: 11
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 ## Current Position
 
 Phase: 09 (Hook Seeding Safety) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-09-15 — Phase 09 execution started
 
@@ -80,6 +80,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 08 P07 | 25min | 1 tasks | 1 files |
 | Phase 09 P01 | 10min | 2 tasks | 5 files |
 | Phase 09 P02 | 5min | 2 tasks | 2 files |
+| Phase 09 P03 | 8min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -173,6 +174,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 09]: read_settings_guarded four-way disposition is one shared pub(crate) helper: NotFound = fresh seed; unreadable/unparseable/non-object root = refuse byte-identical + warn, never overwrite.
 - [Phase 09]: bauded held-lock test asserts the existing first-save contention surface (option a); no startup claim added - WLOCK contract unchanged beyond tests
 - [Phase 09]: Lock regression tests simulate the foreign owner with raw OpenOptions + try_lock, never hold_state_lock, so the re-entrant cache is never the thing under test
+- [Phase 09]: POSIX single-quoted hook command is the canonical seeded form; recognizer accepts quoted form only via strict round-trip (re-quote must reproduce input), legacy unquoted form via the old arm - look-alike quotings never claimed (#78)
 
 ### Pending Todos
 
@@ -206,8 +208,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T04:46:24.597Z
-Stopped at: Completed 09-02-PLAN.md
+Last session: 2026-09-16T05:00:31.693Z
+Stopped at: Completed 09-03-PLAN.md
 Resume file: None
 
 ## Deferred Items

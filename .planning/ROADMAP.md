@@ -106,7 +106,7 @@ Plans:
 3. The seed recognizer matches the quoted form, so quoting does not reintroduce the per-path accumulation that HREG-01 fixed.
 4. Regression tests cover a malformed settings file, a spaced install path end to end, and the two behaviors verified by inspection only in v2.1.3: reopening a workspace whose lock file remains after the OS lock released, and `bauded` encountering a held lock.
 
-**Plans**: 2/4 plans executed
+**Plans**: 3/4 plans executed
 
 Plans:
 
@@ -117,7 +117,7 @@ Plans:
 
 **Wave 2**
 
-- [ ] 09-03-PLAN.md — TDD: POSIX-quoted hook command, both-form recognizer with round-trip validation, `sh -c` E2E
+- [x] 09-03-PLAN.md — TDD: POSIX-quoted hook command, both-form recognizer with round-trip validation, `sh -c` E2E
 - [ ] 09-04-PLAN.md — `.mcp.json` guard (command stays argv data), remaining spawn-path surfaces, app-level malformed-settings tests
 
 ### Phase 10: Clickable Terminal Links
@@ -175,7 +175,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | In Progress|  |
-| 9. Hook Seeding Safety (narrowed) | 2/4 | In Progress|  |
+| 9. Hook Seeding Safety (narrowed) | 3/4 | In Progress|  |
 | 10. Clickable Terminal Links | 0/TBD | Not started | - |
 | 11. Negotiated Multiline Input | 0/TBD | Not started | - |
 | 12. Validation and v2.2.0 Release | 0/TBD | Not started | - |

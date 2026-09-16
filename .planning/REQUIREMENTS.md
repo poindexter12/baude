@@ -37,9 +37,8 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 - [x] **HREG-02** (delivered v2.1.2): A user's custom hooks, mixed groups, ambiguous registrations, and unrelated settings remain unchanged during owned-registration reconciliation.
 - [ ] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
   - `seed_settings` degrades an unparseable file to `json!({})` and overwrites it (`hook.rs:282-288`); every fs call is `let _ =` and no warning path exists. `backend/claude.rs:114-121` repeats the pattern for `.mcp.json`.
-- [ ] **HREG-04** (partial): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
-  - Shipped: recognition and pruning handle spaced paths (`hook.rs:123`).
-  - Gap: `baude_hook_command` interpolates the path unquoted (`hook.rs:86`). Verified 2026-09-13 that hook commands are executed through a shell, so a spaced path runs the wrong argv and a path bearing `$`, `;` or a backtick is worse. A quoting fix must ship with a recognizer that matches the quoted form.
+- [x] **HREG-04** (delivered plan 09-03): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
+  - `baude_hook_command` now emits the POSIX single-quoted canonical form via `quote_posix_single`; `is_seeded_hook_command` accepts quoted (strict round-trip) and legacy forms; `sh -c` E2E proves exact-executable invocation on a space/`$`/`;`/backtick/embedded-`'` path.
 
 ### Workspace Lock Diagnostics (#71)
 
@@ -112,7 +111,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
 | HREG-03 | Phase 9 | Pending |
-| HREG-04 | Phase 9 | Partial — gap in Phase 9 |
+| HREG-04 | Phase 9 | Delivered plan 09-03 |
 | WLOCK-01 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-02 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-03 | Phase 9 | Delivered v2.1.3 |
@@ -140,8 +139,7 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 - Mapped to phases: 29
 - Unmapped: 0
 - Delivered before execution: 6 (HREG-01, HREG-02, WLOCK-01 through WLOCK-04)
-- Delivered during execution: 4 (TISO-01, TISO-02, TISO-03 — plan 08-06; TISO-04 — plan 08-07)
-- Partially delivered, remainder in scope: 1 (HREG-04)
+- Delivered during execution: 5 (TISO-01, TISO-02, TISO-03 — plan 08-06; TISO-04 — plan 08-07; HREG-04 — plan 09-03)
 - Open: 20
 
 ---
