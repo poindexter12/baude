@@ -446,7 +446,18 @@ fn main() -> Result<()> {
             KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
         }
     }
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
+    // Any Err between the push above and run()'s normal exit is a NON-panic
+    // path — the panic hook never fires — so a bare `?` here would leak raw
+    // mode, the alternate screen, AND the pushed keyboard flags (T-11-03's
+    // residue class). Route it through restore_terminal() before propagating.
+    let mut terminal =
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout())) {
+            Ok(t) => t,
+            Err(e) => {
+                restore_terminal();
+                return Err(e.into());
+            }
+        };
 
     let mut app = App::new(launch_dir);
     // Folder-memory notes go up first so a real restore error overwrites an
