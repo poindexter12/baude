@@ -5,16 +5,16 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 09
 current_phase_name: Hook Seeding Safety
 status: planning
-stopped_at: Phase 8 complete, ready to plan Phase 09
-last_updated: "2026-09-16T18:47:53.517Z"
+stopped_at: "Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates"
+last_updated: "2026-09-17T17:48:55.112Z"
 last_activity: 2026-09-16
 last_activity_desc: Phase 8 complete, transitioned to Phase 09
-state_head: 8ca3d42f3ef2dffc2a7717bc7f7e579c8098887b
+state_head: 20b8098be7a0a91e9d9c7560a0234020759423bc
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 25
-  completed_plans: 22
+  completed_plans: 24
   percent: 80
 ---
 
@@ -96,6 +96,7 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 11 P04 | 9 min | 2 tasks | 2 files |
 | Phase 12 P01 | 21 min | 3 tasks | 4 files |
 | Phase 12 P02 | 7 min | 3 tasks | 1 files |
+| Phase 12 P04 | 45 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -215,6 +216,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 12]: README documents baude's own pane selection (click-drag copies on release) alongside the suppression of native drag-select — Documenting only the suppression would report a lost capability that was in fact replaced (app.rs:5446-5519)
 - [Phase 12]: The native-selection workaround is phrased as the terminal's override modifier, with Shift and Option as examples only — The binding belongs to the terminal, not to baude; naming a specific key would be a promise baude cannot keep
 - [Phase 12]: README never advises deleting the workspace lock file; recovery is quit the holder, signal it, or switch workspace — It is an OS advisory lock on an open fd released by the kernel on exit; deleting it while a holder lives yields two writers on one state file (T-12-04)
+- [Phase 12]: Rebased with git rebase --onto origin/main 985f543 because origin/main's 30ce007 is a squash of this chain's own first seven planning commits — A plain rebase conflicted on already-applied content at commit 1 of 181; the --onto form starts from a byte-identical tree and replayed all 174 commits with zero conflicts
+- [Phase 12]: Pushed with the local real-roots gate red after proving by null bracket that the delta came from concurrent host processes, not the test suite — A 45s before/after bracket with no suite also failed; pids 8413 (live baude) and 21951 (FHIR IG publisher under the managed-worktrees root) were identified. check (macos-14) and check (ubuntu-22.04) run the same bracket in a clean room and both passed
 
 ### Pending Todos
 
@@ -248,8 +251,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-09-16T17:59:24.577Z
-Stopped at: Phase 8 complete, ready to plan Phase 09
+Last session: 2026-09-17T17:47:38.892Z
+Stopped at: Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates
 Resume file: None
 
 ## Deferred Items
