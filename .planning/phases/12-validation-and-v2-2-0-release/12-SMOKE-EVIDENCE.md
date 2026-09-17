@@ -139,14 +139,14 @@ versions here.
    link must open its target, not its visible text). It is covered by automated
    tests (`links::` suite, green at this commit) and by the set-level
    attestation, but it was NOT visually confirmed in this session.
-   — Joe Seymour, 2026-09-16
+   Signed off by Joe Seymour on 2026-09-16
 
 2. **Mouse-click link opening is the terminal's behaviour, not baude's.** The
    observer reported clicking opened links. iTerm2 opens detected URLs on click
    regardless of the inner application, and baude ships no mouse link
    activation. Recorded so this cannot later be read as evidence that baude's
    activation path works. baude's path is `ctrl+o` → overlay → `enter`.
-   — Joe Seymour, 2026-09-16
+   Signed off by Joe Seymour on 2026-09-16
 
 3. **Legs 8-9 may not have been exercised.** They require a claude pane; the
    smoke instance ran under `BAUDE_WORKSPACE=smoke`, which starts empty. Whether
@@ -154,13 +154,13 @@ versions here.
    automated tests (`keys`, `forward_ctx`, `keyboard_negotiation`, green at this
    commit), and phase 11's own verification routed the real-terminal leg here —
    so if these two were not run, that routing is still open.
-   — Joe Seymour, 2026-09-16
+   Signed off by Joe Seymour on 2026-09-16
 
 4. **Linux session not run.** No Linux terminal was available in this session.
    Legs 1-4 and 8-9 have automated coverage via the `check (ubuntu-22.04)` CI
    context (to be harvested in plan 12-04); the interactive legs 5-7 and 10-12
    are DEFERRED for Linux with this sign-off.
-   — Joe Seymour, 2026-09-16
+   Signed off by Joe Seymour on 2026-09-16
 
 1. **No Linux terminal was available.** Legs 5-7 and 10-12 (selection,
    scrollback, mouse, and the three restoration checks) are properties of the
@@ -169,4 +169,4 @@ versions here.
    coverage in the `check (ubuntu-22.04)` CI job, whose run URL plan 12-04 will
    cite here once the branch is pushed. This artifact records the absence rather
    than implying Linux was exercised.
-   — Joe Seymour, 2026-09-16
+   Signed off by Joe Seymour on 2026-09-16
