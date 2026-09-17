@@ -24,7 +24,6 @@
 //! Re-verify `claude --version` at execution time and update this comment if
 //! it advances past 2.1.177.
 
-use std::cell::RefCell;
 use std::io::Write;
 
 use serde_json::{json, Value};
@@ -78,34 +77,53 @@ pub const FALLBACK_HOOK_COMMAND: &str = "baude hook";
 /// bare `baude hook` string could silently never fire). Falls back to
 /// [`FALLBACK_HOOK_COMMAND`] if `current_exe()` fails. This string IS the
 /// idempotency sentinel for [`merge_hook_settings`].
+///
+/// Under a test harness `current_exe()` is `target/debug/deps/baude-<hash>`,
+/// whose file stem is not `baude`, so anything seeded from it is not
+/// recognizable by [`is_seeded_hook_command`] — the divergence that let a
+/// fixture look unlike anything production writes, and that kept the pruning
+/// path (#70) beyond the reach of app-level tests. Fixtures therefore hold a
+/// [`crate::testing::TestRedirect`], which supplies a production-shaped
+/// `<absolute path>/baude hook`.
 pub fn baude_hook_command() -> String {
-    if let Some(command) = HOOK_COMMAND_OVERRIDE.with(|cell| cell.borrow().clone()) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(command) = crate::testing::hook_command_override() {
         return command;
     }
     match std::env::current_exe() {
-        Ok(p) => format!("{} hook", p.display()),
+        // D-05/D-06: always-quote, unconditionally — hook commands run
+        // through a shell, so an unquoted path bearing a space, `$`, `;`, or
+        // a backtick invokes the wrong argv (or worse). One canonical quoted
+        // form keeps the idempotency sentinel deterministic.
+        Ok(p) => format!("{} hook", quote_posix_single(&p.display().to_string())),
         Err(_) => FALLBACK_HOOK_COMMAND.to_string(),
     }
 }
 
-thread_local! {
-    /// Test-only override for [`baude_hook_command`]. Thread-local so parallel
-    /// cases cannot decide each other's seeded command.
-    static HOOK_COMMAND_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+/// Wrap `s` in POSIX single quotes, escaping each embedded `'` as the 4-char
+/// quote–backslash-quote–quote sequence (`'\''`).
+///
+/// Inside single quotes a POSIX shell interprets NOTHING, so this one rule
+/// neutralizes spaces, `$`, `;`, backticks, and every other metacharacter
+/// (D-05). This string is both what [`baude_hook_command`] seeds and the
+/// exact form [`is_seeded_hook_command`]'s strict round-trip check demands —
+/// producer and recognizer share this single rule.
+pub fn quote_posix_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Seed `command` instead of the resolved `current_exe()` on the CURRENT
-/// THREAD. Test support only.
+/// Strict inverse of [`quote_posix_single`]: strip the outer quotes, invert
+/// the `'\''` escape, and return the path ONLY if re-quoting it reproduces
+/// `quoted` byte-for-byte.
 ///
-/// Under a test harness `current_exe()` is `target/debug/deps/baude-<hash>`,
-/// whose file stem is not `baude`, so a seeded file is not recognizable by
-/// [`is_seeded_hook_command`] — the divergence that let a fixture look unlike
-/// anything production writes, and that kept the pruning path (#70) beyond the
-/// reach of app-level tests. Fixtures call this with a production-shaped
-/// `<absolute path>/baude hook` so what they seed is what baude really writes.
-pub fn set_hook_command_for_test(command: impl Into<String>) {
-    let command = command.into();
-    HOOK_COMMAND_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(command));
+/// The round-trip requirement is the #78 guard: a user command that merely
+/// LOOKS quoted (doubled outer quotes, a raw un-escaped inner quote, bad
+/// escaping) never round-trips, so it is never claimed as baude's seed — and
+/// therefore never pruned or counted toward the worktree-removal exemption.
+fn unquote_posix_single(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
+    let candidate = inner.replace(r"'\''", "'");
+    (quote_posix_single(&candidate) == quoted).then_some(candidate)
 }
 
 /// True iff `command` is one this module previously seeded from a resolved
@@ -121,10 +139,26 @@ pub fn set_hook_command_for_test(command: impl Into<String>) {
 /// when `current_exe()` fails): it names no specific install, so it can never go
 /// stale and is never pruned.
 pub fn is_seeded_hook_command(command: &str) -> bool {
-    let Some(path) = command.strip_suffix(" hook") else {
+    let Some(remainder) = command.strip_suffix(" hook") else {
         return false;
     };
-    let path = std::path::Path::new(path);
+    // Two-arm extraction (D-07): the quoted canonical form produced by
+    // [`quote_posix_single`], or the legacy raw absolute path seeded by an
+    // older binary. Unquote BEFORE the `Path` checks — a still-quoted string
+    // is never `is_absolute()`, so a naive check would silently reject the
+    // quoted form and reintroduce per-path accumulation (Pitfall 1).
+    let path = if remainder.len() >= 2 && remainder.starts_with('\'') && remainder.ends_with('\'') {
+        // Strict round-trip: accept ONLY a string quote_posix_single itself
+        // produces. A malformed/user look-alike quoting is not ours (#78) —
+        // and it does NOT fall through to the legacy arm.
+        match unquote_posix_single(remainder) {
+            Some(path) => path,
+            None => return false,
+        }
+    } else {
+        remainder.to_string()
+    };
+    let path = std::path::Path::new(&path);
     path.is_absolute()
         && matches!(
             path.file_stem().and_then(|stem| stem.to_str()),
@@ -264,6 +298,58 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
+/// A non-fatal problem encountered while seeding a session cwd's
+/// configuration (HREG-03). Seeding is best-effort — a warning never aborts a
+/// spawn — but the operator must SEE it: baude-core returns these as values
+/// and the binaries own presentation (TUI `set_message`, daemon `eprintln`)
+/// per the "core does not print" contract (D-02).
+#[derive(Debug)]
+pub struct SeedWarning {
+    /// The affected file — the warning must name it so the operator can act
+    /// on it (D-02).
+    pub file: std::path::PathBuf,
+    pub reason: SeedWarningReason,
+}
+
+/// Why a seed attempt warned instead of completing silently (D-01/D-04).
+#[derive(Debug)]
+pub enum SeedWarningReason {
+    /// The file exists but could not be read (any error other than
+    /// `NotFound`, which is the normal fresh-seed path).
+    Unreadable(std::io::Error),
+    /// The file read but is not valid JSON.
+    Unparseable(serde_json::Error),
+    /// The file parses but its root is not a JSON object — user content too
+    /// (D-01); never coerced to `{}` and overwritten.
+    NonObjectRoot,
+    /// Read + merge succeeded but the merged settings could not be written
+    /// back. The spawn continues without updated hooks (D-04).
+    WriteFailed(std::io::Error),
+}
+
+impl std::fmt::Display for SeedWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = self.file.display();
+        const UNTOUCHED: &str =
+            "existing settings left untouched; fix or remove the file to let baude seed its hooks";
+        match &self.reason {
+            SeedWarningReason::Unreadable(error) => {
+                write!(f, "{file}: could not read settings ({error}) — {UNTOUCHED}")
+            }
+            SeedWarningReason::Unparseable(error) => {
+                write!(f, "{file}: could not parse settings ({error}) — {UNTOUCHED}")
+            }
+            SeedWarningReason::NonObjectRoot => {
+                write!(f, "{file}: settings root is not a JSON object — {UNTOUCHED}")
+            }
+            SeedWarningReason::WriteFailed(error) => write!(
+                f,
+                "{file}: could not write merged settings ({error}) — session continues without updated hooks"
+            ),
+        }
+    }
+}
+
 /// Best-effort, idempotent, non-clobbering seed of a session cwd's
 /// `.claude/settings.local.json` so a managed Claude session fires baude's
 /// hooks. Single source of truth for both the TUI (`baude`) and the daemon
@@ -275,17 +361,62 @@ pub fn append_event(sid: &str, line: &str) -> std::io::Result<()> {
 /// regardless of the session PATH), and [`merge_hook_settings`] is idempotent
 /// and non-clobbering so re-spawn/restart never duplicates entries and a
 /// user's `statusLine`/own hooks survive.
-pub fn seed_settings(cwd: &std::path::Path) {
+///
+/// Returns the [`SeedWarning`]s encountered (HREG-03): an existing file that
+/// cannot be read, parsed, or whose root is not an object is left
+/// byte-identical and reported instead of being replaced with the seed alone.
+pub fn seed_settings(cwd: &std::path::Path) -> Vec<SeedWarning> {
     let dir = cwd.join(".claude");
+    // Best-effort: a create_dir_all failure surfaces as the write failure.
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("settings.local.json");
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| json!({}));
+    let existing = match read_settings_guarded(&path) {
+        Ok(existing) => existing,
+        // D-01: the file is user content we could not safely understand —
+        // leave it byte-identical and report, never overwrite with the seed.
+        Err(warning) => return vec![warning],
+    };
     let command = baude_hook_command();
     let merged = merge_hook_settings(&existing, &command);
-    let _ = std::fs::write(&path, merged.to_string());
+    match std::fs::write(&path, merged.to_string()) {
+        Ok(()) => Vec::new(),
+        // D-04: a write failure never aborts the spawn — warn and continue.
+        Err(error) => vec![SeedWarning {
+            file: path,
+            reason: SeedWarningReason::WriteFailed(error),
+        }],
+    }
+}
+
+/// Guarded read of a JSON settings file for seeding (D-01, HREG-03).
+///
+/// Four-way disposition:
+/// - missing file (`NotFound`) → `Ok(json!({}))`: the normal fresh-seed path;
+/// - any other read error → `Err(Unreadable)`;
+/// - JSON parse failure → `Err(Unparseable)`;
+/// - parses but the root is not an object → `Err(NonObjectRoot)`.
+///
+/// On `Err` the caller must NOT touch the file — the warning names it so the
+/// operator can fix or remove it. `pub(crate)` so `seed_mcp_config`
+/// (backend/claude.rs) shares the same guard for `.mcp.json` (D-03).
+pub(crate) fn read_settings_guarded(path: &std::path::Path) -> Result<Value, SeedWarning> {
+    let warn = |reason| SeedWarning {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(error) => return Err(warn(SeedWarningReason::Unreadable(error))),
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => return Err(warn(SeedWarningReason::Unparseable(error))),
+    };
+    if !value.is_object() {
+        return Err(warn(SeedWarningReason::NonObjectRoot));
+    }
+    Ok(value)
 }
 
 /// Route one normalized event line to its transport, never losing the event.
@@ -796,8 +927,9 @@ mod tests {
         assert!(!is_pure_seed_settings(&user_hook));
         // Including the harness's own `target/debug/deps/baude-<hash>`: it is
         // not a shape production ever writes, so fixtures seed a real
-        // `<abs>/baude hook` via `set_hook_command_for_test` instead of
-        // widening this predicate to accept it.
+        // `<abs>/baude hook` via the scoped
+        // `baude_core::testing::TestRedirect` guard instead of widening this
+        // predicate to accept it.
         let harness = merge_hook_settings(&seed, "/t/target/debug/deps/baude-9f2c hook");
         assert!(!is_pure_seed_settings(&harness));
         let mut unknown_event = seed.clone();
@@ -820,7 +952,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
         std::fs::create_dir_all(&cwd).unwrap();
 
-        seed_settings(&cwd);
+        let fresh_warnings = seed_settings(&cwd);
+        assert!(
+            fresh_warnings.is_empty(),
+            "fresh seed must not warn, got {fresh_warnings:?}"
+        );
         let path = cwd.join(".claude").join("settings.local.json");
         let first = std::fs::read_to_string(&path).expect("seed wrote settings file");
         let v: Value = serde_json::from_str(&first).expect("seed wrote valid JSON");
@@ -833,9 +969,422 @@ mod tests {
         }
 
         // Re-seeding is a no-op on the merged content (idempotent).
-        seed_settings(&cwd);
+        let reseed_warnings = seed_settings(&cwd);
+        assert!(
+            reseed_warnings.is_empty(),
+            "idempotent re-seed must not warn, got {reseed_warnings:?}"
+        );
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second, "re-seed must be idempotent");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ---- seed guard (HREG-03) ------------------------------------------
+
+    /// Unique per-test cwd fixture, same shape as
+    /// `seed_settings_writes_idempotent_merge` (temp_dir + pid-suffixed).
+    fn seed_guard_cwd(tag: &str) -> std::path::PathBuf {
+        let cwd =
+            std::env::temp_dir().join(format!("baude-seed-guard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        cwd
+    }
+
+    #[test]
+    fn seed_guard_unparseable_file_left_untouched_and_warned() {
+        // D-01: a settings file that fails JSON parsing is user content —
+        // it survives a seed attempt byte-identical and the caller gets a
+        // structured warning naming the file, never a silent overwrite.
+        let cwd = seed_guard_cwd("unparseable");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            warnings[0].file.ends_with("settings.local.json"),
+            "warning must name the settings file, got {:?}",
+            warnings[0].file
+        );
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::Unparseable(_)),
+            "expected Unparseable, got {:?}",
+            warnings[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json".to_vec(),
+            "unparseable file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_missing_file_fresh_seed_no_warning() {
+        // D-01: a missing settings file is the normal fresh-seed path — all
+        // four events seeded, no warning.
+        let cwd = seed_guard_cwd("missing");
+
+        let warnings = seed_settings(&cwd);
+
+        assert!(
+            warnings.is_empty(),
+            "fresh seed must not warn, got {warnings:?}"
+        );
+        let path = cwd.join(".claude").join("settings.local.json");
+        let raw = std::fs::read_to_string(&path).expect("fresh seed wrote settings file");
+        let v: Value = serde_json::from_str(&raw).expect("fresh seed wrote valid JSON");
+        for ev in EVENTS {
+            assert!(
+                v["hooks"][ev].is_array(),
+                "missing seeded hook array for {ev}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_display_names_file() {
+        // D-02: the rendered warning must name the affected file so the
+        // operator can act on it.
+        let cwd = seed_guard_cwd("display");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let warnings = seed_settings(&cwd);
+        let rendered = warnings
+            .first()
+            .expect("seed over an unparseable file must return a warning")
+            .to_string();
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "Display must contain the full settings path, got: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_unreadable_path_left_untouched() {
+        // D-01: a settings path that exists but cannot be read (here: it is a
+        // DIRECTORY, so read_to_string fails with a non-NotFound error on
+        // every supported platform) warns Unreadable and is left alone.
+        let cwd = seed_guard_cwd("unreadable");
+        let path = cwd.join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::Unreadable(_)),
+            "expected Unreadable, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert!(path.is_dir(), "the directory must still exist");
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            0,
+            "the directory must still be empty — nothing written into it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_non_object_root_left_untouched() {
+        // D-01: valid JSON whose root is not an object is user content too —
+        // never coerced to {} and overwritten.
+        let cwd = seed_guard_cwd("non-object");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "[1,2]").unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::NonObjectRoot),
+            "expected NonObjectRoot, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[1,2]".to_vec(),
+            "non-object file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_guard_write_failure_warns_and_preserves_original() {
+        // D-04: read + merge succeed but the write-back fails — exactly one
+        // WriteFailed warning, the original bytes intact, and no panic/abort.
+        // The file itself is made read-only (0o444): directory write
+        // permission alone does not block truncating an EXISTING entry, so
+        // the dir 0o555 chmod is belt-and-braces, not the trigger.
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = seed_guard_cwd("write-fail");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        let original: &[u8] = br#"{"user":true}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let warnings = seed_settings(&cwd);
+
+        // Restore permissions (0o755/0o644) before asserting so cleanup
+        // succeeds even if an assertion fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(warnings[0].reason, SeedWarningReason::WriteFailed(_)),
+            "expected WriteFailed, got {:?}",
+            warnings[0].reason
+        );
+        assert!(warnings[0].file.ends_with("settings.local.json"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original.to_vec(),
+            "original bytes must be intact after a failed write"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn seed_guard_refusal_repeats_byte_stable() {
+        // Edge-probe idempotency lift: a refused file stays byte-identical
+        // across REPEATED seed attempts — both calls warn, bytes never move.
+        let cwd = seed_guard_cwd("repeat-refusal");
+        let dir = cwd.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.local.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        let first = seed_settings(&cwd);
+        assert_eq!(first.len(), 1, "first attempt must warn");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json".to_vec());
+
+        let second = seed_settings(&cwd);
+        assert_eq!(second.len(), 1, "second attempt must warn again");
+        assert!(
+            matches!(second[0].reason, SeedWarningReason::Unparseable(_)),
+            "expected Unparseable on repeat, got {:?}",
+            second[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json".to_vec(),
+            "refused file must stay byte-identical across repeated attempts"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ---- POSIX-quoted seeded command (HREG-04, 09-03) --------------------
+
+    #[test]
+    fn quote_posix_single_exact_output() {
+        assert_eq!(quote_posix_single("/opt/baude"), "'/opt/baude'");
+        assert_eq!(
+            quote_posix_single("/opt/spa ced/baude"),
+            "'/opt/spa ced/baude'"
+        );
+        // An embedded `'` becomes exactly the 4-char escape sequence.
+        let quoted = quote_posix_single("/opt/qu'ote/baude");
+        assert_eq!(quoted, r"'/opt/qu'\''ote/baude'");
+        assert!(quoted.contains(r"'\''"));
+    }
+
+    #[test]
+    fn quote_unquote_round_trips_every_hostile_class() {
+        for input in [
+            "",
+            "/opt/baude",
+            "/opt/spa ced/baude",
+            "/opt/a$b;c/bauded",
+            "/opt/back`tick/baude",
+            "/opt/qu'ote/baude",
+            "/opt/''double/baude",
+            "'",
+        ] {
+            let quoted = quote_posix_single(input);
+            assert_eq!(
+                unquote_posix_single(&quoted).as_deref(),
+                Some(input),
+                "round-trip must recover {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_seeded_command_spaced_path_is_recognized() {
+        // D-05/D-07: the quoted canonical form is baude's own seed.
+        assert!(is_seeded_hook_command("'/opt/spa ced/baude' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_metachar_path_is_recognized() {
+        // `$` and `;` in the directory, `bauded` stem.
+        assert!(is_seeded_hook_command("'/opt/a$b;c/bauded' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_backtick_dir_is_recognized() {
+        assert!(is_seeded_hook_command("'/opt/back`tick/baude' hook"));
+    }
+
+    #[test]
+    fn quoted_seeded_command_embedded_quote_is_recognized() {
+        // An embedded `'` in the directory name exercises the producer's
+        // quote–backslash-quote–quote escape.
+        let cmd = format!("{} hook", quote_posix_single("/opt/qu'ote/baude"));
+        assert_eq!(cmd, r"'/opt/qu'\''ote/baude' hook");
+        assert!(is_seeded_hook_command(&cmd));
+    }
+
+    #[test]
+    fn quoted_look_alikes_and_legacy_forms_keep_their_meaning() {
+        // Legacy unquoted absolute path stays recognized (D-07) — entries
+        // seeded by older binaries must still be pruned.
+        assert!(is_seeded_hook_command("/opt/baude hook"));
+        // The bare fallback names no install and is never pruned (D-08).
+        assert!(!is_seeded_hook_command("baude hook"));
+        // Wrong stem after unquote.
+        assert!(!is_seeded_hook_command("'/opt/vim' hook"));
+        // Relative after unquote.
+        assert!(!is_seeded_hook_command("'relative/baude' hook"));
+        // Doubled outer quotes: strict round-trip fails (#78 look-alike class).
+        assert!(!is_seeded_hook_command("''/opt/baude'' hook"));
+        // Raw un-escaped inner quote: strict round-trip fails.
+        assert!(!is_seeded_hook_command("'/opt/ba'ude' hook"));
+        // Unterminated quote is not the quoted form and not absolute.
+        assert!(!is_seeded_hook_command("'/opt/baude hook"));
+    }
+
+    #[test]
+    fn merge_prunes_stale_quoted_seeds_to_one_group() {
+        // Criterion 3 / D-06: a file seeded by an older QUOTED install
+        // converges to exactly one seeded group per event on re-seed —
+        // quoting must not reintroduce HREG-01's per-path accumulation.
+        let old = merge_hook_settings(&json!({}), "'/old/baude' hook");
+        let new_cmd = "'/new/baude' hook";
+        let merged = merge_hook_settings(&old, new_cmd);
+        for ev in EVENTS {
+            let groups = merged["hooks"][ev].as_array().unwrap();
+            assert_eq!(
+                groups.len(),
+                1,
+                "exactly one seeded group must survive for {ev}"
+            );
+            assert_eq!(seeded_group_command(&groups[0]), Some(new_cmd));
+        }
+        // Idempotent on its own output (Pitfall 2): merge(merge(x)) == merge(x).
+        assert_eq!(
+            merge_hook_settings(&merged, new_cmd),
+            merged,
+            "re-merge of the quoted form must be a no-op"
+        );
+    }
+
+    #[test]
+    fn merge_converges_legacy_unquoted_seed_to_the_quoted_form() {
+        // D-06/D-07: a file seeded by an older UNQUOTED binary re-seeded with
+        // the quoted command also converges to one group per event.
+        let legacy = merge_hook_settings(&json!({}), "/old/baude hook");
+        let new_cmd = "'/new/baude' hook";
+        let merged = merge_hook_settings(&legacy, new_cmd);
+        for ev in EVENTS {
+            let groups = merged["hooks"][ev].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "one group per event for {ev}");
+            assert_eq!(seeded_group_command(&groups[0]), Some(new_cmd));
+        }
+    }
+
+    #[test]
+    fn pure_seed_accepts_quoted_seeds_and_rejects_look_alikes() {
+        // Freshly seeded worktrees keep their removal exemption: a settings
+        // value built by merge with a quoted command is purely baude's.
+        let quoted = merge_hook_settings(&json!({}), "'/opt/spa ced/baude' hook");
+        assert!(is_pure_seed_settings(&quoted));
+        // A malformed look-alike quoting is user content and must keep
+        // blocking removal (#78 stays closed).
+        let look_alike = merge_hook_settings(&json!({}), "''/opt/baude'' hook");
+        assert!(!is_pure_seed_settings(&look_alike));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spaced_metachar_path_seed_executes_exact_stub() {
+        use std::os::unix::fs::PermissionsExt;
+        // D-11 invocation proof: hostile characters live in the DIRECTORY
+        // name (Pitfall 5) — the stub file itself must be named `baude` for
+        // the stem check. Everything stays inside this test's unique cwd.
+        let cwd = seed_guard_cwd("e2e-hostile");
+        let hostile = cwd.join("sp ace$;`tick'quote");
+        std::fs::create_dir_all(&hostile).unwrap();
+        let stub = hostile.join("baude");
+        std::fs::write(&stub, "#!/bin/sh\nprintf ran > \"$MARKER\"\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The SAME rule the production formatter uses — producer, E2E, and
+        // recognizer share quote_posix_single.
+        let cmd = format!("{} hook", quote_posix_single(&stub.display().to_string()));
+        // Producer/recognizer contract: the seeded string is ours.
+        assert!(
+            is_seeded_hook_command(&cmd),
+            "seeded quoted command must be recognized: {cmd}"
+        );
+
+        // Seed through the production path with the quoted override.
+        let _redirect = crate::testing::TestRedirect::with_hook_command(cmd.clone());
+        let project = cwd.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let warnings = seed_settings(&project);
+        assert!(warnings.is_empty(), "seed must not warn, got {warnings:?}");
+
+        // Read the command string BACK from the written settings file and
+        // execute it exactly as Claude Code would: through a real shell.
+        let raw =
+            std::fs::read_to_string(project.join(".claude").join("settings.local.json")).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let seeded = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("seeded command present in settings.local.json");
+        assert_eq!(seeded, cmd, "file must carry the quoted canonical form");
+
+        let marker = cwd.join("marker");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(seeded)
+            .env("MARKER", &marker)
+            .status()
+            .expect("sh -c must run");
+        assert!(status.success(), "seeded command must exit 0 through sh -c");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "ran",
+            "exactly the stub under the hostile path must have run"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

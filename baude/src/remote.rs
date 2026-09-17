@@ -195,8 +195,9 @@ fn short_err(e: &ureq::Error) -> String {
     }
 }
 
-enum AttachInput {
+pub(crate) enum AttachInput {
     Bytes(Vec<u8>),
+    #[allow(dead_code)] // constructed by the IO loop; matched in app.rs tests
     Resize(u16, u16),
 }
 
@@ -301,6 +302,30 @@ impl RemoteAttach {
             tx,
             size: (rows, cols),
         })
+    }
+
+    /// Test-only attach: a live-looking `RemoteAttach` whose input channel
+    /// the TEST holds — no socket, no IO thread. Lets app.rs prove the
+    /// LINK-04 remote leg (the chord resolves this parser, the same one the
+    /// render path draws) and assert that NO byte crosses to the child while
+    /// the hints overlay is open, deterministically: `write_input` sends
+    /// synchronously into the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn test_stub(
+        remote_id: u64,
+        parser: Arc<Mutex<vt100::Parser>>,
+    ) -> (RemoteAttach, mpsc::Receiver<AttachInput>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            RemoteAttach {
+                remote_id,
+                parser,
+                closed: Arc::new(AtomicBool::new(false)),
+                tx,
+                size: (24, 80),
+            },
+            rx,
+        )
     }
 
     pub fn write_input(&self, bytes: &[u8]) {

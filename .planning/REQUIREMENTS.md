@@ -13,58 +13,63 @@ Approved scope: GitHub #70, #71, #72, clickable terminal links, and Shift+Enter.
 
 ### Test Isolation (#72)
 
-- [ ] **TISO-01** (partial): A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
+- [x] **TISO-01** (delivered plan 08-06): A developer can run repository/worktree tests with every created repository, worktree, config, and state file confined to a unique test-owned temporary root.
   - Shipped v2.1.4: managed worktrees and repos are confined; state is redirectable (`git.rs:1744`, `app.rs:5551`, `app.rs:1202`).
-  - Gap: config has no test redirect (`persist.rs:840`, `meta.rs:24`), so `App::new` reads the real `~/.config/baude/config.json` (`app.rs:719`) and `bauded/src/push.rs` writes real VAPID keys.
-- [ ] **TISO-02** (partial): A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
+  - Closed by plan 08-01: `baude_core::testing::TestRedirect` redirects the config dir, state dir, managed worktrees root, hook command and Claude config dir in one guard; plan 08-02 redirected `bauded/src/push.rs`'s VAPID storage (regressions at `push.rs:390`, `:432`, `:479`).
+  - Closed by plan 08-06: `ManagerFixture` makes a `bauded` fixture one construction holding both guards as fields, and `scripts/assert-real-roots-untouched.sh` proves a full 497-test serial run creates or modifies none of the three real roots.
+- [x] **TISO-02** (delivered plan 08-06): A developer can run those tests concurrently without changing the parent process's HOME/XDG environment or sharing cached workspace identity between fixtures.
   - Shipped: no parent-process HOME/XDG mutation; both test redirects are thread-local (`git.rs:1727`, `hook.rs:80`).
-  - Gap: workspace identity is a process-wide `OnceLock` (`workspace.rs:199`) resolved from the developer's real environment and shared by every fixture, with no reset.
-- [ ] **TISO-03** (partial): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
+  - Closed by plan 08-03: `workspace::override_for_test(&Config, hint)` gives each fixture a literal identity in the same thread-local redirect storage, and `active()` panics in a support build with no override rather than falling back to the process cache.
+  - Closed by plan 08-06: both downstream binaries run UNSERIALIZED inside the observer's before/after bracket with no root change, so concurrency does not alter containment.
+- [x] **TISO-03** (delivered plan 08-06): A developer receives a failing test when a tested creation path attempts to escape its fixture root, without writing to the real user data directory.
   - Shipped v2.1.4: `REQUIRE_WORKTREES_OVERRIDE` asserts on managed-worktree escape (`git.rs:1736`), with a containment test (`app.rs:5635`).
-  - Gap: the guard covers one path only; escapes into config, state (`app.rs:1581`) or `~/.claude` still pass silently, and the flag is armed per-binary by the first fixture, so `baude-core`'s own tests never arm it.
-- [ ] **TISO-04** (not started): A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
-  - No enumeration, preview, or approval tooling exists. The 2026-09-13 cleanup of 661 stray directories was a manual shell operation with nothing checked in.
+  - Closed by plan 08-01: `assert_contained` (`testing.rs:278`) covers the config, state, Claude and managed-worktrees resolutions, keys on `BAUDE_TEST_FIXTURE_ROOT` (independent of XDG, so it arms in every test binary — proven for both downstream binaries by `c52be5b`), and panics at resolution, so an escape performs no real-root I/O.
+  - Closed by plan 08-06: the guard demonstrably fired across the first broad run, catching 22 `manager`, 8 `api`, 5 `lifecycle` and 2 `app` escapes, all since owned; the suite-level observer asserts the aggregate claim the per-resolver guards only constrain.
+  - Residual (tracked, not part of this requirement): `App::open_editor` (`app.rs:5077`) and `copy_to_clipboard` (`app.rs:5442`) spawn subprocesses with the inherited environment rather than through the contained launcher. Neither is test-reachable; WINDOWS entry 6.
+- [x] **TISO-04**: A developer can preview suspected historical test-worktree leaks without deleting them; removal outside newly created test fixtures requires separate approval and verified ownership, never a missing gitdir alone.
+  - Shipped plan 08-04: read-only enumeration and the `Evidence`/`Verdict` classification, with a missing gitdir explicitly unable to clear a candidate (`worktree_scan.rs`).
+  - Shipped plan 08-05: state cross-referencing as ownership-negative evidence, and `prune_at(roots, report, confirmed)` — full re-derivation plus proof equality plus a non-defaulting confirmation parameter.
+  - Gap: no CLI surface yet, so a developer still cannot *run* a preview. Plan 08-07 exposes both through `baude worktrees` with `--prune` and a separate `--yes`.
 
 ### Hook Registration (#70)
 
 - [x] **HREG-01** (delivered v2.1.2): Opening or reopening sessions from different baude/bauded executable paths converges each of the four lifecycle events to one recognized baude-owned registration using the current executable.
 - [x] **HREG-02** (delivered v2.1.2): A user's custom hooks, mixed groups, ambiguous registrations, and unrelated settings remain unchanged during owned-registration reconciliation.
-- [ ] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
+- [x] **HREG-03** (not started): A user retains existing settings unchanged when seeding cannot safely parse or update them and receives an actionable warning instead of silent replacement with empty settings.
   - `seed_settings` degrades an unparseable file to `json!({})` and overwrites it (`hook.rs:282-288`); every fs call is `let _ =` and no warning path exists. `backend/claude.rs:114-121` repeats the pattern for `.mcp.json`.
-- [ ] **HREG-04** (partial): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
-  - Shipped: recognition and pruning handle spaced paths (`hook.rs:123`).
-  - Gap: `baude_hook_command` interpolates the path unquoted (`hook.rs:86`). Verified 2026-09-13 that hook commands are executed through a shell, so a spaced path runs the wrong argv and a path bearing `$`, `;` or a backtick is worse. A quoting fix must ship with a recognizer that matches the quoted form.
+- [x] **HREG-04** (delivered plan 09-03): A user can launch baude from a path containing spaces or shell metacharacters and have the seeded hook invoke that exact executable safely and idempotently.
+  - `baude_hook_command` now emits the POSIX single-quoted canonical form via `quote_posix_single`; `is_seeded_hook_command` accepts quoted (strict round-trip) and legacy forms; `sh -c` E2E proves exact-executable invocation on a space/`$`/`;`/backtick/embedded-`'` path.
 
 ### Workspace Lock Diagnostics (#71)
 
 - [x] **WLOCK-01** (delivered v2.1.3; TUI refuses before session operations (`main.rs:301-327`). `bauded` still learns of contention at first save rather than at startup): Starting a second instance for an already-owned workspace reports explicit lock contention before accepting session operations, rather than starting in a misleading degraded state.
 - [x] **WLOCK-02** (delivered v2.1.3; every write claims the lock before creating a temp (`persist.rs:624`) and no code removes a lock file): A second instance cannot replace another owner's state, remove its lock, or interfere with its live sessions.
 - [x] **WLOCK-03** (delivered v2.1.3; message names workspace, pid, lock path and recovery (`main.rs:311-326`), pid is diagnostic only): A user sees the affected workspace/state path, owner PID when reliably recorded, and a recovery action such as closing the other instance or selecting another workspace; PID metadata is diagnostic only.
-- [x] **WLOCK-04** (delivered v2.1.3; contention is decided by `try_lock` alone, never file existence (`persist.rs:579-594`). The reopen-with-leftover-lock-file sequence has no regression test): A user can reopen the workspace after the OS lock is released even if its lock file remains, while malformed or unreadable state is still reported distinctly and preserved.
+- [x] **WLOCK-04** (delivered v2.1.3; contention is decided by `try_lock` alone, never file existence (`persist.rs:579-594`). The reopen-with-leftover-lock-file sequence is pinned by `persist::tests::reopen_claims_lock_when_leftover_file_outlives_released_os_lock` since plan 09-02): A user can reopen the workspace after the OS lock is released even if its lock file remains, while malformed or unreadable state is still reported distinctly and preserved.
 
 ### Clickable Terminal Links
 
-- [ ] **LINK-01**: A user can activate a labeled OSC8 HTTP(S) link emitted in an agent or shell pane, opening its target rather than interpreting its visible label as a URL.
-- [ ] **LINK-02**: A user can activate a bare HTTP(S) URL, including one soft-wrapped across terminal rows, without adding surrounding prose punctuation or dropping valid URL characters.
-- [ ] **LINK-03**: Links remain associated with the correct rendered cells through scrolling, scrollback, wrapping, resizing, overwrites, and erasure, in both local and attached remote TUI terminals.
-- [ ] **LINK-04**: A user can activate links with a documented explicit gesture while ordinary text selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
-- [ ] **LINK-05**: A user can inspect the actual destination of a labeled link before opening it.
-- [ ] **LINK-06**: A user can copy a link's actual destination without opening it.
-- [ ] **LINK-07**: A user sees unsupported, malformed, or control-character-bearing targets as non-activatable text; v2.2 opens only validated HTTP(S) destinations.
-- [ ] **LINK-08**: Opening an allowed link passes the target as data to the platform opener, never shell code, and an opener failure leaves the session running with a useful error.
+- [x] **LINK-01**: A user can activate a labeled OSC8 HTTP(S) link emitted in an agent or shell pane, opening its target rather than interpreting its visible label as a URL.
+- [x] **LINK-02**: A user can activate a bare HTTP(S) URL, including one soft-wrapped across terminal rows, without adding surrounding prose punctuation or dropping valid URL characters.
+- [x] **LINK-03**: Links remain associated with the correct rendered cells through scrolling, scrollback, wrapping, resizing, overwrites, and erasure, in both local and attached remote TUI terminals.
+- [x] **LINK-04**: A user can activate links with a documented explicit gesture while ordinary text selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
+- [x] **LINK-05**: A user can inspect the actual destination of a labeled link before opening it.
+- [x] **LINK-06**: A user can copy a link's actual destination without opening it.
+- [x] **LINK-07**: A user sees unsupported, malformed, or control-character-bearing targets as non-activatable text; v2.2 opens only validated HTTP(S) destinations.
+- [x] **LINK-08**: Opening an allowed link passes the target as data to the platform opener, never shell code, and an opener failure leaves the session running with a useful error.
 
 ### Multiline Input
 
-- [ ] **TKEY-01**: A user can press Shift+Enter to insert a newline without submitting in Claude/claudex prompts on documented, tested terminal paths that report the modifier distinctly.
-- [ ] **TKEY-02**: Ordinary Enter, Ctrl-C, navigation keys, and existing baude shortcuts retain their behavior after enhanced keyboard handling is enabled.
-- [ ] **TKEY-03**: A user of a terminal that cannot distinguish Shift+Enter retains legacy input behavior and receives documented multiline-input setup or fallback guidance; baude does not guess a missing modifier.
-- [ ] **TKEY-04**: The outer terminal's previous keyboard mode is restored on normal exit and application-controlled failure/suspend paths, and correctly re-established on resume.
-- [ ] **TKEY-05**: Keyboard capability negotiation cannot indefinitely block startup or input, and enhanced sequences are sent only on a verified supported outer-terminal/child input path.
+- [x] **TKEY-01**: A user can press Shift+Enter to insert a newline without submitting in Claude/claudex prompts on documented, tested terminal paths that report the modifier distinctly.
+- [x] **TKEY-02**: Ordinary Enter, Ctrl-C, navigation keys, and existing baude shortcuts retain their behavior after enhanced keyboard handling is enabled.
+- [x] **TKEY-03**: A user of a terminal that cannot distinguish Shift+Enter retains legacy input behavior and receives documented multiline-input setup or fallback guidance; baude does not guess a missing modifier.
+- [x] **TKEY-04**: The outer terminal's previous keyboard mode is restored on normal exit and application-controlled failure/suspend paths, and correctly re-established on resume.
+- [x] **TKEY-05**: Keyboard capability negotiation cannot indefinitely block startup or input, and enhanced sequences are sent only on a verified supported outer-terminal/child input path.
 
 ### Verification and Release
 
-- [ ] **SHIP-01**: A maintainer can run focused regression tests plus workspace tests, fmt, clippy, and the existing supported-platform CI checks successfully after test isolation is in place.
-- [ ] **SHIP-02**: A user can find documented link activation/preview/copy gestures, tested terminal support, Shift+Enter setup or fallback, and workspace-lock recovery instructions.
+- [x] **SHIP-01**: A maintainer can run focused regression tests plus workspace tests, fmt, clippy, and the existing supported-platform CI checks successfully after test isolation is in place.
+- [x] **SHIP-02**: A user can find documented link activation/preview/copy gestures, tested terminal support, Shift+Enter setup or fallback, and workspace-lock recovery instructions.
 - [ ] **SHIP-03**: A maintainer has recorded real macOS/Linux terminal smoke evidence covering links, selection/scrollback, mouse interaction, Shift+Enter, ordinary Enter, and terminal restoration before release approval.
 - [ ] **SHIP-04**: A maintainer can publish v2.2.0 through the existing release workflow after verification passes, with matching release notes/version metadata and the existing supported binary/container distribution outputs.
 
@@ -99,44 +104,45 @@ Each v2.2 requirement maps to exactly one roadmap phase. Continue after archived
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TISO-01 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-02 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-03 | Phase 8 | Partial — gap in Phase 8 |
-| TISO-04 | Phase 8 | Pending |
+| TISO-01 | Phase 8 | Delivered plan 08-06 |
+| TISO-02 | Phase 8 | Delivered plan 08-06 |
+| TISO-03 | Phase 8 | Delivered plan 08-06 |
+| TISO-04 | Phase 8 | Delivered plan 08-07 |
 | HREG-01 | Phase 9 | Delivered v2.1.2 |
 | HREG-02 | Phase 9 | Delivered v2.1.2 |
-| HREG-03 | Phase 9 | Pending |
-| HREG-04 | Phase 9 | Partial — gap in Phase 9 |
+| HREG-03 | Phase 9 | Complete |
+| HREG-04 | Phase 9 | Delivered plan 09-03 |
 | WLOCK-01 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-02 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-03 | Phase 9 | Delivered v2.1.3 |
 | WLOCK-04 | Phase 9 | Delivered v2.1.3 |
-| LINK-01 | Phase 10 | Pending |
-| LINK-02 | Phase 10 | Pending |
-| LINK-03 | Phase 10 | Pending |
-| LINK-04 | Phase 10 | Pending |
-| LINK-05 | Phase 10 | Pending |
-| LINK-06 | Phase 10 | Pending |
-| LINK-07 | Phase 10 | Pending |
-| LINK-08 | Phase 10 | Pending |
-| TKEY-01 | Phase 11 | Pending |
-| TKEY-02 | Phase 11 | Pending |
-| TKEY-03 | Phase 11 | Pending |
-| TKEY-04 | Phase 11 | Pending |
-| TKEY-05 | Phase 11 | Pending |
-| SHIP-01 | Phase 12 | Pending |
-| SHIP-02 | Phase 12 | Pending |
+| LINK-01 | Phase 10 | Complete |
+| LINK-02 | Phase 10 | Complete |
+| LINK-03 | Phase 10 | Complete |
+| LINK-04 | Phase 10 | Complete |
+| LINK-05 | Phase 10 | Complete |
+| LINK-06 | Phase 10 | Complete |
+| LINK-07 | Phase 10 | Complete |
+| LINK-08 | Phase 10 | Complete |
+| TKEY-01 | Phase 11 | Complete |
+| TKEY-02 | Phase 11 | Complete |
+| TKEY-03 | Phase 11 | Complete |
+| TKEY-04 | Phase 11 | Complete |
+| TKEY-05 | Phase 11 | Complete |
+| SHIP-01 | Phase 12 | Complete |
+| SHIP-02 | Phase 12 | Complete |
 | SHIP-03 | Phase 12 | Pending |
 | SHIP-04 | Phase 12 | Pending |
 
 **Coverage:**
+
 - v2.2 requirements: 29 total
 - Mapped to phases: 29
 - Unmapped: 0
 - Delivered before execution: 6 (HREG-01, HREG-02, WLOCK-01 through WLOCK-04)
-- Partially delivered, remainder in scope: 4 (TISO-01, TISO-02, TISO-03, HREG-04)
-- Open: 23
+- Delivered during execution: 5 (TISO-01, TISO-02, TISO-03 — plan 08-06; TISO-04 — plan 08-07; HREG-04 — plan 09-03)
+- Open: 20
 
 ---
 *Requirements defined: 2026-09-08*
-*Last updated: 2026-09-13 — re-baselined to v2.1.5 and reconciled against shipped code*
+*Last updated: 2026-09-15 — TISO-04 closed by plan 08-07 (`baude worktrees scan` preview surface)*

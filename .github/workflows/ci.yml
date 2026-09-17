@@ -16,12 +16,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The real-root observer proves itself against synthetic trees before it
+      # is trusted to judge a suite run.
+      - name: self-test the real-root observer
+        run: bash scripts/assert-real-roots-untouched.sh --self-test
+      # Bracket the suite (#72): the per-resolver guards each prove one
+      # resolution is contained, but only this pair proves the aggregate claim
+      # — that running the suite neither creates nor modifies the real config
+      # dir, the real Claude config dir, or the real managed-worktrees root.
+      - name: fingerprint the real roots before the suite
+        id: roots-before
+        run: bash scripts/assert-real-roots-untouched.sh before
       # Serial test execution on CI (#58): the manager close-rollback test
       # fails only on loaded 3-core CI runners with varying assertions — the
       # signature of cross-test process interference (PTY children spawned in
       # parallel with pid/pgid churn), not a lifecycle defect. Every assertion
       # stays intact; serial execution removes the interference channel.
       - run: cargo test -- --test-threads=1
+      # Runs even when the suite failed: a run that fails AND leaks is the case
+      # most worth catching, and the two statuses are reported independently so
+      # neither masks the other. Guarded on the snapshot having been taken, so
+      # an earlier failure does not turn this into a spurious "no snapshot"
+      # error.
+      - name: assert the suite left the real roots untouched
+        if: always() && steps.roots-before.outcome == 'success'
+        run: bash scripts/assert-real-roots-untouched.sh after
 
   docker:
     runs-on: ubuntu-22.04

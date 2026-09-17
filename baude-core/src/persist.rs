@@ -548,9 +548,14 @@ fn lock_holder_pid(path: &std::path::Path) -> Option<u32> {
 }
 
 /// Drop this process's claim on a lock so a fixture root can be reused or
-/// removed. Tests only — the real lock is held for the life of the process.
-#[cfg(test)]
-fn release_state_lock_for_test(destination: &std::path::Path) {
+/// removed. Test support only — the real lock is held for the life of the
+/// process.
+///
+/// Gated on the `test-support` feature as well as `cfg(test)` so `baude` and
+/// `bauded` fixtures can actually reach it; it was private and `test`-gated,
+/// which made it unreachable from the two crates that need it most.
+#[cfg(any(test, feature = "test-support"))]
+pub fn release_state_lock_for_test(destination: &std::path::Path) {
     let path = lock_path(destination);
     if let Some(locks) = HELD_STATE_LOCKS.get() {
         let mut locks = locks
@@ -837,7 +842,20 @@ pub struct SavedSession {
     pub archived_by_user: bool,
 }
 
-fn config_base() -> PathBuf {
+/// The real config root, with no test redirect and no containment check.
+///
+/// Kept verbatim from the pre-redirect `config_base`. Note the terminal
+/// fallback is `"."` here and `/tmp` in [`crate::git`]'s worktrees resolver —
+/// the four real-root resolvers in this crate share a shape but not their
+/// tails, so they must not be collapsed into one helper.
+///
+/// Public — and ungated — for the same reason [`crate::git::real_worktrees_base`]
+/// is: the leak scanner is production code whose whole job is the real tree, and
+/// it needs a real *config* root to pair with the real worktrees root. Pairing a
+/// real root with the guarded [`config_dir`] gives a support build one
+/// `ScanRoots` whose halves live in different universes (#72, WR-01). Nothing
+/// that allocates, writes, or removes may call this.
+pub fn real_config_base() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
@@ -845,10 +863,78 @@ fn config_base() -> PathBuf {
         .join("baude")
 }
 
+fn config_base() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(base) = crate::testing::config_dir_override() {
+        return base;
+    }
+    let real = real_config_base();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "config dir");
+    real
+}
+
 /// The config directory (`~/.config/baude`), for sibling stores that live
 /// next to config.json and the state files (e.g. breadcrumbs).
 pub fn config_dir() -> PathBuf {
     config_base()
+}
+
+/// The real home directory, with no test redirect and no containment check.
+///
+/// Kept verbatim from the private `expand_tilde` helpers this replaced,
+/// terminal fallback included: `dirs::home_dir()` yields `None` only when
+/// neither `$HOME` nor a passwd entry supplies one, and `/` is what those
+/// helpers substituted.
+///
+/// Private on purpose, and unlike [`real_config_base`] or
+/// [`crate::git::real_worktrees_base`] it has no external consumer to justify
+/// publishing it. Those two are public because the leak *scanner* genuinely
+/// needs the real tree; this one exists only so [`home_dir`] has something to
+/// guard. Published, it would be the unguarded resolver CR-01 removed from
+/// `baude` and `bauded` — a `persist::real_home_dir().join(".config")` in
+/// either binary would compile, pass clippy, and silently re-create #72. The
+/// module boundary is what makes "every home resolution goes through
+/// `home_dir`" a property the compiler enforces rather than a convention
+/// (#72, WR-01).
+fn real_home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The home directory a leading `~` expands to, guarded exactly as
+/// [`config_dir`] is.
+///
+/// This exists because three copies of an unguarded `dirs::home_dir()` survived
+/// the fixture migration in `baude` and `bauded` — code `rustc --test` compiles
+/// verbatim into the two harnesses that produced the original leak (#72). The
+/// reachable touches were a tab-completion `read_dir`, a `POST /sessions`
+/// repository path, and the destination a real `git clone` is written into, so
+/// an unredirected resolution aborts here rather than reaching the developer's
+/// real home.
+pub fn home_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(home) = crate::testing::home_dir_override() {
+        return home;
+    }
+    let real = real_home_dir();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "home directory");
+    real
+}
+
+/// Expand a leading `~` through the guarded [`home_dir`].
+///
+/// One copy on purpose. `baude` and `bauded` each carried a byte-identical
+/// private version reading `dirs::home_dir()` directly, which is how the same
+/// escape survived in two crates at once.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else if s == "~" {
+        home_dir()
+    } else {
+        PathBuf::from(s)
+    }
 }
 
 /// User configuration, ~/.config/baude/config.json. All fields optional.
@@ -943,7 +1029,28 @@ impl Config {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many times [`load_config`] has executed ON THIS THREAD.
+    ///
+    /// Thread-local, not a process counter: the harness runs cases in
+    /// parallel, so a global count would be moved by unrelated tests and could
+    /// not distinguish "the identity path read config" from "some other case
+    /// did". Only a DELTA measured around the calls under test is meaningful.
+    static CONFIG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Instrumentation for the "identity resolution reads no config" assertion
+/// (D-06, T-08-24). Measure a delta around the calls under test — the absolute
+/// value carries no meaning.
+#[cfg(any(test, feature = "test-support"))]
+pub fn config_read_count_for_test() -> usize {
+    CONFIG_READS.with(std::cell::Cell::get)
+}
+
 pub fn load_config() -> Config {
+    #[cfg(any(test, feature = "test-support"))]
+    CONFIG_READS.with(|reads| reads.set(reads.get() + 1));
     std::fs::read_to_string(config_base().join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1004,7 +1111,15 @@ pub fn save_named(file: &str, state: &StateFile) -> Result<()> {
     save_current_at(&config_base(), file, state)
 }
 
-fn load_named_at(
+/// Strict, **non-locking** read of one named state file under an explicit root.
+///
+/// Widened from private for the leak scanner
+/// ([`crate::worktree_scan`]), whose state cross-reference has to read every
+/// workspace's state file without writing anything —
+/// [`load_for_workspace_strict_at`] calls `hold_state_lock`, which creates or
+/// opens a lock file and would violate the scan's no-write contract (D-16).
+/// Kept `pub(crate)`: an internal seam, not crate API.
+pub(crate) fn load_named_at(
     root: &std::path::Path,
     file: &str,
 ) -> std::result::Result<LoadOutcome, LoadError> {
@@ -1061,6 +1176,22 @@ mod tests {
         RuntimeGeneration, SavedCheckout, SavedRepository, SavedStandaloneSession, ShellOwnership,
         StandaloneLifecycle, UnavailableCause,
     };
+
+    /// `config_dir()` follows the thread's redirect, and a nested scope restores
+    /// the outer value when it ends. Pure path resolution — no filesystem, no
+    /// identity, no consumers that later plans still have to isolate.
+    #[test]
+    fn config_dir_honours_redirect() {
+        let outer = PathBuf::from("/nonexistent/baude-persist-redirect-outer");
+        let inner = PathBuf::from("/nonexistent/baude-persist-redirect-inner");
+        let _outer = crate::testing::TestRedirect::new(&outer);
+        assert_eq!(config_dir(), outer.join("config"));
+        {
+            let _inner = crate::testing::TestRedirect::new(&inner);
+            assert_eq!(config_dir(), inner.join("config"));
+        }
+        assert_eq!(config_dir(), outer.join("config"));
+    }
 
     fn isolated_root(label: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1541,6 +1672,52 @@ mod tests {
 
         // Same process re-entering is the cached no-op, not a second claim.
         hold_state_lock(&destination).expect("re-entrant claim is a no-op");
+
+        release_state_lock_for_test(&destination);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// WLOCK-04: contention is decided by `try_lock`, never by lock-file
+    /// existence. A prior owner that exited leaves its lock FILE (and a stale
+    /// pid stamp) on disk, but the OS lock died with the process — reopening
+    /// must succeed and re-stamp the current pid, without anyone ever having
+    /// to delete the leftover file (D-12).
+    #[test]
+    fn reopen_claims_lock_when_leftover_file_outlives_released_os_lock() {
+        let root = isolated_root("leftover-lock");
+        let workspace = test_workspace("claude");
+        let destination = root.join(workspace.state_file("state"));
+        let lock_path = lock_path(&destination);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+
+        // Simulate the PRIOR owner with a RAW file handle, never via
+        // hold_state_lock: the re-entrant cache would return Ok early and the
+        // test would exercise the cache, not the leftover-file path.
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+        writeln!(lock, "999999").unwrap();
+        lock.flush().unwrap();
+
+        // The prior owner exits: the OS lock evaporates, the file stays.
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "lock file must survive the OS lock release"
+        );
+        assert_eq!(lock_holder_pid(&lock_path), Some(999_999));
+
+        // Reopen succeeds despite the leftover file and re-stamps our pid.
+        hold_state_lock(&destination).expect("leftover lock file must not block reopen");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
 
         release_state_lock_for_test(&destination);
         std::fs::remove_dir_all(root).unwrap();

@@ -107,7 +107,11 @@ pub trait Backend: Send + Sync {
     /// Best-effort per-cwd wiring so a spawned session reports back to baude.
     /// Idempotent and non-clobbering — re-run on every restore-driven
     /// re-spawn — and a failure must NEVER abort a spawn.
-    fn prepare_cwd(&self, cwd: &Path);
+    ///
+    /// Returns the [`crate::hook::SeedWarning`]s encountered (HREG-03):
+    /// baude-core does no printing, so callers surface them (TUI message,
+    /// daemon warn logging) per D-02.
+    fn prepare_cwd(&self, cwd: &Path) -> Vec<crate::hook::SeedWarning>;
 
     /// Refresh `meta` from the backend's on-disk/live artifacts for one
     /// session. Called from the poll loop via

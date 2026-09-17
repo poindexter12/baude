@@ -12,8 +12,11 @@ anyhow.workspace = true
 async-stream = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+# `dirs` is deliberately NOT a dependency of this crate. Every home resolution
+# goes through `baude_core::persist::home_dir`, which is guarded; keeping the
+# unguarded crate out of scope means a fourth private `expand_tilde` cannot be
+# written here by accident (#72, CR-01).
 baude-core.workspace = true
-dirs.workspace = true
 futures-core = "0.3"
 hkdf = "0.12"
 p256 = { version = "0.13", features = ["ecdh"] }
@@ -25,6 +28,11 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
+# Re-declares only the feature; path/version are inherited from the workspace
+# dependency. Dev-dependency features are unified into the build graph only when
+# a test target is in play, so `cargo build --release` still ships without the
+# guard (#72, D-12).
+baude-core = { workspace = true, features = ["test-support"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"

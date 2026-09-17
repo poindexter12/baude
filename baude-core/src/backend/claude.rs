@@ -71,11 +71,12 @@ impl Backend for ClaudeBackend {
     /// resolve `current_exe()`, so a daemon-spawned session wires `bauded`
     /// and a TUI one wires `baude` (the Pitfall-2 reason both binaries carry
     /// the `hook`/`permission-mcp` arms).
-    fn prepare_cwd(&self, cwd: &Path) {
-        crate::hook::seed_settings(cwd);
+    fn prepare_cwd(&self, cwd: &Path) -> Vec<crate::hook::SeedWarning> {
+        let mut warnings = crate::hook::seed_settings(cwd);
         if crate::permission::is_prompt_mode() {
-            seed_mcp_config(cwd);
+            warnings.extend(seed_mcp_config(cwd));
         }
+        warnings
     }
 
     fn poll_meta(
@@ -107,18 +108,36 @@ impl Backend for ClaudeBackend {
 /// sibling MCP servers (idempotent — the command is the sentinel). Previously
 /// duplicated byte-identically in `baude/src/app.rs` and `bauded/src/manager.rs`;
 /// this is now the single copy.
-fn seed_mcp_config(cwd: &Path) {
+///
+/// Guarded like [`crate::hook::seed_settings`] (D-03, HREG-03): an existing
+/// `.mcp.json` that cannot be read, parsed, or whose root is not an object is
+/// left byte-identical and reported via [`crate::hook::SeedWarning`] instead
+/// of being replaced with the seed alone. The `command` field stays the RAW
+/// `current_exe()` string — Claude Code spawns stdio MCP servers directly
+/// (no shell), so it is argv data and must never be quoted (D-09).
+fn seed_mcp_config(cwd: &Path) -> Vec<crate::hook::SeedWarning> {
+    use crate::hook::{SeedWarning, SeedWarningReason};
     let exe = match std::env::current_exe() {
         Ok(p) => p.display().to_string(),
-        Err(_) => return, // can't resolve the bridge command — best-effort skip.
+        Err(_) => return Vec::new(), // can't resolve the bridge command — best-effort skip.
     };
     let path = crate::permission::mcp_config_path(cwd);
-    let existing = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    // D-03: the identical guard seed_settings uses — on Err the file is user
+    // content we could not safely understand; leave it untouched and report.
+    let existing = match crate::hook::read_settings_guarded(&path) {
+        Ok(existing) => existing,
+        Err(warning) => return vec![warning],
+    };
+    // D-09: `exe` reaches the merge unmodified — argv data for a direct spawn.
     let merged = crate::permission::merge_mcp_config(&existing, &exe);
-    let _ = std::fs::write(&path, merged.to_string());
+    match std::fs::write(&path, merged.to_string()) {
+        Ok(()) => Vec::new(),
+        // D-04: a write failure never aborts the spawn — warn and continue.
+        Err(error) => vec![SeedWarning {
+            file: path,
+            reason: SeedWarningReason::WriteFailed(error),
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +343,137 @@ mod tests {
         assert_eq!(
             v2["mcpServers"]["baude"]["args"][0].as_str(),
             Some("permission-mcp")
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ---- seed_mcp_config guard (HREG-03 / D-03) --------------------------
+
+    /// Unique per-test cwd fixture, same shape as hook.rs's `seed_guard_cwd`
+    /// (temp_dir + pid-suffixed).
+    fn mcp_guard_cwd(tag: &str) -> std::path::PathBuf {
+        let cwd =
+            std::env::temp_dir().join(format!("baude-mcp-guard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        cwd
+    }
+
+    #[test]
+    fn mcp_guard_unparseable_left_untouched_and_warned() {
+        // D-03: a `.mcp.json` that fails JSON parsing is user content — it
+        // survives a prompt-mode seed attempt byte-identical and the caller
+        // gets the identical warning shape `seed_settings` uses.
+        let cwd = mcp_guard_cwd("unparseable");
+        let path = crate::permission::mcp_config_path(&cwd);
+        std::fs::write(&path, "{not json").unwrap();
+
+        let warnings = seed_mcp_config(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            warnings[0].file.ends_with(".mcp.json"),
+            "warning must name the mcp config file, got {:?}",
+            warnings[0].file
+        );
+        assert!(
+            matches!(
+                warnings[0].reason,
+                crate::hook::SeedWarningReason::Unparseable(_)
+            ),
+            "expected Unparseable, got {:?}",
+            warnings[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{not json".to_vec(),
+            "unparseable file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn mcp_guard_non_object_root_left_untouched() {
+        // D-03: valid JSON whose root is not an object is user content too —
+        // never coerced to `{}` and overwritten.
+        let cwd = mcp_guard_cwd("non-object");
+        let path = crate::permission::mcp_config_path(&cwd);
+        std::fs::write(&path, "[1,2]").unwrap();
+
+        let warnings = seed_mcp_config(&cwd);
+
+        assert_eq!(warnings.len(), 1, "expected exactly one SeedWarning");
+        assert!(
+            matches!(
+                warnings[0].reason,
+                crate::hook::SeedWarningReason::NonObjectRoot
+            ),
+            "expected NonObjectRoot, got {:?}",
+            warnings[0].reason
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[1,2]".to_vec(),
+            "non-object file must remain byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn mcp_guard_missing_file_fresh_seed() {
+        // D-03: a missing `.mcp.json` stays the normal fresh-seed path — no
+        // warning, and the written file registers baude's server.
+        let cwd = mcp_guard_cwd("missing");
+
+        let warnings = seed_mcp_config(&cwd);
+
+        assert!(
+            warnings.is_empty(),
+            "fresh seed must not warn, got {warnings:?}"
+        );
+        let path = crate::permission::mcp_config_path(&cwd);
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("fresh seed wrote valid JSON");
+        assert!(
+            v["mcpServers"]["baude"]["command"].is_string(),
+            "fresh seed must register mcpServers.baude.command, got {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn mcp_command_is_raw_argv_not_shell_quoted() {
+        // D-09: the `.mcp.json` command field is argv data for a DIRECT
+        // process spawn (Claude Code launches stdio MCP servers without a
+        // shell), so it must equal `current_exe()` displayed EXACTLY — a
+        // single-quoted form would make the spawn look for a file whose name
+        // literally contains quote characters (self-inflicted DoS).
+        let cwd = mcp_guard_cwd("raw-argv");
+
+        let warnings = seed_mcp_config(&cwd);
+        assert!(
+            warnings.is_empty(),
+            "fresh seed must not warn, got {warnings:?}"
+        );
+
+        let path = crate::permission::mcp_config_path(&cwd);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let command = v["mcpServers"]["baude"]["command"]
+            .as_str()
+            .expect("command field present");
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        assert_eq!(
+            command, exe,
+            "command must equal current_exe() EXACTLY — raw argv, no quoting"
+        );
+        assert!(
+            !command.starts_with('\''),
+            "command must not start with a single-quote character, got: {command}"
         );
 
         let _ = std::fs::remove_dir_all(&cwd);

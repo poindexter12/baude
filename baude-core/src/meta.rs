@@ -20,12 +20,42 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The config dir the spawned claude processes will use (inherited env).
-pub fn claude_config_dir() -> PathBuf {
+/// The real `~/.claude` root, with no test redirect and no containment check.
+///
+/// Kept verbatim from the pre-redirect `claude_config_dir`. This is NOT an XDG
+/// chain: it consults `CLAUDE_CONFIG_DIR` where [`crate::persist`] and
+/// [`crate::git`] consult `XDG_*`, and its terminal fallback (`"."`) differs
+/// from `crate::git`'s. The real-root resolvers in this crate share a shape but
+/// not their heads or their tails, so they must not be collapsed into one
+/// helper — doing so would change production behavior.
+///
+/// `CLAUDE_CONFIG_DIR` coming first is also why a re-exec'd test child must be
+/// given that variable explicitly: a developer who exports it in their shell
+/// would otherwise have the child resolve their real Claude directory and trip
+/// [`crate::testing::assert_contained`].
+fn real_claude_config_dir() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The config dir the spawned claude processes will use (inherited env).
+///
+/// Under a test redirect this resolves inside the fixture root; with no
+/// redirect and no fixture root it aborts the test rather than reaching the
+/// developer's real `~/.claude` (#72, D-03). Isolating here rather than by
+/// parameter is deliberate: both [`ClaudeMeta::poll`] call sites keep their
+/// current signatures and neither gains an `_at` variant.
+pub fn claude_config_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(dir) = crate::testing::claude_config_dir_override() {
+        return dir;
+    }
+    let real = real_claude_config_dir();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "claude config dir");
+    real
 }
 
 /// Claude Code encodes a project cwd into a directory name by replacing
@@ -1325,5 +1355,133 @@ mod tests {
         assert_eq!(back.tool, ev.tool);
         assert_eq!(back.notification_type, ev.notification_type);
         assert_eq!(back.ts, ev.ts);
+    }
+
+    // ---- claude_config_dir isolation (#72, D-03) ----
+    //
+    // `claude_config_dir()` is the only resolver in this crate that reaches
+    // `~/.claude`, Claude Code's own session and transcript store. These cases
+    // pin it to the thread's fixture redirect. Every one of them asserts the
+    // resolved path BEFORE touching the filesystem, so a regression fails on a
+    // path comparison rather than by reading the developer's real directory.
+
+    /// A unique on-disk fixture root. Keyed by pid and a counter so parallel
+    /// cases never collide, and rooted in the temp dir because the redirect
+    /// short-circuits before any containment check.
+    fn isolated_claude_root(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "baude-meta-claude-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn claude_config_dir_follows_the_thread_redirect() {
+        let root = PathBuf::from("/nonexistent/baude-meta-claude-redirect");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        assert_eq!(claude_config_dir(), root.join("claude"));
+    }
+
+    #[test]
+    fn claude_config_dir_nested_scopes_restore_the_outer_root() {
+        let outer = PathBuf::from("/nonexistent/baude-meta-claude-outer");
+        let inner = PathBuf::from("/nonexistent/baude-meta-claude-inner");
+        let _outer = crate::testing::TestRedirect::new(&outer);
+        assert_eq!(claude_config_dir(), outer.join("claude"));
+        {
+            let _inner = crate::testing::TestRedirect::new(&inner);
+            assert_eq!(claude_config_dir(), inner.join("claude"));
+        }
+        assert_eq!(
+            claude_config_dir(),
+            outer.join("claude"),
+            "dropping the inner guard must restore the outer synthetic root, \
+             never fall through to a developer-path lookup"
+        );
+    }
+
+    /// Holds no [`crate::testing::TestRedirect`] at all: the guard must be armed
+    /// from the first instruction of the binary rather than by some earlier
+    /// fixture's side effect (D-09). The probe is thread-local, so this mutates
+    /// no environment variable and needs no serialization.
+    #[test]
+    #[should_panic(expected = "claude config dir resolved to the real user path")]
+    fn claude_config_dir_unguarded_resolution_panics() {
+        let _no_root = crate::testing::NoFixtureRoot::new();
+        let _escaped = claude_config_dir();
+    }
+
+    /// Dropping the LAST guard restores the escape panic — the redirect is a
+    /// scope, not a one-way arming switch.
+    #[test]
+    #[should_panic(expected = "claude config dir resolved to the real user path")]
+    fn claude_config_dir_escape_returns_after_the_last_guard_drops() {
+        let root = PathBuf::from("/nonexistent/baude-meta-claude-last");
+        {
+            let _redirect = crate::testing::TestRedirect::new(&root);
+            assert_eq!(claude_config_dir(), root.join("claude"));
+        }
+        let _no_root = crate::testing::NoFixtureRoot::new();
+        let _escaped = claude_config_dir();
+    }
+
+    /// Both `poll` call sites — `poll_session_file` and `resolve_transcript` —
+    /// resolve through `claude_config_dir()`, so one redirect moves the session
+    /// file AND the transcript. Neither call site is reshaped and neither gains
+    /// an `_at` variant: that is exactly why D-03 isolates by redirect rather
+    /// than by parameter.
+    #[test]
+    fn claude_config_dir_poll_reads_redirected_session_data() {
+        let root = isolated_claude_root("poll");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let claude = root.join("claude");
+        assert_eq!(
+            claude_config_dir(),
+            claude,
+            "poll must resolve inside the fixture root BEFORE any filesystem read"
+        );
+
+        let cwd = root.join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        let sid = format!("sid-{}", std::process::id());
+        let pid = 424_242u32;
+        let spawn = 1_700_000_000_000u64;
+
+        fs::create_dir_all(claude.join("sessions")).unwrap();
+        fs::write(
+            claude.join("sessions").join(format!("{pid}.json")),
+            serde_json::json!({
+                "sessionId": sid,
+                "cwd": cwd.to_string_lossy(),
+                "startedAt": spawn,
+                "status": "busy",
+                "statusUpdatedAt": spawn + 5,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let project_dir = claude.join("projects").join(encode_path(&cwd));
+        fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{sid}.jsonl"));
+        fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"fixture-model\",\
+             \"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n",
+        )
+        .unwrap();
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&cwd, Some(pid), spawn, &cwd);
+
+        assert_eq!(meta.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(meta.claude_status, Some((true, spawn + 5)));
+        assert_eq!(meta.model.as_deref(), Some("fixture-model"));
+        assert_eq!(meta.totals.input, 3);
+        assert_eq!(meta.transcript_path(), Some(transcript.as_path()));
+
+        fs::remove_dir_all(&root).ok();
     }
 }

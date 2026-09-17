@@ -117,6 +117,8 @@ through to Claude.
 | `ctrl+e` | anywhere | open the session folder in your editor |
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
+| `ctrl+o` | anywhere | link hints (inspect/copy/open urls) |
+| `shift+enter` | claude pane | insert a newline without submitting |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
 | `t` | sidebar | open shell pane (focuses it) |
@@ -143,6 +145,89 @@ Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
 this chord shadows Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
 and `ctrl+n` are intercepted everywhere, so they never reach the shell pane's
 readline (end-of-line, next-history) or the AI CLI.
+
+### Shift+Enter newlines
+
+Inserting a newline with `shift+enter` is negotiated at startup through the
+kitty keyboard protocol: baude asks the terminal whether it can report the
+Shift modifier on Enter and only changes behavior when it answers yes. See
+[Tested terminals](#tested-terminals) below for where that negotiation is
+exercised.
+
+On terminals without the protocol, nothing changes: the terminal reports
+Shift+Enter as plain Enter, so it submits — exactly the pre-existing
+behavior. baude never guesses a missing modifier.
+
+Without protocol support you can still compose multiline prompts with the
+child program's own bindings: Claude Code accepts backslash-then-Enter (or
+run its `/terminal-setup` command); opencode uses `ctrl+j`.
+
+Inside tmux or screen, the negotiation talks to the multiplexer, not your
+outer terminal — tmux passes Shift+Enter through only with its
+`extended-keys` option enabled (e.g. `set -s extended-keys on` in
+`.tmux.conf`).
+
+### Link hints
+
+`ctrl+o` opens a hint overlay listing the links currently visible in the
+focused pane — OSC 8 hyperlinks and bare `http(s)://` urls alike. Each row is
+lettered and shows the link's **actual destination**, never its display label.
+That is the whole point of the preview: a link rendered as `docs` shows you the
+url it would really send you to before you open it. Long destinations are
+middle-truncated to fit the pane width only, so the scheme and host stay
+visible, and the full url is what gets copied or opened.
+
+The overlay footer names every gesture it accepts:
+
+```
+enter opens · c/y copies · j/k moves · esc closes — 7 links
+```
+
+At most ten rows are listed at a time; `j/k` moves through the rest.
+
+Only validated HTTP(S) destinations are collected, so every row in the overlay
+is activatable. Unsupported schemes, malformed targets, and anything carrying
+control characters stay ordinary, non-activatable text. Session output alone
+never opens a link — activation is always this explicit gesture. If the system
+opener fails, baude reports it honestly (`open failed: … — session unaffected`)
+and the session keeps running.
+
+Because baude intercepts `ctrl+o`, the chord no longer reaches the child
+program.
+
+### Mouse, selection, and scrollback
+
+baude turns mouse capture on at startup, unconditionally, and consumes the
+events itself — so your terminal's own drag-to-select is suppressed for as long
+as baude is running. Click and drag inside a pane is baude's own selection
+instead: releasing copies the selected region to the system clipboard
+(`pbcopy` on macOS, `wl-copy` or `xclip` on Linux), and a copy that fails says
+so rather than looking like success. When you want the terminal's native
+selection anyway — to grab text spanning both panes, or to use the terminal's
+own selection buffer — hold your terminal's override modifier while you drag.
+Which key that is belongs to the terminal, not to baude: Shift is the common
+one, and some macOS terminals use Option.
+
+The wheel scrolls whichever pane the pointer is over. When the child program in
+that pane has its own mouse mode on — a full-screen editor or pager — baude
+forwards the scroll to it instead, so those programs keep scrolling themselves.
+
+baude also runs on the alternate screen: it enters at startup and leaves on
+exit. Session output therefore never enters your host terminal's scrollback,
+and scrolling back through a session is baude's own handling inside the pane
+rather than your terminal's. On exit baude puts back everything it changed —
+mouse reporting off, bracketed paste off, alternate screen left — and whatever
+your terminal was showing before baude started is still there.
+
+### Tested terminals
+
+The negotiated gestures — `shift+enter` newlines, `ctrl+o` link hints, and
+mouse capture with its selection and scrolling — are exercised together in
+Ghostty, kitty, iTerm2, WezTerm, foot, and Alacritty. "Verified" means exactly
+that: the gestures were driven by hand in those terminals, not that
+compatibility is guaranteed anywhere else. Each release records the exact
+terminal identities and OS versions the gestures were observed in, in that
+release's smoke evidence.
 
 ## Status icons
 
@@ -384,6 +469,58 @@ workspace. `auto_daemon` runs one daemon per workspace on its own port
 (claude `8642`, opencode `8643`, custom via `daemon_port`). The `claude`
 workspace reads the legacy un-suffixed state files on first run, so existing
 session lists survive the upgrade.
+
+### When a workspace is already open
+
+A workspace admits exactly one writer. A second baude on the same workspace
+refuses to start rather than come up degraded, and says so on stderr:
+
+```
+baude: workspace claude is already open in another baude (pid 41337).
+       Quit that instance, or run this one in another workspace: BAUDE_WORKSPACE=<name> baude
+       lock: /Users/you/.config/baude/.state-claude.json.lock
+```
+
+If the holder never recorded its pid you get the anonymous form of the same
+message:
+
+```
+baude: workspace claude is already open in another baude.
+```
+
+**Where the lock lives.** It is a dotted sibling of the workspace's state
+file: `state-<workspace>.json` is locked by `.state-<workspace>.json.lock` in
+the same directory, so the `claude` workspace locks
+`~/.config/baude/.state-claude.json.lock`. The daemon's
+`daemon-state-<workspace>.json` follows the same shape.
+
+**What the pid means.** The holder stamps its pid into the lock file best
+effort, *after* it has already won the lock. A message with no pid does not
+mean the lock is stale — it means the stamp failed, or the file predates pid
+stamping. The lock is genuinely held either way.
+
+**Never delete the lock file.** This is an OS advisory lock held on an open
+file descriptor, not a pid-file sentinel: the kernel releases it when the
+holding process exits, so a crashed baude never wedges a workspace and there is
+nothing left behind to clean up. Deleting the file while another baude is
+running does not release that process's lock — it only lets a second baude
+create a fresh file, win that one, and start writing. Two writers on one state
+file is the exact corruption the single-writer design exists to prevent.
+
+Recovery, in order:
+
+1. Read the pid out of the message and identify the other instance:
+   `ps -p 41337`.
+2. Quit it the normal way — `ctrl+q` to reach its sidebar, then `q`. Signal it
+   only if it is genuinely wedged (`kill 41337`).
+3. Or sidestep it and run this instance elsewhere, which is what the message
+   itself suggests: `BAUDE_WORKSPACE=other baude`.
+4. If the message showed no pid, find the holder from the printed lock path:
+   `lsof ~/.config/baude/.state-claude.json.lock`.
+
+`bauded` does not claim the lock at startup, so a daemon contending for a
+workspace surfaces the same pid-and-path diagnostic at its first state save
+rather than at launch.
 
 ## opencode backend
 

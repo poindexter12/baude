@@ -1,0 +1,8 @@
+{
+  "command": "cargo test -p vt100 hyperlink --locked && cargo test -p baude links:: --locked && cargo test -p baude link_hints --locked",
+  "exitCode": 101,
+  "output": "TAP version 13\nnot ok 1 - hyperlink::target_not_label_and_wrap_survival\nnot ok 2 - hyperlink::semicolon_uri_rejoined\nnot ok 3 - links::tests::tracer_end_to_end\nnot ok 4 - app::link_hints::chord_without_session_sets_message\n# tests 4\n# pass 0\n# fail 4\n# raw: cargo test -p vt100 hyperlink --locked -> exit 101; 'test result: FAILED. 0 passed; 2 failed'\n# raw: cargo test -p baude links::tests::tracer_end_to_end --locked -> exit 101; assertion `left == right` failed: exactly one OSC8 link collected \u2014 left: 0, right: 1\n# raw: cargo test -p baude link_hints --locked -> exit 101; assertion failed: chord without a session surfaces a message",
+  "targetTest": "links::tests::tracer_end_to_end",
+  "expected": "collect_links yields exactly one DetectedLink whose destination is the parsed OSC8 URI https://real.example/x, delivered to the injected opener spy as one argv string",
+  "actual": "assertion `left == right` failed: exactly one OSC8 link collected \u2014 left: 0, right: 1 (collect_links stub returns empty; fork tests fail on link_id expect; chord test fails on message assert)"
+}

@@ -1214,17 +1214,23 @@ fn draw_term(
 }
 
 /// Shorten a path for display: home → `~`.
+///
+/// Display-only, and still routed through the guarded resolver: containment is
+/// a property of the compiled binary, so a render inside an unredirected test
+/// aborts rather than quietly reading the developer's real HOME.
 fn tilde_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
-    match dirs::home_dir() {
-        Some(h) => {
-            let h = h.display().to_string();
-            s.strip_prefix(&h)
-                .map(|rest| format!("~{rest}"))
-                .unwrap_or(s)
-        }
-        None => s,
+    let home = baude_core::persist::home_dir();
+    // `/` is the resolver's terminal fallback for "no home at all". Stripping
+    // it would abbreviate every absolute path to nonsense; the pre-guard code
+    // reached the same outcome by matching `dirs::home_dir()`'s `None`.
+    if home == std::path::Path::new("/") {
+        return s;
     }
+    let home = home.display().to_string();
+    s.strip_prefix(&home)
+        .map(|rest| format!("~{rest}"))
+        .unwrap_or(s)
 }
 
 /// Status bar: `hints │ ~/path ⎇ branch` with right-aligned session counts
@@ -2105,8 +2111,70 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 rect,
             );
         }
+        Modal::LinkHints { links, selected } => {
+            // Bottom-anchored list panel (RESEARCH Pattern 3). Each row is
+            // `[a] destination` — always the link's ACTUAL destination, never
+            // its label (LINK-01/LINK-05); the destination is middle-truncated
+            // for width ONLY (scheme+host always visible, T-10-15) while the
+            // model, copy, and open all keep the full URL.
+            let list_rows = links.len().clamp(1, 10);
+            let height = ((list_rows as u16) + 3).min(area.height);
+            let rect = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(height),
+                width: area.width,
+                height,
+            };
+            frame.render_widget(Clear, rect);
+            let dim = Style::default().fg(Color::DarkGray);
+            // Viewport scrolling: the selected row is always visible, even
+            // past 26 entries (rows beyond `z` carry no letter and are
+            // reached with j/k).
+            let visible = (rect.height.saturating_sub(3) as usize).max(1);
+            let first = (*selected + 1).saturating_sub(visible);
+            // "[a] " prefix (4) + borders (2)
+            let url_width = rect.width.saturating_sub(6) as usize;
+            let mut lines = Vec::with_capacity(visible + 1);
+            for (i, link) in links.iter().enumerate().skip(first).take(visible) {
+                let label = if i < 26 {
+                    format!("[{}] ", (b'a' + i as u8) as char)
+                } else {
+                    "    ".to_string()
+                };
+                let text = format!(
+                    "{label}{}",
+                    crate::app::display_truncated_width(&link.destination, url_width)
+                );
+                if i == *selected {
+                    lines.push(Line::from(Span::styled(
+                        text,
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    )));
+                } else {
+                    lines.push(Line::raw(text));
+                }
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "enter opens · c/y copies · j/k moves · esc closes — {} links",
+                    links.len()
+                ),
+                dim,
+            )));
+            let p = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" links "),
+            );
+            frame.render_widget(p, rect);
+        }
         Modal::Help => {
-            let rect = centered(area, 60, 35);
+            // 37 paragraph lines + 2 border rows; keep in sync when adding
+            // rows or `help_overlay_lists_shift_enter`'s closing-line assert
+            // fails on the clip.
+            let rect = centered(area, 60, 39);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2141,8 +2209,11 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  ctrl+\\      toggle shell pane (focuses it)"),
                 Line::raw("  ctrl+e      open folder in editor"),
                 Line::raw("  ctrl+n      new session"),
+                Line::raw("  ctrl+o      link hints (inspect/copy/open urls)"),
                 Line::raw("  ctrl+q, x   close session"),
                 Line::raw("  alt+←/→     cycle sessions (skips archived + closed)"),
+                Line::raw("  shift+enter  newline in claude pane"),
+                Line::raw("               (kitty-capable terminals; see README)"),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "status (sidebar sorts alphabetically)",
@@ -2215,13 +2286,117 @@ mod tests {
 
     use crate::app::{App, Focus, Modal, SelId};
 
-    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines};
+    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines, tilde_path};
 
     fn persisted_path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
     }
 
-    fn hierarchy_fixture() -> (App, baude_core::repository::RepositoryKey) {
+    /// `tilde_path` runs on every sidebar row and every status-bar draw. It
+    /// reads a home rather than writing one, but the phase's invariant is that
+    /// containment is a property of the compiled binary — so the display path
+    /// aborts on an unredirected resolution like every other resolver.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_display_abbreviation_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = tilde_path(Path::new("/anywhere"));
+    }
+
+    /// And under a redirect it abbreviates against the FIXTURE's home, so the
+    /// guard is usable rather than merely a tripwire.
+    #[test]
+    fn a_redirected_abbreviation_uses_the_fixture_home() {
+        let root = std::path::PathBuf::from("/nonexistent/baude-ui-tilde");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        assert_eq!(
+            tilde_path(&root.join("home").join("Code").join("baude")),
+            "~/Code/baude"
+        );
+        assert_eq!(
+            tilde_path(Path::new("/elsewhere/baude")),
+            "/elsewhere/baude",
+            "a path outside the home is shown in full"
+        );
+    }
+
+    /// Owns everything a UI case needs to resolve paths and identity on its own
+    /// terms: a unique synthetic root, the redirect that pins every resolved
+    /// path inside it, and the literal workspace identity resolved under that
+    /// root.
+    ///
+    /// `App::new` reads `config.json` from the redirected config dir and
+    /// resolves the active workspace, so a case that renders without holding
+    /// this reads the developer's real config and real workspace. The guards
+    /// are thread-local and drop with this value, so every caller must bind it
+    /// to a NAMED local that outlives the App's final render — returning only
+    /// the App would compile and leave the whole case unredirected.
+    struct UiFixture {
+        root: std::path::PathBuf,
+        /// Struct fields drop in DECLARATION order, the reverse of locals, so
+        /// the identity is declared first and therefore restored while its own
+        /// root is still installed — mirroring the acquisition order below
+        /// (root first, identity second).
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl UiFixture {
+        #[must_use = "the returned UiFixture owns this case's root and identity; bind it to a \
+                      named local that outlives the App's final render"]
+        fn new(label: &str) -> Self {
+            Self::with_config(label, label, None)
+        }
+
+        /// The same owner with an explicit literal workspace and an optional
+        /// synthetic `config.json` sentinel written before the redirect is
+        /// installed, so `App::new`'s own config read observes it.
+        #[must_use = "the returned UiFixture owns this case's root and identity; bind it to a \
+                      named local that outlives the App's final render"]
+        fn with_config(label: &str, workspace: &str, auto_archive_minutes: Option<u64>) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "baude-ui-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            if let Some(minutes) = auto_archive_minutes {
+                std::fs::write(
+                    root.join("config").join("config.json"),
+                    format!("{{\"auto_archive_minutes\":{minutes}}}"),
+                )
+                .unwrap();
+            }
+            let redirect = baude_core::testing::TestRedirect::new(&root);
+            let identity = baude_core::workspace::override_for_test(
+                &baude_core::persist::Config {
+                    workspace: Some(workspace.to_string()),
+                    ..baude_core::persist::Config::default()
+                },
+                None,
+            );
+            Self {
+                root,
+                _identity: identity,
+                _redirect: redirect,
+            }
+        }
+
+        #[allow(dead_code)]
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn config_path(&self) -> std::path::PathBuf {
+            self.root.join("config").join("config.json")
+        }
+    }
+
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn hierarchy_fixture() -> (UiFixture, App, baude_core::repository::RepositoryKey) {
         let mut state = RepositoryState::default();
         let repository = state.allocate_repository_key().unwrap();
         let repository_order = state.allocate_first_seen_order().unwrap();
@@ -2295,10 +2470,13 @@ mod tests {
             ));
         }
         let selected = state.checkouts[1].key;
+        // Root and identity before construction: App::new reads config.json
+        // from the redirected config dir and resolves the active workspace.
+        let fixture = UiFixture::new("hierarchy");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Checkout(selected));
-        (app, repository)
+        (fixture, app, repository)
     }
 
     fn render(app: &App, width: u16, height: u16) -> (String, ratatui::buffer::Buffer) {
@@ -2319,7 +2497,7 @@ mod tests {
 
     #[test]
     fn hierarchy_viewport_matrix_renders_without_panic_and_preserves_semantics() {
-        let (mut app, repository) = hierarchy_fixture();
+        let (_fixture, mut app, repository) = hierarchy_fixture();
         for (width, height) in [(160, 40), (100, 30), (79, 24), (59, 20), (40, 12)] {
             app.focus = Focus::Sidebar;
             let (rendered, buffer) = render(&app, width, height);
@@ -2381,11 +2559,27 @@ mod tests {
         assert!(rendered.contains("X removes"), "{rendered}");
     }
 
+    /// D-12/TKEY-03: the help overlay's global section documents the
+    /// shift+enter newline binding and points at the README for terminal
+    /// support detail. The tall backend lets the overlay render at its full
+    /// fixed height, so a missing closing line means the paragraph outgrew
+    /// the `centered()` height argument (clipping regression guard).
+    #[test]
+    fn help_overlay_lists_shift_enter() {
+        let (_fixture, mut app, _) = hierarchy_fixture();
+        app.focus = Focus::Sidebar;
+        app.modal = Modal::Help;
+        let (rendered, _) = render(&app, 80, 45);
+        assert!(rendered.contains("shift+enter"), "{rendered}");
+        assert!(rendered.contains("see README"), "{rendered}");
+        assert!(rendered.contains("press any key to close"), "{rendered}");
+    }
+
     #[test]
     fn archived_rows_hide_behind_z_and_fully_archived_repository_collapses() {
         // Mixed repository: the archived child hides, the footer counts it,
         // and no per-parent chip appears while a live sibling is visible.
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.remote = None;
         app.focus = Focus::Sidebar;
         let (rendered, _) = render(&app, 100, 30);
@@ -2436,6 +2630,7 @@ mod tests {
                 },
             ));
         }
+        let _fixture = UiFixture::new("collapsed-archive");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.remote = None;
         app.install_hierarchy_state_for_test(state, HashMap::new());
@@ -2461,7 +2656,7 @@ mod tests {
         assert!(Line::raw(clipped.clone()).width() <= 6, "{clipped:?}");
         assert!(clipped.ends_with("界e\u{301}"), "{clipped:?}");
 
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child)
                 if child.status == crate::hierarchy::LocalStatus::Unavailable =>
@@ -2490,7 +2685,7 @@ mod tests {
 
     #[test]
     fn hierarchy_modals_name_exact_targets_and_distinguish_close_from_remove() {
-        let (mut app, _) = hierarchy_fixture();
+        let (_fixture, mut app, _) = hierarchy_fixture();
         app.modal = Modal::ConfirmCloseWorktree { id: u64::MAX };
         let (wide, wide_buffer) = render(&app, 100, 30);
         assert!(wide.contains("close local session"), "{wide}");
@@ -2548,6 +2743,7 @@ mod tests {
 
     #[test]
     fn hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints() {
+        let _fixture = UiFixture::new("empty-copy");
         let mut empty = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         empty.remote = None;
         let (rendered, _) = render(&empty, 100, 30);
@@ -2558,7 +2754,7 @@ mod tests {
         );
         assert!(rendered.contains(super::EMPTY_HEADING), "{rendered}");
 
-        let (mut app, repository) = hierarchy_fixture();
+        let (_fixture, mut app, repository) = hierarchy_fixture();
         app.selected_id = Some(SelId::Repository(repository));
         assert_eq!(
             super::status_hint(&app, 160),
@@ -2735,7 +2931,7 @@ mod tests {
 
     #[test]
     fn context_footer_names_the_folder_and_composes_with_the_archived_line() {
-        let (mut app, _repository) = hierarchy_fixture();
+        let (_fixture, mut app, _repository) = hierarchy_fixture();
         app.remote = None;
         app.enable_folder_context_for_test(Path::new("/tmp/viewport/launch"));
 
@@ -2796,6 +2992,7 @@ mod tests {
                 ever_launched: true,
             },
         ));
+        let _fixture = UiFixture::new("standalone-folder");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Standalone(key));
@@ -2871,6 +3068,7 @@ mod tests {
         }
 
         let selected = state.checkouts[0].key;
+        let _fixture = UiFixture::new("tracer-render");
         let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
         app.selected_id = Some(SelId::Checkout(selected));
@@ -2948,5 +3146,98 @@ mod tests {
             .any(|line| line.contains("refs/heads/feature/safe-remove")));
         assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
         assert!(lines.iter().any(|line| line.contains("branch is retained")));
+    }
+
+    // ---- UI fixture ownership regressions -------------------------------
+    //
+    // Authored `#[ignore]`d by plan 08-03 so the ownership contract was pinned
+    // alongside the migration it guards, and un-ignored by plan 08-08 task 1:
+    // both cases run an App, and an App's `UsagePoller` was not inert — and its
+    // remote selection not disabled — until that plan compiled those workers
+    // out of test builds. Running them before that would have read the
+    // developer's real Claude transcripts through `ccusage`.
+
+    /// The guard must still be held AFTER the helper returned: the sentinel
+    /// config the fixture wrote, the identity it resolved and the config path
+    /// it redirected all have to survive into the caller's renders. A helper
+    /// that returned only the App would restore the developer's real config dir
+    /// the instant it returned, and every assertion here would read the real
+    /// machine while still rendering green.
+    #[test]
+    fn ui_fixture_isolation_after_helper_return() {
+        let fixture = UiFixture::with_config("after-return", "ui-after-return", Some(7));
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.remote = None;
+
+        // The raw loaded field, not auto_archive_ms(): that folds in an
+        // environment override and would answer the developer's environment.
+        assert_eq!(
+            app.config_for_test().auto_archive_minutes,
+            Some(7),
+            "the App must have loaded the fixture's synthetic config.json"
+        );
+        assert_eq!(baude_core::workspace::active().name, "ui-after-return");
+        assert_eq!(
+            baude_core::persist::config_dir().join("config.json"),
+            fixture.config_path(),
+            "the config path must still point inside the fixture root"
+        );
+
+        // Two widths: the wide layout and the narrow one, both after the
+        // helper returned and with the owner still bound.
+        let (wide, _) = render(&app, 100, 30);
+        let (narrow, _) = render(&app, 40, 12);
+        assert!(!wide.is_empty());
+        assert!(!narrow.is_empty());
+        assert_eq!(baude_core::workspace::active().name, "ui-after-return");
+        assert_eq!(app.config_for_test().auto_archive_minutes, Some(7));
+    }
+
+    /// Nesting a second fixture must restore the first one exactly — root,
+    /// identity and config path — once the inner owner drops, including for a
+    /// directly constructed App.
+    #[test]
+    fn ui_fixture_isolation_nested_restore() {
+        let outer = UiFixture::with_config("nested-outer", "ui-nested-outer", Some(7));
+        let mut outer_app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        outer_app.remote = None;
+        assert_eq!(outer_app.config_for_test().auto_archive_minutes, Some(7));
+        assert_eq!(baude_core::workspace::active().name, "ui-nested-outer");
+
+        {
+            let inner = UiFixture::with_config("nested-inner", "ui-nested-inner", Some(11));
+            // Direct construction inside the inner scope, same owner contract.
+            let mut inner_app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+            inner_app.remote = None;
+            assert_eq!(
+                inner_app.config_for_test().auto_archive_minutes,
+                Some(11),
+                "the inner App must read the inner fixture's config.json"
+            );
+            assert_eq!(baude_core::workspace::active().name, "ui-nested-inner");
+            assert_eq!(
+                baude_core::persist::config_dir().join("config.json"),
+                inner.config_path()
+            );
+            let (rendered, _) = render(&inner_app, 40, 12);
+            assert!(!rendered.is_empty());
+            // The inner App is dropped before the outer one is used again.
+        }
+
+        assert_eq!(
+            baude_core::workspace::active().name,
+            "ui-nested-outer",
+            "dropping the inner fixture must restore the outer identity"
+        );
+        assert_eq!(
+            baude_core::persist::config_dir().join("config.json"),
+            outer.config_path(),
+            "dropping the inner fixture must restore the outer root"
+        );
+        let (wide, _) = render(&outer_app, 100, 30);
+        let (narrow, _) = render(&outer_app, 40, 12);
+        assert!(!wide.is_empty());
+        assert!(!narrow.is_empty());
+        assert_eq!(outer_app.config_for_test().auto_archive_minutes, Some(7));
     }
 }

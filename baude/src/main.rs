@@ -1,6 +1,7 @@
 mod app;
 mod hierarchy;
 mod keys;
+mod links;
 mod notify_desktop;
 mod remote;
 mod ui;
@@ -86,22 +87,57 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
 }
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
+use ratatui::crossterm::{execute, queue};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use app::App;
 
-fn restore_terminal() {
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        stdout(),
+/// True iff keyboard-enhancement flags were successfully pushed onto the outer
+/// terminal and must be popped on restore. A module-level static (not App
+/// state) because the panic hook is a `'static` closure that cannot see App.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+/// Bounded outer-terminal kitty-keyboard negotiation (D-01, D-02): only an
+/// affirmative probe enables enhanced mode. `Err` — crossterm's internal 2 s
+/// deadline elapsing, no tty, Windows — means unsupported means legacy; probe
+/// failures never kill a session (TKEY-05).
+fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
+    matches!(probe(), Ok(true))
+}
+
+/// Single restore-emission path (D-07/D-08): queues the conditional keyboard
+/// pop FIRST — kitty keyboard stacks are per-screen, so the pop must land on
+/// the alternate screen before LeaveAlternateScreen switches away — then the
+/// pre-phase teardown, then one flush.
+fn write_restore_sequence<W: std::io::Write>(w: &mut W, pop_enhanced: bool) -> std::io::Result<()> {
+    if pop_enhanced {
+        queue!(w, PopKeyboardEnhancementFlags)?;
+    }
+    queue!(
+        w,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
-    );
+    )?;
+    w.flush()
+}
+
+fn restore_terminal() {
+    // Swap so a double restore (panic during the exit path) pops exactly once.
+    let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
+    let _ = disable_raw_mode();
+    // Suspend note (D-06, RESEARCH Q5): baude has no SIGTSTP/suspend
+    // handling, so the suspend/resume leg of TKEY-04 is vacuous this phase.
+    // Any future suspend feature must pop the keyboard flags before handing
+    // the terminal back and re-push on resume WITHOUT re-querying — outer
+    // support cannot change mid-session.
+    let _ = write_restore_sequence(&mut stdout(), popped);
 }
 
 /// `<binary> hook` — Claude Code lifecycle-event hook, no TUI. Claude invokes it
@@ -217,6 +253,21 @@ fn run_permission_mcp() -> ! {
     std::process::exit(0);
 }
 
+/// The top-level `--help` body.
+///
+/// Extracted from `main` so the subcommand list is assertable: a verb that
+/// dispatches but is undiscoverable is half-shipped, and the only way to keep
+/// the list and the dispatch a matched pair is to test the list.
+fn help_text() -> String {
+    format!(
+        "baude {} — multiple AI coding sessions in one terminal\n\n\
+         usage: baude [<repo-dir>]\n\n\
+         subcommands: statusline, hook, permission-mcp, worktrees\n\
+         options:     --version/-V, --help/-h",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn main() -> Result<()> {
     // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
     // Must be dispatched before anything touches the terminal: Claude Code
@@ -250,6 +301,30 @@ fn main() -> Result<()> {
         run_permission_mcp();
     }
 
+    // `baude worktrees …` — the TISO-04 managed-worktree preview. Dispatched
+    // before the launch-dir logic for the same reason as the flags below: an
+    // undispatched verb is read as a repo path and boots the TUI. The roots are
+    // resolved HERE, by this process, and handed down explicitly — a saved
+    // report is compared against them and is never a place to name the tree to
+    // act on (T-08-25). No matching arm exists in `bauded` (T-08-17).
+    if args.get(1).map(String::as_str) == Some("worktrees") {
+        // Both halves are the REAL resolvers, deliberately. The scanner's
+        // subject is the developer's actual tree, so pairing a real worktrees
+        // root with the redirect-aware `persist::config_dir()` would, in a
+        // support build, cross-reference a real candidate set against a fixture's
+        // state files — an inconsistency the release binary happens to hide
+        // because there the two resolvers coincide (#72, WR-01).
+        let roots = baude_core::worktree_scan::ScanRoots {
+            worktrees_base: baude_core::git::real_worktrees_base(),
+            config_dir: baude_core::persist::real_config_base(),
+        };
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let code = run_worktrees_at(&args[2..], &roots, &mut out, &mut err);
+        let _ = std::io::Write::flush(&mut out);
+        std::process::exit(code);
+    }
+
     // `baude --version` / `--help` — print and exit BEFORE the launch-dir logic
     // below (which would otherwise treat the flag as a repo path and boot the
     // TUI without a TTY). Mirrors the `bauded` arms.
@@ -259,13 +334,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!(
-                "baude {} — multiple AI coding sessions in one terminal\n\n\
-                 usage: baude [<repo-dir>]\n\n\
-                 subcommands: statusline, hook, permission-mcp\n\
-                 options:     --version/-V, --help/-h",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("{}", help_text());
             return Ok(());
         }
         _ => {}
@@ -296,7 +365,7 @@ fn main() -> Result<()> {
         Some(&memory_root),
         &launch_dir,
     );
-    let workspace = baude_core::workspace::initialize(plan.hint.as_deref());
+    let workspace = baude_core::workspace::initialize(&config, plan.hint.as_deref());
 
     // One writer per workspace. Claim the state lock BEFORE the terminal, the
     // daemon, or any folder-memory write: a second baude on a held lock used
@@ -362,7 +431,33 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
+    // Single-shot keyboard negotiation (TKEY-05): runs exactly once, in this
+    // single-threaded pre-loop window where the probe owns the event source,
+    // bounded by crossterm's internal 2 s deadline. Pushed AFTER
+    // EnterAlternateScreen so push and pop hit the same per-screen kitty
+    // stack. DISAMBIGUATE only — the REPORT_* flags change other keys' wire
+    // forms and would break the TKEY-02 byte freeze.
+    if negotiate_keyboard(supports_keyboard_enhancement) {
+        let pushed = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        if pushed.is_ok() {
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        }
+    }
+    // Any Err between the push above and run()'s normal exit is a NON-panic
+    // path — the panic hook never fires — so a bare `?` here would leak raw
+    // mode, the alternate screen, AND the pushed keyboard flags (T-11-03's
+    // residue class). Route it through restore_terminal() before propagating.
+    let mut terminal =
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout())) {
+            Ok(t) => t,
+            Err(e) => {
+                restore_terminal();
+                return Err(e.into());
+            }
+        };
 
     let mut app = App::new(launch_dir);
     // Folder-memory notes go up first so a real restore error overwrites an
@@ -406,5 +501,1485 @@ fn run(
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `baude worktrees scan` — the TISO-04 leak preview surface.
+//
+// `baude-core::worktree_scan` already enumerates, classifies, cross-references
+// persisted state and re-verifies a prune. None of it is reachable by a
+// developer, and TISO-04's deliverable is a preview they can *run*. This is
+// that surface and nothing more: the default path reads, prints and exits.
+//
+// Two distinct opt-ins are required before anything is removed (`--prune` AND
+// `--yes`), and the removal set comes from a report the operator previously
+// saved and inspected — never from a fresh scan (D-15, T-08-18, T-08-25). The
+// verb is deliberately absent from `bauded`: a headless daemon has no operator
+// present to approve a deletion (T-08-17).
+// ---------------------------------------------------------------------------
+
+/// Exit code when the command did what was asked.
+const WORKTREES_EXIT_OK: i32 = 0;
+/// Exit code when the command could not complete.
+///
+/// Deliberately does *not* promise the tree is untouched, and must not be read
+/// alongside [`WORKTREES_EXIT_USAGE`]'s "nothing was read or removed" as though
+/// the two made the same guarantee. A confirmed prune that removed one
+/// candidate and then failed on the next exits here — that is the whole point
+/// of the rule, since a part-way removal must not look like success (#72,
+/// WR-02). The paths that bail before touching anything (an unreadable or
+/// unparseable report, or one `prune_at` refuses outright) say "Nothing was
+/// removed." in their own message. Everywhere else, the account printed above
+/// the exit is the record of what actually happened (#72, WR-04, iteration 2).
+const WORKTREES_EXIT_FAILED: i32 = 1;
+/// Exit code when the command line itself was wrong. Nothing was read or
+/// removed — the arguments never reached the filesystem.
+const WORKTREES_EXIT_USAGE: i32 = 2;
+
+/// The verb's own help, printed by `baude worktrees --help` and appended to
+/// every usage error.
+///
+/// It documents the flow as two invocations on purpose: the operator saves a
+/// preview, reads it, and only then hands that same file back. A help text that
+/// showed a one-shot `--prune` would be teaching the habit this surface exists
+/// to prevent.
+fn worktrees_help_text() -> String {
+    "baude worktrees — inspect the managed-worktree root\n\
+     \n\
+     usage: baude worktrees scan [--json]\n\
+     \x20      baude worktrees scan --prune --report <file> [--yes]\n\
+     \n\
+     Step one — preview. Reads only; removes nothing:\n\
+     \x20 baude worktrees scan                 grouped, human-readable summary\n\
+     \x20 baude worktrees scan --json > p.json the full report, evidence included\n\
+     \n\
+     Step two — act on a preview you have read:\n\
+     \x20 --prune --report <file>   re-derive every fact and report what WOULD go\n\
+     \x20 --yes                     a separate confirmation; without it nothing goes\n\
+     \n\
+     `--prune` requires `--report`, and the removal set comes from that saved\n\
+     file — never from a fresh scan. A candidate is removed only when the\n\
+     freshly re-derived proof still matches the one in the report you approved.\n\
+     `--json` describes a scan, so it cannot be combined with `--prune`.\n\
+     \n\
+     A refusal is the tool working: a candidate that stopped qualifying, or one\n\
+     git owns, is reported and left alone, and the run still exits 0. A removal\n\
+     that was attempted and FAILED exits 1 — that is the one outcome a script\n\
+     cannot infer from the exit code otherwise. Read the account either way.\n\
+     \n\
+     exit codes: 0 did what was asked (refusals included),\n\
+     \x20           1 could not complete — a report that was rejected outright\n\
+     \x20             (nothing removed), or a removal that failed part-way,\n\
+     \x20           2 the command line was wrong (nothing was read or removed)"
+        .to_string()
+}
+
+/// The parsed `baude worktrees` command line.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WorktreesOptions {
+    json: bool,
+    prune: bool,
+    report: Option<std::path::PathBuf>,
+    yes: bool,
+}
+
+/// What the command line asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorktreesRequest {
+    Help,
+    Scan(WorktreesOptions),
+}
+
+/// Parse the tokens following `baude worktrees`.
+///
+/// Hand-written rather than pulled from an argument crate, and deliberately
+/// strict: an unknown option, a repeated one, or a missing value is refused
+/// outright instead of being ignored. The whole point of the two opt-ins is
+/// that they are hard to type by accident, which a parser that silently skips
+/// what it does not recognize would undo.
+fn parse_worktrees_args(rest: &[String]) -> Result<WorktreesRequest, String> {
+    let mut tokens = rest.iter().map(String::as_str);
+    let Some(verb) = tokens.next() else {
+        return Err("expected a subcommand; the only one is `scan`".to_string());
+    };
+    if matches!(verb, "--help" | "-h" | "help") {
+        return Ok(WorktreesRequest::Help);
+    }
+    if verb != "scan" {
+        return Err(format!(
+            "`{verb}` is not a worktrees subcommand; the only one is `scan` \
+             (`prune` is an option on `scan`, never a verb of its own)"
+        ));
+    }
+
+    let mut options = WorktreesOptions::default();
+    let mut seen: Vec<&str> = Vec::new();
+    let once = |flag: &'static str, seen: &mut Vec<&str>| -> Result<(), String> {
+        if seen.contains(&flag) {
+            return Err(format!("`{flag}` was given more than once"));
+        }
+        seen.push(flag);
+        Ok(())
+    };
+    while let Some(token) = tokens.next() {
+        match token {
+            "--help" | "-h" => return Ok(WorktreesRequest::Help),
+            "--json" => {
+                once("--json", &mut seen)?;
+                options.json = true;
+            }
+            "--prune" => {
+                once("--prune", &mut seen)?;
+                options.prune = true;
+            }
+            "--yes" => {
+                once("--yes", &mut seen)?;
+                options.yes = true;
+            }
+            "--report" => {
+                once("--report", &mut seen)?;
+                let value = tokens
+                    .next()
+                    .ok_or_else(|| "`--report` needs the path of a saved report".to_string())?;
+                options.report = Some(std::path::PathBuf::from(value));
+            }
+            other => return Err(format!("`{other}` is not an option of `worktrees scan`")),
+        }
+    }
+
+    // The three ways a partially typed removal could be read as an authorized
+    // one. Each is refused before any root is opened.
+    if options.yes && !options.prune {
+        return Err("`--yes` confirms a `--prune`; on its own it authorizes nothing".to_string());
+    }
+    if options.report.is_some() && !options.prune {
+        return Err(
+            "`--report` names the set a `--prune` acts on; a scan builds its own \
+             and never reads one"
+                .to_string(),
+        );
+    }
+    if options.prune && options.report.is_none() {
+        return Err(
+            "`--prune` needs `--report <file>`: the removal set comes from a \
+             preview you have already read, never from a fresh scan"
+                .to_string(),
+        );
+    }
+    // The prune account is a record of actions taken, not the scan report that
+    // `--json` names, so the combination has no single meaning to serialize.
+    if options.json && options.prune {
+        return Err(
+            "`--json` writes a scan report; it cannot be combined with `--prune`. \
+             Save the preview first, then prune from it"
+                .to_string(),
+        );
+    }
+    Ok(WorktreesRequest::Scan(options))
+}
+
+/// One observed signal, in words.
+fn evidence_phrase(evidence: &baude_core::worktree_scan::Evidence) -> String {
+    use baude_core::worktree_scan::Evidence;
+    match evidence {
+        Evidence::ShapeMatch => "managed shape".to_string(),
+        Evidence::NotReferencedByState {
+            workspaces_checked,
+            files_checked,
+            files_absent,
+        } => format!(
+            "no state reference ({} workspace(s), {} file(s) read, {} absent)",
+            workspaces_checked.len(),
+            files_checked.len() - files_absent.len(),
+            files_absent.len()
+        ),
+        Evidence::NoGitdir => "no gitdir".to_string(),
+        Evidence::Empty => "empty".to_string(),
+        Evidence::GitDisownsIt { owning_repository } => format!(
+            "git disowns it (repository {})",
+            owning_repository.display()
+        ),
+        Evidence::ContainsCheckout { entries } => {
+            format!("contains a checkout ({entries} entr(y/ies))")
+        }
+        Evidence::ReferencedByState {
+            workspace,
+            repository_key,
+            matched,
+        } => {
+            let key = repository_key
+                .map(|key| format!("key {key}"))
+                .unwrap_or_else(|| "no key".to_string());
+            format!("referenced by state (workspace {workspace}, {key}, {matched:?} match)")
+        }
+        Evidence::IsSymlink => "is itself a symlink".to_string(),
+        Evidence::StateUnreadable {
+            source,
+            workspace,
+            detail,
+        } => format!(
+            "state unreadable ({}, workspace {workspace}: {detail})",
+            source.display()
+        ),
+    }
+}
+
+/// A verdict and the facts behind it, in one line.
+fn verdict_phrase(verdict: &baude_core::worktree_scan::Verdict) -> String {
+    use baude_core::worktree_scan::{ClearingSignal, Verdict};
+    let phrases = |evidence: &[baude_core::worktree_scan::Evidence]| {
+        evidence
+            .iter()
+            .map(evidence_phrase)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match verdict {
+        Verdict::Live { evidence } => format!("live — {}", phrases(evidence)),
+        Verdict::Indeterminate { evidence } => {
+            let facts = phrases(evidence);
+            if facts.is_empty() {
+                "indeterminate — nothing observed".to_string()
+            } else {
+                format!("indeterminate — {facts}")
+            }
+        }
+        Verdict::Removable { proof } => {
+            let clearing = match &proof.clearing {
+                ClearingSignal::Empty => "empty".to_string(),
+                ClearingSignal::GitDisownsIt { owning_repository } => {
+                    format!("git disowns it ({})", owning_repository.display())
+                }
+            };
+            format!(
+                "removable — cleared by {clearing}, {} workspace(s) checked",
+                proof.workspaces_checked.len()
+            )
+        }
+    }
+}
+
+/// The one-word bucket a verdict falls in, used for the grouped counts.
+fn verdict_label(verdict: &baude_core::worktree_scan::Verdict) -> &'static str {
+    use baude_core::worktree_scan::Verdict;
+    match verdict {
+        Verdict::Live { .. } => "live",
+        Verdict::Indeterminate { .. } => "indeterminate",
+        Verdict::Removable { .. } => "removable",
+    }
+}
+
+/// Print the human-readable preview: candidates grouped by workspace, each one
+/// named with the verdict and the facts that produced it, then a total.
+fn print_scan_summary(
+    report: &baude_core::worktree_scan::ScanReport,
+    out: &mut dyn std::io::Write,
+) {
+    let _ = writeln!(
+        out,
+        "baude worktrees scan — preview only, nothing was removed\n"
+    );
+    let _ = writeln!(
+        out,
+        "  worktrees base: {}",
+        report.worktrees_base.to_path_buf().display()
+    );
+    let _ = writeln!(
+        out,
+        "  config dir:     {}",
+        report.config_dir.to_path_buf().display()
+    );
+    let inventory = &report.state_inventory;
+    let _ = writeln!(
+        out,
+        "  state inventory: {} — {} workspace(s), {} state file(s), {} absent",
+        if inventory.complete {
+            "complete"
+        } else {
+            "INCOMPLETE — no candidate can be cleared"
+        },
+        inventory.workspaces_checked.len(),
+        inventory.files_checked.len(),
+        inventory.files_absent.len()
+    );
+
+    let mut workspaces: Vec<&str> = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.workspace.as_str())
+        .collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+
+    let mut removable = 0usize;
+    let mut live = 0usize;
+    let mut indeterminate = 0usize;
+    for workspace in workspaces {
+        let mut group: Vec<&baude_core::worktree_scan::Candidate> = report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.workspace == workspace)
+            .collect();
+        group.sort_by_key(|candidate| candidate.repository_key);
+        let count = |label: &str| {
+            group
+                .iter()
+                .filter(|candidate| verdict_label(&candidate.verdict) == label)
+                .count()
+        };
+        let (group_removable, group_live, group_indeterminate) =
+            (count("removable"), count("live"), count("indeterminate"));
+        removable += group_removable;
+        live += group_live;
+        indeterminate += group_indeterminate;
+        let _ = writeln!(
+            out,
+            "\nworkspace {workspace} — {} candidate(s): {group_removable} removable, \
+             {group_live} live, {group_indeterminate} indeterminate",
+            group.len()
+        );
+        for candidate in group {
+            let _ = writeln!(
+                out,
+                "  {:<13} {}  [{}]",
+                verdict_label(&candidate.verdict),
+                candidate.relative.join("/"),
+                verdict_phrase(&candidate.verdict)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "\ntotal: {} candidate(s) — {removable} removable, {live} live, \
+         {indeterminate} indeterminate",
+        report.candidates.len()
+    );
+    let _ = writeln!(
+        out,
+        "Nothing was removed: this command only reads. To act on this preview, \
+         save it and hand it back:\n  \
+         baude worktrees scan --json > preview.json\n  \
+         baude worktrees scan --prune --report preview.json        # re-verify only\n  \
+         baude worktrees scan --prune --report preview.json --yes  # and remove"
+    );
+}
+
+/// Why one candidate was not removed, in words. Every refusal names its reason:
+/// an account that says only "refused" is the one an operator works around
+/// (T-08-15).
+fn refusal_phrase(reason: &baude_core::worktree_scan::RefusalReason) -> String {
+    use baude_core::worktree_scan::RefusalReason;
+    match reason {
+        RefusalReason::NotRemovableNow { verdict } => {
+            format!(
+                "re-derivation no longer clears it: {}",
+                verdict_phrase(verdict)
+            )
+        }
+        RefusalReason::ProofChanged {
+            approved,
+            rederived,
+        } => format!(
+            "the re-derived proof is not the approved proof — approved {} workspace(s) \
+             checked, re-derived {}; approved evidence {} item(s), re-derived {}",
+            approved.workspaces_checked.len(),
+            rederived.workspaces_checked.len(),
+            approved.observed.len(),
+            rederived.observed.len()
+        ),
+        RefusalReason::Vanished => "gone since the approved scan — nothing to remove".to_string(),
+        RefusalReason::BecameSymlink => {
+            "a symlink stands where the directory was; refused without resolving it".to_string()
+        }
+        RefusalReason::NotADirectory => "not a directory any more".to_string(),
+        RefusalReason::GitdirPresent { holder } => format!(
+            "a gitdir is present ({}) — this is git's to remove, not ours",
+            holder.display()
+        ),
+        RefusalReason::RemovalFailed { detail } => format!("the removal failed: {detail}"),
+    }
+}
+
+/// Print the complete account of a prune: every approved record, every refusal
+/// with its reason, and everything found on disk that the report never named.
+fn print_prune_account(
+    report: &baude_core::worktree_scan::PruneReport,
+    out: &mut dyn std::io::Write,
+) {
+    use baude_core::worktree_scan::PruneDisposition;
+    let _ = writeln!(
+        out,
+        "baude worktrees scan --prune — {}\n",
+        if report.confirmed {
+            "confirmed: re-verified candidates that still match their approved proof were removed"
+        } else {
+            "re-verification only, nothing was removed"
+        }
+    );
+
+    let mut removed = 0usize;
+    let mut would = 0usize;
+    let mut refused = 0usize;
+    let mut untouched = 0usize;
+    for outcome in &report.outcomes {
+        let path = outcome.relative.join("/");
+        let line = match &outcome.disposition {
+            PruneDisposition::NotApproved => {
+                untouched += 1;
+                "not approved  (named by the report, but not as removable)".to_string()
+            }
+            PruneDisposition::Unapproved => {
+                untouched += 1;
+                "not approved  (found on disk, absent from the report — never this run's to remove)"
+                    .to_string()
+            }
+            PruneDisposition::WouldRemove => {
+                would += 1;
+                "would remove  (re-verified and still matching; awaiting --yes)".to_string()
+            }
+            PruneDisposition::Removed => {
+                removed += 1;
+                "removed".to_string()
+            }
+            PruneDisposition::Refused { reason } => {
+                refused += 1;
+                format!("refused       ({})", refusal_phrase(reason))
+            }
+        };
+        let _ = writeln!(out, "  {path}  {line}");
+    }
+
+    let _ = writeln!(
+        out,
+        "\ntotal: {} record(s) — {removed} removed, {would} would remove, \
+         {refused} refused, {untouched} left alone",
+        report.outcomes.len()
+    );
+    if !report.confirmed {
+        let _ = writeln!(
+            out,
+            "Nothing was removed. Re-run the same command with --yes to act on it."
+        );
+    }
+}
+
+/// Run `baude worktrees <args>` against explicit roots.
+///
+/// The roots and the sinks are parameters so a test drives the real command
+/// path without a developer directory anywhere near it, and so `main` stays the
+/// only place a real root is resolved.
+fn run_worktrees_at(
+    rest: &[String],
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let options = match parse_worktrees_args(rest) {
+        Ok(WorktreesRequest::Help) => {
+            let _ = writeln!(out, "{}", worktrees_help_text());
+            return WORKTREES_EXIT_OK;
+        }
+        Ok(WorktreesRequest::Scan(options)) => options,
+        Err(message) => {
+            let _ = writeln!(err, "baude worktrees: {message}");
+            let _ = writeln!(err, "\n{}", worktrees_help_text());
+            return WORKTREES_EXIT_USAGE;
+        }
+    };
+
+    if options.prune {
+        run_worktrees_prune(&options, roots, out, err)
+    } else {
+        run_worktrees_scan(&options, roots, out, err)
+    }
+}
+
+/// The preview path. Reads, prints, exits.
+fn run_worktrees_scan(
+    options: &WorktreesOptions,
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let report = match baude_core::worktree_scan::scan_at(roots) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(err, "baude worktrees: {error}");
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    if options.json {
+        // In `--json` mode stdout is the report and nothing else, byte for
+        // byte: it is meant to be redirected to a file and handed back to
+        // `--prune`. Every diagnostic goes to stderr.
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => {
+                let _ = writeln!(out, "{text}");
+                WORKTREES_EXIT_OK
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "baude worktrees: the report could not be written: {error}"
+                );
+                WORKTREES_EXIT_FAILED
+            }
+        }
+    } else {
+        print_scan_summary(&report, out);
+        WORKTREES_EXIT_OK
+    }
+}
+
+/// The prune path: load the approved report, hand it to the core unchanged, and
+/// print the account.
+///
+/// The report is loaded and deserialized here and passed through verbatim. It
+/// is comparison data: `prune_at` re-derives every fact for itself against the
+/// roots THIS process resolved, and removes only what still matches (D-15).
+fn run_worktrees_prune(
+    options: &WorktreesOptions,
+    roots: &baude_core::worktree_scan::ScanRoots,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let Some(path) = options.report.as_deref() else {
+        // Unreachable: the parser refuses `--prune` without `--report`. Kept as
+        // a refusal rather than a panic so the failure mode of a future parser
+        // change is "removes nothing", not "removes the wrong set".
+        let _ = writeln!(err, "baude worktrees: no approved report was given");
+        return WORKTREES_EXIT_USAGE;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: the approved report {} could not be read: {error}\n\
+                 Nothing was removed.",
+                path.display()
+            );
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    let approved: baude_core::worktree_scan::ScanReport = match serde_json::from_slice(&bytes) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: {} is not a report this build can act on: {error}\n\
+                 Nothing was removed.",
+                path.display()
+            );
+            return WORKTREES_EXIT_FAILED;
+        }
+    };
+    match baude_core::worktree_scan::prune_at(roots, &approved, options.yes) {
+        Ok(report) => {
+            use baude_core::worktree_scan::{PruneDisposition, RefusalReason};
+
+            print_prune_account(&report, out);
+            // `prune_at` returns `Ok` when the *report* was acceptable; a
+            // per-candidate failure travels inside the account. A removal that
+            // was attempted and failed on I/O is the one disposition an operator
+            // scripting this flow cannot be told about by an exit code of 0
+            // (#72, WR-02). Safety refusals stay exit-0: they are the tool
+            // working, not failing — a deliberate policy line, and every variant
+            // below has been placed on one side of it by hand.
+            //
+            // Spelled as a real `match` rather than `matches!` because that is
+            // the only form which makes the compiler enforce the paragraph
+            // above. `matches!` does not participate in exhaustiveness checking
+            // at all — its non-matching arm is an implicit wildcard, so a new
+            // `RefusalReason` would compile with no warning and land silently on
+            // the exit-0 side whatever its semantics (#72, WR-02, iteration 2).
+            //
+            // Gated on `confirmed` because CR-02 moved `removal_gate` onto the
+            // unconfirmed path, and that gate maps any non-`NotFound`
+            // `symlink_metadata` error to `RemovalFailed` — so a *preview*,
+            // which by contract "reads only; removes nothing", could otherwise
+            // exit 1 on an `EACCES`/`EIO` while printing "Nothing was removed."
+            // An operator scripting the documented two-step flow could not tell
+            // that apart from a real removal failure. `RemovalFailed` means "a
+            // removal was attempted and failed", and only the confirmed path
+            // attempts one (#72, WR-03, iteration 2).
+            let failed = report.confirmed
+                && report
+                    .outcomes
+                    .iter()
+                    .any(|outcome| match &outcome.disposition {
+                        PruneDisposition::Refused { reason } => match reason {
+                            RefusalReason::RemovalFailed { .. } => true,
+                            RefusalReason::NotRemovableNow { .. }
+                            | RefusalReason::ProofChanged { .. }
+                            | RefusalReason::Vanished
+                            | RefusalReason::BecameSymlink
+                            | RefusalReason::NotADirectory
+                            | RefusalReason::GitdirPresent { .. } => false,
+                        },
+                        PruneDisposition::NotApproved
+                        | PruneDisposition::Unapproved
+                        | PruneDisposition::WouldRemove
+                        | PruneDisposition::Removed => false,
+                    });
+            if failed {
+                WORKTREES_EXIT_FAILED
+            } else {
+                WORKTREES_EXIT_OK
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "baude worktrees: the approved report was refused: {error}\n\
+                 Nothing was removed."
+            );
+            WORKTREES_EXIT_FAILED
+        }
+    }
+}
+
+#[cfg(test)]
+mod worktrees_cli_tests {
+    use super::*;
+    use baude_core::repository::{
+        PersistedPath, RepositoryHealth, RepositoryState, SavedRepository,
+    };
+    use baude_core::worktree_scan::{ScanReport, ScanRoots, REPORT_FORMAT_VERSION};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    /// A synthetic pair of scan roots plus a report directory that lies outside
+    /// both of them, so saving a report can never be mistaken for a write into
+    /// a root the read-only contract asserts is unchanged.
+    struct CliFixture {
+        root: PathBuf,
+    }
+
+    impl CliFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "baude-worktrees-cli-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("worktrees")).expect("create fixture worktrees base");
+            std::fs::create_dir_all(root.join("config")).expect("create fixture config dir");
+            std::fs::create_dir_all(root.join("reports")).expect("create fixture report dir");
+            std::fs::create_dir_all(root.join("external")).expect("create fixture external dir");
+            Self { root }
+        }
+
+        fn base(&self) -> PathBuf {
+            self.root.join("worktrees")
+        }
+
+        fn config(&self) -> PathBuf {
+            self.root.join("config")
+        }
+
+        fn roots(&self) -> ScanRoots {
+            ScanRoots {
+                worktrees_base: self.base(),
+                config_dir: self.config(),
+            }
+        }
+
+        /// A report path outside both scan roots.
+        fn report_path(&self, name: &str) -> PathBuf {
+            self.root.join("reports").join(name)
+        }
+
+        /// An empty, shaped, unclaimed directory — the shape the predicate
+        /// clears.
+        fn candidate(&self, workspace: &str, name: &str) -> PathBuf {
+            let path = self.base().join(workspace).join(name);
+            std::fs::create_dir_all(&path).expect("create fixture candidate");
+            path
+        }
+
+        /// A shaped directory holding real content, which `ContainsCheckout`
+        /// proves live.
+        fn occupied(&self, workspace: &str, name: &str) -> PathBuf {
+            let path = self.candidate(workspace, name).join("primary");
+            std::fs::create_dir_all(&path).expect("create fixture checkout dir");
+            std::fs::write(path.join("tracked.txt"), b"fixture\n").expect("write fixture content");
+            self.base().join(workspace).join(name)
+        }
+
+        fn workspace(&self, workspace: &str) -> PathBuf {
+            let path = self.base().join(workspace);
+            std::fs::create_dir_all(&path).expect("create fixture workspace");
+            path
+        }
+
+        fn write_state(&self, file: &str, state: RepositoryState) {
+            let bytes = serde_json::to_vec_pretty(&baude_core::persist::StateFile::new(state))
+                .expect("serialize fixture state");
+            std::fs::write(self.config().join(file), bytes).expect("write fixture state file");
+        }
+
+        /// The readable, empty state file every clearing case needs: without a
+        /// complete inventory no candidate is ever cleared.
+        fn empty_state(&self) {
+            self.write_state("state-claude.json", RepositoryState::default());
+        }
+
+        /// A state file recording repository `key`, which is an ownership claim
+        /// on `<base>/claude/repository-<key>`.
+        fn state_claiming(&self, key: u64) {
+            let main = self.root.join("external").join("repo");
+            std::fs::create_dir_all(&main).expect("create fixture external repo");
+            let mut state = RepositoryState {
+                next_repository_key: key,
+                ..RepositoryState::default()
+            };
+            let allocated = state
+                .allocate_repository_key()
+                .expect("allocate fixture repository key");
+            let order = state.next_first_seen_order;
+            state.next_first_seen_order += 1;
+            state.repositories.push(SavedRepository {
+                key: allocated,
+                observed_common_dir: PersistedPath::from_path(&main.join(".git")),
+                observed_main_worktree: PersistedPath::from_path(&main),
+                first_seen_order: order,
+                health: RepositoryHealth::Available,
+            });
+            self.write_state("state-claude.json", state);
+        }
+
+        /// A sorted, recursive listing of both scan roots: every entry with its
+        /// kind and size. Two of these bracket every non-destructive variant.
+        fn snapshot(&self) -> Vec<String> {
+            let mut entries = Vec::new();
+            listing(&self.base(), "worktrees/", &mut entries);
+            listing(&self.config(), "config/", &mut entries);
+            entries
+        }
+    }
+
+    impl Drop for CliFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn listing(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let mut items: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(read) => read.filter_map(Result::ok).collect(),
+            Err(error) => {
+                out.push(format!("{prefix}<unreadable: {error}>"));
+                return;
+            }
+        };
+        items.sort_by_key(std::fs::DirEntry::file_name);
+        for item in items {
+            let name = item.file_name().to_string_lossy().to_string();
+            let path = item.path();
+            let meta = std::fs::symlink_metadata(&path).expect("stat fixture entry");
+            let kind = if meta.file_type().is_symlink() {
+                "link"
+            } else if meta.is_dir() {
+                "dir"
+            } else {
+                "file"
+            };
+            out.push(format!("{prefix}{name} [{kind} {}]", meta.len()));
+            if meta.is_dir() {
+                listing(&path, &format!("{prefix}{name}/"), out);
+            }
+        }
+    }
+
+    /// Drive the subcommand exactly as `main` does, with explicit roots and
+    /// captured sinks. `args` are the tokens that follow `baude worktrees`.
+    fn run(fixture: &CliFixture, args: &[&str]) -> (i32, String, String) {
+        let argv: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_worktrees_at(&argv, &fixture.roots(), &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("stdout is utf-8"),
+            String::from_utf8(err).expect("stderr is utf-8"),
+        )
+    }
+
+    /// Save a preview the way the documented flow tells an operator to: capture
+    /// `--json` stdout into a file outside both roots.
+    fn save_preview(fixture: &CliFixture, name: &str) -> PathBuf {
+        let (code, stdout, _) = run(fixture, &["scan", "--json"]);
+        assert_eq!(code, WORKTREES_EXIT_OK, "a json scan must succeed");
+        let path = fixture.report_path(name);
+        std::fs::write(&path, stdout.as_bytes()).expect("save the preview");
+        path
+    }
+
+    fn report_at(path: &Path) -> ScanReport {
+        let bytes = std::fs::read(path).expect("read the saved preview");
+        serde_json::from_slice(&bytes).expect("the saved preview parses as a core ScanReport")
+    }
+
+    // ---- the read-only contract ------------------------------------------
+
+    #[test]
+    fn a_plain_scan_prints_a_grouped_summary_and_changes_neither_root() {
+        let fixture = CliFixture::new("plain-scan");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        fixture.occupied("claude", "repository-5");
+
+        let before = fixture.snapshot();
+        let (code, stdout, stderr) = run(&fixture, &["scan"]);
+        let after = fixture.snapshot();
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert_eq!(before, after, "a scan must change neither root");
+        assert!(
+            stdout.contains("workspace claude"),
+            "the summary groups by workspace: {stdout}"
+        );
+        assert!(
+            stdout.contains("claude/repository-9") && stdout.contains("claude/repository-5"),
+            "every candidate is named: {stdout}"
+        );
+        assert!(
+            stdout.contains("removable") && stdout.contains("live"),
+            "verdicts are grouped and counted: {stdout}"
+        );
+        assert!(
+            stdout.contains("total: 2 candidate"),
+            "the summary carries a total: {stdout}"
+        );
+        assert!(
+            stdout.to_lowercase().contains("nothing was removed"),
+            "the preview says so in words: {stdout}"
+        );
+    }
+
+    #[test]
+    fn a_json_scan_changes_neither_root_and_describes_the_same_candidate_set() {
+        let fixture = CliFixture::new("json-scan");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        fixture.occupied("claude", "repository-5");
+
+        let (_, plain, _) = run(&fixture, &["scan"]);
+        let before = fixture.snapshot();
+        let (code, stdout, stderr) = run(&fixture, &["scan", "--json"]);
+        let after = fixture.snapshot();
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert_eq!(before, after, "a json scan must change neither root");
+        let report: ScanReport =
+            serde_json::from_str(&stdout).expect("stdout is exactly one core ScanReport");
+        assert_eq!(report.candidates.len(), 2);
+        for candidate in &report.candidates {
+            assert!(
+                plain.contains(&candidate.relative.join("/")),
+                "both modes describe the same set: {plain}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_output_carries_diagnostics_on_stderr_only() {
+        let fixture = CliFixture::new("json-clean");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+
+        let (code, stdout, _) = run(&fixture, &["scan", "--json"]);
+
+        assert_eq!(code, WORKTREES_EXIT_OK);
+        assert!(
+            stdout.trim_start().starts_with('{'),
+            "stdout must be machine-readable from the first byte: {stdout}"
+        );
+        serde_json::from_str::<ScanReport>(&stdout)
+            .expect("nothing but the report may reach stdout in json mode");
+    }
+
+    #[test]
+    fn saved_json_round_trips_into_the_core_scan_report() {
+        let fixture = CliFixture::new("round-trip");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        fixture.occupied("claude", "repository-5");
+
+        let saved = save_preview(&fixture, "preview.json");
+        let report = report_at(&saved);
+
+        assert_eq!(report.format_version, REPORT_FORMAT_VERSION);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(
+            !report.state_inventory.workspaces_checked.is_empty(),
+            "the saved report carries the inventory the verdicts rest on"
+        );
+        let removable = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.relative == ["claude", "repository-9"])
+            .expect("the empty candidate is in the saved report");
+        assert!(
+            matches!(
+                removable.verdict,
+                baude_core::worktree_scan::Verdict::Removable { .. }
+            ),
+            "the saved report carries the full verdict and its proof: {removable:?}"
+        );
+    }
+
+    // ---- the two-invocation flow -----------------------------------------
+
+    #[test]
+    fn prune_acts_on_the_saved_report_rather_than_a_fresh_scan() {
+        let fixture = CliFixture::new("saved-set");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        // Created AFTER the preview. A fresh scan would clear it; the approved
+        // report does not name it, so it is not this run's to remove.
+        let latecomer = fixture.candidate("claude", "repository-7");
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(!approved.exists(), "the approved candidate is removed");
+        assert!(
+            latecomer.exists(),
+            "a candidate created after the preview is never pruned"
+        );
+        assert!(
+            stdout.contains("claude/repository-7"),
+            "the account is complete — the latecomer is reported: {stdout}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_previewed_candidate_is_removed_only_with_all_three_opt_ins() {
+        let fixture = CliFixture::new("opt-ins");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+        let path = saved.to_str().unwrap().to_string();
+
+        let (code, stdout, stderr) = run(&fixture, &["scan", "--prune", "--report", &path]);
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(
+            approved.exists(),
+            "--prune without --yes re-verifies and removes nothing"
+        );
+        assert!(
+            stdout.contains("would remove"),
+            "the withheld path says what it would have done: {stdout}"
+        );
+
+        let (code, stdout, stderr) =
+            run(&fixture, &["scan", "--prune", "--report", &path, "--yes"]);
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(!approved.exists(), "both opt-ins together remove it");
+        assert!(
+            stdout.contains("removed"),
+            "the account names the removal: {stdout}"
+        );
+    }
+
+    #[test]
+    fn prune_without_yes_re_verifies_and_removes_nothing() {
+        let fixture = CliFixture::new("no-yes");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        let before = fixture.snapshot();
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &["scan", "--prune", "--report", saved.to_str().unwrap()],
+        );
+        let after = fixture.snapshot();
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert_eq!(before, after, "re-verification alone changes nothing");
+        assert!(
+            stdout.contains("claude/repository-9"),
+            "the re-verification result is reported: {stdout}"
+        );
+    }
+
+    /// WR-02. `prune_at` returns `Ok` whenever the *report* was acceptable, so
+    /// a removal that was attempted and failed on I/O used to exit 0 — the one
+    /// outcome an operator scripting this two-step flow could not tell apart
+    /// from "removed cleanly" without parsing stdout prose.
+    ///
+    /// Built by making the candidate's parent read-only after the preview:
+    /// `remove_dir` needs write permission on the parent, so the gate clears
+    /// (the candidate itself is untouched and still empty) and the removal
+    /// itself is what fails. Root ignores the mode bits, so the case probes for
+    /// that first and declines rather than asserting something false.
+    #[test]
+    fn a_removal_that_failed_exits_nonzero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = CliFixture::new("removal-failed");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let parent = fixture.workspace("claude");
+        let saved = save_preview(&fixture, "preview.json");
+
+        let readonly = std::fs::Permissions::from_mode(0o555);
+        let writable = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&parent, readonly.clone()).expect("make the parent read-only");
+        // Root bypasses the mode bits entirely, and a case that silently passed
+        // there would be asserting nothing at all.
+        let enforced = std::fs::create_dir(parent.join("probe-9")).is_err();
+        if !enforced {
+            let _ = std::fs::remove_dir(parent.join("probe-9"));
+            std::fs::set_permissions(&parent, writable).expect("restore the parent");
+            eprintln!("skipped: this user can write a read-only directory (running as root?)");
+            return;
+        }
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+        // Restored before the assertions so a failure here cannot leave an
+        // undeletable fixture behind for `Drop`.
+        std::fs::set_permissions(&parent, writable).expect("restore the parent");
+
+        assert_eq!(
+            code, WORKTREES_EXIT_FAILED,
+            "a failed removal must not exit 0 — stdout: {stdout}, stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("refused"),
+            "the account still names the failure: {stdout}"
+        );
+        assert!(approved.exists(), "the candidate was not in fact removed");
+    }
+
+    /// The other half of the line WR-02 draws: a refusal is the tool working,
+    /// so it stays exit 0. Only an attempted-and-failed removal is exit 1.
+    #[test]
+    fn a_safety_refusal_still_exits_zero() {
+        let fixture = CliFixture::new("refusal-exit-ok");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        // A second workspace widens `workspaces_checked`, so the candidate still
+        // clears but no longer by the approved proof.
+        fixture.workspace("opencode");
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(stdout.contains("refused"), "{stdout}");
+        assert!(approved.exists());
+    }
+
+    // ---- refusals, each naming its reason ---------------------------------
+
+    #[test]
+    fn a_candidate_whose_proof_changed_is_refused_and_names_the_reason() {
+        let fixture = CliFixture::new("proof-changed");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        // A second workspace directory widens `workspaces_checked`, so the
+        // candidate still clears — but not by the facts the operator approved.
+        fixture.workspace("opencode");
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(approved.exists(), "a changed proof is not the approved one");
+        assert!(
+            stdout.contains("refused") && stdout.contains("proof"),
+            "the refusal names the reason: {stdout}"
+        );
+    }
+
+    #[test]
+    fn a_candidate_newly_referenced_by_state_is_refused_and_names_the_reason() {
+        let fixture = CliFixture::new("new-reference");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        // The operator re-admitted the repository between preview and prune.
+        fixture.state_claiming(9);
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(approved.exists(), "a live candidate is never removed");
+        assert!(
+            stdout.contains("refused") && stdout.to_lowercase().contains("referenced by state"),
+            "the refusal names the blocker: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_replaced_by_a_symlink_is_refused_and_names_the_reason() {
+        let fixture = CliFixture::new("symlink");
+        fixture.empty_state();
+        let approved = fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        let target = fixture.root.join("external").join("elsewhere");
+        std::fs::create_dir_all(&target).expect("create the symlink target");
+        std::fs::remove_dir(&approved).expect("clear the approved candidate");
+        std::os::unix::fs::symlink(&target, &approved).expect("replace it with a symlink");
+
+        let (code, stdout, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                saved.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+
+        assert_eq!(code, WORKTREES_EXIT_OK, "stderr: {stderr}");
+        assert!(target.exists(), "the symlink target is untouched");
+        assert!(
+            std::fs::symlink_metadata(&approved)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink(),
+            "a symlink is refused without being resolved"
+        );
+        assert!(
+            stdout.contains("refused") && stdout.to_lowercase().contains("symlink"),
+            "the refusal names the reason: {stdout}"
+        );
+    }
+
+    // ---- report input that cannot authorize anything ----------------------
+
+    #[test]
+    fn a_missing_report_file_removes_nothing() {
+        let fixture = CliFixture::new("missing-report");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        let absent = fixture.report_path("never-written.json");
+
+        let before = fixture.snapshot();
+        let (code, _, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                absent.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+        let after = fixture.snapshot();
+
+        assert_ne!(code, WORKTREES_EXIT_OK, "a missing report exits nonzero");
+        assert_eq!(before, after, "nothing was removed");
+        assert!(!stderr.is_empty(), "the failure is explained");
+    }
+
+    #[test]
+    fn a_malformed_report_removes_nothing() {
+        let fixture = CliFixture::new("malformed-report");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        let path = fixture.report_path("garbage.json");
+        std::fs::write(&path, b"{not a report").expect("write a malformed report");
+
+        let before = fixture.snapshot();
+        let (code, _, stderr) = run(
+            &fixture,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                path.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+        let after = fixture.snapshot();
+
+        assert_ne!(code, WORKTREES_EXIT_OK, "a malformed report exits nonzero");
+        assert_eq!(before, after, "nothing was removed");
+        assert!(!stderr.is_empty(), "the failure is explained");
+    }
+
+    #[test]
+    fn a_report_bound_to_a_foreign_root_removes_nothing() {
+        let mine = CliFixture::new("foreign-mine");
+        mine.empty_state();
+        mine.candidate("claude", "repository-9");
+
+        let theirs = CliFixture::new("foreign-theirs");
+        theirs.empty_state();
+        theirs.candidate("claude", "repository-9");
+        let foreign = save_preview(&theirs, "preview.json");
+
+        let before = mine.snapshot();
+        let (code, _, stderr) = run(
+            &mine,
+            &[
+                "scan",
+                "--prune",
+                "--report",
+                foreign.to_str().unwrap(),
+                "--yes",
+            ],
+        );
+        let after = mine.snapshot();
+
+        assert_ne!(code, WORKTREES_EXIT_OK, "a foreign report exits nonzero");
+        assert_eq!(before, after, "nothing was removed");
+        assert!(!stderr.is_empty(), "the failure is explained");
+    }
+
+    // ---- usage: a single mistyped argument cannot authorize a deletion -----
+
+    #[test]
+    fn yes_without_prune_is_a_usage_error() {
+        let fixture = CliFixture::new("yes-alone");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+
+        let before = fixture.snapshot();
+        let (code, _, stderr) = run(&fixture, &["scan", "--yes"]);
+        let after = fixture.snapshot();
+
+        assert_eq!(code, WORKTREES_EXIT_USAGE, "stderr: {stderr}");
+        assert_eq!(before, after, "nothing was removed");
+    }
+
+    #[test]
+    fn report_without_prune_is_a_usage_error() {
+        let fixture = CliFixture::new("report-alone");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+        let saved = save_preview(&fixture, "preview.json");
+
+        let (code, _, stderr) = run(&fixture, &["scan", "--report", saved.to_str().unwrap()]);
+
+        assert_eq!(
+            code, WORKTREES_EXIT_USAGE,
+            "report input must never be confused with a new scan: {stderr}"
+        );
+    }
+
+    #[test]
+    fn prune_without_report_is_a_usage_error() {
+        let fixture = CliFixture::new("prune-alone");
+        fixture.empty_state();
+        fixture.candidate("claude", "repository-9");
+
+        let before = fixture.snapshot();
+        let (code, _, stderr) = run(&fixture, &["scan", "--prune", "--yes"]);
+        let after = fixture.snapshot();
+
+        assert_eq!(code, WORKTREES_EXIT_USAGE, "stderr: {stderr}");
+        assert_eq!(before, after, "nothing was removed");
+    }
+
+    #[test]
+    fn an_unknown_option_is_a_usage_error() {
+        let fixture = CliFixture::new("unknown-option");
+        let (code, _, stderr) = run(&fixture, &["scan", "--force"]);
+        assert_eq!(code, WORKTREES_EXIT_USAGE);
+        assert!(
+            stderr.contains("--force"),
+            "the bad option is named: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_option_is_a_usage_error() {
+        let fixture = CliFixture::new("duplicate-option");
+        let (code, _, stderr) = run(&fixture, &["scan", "--json", "--json"]);
+        assert_eq!(code, WORKTREES_EXIT_USAGE, "stderr: {stderr}");
+    }
+
+    #[test]
+    fn a_missing_option_value_is_a_usage_error() {
+        let fixture = CliFixture::new("missing-value");
+        let (code, _, stderr) = run(&fixture, &["scan", "--prune", "--report"]);
+        assert_eq!(code, WORKTREES_EXIT_USAGE, "stderr: {stderr}");
+    }
+
+    #[test]
+    fn an_unknown_verb_is_a_usage_error() {
+        let fixture = CliFixture::new("unknown-verb");
+        let (code, _, stderr) = run(&fixture, &["prune"]);
+        assert_eq!(
+            code, WORKTREES_EXIT_USAGE,
+            "`prune` is an option, never a verb: {stderr}"
+        );
+    }
+
+    // ---- discoverability --------------------------------------------------
+
+    #[test]
+    fn the_top_level_help_lists_the_worktrees_verb() {
+        let help = help_text();
+        assert!(
+            help.contains("worktrees"),
+            "a verb that dispatches but is undiscoverable is half-shipped: {help}"
+        );
+    }
+
+    #[test]
+    fn the_worktrees_help_documents_the_two_invocation_flow() {
+        let fixture = CliFixture::new("verb-help");
+        let (code, stdout, _) = run(&fixture, &["--help"]);
+
+        assert_eq!(code, WORKTREES_EXIT_OK);
+        assert!(stdout.contains("--json"), "flow step one: {stdout}");
+        assert!(stdout.contains("--report"), "flow step two: {stdout}");
+        assert!(
+            stdout.contains("--yes"),
+            "the separate confirmation: {stdout}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_negotiation_tests {
+    use super::*;
+
+    /// Byte-subsequence offset finder: the pop bytes are pure ASCII, but
+    /// offset comparison on `&[u8]` avoids lossy string conversion questions.
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// `PopKeyboardEnhancementFlags` wire form: CSI < 1 u.
+    const POP: &[u8] = b"\x1b[<1u";
+    /// `LeaveAlternateScreen` wire form: CSI ? 1049 l.
+    const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+
+    #[test]
+    fn probe_failure_and_refusal_are_legacy_never_fatal() {
+        // D-02/D-03 (TKEY-05): Ok(false) and Err (crossterm's internal 2 s
+        // deadline, no tty, Windows) both mean unsupported means legacy —
+        // no panic, no propagated error.
+        assert!(!negotiate_keyboard(|| Ok(false)));
+        assert!(!negotiate_keyboard(|| Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timed out"
+        ))));
+        assert!(negotiate_keyboard(|| Ok(true)));
+    }
+
+    #[test]
+    fn pop_precedes_alternate_screen_leave_when_pushed() {
+        // D-07: per-screen kitty stacks — the pop must land on the alternate
+        // screen before LeaveAlternateScreen switches away.
+        let mut out: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut out, true).unwrap();
+        let pop = find_subsequence(&out, POP).expect("pop bytes missing from restore output");
+        let leave =
+            find_subsequence(&out, LEAVE_ALT).expect("alt-screen leave missing from restore");
+        assert!(
+            pop < leave,
+            "pop offset {pop} must precede alt-screen leave offset {leave}"
+        );
+    }
+
+    #[test]
+    fn legacy_restore_emits_no_pop_and_matches_pre_phase_bytes() {
+        // D-03: on a legacy terminal the restore emission is byte-identical
+        // to the pre-phase sequence (built here from the same commands the
+        // pre-phase restore_terminal executed).
+        let mut out: Vec<u8> = Vec::new();
+        write_restore_sequence(&mut out, false).unwrap();
+        assert!(
+            find_subsequence(&out, POP).is_none(),
+            "legacy restore must not emit the pop"
+        );
+        let mut expected: Vec<u8> = Vec::new();
+        queue!(
+            expected,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
+        .unwrap();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn double_restore_pops_exactly_once() {
+        // Panic during the exit path drives restore_terminal twice; the
+        // AtomicBool swap must make the second pass a no-op for the pop.
+        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        let mut first: Vec<u8> = Vec::new();
+        let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
+        write_restore_sequence(&mut first, popped).unwrap();
+        let mut second: Vec<u8> = Vec::new();
+        let popped = KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed);
+        write_restore_sequence(&mut second, popped).unwrap();
+        assert!(
+            find_subsequence(&first, POP).is_some(),
+            "first restore must pop"
+        );
+        assert!(
+            find_subsequence(&second, POP).is_none(),
+            "second restore must not re-emit the pop"
+        );
     }
 }

@@ -6,6 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles `baude_core::testing` (fixture redirects + the real-path escape
+# guard) into a DEPENDENT crate's test binary. `cfg(test)` is set per crate by
+# `rustc --test`, so it is false inside baude-core when cargo builds baude's or
+# bauded's harness — the two binaries that leaked worktrees (#72). Downstream
+# crates enable this from `[dev-dependencies]` only, which resolver v2 leaves
+# unselected for `cargo build --release`.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
@@ -14,4 +23,6 @@ portable-pty = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "2", features = ["json"] }
-vt100 = "0.15"
+# Vendored fork of vt100 0.15.2 with OSC 8 hyperlink support (per-cell link
+# ids); upstream has no OSC 8 through 0.16.2. See vendor/vt100/README.md.
+vt100 = { path = "../vendor/vt100" }

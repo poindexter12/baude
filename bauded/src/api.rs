@@ -678,8 +678,60 @@ mod tests {
 
     use crate::manager::Manager;
 
-    fn app() -> axum::Router {
-        super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))))
+    /// The minimal API isolation owner: a unique synthetic root, the redirect
+    /// that pins every resolved path inside it, and the literal workspace
+    /// identity resolved under that root. For router cases that need no
+    /// repository fixture — they still reach `workspace::active()` through the
+    /// handlers.
+    ///
+    /// `pub(super)` so the sibling `pty_ws_tests` module can own one too: the
+    /// websocket case drives the same handlers over a real socket and reaches
+    /// the same ambient config reads.
+    pub(super) struct ApiScope {
+        /// Struct fields drop in declaration order, so the identity is restored
+        /// while its own root is still installed.
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    #[must_use = "the returned ApiScope owns this case's root and identity; bind it to a named \
+                  local that outlives every handler await"]
+    pub(super) fn api_scope(label: &str) -> ApiScope {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "bauded-scope-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(label.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        ApiScope {
+            _identity: identity,
+            _redirect: redirect,
+        }
+    }
+
+    /// The router together with the scope that isolates it.
+    ///
+    /// Every handler resolves the active workspace and names its state file
+    /// from it, so the scope must be retained for the whole test body —
+    /// including across every `await`, which is where session creation reaches
+    /// managed worktree allocation. Returning the bare router would compile and
+    /// run the case against the developer's real workspace and data dir.
+    #[must_use = "the leading ApiScope isolates this router; bind it to a named local that \
+                  outlives every handler await"]
+    fn app() -> (ApiScope, axum::Router) {
+        let scope = api_scope("router");
+        let router = super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))));
+        (scope, router)
     }
 
     async fn body_json(res: axum::response::Response) -> serde_json::Value {
@@ -707,14 +759,59 @@ mod tests {
             .success());
     }
 
-    fn initialized_repo(root: &Path, name: &str) -> std::path::PathBuf {
+    /// A fixture repository together with the redirect that contains it.
+    ///
+    /// The redirect is thread-local and drops with this value, so the owner must
+    /// be held in a NAMED binding for the whole test body — including across
+    /// every handler `await`, since that is where session creation reaches
+    /// managed worktree allocation. Returning a bare `TestRedirect` from the
+    /// helper, or letting the owner live only as a temporary, would compile and
+    /// leave the fixture running completely unredirected (issue #72).
+    struct FixtureRepo {
+        repo: std::path::PathBuf,
+        /// Struct fields drop in DECLARATION order, the reverse of locals, so
+        /// the identity scope is declared before the root redirect and is
+        /// therefore restored while its own root is still installed — mirroring
+        /// the acquisition order in `initialized_repo_in_workspace` (root
+        /// first, identity second).
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl FixtureRepo {
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+    }
+
+    /// The default fixture identity is the literal `claude` workspace, which is
+    /// exactly the identity these tests were written against and the one the
+    /// `persist_at_for_test` call sites pair their state with. It is a literal,
+    /// never the developer's configured workspace.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn initialized_repo(root: &Path, name: &str) -> FixtureRepo {
+        initialized_repo_in_workspace(root, name, "claude")
+    }
+
+    /// The same fixture under an explicitly chosen literal workspace, for cases
+    /// that need two fixtures to be distinguishable by identity alone.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn initialized_repo_in_workspace(root: &Path, name: &str, workspace: &str) -> FixtureRepo {
         // Contain managed worktree allocation (issue #72): every API test that
         // restarts or activates a session can reach worktree creation.
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            root.join("bin").join("baude").display()
-        ));
+        let redirect = baude_core::testing::TestRedirect::new(root);
+        // Identity second, under the root just installed. Held by the returned
+        // owner so it survives every handler `await`, which is where session
+        // creation reaches managed worktree allocation.
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(workspace.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
@@ -723,10 +820,103 @@ mod tests {
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
-        repo
+        FixtureRepo {
+            repo,
+            _identity: identity,
+            _redirect: redirect,
+        }
     }
 
+    /// Owner-only workspace-identity isolation.
+    ///
+    /// These cases resolve identity and compose managed paths only: no router
+    /// is driven, no Manager is created, no PTY is spawned. Session workers are
+    /// not isolated until plan 08.
+    mod fixture_identity_isolation {
+        use super::*;
+        use std::sync::Barrier;
+
+        /// Two API fixtures built on two threads under two explicit literal
+        /// workspaces keep independent identities and managed paths after their
+        /// helpers returned.
+        #[test]
+        fn concurrent_api_fixtures_keep_independent_identities() {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for workspace in ["api-identity-alpha", "api-identity-beta"] {
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    let root = std::env::temp_dir().join(format!(
+                        "bauded-{workspace}-{}-{:?}",
+                        std::process::id(),
+                        std::thread::current().id()
+                    ));
+                    let _ = std::fs::remove_dir_all(&root);
+                    std::fs::create_dir_all(&root).unwrap();
+                    let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
+                    barrier.wait();
+                    let resolved = baude_core::workspace::active().name.clone();
+                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    barrier.wait();
+                    assert_eq!(resolved, workspace);
+                    assert!(
+                        managed.starts_with(&root),
+                        "{} escaped the fixture root {}",
+                        managed.display(),
+                        root.display()
+                    );
+                    assert!(
+                        managed
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(workspace)),
+                        "{} does not carry the fixture's own workspace {workspace}",
+                        managed.display()
+                    );
+                    assert!(fixture.path().exists());
+                    drop(fixture);
+                    let _ = std::fs::remove_dir_all(&root);
+                }));
+            }
+            for thread in threads {
+                thread.join().expect("identity thread panicked");
+            }
+        }
+
+        /// An override-free thread cannot inherit a live API fixture identity.
+        #[test]
+        fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
+            let root =
+                std::env::temp_dir().join(format!("bauded-identity-escape-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let _fixture = initialized_repo(&root, "repo");
+            let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
+            let payload = probe.expect_err("an override-free reader must not resolve an identity");
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
+                "expected the identity-escape panic, got {message:?}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Requires a caller-owned isolation scope established BEFORE the call:
+    /// the manager it returns polls session metadata through
+    /// `backend::active()` and names its state file from `workspace::active()`.
+    /// Every caller already binds an `initialized_repo` owner first; this
+    /// assertion is what keeps the next one from forgetting.
     fn exited_tracked_manager(repo: &Path) -> (crate::manager::Shared, u64) {
+        assert!(
+            baude_core::testing::workspace_override().is_some(),
+            "exited_tracked_manager requires a caller-owned isolation scope: bind an \
+             initialized_repo (or api_scope) owner before calling it"
+        );
         let state = Arc::new(Mutex::new(Manager::new("true".into(), false)));
         let id = crate::manager::lock(&state)
             .create(repo.to_str().unwrap(), None, None)
@@ -743,7 +933,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_starts_empty() {
-        let res = app().oneshot(get("/sessions")).await.unwrap();
+        let (_scope, router) = app();
+        let res = router.oneshot(get("/sessions")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await, serde_json::json!([]));
     }
@@ -756,7 +947,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let repo = initialized_repo(&root, "repo").canonicalize().unwrap();
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().canonicalize().unwrap();
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -853,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_session_is_404() {
-        let app = app();
+        let (_scope, app) = app();
         for req in [
             get("/sessions/9"),
             get("/sessions/9/messages"),
@@ -872,7 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_requests_are_400() {
-        let app = app();
+        let (_scope, app) = app();
         let res = app
             .clone()
             .oneshot(post_json("/sessions", r#"{"repo":"/nonexistent-xyz"}"#))
@@ -895,6 +1087,10 @@ mod tests {
     #[tokio::test]
     async fn real_atomic_persistence_failures_are_503_for_every_mutation() {
         use baude_core::persist::{self, AtomicFailure};
+
+        // Declared first so it drops last: every `Manager::new` below reads
+        // config ambiently even though the state roots are passed explicitly.
+        let _scope = api_scope("atomic-persistence");
 
         for (failure, committed) in [
             (AtomicFailure::Rename, false),
@@ -1006,7 +1202,8 @@ mod tests {
             let restart_root = std::env::temp_dir().join(format!("bauded-api-restart-{suffix}"));
             let _ = std::fs::remove_dir_all(&restart_root);
             std::fs::create_dir_all(&restart_root).unwrap();
-            let repo = initialized_repo(&restart_root, "repo");
+            let restart_fixture = initialized_repo(&restart_root, "repo");
+            let repo = restart_fixture.path().to_path_buf();
             let restart_state = Arc::new(Mutex::new(Manager::new("true".into(), true)));
             let restart_id = {
                 let mut manager = crate::manager::lock(&restart_state);
@@ -1058,7 +1255,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("bauded-api-restart-branch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let repo = initialized_repo(&root, "repo");
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().to_path_buf();
         let (state, id) = exited_tracked_manager(&repo);
         git(&repo, &["checkout", "-b", "changed"]);
 
@@ -1084,8 +1282,10 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let repo = initialized_repo(&root, "repo");
-        let replacement = initialized_repo(&root, "replacement");
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().to_path_buf();
+        let replacement_fixture = initialized_repo(&root, "replacement");
+        let replacement = replacement_fixture.path().to_path_buf();
         let (state, id) = exited_tracked_manager(&repo);
         std::fs::rename(&repo, root.join("original")).unwrap();
         symlink(&replacement, &repo).unwrap();
@@ -1106,6 +1306,7 @@ mod tests {
     async fn post_event_appends_and_404s_unknown() {
         use crate::manager::lock;
 
+        let _scope = api_scope("post-event");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         // Pin a deterministic claude session_id so the /tmp path is isolated.
@@ -1151,6 +1352,7 @@ mod tests {
     async fn activity_returns_events_clamps_limit_and_404s_unknown() {
         use crate::manager::lock;
 
+        let _scope = api_scope("activity-events");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let sid = format!("api-activity-test-{}", std::process::id());
@@ -1227,6 +1429,7 @@ mod tests {
     async fn activity_stream_guards_known_and_unknown() {
         use crate::manager::lock;
 
+        let _scope = api_scope("activity-stream");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
@@ -1257,6 +1460,7 @@ mod tests {
     async fn permission_get_post_round_trip_and_validation() {
         use crate::manager::{lock, PendingPermission};
 
+        let _scope = api_scope("permission-round-trip");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
@@ -1358,6 +1562,7 @@ mod tests {
     async fn permission_post_deny_resolves_deny() {
         use crate::manager::{lock, PendingPermission};
 
+        let _scope = api_scope("permission-deny");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
@@ -1403,6 +1608,7 @@ mod tests {
 
         use crate::manager::{lock, PendingPermission};
 
+        let _scope = api_scope("permission-long-poll");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
@@ -1461,7 +1667,8 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_pwa() {
-        let res = app().oneshot(get("/")).await.unwrap();
+        let (_scope, router) = app();
+        let res = router.oneshot(get("/")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let ct = res.headers()[header::CONTENT_TYPE].to_str().unwrap();
         assert!(ct.starts_with("text/html"));
@@ -1471,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_lifecycle_over_http() {
-        let app = app();
+        let (_scope, app) = app();
         // create
         let res = app
             .clone()
@@ -1551,10 +1758,15 @@ mod pty_ws_tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+    use super::tests::api_scope;
     use crate::manager::{lock, Manager};
 
     #[tokio::test]
     async fn pty_websocket_round_trip() {
+        // Declared first so it drops last: the spawned `axum::serve` task and
+        // the PTY it drives run on this same current-thread runtime, so the
+        // thread-local redirect must outlive the socket, not just the setup.
+        let _scope = api_scope("pty-websocket");
         // Wrap the shell so the spawn-site permission flag (appended to the
         // base cmd, default `--dangerously-skip-permissions`) lands as the
         // harmless `$0` of `sh -c` instead of breaking bash's arg parsing.

@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 8
-current_phase_name: Test Isolation and Fixture Ownership
-status: Ready to plan Phase 8
-stopped_at: v2.2 roadmap reconciled against shipped v2.1.2-v2.1.5 code; Phases 8 and 9 narrowed
-last_updated: "2026-09-14T00:20:00.000Z"
-last_activity: 2026-09-13
-last_activity_desc: Phases 8 and 9 re-scoped to verified remaining gaps
-state_head: 7ccb2bd74ac94b923aa9b92c032623cf19b88a72
+current_phase: 09
+current_phase_name: Hook Seeding Safety
+status: planning
+stopped_at: "Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates"
+last_updated: "2026-09-17T17:48:55.112Z"
+last_activity: 2026-09-16
+last_activity_desc: Phase 8 complete, transitioned to Phase 09
+state_head: 20b8098be7a0a91e9d9c7560a0234020759423bc
 progress:
   total_phases: 5
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 4
+  total_plans: 25
+  completed_plans: 24
+  percent: 80
 ---
 
 # Project State
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-30)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 8 planning — config/identity isolation and leak preview, the gaps v2.1.4 did not close
+**Current focus:** Phase 12 — Validation and v2.2.0 Release
 
 ## Current Position
 
-Phase: 8 (Test Isolation and Fixture Ownership, narrowed)
+Phase: 09 — Hook Seeding Safety
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-09-13 — Phases 8 and 9 reconciled against shipped code
+Last activity: 2026-09-16 — Phase 8 complete, transitioned to Phase 09
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -50,6 +50,10 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | 5. Durable Repository Admission | 3/3 | 38 min | 13 min |
 | 6. Shared Lifecycle Core Refactor | 7/7 locally implemented | 145 min execution history | 21 min |
 | 7. Local TUI Dogfood Release | 6/6 locally implemented | 118 min | 20 min |
+| 9 | 4 | - | - |
+| 10 | 4 | - | - |
+| 11 | 4 | - | - |
+| 8 | 8 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -70,6 +74,29 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | Phase 07 P04 | 16min | 2 tasks | 2 files |
 | Phase 07 P05 | 9min | 3 tasks | 7 files |
 | Phase 07 P06 | 12min | 2 tasks | 4 files |
+| Phase 08 P01 | 26min | 3 tasks | 11 files |
+| Phase 08 P02 | 16min | 2 tasks | 2 files |
+| Phase 08 P03 | 45min | 2 tasks | 9 files |
+| Phase 08 P04 | 70min | 3 tasks | 4 files |
+| Phase 08 P08 | ~3h | 2 tasks | 4 files |
+| Phase 08 P05 | 39min | 3 tasks | 1 files |
+| Phase 08 P06 | 58min | 2 tasks | 6 files |
+| Phase 08 P07 | 25min | 1 tasks | 1 files |
+| Phase 09 P01 | 10min | 2 tasks | 5 files |
+| Phase 09 P02 | 5min | 2 tasks | 2 files |
+| Phase 09 P03 | 8min | 2 tasks | 1 files |
+| Phase 09 P04 | 15 min | 3 tasks | 3 files |
+| Phase 10 P01 | 33 min | 2 tasks | 23 files |
+| Phase 10 P02 | 16 min | 2 tasks | 9 files |
+| Phase 10 P03 | 16 min | 2 tasks | 3 files |
+| Phase 10 P04 | 23 min | 3 tasks | 4 files |
+| Phase 11 P01 | 28 min | 3 tasks | 3 files |
+| Phase 11 P02 | 6 min | 1 tasks | 2 files |
+| Phase 11 P03 | 9 min | 2 tasks | 2 files |
+| Phase 11 P04 | 9 min | 2 tasks | 2 files |
+| Phase 12 P01 | 21 min | 3 tasks | 4 files |
+| Phase 12 P02 | 7 min | 3 tasks | 1 files |
+| Phase 12 P04 | 45 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -130,6 +157,67 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 07]: Artifact readiness copies only the supported target and two-binary archive shape, with read-only contents permission and no publication authority.
 - [Phase 07]: The beta is described only as a local source-readiness target; stable remote install guidance remains at v0.14.0.
 - [Phase 07]: Morning UAT evidence is created only from observed commands, screenshots, and certification outcomes; implementation creates no placeholder evidence file.
+- [Phase 08]: Phase 8 guard is gated on cfg(any(test, feature = "test-support")), not cfg(test): rustc --test sets `test` per crate, so a cfg(test)-only guard is absent from baude's and bauded's test binaries — the two that leaked (RESEARCH Deviation 1).
+- [Phase 08]: assert_contained is a containment predicate (did this resolve inside BAUDE_TEST_FIXTURE_ROOT?), not an override-presence check, so it needs no arming state and holds for the first test in a binary (D-09).
+- [Phase 08]: Test fixture helpers return owner structs (AdmissionRepo, FixtureRepo), never a bare TestRedirect or a path alone — a returned guard drops in the same statement and leaves the fixture unredirected while still compiling.
+- [Phase 08]: meta::claude_config_dir isolates by ambient redirect, not by parameter: both ClaudeMeta::poll call sites keep their signatures and neither gains an _at variant (D-03).
+- [Phase 08]: The three real-root resolvers (meta CLAUDE_CONFIG_DIR, persist XDG+baude, git XDG+/tmp tail) stay separate — same shape, different heads and tails; collapsing them would change production behavior.
+- [Phase 08]: bauded's duplicate config resolver was deleted rather than separately guarded; its chain was byte-identical to persist's, so production paths and the already-written VAPID key are unchanged (T-08-08 still accepted).
+- [Phase 08]: Phase 08 plan 03: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
+- [Phase 08]: Phase 08 plan 03: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
+- [Phase 08]: Phase 08 plan 03: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
+- [Phase 08]: Phase 08 plan 03: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
+- [Phase 08]: 08-04: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
+- [Phase 08]: 08-04: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
+- [Phase 08]: 08-04: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
+- [Phase 08]: 08-04: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
+- [Phase 08]: 08-04: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
+- [Phase 08]: 08-04: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
+- [Phase 08]: 08-08: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
+- [Phase 08]: 08-08: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
+- [Phase 08]: 08-08: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
+- [Phase 08]: 08-08: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
+- [Phase 08]: 08-05: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
+- [Phase 08]: 08-05: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
+- [Phase 08]: 08-05: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
+- [Phase 08]: 08-05 DEVIATION: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
+- [Phase 08]: 08-06: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
+- [Phase 08]: 08-06: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
+- [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
+- [Phase 08]: 08-07: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
+- [Phase 08]: 08-07: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
+- [Phase 09]: Seed warnings are return values crossing the crate seam (SeedWarning{file,reason}); binaries own presentation — TUI set_message every time, stderr once per process.
+- [Phase 09]: read_settings_guarded four-way disposition is one shared pub(crate) helper: NotFound = fresh seed; unreadable/unparseable/non-object root = refuse byte-identical + warn, never overwrite.
+- [Phase 09]: bauded held-lock test asserts the existing first-save contention surface (option a); no startup claim added - WLOCK contract unchanged beyond tests
+- [Phase 09]: Lock regression tests simulate the foreign owner with raw OpenOptions + try_lock, never hold_state_lock, so the re-entrant cache is never the thing under test
+- [Phase 09]: POSIX single-quoted hook command is the canonical seeded form; recognizer accepts quoted form only via strict round-trip (re-quote must reproduce input), legacy unquoted form via the old arm - look-alike quotings never claimed (#78)
+- [Phase 09]: .mcp.json command field stays raw current_exe() argv data — direct spawn, no shell (D-09); quoting it would break the MCP server launch
+- [Phase 09]: bauded seed warnings repeat per re-spawn in the restore loop by design — noise accepted over hidden state
+- [Phase 10]: 10-01: ctrl+o adopted as the link-hint chord (collision-checked); vendored vt100 0.15.2 fork carries OSC8 as a per-cell Attrs link id
+- [Phase 10]: 10-01: SGR reset preserves the open link in the fork — link runs end only via empty-URI OSC8
+- [Phase 10]: vte 0.11 default no_std caps OSC at 1024 bytes — truncated OSC8 refused instead of interning truncated URIs (10-02)
+- [Phase 10]: OSC8 re-emission at single point Attrs::write_escape_code_diff with intern table threaded through all fork writers (10-02)
+- [Phase 10]: validate_http_url requires canonical http(s):// raw prefix (WHATWG accepts http:/one-slash; fail closed)
+- [Phase 10]: off-screen wrap continuation read via cloned Screen with shifted view window; fork Screen::set_scrollback made public (upstream 0.16 parity)
+- [Phase 10]: Action keys c/y/j/k shadow their hint letters in link-hint mode; shadowed rows reachable via j/k navigation
+- [Phase 10]: Link-hint display truncation anchors on url Position::BeforePath so scheme+host survive any width budget (T-10-15)
+- [Phase 10]: Chord resolves the remote-attach parser under the same remote_id+liveness predicate the render path uses; links sorted (row, start_col)
+- [Phase 11]: Shift+Enter encoding: CSI-u only under observed kitty child; ESC CR fallback to Claude pane; plain CR to shell pane (readline meta-CR hazard)
+- [Phase 11]: RED-phase scaffolding in test commit (behavior-preserving) so TDD RED fails on assertions, not compile errors (#3770)
+- [Phase 11]: 11-02: unknown CSI = set-modes ignored fail-closed in the vt100 kitty stack; depth cap proven behaviorally since the stack is private
+- [Phase 11]: Help overlay height 35->39: pre-existing 2-row clip fixed alongside the shift+enter rows; test guards the closing line
+- [Phase 11]: README shift+enter guidance uses 'verified to work' framing — no TERM/terminal-name detection claims (D-01)
+- [Phase 11]: encode_ctx is the single EncodeCtx producer for both forward_key branches; kitty_child reads the vt100 observed-push accessor with every fallback fail-closed to legacy (D-04)
+- [Phase 11]: subscribe() replays one CSI > flags u push conditioned on kitty_keyboard() so remote mirrors converge; inactive children keep byte-identical snapshots
+- [Phase 12]: Relaxed the vendored vt100 fork clippy group opt-ins inside one commented FORK (baude) block rather than rewriting 30 upstream sites or adding publishing metadata to three never-published manifests — D-04/D-14; the fork compile failure was masking two real baude lints, and the narrow fix keeps the diff-vs-upstream surface auditable
+- [Phase 12]: Used clippy group allows in the fork instead of the ten named lints — A named list drifts each time the runner clippy advances, and this fork is frozen against upstream
+- [Phase 12]: The locked release build is the packaging verification, in place of any packaging rework — D-10; proves the vendored path dependency survives cargo build --workspace --release --locked
+- [Phase 12]: Relocated the tested-terminal list into its own README subsection so one statement covers links, mouse, and Shift+Enter — Restating it in place would have left the list inside the kitty-keyboard-protocol paragraph, which is the Shift+Enter-only scoping SHIP-02 flagged
+- [Phase 12]: README documents baude's own pane selection (click-drag copies on release) alongside the suppression of native drag-select — Documenting only the suppression would report a lost capability that was in fact replaced (app.rs:5446-5519)
+- [Phase 12]: The native-selection workaround is phrased as the terminal's override modifier, with Shift and Option as examples only — The binding belongs to the terminal, not to baude; naming a specific key would be a promise baude cannot keep
+- [Phase 12]: README never advises deleting the workspace lock file; recovery is quit the holder, signal it, or switch workspace — It is an OS advisory lock on an open fd released by the kernel on exit; deleting it while a holder lives yields two writers on one state file (T-12-04)
+- [Phase 12]: Rebased with git rebase --onto origin/main 985f543 because origin/main's 30ce007 is a squash of this chain's own first seven planning commits — A plain rebase conflicted on already-applied content at commit 1 of 181; the --onto form starts from a byte-identical tree and replayed all 174 commits with zero conflicts
+- [Phase 12]: Pushed with the local real-roots gate red after proving by null bracket that the delta came from concurrent host processes, not the test suite — A 45s before/after bracket with no suite also failed; pids 8413 (live baude) and 21951 (FHIR IG publisher under the managed-worktrees root) were identified. check (macos-14) and check (ubuntu-22.04) run the same bracket in a clean room and both passed
 
 ### Pending Todos
 
@@ -143,6 +231,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - Linux synchronized gate/release and descendant process-group extinction remain uncertified.
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
 - REL-03 and remaining Phase 7 requirement/phase completion remain blocked on morning dogfood, certification, review, verification, and approvals.
+- TISO-01 and TISO-03 remain PARTIAL after 08-01: requirements.mark-complete reports both not_found in REQUIREMENTS.md (entries carry a '(partial)' suffix) and neither is fully delivered until plans 02/03/06 migrate the remaining consumers. Do not check them off before plan 06.
+- Five baude-core/src/lifecycle.rs tests fail plan-01 containment (no TestRedirect held); measured pre-existing at 08-03's RED commit f6a3b1c. lifecycle.rs is in no phase-08 plan's files_modified — deferred to 08-06, which cannot go green until they hold a root and a literal identity. See 08 deferred-items.md.
+- ui::tests::ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are committed #[ignore]d: they build an App whose UsagePoller is uncontained until 08-08. Plan 08-08 task 1 must remove the attribute and run them.
+- 08-08 left the full workspace test suite unrun (plan forbids broad runs before 08-06 task 1 completes manager ownership). Real pass/fail numbers for the whole suite are owed by 08-06 task 2.
 
 ## Deferred Items
 
@@ -159,8 +251,8 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 
 ## Session Continuity
 
-Last session: 2026-08-31T10:21:35.011Z
-Stopped at: Completed 07-06-PLAN.md local implementation; morning certification and completion decisions pending
+Last session: 2026-09-17T17:47:38.892Z
+Stopped at: Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates
 Resume file: None
 
 ## Deferred Items

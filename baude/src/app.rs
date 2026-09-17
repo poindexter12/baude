@@ -26,7 +26,7 @@ use baude_core::session::{Session, Status};
 use crate::hierarchy::{
     self, ActionKind, ActionView, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
 };
-use crate::keys::encode_key;
+use crate::keys::{encode_key, EncodeCtx};
 use crate::notify_desktop::{self, DesktopNotifier, Row};
 use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
 use crate::usage::{UsageCosts, UsagePoller};
@@ -154,18 +154,6 @@ fn is_backslash(code: KeyCode) -> bool {
     matches!(code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
-fn expand_tilde(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(rest)
-    } else if s == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-    } else {
-        PathBuf::from(s)
-    }
-}
-
 /// Shell-style directory completion: complete the component after the last
 /// '/' against directories on disk. Returns the new buffer (if it advanced)
 /// and the candidate list when ambiguous. The typed prefix (incl. `~/`) is
@@ -178,7 +166,9 @@ fn complete_dir_path(input: &str) -> (Option<String>, Vec<String>) {
     let search = if dir_part.is_empty() {
         PathBuf::from(".")
     } else {
-        expand_tilde(dir_part)
+        // Guarded: this feeds a `read_dir`, so an unredirected `~` would list
+        // the developer's real home from inside this crate's test binary.
+        persist::expand_tilde(dir_part)
     };
     let Ok(entries) = std::fs::read_dir(&search) else {
         return (None, vec![]);
@@ -411,6 +401,13 @@ pub enum Modal {
     },
     ConfirmKill {
         id: SelId,
+    },
+    /// Link-hint mode: the visible, validated link destinations of the
+    /// focused pane. The overlay always shows each link's actual destination
+    /// (never its label) before Enter can open it (LINK-04/LINK-05).
+    LinkHints {
+        links: Vec<crate::links::DetectedLink>,
+        selected: usize,
     },
     ConfirmCloseWorktree {
         id: u64,
@@ -719,12 +716,39 @@ impl App {
         let config = persist::load_config();
         let config_notify = config.desktop_notifications;
         let folder_context_enabled = config.folder_context_enabled();
+        // Production precedence, verbatim: BAUDE_DAEMON_URL, then the active
+        // workspace's daemon_url, then config.
+        #[cfg(not(test))]
         let remote = std::env::var("BAUDE_DAEMON_URL")
             .ok()
             .or_else(|| baude_core::workspace::active().daemon_url.clone())
             .or_else(|| config.daemon_url.clone())
             .filter(|u| !u.trim().is_empty())
             .map(RemotePoller::start);
+        // The selection EXPRESSION is what is disabled, not its result. A
+        // detached `RemotePoller` worker outlives the handle, so assigning
+        // `app.remote = None` after construction does not stop one — by then it
+        // has already been started against whatever daemon the developer's
+        // environment named. Tests that want a remote attach their own
+        // synthetic loopback poller after construction.
+        #[cfg(test)]
+        let remote: Option<RemotePoller> = None;
+
+        // Notifications post through an OS subprocess from `tick`. Disabled
+        // here so an ordinary fixture cannot reach it; the pure notifier
+        // decision tests call the tick logic directly and are unaffected.
+        #[cfg(not(test))]
+        let desktop_notify_enabled = std::env::var("BAUDE_NOTIFY")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .or(config_notify)
+            .unwrap_or(true);
+        #[cfg(test)]
+        let desktop_notify_enabled = {
+            let _ = config_notify;
+            false
+        };
+
         App {
             sessions: Vec::new(),
             selected_id: None,
@@ -753,11 +777,7 @@ impl App {
             folder_context_enabled_for_test: false,
             pending_clones: Vec::new(),
             desktop_notifier: DesktopNotifier::default(),
-            desktop_notify_enabled: std::env::var("BAUDE_NOTIFY")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false"))
-                .or(config_notify)
-                .unwrap_or(true),
+            desktop_notify_enabled,
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
@@ -1134,6 +1154,18 @@ impl App {
         });
     }
 
+    /// The raw config this App loaded at construction.
+    ///
+    /// UI fixtures assert the loaded sentinel field directly rather than going
+    /// through `auto_archive_ms()`, which folds in an environment override and
+    /// would answer the developer's environment instead of the fixture's
+    /// synthetic `config.json`. Test-only, so production visibility of
+    /// `App::config` is unchanged.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> &Config {
+        &self.config
+    }
+
     #[cfg(test)]
     pub(crate) fn install_hierarchy_state_for_test(
         &mut self,
@@ -1381,9 +1413,17 @@ impl App {
             return String::new();
         };
         let key = context.folder_key();
-        let home = dirs::home_dir()
-            .map(|home| home.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // Guarded like every other home resolution in this crate. Display-only,
+        // but still compiled into the test binary, and `/` is the resolver's
+        // terminal "no home at all" fallback — abbreviating against it would
+        // rewrite every absolute path, which the pre-guard empty-string case
+        // already declined to do.
+        let home = persist::home_dir();
+        let home = if home == std::path::Path::new("/") {
+            String::new()
+        } else {
+            home.to_string_lossy().into_owned()
+        };
         let abbreviated = match key.strip_prefix(&home) {
             Some(rest) if !home.is_empty() => format!("~{rest}"),
             _ => key.to_string(),
@@ -2804,8 +2844,10 @@ impl App {
         // Wire the session cwd before the CLI starts (for Claude: the
         // settings.local.json hook seed, plus the prompt-mode .mcp.json).
         // Best-effort: a seeding failure must NOT abort the spawn — the session
-        // simply falls back to the silence path (no regression).
-        be.prepare_cwd(&cwd);
+        // simply falls back to the silence path (no regression) — but the
+        // operator must SEE it (HREG-03/D-02): surface every warning.
+        let seed_warnings = be.prepare_cwd(&cwd);
+        self.warn_seed_failures(&seed_warnings);
 
         if baude_core::permission::is_prompt_mode() && be.prompt_mode_needs_daemon() {
             // WR-01: claude's permission approval is inherently daemon+PWA-
@@ -3568,6 +3610,36 @@ impl App {
         self.set_message(MSG.into());
     }
 
+    /// HREG-03/D-02: surface every seed warning from a spawn path's
+    /// `prepare_cwd`. The TUI message is a single aggregate naming EVERY
+    /// affected file — `set_message` is last-wins, so per-warning calls would
+    /// drop all but the final warning of a multi-warning spawn (e.g. a
+    /// prompt-mode spawn warning about both `settings.local.json` and
+    /// `.mcp.json`). The stderr echo is deduplicated once per process PER
+    /// affected file (not one flag shared by all warnings), so a later
+    /// warning about a different file is never silently swallowed. Seeding
+    /// stays best-effort and the spawn continues regardless (D-04).
+    fn warn_seed_failures(&mut self, warnings: &[baude_core::hook::SeedWarning]) {
+        if warnings.is_empty() {
+            return;
+        }
+        static WARNED_FILES: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let mut warned = WARNED_FILES.lock().unwrap_or_else(|p| p.into_inner());
+        for warning in warnings {
+            if warned.insert(warning.file.clone()) {
+                eprintln!("baude: {warning}");
+            }
+        }
+        drop(warned);
+        let combined = warnings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        self.set_message(combined);
+    }
+
     /// Feed the desktop-banner state machine one snapshot of every sidebar
     /// row — local sessions and the remote daemon's — and post whatever it
     /// decides. Cheap per frame; osascript runs off-thread on actual events.
@@ -3834,6 +3906,13 @@ impl App {
             self.open_new_session_modal();
             return;
         }
+        if ctrl && matches!(key.code, KeyCode::Char('o')) {
+            // Link-hint mode: the explicit gesture for inspecting/opening
+            // visible links (LINK-04). ctrl+o is collision-checked against
+            // the occupied chord set above.
+            self.open_link_hints();
+            return;
+        }
         match self.focus {
             Focus::Sidebar => self.handle_sidebar_key(key),
             Focus::Claude => self.forward_key(key, false),
@@ -3853,12 +3932,19 @@ impl App {
                 if a.remote_id != id {
                     return;
                 }
-                let app_cursor = a
+                // Same derivation as the local branch below — one helper, so
+                // remote sessions cannot diverge (TKEY-02 parity). A poisoned
+                // lock degrades to legacy (fail-closed, D-04).
+                let ctx = a
                     .parser
                     .lock()
-                    .map(|p| p.screen().application_cursor())
-                    .unwrap_or(false);
-                a.write_input(&encode_key(&key, app_cursor));
+                    .map(|p| encode_ctx(p.screen(), to_shell))
+                    .unwrap_or(EncodeCtx {
+                        app_cursor: false,
+                        kitty_child: false,
+                        to_shell,
+                    });
+                a.write_input(&encode_key(&key, ctx));
                 return;
             }
         }
@@ -3871,12 +3957,18 @@ impl App {
         } else {
             &mut s.claude
         };
-        let app_cursor = pty
+        // Single ctx producer with the remote-attach branch above; a
+        // poisoned lock degrades to legacy (fail-closed, D-04).
+        let ctx = pty
             .parser
             .lock()
-            .map(|p| p.screen().application_cursor())
-            .unwrap_or(false);
-        let bytes = encode_key(&key, app_cursor);
+            .map(|p| encode_ctx(p.screen(), to_shell))
+            .unwrap_or(EncodeCtx {
+                app_cursor: false,
+                kitty_child: false,
+                to_shell,
+            });
+        let bytes = encode_key(&key, ctx);
         pty.write_input(&bytes);
         if !to_shell && s.unarchive_on_input() {
             self.save();
@@ -3885,6 +3977,15 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) {
+        // LINK-04 at byte granularity: while any non-input modal (the link-
+        // hint overlay, help, confirms, …) is open, input to the child is
+        // suspended — a paste must not slip behind the overlay into the
+        // child. Mirrors the modal-first routing in handle_key (the
+        // handle_modal_key branch above); Modal::Input keeps its dedicated
+        // paste path below.
+        if !matches!(self.modal, Modal::None | Modal::Input { .. }) {
+            return;
+        }
         let to_shell = match self.focus {
             Focus::Shell => true,
             Focus::Claude => false,
@@ -4311,6 +4412,13 @@ impl App {
             Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
             }
+            // Production call site injects the real platform opener and the
+            // existing clipboard path (WINDOWS entry 6: reuse, never a second
+            // clipboard spawn); tests inject closure spies via
+            // handle_link_hints_key directly.
+            Modal::LinkHints { .. } => {
+                self.handle_link_hints_key(key, spawn_opener, Self::copy_to_clipboard)
+            }
             Modal::Input {
                 kind,
                 buf,
@@ -4440,7 +4548,7 @@ impl App {
         }
         match kind {
             InputKind::NewSessionPath => {
-                let expanded = expand_tilde(&value);
+                let expanded = persist::expand_tilde(&value);
                 let expanded = expanded.canonicalize().unwrap_or(expanded);
                 if expanded.is_dir() {
                     self.open_repo_session(expanded);
@@ -4476,7 +4584,10 @@ impl App {
                 };
             }
             InputKind::CloneDest { url, name } => {
-                let dest = expand_tilde(&value);
+                // Guarded, and this is the call that mattered most: the buffer
+                // is prefilled from `clone_base_dir` (default `~/Code`) and a
+                // clear destination is handed to a real `git clone`.
+                let dest = persist::expand_tilde(&value);
                 // Already cloned there? Just open a session on it.
                 if dest.join(".git").exists() {
                     self.set_message(format!("{name} already cloned — opening session"));
@@ -5206,7 +5317,10 @@ impl App {
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
         let plan = be.spawn_plan(&base, None, mode);
-        be.prepare_cwd(&cwd);
+        // HREG-03/D-02: surface seed warnings exactly like the add-session
+        // path — restart is a spawn path too.
+        let seed_warnings = be.prepare_cwd(&cwd);
+        self.warn_seed_failures(&seed_warnings);
         let checkout = checkout_for_runtime(&self.runtime_checkouts, id);
         let mut pty = if let Some(checkout) = checkout {
             let generation = self
@@ -5382,6 +5496,7 @@ impl App {
                             _ => self.selected().map(|s| &s.claude.parser),
                         }
                     };
+                    let mut copy_result = None;
                     if let Some(parser) = parser {
                         if let Ok(mut p) = parser.lock() {
                             p.set_scrollback(scroll);
@@ -5392,9 +5507,13 @@ impl App {
                             let text = screen.contents_between(sr, sc, er, ec + 1);
                             p.set_scrollback(0);
                             if !text.is_empty() {
-                                Self::copy_to_clipboard(&text);
+                                copy_result = Some(Self::copy_to_clipboard(&text));
                             }
                         }
+                    }
+                    // WR-02: a silent no-op copy must not look like success.
+                    if let Some(Err(e)) = copy_result {
+                        self.set_message(format!("copy failed: {e}"));
                     }
                 }
             }
@@ -5402,18 +5521,339 @@ impl App {
         }
     }
 
-    fn copy_to_clipboard(text: &str) {
+    /// Pipe `text` into the platform clipboard writer. Fallible so callers
+    /// can surface failure instead of asserting a success they cannot
+    /// observe (WR-02): `pbcopy` on macOS; `wl-copy` (Wayland) with an
+    /// `xclip` fallback (X11) elsewhere — cfg-gated like `OPENER`.
+    fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
         use std::io::Write;
-        if let Ok(mut child) = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
+        #[cfg(target_os = "macos")]
+        const CLIPBOARD_CMDS: &[&[&str]] = &[&["pbcopy"]];
+        #[cfg(not(target_os = "macos"))]
+        const CLIPBOARD_CMDS: &[&[&str]] = &[&["wl-copy"], &["xclip", "-selection", "clipboard"]];
+        let mut last_err: Option<std::io::Error> = None;
+        for argv in CLIPBOARD_CMDS {
+            match Command::new(argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                // Spawned: the command exists, so a failure past this point
+                // is a real copy failure — report it, never fall through.
+                Ok(mut child) => {
+                    let written = match child.stdin.take() {
+                        Some(mut stdin) => stdin.write_all(text.as_bytes()),
+                        None => Err(std::io::Error::other("clipboard stdin unavailable")),
+                    };
+                    // stdin is dropped, so the writer sees EOF; both
+                    // clipboard writers fork/exit promptly after that, and
+                    // waiting here reaps the child (no zombie, no reaper
+                    // thread needed).
+                    let status = child.wait()?;
+                    written?;
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(format!(
+                            "{} exited with {status}",
+                            argv[0]
+                        )))
+                    };
+                }
+                // Spawn failed (binary missing): try the next candidate.
+                Err(e) => last_err = Some(e),
             }
         }
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no clipboard command available")))
+    }
+
+    /// Open link-hint mode for the focused content pane (LINK-04's explicit
+    /// gesture — the ONLY entry path into hint mode). Collects links from
+    /// the pane's parser at its current scroll offset; the scrollback
+    /// bracket and lock are dropped BEFORE any modal state changes (same
+    /// split as selection copy).
+    fn open_link_hints(&mut self) {
+        let (scroll, parser) = match self.focus {
+            Focus::Shell => (
+                self.shell_scroll,
+                self.selected()
+                    .and_then(|s| s.shell.as_ref())
+                    .map(|p| &p.parser),
+            ),
+            Focus::Claude => (
+                self.claude_scroll,
+                match self.selected_id {
+                    // Render parity: only the attach the render path would
+                    // draw serves links (ui.rs draw_remote_content filters
+                    // on remote_id + liveness the same way).
+                    Some(SelId::Remote(id)) => self
+                        .attach
+                        .as_ref()
+                        .filter(|a| a.remote_id == id && !a.is_closed())
+                        .map(|a| &a.parser),
+                    _ => self.selected().map(|s| &s.claude.parser),
+                },
+            ),
+            Focus::Sidebar => (0, None),
+        };
+        let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
+            p.set_scrollback(scroll);
+            let mut links = crate::links::collect_links(p.screen());
+            p.set_scrollback(0);
+            // Top-to-bottom, left-to-right — hint letters label links in
+            // visual order regardless of which pass found them.
+            links.sort_by_key(|l| (l.row, l.start_col));
+            links
+        });
+        match links {
+            Some(links) if !links.is_empty() => {
+                self.modal = Modal::LinkHints { links, selected: 0 };
+            }
+            _ => self.set_message("no links visible".into()),
+        }
+    }
+
+    /// Keys inside link-hint mode. Enter opens the selected destination via
+    /// the injected `open`; `c`/`y` copy it via the injected `copy` sink
+    /// (production: the existing clipboard path); j/k and arrows navigate;
+    /// a hint letter jumps selection; Esc dismisses; everything else is
+    /// swallowed — no byte ever reaches the child while the overlay is open
+    /// (LINK-04). The modal is taken via `mem::replace` so the borrow of
+    /// `self.modal` ends before `&mut self` methods run.
+    fn handle_link_hints_key<F, C>(&mut self, key: KeyEvent, open: F, copy: C)
+    where
+        F: FnOnce(&str) -> std::io::Result<()>,
+        C: FnOnce(&str) -> std::io::Result<()>,
+    {
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Enter => {
+                let modal = std::mem::replace(&mut self.modal, Modal::None);
+                if let Modal::LinkHints { links, selected } = modal {
+                    if let Some(link) = links.get(selected) {
+                        self.activate_link(&link.destination, open);
+                    }
+                }
+            }
+            // LINK-06: copy the selected destination WITHOUT opening it. The
+            // sink receives the full normalized URL; display truncation is
+            // message-only.
+            KeyCode::Char('c') | KeyCode::Char('y') if plain => {
+                let modal = std::mem::replace(&mut self.modal, Modal::None);
+                if let Modal::LinkHints { links, selected } = modal {
+                    if let Some(link) = links.get(selected) {
+                        // WR-02: the sink is fallible — claim "copied" only
+                        // when it reports success; failure surfaces the same
+                        // non-fatal way as activate_link's opener errors.
+                        match copy(link.destination.as_str()) {
+                            Ok(()) => self.set_message(format!(
+                                "copied {}",
+                                display_truncated(&link.destination)
+                            )),
+                            Err(e) => {
+                                self.set_message(format!("copy failed: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down if plain || key.code == KeyCode::Down => {
+                if let Modal::LinkHints { links, selected } = &mut self.modal {
+                    *selected = (*selected + 1).min(links.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up if plain || key.code == KeyCode::Up => {
+                if let Modal::LinkHints { selected, .. } = &mut self.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            // Hint-letter jump: a-z select their labeled row directly.
+            // c/y/j/k are shadowed by the action arms above; those rows stay
+            // reachable via j/k navigation.
+            KeyCode::Char(ch) if plain && ch.is_ascii_lowercase() => {
+                if let Modal::LinkHints { links, selected } = &mut self.modal {
+                    let idx = (ch as u8 - b'a') as usize;
+                    if idx < links.len().min(26) {
+                        *selected = idx;
+                    }
+                }
+            }
+            // Everything else is swallowed: the modal stays as-is and no
+            // byte ever reaches the child (LINK-04).
+            _ => {}
+        }
+    }
+
+    /// Open a validated link destination. `open` is injected so activation is
+    /// unit-testable without opening anything — the same seam shape as
+    /// hook::route_event's injected `post` (hook.rs:431-433). The production
+    /// call site passes `spawn_opener`; tests pass a recording closure.
+    /// Both arms resolve to `set_message`: opener failure never kills the
+    /// session (LINK-08).
+    pub(crate) fn activate_link<F: FnOnce(&str) -> std::io::Result<()>>(
+        &mut self,
+        url: &url::Url,
+        open: F,
+    ) {
+        match open(url.as_str()) {
+            Ok(()) => self.set_message(format!("opening {}", display_truncated(url))),
+            Err(e) => self.set_message(format!("open failed: {e} — session unaffected")),
+        }
+    }
+}
+
+/// Derive the per-keystroke encode context from the child's observed screen
+/// state: DECCKM for cursor keys (the `application_cursor()` precedent), and
+/// the kitty keyboard stack for the D-04 child-verification leg —
+/// `kitty_child` is true only while the child's own kitty push is active on
+/// its parser (`kitty_keyboard() != 0`); a fresh parser or fully-popped stack
+/// reads 0 and stays legacy (fail-closed). Single producer for BOTH
+/// forward_key branches so local and remote-attach sessions cannot diverge
+/// (TKEY-02 parity).
+fn encode_ctx(screen: &baude_core::vt100::Screen, to_shell: bool) -> EncodeCtx {
+    EncodeCtx {
+        app_cursor: screen.application_cursor(),
+        kitty_child: screen.kitty_keyboard() != 0,
+        to_shell,
+    }
+}
+
+#[cfg(target_os = "macos")]
+const OPENER: &str = "open";
+#[cfg(not(target_os = "macos"))]
+const OPENER: &str = "xdg-open";
+
+/// LINK-08: the URL is a single argv argument — never shell text. Detached,
+/// stdio null on all three handles (open_editor precedent, minus its shell
+/// indirection); a reaper thread waits on the child so it never lingers as
+/// a zombie. Not test-reachable: every test injects a closure spy instead
+/// (WINDOWS entry 6 discipline).
+fn spawn_opener(url: &str) -> std::io::Result<()> {
+    let mut child = Command::new(OPENER)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Middle-truncate a URL for the transient message line. Display only — the
+/// full `Url::as_str()` is always what the opener receives.
+fn display_truncated(url: &url::Url) -> String {
+    display_truncated_width(url, 60)
+}
+
+/// Middle-ellipsis a URL to at most `max` chars for DISPLAY only, always
+/// keeping the scheme and host fully visible (T-10-15: a truncated display
+/// must never let ellipses hide the real origin). The model — and copy and
+/// open — always use the full normalized `Url::as_str()` (LINK-05).
+pub(crate) fn display_truncated_width(url: &url::Url, max: usize) -> String {
+    let s = url.as_str();
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    // scheme://[user@]host[:port] stays fully visible, whatever the budget.
+    let prefix = &url[..url::Position::BeforePath];
+    let rest = &s[prefix.len()..];
+    let budget = max.saturating_sub(prefix.chars().count());
+    if budget < 2 {
+        return format!("{prefix}…");
+    }
+    let keep = budget - 1; // one char reserved for the ellipsis
+    let head_n = keep - keep / 2;
+    let tail_n = keep / 2;
+    let head: String = rest.chars().take(head_n).collect();
+    let tail: String = if tail_n == 0 {
+        String::new()
+    } else {
+        let count = rest.chars().count();
+        rest.chars().skip(count - tail_n).collect()
+    };
+    format!("{prefix}{head}…{tail}")
+}
+
+/// TKEY-01/TKEY-05 ctx derivation: pure byte-in/state-out over a directly-fed
+/// vt100 parser (the clipboard_tests precedent) — no PTY, no App. Proves the
+/// observed-push gate (D-04), pop-returns-to-unverified, DECCKM independence,
+/// and the full Shift+Enter decision matrix composed through the REAL
+/// derivation path (encode_ctx → encode_key, D-09).
+#[cfg(test)]
+mod forward_ctx_tests {
+    use super::encode_ctx;
+    use crate::keys::encode_key;
+    use baude_core::vt100;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn parser_fed(bytes: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(6, 60, 0);
+        parser.process(bytes);
+        parser
+    }
+
+    #[test]
+    fn observed_push_yields_kitty_child_true_fresh_parser_false() {
+        let pushed = parser_fed(b"\x1b[>1u");
+        assert!(
+            encode_ctx(pushed.screen(), false).kitty_child,
+            "observed CSI > 1 u push must verify the child"
+        );
+        let fresh = vt100::Parser::new(6, 60, 0);
+        assert!(
+            !encode_ctx(fresh.screen(), false).kitty_child,
+            "fresh parser must stay unverified (fail-closed default)"
+        );
+    }
+
+    #[test]
+    fn pop_returns_kitty_child_to_unverified() {
+        let popped = parser_fed(b"\x1b[>1u\x1b[<1u");
+        assert!(
+            !encode_ctx(popped.screen(), false).kitty_child,
+            "push then pop must return to unverified"
+        );
+    }
+
+    #[test]
+    fn app_cursor_and_kitty_child_are_independent_modes() {
+        let decckm = parser_fed(b"\x1b[?1h");
+        let ctx = encode_ctx(decckm.screen(), false);
+        assert!(ctx.app_cursor, "DECCKM set must read app_cursor true");
+        assert!(
+            !ctx.kitty_child,
+            "DECCKM alone must not verify the kitty child"
+        );
+    }
+
+    #[test]
+    fn composed_shift_enter_matrix_through_real_derivation() {
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        // Verified child: enhanced passthrough (D-09).
+        let pushed = parser_fed(b"\x1b[>1u");
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(pushed.screen(), false)),
+            b"\x1b[13;2u".to_vec(),
+            "pushed child must receive the enhanced sequence"
+        );
+        // Unverified child, Claude pane: documented fallback insert.
+        let fresh = vt100::Parser::new(6, 60, 0);
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(fresh.screen(), false)),
+            b"\x1b\r".to_vec(),
+            "legacy Claude-pane fallback must be ESC CR"
+        );
+        // Unverified child, shell pane: degrades to plain Enter.
+        assert_eq!(
+            encode_key(&shift_enter, encode_ctx(fresh.screen(), true)),
+            b"\r".to_vec(),
+            "legacy shell-pane fallback must be plain CR"
+        );
     }
 }
 
@@ -5448,6 +5888,604 @@ mod clipboard_tests {
         assert_eq!(
             selected("tab\tvalue\r\ne\u{301} and 界\r\nnext", 5, 20, 2, 4),
             "tab     value\ne\u{301} and 界\nnext"
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_hints {
+    use super::{display_truncated_width, App, Focus, Modal};
+    use crate::links::{DetectedLink, LinkSource};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    fn test_link(u: &str) -> DetectedLink {
+        DetectedLink {
+            destination: url::Url::parse(u).expect("test URL parses"),
+            row: 0,
+            start_col: 0,
+            end_col: 0,
+            source: LinkSource::Bare,
+        }
+    }
+
+    /// Session-less App with the hints modal pre-opened on `urls`. The
+    /// redirect is returned FIRST so it outlives the App (Phase-8
+    /// containment: App::new resolves the config dir).
+    fn hinted(urls: &[&str], selected: usize) -> (baude_core::testing::TestRedirect, App) {
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.modal = Modal::LinkHints {
+            links: urls.iter().map(|u| test_link(u)).collect(),
+            selected,
+        };
+        (redirect, app)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn selected_of(app: &App) -> usize {
+        match &app.modal {
+            Modal::LinkHints { selected, .. } => *selected,
+            _ => panic!("expected the LinkHints modal to be open"),
+        }
+    }
+
+    /// The hint chord with no live session must not panic, must not open the
+    /// hints modal, and must surface the "no links" outcome via the message
+    /// path — nothing is spawned (LINK-04).
+    #[test]
+    fn chord_without_session_sets_message() {
+        // Phase-8 containment: App::new resolves the config dir, so the test
+        // holds a fixture redirect (never the real user paths).
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.focus = Focus::Claude;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::None), "modal stays closed");
+        assert!(
+            app.message.is_some(),
+            "chord without a session surfaces a message"
+        );
+    }
+
+    /// LINK-06: `c` invokes the injected copy sink with the FULL normalized
+    /// destination — byte-identical to `Url::as_str()` — closes the modal,
+    /// sets a "copied" message, and never touches the opener (CONTEXT locked
+    /// decision: c/y copies, Enter opens, Esc dismisses).
+    #[test]
+    fn c_copies_full_destination_without_opening() {
+        let full = "https://example.com/some/long/path?q=1";
+        let expected = url::Url::parse(full).unwrap().as_str().to_string();
+        let (_rd, mut app) = hinted(&[full], 0);
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Char('c')),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            copied.borrow().as_slice(),
+            std::slice::from_ref(&expected),
+            "copy sink receives exactly Url::as_str()"
+        );
+        assert!(opened.borrow().is_empty(), "copy must never open (LINK-06)");
+        assert!(matches!(app.modal, Modal::None), "copy closes the modal");
+        let (msg, _) = app.message.as_ref().expect("copy sets a message");
+        assert!(msg.contains("copied"), "message names the copy: {msg}");
+    }
+
+    /// `y` behaves exactly like `c`, and copies the SELECTED entry.
+    #[test]
+    fn y_copies_selected_entry() {
+        let (_rd, mut app) = hinted(
+            &["https://first.example.com/", "https://second.example.com/"],
+            1,
+        );
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Char('y')),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            copied.borrow().as_slice(),
+            ["https://second.example.com/"],
+            "y copies the selected entry's full destination"
+        );
+        assert!(opened.borrow().is_empty(), "y must never open");
+        assert!(matches!(app.modal, Modal::None), "y closes the modal");
+    }
+
+    /// WR-02: a failing copy sink surfaces "copy failed: {e}" — never a
+    /// false "copied" success claim — and the modal still closes. The
+    /// session survives, same non-fatal surface as opener errors.
+    #[test]
+    fn copy_error_surfaces_failure_not_success() {
+        let (_rd, mut app) = hinted(&["https://example.com/x"], 0);
+        app.handle_link_hints_key(
+            key(KeyCode::Char('c')),
+            |_| panic!("copy must not open"),
+            |_| Err(std::io::Error::other("no clipboard command available")),
+        );
+        assert!(matches!(app.modal, Modal::None), "modal closes on copy Err");
+        let (msg, _) = app.message.as_ref().expect("copy Err sets a message");
+        assert!(msg.contains("copy failed"), "names the failure: {msg}");
+        assert!(
+            msg.contains("no clipboard command available"),
+            "carries the cause: {msg}"
+        );
+        assert!(!msg.contains("copied "), "no false success claim: {msg}");
+    }
+
+    /// j/k and Up/Down move `selected` with bounds clamping.
+    #[test]
+    fn navigation_moves_selected_with_bounds() {
+        let urls = [
+            "https://a.example.com/",
+            "https://b.example.com/",
+            "https://c.example.com/",
+        ];
+        let (_rd, mut app) = hinted(&urls, 0);
+        let noop = |_: &str| -> std::io::Result<()> { Ok(()) };
+        let never = |_: &str| -> std::io::Result<()> { panic!("navigation must not open") };
+        app.handle_link_hints_key(key(KeyCode::Char('j')), never, noop);
+        assert_eq!(selected_of(&app), 1, "j moves down");
+        app.handle_link_hints_key(key(KeyCode::Down), never, noop);
+        assert_eq!(selected_of(&app), 2, "Down moves down");
+        app.handle_link_hints_key(key(KeyCode::Char('j')), never, noop);
+        assert_eq!(selected_of(&app), 2, "j clamps at the last entry");
+        app.handle_link_hints_key(key(KeyCode::Char('k')), never, noop);
+        assert_eq!(selected_of(&app), 1, "k moves up");
+        app.handle_link_hints_key(key(KeyCode::Up), never, noop);
+        assert_eq!(selected_of(&app), 0, "Up moves up");
+        app.handle_link_hints_key(key(KeyCode::Char('k')), never, noop);
+        assert_eq!(selected_of(&app), 0, "k clamps at the first entry");
+    }
+
+    /// Typing a hint letter selects that entry directly — without opening or
+    /// copying. (`c`/`y`/`j`/`k` are action keys and shadow their letters;
+    /// those rows stay reachable via j/k navigation.)
+    #[test]
+    fn hint_letter_jumps_selection() {
+        let urls = [
+            "https://a.example.com/",
+            "https://b.example.com/",
+            "https://c.example.com/",
+            "https://d.example.com/",
+        ];
+        let (_rd, mut app) = hinted(&urls, 0);
+        let copied = RefCell::new(Vec::<String>::new());
+        let opened = RefCell::new(Vec::<String>::new());
+        let press = |app: &mut App, ch: char| {
+            app.handle_link_hints_key(
+                key(KeyCode::Char(ch)),
+                |u| {
+                    opened.borrow_mut().push(u.to_string());
+                    Ok(())
+                },
+                |u| {
+                    copied.borrow_mut().push(u.to_string());
+                    Ok(())
+                },
+            );
+        };
+        press(&mut app, 'b');
+        assert_eq!(selected_of(&app), 1, "b jumps to the second entry");
+        press(&mut app, 'd');
+        assert_eq!(selected_of(&app), 3, "d jumps to the fourth entry");
+        press(&mut app, 'a');
+        assert_eq!(selected_of(&app), 0, "a jumps back to the first entry");
+        press(&mut app, 'z');
+        assert_eq!(selected_of(&app), 0, "out-of-range letter is swallowed");
+        assert!(opened.borrow().is_empty(), "letters never open");
+        assert!(copied.borrow().is_empty(), "letters never copy");
+    }
+
+    /// Enter opens the SELECTED entry only; the copy sink stays untouched.
+    #[test]
+    fn enter_opens_selected_entry_only() {
+        let (_rd, mut app) = hinted(
+            &[
+                "https://a.example.com/",
+                "https://b.example.com/",
+                "https://c.example.com/",
+            ],
+            2,
+        );
+        let opened = RefCell::new(Vec::<String>::new());
+        let copied = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            key(KeyCode::Enter),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |u| {
+                copied.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            opened.borrow().as_slice(),
+            ["https://c.example.com/"],
+            "Enter opens exactly the selected entry"
+        );
+        assert!(copied.borrow().is_empty(), "Enter never copies");
+        assert!(matches!(app.modal, Modal::None), "Enter closes the modal");
+    }
+
+    /// Any other key while the overlay is open is swallowed: the modal is
+    /// unchanged and neither sink runs (LINK-04).
+    #[test]
+    fn unhandled_keys_are_swallowed() {
+        let (_rd, mut app) = hinted(&["https://a.example.com/"], 0);
+        let never_open = |_: &str| -> std::io::Result<()> { panic!("swallowed key opened") };
+        let never_copy = |_: &str| -> std::io::Result<()> { panic!("swallowed key copied") };
+        for code in [
+            KeyCode::Char('!'),
+            KeyCode::Char('C'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::F(5),
+        ] {
+            app.handle_link_hints_key(key(code), never_open, never_copy);
+            assert!(
+                matches!(app.modal, Modal::LinkHints { .. }),
+                "modal survives swallowed key {code:?}"
+            );
+            assert_eq!(selected_of(&app), 0, "selection unchanged by {code:?}");
+        }
+    }
+
+    /// T-10-15: display truncation is render-only middle-ellipsis that never
+    /// drops the scheme or host, and the model keeps the full URL.
+    #[test]
+    fn truncation_preserves_scheme_and_host_at_narrow_width() {
+        let url = url::Url::parse(
+            "https://example.com/very/long/path/segment/with/file.html?query=abcdefghij",
+        )
+        .unwrap();
+        let out = display_truncated_width(&url, 30);
+        assert!(
+            out.starts_with("https://example.com"),
+            "scheme+host retained: {out}"
+        );
+        assert!(out.contains('…'), "long URL is middle-ellipsized: {out}");
+        assert!(out.chars().count() <= 30, "fits the width budget: {out}");
+        // Render-only: the model value is untouched by display truncation.
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/very/long/path/segment/with/file.html?query=abcdefghij"
+        );
+    }
+
+    /// A width narrower than scheme+host still shows them in full — the one
+    /// case display may exceed the budget rather than hide the origin.
+    #[test]
+    fn truncation_below_prefix_width_still_shows_scheme_and_host() {
+        let url =
+            url::Url::parse("https://example.com/very/long/path/that/wont/fit/anywhere").unwrap();
+        let out = display_truncated_width(&url, 10);
+        assert!(
+            out.starts_with("https://example.com"),
+            "scheme+host survive even a too-narrow budget: {out}"
+        );
+        assert!(out.ends_with('…'), "the hidden remainder is marked: {out}");
+    }
+
+    /// A URL that fits is returned verbatim — no ellipsis, no mutation.
+    #[test]
+    fn truncation_is_noop_when_url_fits() {
+        let url = url::Url::parse("https://example.com/ok").unwrap();
+        let out = display_truncated_width(&url, 60);
+        assert_eq!(out, "https://example.com/ok");
+        assert!(!out.contains('…'));
+    }
+
+    // ------- gesture integration (Task 2): the chord call site over a real
+    // parser, via the remote-attach stub — the same parser the render path
+    // draws (ui.rs draw_remote_content), with the test holding the input
+    // channel so "no byte reached the child" is a deterministic assertion.
+
+    use crate::remote::{AttachInput, RemoteAttach};
+    use baude_core::vt100;
+    use std::sync::{Arc, Mutex};
+
+    /// App wired to a stub remote attach whose parser processed `feed`.
+    /// Returns the redirect first so it outlives the App.
+    fn attached_app(
+        feed: &[u8],
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+    ) -> (
+        baude_core::testing::TestRedirect,
+        App,
+        Arc<Mutex<vt100::Parser>>,
+        std::sync::mpsc::Receiver<AttachInput>,
+    ) {
+        let root = PathBuf::from("/nonexistent/baude-link-hints");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
+        parser.lock().unwrap().process(feed);
+        let (attach, rx) = RemoteAttach::test_stub(7, Arc::clone(&parser));
+        app.attach = Some(attach);
+        app.selected_id = Some(super::SelId::Remote(7));
+        app.focus = Focus::Claude;
+        (redirect, app, parser, rx)
+    }
+
+    fn chord() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
+    }
+
+    /// The chord at a scrolled-back offset collects links from the VIEWED
+    /// rows (set_scrollback bracket) and restores the offset to 0 — with the
+    /// modal set only after the lock is dropped (LINK-04 remote leg: the
+    /// chord resolves the remote-attach parser, same as the render path).
+    #[test]
+    fn chord_at_scrolled_offset_collects_viewed_rows_and_restores_bracket() {
+        // 13 content lines: the URL line scrolls 9 rows back of a 5-row view.
+        let mut feed = b"https://scrolled.example.com/x\r\n".to_vec();
+        for i in 1..=12 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (_rd, mut app, parser, _rx) = attached_app(&feed, 5, 80, 100);
+        app.claude_scroll = 9;
+        app.handle_key(chord());
+        match &app.modal {
+            Modal::LinkHints { links, selected } => {
+                assert_eq!(*selected, 0);
+                assert_eq!(links.len(), 1, "the viewed rows hold exactly one link");
+                assert_eq!(
+                    links[0].destination.as_str(),
+                    "https://scrolled.example.com/x"
+                );
+            }
+            _ => panic!("chord over a scrolled-back link must open the modal"),
+        }
+        assert_eq!(
+            parser.lock().unwrap().screen().scrollback(),
+            0,
+            "scrollback offset restored to 0 after collection"
+        );
+    }
+
+    /// Both detection passes feed the modal — one OSC8 link and one bare URL
+    /// yield two entries — ordered top-to-bottom by screen position so hint
+    /// letters read in visual order.
+    #[test]
+    fn chord_collects_both_passes_ordered_top_to_bottom() {
+        let feed =
+            b"see https://bare.example.org/x\r\n\r\n\x1b]8;;https://osc.example.com/\x1b\\click\x1b]8;;\x1b\\";
+        let (_rd, mut app, _parser, _rx) = attached_app(feed, 5, 80, 0);
+        app.handle_key(chord());
+        match &app.modal {
+            Modal::LinkHints { links, .. } => {
+                assert_eq!(links.len(), 2, "OSC8 pass + bare pass both collect");
+                assert_eq!(
+                    links[0].destination.as_str(),
+                    "https://bare.example.org/x",
+                    "row-0 bare link is labeled first (top-to-bottom order)"
+                );
+                assert_eq!(links[1].destination.as_str(), "https://osc.example.com/");
+            }
+            _ => panic!("chord over a linked screen must open the modal"),
+        }
+    }
+
+    /// A parser whose screen has zero links: message set, modal stays None,
+    /// and the scrollback bracket is restored even on the empty path.
+    #[test]
+    fn chord_with_zero_links_sets_message_and_restores_bracket() {
+        let mut feed = Vec::new();
+        for i in 1..=12 {
+            feed.extend_from_slice(format!("plain text {i}\r\n").as_bytes());
+        }
+        let (_rd, mut app, parser, _rx) = attached_app(&feed, 5, 80, 100);
+        app.claude_scroll = 3;
+        app.handle_key(chord());
+        assert!(matches!(app.modal, Modal::None), "no modal without links");
+        let (msg, _) = app.message.as_ref().expect("zero links surfaces a message");
+        assert!(msg.contains("no links"), "message names the outcome: {msg}");
+        assert_eq!(
+            parser.lock().unwrap().screen().scrollback(),
+            0,
+            "bracket restored on the empty-result path too"
+        );
+    }
+
+    /// Render parity (LINK-04 remote leg): the chord resolves the attach
+    /// parser only when it is the one the render path would draw — an attach
+    /// for a DIFFERENT remote id must not serve links for this pane.
+    #[test]
+    fn chord_ignores_attach_for_a_different_remote() {
+        let feed = b"see https://bare.example.org/x\r\n";
+        let (_rd, mut app, _parser, _rx) = attached_app(feed, 5, 80, 0);
+        app.selected_id = Some(super::SelId::Remote(9)); // attach is remote 7
+        app.handle_key(chord());
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a mismatched attach must not open the modal"
+        );
+        assert!(app.message.is_some(), "falls back to the no-links message");
+    }
+
+    /// LINK-04 structural guarantee at handle_key granularity: while the
+    /// hints overlay is open, EVERY key — printable, ctrl chords, Enter — is
+    /// handled or swallowed by the modal path; no byte reaches the child.
+    /// The stub's channel makes the proof deterministic (no IO thread), and
+    /// a control leg proves the same key IS forwarded once the modal closes.
+    #[test]
+    fn modal_open_swallows_every_key_from_the_child() {
+        let feed = b"see https://bare.example.org/x\r\n";
+        let (_rd, mut app, _parser, rx) = attached_app(feed, 5, 80, 0);
+        app.modal = Modal::LinkHints {
+            links: vec![test_link("https://a.example.com/")],
+            selected: 0,
+        };
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            app.handle_key(key);
+            assert!(
+                matches!(app.modal, Modal::LinkHints { .. }),
+                "modal survives swallowed key {key:?}"
+            );
+        }
+        // WR-01 regression: LINK-04 is byte-level, not key-level — a paste
+        // while the overlay is open is swallowed too.
+        app.handle_paste("pasted-behind-overlay".into());
+        assert!(
+            matches!(app.modal, Modal::LinkHints { .. }),
+            "modal survives a swallowed paste"
+        );
+        // Enter is consumed by the modal too (empty list: nothing to open,
+        // nothing spawned — the overlay simply closes).
+        app.modal = Modal::LinkHints {
+            links: vec![],
+            selected: 0,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None), "Enter consumed by modal");
+        assert!(
+            rx.try_recv().is_err(),
+            "no byte reached the child while the overlay was open"
+        );
+        // Control: with the modal closed the SAME key is forwarded — the
+        // spy channel is live, so the assertions above are not vacuous.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            matches!(rx.try_recv(), Ok(AttachInput::Bytes(b)) if b == b"x"),
+            "modal closed: keys forward to the child again"
+        );
+        // Paste control leg: the SAME paste is forwarded once the modal is
+        // closed, so the swallow assertion above is not vacuous.
+        app.handle_paste("pasted".into());
+        assert!(
+            matches!(rx.try_recv(), Ok(AttachInput::Bytes(b)) if b == b"pasted"),
+            "modal closed: paste forwards to the child again"
+        );
+    }
+}
+
+/// LINK-08 failure surface: an opener spawn error resolves to exactly one
+/// `set_message` warning and the session keeps running — never a panic,
+/// never a retry loop, never a real `Command` in tests (WINDOWS entry 6).
+#[cfg(test)]
+mod link_open {
+    use super::{App, Focus, Modal};
+    use crate::links::{DetectedLink, LinkSource};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    fn hinted(url: &str) -> (baude_core::testing::TestRedirect, App) {
+        let root = PathBuf::from("/nonexistent/baude-link-open");
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.modal = Modal::LinkHints {
+            links: vec![DetectedLink {
+                destination: url::Url::parse(url).expect("test URL parses"),
+                row: 0,
+                start_col: 0,
+                end_col: 0,
+                source: LinkSource::Osc8,
+            }],
+            selected: 0,
+        };
+        (redirect, app)
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    /// Err from the injected opener: one warning message naming the failure
+    /// and the session's survival; modal closed; the App still processes a
+    /// subsequent key normally (LINK-08 non-fatal failure, CONTEXT locked
+    /// decision: failure surfaces via set_message).
+    #[test]
+    fn opener_error_surfaces_one_warning_and_session_survives() {
+        let (_rd, mut app) = hinted("https://example.com/broken");
+        app.handle_link_hints_key(
+            enter(),
+            |_| Err(std::io::Error::other("browser exploded")),
+            |_| panic!("Err path must not copy"),
+        );
+        assert!(matches!(app.modal, Modal::None), "modal closed after Err");
+        let (msg, _) = app.message.as_ref().expect("Err surfaces one message");
+        assert!(msg.contains("browser exploded"), "names the failure: {msg}");
+        assert!(
+            msg.contains("session unaffected"),
+            "signals the session survives: {msg}"
+        );
+        // Liveness: the very next key is handled normally — the global
+        // ctrl+q chord still moves focus to the sidebar.
+        app.focus = Focus::Claude;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(app.focus, Focus::Sidebar),
+            "session keeps processing events after an opener failure"
+        );
+    }
+
+    /// Ok from the injected opener: the opener received the FULL normalized
+    /// URL as its single argument, and the message shows the truncated
+    /// display form (display-only truncation, LINK-05).
+    #[test]
+    fn opener_ok_sets_opening_message_with_display_form() {
+        let long = "https://example.com/very/long/path/segment/with/file.html?query=abcdefghijklmnopqrstuvwxyz";
+        let (_rd, mut app) = hinted(long);
+        let opened = RefCell::new(Vec::<String>::new());
+        app.handle_link_hints_key(
+            enter(),
+            |u| {
+                opened.borrow_mut().push(u.to_string());
+                Ok(())
+            },
+            |_| panic!("Enter must not copy"),
+        );
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [long],
+            "opener receives the full normalized URL"
+        );
+        let (msg, _) = app.message.as_ref().expect("Ok path sets a message");
+        assert!(msg.starts_with("opening "), "announces the open: {msg}");
+        assert!(
+            msg.contains("https://example.com") && msg.contains('…'),
+            "message shows the truncated display form, origin visible: {msg}"
+        );
+        assert!(
+            !msg.contains(long),
+            "the message line carries the display form, not the full URL"
         );
     }
 }
@@ -5509,6 +6547,283 @@ mod tests {
         }
     }
 
+    /// The `test-support` cargo feature must reach THIS binary's test build.
+    ///
+    /// `cfg(test)` is set per crate by `rustc --test`, so a `#[cfg(test)]`-only
+    /// guard inside `baude-core` would be absent from exactly the two binaries
+    /// that leaked worktrees (#72). This observes the dependency's gated code
+    /// through its public resolver rather than evaluating a feature predicate
+    /// locally: it fails to COMPILE if the dev-dependency feature wiring is
+    /// removed, and fails its assertions if the redirect wiring is broken.
+    ///
+    /// Deliberately touches no filesystem, no identity, and no git — it is a
+    /// pure path resolution through the gate.
+    #[test]
+    fn test_support_gate_is_active() {
+        let outer = PathBuf::from("/nonexistent/baude-gate-outer");
+        let inner = PathBuf::from("/nonexistent/baude-gate-inner");
+        let _outer = baude_core::testing::TestRedirect::new(&outer);
+        assert_eq!(persist::config_dir(), outer.join("config"));
+        {
+            let _inner = baude_core::testing::TestRedirect::new(&inner);
+            assert_eq!(persist::config_dir(), inner.join("config"));
+        }
+        assert_eq!(
+            persist::config_dir(),
+            outer.join("config"),
+            "dropping the inner redirect must restore the outer one"
+        );
+    }
+
+    /// Selects the re-exec'd child branch of
+    /// [`worker_isolation_app_does_not_launch_ambient_readers`].
+    const WORKER_ISOLATION_APP_CHILD: &str = "BAUDE_WORKER_ISOLATION_APP_CHILD";
+
+    /// Write a fake executable that records the fact it ran and nothing else.
+    ///
+    /// The marker path is baked into the script text rather than read from the
+    /// environment, so the detector cannot be silenced by the very environment
+    /// policy under test.
+    fn write_invocation_recorder(bin: &Path, markers: &Path, name: &str, stdout: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf invoked >> {}\nprintf '{stdout}'\nexit 0\n",
+                markers.join(name).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Constructing an `App` must not start the ccusage reader, an
+    /// environment-selected remote poller, or a desktop-notification worker.
+    ///
+    /// Those three escape the thread-local redirects entirely: a detached
+    /// thread does not inherit them, and `ccusage` reads every Claude
+    /// transcript on disk through the *inherited environment* rather than
+    /// through any Rust resolver. No containment guard and no filesystem
+    /// no-write observer can see that read.
+    ///
+    /// The whole exercise therefore runs in a re-exec'd child with an explicit
+    /// environment map whose apparent ambient roots are synthetic siblings of
+    /// the held fixture root, and with fake `ccusage`/`date` executables ahead
+    /// of the real ones on `PATH`. Each fake is invoked directly first as a
+    /// POSITIVE CONTROL, so a detector that silently stopped working cannot let
+    /// this pass. Nothing here can reach developer data even while it is red.
+    #[test]
+    fn worker_isolation_app_does_not_launch_ambient_readers() {
+        if std::env::var_os(WORKER_ISOLATION_APP_CHILD).is_some() {
+            let root = PathBuf::from(
+                std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
+                    .expect("the child must receive a synthetic fixture root"),
+            );
+            let markers = root.join("markers");
+            let fixture = root.join("fixture");
+
+            // Positive controls: prove the recorder works before relying on its
+            // silence. Both fakes shadow the real commands on PATH.
+            std::process::Command::new("ccusage")
+                .args(["daily", "--json", "-O"])
+                .output()
+                .expect("the fake ccusage must be reachable on the child PATH");
+            std::process::Command::new("date")
+                .arg("+%F")
+                .output()
+                .expect("the fake date must be reachable on the child PATH");
+            assert!(
+                markers.join("ccusage").exists(),
+                "positive control failed: invoking ccusage recorded no marker"
+            );
+            assert!(
+                markers.join("date").exists(),
+                "positive control failed: invoking date recorded no marker"
+            );
+            std::fs::remove_file(markers.join("ccusage")).unwrap();
+            std::fs::remove_file(markers.join("date")).unwrap();
+
+            // The fixture root is a SIBLING of the synthetic ambient roots, so
+            // an escape lands somewhere observably different rather than
+            // accidentally inside the fixture.
+            std::fs::create_dir_all(fixture.join("config")).unwrap();
+            let _redirect = baude_core::testing::TestRedirect::new(&fixture);
+            let _identity = baude_core::workspace::override_for_test(
+                &persist::Config {
+                    workspace: Some("worker-isolation".to_string()),
+                    ..persist::Config::default()
+                },
+                None,
+            );
+
+            let app = App::new(fixture.clone());
+            assert!(
+                app.remote.is_none(),
+                "App::new selected a remote poller from the ambient BAUDE_DAEMON_URL"
+            );
+            assert!(
+                !app.desktop_notify_enabled,
+                "App::new left desktop notifications armed in a test build"
+            );
+            assert!(
+                app.usage.is_inert_for_test(),
+                "a background worker still owns the App's usage snapshot"
+            );
+
+            // Direct construction must be protected too: the guarantee is a
+            // property of the poller, not of one blessed helper.
+            let poller = crate::usage::UsagePoller::start();
+            assert!(
+                poller.is_inert_for_test(),
+                "a directly constructed UsagePoller still spawned a worker"
+            );
+            for _ in 0..3 {
+                let from_app = app.usage_costs();
+                assert!(
+                    from_app.today_usd.is_none() && from_app.week_usd.is_none(),
+                    "the App reported usage costs in a test build"
+                );
+                let direct = poller.costs();
+                assert!(
+                    direct.today_usd.is_none() && direct.week_usd.is_none(),
+                    "a directly constructed poller reported usage costs"
+                );
+            }
+
+            drop(app);
+            drop(poller);
+
+            assert!(
+                !markers.join("ccusage").exists(),
+                "constructing, polling or dropping an App invoked ccusage"
+            );
+            assert!(
+                !markers.join("date").exists(),
+                "constructing, polling or dropping an App invoked date"
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "baude-worker-isolation-app-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for leaf in [
+            "fixture",
+            "markers",
+            "bin",
+            "ambient/home",
+            "ambient/config",
+            "ambient/data",
+            "ambient/claude",
+        ] {
+            std::fs::create_dir_all(root.join(leaf)).expect("synthetic child tree");
+        }
+        let bin = root.join("bin");
+        let markers = root.join("markers");
+        write_invocation_recorder(&bin, &markers, "ccusage", "{}");
+        write_invocation_recorder(&bin, &markers, "date", "1970-01-01");
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "app::tests::worker_isolation_app_does_not_launch_ambient_readers",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        // An explicit map, not the parent's environment plus overrides: an
+        // inherited CLAUDE_CONFIG_DIR or ccusage config would otherwise reach
+        // the developer's data through a path this test does not name.
+        command.env_clear();
+        command.env(WORKER_ISOLATION_APP_CHILD, "1");
+        command.env("BAUDE_TEST_FIXTURE_ROOT", &root);
+        command.env("HOME", root.join("ambient").join("home"));
+        command.env("XDG_CONFIG_HOME", root.join("ambient").join("config"));
+        command.env("XDG_DATA_HOME", root.join("ambient").join("data"));
+        command.env("CLAUDE_CONFIG_DIR", root.join("ambient").join("claude"));
+        command.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        // A synthetic loopback endpoint: nothing listens, and the assertion is
+        // that no poller was ever constructed to try.
+        command.env("BAUDE_DAEMON_URL", "http://127.0.0.1:9/");
+        let output = command.output().expect("re-exec the test binary");
+
+        let status = output.status;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let ccusage_marker = markers.join("ccusage").exists();
+        let date_marker = markers.join("date").exists();
+        if status.success() {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert!(
+            status.success(),
+            "worker-isolation child failed ({status})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have RUN the case, not filtered it out:\n{stdout}"
+        );
+        assert!(
+            !ccusage_marker && !date_marker,
+            "the child left an ambient-reader invocation marker behind"
+        );
+    }
+
+    /// The deliberate escape: config resolution with NO redirect must abort
+    /// this binary's test, not quietly reach the developer's real
+    /// `~/.config/baude`.
+    ///
+    /// This is the test that would have caught the original leak, and it is the
+    /// only direct evidence that the cross-crate gate survived into `baude`'s
+    /// test binary. A pass WITHOUT a panic is the warning sign that the gate
+    /// vanished downstream, which is exactly how #72 went unnoticed.
+    ///
+    /// It mutates no environment variable. `BAUDE_TEST_FIXTURE_ROOT` is
+    /// process-wide, so clearing it to observe this condition would change what
+    /// every concurrently running test sees, and a mutex could not fix that —
+    /// non-participating tests never take the lock. The `NoFixtureRoot` probe is
+    /// thread-local, so this needs no serial flag and no `--test-threads=1`.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_resolution_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = persist::config_dir();
+    }
+
+    /// The `~` expansion behind tab completion and the clone destination.
+    /// Unguarded, the worst of those call sites wrote a real `git clone` into
+    /// the developer's `~/Code` — a root the CI bracket did not even observe.
+    #[test]
+    #[should_panic(expected = "resolved to the real user path")]
+    fn unguarded_tilde_expansion_panics() {
+        let _no_root = baude_core::testing::NoFixtureRoot::new();
+        let _escaped = persist::expand_tilde("~/Code");
+    }
+
+    /// A redirected fixture expands `~` inside its own root, so the guarded
+    /// resolver is usable and not merely a tripwire.
+    #[test]
+    fn a_redirected_tilde_expands_inside_the_fixture() {
+        let root = std::path::PathBuf::from("/nonexistent/baude-app-tilde");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        assert_eq!(
+            persist::expand_tilde("~/Code"),
+            root.join("home").join("Code")
+        );
+        assert_eq!(persist::expand_tilde("~"), root.join("home"));
+        assert_eq!(
+            persist::expand_tilde("/absolute/path"),
+            std::path::PathBuf::from("/absolute/path"),
+            "a path without a leading tilde resolves nothing at all"
+        );
+    }
+
     fn pid_is_live(pid: u32) -> bool {
         Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -5548,28 +6863,121 @@ mod tests {
             .success());
     }
 
-    fn admission_repo(name: &str) -> PathBuf {
+    /// A fixture repository, the temp root that contains it, and the redirect
+    /// that keeps every path baude resolves inside that root.
+    ///
+    /// The redirect is thread-local and drops with this value, so every caller
+    /// must retain the owner in a NAMED binding that outlives the test body. A
+    /// helper returning only the repository path would still compile and leave
+    /// the fixture completely unredirected — a miss that is invisible locally
+    /// (the tests stay green) and shows up as hundreds of stale
+    /// `repository-<pid>` directories in the developer's real data dir (#72).
+    struct AdmissionRepo {
+        root: PathBuf,
+        repo: PathBuf,
+        /// Struct fields drop in DECLARATION order, which is the reverse of the
+        /// order locals drop in. The identity scope is therefore declared
+        /// before the root redirect so it is restored while its own root is
+        /// still installed — the mirror image of the acquisition order in
+        /// `admission_repo` (root first, identity second). Swapping these two
+        /// lines restores the root first and leaves the identity pointing at a
+        /// root that no longer exists.
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    impl AdmissionRepo {
+        /// The checkout this fixture selected — the pushed repository, or the
+        /// clone for [`admission_repo_cloned`].
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+
+        /// The fixture root every redirected path is contained by.
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        /// Select a different checkout inside the SAME fixture root, retaining
+        /// the redirect that contains it.
+        fn with_path(self, repo: PathBuf) -> Self {
+            Self { repo, ..self }
+        }
+    }
+
+    /// The minimal fixture owner: a unique synthetic root plus the literal
+    /// workspace identity resolved under it, in restoration order.
+    ///
+    /// For cases that construct an `App` without a repository fixture. "No
+    /// repository" is not "no identity": `App::new` and `restore` still resolve
+    /// the active workspace, name state files from it and compose managed
+    /// paths, so without this the case reads the developer's real workspace and
+    /// writes into the real data dir.
+    struct IsolationScope {
+        /// Struct fields drop in declaration order, so the identity is restored
+        /// while its own root is still installed.
+        _identity: baude_core::testing::TestRedirect,
+        _redirect: baude_core::testing::TestRedirect,
+    }
+
+    #[must_use = "the returned IsolationScope owns this case's root and identity guards; bind it \
+                  to a named local that outlives every App it isolates"]
+    fn isolation_scope(label: &str) -> IsolationScope {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "baude-isolation-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(label.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        IsolationScope {
+            _identity: identity,
+            _redirect: redirect,
+        }
+    }
+
+    #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives the test body"]
+    fn admission_repo(name: &str) -> AdmissionRepo {
         let root = std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
             });
         let _ = std::fs::remove_dir_all(&root);
-        // Managed worktrees are allocated under the data dir, so pin that to
-        // the fixture root before anything can create one. Without this the
+        // Managed worktrees are allocated under the data dir and the hook seed
+        // is derived from the binary path, so one redirect pins both to the
+        // fixture root before anything can create either. Without this the
         // suite seeds the developer's real ~/.local/share/baude/worktrees.
-        baude_core::git::set_worktrees_base_for_test(root.join("data"));
-        // Seed the shape production seeds. Under the harness `current_exe()` is
-        // `target/debug/deps/baude-<hash>`, whose stem is not `baude`, so
-        // everything seeded here would be unrecognizable as baude's own — the
-        // divergence that hid #78 and kept #70's pruning path untested at this
-        // level.
+        //
+        // The seeded command is the shape production seeds. Under the harness
+        // `current_exe()` is `target/debug/deps/baude-<hash>`, whose stem is not
+        // `baude`, so everything seeded here would be unrecognizable as baude's
+        // own — the divergence that hid #78 and kept #70's pruning path
+        // untested at this level.
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        // Identity second, resolved under the root the redirect just installed.
+        // The literal names THIS fixture, so two fixtures alive at once compose
+        // managed paths into two different directories and neither inherits the
+        // developer's configured workspace.
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some(name.to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        baude_core::hook::set_hook_command_for_test(format!(
-            "{} hook",
-            bin.join("baude").display()
-        ));
         let origin = root.join("origin.git");
         let repo = root.join("repo");
         std::fs::create_dir_all(&origin).unwrap();
@@ -5589,14 +6997,21 @@ mod tests {
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
         git(&repo, &["push", "-u", "origin", "main"]);
-        repo
+        AdmissionRepo {
+            root,
+            repo,
+            _identity: identity,
+            _redirect: redirect,
+        }
     }
 
     /// The post-`git clone` shape, so the admission matrix covers repositories that already
     /// carry `refs/remotes/origin/HEAD` as well as those that never will.
-    fn admission_repo_cloned(name: &str) -> PathBuf {
+    #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives the test body"]
+    fn admission_repo_cloned(name: &str) -> AdmissionRepo {
         let pushed = admission_repo(name);
-        let root = pushed.parent().unwrap().to_path_buf();
+        let root = pushed.root().to_path_buf();
         let origin = root.join("origin.git");
         let clone = root.join("clone");
         let _ = std::fs::remove_dir_all(&clone);
@@ -5604,7 +7019,9 @@ mod tests {
             &root,
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
-        clone
+        // Retain the pushed fixture's owner: only the selected checkout
+        // changes, and dropping it here would un-redirect the clone.
+        pushed.with_path(clone)
     }
 
     /// Guards the fixture itself: `admission_repo` must keep the pushed shape. Repairing
@@ -5612,7 +7029,8 @@ mod tests {
     /// `gh repo create` repositories were being refused.
     #[test]
     fn admission_fixture_records_no_remote_head() {
-        let repo = admission_repo("shape-guard");
+        let fixture = admission_repo("shape-guard");
+        let repo = fixture.path().to_path_buf();
         let probe = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -5633,8 +7051,8 @@ mod tests {
     /// data dir (issue #72).
     #[test]
     fn admission_fixture_contains_managed_worktrees() {
-        let repo = admission_repo("containment-guard");
-        let root = repo.parent().unwrap().to_path_buf();
+        let fixture = admission_repo("containment-guard");
+        let root = fixture.root().to_path_buf();
         let allocated = baude_core::git::managed_default_worktree_path(1, 2);
         assert!(
             allocated.starts_with(&root),
@@ -5645,6 +7063,106 @@ mod tests {
         );
     }
 
+    /// Owner-only workspace-identity isolation.
+    ///
+    /// Every case here resolves identity and composes managed paths and NOTHING
+    /// else: no `App` is constructed, no poller is started, no PTY is spawned.
+    /// Those workers are not isolated until plan 08, so running them from this
+    /// filter would reach unisolated background work before its containment
+    /// exists.
+    mod fixture_identity_isolation {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        /// Two admission fixtures built on two threads resolve two different
+        /// identities, and each keeps composing managed paths under its own
+        /// workspace AFTER the helper returned. A process-wide identity cache
+        /// makes the two agree — which is the whole defect.
+        #[test]
+        fn concurrent_admission_fixtures_keep_independent_identities() {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for name in ["identity-alpha", "identity-beta"] {
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    // The owner is retained for the whole body: the identity
+                    // assertions below all run after the helper returned.
+                    let fixture = admission_repo(name);
+                    // Both identities are live before either is observed, so a
+                    // shared cache cannot be masked by sequential execution.
+                    barrier.wait();
+                    let resolved = baude_core::workspace::active().name.clone();
+                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    barrier.wait();
+                    assert_eq!(
+                        resolved, name,
+                        "each fixture must resolve its own literal workspace"
+                    );
+                    assert!(
+                        managed.starts_with(fixture.root()),
+                        "{} escaped the fixture root {}",
+                        managed.display(),
+                        fixture.root().display()
+                    );
+                    assert!(
+                        managed
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(name)),
+                        "{} does not carry the fixture's own workspace {name}",
+                        managed.display()
+                    );
+                }));
+            }
+            for thread in threads {
+                thread.join().expect("identity thread panicked");
+            }
+        }
+
+        /// A thread that holds no fixture identity cannot inherit one from a
+        /// fixture live on another thread: it must panic rather than silently
+        /// resolve the developer's real workspace.
+        #[test]
+        fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
+            let _fixture = admission_repo("identity-escape");
+            let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
+            let payload = probe.expect_err("an override-free reader must not resolve an identity");
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
+                "expected the identity-escape panic, got {message:?}"
+            );
+        }
+
+        /// Dropping a fixture owner restores the caller's identity, not the
+        /// process default — the nesting property every helper depends on.
+        #[test]
+        fn dropping_a_fixture_owner_restores_the_enclosing_identity() {
+            let _outer = baude_core::workspace::override_for_test(
+                &baude_core::persist::Config {
+                    workspace: Some("enclosing-identity".to_string()),
+                    ..baude_core::persist::Config::default()
+                },
+                None,
+            );
+            assert_eq!(baude_core::workspace::active().name, "enclosing-identity");
+            {
+                let inner = admission_repo("identity-nested");
+                assert_eq!(baude_core::workspace::active().name, "identity-nested");
+                drop(inner);
+            }
+            assert_eq!(
+                baude_core::workspace::active().name,
+                "enclosing-identity",
+                "the inner fixture must restore the enclosing identity on drop"
+            );
+        }
+    }
+
     /// The seed a fixture writes must be the seed production writes — an
     /// absolute `…/baude hook` that baude recognizes as its own. While the
     /// harness seeded `target/debug/deps/baude-<hash>`, nothing at this level
@@ -5652,7 +7170,8 @@ mod tests {
     /// pruning path had no app-level coverage.
     #[test]
     fn activation_seeds_a_recognizable_command_and_reseeding_prunes_the_old_one() {
-        let (_app, _repo, root, _checkout, _runtime, path) = removal_app("seed-shape", 260_000);
+        let (_fixture, _app, _repo, root, _checkout, _runtime, path) =
+            removal_app("seed-shape", 260_000);
         let settings = path.join(".claude").join("settings.local.json");
         let seeded: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
@@ -5663,20 +7182,58 @@ mod tests {
 
         // A second install seeds over the first: one group per event, pointing
         // at the newcomer. The old path is pruned, not stacked beside it.
+        let original = baude_core::hook::baude_hook_command();
+        let config_before = baude_core::testing::config_dir_override();
+        let worktrees_before = baude_core::testing::worktrees_base_override();
+        let workspace_before = baude_core::testing::workspace_override().is_some();
         let newer = format!("{} hook", root.join("bin2").join("baude").display());
-        baude_core::hook::set_hook_command_for_test(&newer);
-        baude_core::hook::seed_settings(&path);
-        let reseeded: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        for (event, groups) in reseeded["hooks"].as_object().unwrap() {
-            let groups = groups.as_array().unwrap();
-            assert_eq!(groups.len(), 1, "{event} kept {} groups", groups.len());
-            assert_eq!(
-                groups[0]["hooks"][0]["command"].as_str().unwrap(),
-                newer,
-                "{event} still points at the superseded install"
-            );
+        assert_ne!(
+            newer, original,
+            "the second install must be a distinct path"
+        );
+        {
+            // Bound for the whole reseed-and-reconcile window: a temporary here
+            // would restore the first install's command before `seed_settings`
+            // ever ran, and the reconciliation below would assert against the
+            // command it was supposed to supersede.
+            let _newer_hook = baude_core::testing::TestRedirect::with_hook_command(&newer);
+            baude_core::hook::seed_settings(&path);
+            let reseeded: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+            for (event, groups) in reseeded["hooks"].as_object().unwrap() {
+                let groups = groups.as_array().unwrap();
+                assert_eq!(groups.len(), 1, "{event} kept {} groups", groups.len());
+                assert_eq!(
+                    groups[0]["hooks"][0]["command"].as_str().unwrap(),
+                    newer,
+                    "{event} still points at the superseded install"
+                );
+            }
         }
+
+        // Dropping the hook-only scope restores the enclosing fixture exactly:
+        // the first install's command returns and no path or identity redirect
+        // moved, so the next assertion in any caller still runs contained.
+        assert_eq!(
+            baude_core::hook::baude_hook_command(),
+            original,
+            "dropping the second-install scope must restore the fixture's command"
+        );
+        assert_eq!(
+            baude_core::testing::config_dir_override(),
+            config_before,
+            "a hook-only scope must not disturb the config redirect"
+        );
+        assert_eq!(
+            baude_core::testing::worktrees_base_override(),
+            worktrees_before,
+            "a hook-only scope must not disturb the worktrees redirect"
+        );
+        assert_eq!(
+            baude_core::testing::workspace_override().is_some(),
+            workspace_before,
+            "a hook-only scope must not disturb the workspace identity"
+        );
     }
 
     // Both provisioning shapes are covered at admission level: `admission_repo` is the
@@ -5684,12 +7241,26 @@ mod tests {
     // cloned_shape` covers the cloned one. Resolve-level adoption — including the default
     // branch living in a linked worktree — is pinned in baude-core::git::tests::default_branch.
 
+    /// The leading `AdmissionRepo` is the fixture's redirect owner. Destructure
+    /// it into a NAMED binding (`_fixture` is fine, a bare `_` is not): binding
+    /// it to `_` drops the redirect immediately and hands the rest of the test
+    /// the developer's real data dir.
+    #[must_use = "the leading AdmissionRepo owns the redirect that contains this fixture"]
     fn removal_app(
         label: &str,
         key_offset: u64,
-    ) -> (App, PathBuf, PathBuf, CheckoutKey, u64, PathBuf) {
-        let repo = admission_repo(label);
-        let root = repo.parent().unwrap().to_path_buf();
+    ) -> (
+        AdmissionRepo,
+        App,
+        PathBuf,
+        PathBuf,
+        CheckoutKey,
+        u64,
+        PathBuf,
+    ) {
+        let fixture = admission_repo(label);
+        let repo = fixture.path().to_path_buf();
+        let root = fixture.root().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
         let mut app = App::new(repo.clone());
@@ -5711,7 +7282,7 @@ mod tests {
         let path = app.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
-        (app, repo, root, checkout, runtime, path)
+        (fixture, app, repo, root, checkout, runtime, path)
     }
 
     fn add_checkout(state: &mut RepositoryState, role: CheckoutRole, active_intent: bool) {
@@ -5769,6 +7340,7 @@ mod tests {
 
     #[test]
     fn hierarchy_navigation_skips_parent_with_available_checkout_and_retains_selection() {
+        let _scope = isolation_scope("hierarchy-navigation");
         let mut state = RepositoryState::default();
         let repository_key = state.allocate_repository_key().unwrap();
         let order = state.allocate_first_seen_order().unwrap();
@@ -5814,6 +7386,9 @@ mod tests {
 
     #[test]
     fn hierarchy_action_matrix_dispatches_only_authorized_local_actions() {
+        // Bound first so it outlives both `App`s below — each `App::new` reads
+        // the ambient config dir, and an unowned read resolves to the real one.
+        let _scope = isolation_scope("hierarchy-action-matrix");
         use super::{SidebarAction, SidebarRefusal};
         use crate::hierarchy::{action_view, ActionSelection};
         use baude_core::lifecycle::LifecycleCapability;
@@ -6210,7 +7785,7 @@ mod tests {
         assert_eq!(app.ordered_ids(), hidden_order);
         std::fs::remove_dir_all(action_state_root).unwrap();
 
-        let (mut app, repo, root, checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, root, checkout, runtime, worktree_path) =
             removal_app("hierarchy-action-matrix", 180_000);
         let repository = app.repository_state.checkouts[0].repository_key;
         let baseline_state = app.repository_state.clone();
@@ -6329,6 +7904,7 @@ mod tests {
 
     #[test]
     fn hierarchy_flat_remote_compatibility_has_no_local_parent_or_remove_action() {
+        let _scope = isolation_scope("hierarchy-flat-remote");
         use super::{SelId, SidebarAction};
         use crate::hierarchy::ActionKind;
 
@@ -6449,6 +8025,7 @@ mod tests {
 
     #[test]
     fn archived_rows_hide_from_selection_and_cycling_until_revealed() {
+        let _scope = isolation_scope("archived-rows");
         use super::SelId;
 
         let remote = |id: u64, name: &str, archived: bool| {
@@ -6543,6 +8120,9 @@ mod tests {
 
     #[test]
     fn hierarchy_resize_never_sends_zero_dimensions_and_transfers_hidden_shell_focus() {
+        // The `paused` App below is built before `removal_app` installs its own
+        // fixture, so this case needs its own owner for that first read.
+        let _scope = isolation_scope("hierarchy-resize");
         let mut paused = App::new(PathBuf::from("/not-a-repository"));
         paused.remote = None;
         paused.focus = super::Focus::Shell;
@@ -6553,7 +8133,7 @@ mod tests {
             Some("shell hidden at this terminal height — resize to 13+ rows; session input is paused")
         );
 
-        let (mut app, repo, root, _checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, root, _checkout, runtime, worktree_path) =
             removal_app("tiny-resize", 185_000);
         app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
         let before = app
@@ -6667,7 +8247,8 @@ mod tests {
 
     #[test]
     fn production_admission_retains_intent_without_runtime_on_save_failure() {
-        let repo = admission_repo("save-failure");
+        let fixture = admission_repo("save-failure");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let blocked_root = root.join("persistence-root");
         std::fs::write(&blocked_root, b"not a directory").unwrap();
@@ -6690,7 +8271,8 @@ mod tests {
 
     #[test]
     fn production_admission_retains_saved_intent_on_spawn_failure() {
-        let repo = admission_repo("spawn-failure");
+        let fixture = admission_repo("spawn-failure");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6728,7 +8310,8 @@ mod tests {
 
     #[test]
     fn active_launch_repository_restart_focuses_restored_runtime_without_duplicate_spawn() {
-        let repo = admission_repo("active-launch-restart");
+        let fixture = admission_repo("active-launch-restart");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6763,7 +8346,8 @@ mod tests {
 
     #[test]
     fn admit_repository_populates_existing_worktrees_as_inactive_rows() {
-        let repo = admission_repo("worktree-autopopulate");
+        let fixture = admission_repo("worktree-autopopulate");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6836,7 +8420,8 @@ mod tests {
         // default lives in a linked worktree, so the linked worktree's upstream is the
         // only local evidence of the default. Resolution covers that now (#73); the
         // cloned shape has its own coverage in `admit_repository_admits_cloned_shape`.
-        let repo = admission_repo("worktree-main-role");
+        let fixture = admission_repo("worktree-main-role");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6895,7 +8480,8 @@ mod tests {
     /// shape, so this is what keeps the recorded-remote-HEAD path covered.
     #[test]
     fn admit_repository_admits_cloned_shape() {
-        let repo = admission_repo_cloned("cloned-shape");
+        let fixture = admission_repo_cloned("cloned-shape");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -6937,7 +8523,8 @@ mod tests {
 
     #[test]
     fn lifecycle_create_activate_local_persists_once_and_reuses_runtime() {
-        let repo = admission_repo("branch-activation");
+        let fixture = admission_repo("branch-activation");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7102,7 +8689,8 @@ mod tests {
 
     #[test]
     fn lifecycle_creation_rollback_local_precommit_save_failure_has_no_partial_child() {
-        let repo = admission_repo("branch-rollback");
+        let fixture = admission_repo("branch-rollback");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let blocked_root = root.join("blocked-state-root");
         std::fs::write(&blocked_root, b"not a directory").unwrap();
@@ -7161,7 +8749,8 @@ mod tests {
 
     #[test]
     fn activation_recovery_reuses_unchanged_preexisting_worktree_after_pending_save_crash() {
-        let repo = admission_repo("occupied-pending-recovery");
+        let fixture = admission_repo("occupied-pending-recovery");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7245,7 +8834,8 @@ mod tests {
                 "runtime spawn",
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -7321,7 +8911,8 @@ mod tests {
 
     #[test]
     fn lifecycle_close_local_snapshots_resume_context_and_retains_hierarchy() {
-        let repo = admission_repo("retained-close");
+        let fixture = admission_repo("retained-close");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7464,7 +9055,8 @@ mod tests {
                 true,
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -7567,7 +9159,8 @@ mod tests {
 
     #[test]
     fn lifecycle_reopen_local_targets_retained_checkout_once_and_obeys_save_boundary() {
-        let repo = admission_repo("retained-reopen");
+        let fixture = admission_repo("retained-reopen");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -7657,6 +9250,18 @@ mod tests {
                 .env("BAUDE_TEST_FIXTURE_ROOT", &root)
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("HOME", root.join("home"))
+                // `HOME` alone does NOT contain the child's config resolution:
+                // `meta::claude_config_dir` reads `CLAUDE_CONFIG_DIR` FIRST and
+                // only then falls back to `$HOME/.claude`, and `persist`
+                // likewise prefers `XDG_CONFIG_HOME`. On any machine where the
+                // developer exports either (this project's documented setup
+                // does), the child would inherit a real root and trip
+                // `assert_contained`. Pinning both under the fixture root is the
+                // isolation this test always intended; it is a fixture
+                // correction, not an exemption from the guard. Set on the CHILD
+                // command only — never on the parent process environment.
+                .env("CLAUDE_CONFIG_DIR", root.join("home").join(".claude"))
+                .env("XDG_CONFIG_HOME", root.join("home").join(".config"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env_remove("BAUDE_DAEMON_URL")
@@ -7753,7 +9358,21 @@ mod tests {
             std::env::var_os("HOME"),
             Some(configured_root.join("home").into_os_string())
         );
-        let repo = admission_repo("restart-dedup").canonicalize().unwrap();
+        // The child is a test-harness entry, not `main`, so nothing called
+        // `workspace::initialize` for it. It holds its own literal identity
+        // before the first app or backend reader rather than inheriting one;
+        // the admission fixture below nests its own inside this. Filesystem
+        // containment is the parent's child-only HOME, XDG_DATA_HOME,
+        // XDG_CONFIG_HOME and CLAUDE_CONFIG_DIR, asserted just above.
+        let _child_identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("dogfood".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let fixture = admission_repo("restart-dedup");
+        let repo = fixture.path().canonicalize().unwrap();
         let root = configured_root.canonicalize().unwrap();
         assert_eq!(repo.parent(), Some(root.as_path()));
         let state_root = root.join("state");
@@ -7933,7 +9552,8 @@ mod tests {
 
     #[test]
     fn lifecycle_remove_clean_local_rechecks_after_stop_and_compensates_a_race() {
-        let repo = admission_repo("safe-remove-local");
+        let fixture = admission_repo("safe-remove-local");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -8018,7 +9638,8 @@ mod tests {
                 true,
             ),
         ] {
-            let repo = admission_repo(label);
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
             let root = repo.parent().unwrap().to_path_buf();
             let state_root = root.join("state");
             std::fs::create_dir_all(&state_root).unwrap();
@@ -8099,7 +9720,7 @@ mod tests {
 
     #[test]
     fn lifecycle_remove_clean_local_stop_git_and_compensation_failures_preserve_context() {
-        let (mut app, repo, root, checkout, runtime, path) =
+        let (_fixture, mut app, repo, root, checkout, runtime, path) =
             removal_app("safe-remove-stop-refusal", 150_000);
         let before = app.repository_state.clone();
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
@@ -8147,7 +9768,7 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
 
-        let (mut app, repo, root, checkout, _, path) =
+        let (_fixture, mut app, repo, root, checkout, _, path) =
             removal_app("safe-remove-compensation-failure", 160_000);
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
         app.remove_git_refusal_for_test = true;
@@ -8182,7 +9803,8 @@ mod tests {
             ("remove-agent-partial", true, 170_000),
             ("remove-shell-partial", false, 180_000),
         ] {
-            let (mut app, repo, root, checkout, runtime, path) = removal_app(label, offset);
+            let (_fixture, mut app, repo, root, checkout, runtime, path) =
+                removal_app(label, offset);
             app.session_mut(runtime).unwrap().open_shell(5, 40).unwrap();
             if fail_agent {
                 app.session(runtime)
@@ -8225,7 +9847,8 @@ mod tests {
 
     #[test]
     fn remove_confirmation_is_distinct_targeted_and_cancel_is_non_mutating() {
-        let repo = admission_repo("remove-confirmation");
+        let fixture = admission_repo("remove-confirmation");
+        let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         let state_root = root.join("state");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -8302,6 +9925,7 @@ mod tests {
 
     #[test]
     fn standalone_admission_dedup_close_reopen_and_missing_are_durable() {
+        let _scope = isolation_scope("standalone-lifecycle");
         let root =
             std::env::temp_dir().join(format!("baude-standalone-lifecycle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8313,8 +9937,14 @@ mod tests {
         app.remote = Some(crate::remote::RemotePoller::start(
             "http://127.0.0.1:9".into(),
         ));
-        app.config.claude_cmd = Some("sleep 30".into());
-        app.config.opencode_cmd = Some("sleep 30".into());
+        // Wrapped in `sh -c` like every other stand-in in this file: the spawn
+        // appends `--dangerously-skip-permissions`, and a BARE `sleep 30` takes
+        // that as a second operand, fails usage, and exits at once. The dedup
+        // assertion below only ever saw a live runtime because it raced the
+        // child's death; the wrapper swallows the flag as an ignored positional
+        // so the stand-in stays alive for the lifecycle this case asserts.
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         app.persistence_root_for_test = Some(state_root.clone());
 
         app.open_repo_session_via(folder.clone(), LocalAdmissionRoute::Open);
@@ -8404,6 +10034,7 @@ mod tests {
 
     #[test]
     fn standalone_failed_first_spawn_retries_fresh_intent() {
+        let _scope = isolation_scope("standalone-first-spawn");
         let root = std::env::temp_dir().join(format!(
             "baude-standalone-first-spawn-{}",
             std::process::id()
@@ -8452,6 +10083,7 @@ mod tests {
 
     #[test]
     fn standalone_active_runtime_is_restored_with_exact_recorded_teardown() {
+        let _scope = isolation_scope("standalone-restore");
         let root =
             std::env::temp_dir().join(format!("baude-standalone-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8589,6 +10221,7 @@ mod tests {
 
     #[test]
     fn folder_context_scopes_rows_cycling_and_the_f_reveal() {
+        let _scope = isolation_scope("folder-context-rows");
         let (state, inside_main, inside_wt, outside_main, standalone) = context_fixture();
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
@@ -8660,6 +10293,7 @@ mod tests {
 
     #[test]
     fn folder_context_selection_moves_never_record() {
+        let _scope = isolation_scope("folder-context-moves");
         let (state, inside_main, ..) = context_fixture();
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
@@ -8675,6 +10309,7 @@ mod tests {
 
     #[test]
     fn folder_context_restore_prefers_the_last_used_session() {
+        let _scope = isolation_scope("folder-context-restore");
         let (state, inside_main, _inside_wt, outside_main, _standalone) = context_fixture();
         let root = std::env::temp_dir().join(format!(
             "baude-folder-context-restore-{}",
@@ -8735,6 +10370,8 @@ mod tests {
     /// line, because the failures that follow are the ones the user sees (#71).
     #[test]
     fn held_workspace_lock_names_the_holder_instead_of_asking_for_a_repair() {
+        // Installed before the `workspace::active()` read two lines below.
+        let _scope = isolation_scope("held-workspace-lock");
         let root =
             std::env::temp_dir().join(format!("baude-held-workspace-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8770,5 +10407,95 @@ mod tests {
 
         holder.unlock().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- seed warning surface (HREG-03 / D-10, app-level) ----------------
+
+    /// D-10 (app half): a REAL App spawn attempt over a malformed
+    /// `.claude/settings.local.json` leaves the file byte-identical and
+    /// surfaces a TUI message naming it. Drives the standalone spawn entry
+    /// point (never `prepare_cwd` directly — that would not be an app-level
+    /// spawn test) under the Phase-8 guarded fixture.
+    fn assert_seed_warning_survives_spawn_attempt(tag: &str, malformed: &[u8]) {
+        let root = std::env::temp_dir().join(format!(
+            "baude-seed-warning-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let _identity = baude_core::workspace::override_for_test(
+            &persist::Config {
+                workspace: Some(format!("seed-warning-{tag}")),
+                ..persist::Config::default()
+            },
+            None,
+        );
+        // Production-shaped hook command override (legacy unquoted form —
+        // both forms are recognized after 09-03, and these assertions do not
+        // depend on quoting).
+        let _hook = baude_core::testing::TestRedirect::with_hook_command(format!(
+            "{} hook",
+            root.join("bin").join("baude").display()
+        ));
+
+        // Session cwd inside the fixture root with a malformed settings file.
+        let cwd = root.join("session");
+        let settings_dir = cwd.join(".claude");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings = settings_dir.join("settings.local.json");
+        std::fs::write(&settings, malformed).unwrap();
+
+        let mut app = App::new(cwd.clone());
+        app.remote = None;
+        // Stub command per the manager-test convention.
+        app.config.claude_cmd = Some("true".into());
+        let key = app
+            .repository_state
+            .allocate_standalone_key()
+            .expect("fresh state allocates a standalone key");
+
+        // A REAL spawn entry point that reaches `be.prepare_cwd(&cwd)`. The
+        // attempt MAY return Err after seeding (PTY/backend constraints in a
+        // test process) — the assertions bind to the seeding effects, not
+        // spawn success (D-04: the warning never blocks the spawn path).
+        let _ = app.add_standalone_session_with_mode(
+            key,
+            cwd.clone(),
+            baude_core::backend::SpawnMode::Fresh,
+            false,
+        );
+
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            malformed.to_vec(),
+            "malformed settings must remain byte-identical after a spawn attempt"
+        );
+        let message = app
+            .message
+            .clone()
+            .expect("warn_seed_failures must set a TUI message")
+            .0;
+        assert!(
+            message.contains(&settings.display().to_string()),
+            "TUI message must name the settings file, got: {message}"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_warning_malformed_settings_survives_spawn_attempt() {
+        assert_seed_warning_survives_spawn_attempt("unparseable", b"{not json");
+    }
+
+    #[test]
+    fn seed_warning_non_object_settings_survives_spawn_attempt() {
+        assert_seed_warning_survives_spawn_attempt("non-object", b"[1,2]");
     }
 }

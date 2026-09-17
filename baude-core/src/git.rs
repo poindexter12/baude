@@ -1,9 +1,7 @@
-use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Result};
 
@@ -290,6 +288,36 @@ fn parse_worktree_porcelain(
     Ok(records)
 }
 
+/// Git's own worktree inventory for the repository containing `path`, with
+/// every record canonicalized. Main worktree first, as Git reports it.
+///
+/// Split out of [`discover_repository`] for the leak scanner, which has to ask
+/// the inventory about a path that may be **absent** from it — that absence is
+/// exactly what disownment means, and `discover_repository` rejects it with
+/// [`RepositoryDiscoveryError::SelectedWorktreeMissing`] rather than answering.
+/// Kept `pub(crate)`: this is an internal seam, not crate API.
+pub(crate) fn worktree_inventory(
+    path: &Path,
+) -> std::result::Result<Vec<WorktreeRecord>, RepositoryDiscoveryError> {
+    let inventory_output = git_bytes(
+        path,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("list"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+        ],
+        "worktree inventory",
+    )?;
+    let mut worktrees = parse_worktree_porcelain(&inventory_output.stdout)?;
+    for record in &mut worktrees {
+        if let Ok(canonical) = record.path.canonicalize() {
+            record.path = canonical;
+        }
+    }
+    Ok(worktrees)
+}
+
 /// Discover canonical repository membership without reading Git's on-disk layout.
 pub fn discover_repository(
     path: &Path,
@@ -324,22 +352,7 @@ pub fn discover_repository(
             source,
         })?;
 
-    let inventory_output = git_bytes(
-        &canonical_input,
-        &[
-            OsStr::new("worktree"),
-            OsStr::new("list"),
-            OsStr::new("--porcelain"),
-            OsStr::new("-z"),
-        ],
-        "worktree inventory",
-    )?;
-    let mut worktrees = parse_worktree_porcelain(&inventory_output.stdout)?;
-    for record in &mut worktrees {
-        if let Ok(canonical) = record.path.canonicalize() {
-            record.path = canonical;
-        }
-    }
+    let worktrees = worktree_inventory(&canonical_input)?;
     let main_worktree = worktrees
         .first()
         .expect("parser rejects an empty inventory")
@@ -1724,44 +1737,40 @@ pub fn repo_root(path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-thread_local! {
-    /// Test-only redirect for [`worktrees_base`]. Thread-local, not an env
-    /// var: the test binary runs cases in parallel, and a process-wide
-    /// `XDG_DATA_HOME` written by one case would decide where another one's
-    /// worktrees land.
-    static WORKTREES_BASE_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
-
-/// Armed by the first test fixture that redirects the worktree root. Once
-/// armed, [`worktrees_base`] refuses to fall back to the real data dir on a
-/// thread that set no override, so a fixture that forgets fails the test
-/// instead of silently seeding `~/.local/share/baude/worktrees`.
-static REQUIRE_WORKTREES_OVERRIDE: AtomicBool = AtomicBool::new(false);
-
-/// Point managed worktree allocation at `base` for the CURRENT THREAD, and
-/// arm the leak guard process-wide. Test support only — production resolves
-/// the root from `XDG_DATA_HOME`/`$HOME` and never calls this.
-pub fn set_worktrees_base_for_test(base: impl Into<PathBuf>) {
-    let base = base.into();
-    WORKTREES_BASE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(base));
-    REQUIRE_WORKTREES_OVERRIDE.store(true, Ordering::SeqCst);
-}
-
-fn worktrees_base() -> PathBuf {
-    if let Some(base) = WORKTREES_BASE_OVERRIDE.with(|cell| cell.borrow().clone()) {
-        return base.join("baude").join("worktrees");
-    }
-    assert!(
-        !REQUIRE_WORKTREES_OVERRIDE.load(Ordering::SeqCst),
-        "managed worktree root resolved to the real data dir during a test; \
-         call baude_core::git::set_worktrees_base_for_test on this thread first"
-    );
+/// The real managed-worktree root, with no test redirect and no containment
+/// check.
+///
+/// Ungated and public on purpose: the leak scanner is production code whose
+/// entire job is to target the real root. Note the terminal fallback is `/tmp`
+/// here and `"."` in [`crate::persist`]'s config resolver — the real-root
+/// resolvers share a shape but not their tails, so they must not be collapsed
+/// into one helper.
+pub fn real_worktrees_base() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("baude")
         .join("worktrees")
+}
+
+/// The managed-worktree root a caller should allocate under: the thread's
+/// redirect when a fixture holds one, otherwise the real root — which, inside a
+/// test binary, must be contained by the fixture root or the test aborts.
+///
+/// There is deliberately no arming flag. Containment is a property of the
+/// compiled binary rather than of execution history, so there is no window
+/// before arming in which a test runs unguarded — the defect that left
+/// `baude-core`'s own tests entirely unprotected.
+pub(crate) fn worktrees_base() -> PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(base) = crate::testing::worktrees_base_override() {
+        return base.join("baude").join("worktrees");
+    }
+    let real = real_worktrees_base();
+    #[cfg(any(test, feature = "test-support"))]
+    crate::testing::assert_contained(&real, "managed worktree root");
+    real
 }
 
 /// Deterministic workspace-local allocation for a durable primary checkout.
@@ -3907,8 +3916,9 @@ mod tests {
                     fixture.linked_worktree(&repo, "seed exemption linked", "seed-exemption");
                 // Seed what production seeds: under the harness `current_exe()`
                 // is `target/debug/deps/baude-<hash>`, which baude does not
-                // recognize as its own (#78).
-                crate::hook::set_hook_command_for_test("/opt/baude hook");
+                // recognize as its own (#78). The scoped guard supplies the
+                // production shape and reverts when it drops.
+                let _hook = crate::testing::TestRedirect::with_hook_command("/opt/baude hook");
                 crate::hook::seed_settings(&linked);
                 std::fs::write(
                     linked.join(".mcp.json"),
@@ -4414,6 +4424,21 @@ mod tests {
 
             #[test]
             fn durable_keys_not_labels_supply_bounded_path_identity() {
+                // Root first, identity second: identity is restored before the
+                // root it was resolved under. This test only composes paths, so
+                // the root never needs to exist on disk.
+                let _root = crate::testing::TestRedirect::new(format!(
+                    "/nonexistent/baude-git-durable-keys-{}",
+                    std::process::id()
+                ));
+                let _identity = crate::workspace::override_for_test(
+                    &crate::persist::Config {
+                        workspace: Some("durable-keys".to_string()),
+                        ..crate::persist::Config::default()
+                    },
+                    None,
+                );
+
                 let slash = managed_branch_worktree_path(7, 11, "feature/a");
                 let dash = managed_branch_worktree_path(7, 12, "feature-a");
                 let other_repository = managed_branch_worktree_path(8, 11, "feature/a");

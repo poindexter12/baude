@@ -8,10 +8,25 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# `dirs` is deliberately NOT a dependency of this crate. Every home resolution
+# goes through `baude_core::persist::home_dir`, which is guarded; keeping the
+# unguarded crate out of scope means a fourth private `expand_tilde` cannot be
+# written here by accident (#72, CR-01).
 baude-core.workspace = true
-dirs.workspace = true
 ratatui = "0.30"
 serde.workspace = true
 serde_json.workspace = true
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "2", features = ["json"] }
+# LINK-07 validation: WHATWG URL parse + scheme allowlist, and post-decode
+# control-char rechecks. Both are already transitive via ureq — promoting
+# them to direct deps adds zero new packages.
+url = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+# Re-declares only the feature; path/version are inherited from the workspace
+# dependency. Dev-dependency features are unified into the build graph only when
+# a test target is in play, so `cargo build --release` still ships without the
+# guard (#72, D-12).
+baude-core = { workspace = true, features = ["test-support"] }
