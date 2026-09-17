@@ -22,6 +22,20 @@ run existed.
 | Commits carried | 174 (33 `feat`, 20 `fix`, 72 `docs`, 43 `test`, 5 `style`, 1 `refactor`; 0 breaking) |
 | PR state at time of writing | **OPEN, unmerged** |
 
+### Which sha this evidence is about
+
+`e07b28e` is the sha at which the **code** was judged. Commits pushed after it
+in this plan are `.planning/`-only (this checklist, the plan SUMMARY, and the
+STATE/ROADMAP updates), so they do not change the source tree — provable with
+`git diff e07b28e HEAD -- ':!.planning'`, which is empty. Each such push
+re-triggers `ci.yml` on the new head, and those runs are expected to be green
+for the same reason.
+
+The maintainer's merge-time check is therefore "are the three required contexts
+green on PR #87's *current* head", which is its own item under
+**Evidence gate** below. This section is the record of the first run that ever
+exercised phases 8 through 11, not a substitute for that check.
+
 ### Required status contexts — all three green
 
 `main`'s branch protection requires exactly these three, with
@@ -211,6 +225,11 @@ claimed before the gate is answered.
 - [ ] **CI evidence:** the `## CI evidence (SHIP-01)` section above — PR #87,
       head `e07b28e`, `ci.yml` run 35253356923, all three required contexts
       SUCCESS.
+
+- [ ] **Confirm the three required contexts are green on PR #87's current
+      head**, not only on `e07b28e`. `enforce_admins: true` gates on the current
+      head, and this plan pushed `.planning/`-only commits after the recorded
+      run. `gh pr checks 87` answers it.
 
 - [ ] **Smoke evidence (SHIP-03):** `12-SMOKE-EVIDENCE.md` is complete per plan
       12-03, meaning no leg is unaccounted for. Read what it actually is before
