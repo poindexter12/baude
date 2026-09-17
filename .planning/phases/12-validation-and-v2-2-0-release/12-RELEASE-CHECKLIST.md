@@ -96,3 +96,192 @@ were each confirmed an ancestor of HEAD via
 rebase rewrote those commits, so the old branch refs are no longer ancestors of
 the new HEAD; their post-rebase equivalents are `9a46f33`, `454a91e`,
 `5b13ba9`, and `fcaf40b`.
+
+## Pre-release checklist
+
+Worked through by the maintainer before plan 12-05's blocking-human checkpoints
+authorize the merge, the label change, or the publish. Plan 12-04 wrote this
+list; with one documented exception it does not tick it.
+
+### Phase 8 re-stamp (D-11)
+
+- [x] Re-run `/gsd-verify-work 8`. **Done 2026-09-16** — commits `8ca3d42`
+      (`test(08): complete UAT - 2 passed, 0 issues`) and `164fc26`
+      (`docs(phase-8): re-verify and complete phase`). `08-UAT.md` now exists
+      and `08-VERIFICATION.md` reads `status: passed`.
+
+  Why it was outstanding, recorded so the tick is auditable rather than
+  assumed: `08-VERIFICATION.md`'s frontmatter said `passed` while its own Gaps
+  Summary said `human_needed`, for one reason only — two of its verifications
+  are by their nature measurements of the developer's real filesystem, and the
+  phase-8 verifier operated under a hard constraint forbidding it to read,
+  write, or fingerprint those roots.
+
+  **Plan 12-01's bracket is exactly that forbidden measurement, and it passed.**
+  `assert-real-roots-untouched.sh --self-test` (40 checks, 0 failures) then
+  `before`, then the full 645-test serial suite, then `after` → exit 0,
+  `PASS: the run left all four real roots untouched.` The four roots
+  fingerprinted on this host were `/Users/joese/.config/baude`,
+  `/Users/joese/.poindexter/claude`,
+  `/Users/joese/.local/share/baude/worktrees`, and `/Users/joese/Code`; all four
+  reported `unchanged (present, ...)` in the after-check. `check (macos-14)` and
+  `check (ubuntu-22.04)` on PR #87 re-prove the same bracket in a clean room.
+
+  This item is the one pre-ticked box in this list. It is ticked because the
+  re-stamp demonstrably already happened and is no longer maintainer work at the
+  gate; leaving it open would misrepresent the project state.
+
+### Planning-state consistency
+
+- [ ] Reconcile `.planning/STATE.md` before `/gsd-complete-milestone`. Its
+      frontmatter still reads `current_phase: 09`, `status: planning`,
+      `stopped_at: Phase 8 complete, ready to plan Phase 09` while phase 12 is
+      executing. `/gsd-complete-milestone` will otherwise be working from a
+      position four phases stale. The ROADMAP half of this inconsistency is
+      already resolved — phase 8 now reads `8/8 | Complete | 2026-09-16`, not
+      the "In Progress with all plans done" state research recorded.
+
+- [ ] Note, no action expected: phases 9, 10 and 11 report `stale` to the
+      staleness scanner even though each `NN-VERIFICATION.md` reads
+      `status: passed` and the ROADMAP shows all three Complete. The cause is
+      structural, not a real gap — `.planning/REQUIREMENTS.md` appears in every
+      phase's `covered_files` list, and each subsequent phase completion
+      rewrites that file, which invalidates every earlier phase's file
+      fingerprints. Re-verifying them would not change any finding. Recorded so
+      a later reader does not mistake the label for outstanding work.
+
+### Version agreement (SHIP-04)
+
+"Matching versions" for this release means these seven all read **2.2.0**:
+
+- [ ] Root `Cargo.toml` inline marker (line 15,
+      `baude-core = { path = "baude-core", version = "=2.1.5" } # x-release-please-version`)
+- [ ] `baude-core/Cargo.toml` `package.version`
+- [ ] `baude/Cargo.toml` `package.version`
+- [ ] `bauded/Cargo.toml` `package.version`
+- [ ] `.release-please-manifest.json` (currently `{ ".": "2.1.5" }`)
+- [ ] The git tag `v2.2.0`
+- [ ] The `CHANGELOG.md` heading for 2.2.0
+
+release-please owns all four source files via its `extra-files` list plus the
+manifest, and `release-please.yml` separately clones the release branch and runs
+`cargo update --workspace` to refresh `Cargo.lock`, committing
+`chore: finalize release metadata`.
+
+- [ ] Confirm `vendor/vt100/Cargo.toml` still reads `version = "0.15.2"`.
+      **The vendored fork is deliberately excluded from version matching** and
+      must stay at its upstream value: that number names the upstream vt100
+      release the fork derives from, not baude's. It is intentionally absent
+      from `extra-files`, and bumping it would be a defect, not a correction.
+
+- [ ] Confirm no version was hand-edited anywhere in this phase. A manual bump
+      fights the release PR and desyncs `.release-please-manifest.json`.
+      release-please's arithmetic from `2.1.5` over 33 `feat`, 20 `fix` and zero
+      breaking changes lands on 2.2.0 on its own, which `release-please.yml`
+      classifies as `tier=minor`.
+
+### Distribution outputs (D-10)
+
+Confirm at publish time. No packaging rework is in scope for this phase; the
+existing `release.yml` outputs are reused as-is and verified, and all four of
+the last four release runs (v2.1.2 … v2.1.5) concluded success.
+
+- [ ] `baude-v2.2.0-aarch64-apple-darwin.tar.gz` attached
+- [ ] `baude-v2.2.0-x86_64-apple-darwin.tar.gz` attached
+- [ ] `baude-v2.2.0-x86_64-unknown-linux-gnu.tar.gz` attached
+- [ ] `baude-v2.2.0-aarch64-unknown-linux-gnu.tar.gz` attached
+- [ ] Each of the four tarballs carries **both** binaries (`baude` and `bauded`)
+- [ ] `SHA256SUMS.txt` present (generated by `release.yml`'s
+      `shasum -a 256 *.tar.gz > SHA256SUMS.txt`)
+- [ ] The multi-arch container image was pushed (the `image` + `image-manifest`
+      jobs, two architectures behind one manifest)
+
+- [ ] Note, no action expected: `cargo publish` is not used anywhere in this
+      repo — distribution is entirely GitHub Release tarballs plus the ghcr.io
+      image. This is why `baude-core`'s vendored path dependency
+      (`vt100 = { path = "../vendor/vt100" }`) is harmless to both shipping
+      paths. A path dependency would be fatal to `cargo publish` and is
+      irrelevant to a tarball or an image build. No mitigation is needed.
+
+### Evidence gate
+
+The artifacts plan 12-05's checkpoints act on. Each must be present and read as
+claimed before the gate is answered.
+
+- [ ] **CI evidence:** the `## CI evidence (SHIP-01)` section above — PR #87,
+      head `e07b28e`, `ci.yml` run 35253356923, all three required contexts
+      SUCCESS.
+
+- [ ] **Smoke evidence (SHIP-03):** `12-SMOKE-EVIDENCE.md` is complete per plan
+      12-03, meaning no leg is unaccounted for. Read what it actually is before
+      signing, because it is weaker than "twelve behaviors verified on two
+      platforms" and says so in its own header:
+
+  - The **macOS session is a labeled bulk attestation**, not a leg-by-leg
+    walkthrough. Exactly one leg was reported individually (leg 1, `ctrl+o`
+    opens the link overlay: "yeah, ctrl o works"). The other eleven rest on a
+    single set-level statement, "all works flawlessly", recorded as covering the
+    set rather than paraphrased into each leg.
+  - **Three gaps are signed, not smoothed over.** (1) Leg 2's
+    label-vs-destination check was never narrated, which is precisely the
+    property LINK-01 exists to guarantee; automated `links::` tests cover it,
+    a human did not visually confirm it. (2) The reported mouse-click link
+    opening is the outer terminal's behavior, not baude's — iTerm2 detects URLs
+    independently, and phase 10 shipped keyboard-only activation deliberately.
+    (3) Legs 8-9 may not have been exercised at all, since they need a claude
+    pane and the smoke instance started with no sessions.
+  - The **Linux session is deferred in full**, with sign-off. No Linux terminal
+    was available; all twelve Linux legs read DEFERRED. Legs 1-4 and 8-9 name
+    `check (ubuntu-22.04)` as their automated proxy — that job's run URL is
+    recorded in the CI evidence section above. Legs 5-7 and 10-12 are
+    outer-terminal behaviors with no automated substitute and are deferred
+    outright.
+
+  Signing this box means accepting that evidence at its stated strength. It does
+  not mean twelve behaviors were observed on two platforms.
+
+- [ ] **Documentation (SHIP-02):** the grep criteria are satisfied per plan
+      12-02, which recorded `requirements-completed: [SHIP-02]` and
+      `status: complete`.
+
+### Merge strategy and release gating
+
+- [ ] **Choose the merge method for PR #87.** This is the maintainer's call at
+      the gate, not plan 12-04's.
+
+  **Recommended: merge commit.** It is the only option that produces the
+  per-feature changelog the milestone asked for — release-please parses all 174
+  commits individually and emits 33 Features plus 20 Bug Fixes, filtering
+  `docs`/`test`/`style`/`refactor` out by default. `required_linear_history` is
+  false on this repo so a merge commit is permitted, and it matches how the
+  release PRs themselves are merged.
+
+  A **squash** collapses those 174 into one commit whose body concatenates the
+  messages; whether release-please extracts individual conventional commits from
+  a concatenated body is unverified, so the safe reading is a one-line v2.2.0
+  changelog.
+
+  **Hazard if squashing: a non-`feat` PR title cuts no release at all.** PR
+  #86's `docs:` title produced none. PR #87 is titled
+  `feat: v2.2 reliability and terminal usability`, which is correct under both
+  strategies — so this hazard is already neutralized as long as the title is
+  not edited at merge time.
+
+- [ ] **Apply `release:hold` as the very first action after PR #87 merges**,
+      before anything else. `release-automerge.yml` runs on a `*/30` cron and
+      merges a `release:minor` PR once `SOAK_HOURS=2` has elapsed and required
+      checks are green. The human gate is **opt-in, not opt-out**: without the
+      label, v2.2.0 can publish on a timer without anyone authorizing it.
+
+      ```bash
+      num=$(gh pr list --state open --label 'release:minor' --json number --jq '.[0].number')
+      gh pr edit "$num" --add-label release:hold
+      ```
+
+- [ ] Release the gate only after the boxes above are answered:
+      `gh pr edit "$num" --remove-label release:hold` (the cron lands it within
+      30 minutes), or `gh pr merge "$num" --merge` to publish immediately.
+
+- [ ] Do not hand-write the v2.2.0 changelog. release-please generates and owns
+      `CHANGELOG.md`; a hand-written file is overwritten on the release branch.
+
