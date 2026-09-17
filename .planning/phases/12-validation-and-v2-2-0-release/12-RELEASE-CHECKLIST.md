@@ -304,3 +304,49 @@ claimed before the gate is answered.
 - [ ] Do not hand-write the v2.2.0 changelog. release-please generates and owns
       `CHANGELOG.md`; a hand-written file is overwritten on the release branch.
 
+
+---
+
+## Merge Authorization
+
+**Merge authorized by:** Joe Seymour on 2026-09-17
+
+- PR [#87](https://github.com/poindexter12/baude/pull/87) merged into `main` as a
+  **merge commit** (`aa12cb2ee0045ce5e6426618a85ab83c43f0cf57`) at
+  2026-09-17T18:24:17Z. Merge-commit rather than squash so release-please sees
+  every conventional commit; PR #86's `docs:`-titled squash cut no release and is
+  the precedent that decided this.
+- All 11 checks were green at merge time, including the three required contexts
+  `check (macos-14)`, `check (ubuntu-22.04)` and `docker`, plus CodeQL and
+  artifact-readiness on all four release targets.
+- Authorization was given in response to an explicit one-way-door checkpoint that
+  named the consequence (release-please cutting a v2.2.0 release PR) and the
+  `release:hold` timing hazard.
+
+### Release PR and the hold
+
+- release-please opened [#88](https://github.com/poindexter12/baude/pull/88)
+  (`chore(main): release 2.2.0`) 80 seconds after the merge.
+- **The `release:hold` label did not exist in this repository.** The first
+  labelling attempt failed with `'release:hold' not found`, leaving #88 carrying
+  only `release:minor` + `autorelease: pending` — precisely the state
+  `release-automerge.yml` selects for its `*/30` cron. The label was created
+  (`B60205`, "Blocks release-automerge: requires explicit human authorization to
+  publish") and applied; `autoMergeRequest` is `none`.
+- Hold verified against the workflow itself, not assumed:
+  `release-automerge.yml:40-42` filters
+  `select([.labels[].name] | index("release:hold") | not)`, so #88 is now
+  excluded from auto-merge.
+- **Worth fixing at leisure:** the escape hatch documented at
+  `release-automerge.yml:8` depended on a label nobody had created, so every
+  prior minor release was auto-mergeable with no way to veto it. The label now
+  exists permanently.
+
+## Publish Authorization
+
+_Not yet authorized. v2.2.0 remains unpublished; PR #88 is held._
+
+To authorize, this section must carry a line of the form
+`**Publish authorized by:** <name> on <YYYY-MM-DD>` — a distinct sentinel from
+the merge record above, so a merge approval can never be mistaken for a publish
+approval (plan 12-05 Task 3's gate gates on exactly this heading and line).
