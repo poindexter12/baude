@@ -344,7 +344,18 @@ claimed before the gate is answered.
 
 ## Publish Authorization
 
-_Not yet authorized. v2.2.0 remains unpublished; PR #88 is held._
+_Not authorized. v2.2.0 remains unpublished; PR #88 is held._
+
+**Publish deliberately deferred on 2026-09-17** by Joe Seymour, at an explicit
+publish checkpoint that named the consequences and summarized the evidence. This
+is a decision, not an unfinished step: the release machinery is proven and the
+automated gates are green, but the human-observed half of SHIP-03 is thinner
+than the requirement imagined (bulk attestation, one leg individually reported,
+three signed gaps, Linux deferred). Holding rather than publishing on that basis
+is the requirement working as designed.
+
+Resume by re-running the publish decision — nothing needs redoing. PR #88 stays
+safe from `release-automerge.yml` for as long as `release:hold` is on it.
 
 To authorize, this section must carry a line of the form
 `**Publish authorized by:** <name> on <YYYY-MM-DD>` — a distinct sentinel from
