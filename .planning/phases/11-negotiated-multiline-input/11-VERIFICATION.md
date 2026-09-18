@@ -1,7 +1,8 @@
 ---
 phase: 11-negotiated-multiline-input
 verified: 2026-09-18T00:00:00Z
-status: human_needed
+status: passed
+human_items_accepted: "2026-09-18 by Joe Seymour — accepted, NOT observed; see Acceptance Record"
 score: 14/15 must-haves verified
 covered_files:
   - .planning/REQUIREMENTS.md
@@ -91,7 +92,7 @@ advisory: []
 
 **Phase Goal:** Users can insert newlines with Shift+Enter on verified terminal paths without changing existing key behavior or leaking terminal modes.
 **Verified:** 2026-09-18T00:00:00Z
-**Status:** human_needed
+**Status:** passed — automated verification passed; the open human-verification items were ACCEPTED by the maintainer on 2026-09-18 rather than observed (see Acceptance Record).
 **Re-verification:** YES — this is a RE-VERIFICATION of phase 11 at current HEAD (`ee6fa3c`), superseding the 2026-09-16 report.
 
 ## Why this re-verification ran
@@ -340,3 +341,33 @@ The two source changes that invalidated the digest are both benign for phase 11:
 
 _Verified: 2026-09-18T00:00:00Z (re-verification at HEAD ee6fa3c)_
 _Verifier: Claude (gsd-verifier)_
+
+---
+
+## Acceptance Record — 2026-09-18
+
+The open `human_verification` items above were presented to the maintainer and
+**accepted**, not observed. They are deliberately left listed rather than
+deleted: acceptance is a decision about risk, and a later reader is entitled to
+see exactly what was accepted and on what basis.
+
+- **Accepted by:** Joe Seymour, 2026-09-18
+- **What was accepted:** every open item in this report's `human_verification`
+  block, and the backstop-tier truth that remains `behavior_unverified`.
+- **What this does NOT mean:** no item was independently observed as a result of
+  this acceptance. The verified score is unchanged by it, `overrides_applied`
+  stays as recorded, and the backstop truth is still not counted as verified.
+The phase-11 gap remains a gap, accepted rather than closed: TKEY-01 and
+  TKEY-02 rest on automated coverage plus a set-level attestation, NOT on a
+  confirmed live keystroke. The smoke instance ran under `BAUDE_WORKSPACE=smoke`,
+  which starts with no claude pane, and nobody confirmed one was added before
+  legs 8-9.
+
+- **What IS independently established** (re-verification at HEAD `ee6fa3c`, this
+  pass): no regression in any must_have; the full workspace suite green at 646
+  results / 0 failed with `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` both exit 0; and every
+  behavioral claim in the body bound to a targeted test run in the verifier's own
+  process. Requirements TKEY-01..TKEY-05 are satisfied on that automated evidence.
+
+This record exists so "passed" is never mistaken for "observed".

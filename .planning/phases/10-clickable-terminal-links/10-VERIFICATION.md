@@ -1,7 +1,8 @@
 ---
 phase: 10-clickable-terminal-links
 verified: 2026-09-18T00:00:00Z
-status: human_needed
+status: passed
+human_items_accepted: "2026-09-18 by Joe Seymour — accepted, NOT observed; see Acceptance Record"
 score: 23/24 must-haves verified
 covered_files:
   - ".planning/REQUIREMENTS.md"
@@ -110,7 +111,7 @@ human_verification:
 
 **Phase Goal:** Users can inspect, copy, and explicitly open validated HTTP(S) destinations while terminal rendering, selection, and remote attachment remain authoritative and safe.
 **Verified:** 2026-09-18T00:00:00Z
-**Status:** human_needed
+**Status:** passed — automated verification passed; the open human-verification items were ACCEPTED by the maintainer on 2026-09-18 rather than observed (see Acceptance Record).
 **Re-verification:** **Yes — this is a RE-VERIFICATION of phase 10 at HEAD `ee6fa3c`, not the initial pass.**
 
 ## Why this re-verification ran
@@ -439,3 +440,33 @@ rather than baude's keyboard activation path. Neither gap is upgraded or quietly
 
 _Verified: 2026-09-18T00:00:00Z_
 _Verifier: Claude (gsd-verifier) — re-verification at HEAD ee6fa3c_
+
+---
+
+## Acceptance Record — 2026-09-18
+
+The open `human_verification` items above were presented to the maintainer and
+**accepted**, not observed. They are deliberately left listed rather than
+deleted: acceptance is a decision about risk, and a later reader is entitled to
+see exactly what was accepted and on what basis.
+
+- **Accepted by:** Joe Seymour, 2026-09-18
+- **What was accepted:** every open item in this report's `human_verification`
+  block, and the backstop-tier truth that remains `behavior_unverified`.
+- **What this does NOT mean:** no item was independently observed as a result of
+  this acceptance. The verified score is unchanged by it, `overrides_applied`
+  stays as recorded, and the backstop truth is still not counted as verified.
+The two phase-10-relevant signed gaps in `12-SMOKE-EVIDENCE.md` remain
+  gaps, accepted rather than closed: the `ctrl+o` overlay's label-vs-destination
+  distinction (LINK-01's core guarantee) was never visually narrated, and the
+  maintainer's "clicking opened links" was iTerm2's own URL handling rather than
+  baude's keyboard activation path.
+
+- **What IS independently established** (re-verification at HEAD `ee6fa3c`, this
+  pass): no regression in any must_have; the full workspace suite green at 646
+  results / 0 failed with `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` both exit 0; and every
+  behavioral claim in the body bound to a targeted test run in the verifier's own
+  process. Requirements LINK-01..LINK-08 are satisfied on that automated evidence.
+
+This record exists so "passed" is never mistaken for "observed".

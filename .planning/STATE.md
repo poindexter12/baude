@@ -5,11 +5,11 @@ milestone_name: Reliability and Terminal Usability
 current_phase: 09
 current_phase_name: Hook Seeding Safety
 status: planning
-stopped_at: "Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates"
-last_updated: "2026-09-17T17:48:55.112Z"
-last_activity: 2026-09-16
+stopped_at: Phase 8 complete, ready to plan Phase 09
+last_updated: "2026-09-18T18:27:16.979Z"
+last_activity: 2026-09-18
 last_activity_desc: Phase 8 complete, transitioned to Phase 09
-state_head: 20b8098be7a0a91e9d9c7560a0234020759423bc
+state_head: 859d98e207c08534d8f6c76faefe5493acf5e986
 progress:
   total_phases: 5
   completed_phases: 4
@@ -32,7 +32,7 @@ See: .planning/PROJECT.md (updated 2026-08-30)
 Phase: 09 — Hook Seeding Safety
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-09-16 — Phase 8 complete, transitioned to Phase 09
+Last activity: 2026-09-18 — Phase 8 complete, transitioned to Phase 09
 
 Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
 
@@ -252,7 +252,7 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 ## Session Continuity
 
 Last session: 2026-09-17T17:47:38.892Z
-Stopped at: Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates
+Stopped at: Phase 8 complete, ready to plan Phase 09
 Resume file: None
 
 ## Deferred Items

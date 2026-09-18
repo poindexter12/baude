@@ -1,7 +1,8 @@
 ---
 phase: 09-hook-seeding-safety
 verified: 2026-09-18T00:00:00Z
-status: human_needed
+status: passed
+human_items_accepted: "2026-09-18 by Joe Seymour — accepted, NOT observed; see Acceptance Record"
 score: 15/16 must-haves verified
 covered_files:
   - .planning/REQUIREMENTS.md
@@ -67,7 +68,7 @@ advisory:
 
 **Phase Goal:** Seeding a project's hooks never destroys a user's existing settings and never emits a command string the shell will mis-execute.
 **Verified:** 2026-09-18
-**Status:** human_needed
+**Status:** passed — automated verification passed; the open human-verification items were ACCEPTED by the maintainer on 2026-09-18 rather than observed (see Acceptance Record).
 **Re-verification:** **Yes** — re-verification at HEAD `ee6fa3c`, not an initial pass. The 2026-09-15 report went stale on `covered_digest` (mechanical: `.planning/REQUIREMENTS.md` and `baude/src/app.rs` both changed after it was written). This pass re-binds every must-have to code and named tests at the current HEAD and emits a fresh digest.
 
 **Headline: no regression. Phase 9's delivered behavior is intact at this HEAD.**
@@ -249,3 +250,28 @@ Status is `human_needed` — not `passed` — for the same four reasons as the p
 
 _Verified: 2026-09-18 at HEAD `ee6fa3c25733f7f499acc11a4ac150ac3bcfa712`_
 _Verifier: Claude (gsd-verifier) — re-verification_
+
+---
+
+## Acceptance Record — 2026-09-18
+
+The open `human_verification` items above were presented to the maintainer and
+**accepted**, not observed. They are deliberately left listed rather than
+deleted: acceptance is a decision about risk, and a later reader is entitled to
+see exactly what was accepted and on what basis.
+
+- **Accepted by:** Joe Seymour, 2026-09-18
+- **What was accepted:** every open item in this report's `human_verification`
+  block, and the backstop-tier truth that remains `behavior_unverified`.
+- **What this does NOT mean:** no item was independently observed as a result of
+  this acceptance. The verified score is unchanged by it, `overrides_applied`
+  stays as recorded, and the backstop truth is still not counted as verified.
+
+- **What IS independently established** (re-verification at HEAD `ee6fa3c`, this
+  pass): no regression in any must_have; the full workspace suite green at 646
+  results / 0 failed with `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` both exit 0; and every
+  behavioral claim in the body bound to a targeted test run in the verifier's own
+  process. Requirements HREG-03, HREG-04 are satisfied on that automated evidence.
+
+This record exists so "passed" is never mistaken for "observed".

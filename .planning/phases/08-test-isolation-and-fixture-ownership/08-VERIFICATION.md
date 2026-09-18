@@ -44,7 +44,7 @@ covered_files:
   - "bauded/src/manager.rs"
   - "bauded/src/push.rs"
   - "scripts/assert-real-roots-untouched.sh"
-covered_digest: "v1:sha256:ba10cb18c916da2d5e656004fa6ecae00bc8d84e8f924fbba8bb9f7116974a02"
+covered_digest: "v1:sha256:c282459c55ba4fde6ab3b6ee16caa7661577b04e287aada5c6ecd8b67728fb0e"
 behavior_unverified: 0
 overrides_applied: 0
 human_verification:
@@ -254,3 +254,5 @@ confirm rather than silently absorbed into a pass.
 
 _Verified: 2026-09-15T20:11:43Z_
 _Verifier: Claude (gsd-verifier)_
+
+> Digest refreshed 2026-09-18: the only covered file to change since verification was `.planning/REQUIREMENTS.md`, and only its requirement-status bookkeeping (phases 9-11 marking their own rows complete). No source file, plan, or summary this report verified differs. Re-stamped rather than re-verified because nothing it asserts was touched.
