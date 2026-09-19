@@ -383,3 +383,22 @@ by `check (ubuntu-22.04)`, and legs 5-7 and 10-12 are deferred with sign-off.
 v2.2.0 ships on strong automated evidence and thin human-observed evidence, and
 that distinction is recorded here deliberately so a future bug report can be
 read against what was actually checked.
+
+### Published artifacts — verified 2026-09-19
+
+| Check | Result |
+|---|---|
+| Release PR #88 merged | `1c37551ad8ecb2fced18ecb3220136e81eb7bb8b`, 2026-09-19T17:01:16Z |
+| Tag `v2.2.0` | pushed, points at the merge sha |
+| GitHub release | published 2026-09-19T17:01:29Z, `isDraft: false`, `isPrerelease: false` |
+| Release workflow (run 35456777276) | success — all 8 jobs: 4 `build`, 2 `image`, `image-manifest`, `publish` |
+| Tarballs | 4 targets: aarch64/x86_64 × apple-darwin/unknown-linux-gnu, plus `SHA256SUMS.txt` |
+| Checksum | `shasum -a 256 -c` on the downloaded aarch64-apple-darwin tarball → `OK` |
+| Contents | extracts to exactly `baude` + `bauded` (the two-binary shape) |
+| Version agreement | extracted binaries report `baude 2.2.0` and `bauded 2.2.0` — matching tag, manifests and release notes |
+| Container | `image` (amd64 + arm64) and `image-manifest` jobs succeeded; multi-arch manifest pushed |
+
+Verification was performed against the *published* artifact — downloaded from the
+release, checksum-verified, extracted and executed — not against a local build.
+
+**Release URL:** https://github.com/poindexter12/baude/releases/tag/v2.2.0
