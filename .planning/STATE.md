@@ -2,39 +2,37 @@
 gsd_state_version: "1.0"
 milestone: v2.2
 milestone_name: Reliability and Terminal Usability
-current_phase: 09
-current_phase_name: Hook Seeding Safety
-status: planning
+status: Awaiting next milestone
 stopped_at: Phase 8 complete, ready to plan Phase 09
-last_updated: "2026-09-18T18:27:16.979Z"
-last_activity: 2026-09-18
-last_activity_desc: Phase 8 complete, transitioned to Phase 09
-state_head: 859d98e207c08534d8f6c76faefe5493acf5e986
+last_updated: "2026-09-19T18:05:20.300Z"
+last_activity: 2026-09-19
+last_activity_desc: Milestone v2.2 completed and archived
+state_head: b1038fdf54c6a00d6b7ee0f4d7e1907bbab3b245
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 25
-  completed_plans: 24
+  completed_plans: 25
   percent: 80
+current_phase: 09
+current_phase_name: Hook Seeding Safety
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-30)
+See: .planning/PROJECT.md (updated 2026-09-19)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 12 — Validation and v2.2.0 Release
+**Current focus:** Planning next milestone (v2.2 shipped 2026-09-19)
 
 ## Current Position
 
-Phase: 09 — Hook Seeding Safety
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-09-18 — Phase 8 complete, transitioned to Phase 09
-
-Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
+Phase: Milestone v2.2 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-09-19 — Milestone v2.2 completed and archived
 
 ## Performance Metrics
 
@@ -273,6 +271,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 | verification_gaps | 04/04-VERIFICATION.md (archived v0.7) | human_needed | 2026-09-03 | v2.0 |
 | deferred_items | 06/deferred-items.md: legacy App removal route is_dirty note (superseded by 06-06 inspect_removal) | acknowledged | 2026-09-03 | v2.0 |
 | deferred_items | 07/deferred-items.md: pre-existing docker smoke shellcheck SC2015/SC2034 | acknowledged | 2026-09-03 | v2.0 |
+| deferred_items | 10/deferred-items.md: 10-04 flaky bauded lifecycle test (failed once 356/357, passed on rerun; flake-hunt candidate) | acknowledged | 2026-09-19 | v2.2 |
+| deferred_items | 11/deferred-items.md: pre-existing clippy failures (resolved in 12-01; vendored vt100 lint header had masked baude lints) | acknowledged | 2026-09-19 | v2.2 |
 
 ## Operator Next Steps
 

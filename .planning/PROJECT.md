@@ -14,20 +14,13 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current State (v2.1.0 source baseline)
+## Current State (v2.2.0 shipped 2026-09-19)
 
-v2.1.0 is the source baseline for this milestone. The latest GSD-completed milestone remains v2.0 through Phase 7. v2.2 focuses on reliability fixes from GitHub issues #70, #71, and #72 plus safer, more usable terminal links and newline input, followed by the existing v2.2.0 release process.
+v2.2.0 is the current release and the source baseline for the next milestone. The latest GSD-completed milestone is v2.2 through Phase 12 (phases 8-12, archived under `milestones/v2.2-*`). The codebase is about 51.6k lines of Rust across `baude-core`, `baude`, and `bauded`.
 
-## Current Milestone: v2.2 Reliability and Terminal Usability
+## Current Milestone
 
-**Goal:** Make everyday session management safer and more dependable while improving terminal interaction.
-
-**Target features:**
-- Stop GitHub #70 hook configuration accumulation while preserving user hooks and settings.
-- Add actionable state-lock contention diagnostics without removing locks or overwriting another live owner.
-- Isolate test worktrees and environments so tests do not leak state or race through global environment.
-- Support clickable OSC8 labeled links and bare URLs with destination preview and copy, without shell evaluation or loss of text selection.
-- Fix Shift+Enter newline behavior on supported terminals with terminal mode restoration and a legacy fallback.
+None active. v2.2 shipped 2026-09-19; the next milestone is being defined via `/gsd-new-milestone`.
 
 ## Requirements
 
@@ -56,6 +49,12 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 - ✓ Live per-session tool-activity timeline (capped ring → `GET /activity` + SSE) in the PWA and TUI — v0.7
 - ✓ Remote tool-permission approve/deny from the phone (opt-in `prompt` mode via `--permission-prompt-tool` MCP bridge; distinct push) — v0.7
 - ✓ Backend-isolated Claude Code and OpenCode workspaces, commands, metadata, and session pools — v0.8-v0.14
+- ✓ Hook configuration no longer accumulates (#70): idempotent, guarded seeding preserves user hooks and settings — v2.2
+- ✓ State-lock contention is diagnosed (#71) without removing locks or overwriting a live owner — v2.2
+- ✓ Test worktrees and environments are isolated per fixture (#72); fail-closed managed-worktree leak scan, preview-only by default — v2.2
+- ✓ OSC8 labeled links and bare URLs open on gesture (`ctrl+o` hints) with destination preview and copy, no shell evaluation, selection preserved — v2.2
+- ✓ Shift+Enter inserts a newline on kitty-protocol terminals with mode restoration and a legacy fallback — v2.2
+- ✓ v2.2.0 published through the existing release process after test, CI, and smoke validation — v2.2
 
 > v0.7 code-complete; data paths Claude-validated live (4 integration bugs found + fixed). Pending human UATs before public ship: hook-state flip visual (BL-01), PWA activity-strip + TUI `v` overlay visuals, live-`claude` `--permission-prompt-tool` MCP wire contract, first-phone Web Push. Tracked in `.planning/STATE.md` Deferred Items + per-phase UAT.md.
 
@@ -63,12 +62,7 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 
 <!-- Current milestone scope. -->
 
-- [ ] Prevent hook configuration accumulation for GitHub #70 with idempotent updates that preserve user hooks and settings.
-- [ ] Diagnose state-lock contention for GitHub #71 without removing state locks or overwriting another live owner.
-- [ ] Prevent test worktree leakage for GitHub #72 by isolating fixtures and avoiding global-environment races.
-- [ ] Make OSC8 labeled links and bare URLs clickable on supported terminals with destination preview and copy, without shell evaluation or loss of text selection.
-- [ ] Make Shift+Enter insert a newline on supported terminals while restoring terminal mode and retaining a legacy fallback.
-- [ ] Complete test, CI, and smoke validation before publishing v2.2.0 through the existing release process.
+(None — the next milestone's requirements are defined in REQUIREMENTS.md via `/gsd-new-milestone`.)
 
 ### Out of Scope
 
@@ -84,14 +78,17 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 
 ## Context
 
-- Mature codebase at **v2.1.0**, source baseline for this milestone; public repo `github.com/poindexter12/baude`, MIT.
+- Mature codebase at **v2.2.0** (shipped 2026-09-19), about 51.6k lines of Rust; public repo `github.com/poindexter12/baude`, MIT.
 - Cargo workspace: `baude-core/` (pty, session, meta, persist, git, bridge — no UI deps), `baude/` (ratatui TUI), `bauded/` (axum daemon + embedded PWA).
 - Distributed as prebuilt binaries via `mise`/`ubi` (release.yml builds 4 targets) and a multi-arch `ghcr.io/poindexter12/bauded` image.
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
 - The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
 - Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
 - Phases 5 through 7 are retained as completed v2.0 history. The Phase 6 corrective shared-core work is shipped, not an active v2.2 blocker; explicitly deferred human verification remains recorded in STATE.md.
-- The v2.0 GSD-completed milestone runs through Phase 7. v2.1.0 is the source baseline for the current v2.2 reliability and terminal usability work.
+- The v2.2 GSD-completed milestone runs through Phase 12; the next phase number is 13.
+- Workspace (state namespace) resolution chain: `BAUDE_WORKSPACE` -> folder-memory hint (`~/.config/baude/folder-workspaces.json`, keyed by exact canonical launch dir) -> config `workspace` -> `BAUDE_BACKEND` -> config `backend` -> `claude`. The launch folder itself never names the workspace.
+- Managed worktrees live at `~/.local/share/baude/worktrees/<workspace>/repository-<key>/<primary|branch-label>-<key>`; keys are per-state-file counters (TUI `state-<ws>.json` and daemon `daemon-state-<ws>.json` each start at 1) and the path carries no repository identity, so two repos can claim the same `repository-1` and collide as a hard `PathCollision` error.
+- User config is `~/.config/baude/config.json` (`claude_cmd`, `new_session_dir`, `clone_base_dir`, `workspace`/`workspaces`, `auto_archive_minutes`); the `n` prompt prefills `new_session_dir` when set, else the launch dir (argv[1] or cwd, canonicalized, not the git toplevel).
 
 ## Constraints
 
@@ -113,6 +110,12 @@ v2.1.0 is the source baseline for this milestone. The latest GSD-completed miles
 | Permission-prompt mode is opt-in; `skip` stays default | Unattended overnight runs must not block on phone approval | ✓ Good — fail-safe default-stays-skip + deny-on-timeout, security-reviewed (v0.7) |
 | `--permission-prompt-tool` requires a stdio MCP server (not a plain command) | Pinned by v0.7 research; baude hand-rolls a 3-method JSON-RPC server in both binaries, no new deps | ⚠️ Revisit — wire contract is MEDIUM-confidence (claude-code #1175); confirm against live claude 2.1.178 before public ship |
 | Narrow v2.0 to shared lifecycle ownership plus a local-TUI dogfood release | Deep Phase 6 review exposed duplicated App/Manager ownership and unsafe recovery transitions; remote/PWA and dormant-branch breadth would compound that risk | Completed in v2.0; later publication superseded the original no-publish boundary |
+| Fail-closed managed-worktree leak scan; removal only behind a saved report plus two opt-ins | 1433 live candidates matched the naive "path shape + missing gitdir" signal; deletion must never be authorized by evidence every live worktree satisfies | ✓ Good — shipped v2.2, preview-only default |
+| One `TestRedirect` owns all fixture paths via a cargo feature (not `cfg(test)`), with an escape guard | Tests leaked worktrees into the real home (#72); `cfg(test)` cannot reach the binaries' integration tests | ✓ Good — 16 isolation blockers closed, 645 tests green |
+| Vendor and fork vt100 0.15.2 to carry per-cell OSC8 link ids; collect links at gesture time only | Upstream has no link-id plumbing; gesture-time collection leaves the render path unchanged | ✓ Good — links shipped with remote-attach parity; the fork's lint header had to be relaxed (12-01) |
+| Shift+Enter via negotiated kitty keyboard protocol, doubly verified (outer terminal and child), legacy bytes frozen in a corpus | Blind CSI-u would break terminals and children that do not speak kitty | ✓ Good — honest fallback, byte-freeze corpus guards regressions |
+| Guarded settings seeding: never overwrite unreadable, unparseable, or non-object settings; warn instead | Silent replacement destroyed user hooks (#70) | ✓ Good — HREG-03/04 delivered |
+| Ship v2.2.0 through release-please; close GSD v2.2 by override (no Phase 12 VERIFICATION.md) and no separate GSD tag | Release already published with CI green; GSD verification would duplicate 12-VALIDATION and the smoke evidence | ⚠️ Revisit — run `/gsd-verify-work` before close next time |
 
 ## Evolution
 
@@ -132,4 +135,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-08 for v2.2 milestone kickoff*
+*Last updated: 2026-09-19 after v2.2 milestone*
