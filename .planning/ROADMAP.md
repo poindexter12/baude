@@ -64,6 +64,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, WSPC-05, OPEN-01, OPEN-02, OPEN-03, OPEN-04
 
 **Success Criteria** (what must be TRUE):
+
   1. User launches baude from a subfolder of a repository and the correct workspace is used (either from a recorded folder binding or derived from the repo root folder name)
   2. The new-session (`n`) prompt prefills the git toplevel when launched inside a repo, or the configured `new_session_dir` when launched outside any repository
   3. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `BAUDE_BACKEND` env/config still override derivation and recorded bindings
@@ -72,8 +73,16 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   6. The top title of the TUI names the active workspace and how it was chosen, or shows a `(blank)` placeholder when none applies, so the landing workspace is visible at a glance
 
 **Plans**: 3 plans
+**Wave 1**
+
 - [ ] 13-01-PLAN.md — Implement workspace derivation and TUI title end-to-end
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 13-02-PLAN.md — Comprehensive unit and integration tests for resolution, prefill, and deduplication
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 13-03-PLAN.md — Daemon parity and README documentation
 
 ### Phase 14: Managed Worktree Identity
@@ -85,6 +94,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Requirements**: WTID-01, WTID-02, WTID-03, WTID-04
 
 **Success Criteria** (what must be TRUE):
+
   1. Two repositories never resolve to the same managed worktree path, verified across TUI and daemon state files and after a state reset
   2. Existing managed checkouts work unchanged under the new identity scheme (no deletions, no re-cloning, in-place migration)
   3. When a collision is detected, baude names the repository that owns the path and offers non-destructive resolution instead of a hard error
@@ -101,6 +111,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Requirements**: PERF-01, PERF-02, PERF-03, PERF-04
 
 **Success Criteria** (what must be TRUE):
+
   1. A timing facility (env var or flag) logs each startup stage's duration so a slow launch can be diagnosed without a debugger
   2. The first frame renders before session restore and the first metadata poll complete
   3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
@@ -117,6 +128,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Requirements**: UX-01
 
 **Success Criteria** (what must be TRUE):
+
   1. Pane focus (Claude pane or expanded shell pane) is remembered when the user switches to a different session and back
   2. A keyboard shortcut toggles focus between the Claude pane and shell pane while both are visible
 
@@ -131,6 +143,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 **Requirements**: SHIP-05
 
 **Success Criteria** (what must be TRUE):
+
   1. All tests pass (`cargo test --workspace`)
   2. Clippy reports no warnings (`cargo clippy -D warnings`)
   3. Terminal smoke test confirms the new defaults, workspace derivation, and startup performance work end-to-end
