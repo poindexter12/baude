@@ -7,7 +7,7 @@
 <domain>
 ## Phase Boundary
 
-Opening baude from any folder with no arguments uses the right workspace and repository. The workspace is derived from the launch folder when nothing explicit is set: nearest recorded folder binding walking up from the launch dir, else the repository root's folder name. New-session and open paths default to the launch repository's git root ahead of `new_session_dir`. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `folder_context` keep priority. `bauded` applies the same rule. Requirements: WSPC-01..04, OPEN-01..04. Managed worktree path identity (Phase 14), startup performance (Phase 15), pane focus (Phase 16) are out of this phase.
+Opening baude from any folder with no arguments uses the right workspace and repository. The workspace is derived from the launch folder when nothing explicit is set: nearest recorded folder binding walking up from the launch dir, else the repository root's folder name. New-session and open paths default to the launch repository's git root ahead of `new_session_dir`. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `folder_context` keep priority. `bauded` applies the same rule. Requirements: WSPC-01..05, OPEN-01..04. WSPC-05 (added during discuss, 2026-09-19): the TUI shows a clear title at the top naming the active workspace. Managed worktree path identity (Phase 14), startup performance (Phase 15), pane focus (Phase 16) are out of this phase.
 
 </domain>
 
@@ -38,6 +38,12 @@ Opening baude from any folder with no arguments uses the right workspace and rep
 - Tests: unit tests for the ancestor walk, derivation, sanitization, and precedence under the existing TestRedirect fixtures; app-level tests for `n` prefill (inside and outside a repo) and subfolder admission; a daemon test for parity. No test may touch the real `~/.config/baude`.
 - No automatic migration of sessions already in the `claude` workspace; existing bindings keep routing the iarx-com and joese-iarx trees to `claude`. README explains how to rebind a folder.
 
+### Workspace title (WSPC-05, added by Joe during discuss)
+- The TUI shows a clear title at the top of the whole window naming the active workspace, so it is obvious which workspace a launch landed in.
+- The title also shows how the workspace was chosen: explicit (env or config), bound (folder binding), or derived (repo-root name). Wording is Claude's discretion; keep it to one short line.
+- When no workspace applies (implicit default, nothing explicit, bound, or derived), show a placeholder such as `(blank)` rather than the literal default name, so an unconfigured launch is visibly unconfigured.
+- Render in the existing top chrome (reuse the current header or sidebar title area rather than adding a new row when possible); remote-attach and daemon-backed views show the daemon's workspace the same way.
+
 ### Claude's Discretion
 - Exact placement of the shared resolver (new module vs. extending `folder_workspace::plan_launch`) and the walk's stop condition implementation.
 - Whether the derived binding is written before or after the workspace lock is claimed, as long as a lock refusal does not leave a half-written binding file.
@@ -52,6 +58,7 @@ Opening baude from any folder with no arguments uses the right workspace and rep
 - `baude-core/src/workspace.rs:144-151` resolution chain and `workspace::sanitize` (99-111); `DEFAULT = "claude"` (58); `initialize` (276).
 - `baude/src/main.rs:343-347` launch dir (argv[1] or cwd, canonicalized); `main.rs:359-370` plan_launch plus initialize.
 - `baude/src/app.rs:4042-4056` `n` prompt prefill (`config.new_session_dir` else launch dir); `app.rs:2815-2817` the only existing `git::repo_root` fallback; `app.rs:4723-4777` `open_repo_session_via` -> `git::discover_repository` -> admission; `app.rs:1321-1324` startup auto-admission.
+- `baude/src/ui.rs:223` outer block title `" baude v<version> "` is the existing top-of-window chrome for WSPC-05; `ui.rs:1283` already calls `baude_core::workspace::active().display_label()` (info overlay), so a display label exists to reuse.
 - `bauded/src/manager.rs:808` daemon admission equivalent; daemon state file `daemon-state-<ws>.json` (manager.rs:36).
 - Tests to extend: `workspace.rs:656-810` (defaulting chain), `folder_workspace.rs:148-214` (folder memory), `app.rs:8348-8482` (`admit_repository_*`).
 

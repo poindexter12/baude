@@ -16,6 +16,7 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 - [ ] **WSPC-02**: With no binding on any ancestor, baude derives the workspace from the launch repository root's folder name (sanitized) and records a binding for that root so later launches are stable
 - [ ] **WSPC-03**: Explicit `BAUDE_WORKSPACE`, config `workspace`, and the `folder_context` flow keep priority over derivation, and the README documents the full precedence and the derivation rule
 - [ ] **WSPC-04**: `bauded` resolves the workspace by the same rule for the same launch dir, so TUI and daemon agree on the workspace
+- [ ] **WSPC-05**: The TUI shows a clear title at the top naming the active workspace (and whether it was explicit, bound, or derived); when no workspace applies it shows a placeholder such as `(blank)`
 
 ### New-session and open defaults
 
@@ -88,6 +89,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WSPC-02 | Phase 13 | Pending |
 | WSPC-03 | Phase 13 | Pending |
 | WSPC-04 | Phase 13 | Pending |
+| WSPC-05 | Phase 13 | Pending |
 | OPEN-01 | Phase 13 | Pending |
 | OPEN-02 | Phase 13 | Pending |
 | OPEN-03 | Phase 13 | Pending |
@@ -104,8 +106,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SHIP-05 | Phase 17 | Pending |
 
 **Coverage:**
-- v2.3 requirements: 18 total
-- Mapped to phases: 18
+- v2.3 requirements: 19 total
+- Mapped to phases: 19
 - Unmapped: 0 ✓
 
 ---

@@ -61,7 +61,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 **Depends on**: Nothing (first phase of this milestone)
 
-**Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, OPEN-01, OPEN-02, OPEN-03, OPEN-04
+**Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, WSPC-05, OPEN-01, OPEN-02, OPEN-03, OPEN-04
 
 **Success Criteria** (what must be TRUE):
   1. User launches baude from a subfolder of a repository and the correct workspace is used (either from a recorded folder binding or derived from the repo root folder name)
@@ -69,6 +69,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   3. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `BAUDE_BACKEND` env/config still override derivation and recorded bindings
   4. Launching baude from different subfolders of the same repository and from its root all admit the same repository row (no duplicates)
   5. The README documents the full derivation rule, precedence chain, and examples for workspace and default-path selection
+  6. The top title of the TUI names the active workspace and how it was chosen, or shows a `(blank)` placeholder when none applies, so the landing workspace is visible at a glance
 
 **Plans**: TBD
 
