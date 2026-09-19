@@ -344,20 +344,42 @@ claimed before the gate is answered.
 
 ## Publish Authorization
 
-_Not authorized. v2.2.0 remains unpublished; PR #88 is held._
+**Publish authorized by:** Joe Seymour on 2026-09-19
 
-**Publish deliberately deferred on 2026-09-17** by Joe Seymour, at an explicit
-publish checkpoint that named the consequences and summarized the evidence. This
-is a decision, not an unfinished step: the release machinery is proven and the
-automated gates are green, but the human-observed half of SHIP-03 is thinner
-than the requirement imagined (bulk attestation, one leg individually reported,
-three signed gaps, Linux deferred). Holding rather than publishing on that basis
-is the requirement working as designed.
+Authorization given at plan 12-05's second blocking-human checkpoint, after an
+earlier deliberate deferral on 2026-09-17. The deferral and this authorization
+are both recorded; the hold was lifted only by this line.
 
-Resume by re-running the publish decision — nothing needs redoing. PR #88 stays
-safe from `release-automerge.yml` for as long as `release:hold` is on it.
+### Evidence the authorization rests on
 
-To authorize, this section must carry a line of the form
-`**Publish authorized by:** <name> on <YYYY-MM-DD>` — a distinct sentinel from
-the merge record above, so a merge approval can never be mistaken for a publish
-approval (plan 12-05 Task 3's gate gates on exactly this heading and line).
+- Release PR [#88](https://github.com/poindexter12/baude/pull/88)
+  `chore(main): release 2.2.0`, MERGEABLE/CLEAN, 11/11 checks green, bumping
+  `2.1.5 -> 2.2.0` across `.release-please-manifest.json`, root `Cargo.toml`,
+  `baude/`, `baude-core/`, `bauded/` and `Cargo.lock`, with the
+  `x-release-please-version` pin on `baude-core` moving in step.
+- CHANGELOG generated from the full conventional-commit set — the merge-commit
+  strategy chosen at PR #87 worked: every phase 8-11 `feat` is present. A squash
+  would have collapsed this to one line or cut no release at all (PR #86's
+  precedent).
+- Phases 8-11 all COMPLETE with `verification_status: passed`, re-verified at
+  HEAD `ee6fa3c` on 2026-09-18 with no regressions: 646 tests / 0 failed,
+  `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+  both exit 0.
+
+### What this authorization does NOT claim
+
+SHIP-03's human evidence is a labeled bulk attestation, not a leg-by-leg
+walkthrough, and three signed gaps ride into this release unclosed:
+
+1. LINK-01's label-vs-destination distinction was never visually narrated.
+2. The reported mouse-click link opening was iTerm2's own URL handling, not
+   baude's keyboard activation path.
+3. TKEY-01/TKEY-02 rest on automated coverage plus a set-level attestation, not
+   on a confirmed live keystroke.
+
+The Linux smoke session was never run; legs 1-4 and 8-9 there are covered only
+by `check (ubuntu-22.04)`, and legs 5-7 and 10-12 are deferred with sign-off.
+
+v2.2.0 ships on strong automated evidence and thin human-observed evidence, and
+that distinction is recorded here deliberately so a future bug report can be
+read against what was actually checked.
