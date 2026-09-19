@@ -2,11 +2,13 @@
 gsd_state_version: "1.0"
 milestone: v2.3
 milestone_name: Launch Defaults and Startup Speed
-status: planning
-last_updated: "2026-09-19T18:14:39.490Z"
+current_phase: 13
+current_phase_name: Workspace Derivation and New-Session/Open Defaults
+status: ready_to_plan
+last_updated: "2026-09-19T19:00:00.000Z"
 last_activity: 2026-09-19
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +22,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-09-19)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Planning next milestone (v2.2 shipped 2026-09-19)
+**Current focus:** Roadmap created for v2.3; ready to plan phases (v2.2.0 shipped 2026-09-19)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 13 (Workspace Derivation and New-Session/Open Defaults)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-09-19 — Milestone v2.3 started
+Status: Ready to plan
+Last activity: 2026-09-19 — Roadmap created for v2.3 milestone
 
 ## Performance Metrics
 
@@ -156,29 +158,29 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: meta::claude_config_dir isolates by ambient redirect, not by parameter: both ClaudeMeta::poll call sites keep their signatures and neither gains an _at variant (D-03).
 - [Phase 08]: The three real-root resolvers (meta CLAUDE_CONFIG_DIR, persist XDG+baude, git XDG+/tmp tail) stay separate — same shape, different heads and tails; collapsing them would change production behavior.
 - [Phase 08]: bauded's duplicate config resolver was deleted rather than separately guarded; its chain was byte-identical to persist's, so production paths and the already-written VAPID key are unchanged (T-08-08 still accepted).
-- [Phase 08]: Phase 08 plan 03: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
-- [Phase 08]: Phase 08 plan 03: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
-- [Phase 08]: Phase 08 plan 03: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
-- [Phase 08]: Phase 08 plan 03: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
-- [Phase 08]: 08-04: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
-- [Phase 08]: 08-04: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
-- [Phase 08]: 08-04: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
-- [Phase 08]: 08-04: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
-- [Phase 08]: 08-04: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
-- [Phase 08]: 08-04: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
-- [Phase 08]: 08-08: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
-- [Phase 08]: 08-08: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
-- [Phase 08]: 08-08: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
-- [Phase 08]: 08-08: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
-- [Phase 08]: 08-05: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
-- [Phase 08]: 08-05: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
-- [Phase 08]: 08-05: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
-- [Phase 08]: 08-05 DEVIATION: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
-- [Phase 08]: 08-06: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
-- [Phase 08]: 08-06: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
-- [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
-- [Phase 08]: 08-07: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
-- [Phase 08]: 08-07: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
+- [Phase 08 plan 03]: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
+- [Phase 08 plan 03]: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
+- [Phase 08 plan 03]: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
+- [Phase 08 plan 03]: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
+- [Phase 08-04]: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
+- [Phase 08-04]: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
+- [Phase 08-04]: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
+- [Phase 08-04]: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
+- [Phase 08-04]: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
+- [Phase 08-04]: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
+- [Phase 08-08]: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
+- [Phase 08-08]: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
+- [Phase 08-08]: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
+- [Phase 08-08]: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
+- [Phase 08-05]: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
+- [Phase 08-05]: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
+- [Phase 08-05]: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
+- [Phase 08-05 DEVIATION]: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
+- [Phase 08-06]: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
+- [Phase 08-06]: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
+- [Phase 08-06]: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
+- [Phase 08-07]: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
+- [Phase 08-07]: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
 - [Phase 09]: Seed warnings are return values crossing the crate seam (SeedWarning{file,reason}); binaries own presentation — TUI set_message every time, stderr once per process.
 - [Phase 09]: read_settings_guarded four-way disposition is one shared pub(crate) helper: NotFound = fresh seed; unreadable/unparseable/non-object root = refuse byte-identical + warn, never overwrite.
 - [Phase 09]: bauded held-lock test asserts the existing first-save contention surface (option a); no startup claim added - WLOCK contract unchanged beyond tests
@@ -242,13 +244,7 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 | verification | Phase 1/3/4 human-needed verification artifacts | pending |
 | deferred | First-real-phone Web Push verification from v0.5 | pending |
 
-## Session Continuity
-
-Last session: 2026-09-17T17:47:38.892Z
-Stopped at: Phase 8 complete, ready to plan Phase 09
-Resume file: None
-
-## Deferred Items
+## Deferred Items from Milestone Closure
 
 Items acknowledged and deferred at milestone close, most recent first:
 
@@ -269,6 +265,12 @@ Items acknowledged and deferred at milestone close, most recent first:
 | deferred_items | 10/deferred-items.md: 10-04 flaky bauded lifecycle test (failed once 356/357, passed on rerun; flake-hunt candidate) | acknowledged | 2026-09-19 | v2.2 |
 | deferred_items | 11/deferred-items.md: pre-existing clippy failures (resolved in 12-01; vendored vt100 lint header had masked baude lints) | acknowledged | 2026-09-19 | v2.2 |
 
+## Session Continuity
+
+Last session: 2026-09-19T19:00:00.000Z
+Stopped at: Roadmap created for v2.3, ready to plan Phase 13
+Resume file: None
+
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Start planning Phase 13 with `/gsd-plan-phase 13`

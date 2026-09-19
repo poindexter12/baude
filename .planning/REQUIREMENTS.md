@@ -84,30 +84,30 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WSPC-01 | TBD | Pending |
-| WSPC-02 | TBD | Pending |
-| WSPC-03 | TBD | Pending |
-| WSPC-04 | TBD | Pending |
-| OPEN-01 | TBD | Pending |
-| OPEN-02 | TBD | Pending |
-| OPEN-03 | TBD | Pending |
-| OPEN-04 | TBD | Pending |
-| WTID-01 | TBD | Pending |
-| WTID-02 | TBD | Pending |
-| WTID-03 | TBD | Pending |
-| WTID-04 | TBD | Pending |
-| PERF-01 | TBD | Pending |
-| PERF-02 | TBD | Pending |
-| PERF-03 | TBD | Pending |
-| PERF-04 | TBD | Pending |
-| UX-01 | TBD | Pending |
-| SHIP-05 | TBD | Pending |
+| WSPC-01 | Phase 13 | Pending |
+| WSPC-02 | Phase 13 | Pending |
+| WSPC-03 | Phase 13 | Pending |
+| WSPC-04 | Phase 13 | Pending |
+| OPEN-01 | Phase 13 | Pending |
+| OPEN-02 | Phase 13 | Pending |
+| OPEN-03 | Phase 13 | Pending |
+| OPEN-04 | Phase 13 | Pending |
+| WTID-01 | Phase 14 | Pending |
+| WTID-02 | Phase 14 | Pending |
+| WTID-03 | Phase 14 | Pending |
+| WTID-04 | Phase 14 | Pending |
+| PERF-01 | Phase 15 | Pending |
+| PERF-02 | Phase 15 | Pending |
+| PERF-03 | Phase 15 | Pending |
+| PERF-04 | Phase 15 | Pending |
+| UX-01 | Phase 16 | Pending |
+| SHIP-05 | Phase 17 | Pending |
 
 **Coverage:**
 - v2.3 requirements: 18 total
-- Mapped to phases: 0
-- Unmapped: 18 ⚠️
+- Mapped to phases: 18
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-09-19*
-*Last updated: 2026-09-19 after initial definition*
+*Last updated: 2026-09-19 after roadmap creation*

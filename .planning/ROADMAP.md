@@ -5,8 +5,9 @@
 - ✅ **v0.7 Session Visibility** — Phases 1-4 (shipped 2026-07-02) ([archive](milestones/v0.7-ROADMAP.md))
 - ✅ **v2.0 Local TUI Dogfood Release** — Phases 5-7 (shipped 2026-09-03) ([archive](milestones/v2.0-ROADMAP.md))
 - ✅ **v2.2 Reliability and Terminal Usability** — Phases 8-12 (shipped 2026-09-19 as v2.2.0) ([archive](milestones/v2.2-ROADMAP.md))
+- 🚧 **v2.3 Launch Defaults and Startup Speed** — Phases 13-17 (in progress)
 
-v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases. Next phase number: 13.
+v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases.
 
 ## Phases
 
@@ -44,6 +45,105 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 </details>
 
+## v2.3 Launch Defaults and Startup Speed (Phases 13-17)
+
+- [ ] **Phase 13: Workspace Derivation and New-Session/Open Defaults** - Opening baude from any folder uses the right workspace and repository
+- [ ] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions
+- [ ] **Phase 15: Startup Performance** - Startup is measurable and reaches the first frame quickly
+- [ ] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches
+- [ ] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation
+
+## Phase Details
+
+### Phase 13: Workspace Derivation and New-Session/Open Defaults
+
+**Goal**: Opening baude from any folder automatically uses the right workspace and repository, with recorded defaults and explicit config still winning.
+
+**Depends on**: Nothing (first phase of this milestone)
+
+**Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, OPEN-01, OPEN-02, OPEN-03, OPEN-04
+
+**Success Criteria** (what must be TRUE):
+  1. User launches baude from a subfolder of a repository and the correct workspace is used (either from a recorded folder binding or derived from the repo root folder name)
+  2. The new-session (`n`) prompt prefills the git toplevel when launched inside a repo, or the configured `new_session_dir` when launched outside any repository
+  3. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `BAUDE_BACKEND` env/config still override derivation and recorded bindings
+  4. Launching baude from different subfolders of the same repository and from its root all admit the same repository row (no duplicates)
+  5. The README documents the full derivation rule, precedence chain, and examples for workspace and default-path selection
+
+**Plans**: TBD
+
+### Phase 14: Managed Worktree Identity
+
+**Goal**: Managed worktrees carry stable repository identity preventing cross-repo collisions and enabling safe in-place migration.
+
+**Depends on**: Phase 13
+
+**Requirements**: WTID-01, WTID-02, WTID-03, WTID-04
+
+**Success Criteria** (what must be TRUE):
+  1. Two repositories never resolve to the same managed worktree path, verified across TUI and daemon state files and after a state reset
+  2. Existing managed checkouts work unchanged under the new identity scheme (no deletions, no re-cloning, in-place migration)
+  3. When a collision is detected, baude names the repository that owns the path and offers non-destructive resolution instead of a hard error
+  4. `baude worktrees scan` reports the owning repository for each managed checkout and surface any collisions with ownership info
+
+**Plans**: TBD
+
+### Phase 15: Startup Performance
+
+**Goal**: Startup is measurable and reaches the first frame quickly, without blocking on external services.
+
+**Depends on**: Phase 14
+
+**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04
+
+**Success Criteria** (what must be TRUE):
+  1. A timing facility (env var or flag) logs each startup stage's duration so a slow launch can be diagnosed without a debugger
+  2. The first frame renders before session restore and the first metadata poll complete
+  3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
+  4. Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
+
+**Plans**: TBD
+
+### Phase 16: Pane Focus UX
+
+**Goal**: Users can keep consistent pane focus (Claude or shell) across session switches.
+
+**Depends on**: Phase 15
+
+**Requirements**: UX-01
+
+**Success Criteria** (what must be TRUE):
+  1. Pane focus (Claude pane or expanded shell pane) is remembered when the user switches to a different session and back
+  2. A keyboard shortcut toggles focus between the Claude pane and shell pane while both are visible
+
+**Plans**: TBD
+
+### Phase 17: Validation and v2.3.0 Release
+
+**Goal**: v2.3.0 is published after tests, CI, and smoke validation confirm stability and the new features work end-to-end.
+
+**Depends on**: Phase 16
+
+**Requirements**: SHIP-05
+
+**Success Criteria** (what must be TRUE):
+  1. All tests pass (`cargo test --workspace`)
+  2. Clippy reports no warnings (`cargo clippy -D warnings`)
+  3. Terminal smoke test confirms the new defaults, workspace derivation, and startup performance work end-to-end
+  4. Release notes and README reflect the new workspace derivation behavior, new-session defaults, worktree identity scheme, and startup improvements
+
+**Plans**: TBD
+
+## Progress Table
+
+| Phase | Plans Complete | Status | Completed |
+|-------|----------------|--------|-----------|
+| 13. Workspace Derivation and New-Session/Open Defaults | 0/? | Not started | - |
+| 14. Managed Worktree Identity | 0/? | Not started | - |
+| 15. Startup Performance | 0/? | Not started | - |
+| 16. Pane Focus UX | 0/? | Not started | - |
+| 17. Validation and v2.3.0 Release | 0/? | Not started | - |
+
 ## Backlog
 
 See `.planning/BACKLOG.md`:
@@ -53,4 +153,4 @@ See `.planning/BACKLOG.md`:
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
 
 ---
-*Last updated: 2026-09-13. Phases 8 and 9 re-scoped against shipped v2.1.2-v2.1.5 code.*
+*Last updated: 2026-09-19. Roadmap created for v2.3 milestone.*
