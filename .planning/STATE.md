@@ -1,21 +1,16 @@
 ---
 gsd_state_version: "1.0"
-milestone: v2.2
-milestone_name: Reliability and Terminal Usability
-status: Awaiting next milestone
-stopped_at: Phase 8 complete, ready to plan Phase 09
-last_updated: "2026-09-19T18:05:20.300Z"
+milestone: v2.3
+milestone_name: Launch Defaults and Startup Speed
+status: planning
+last_updated: "2026-09-19T18:14:39.490Z"
 last_activity: 2026-09-19
-last_activity_desc: Milestone v2.2 completed and archived
-state_head: b1038fdf54c6a00d6b7ee0f4d7e1907bbab3b245
 progress:
-  total_phases: 5
-  completed_phases: 4
-  total_plans: 25
-  completed_plans: 25
-  percent: 80
-current_phase: 09
-current_phase_name: Hook Seeding Safety
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -29,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-09-19)
 
 ## Current Position
 
-Phase: Milestone v2.2 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-09-19 — Milestone v2.2 completed and archived
+Status: Defining requirements
+Last activity: 2026-09-19 — Milestone v2.3 started
 
 ## Performance Metrics
 

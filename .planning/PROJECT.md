@@ -18,9 +18,15 @@ and act on it — whether you're at the terminal or on your phone.
 
 v2.2.0 is the current release and the source baseline for the next milestone. The latest GSD-completed milestone is v2.2 through Phase 12 (phases 8-12, archived under `milestones/v2.2-*`). The codebase is about 51.6k lines of Rust across `baude-core`, `baude`, and `bauded`.
 
-## Current Milestone
+## Current Milestone: v2.3 Launch Defaults and Startup Speed
 
-None active. v2.2 shipped 2026-09-19; the next milestone is being defined via `/gsd-new-milestone`.
+**Goal:** Opening baude from any folder with no arguments lands in the right workspace, offers the right repo, never collides with another repo's worktrees, and reaches the first frame fast.
+
+**Target features:**
+- Derive the workspace from the launch folder when nothing is passed: nearest recorded folder binding walking up from the launch dir, else the repo root's folder name; explicit env/config still win and the derived binding is recorded.
+- Default new-session and open paths to the launch repository's git root, ahead of `new_session_dir`, which applies only outside any repository.
+- Give managed worktree paths a stable repository identity so `repository-<key>` collisions across TUI and daemon state files (or after a state reset) cannot happen; migrate existing worktrees in place without deleting anything.
+- Make startup measurable and fast: a timing facility, a non-blocking kitty keyboard probe, and lazy or parallel session restore with far fewer full-state fsyncs so the first frame renders before the first metadata poll.
 
 ## Requirements
 
@@ -62,7 +68,10 @@ None active. v2.2 shipped 2026-09-19; the next milestone is being defined via `/
 
 <!-- Current milestone scope. -->
 
-(None — the next milestone's requirements are defined in REQUIREMENTS.md via `/gsd-new-milestone`.)
+- [ ] Workspace derives from the launch folder when nothing is passed (nearest ancestor binding, else repo-root name), with explicit env/config still winning.
+- [ ] New-session and open default to the launch repository's git root; `new_session_dir` applies only outside a repository.
+- [ ] Managed worktree paths carry a stable repository identity; no `repository-<key>` collisions across TUI/daemon state or after a reset; existing worktrees migrate in place.
+- [ ] Startup is measurable (timing facility) and fast (non-blocking keyboard probe, lazy/parallel restore, batched state writes, first frame before first poll).
 
 ### Out of Scope
 
@@ -135,4 +144,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-19 after v2.2 milestone*
+*Last updated: 2026-09-19 after v2.3 milestone start*
