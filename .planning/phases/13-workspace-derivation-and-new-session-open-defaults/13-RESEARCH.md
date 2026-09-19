@@ -547,22 +547,19 @@ Existing test suites already pass `Some(&fixture_root)` to `plan_launch` and `re
 
 **All HIGH-confidence claims verified by reading source code this session. MEDIUM-confidence claims from existing documentation or test patterns.**
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Workspace display hint exact wording:**
    - What we know: Requirement is to show how workspace was chosen: explicit, bound, or derived; placeholder `(blank)` when implicit default applies.
-   - What's unclear: Exact short string to display (e.g., `(explicit)`, `from env`, `explicit: BAUDE_WORKSPACE`, etc.); where in title to place it (before or after workspace name).
-   - Recommendation: Define in PLAN.md after this research completes; UI can use `display_hint()` method that returns the string, making wording a non-breaking change.
+   - **RESOLVED:** 13-01-PLAN.md specifies the `display_hint()` method returns one of four strings: `(explicit)`, `(folder binding)`, `(derived)`, or `(default)`. UI integration at `ui.rs:223` includes the hint via `workspace::active().display_hint()` in the title. Exact wording per plan 01 action.
 
 2. **Ancestor walk home detection on non-UNIX systems:**
    - What we know: Phase decision says walk to `$HOME` or filesystem root; tests will use `TestRedirect` which provides a fixture home.
-   - What's unclear: How to reliably detect filesystem root on Windows or other non-POSIX systems; whether `path.pop()` + `current == home` check is portable.
-   - Recommendation: Use `std::path::PathBuf`'s built-in methods and test on CI matrix (Linux + macOS confirmed; Windows deferred if not in CI scope).
+   - **RESOLVED:** 13-02-PLAN.md TDD task 1 includes explicit test coverage: `test_find_binding_stops_at_home` verifies walk does not continue above home; edge case test handles launch_dir outside home (filesystem root stop). Implementation in 13-01 uses `current.pop()` loop with `current == home` boundary check, standard Rust `Path` methods. Tests verify behavior; platform-specific corner cases (Windows) would be caught by CI test matrix.
 
 3. **Recording binding write timing relative to lock claim:**
    - What we know: Locked decision says "as long as lock refusal does not leave half-written binding file."
-   - What's unclear: Should binding write happen BEFORE lock is claimed (and fail open if write fails), or AFTER lock is claimed (and fail if write fails after lock)?
-   - Recommendation: Implement as AFTER lock claim; if lock refusal occurs, don't write binding (it will be derived again next launch, and derivation is idempotent).
+   - **RESOLVED:** 13-01-PLAN.md key_links section (line 119-120) specifies: "Recording (lines 399-411) is unchanged; it writes the hint to folder-workspaces.json after lock claim, making the binding durable for future launches." Binding write happens AFTER workspace lock is claimed per main.rs:399-411 flow.
 
 ## Environment Availability
 
