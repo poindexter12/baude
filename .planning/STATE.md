@@ -104,6 +104,7 @@ Last activity: 2026-09-20 — Phase 13 complete, transitioned to Phase 14
 Recent decisions affecting current work (full log in PROJECT.md):
 
 - [Phase 15 pre-planning, 2026-09-20]: PERF-05 locked to static status glyphs — the wall-clock spinner and ~1.4 Hz waiting flash in baude/src/ui.rs are replaced by a fixed busy/thinking icon and a fixed needs-input marker, so redraws happen only on input, PTY output, status transitions, and resize (user decision; no animation timer remains)
+- [Phase 15 pre-planning, 2026-09-20]: UX-02 added to Phase 15 — status glyphs become static single-character codes (`?` waiting for input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable) readable without a key, plus an in-app legend; shares the ui.rs sites PERF-05 touches, so it ships in the same phase (user decision; exact characters confirmed at Phase 15 discuss)
 - 2026-09-20 Phase 13: one shared `launch::start_workspace` resolver for TUI and daemon; held lock refuses startup (no binding written); derived bindings keyed by repo root; title shows `name (source)` or `(blank)`.
 - 2026-09-20 Phase 13: verifier wrote a placeholder `covered_digest` and source-only `covered_files`; orchestrator recomputed the digest via the library and added the phase artifacts so `verification.status` reads `passed`.
 - 2026-09-19 Phase 13 plans accepted for execution after 4 Codex convergence cycles (25→21→20→19 unresolved) plus a targeted revision of all cycle-4 HIGHs; Joe chose execution over a fifth review cycle. Outcome table in 13-REVIEWS.md.

@@ -116,7 +116,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 **Depends on**: Phase 14
 
-**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04, PERF-05, PERF-06, PERF-07, PERF-08
+**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04, PERF-05, PERF-06, PERF-07, PERF-08, UX-02
 
 **Success Criteria** (what must be TRUE):
 
@@ -128,6 +128,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   6. Idle per-session polling touches only live, non-archived rows and skips unchanged files, so CPU no longer grows with the session count
   7. An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and the user can see which children are suspended
   8. The usage poller can be disabled or slowed from config
+  9. Every session and checkout row shows a static single-character status code (`?` waiting, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable) that is readable without a key, with an in-app legend; the old circle and spinner glyphs are gone
 
 **Plans**: TBD
 

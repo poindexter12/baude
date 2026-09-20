@@ -131,6 +131,7 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 | The TUI title renders `name (source)` for explicit, bound, and derived workspaces and exactly `(blank)` for the implicit default | An unconfigured launch should look unconfigured instead of showing the backend name as if chosen | ✓ Good — Phase 13 (Joe's request) |
 | Phase 13 plans went through four Codex convergence cycles then executed with remaining findings accepted; the 13-02 TDD gate (no `feat(13-02)` GREEN commit) was accepted as debt | Each cycle surfaced new source-level facts rather than regressions; the tests exist and pass | ⚠️ Revisit — split behavior fixes out of test commits in later TDD plans |
 | Replace the wall-clock spinner and needs-input flash with static status glyphs (2026-09-20) | Timer-driven animation forces a repaint every tick even when nothing changed; a static busy/thinking icon lets the dirty-flag redraw fire only on real state changes, which is what makes idle CPU reach zero | — Pending (Phase 15, PERF-05) |
+| Status indicators become single-character codes (`?` `B` `✓` `✗` `-` `A` `!`) with color as a secondary cue (2026-09-20) | Filled/empty circles and blue-vs-yellow carried meaning only with a mental key; a static indicator has no motion to hint at state, so the character itself must say what is happening | — Pending (Phase 15, UX-02) |
 
 ## Evolution
 
