@@ -17,11 +17,13 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 dirs.workspace = true
 libc = "0.2"
 portable-pty = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 ureq = { version = "2", features = ["json"] }
 # Vendored fork of vt100 0.15.2 with OSC 8 hyperlink support (per-cell link
 # ids); upstream has no OSC 8 through 0.16.2. See vendor/vt100/README.md.
