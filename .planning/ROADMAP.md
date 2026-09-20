@@ -72,14 +72,14 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   5. The README documents the full derivation rule, precedence chain, and examples for workspace and default-path selection
   6. The top title of the TUI names the active workspace and how it was chosen, or shows a `(blank)` placeholder when none applies, so the landing workspace is visible at a glance
 
-**Plans**: 1/3 plans executed
+**Plans**: 2/3 plans executed
 **Wave 1**
 
 - [x] 13-01-PLAN.md — Implement workspace derivation and TUI title end-to-end
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 13-02-PLAN.md — Comprehensive unit and integration tests for resolution, prefill, and deduplication
+- [x] 13-02-PLAN.md — Comprehensive unit and integration tests for resolution, prefill, and deduplication
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -159,7 +159,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 13. Workspace Derivation and New-Session/Open Defaults | 1/3 | In Progress|  |
+| 13. Workspace Derivation and New-Session/Open Defaults | 2/3 | In Progress|  |
 | 14. Managed Worktree Identity | 0/? | Not started | - |
 | 15. Startup and Idle Performance | 0/? | Not started | - |
 | 16. Pane Focus UX | 0/? | Not started | - |
