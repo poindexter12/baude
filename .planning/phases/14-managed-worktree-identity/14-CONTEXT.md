@@ -78,3 +78,12 @@ Managed worktrees carry a stable repository identity so two repositories can nev
 - Automatic pruning of orphaned managed directories (stays behind the preview-and-opt-in flow).
 
 </deferred>
+
+## Revision Dispositions (Iteration 1)
+
+| Issue | Dimension | Severity | Fix Applied | Disposition |
+|-------|-----------|----------|-------------|-------------|
+| All plans lack "Artifacts this phase produces" | task_completeness | blocker | Added section to 14-01, 14-02, 14-03 listing new files, functions, types, updated signatures per plan | RESOLVED |
+| 14-02 Task 1 done criteria contradicts itself (cargo build succeeds + compiler errors exist) | task_completeness | blocker | Updated done criteria to state `cargo build --workspace` and `cargo test --workspace` succeed with no errors; removed compiler-error parenthetical | RESOLVED |
+| 14-02 Task 1 action contradicts itself (says "update all" then "fixed in later tasks") | task_completeness | blocker | Removed "will be updated in later tasks" sentence; added explicit call-site list (grep sources); confirmed all sites updated in this task via artifacts list | RESOLVED |
+| 14-02 Tasks 1,2,3 TDD tasks lack "Commits:" sections | task_completeness | warning | Added explicit commit shapes to all three tasks: 1. test(14-02): RED, 2. feat(14-02): GREEN; behavior changes never ride in test() commits | RESOLVED |
