@@ -102,6 +102,8 @@ pub fn find_binding(root: &Path, launch_dir: &Path, home: &Path) -> Option<Strin
 ///
 /// Discovers the repository root (if inside a git repository) and performs an
 /// ancestor walk to find recorded folder bindings, stopping at the home directory.
+/// Per the precedence reorder (D-02), BAUDE_BACKEND no longer suppresses the
+/// ancestor walk or derivation — it only affects fallback resolution.
 pub fn plan_launch(
     enabled: bool,
     ws_env: Option<&str>,
@@ -112,7 +114,7 @@ pub fn plan_launch(
     // Discover repository root via git (succeeds only if inside a repo).
     let repo_root = crate::git::repo_root(launch_dir);
 
-    if !enabled || ws_env.is_some() || backend_env.is_some() {
+    if !enabled || ws_env.is_some() {
         return LaunchPlan {
             repo_root,
             ..Default::default()
@@ -229,9 +231,10 @@ mod tests {
         // Kill switch off.
         let plan = plan_launch(false, None, None, Some(&dir), Path::new("/mem/api"));
         assert_eq!(plan, LaunchPlan::default());
-        // Either env var set: explicit choice, memory not even read.
+        // BAUDE_WORKSPACE env var suppresses memory read (explicit choice).
         let plan = plan_launch(true, Some("work"), None, Some(&dir), Path::new("/mem/api"));
         assert_eq!(plan, LaunchPlan::default());
+        // BAUDE_BACKEND env var no longer suppresses memory read (per D-02 precedence reorder).
         let plan = plan_launch(
             true,
             None,
@@ -239,7 +242,7 @@ mod tests {
             Some(&dir),
             Path::new("/mem/api"),
         );
-        assert_eq!(plan, LaunchPlan::default());
+        assert_eq!(plan.hint.as_deref(), Some("opencode"));
         // In-memory mode: no store to read, and recording is a no-op.
         record(None, Path::new("/mem/api"), "oss", 6);
         let plan = plan_launch(true, None, None, None, Path::new("/mem/api"));
@@ -277,5 +280,133 @@ mod tests {
         assert_eq!(applied_note("work", None, None, &config), None);
         assert_eq!(applied_note("claude", None, None, &Config::default()), None);
         assert_eq!(applied_note("oss", Some("oss"), None, &config), None);
+    }
+
+    #[test]
+    fn find_binding_at_parent_level_returns_parent_workspace() {
+        let _redirect = TestRedirect::new(scratch("find-binding-parent-root"));
+        let dir = scratch("find-binding-parent");
+        let parent = Path::new("/mem");
+        let home = Path::new("/home/user");
+
+        record(Some(&dir), parent, "poindexter12", 10);
+
+        let binding = find_binding(&dir, parent, home);
+        assert_eq!(binding.as_deref(), Some("poindexter12"));
+    }
+
+    #[test]
+    fn find_binding_at_grandparent_when_parent_has_no_binding() {
+        let _redirect = TestRedirect::new(scratch("find-binding-grandparent-root"));
+        let dir = scratch("find-binding-grandparent");
+        let grandparent = Path::new("/mem");
+        let parent = Path::new("/mem/api");
+        let launch_dir = Path::new("/mem/api/src");
+        let home = Path::new("/home/user");
+
+        record(Some(&dir), grandparent, "oss", 10);
+
+        let binding = find_binding(&dir, launch_dir, home);
+        assert_eq!(binding.as_deref(), Some("oss"));
+    }
+
+    #[test]
+    fn find_binding_nearest_wins_when_both_parent_and_grandparent_have_bindings() {
+        let _redirect = TestRedirect::new(scratch("find-binding-nearest-root"));
+        let dir = scratch("find-binding-nearest");
+        let grandparent = Path::new("/mem");
+        let parent = Path::new("/mem/api");
+        let launch_dir = Path::new("/mem/api/src");
+        let home = Path::new("/home/user");
+
+        record(Some(&dir), grandparent, "oss", 10);
+        record(Some(&dir), parent, "work", 20);
+
+        let binding = find_binding(&dir, launch_dir, home);
+        assert_eq!(binding.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn find_binding_stops_at_home_boundary() {
+        let _redirect = TestRedirect::new(scratch("find-binding-home-root"));
+        let dir = scratch("find-binding-home");
+        let above_home = Path::new("/");
+        let home = Path::new("/home/user");
+        let launch_dir = home;
+
+        record(Some(&dir), above_home, "should-not-find", 10);
+
+        let binding = find_binding(&dir, launch_dir, home);
+        assert_eq!(binding, None);
+    }
+
+    #[test]
+    fn find_binding_returns_none_when_no_binding_exists() {
+        let _redirect = TestRedirect::new(scratch("find-binding-none-root"));
+        let dir = scratch("find-binding-none");
+        let launch_dir = Path::new("/mem/api/src");
+        let home = Path::new("/home/user");
+
+        let binding = find_binding(&dir, launch_dir, home);
+        assert_eq!(binding, None);
+    }
+
+    #[test]
+    fn find_binding_at_home_with_binding_returns_some() {
+        let _redirect = TestRedirect::new(scratch("find-binding-at-home-root"));
+        let dir = scratch("find-binding-at-home");
+        let home = Path::new("/home/user");
+
+        record(Some(&dir), home, "bound-at-home", 10);
+
+        let binding = find_binding(&dir, home, home);
+        assert_eq!(binding.as_deref(), Some("bound-at-home"));
+    }
+
+    #[test]
+    fn find_binding_at_home_without_binding_returns_none() {
+        let _redirect = TestRedirect::new(scratch("find-binding-no-binding-root"));
+        let dir = scratch("find-binding-no-binding");
+        let home = Path::new("/home/user");
+
+        let binding = find_binding(&dir, home, home);
+        assert_eq!(binding, None);
+    }
+
+    #[test]
+    fn plan_launch_with_baude_backend_and_binding_returns_hint() {
+        let _redirect = TestRedirect::new(scratch("plan-launch-backend-root"));
+        let dir = scratch("plan-launch-backend");
+
+        let parent_dir = scratch("plan-launch-backend-parent");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let launch_dir = parent_dir.join("subfolder");
+        std::fs::create_dir_all(&launch_dir).unwrap();
+
+        record(Some(&dir), &parent_dir, "bound-workspace", 10);
+
+        // Per the plan: BAUDE_BACKEND does NOT suppress binding lookup.
+        // The hint should be returned even when BAUDE_BACKEND is set.
+        let plan = plan_launch(true, None, Some("opencode"), Some(&dir), &launch_dir);
+        assert_eq!(plan.hint.as_deref(), Some("bound-workspace"));
+    }
+
+    #[test]
+    fn plan_launch_with_baude_backend_and_no_binding_derives() {
+        let _redirect = TestRedirect::new(scratch("plan-launch-derive-root"));
+        let dir = scratch("plan-launch-derive");
+
+        // Create a temporary git repository to test derivation.
+        let repo_dir = scratch("plan-launch-derive-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(&["init"])
+            .current_dir(&repo_dir)
+            .output();
+
+        // Per the plan: BAUDE_BACKEND does NOT suppress derivation.
+        // When no binding exists, the repo_root should be returned for derivation.
+        let plan = plan_launch(true, None, Some("opencode"), Some(&dir), &repo_dir);
+        assert!(plan.repo_root.is_some());
     }
 }

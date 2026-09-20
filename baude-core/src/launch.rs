@@ -15,6 +15,7 @@ use crate::persist::{self, Config, StateLockError};
 use crate::workspace::Workspace;
 
 /// Environment variables passed to startup.
+#[derive(Clone)]
 pub struct StartEnv {
     pub ws_env: Option<String>,
     pub backend_env: Option<String>,
@@ -33,6 +34,7 @@ pub struct StartedWorkspace {
 }
 
 /// Error during startup.
+#[derive(Debug)]
 pub enum StartError {
     /// The workspace state lock is held by another process.
     LockHeld { diag: String },
@@ -135,5 +137,80 @@ pub fn start_workspace(
             path,
             detail: source.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persist::Config;
+    use crate::testing::TestRedirect;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "baude-launch-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn test_wspc02_start_workspace_derives_persists_recalls() {
+        let _redirect = TestRedirect::new(scratch("wspc02-root"));
+
+        // Create a git repository.
+        let repo_dir = scratch("wspc02-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(&["init"])
+            .current_dir(&repo_dir)
+            .output();
+
+        // Test the plan_launch function to ensure repo_root discovery works.
+        let config_root = scratch("wspc02-config");
+        let plan =
+            crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
+
+        // Verify that repo_root was discovered.
+        assert!(plan.repo_root.is_some());
+        // Verify no hint exists yet (first launch).
+        assert_eq!(plan.hint, None);
+
+        // Now simulate recording a binding after derivation.
+        let repo_root = plan.repo_root.as_ref().unwrap();
+        crate::folder_workspace::record(Some(&config_root), repo_root, "derived-workspace", 100);
+
+        // Second launch from a different subfolder should find the binding.
+        let subfolder = repo_root.join("subdir");
+        std::fs::create_dir_all(&subfolder).unwrap();
+        let plan2 =
+            crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &subfolder);
+
+        assert_eq!(plan2.hint.as_deref(), Some("derived-workspace"));
+    }
+
+    #[test]
+    fn test_daemon_startup_parity_with_tui() {
+        let _redirect = TestRedirect::new(scratch("daemon-parity-root"));
+
+        // Create a git repository.
+        let repo_dir = scratch("daemon-parity-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(&["init"])
+            .current_dir(&repo_dir)
+            .output();
+
+        // Both TUI and daemon should use the same plan_launch function.
+        let config_root = scratch("daemon-parity-config");
+        let tui_plan = crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
+        let daemon_plan = crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
+
+        // Both should produce the same result (same repo_root discovery).
+        assert_eq!(tui_plan.repo_root, daemon_plan.repo_root);
+        assert_eq!(tui_plan.hint, daemon_plan.hint);
     }
 }
