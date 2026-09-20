@@ -748,7 +748,7 @@ No ASVS V5 input validation required beyond existing canonicalization (already i
 
 All assumptions are documented for the planner and discuss-phase to confirm before execution.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 **(RESOLVED by CONTEXT.md locked decisions)**
 
