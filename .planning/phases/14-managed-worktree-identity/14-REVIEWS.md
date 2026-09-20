@@ -477,3 +477,13 @@ The three plans are **not execution-ready**. The most important corrections are:
 8. Replace the infeasible cross-binary test promise with core parity tests plus adapter tests.
 
 Overall phase risk: **HIGH**. The direction is sound, but the unresolved ownership race, prune-reference mapping, state-reset child recovery, and missing user-visible collision path directly threaten WTID-01 through WTID-03.
+
+## Convergence Outcome (2026-09-20)
+
+| Cycle | Reviewer | current_high | current_actionable | Replan commits |
+|-------|----------|--------------|--------------------|----------------|
+| 1 | codex | 15 | 8 | 8f65e9a, b976973 (checker revision) |
+| 2 | codex | 6 | 3 | 690f453, f9f83ab, a9e5704 (checker revisions) |
+| 3 | codex | 14 | 10 | 5036891, 27111c7 (targeted: all 14 HIGHs and 10 actionables) |
+
+Not converged to zero (23 -> 9 -> 24 unresolved). Cycle 2 resolved every cycle 1 HIGH; cycle 3 then raised fourteen new source-level findings one layer deeper (marker exclusivity, physical-key plumbing, scanner read-only contract, daemon reporting path, test placement). After cycle 3 Joe chose "fix the design-level HIGHs, then execute" over a fourth cycle. Every cycle 3 finding was resolved in the plans with a Cycle 3 disposition row, including one reversal of a cycle 2 orchestrator decision: human-readable collision and scan output DOES name the owner's canonical common dir and display name, because 14-CONTEXT.md lines 30 and 35 lock it. The gsd-plan-checker verdict on the final plans is recorded in STATE.md.

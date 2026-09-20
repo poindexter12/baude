@@ -108,6 +108,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - 2026-09-20 Phase 13: one shared `launch::start_workspace` resolver for TUI and daemon; held lock refuses startup (no binding written); derived bindings keyed by repo root; title shows `name (source)` or `(blank)`.
 - 2026-09-20 Phase 13: verifier wrote a placeholder `covered_digest` and source-only `covered_files`; orchestrator recomputed the digest via the library and added the phase artifacts so `verification.status` reads `passed`.
 - 2026-09-19 Phase 13 plans accepted for execution after 4 Codex convergence cycles (25→21→20→19 unresolved) plus a targeted revision of all cycle-4 HIGHs; Joe chose execution over a fifth review cycle. Outcome table in 13-REVIEWS.md.
+- 2026-09-20 Phase 14 plans accepted for execution after 3 Codex convergence cycles (23->9->24 unresolved) plus a targeted revision of all cycle-3 HIGHs and actionables; Joe chose execution over a fourth review cycle. One cycle-2 orchestrator decision was reversed to honor locked CONTEXT (canonical common dirs are shown in collision and scan output). Outcome table in 14-REVIEWS.md.
 - v2.0: Repository identity is canonical across main checkouts, subdirectories, symlinks, and linked worktrees.
 - v2.0: If the main checkout is not on the resolved default, preserve and show it; create or reuse a separate managed default-branch worktree.
 - v2.0: Opening never silently switches branches, fetches, or guesses a default branch.
