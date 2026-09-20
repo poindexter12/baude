@@ -166,7 +166,9 @@ pub fn read_marker(dir: &Path) -> Result<MarkerRead, io::Error> {
             // Check size (max 64 KiB)
             const MAX_MARKER_SIZE: u64 = 64 * 1024;
             if metadata.len() > MAX_MARKER_SIZE {
-                return Ok(MarkerRead::Invalid(InvalidReason::Oversized(metadata.len())));
+                return Ok(MarkerRead::Invalid(InvalidReason::Oversized(
+                    metadata.len(),
+                )));
             }
 
             // Now open and read the file (which is known to be non-symlink)
@@ -179,7 +181,9 @@ pub fn read_marker(dir: &Path) -> Result<MarkerRead, io::Error> {
                     // Check scheme version
                     const CURRENT_SCHEME_VERSION: u32 = 1;
                     if meta.scheme_version > CURRENT_SCHEME_VERSION {
-                        Ok(MarkerRead::Invalid(InvalidReason::SchemeTooNew(meta.scheme_version)))
+                        Ok(MarkerRead::Invalid(InvalidReason::SchemeTooNew(
+                            meta.scheme_version,
+                        )))
                     } else {
                         Ok(MarkerRead::Valid(meta))
                     }
@@ -197,9 +201,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::thread;
     use std::sync::{Arc, Barrier};
+    use std::thread;
 
+    #[allow(dead_code)]
     fn test_dir(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -217,7 +222,11 @@ mod tests {
         let digest1 = crate::repository::compute_repository_digest(test_bytes);
         let digest2 = crate::repository::compute_repository_digest(test_bytes);
         assert_eq!(digest1, digest2, "Same input should produce same digest");
-        assert_eq!(digest1.len(), 12, "Digest should be exactly 12 hex characters");
+        assert_eq!(
+            digest1.len(),
+            12,
+            "Digest should be exactly 12 hex characters"
+        );
     }
 
     #[test]
@@ -232,14 +241,23 @@ mod tests {
 
         // Write marker
         let result = write_marker(&test_dir, &meta);
-        assert!(matches!(result, Ok(MarkerWrite::Created)), "First write should create marker");
+        assert!(
+            matches!(result, Ok(MarkerWrite::Created)),
+            "First write should create marker"
+        );
 
         // Read marker back
         let read_result = read_marker(&test_dir);
-        assert!(matches!(read_result, Ok(MarkerRead::Valid(_))), "Should read valid marker");
+        assert!(
+            matches!(read_result, Ok(MarkerRead::Valid(_))),
+            "Should read valid marker"
+        );
 
         if let Ok(MarkerRead::Valid(read_meta)) = read_result {
-            assert_eq!(read_meta.canonical_common_dir, meta.canonical_common_dir, "Bytes should survive roundtrip");
+            assert_eq!(
+                read_meta.canonical_common_dir, meta.canonical_common_dir,
+                "Bytes should survive roundtrip"
+            );
             assert_eq!(read_meta.scheme_version, meta.scheme_version);
             assert_eq!(read_meta.recorded_at_ms, meta.recorded_at_ms);
         }
@@ -289,7 +307,10 @@ mod tests {
             .count();
 
         assert_eq!(created_count, 1, "Exactly one thread should create marker");
-        assert_eq!(already_owned_count, 1, "Exactly one thread should see already owned");
+        assert_eq!(
+            already_owned_count, 1,
+            "Exactly one thread should see already owned"
+        );
     }
 
     #[test]
@@ -314,7 +335,10 @@ mod tests {
         };
 
         let result2 = write_marker(&test_dir, &meta2);
-        assert!(matches!(result2, Err(MarkerError::OwnedByOther(_))), "Should reject foreign marker");
+        assert!(
+            matches!(result2, Err(MarkerError::OwnedByOther(_))),
+            "Should reject foreign marker"
+        );
     }
 
     #[test]
@@ -350,7 +374,10 @@ mod tests {
             .filter(|r| matches!(r, Ok(MarkerWrite::Created)))
             .count();
 
-        assert_eq!(created_count, 1, "Exactly one thread should successfully create marker");
+        assert_eq!(
+            created_count, 1,
+            "Exactly one thread should successfully create marker"
+        );
     }
 
     #[test]
@@ -369,7 +396,10 @@ mod tests {
 
         let read_result = read_marker(&test_dir).unwrap();
         if let MarkerRead::Valid(read_meta) = read_result {
-            assert_eq!(read_meta.canonical_common_dir, non_utf8_bytes, "Non-UTF-8 bytes should survive");
+            assert_eq!(
+                read_meta.canonical_common_dir, non_utf8_bytes,
+                "Non-UTF-8 bytes should survive"
+            );
         } else {
             panic!("Expected valid marker");
         }
@@ -388,7 +418,10 @@ mod tests {
             std::os::unix::fs::symlink(&target, &marker_path).unwrap();
 
             let result = read_marker(&test_dir).unwrap();
-            assert!(matches!(result, MarkerRead::Invalid(InvalidReason::Symlink)), "Symlink should be invalid");
+            assert!(
+                matches!(result, MarkerRead::Invalid(InvalidReason::Symlink)),
+                "Symlink should be invalid"
+            );
         }
 
         #[cfg(not(unix))]
@@ -406,7 +439,10 @@ mod tests {
         fs::write(&marker_path, large_content).unwrap();
 
         let result = read_marker(&test_dir).unwrap();
-        assert!(matches!(result, MarkerRead::Invalid(InvalidReason::Oversized(_))), "Oversized marker should be invalid");
+        assert!(
+            matches!(result, MarkerRead::Invalid(InvalidReason::Oversized(_))),
+            "Oversized marker should be invalid"
+        );
     }
 
     #[test]
@@ -417,6 +453,9 @@ mod tests {
         fs::write(&marker_path, "not valid json {{{").unwrap();
 
         let result = read_marker(&test_dir).unwrap();
-        assert!(matches!(result, MarkerRead::Invalid(InvalidReason::Malformed(_))), "Malformed JSON should be invalid");
+        assert!(
+            matches!(result, MarkerRead::Invalid(InvalidReason::Malformed(_))),
+            "Malformed JSON should be invalid"
+        );
     }
 }

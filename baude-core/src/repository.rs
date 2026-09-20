@@ -922,16 +922,13 @@ impl RepositoryState {
 /// Returns the first 12 lowercase hexadecimal characters of SHA256(input).
 /// This is deterministic: the same input always produces the same output.
 pub fn compute_repository_digest(common_dir_bytes: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(common_dir_bytes);
     let result = hasher.finalize();
 
-    format!("{:x}", result)
-        .chars()
-        .take(12)
-        .collect()
+    format!("{:x}", result).chars().take(12).collect()
 }
 
 /// Encode a byte slice as base64.
