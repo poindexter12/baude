@@ -293,3 +293,7 @@ Workspace derivation test coverage complete and end-to-end verified with full te
 *Phase: 13 (Workspace Derivation and New-Session/Open Defaults)*
 *Completed: 2026-09-20*
 *Plan Type: TDD (Red→Green→Refactor)*
+
+## Post-Wave Orchestrator Fix (2026-09-19)
+
+The post-merge gate found `cargo fmt --check` (18 diffs) and `cargo clippy -D warnings` failing after this plan (unused test imports in `launch.rs`, the now-unused `plan_launch` `backend_env` parameter after the gate removal, an unused test variable, and `needless_borrows_for_generic_args` on `Command::args(&["init"])` in baude-core and app.rs tests). Fixed in commits `5a6f94a` and the following `style(13-02)` commit; fmt, clippy, and the full workspace suite (677 passed) are green after the fix.
