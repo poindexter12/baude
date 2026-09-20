@@ -266,6 +266,8 @@ sessions never send push notifications.
 
 ## Folder context
 
+### Session breadcrumbs
+
 baude leaves breadcrumbs per launch folder: the sessions a run actually used
 (opened, typed into, created with `w`, or admitted) are recorded against the
 folder baude was started in, and the next launch from that folder scopes the
@@ -281,19 +283,26 @@ is ever written into your repositories. Entries reference sessions by path,
 prune automatically when a checkout or folder leaves durable state, and a
 corrupt file just means a fresh context. Remote (`⇄ remote`) rows are not
 scoped in this release: launch-folder attribution isn't reliable for daemon
-sessions, so they always render. Set `folder_context: false` in config (or
-`BAUDE_FOLDER_CONTEXT=0`) to disable recording and filtering entirely.
+sessions, so they always render.
+
+### Workspace memory (ancestor walk)
 
 Folder memory also covers the [workspace](#workspaces): every launch records
-which workspace the folder ran in
-(`~/.config/baude/folder-workspaces.json`), and a later plain `baude` there
-comes back up in that workspace — same backend, daemon, and state pool.
-Precedence: an explicit `BAUDE_WORKSPACE` or `BAUDE_BACKEND` always wins and
-suppresses the memory for that run (while still teaching the folder for the
-next one); the remembered workspace outranks the config `workspace`/`backend`
-defaults; with no memory, resolution is unchanged. When memory changes the
-outcome the status line notes `workspace <name> (folder history)`. The
-`folder_context` kill switch above disables this too.
+which workspace the folder ran in (`~/.config/baude/folder-workspaces.json`).
+
+**Walk behavior:** When you launch baude, it walks up from your launch directory checking each ancestor folder for a recorded binding. The first binding found is used; if no binding exists at any level, the walk returns None and precedence continues to the next tier.
+
+**Boundary:** The walk stops at your home directory (`$HOME`) and does not continue above it. If your launch directory is outside your home (e.g., in `/tmp`), the walk stops at the filesystem root.
+
+**Recording:** When you launch from a new repository without a binding, baude derives the workspace name from the repository root's folder name and records the binding for that repository root, so future launches from any subfolder of that repository use the same workspace.
+
+**Override or rebind:** To use a different workspace for a folder path, use one of these approaches in order of priority:
+1. Set `BAUDE_WORKSPACE` environment variable (highest priority)
+2. Delete the binding from `~/.config/baude/folder-workspaces.json` and re-launch to record a new derived binding
+3. Set the config `workspace` key — but note that ancestor bindings have priority, so if a parent folder has a recorded binding, the config value does not override it
+4. To override an ancestor binding, use `BAUDE_WORKSPACE` env var
+
+**Kill switch:** Set config `folder_context: false` to disable folder memory entirely; the walk is skipped and precedence goes directly to config workspace key (if any), BAUDE_BACKEND, config backend, then default. This also disables session breadcrumbs.
 
 ## Cloning
 
@@ -453,22 +462,49 @@ histories. Custom workspaces are declared in config:
 }
 ```
 
-`BAUDE_WORKSPACE` selects the workspace; with neither env var set, the launch
-folder's remembered workspace comes next (see "Folder context"), then config
-`workspace`, then the backend name. A workspace's backend binding **wins over
-`BAUDE_BACKEND`** —
-the env var can't cross-wire a workspace onto the wrong backend (a conflict
-warns and is ignored). The status bar shows the active workspace and its
-platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces,
-`⬢ work · Claude Code` / `⬢ oss · opencode` for named ones.
+### Workspace selection: precedence order
 
-Daemons serve exactly one workspace: `bauded` reads `BAUDE_WORKSPACE` at
-startup, namespaces its state, and reports its identity at `GET /info`; the
-TUI refuses to create sessions through a daemon serving a different
-workspace. `auto_daemon` runs one daemon per workspace on its own port
-(claude `8642`, opencode `8643`, custom via `daemon_port`). The `claude`
-workspace reads the legacy un-suffixed state files on first run, so existing
-session lists survive the upgrade.
+Workspace selection follows a precedence order, from highest to lowest priority:
+
+1. **BAUDE_WORKSPACE environment variable** — explicit, overrides all
+2. **Folder binding from ancestor walk** — nearest recorded binding wins (see "Folder context")
+3. **config `workspace` key** — explicit config in `~/.config/baude/config.json`
+4. **Derived workspace name from repository root** — only when inside a git repository
+5. **BAUDE_BACKEND environment variable**
+6. **config `backend` key** — `~/.config/baude/config.json`
+7. **Default workspace name** — `claude`
+
+A workspace's backend binding **wins over `BAUDE_BACKEND`** — the env var can't cross-wire a workspace onto the wrong backend (a conflict warns and is ignored). The status bar shows the active workspace and its platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces, `⬢ work · Claude Code` / `⬢ oss · opencode` for named ones.
+
+### When does derivation apply?
+
+Derivation applies **only when launched inside a git repository** (determined by git's repo root discovery) **and no higher-precedence source** (BAUDE_WORKSPACE, folder binding, or config workspace) is found. When you launch from a git repository for the first time, baude derives the workspace name from the repository root's folder name and records the binding so future launches from any subfolder of that repository use the same workspace.
+
+Unbound non-git folders skip derivation and use the remaining chain (BAUDE_BACKEND, config backend, default). Nothing is derived or recorded for those folders.
+
+### Examples
+
+- **Launch from ~/Code/github.com/iarx-com/baude/src (repo subfolder) with no explicit settings:**
+  - Inside a git repo, no binding exists → derives workspace `baude` from repo root folder name
+  - Binding recorded: next launch from any subfolder of that repo comes up in `baude`
+
+- **Launch from ~/Code/github.com/poindexter12/baude with binding recorded as poindexter12:**
+  - Folder binding found → uses bound workspace `poindexter12`
+  - Ancestor walk takes precedence over derivation
+
+- **Launch from ~/Documents (not a git repo) with no binding or config:**
+  - Not a git repo, no binding exists → skips derivation
+  - Uses default `claude` workspace
+
+### Daemon workspace resolution
+
+The daemon (`bauded`) applies the same workspace selection rules as the TUI. When launched, `bauded` walks the folder-workspaces.json for bindings, derives workspace names from repository roots, and records new bindings using the same logic as `baude`. This ensures that switching between TUI and daemon does not change your active workspace for a given directory.
+
+### Legacy state files
+
+The `claude` workspace reads the legacy un-suffixed state files on first run, so existing session lists survive the upgrade.
+
+`auto_daemon` runs one daemon per workspace on its own port (claude `8642`, opencode `8643`, custom via `daemon_port`).
 
 ### When a workspace is already open
 
@@ -521,6 +557,27 @@ Recovery, in order:
 `bauded` does not claim the lock at startup, so a daemon contending for a
 workspace surfaces the same pid-and-path diagnostic at its first state save
 rather than at launch.
+
+### New-session defaults
+
+The `n` command opens a prompt to create a new session. Path prefill defaults based on your launch location:
+
+- **Inside a git repository:** The default is that repository's root path (allowing you to easily create sessions in the same repository)
+- **Outside a repository:** The default is the `new_session_dir` config option (if set), otherwise your launch directory
+
+You can always type a different path; the prefill is a convenience only.
+
+### TUI title display
+
+The top title bar shows the active workspace name and how it was selected. The format is `baude v<version> — <workspace-name> (<source>)`.
+
+**Source labels:**
+- `(explicit)` — workspace selected via BAUDE_WORKSPACE environment variable or config `workspace` key
+- `(folder binding)` — workspace found by ancestor walk through recorded folder bindings
+- `(derived)` — workspace derived from repository root folder name
+- `(blank)` — implicit default (no explicit setting, no binding, no derivation)
+
+This makes it clear at a glance which workspace you're in and why.
 
 ## opencode backend
 
