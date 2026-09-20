@@ -153,3 +153,117 @@ I would block execution until the plans explicitly answer these four design ques
 2. What deterministic key is used when the first 12 digest characters collide?
 3. How is ownership claimed atomically between concurrent TUI and daemon processes?
 4. Does scan report ownership per repository directory or per checkout, and how is that incorporated into prune re-verification?
+
+## GPT-5.3-Codex Review
+
+## 14-01 Plan Review (Marker module and digest resolution)
+
+### 1) Summary
+This plan has a solid intent (shared digest identity + marker ownership source of truth), but it mixes foundational work with substantial policy and fallback machinery that introduces avoidable complexity and several correctness contradictions. As written, parts of the implementation would likely block migration-in-place and conflict with the phase’s non-destructive goals.
+
+### 2) Strengths
+- Clear focus on deterministic identity and shared core logic between TUI/daemon.
+- Good emphasis on atomic marker writes and fail-closed marker reads.
+- Strong test-first posture, including recovery and collision scenarios.
+- Explicit threat model thinking (symlink handling, bounded reads, malformed JSON behavior).
+
+### 3) Concerns
+- **HIGH:** `write_marker` design is contradictory (`create_dir` ownership claim on an already-existing repository dir). Migration requires writing marker *inside* existing `repository-*` dirs; this approach would fail normal paths.
+- **HIGH:** Adds `repository_identity` + digest-length fallback (12→16→…→64) in tracer scope, which is likely over-engineering before basic WTID behavior is proven.
+- **HIGH:** `HashMap<Vec<u8>, String>` state mapping (introduced later, implied here) is risky for JSON persistence semantics and compatibility.
+- **MEDIUM:** 1 KiB marker read cap may reject legitimate markers as fields evolve (especially with base64 path bytes + extra fields).
+- **MEDIUM:** Non-UTF8 byte-preservation across all layers is thoughtful but may be unnecessary complexity unless the surrounding state model already uses byte-path semantics end-to-end.
+- **LOW:** Adds `sha2` dependency changes despite likely existing workspace dependency; potential duplication churn.
+
+### 4) Suggestions
+- Keep 14-01 minimal: deterministic 12-hex digest + marker read/write (atomic temp file in existing dir), no fallback-length expansion yet.
+- Remove `create_dir` from marker writes; use `create_new` temp file + rename within existing managed repo dir.
+- Use a marker schema aligned to locked decisions only: canonical common dir, scheme version, recorded-at (avoid premature `physical_key` unless required by callsites).
+- Keep path identity types as UTF-8 canonical strings unless there is a demonstrated cross-platform need for byte-level path storage.
+- Reserve resolver/fallback policy for 14-02 where integration concerns are handled holistically.
+
+### 5) Risk Assessment
+**Overall risk: HIGH**  
+The architectural direction is right, but there are fundamental implementation contradictions (especially marker write semantics) that can break migration-in-place and derail WTID-02/03 if not corrected early.
+
+---
+
+## 14-02 Plan Review (Path composition, scanner migration, collision integration)
+
+### 1) Summary
+This is the critical integration plan and it correctly targets the right surfaces (`git.rs`, `lifecycle.rs`, `worktree_scan.rs`), but it currently carries several cross-cutting inconsistencies that could prevent WTID guarantees from actually holding in production, especially around collision fallback behavior and key-format parsing.
+
+### 2) Strengths
+- Correctly changes managed path composition to string repository keys.
+- Explicitly preserves legacy directory readability while introducing digest keys.
+- Includes scanner schema/version migration and marker-awareness (important for tools/prune safety).
+- Captures non-fatal collision handling intent in admission path.
+
+### 3) Concerns
+- **HIGH:** Collision handling path is underspecified for continuation. Returning `Some(CollisionReport)` is not enough; plan must guarantee newcomer gets a distinct directory immediately (WTID-03).
+- **HIGH:** Parser rule conflict: `repository_key` only accepts 12-char hex, but earlier fallback logic proposes longer digest keys. These plans conflict directly.
+- **HIGH:** `common_dir_to_physical_key: HashMap<Vec<u8>, String>` in persisted state is a high-risk schema choice; JSON map-key behavior and backward compatibility are unclear.
+- **MEDIUM:** “Lazy adoption only” is good for perf, but recovery guarantees after state reset depend on marker presence; plan should ensure marker adoption occurs reliably during admission/scan before key resolution decisions.
+- **MEDIUM:** Task boundaries are blurred (14-02 still shaping APIs/UI behavior that 14-03 also owns), increasing rework risk.
+- **LOW:** Verification commands are brittle and likely to be flaky due to filter usage patterns.
+
+### 4) Suggestions
+- Define exact collision continuation contract in `ensure_repository`: on mismatch, allocate/resolve alternate physical key *in the same function* and return both report + resolved key.
+- Unify key format strategy across plans: either fixed 12 hex everywhere or variable-length digests everywhere (parser, docs, tests, scan).
+- Replace `Vec<u8>` map keys in persisted state with stable string form (canonical path string) unless byte keys are absolutely required.
+- Add explicit state schema migration/defaulting tests for pre-v2.3 state files.
+- Make marker adoption trigger points explicit and guaranteed: admission path + scan path, with idempotent writes and clear event/reporting.
+
+### 5) Risk Assessment
+**Overall risk: MEDIUM-HIGH**  
+The plan is close to phase goals but has unresolved internal contradictions that can cause partial correctness and mismatched behavior across components.
+
+---
+
+## 14-03 Plan Review (Admission UX, daemon parity, scan ownership output, docs)
+
+### 1) Summary
+This plan appropriately focuses on user-visible behavior and cross-binary parity, but it introduces additional modeling complexity (per-checkout ownership structures) and contains output-policy contradictions that should be resolved before implementation to avoid churn and accidental information leaks.
+
+### 2) Strengths
+- Correctly treats collisions as non-fatal in both TUI and daemon flows.
+- Good emphasis on parity testing between TUI and daemon.
+- Includes required WTID-04 scan ownership surfacing and README updates.
+- Keeps migration non-destructive and explicitly documents legacy compatibility.
+
+### 3) Concerns
+- **HIGH:** Internal contradiction on path exposure: prohibitions say don’t expose canonical dirs in user-facing output, but task text proposes printing owner paths directly in scan text rows.
+- **MEDIUM:** Per-checkout ownership structures may be more than required for WTID-04 and can bloat complexity; requirement is owner reporting, not necessarily full nested model redesign.
+- **MEDIUM:** API shape churn risk (`/sessions` response wrapper/optional collision field) without explicit compatibility strategy for existing clients.
+- **MEDIUM:** Reintroduces base64 canonical-dir serialization patterns that may not be needed if this is daemon/admin-only data.
+- **LOW:** Task scope mixes UX, API contract, scan model, and docs in one wave, increasing coupling risk.
+
+### 4) Suggestions
+- Resolve output policy first: text UI should show stable display owner (`repository-<key>` / display name), keep canonical dirs in JSON/debug only.
+- Keep WTID-04 minimal: add owner fields to existing scan candidate model first; defer deeper per-checkout nested model unless required by current consumers.
+- Version API responses or add additive optional fields only, with explicit backward-compat tests.
+- Align README and CLI output terminology with actual implementation fields (owner display vs canonical path).
+
+### 5) Risk Assessment
+**Overall risk: MEDIUM**  
+This plan can achieve WTID-03/04, but only if it trims optional complexity and resolves the canonical-path exposure contradiction.
+
+---
+
+## Overall Cross-Plan Assessment
+
+### Summary
+The plan set is directionally strong and requirement-aware, but it is currently over-specified in some low-value areas and under-specified in one crucial area: guaranteed non-destructive collision continuation. The biggest risks are internal inconsistencies (key format, marker semantics, output policy) rather than missing intent.
+
+### Top cross-plan fixes before execution
+- Normalize one repository key strategy across all plans (fixed 12 hex vs variable length).
+- Fix marker write semantics for existing dirs (no `create_dir` ownership claim).
+- Specify and test collision continuation behavior in one authoritative place (`ensure_repository`).
+- Simplify state serialization types for compatibility and maintainability.
+- Clarify user-facing vs admin/debug ownership data exposure policy end-to-end.
+
+### Overall Risk Level
+**MEDIUM-HIGH**  
+Achievable phase with strong foundations, but requires targeted de-risking of contradictory details before implementation starts to avoid late-cycle rewrites.
+
+---
