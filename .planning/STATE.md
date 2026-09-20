@@ -102,6 +102,7 @@ Last activity: 2026-09-19 — Roadmap created for v2.3 milestone
 
 Recent decisions affecting current work (full log in PROJECT.md):
 
+- 2026-09-19 Phase 13 plans accepted for execution after 4 Codex convergence cycles (25→21→20→19 unresolved) plus a targeted revision of all cycle-4 HIGHs; Joe chose execution over a fifth review cycle. Outcome table in 13-REVIEWS.md.
 - v2.0: Repository identity is canonical across main checkouts, subdirectories, symlinks, and linked worktrees.
 - v2.0: If the main checkout is not on the resolved default, preserve and show it; create or reuse a separate managed default-branch worktree.
 - v2.0: Opening never silently switches branches, fetches, or guesses a default branch.

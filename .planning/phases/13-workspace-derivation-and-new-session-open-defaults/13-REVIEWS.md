@@ -135,3 +135,14 @@ Overall risk is **HIGH until revised**. The plans cover every phase requirement 
 3. Align tests with the thread-local test identity system and use subprocesses or injection for real lock contention.
 
 After those corrections, the phase is well-bounded: repository identity and clone behavior already have suitable seams, and the remaining implementation is primarily resolver plumbing, UI labeling, and documentation.
+
+## Convergence Outcome (2026-09-19)
+
+| Cycle | Reviewer | current_high | current_actionable | Replan commit |
+|-------|----------|--------------|--------------------|---------------|
+| 1 | codex | 14 | 11 | 8f08072 |
+| 2 | codex | 8 | 13 | 9f4def0, 320d4a5 |
+| 3 | codex | 12 | 8 | 27f36ee, 24aa141 |
+| 4 (extra, user-approved) | codex | 10 | 9 | b9b8dda (targeted: all 10 HIGHs) |
+
+Not converged to zero. Each cycle surfaced new source-level mismatches rather than regressions. After cycle 4 Joe chose "fix the design-level HIGHs, then execute" over a fifth cycle: the ten cycle-4 HIGHs were made true in the plans (lock base parameter with `"state"`/`"daemon-state"`, refuse startup on a held lock per #71, behavior assertions instead of cache-seeding checks, corrected test module routing, injected lock-refusal test, complete remote provenance path, two-call-site parity) and the nine actionable items were incorporated or dispositioned in each plan's Review Dispositions ledger. The plan checker passed at b9b8dda. Execution proceeds without a fifth Codex review; executors compile against the real code and the verifier checks must-haves.
