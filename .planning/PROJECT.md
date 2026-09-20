@@ -61,6 +61,8 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 - ✓ OSC8 labeled links and bare URLs open on gesture (`ctrl+o` hints) with destination preview and copy, no shell evaluation, selection preserved — v2.2
 - ✓ Shift+Enter inserts a newline on kitty-protocol terminals with mode restoration and a legacy fallback — v2.2
 - ✓ v2.2.0 published through the existing release process after test, CI, and smoke validation — v2.2
+- ✓ Workspace derives from the launch folder when nothing is passed (nearest ancestor binding, else sanitized repo-root name, recorded at the repo root); explicit env/config still win; TUI and daemon share one `launch::start_workspace` resolver — Phase 13
+- ✓ New-session and open default to the launch repository's git root; `new_session_dir` applies only outside a repository; the TUI title (and remote header via `/info` `workspace_source`) shows the workspace with its source or `(blank)` — Phase 13
 
 > v0.7 code-complete; data paths Claude-validated live (4 integration bugs found + fixed). Pending human UATs before public ship: hook-state flip visual (BL-01), PWA activity-strip + TUI `v` overlay visuals, live-`claude` `--permission-prompt-tool` MCP wire contract, first-phone Web Push. Tracked in `.planning/STATE.md` Deferred Items + per-phase UAT.md.
 
@@ -68,8 +70,6 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 
 <!-- Current milestone scope. -->
 
-- [ ] Workspace derives from the launch folder when nothing is passed (nearest ancestor binding, else repo-root name), with explicit env/config still winning.
-- [ ] New-session and open default to the launch repository's git root; `new_session_dir` applies only outside a repository.
 - [ ] Managed worktree paths carry a stable repository identity; no `repository-<key>` collisions across TUI/daemon state or after a reset; existing worktrees migrate in place.
 - [ ] Startup is measurable (timing facility) and fast (non-blocking keyboard probe, lazy/parallel restore, batched state writes, first frame before first poll); idle baude costs near-zero CPU (dirty-flag redraw, live-row-only polling, opt-in idle-child suspension, configurable usage poller).
 
@@ -125,6 +125,11 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 | Shift+Enter via negotiated kitty keyboard protocol, doubly verified (outer terminal and child), legacy bytes frozen in a corpus | Blind CSI-u would break terminals and children that do not speak kitty | ✓ Good — honest fallback, byte-freeze corpus guards regressions |
 | Guarded settings seeding: never overwrite unreadable, unparseable, or non-object settings; warn instead | Silent replacement destroyed user hooks (#70) | ✓ Good — HREG-03/04 delivered |
 | Ship v2.2.0 through release-please; close GSD v2.2 by override (no Phase 12 VERIFICATION.md) and no separate GSD tag | Release already published with CI green; GSD verification would duplicate 12-VALIDATION and the smoke evidence | ⚠️ Revisit — run `/gsd-verify-work` before close next time |
+| One shared `launch::start_workspace(launch_dir, config, env, lock_base)` in baude-core drives both TUI (`"state"`) and daemon (`"daemon-state"`) startup: canonicalize, ancestor-walk binding lookup, repo-root derivation, cache seeding, lock claim, then binding record | Two hand-rolled startup paths had already diverged (daemon never claimed a lock); one seam makes parity testable and keeps the write order fixed | ✓ Good — Phase 13, parity and end-to-end tests pass |
+| A held workspace lock refuses startup (`StartError::LockHeld`) and never records a binding | Preserves the v2.1.3 single-writer invariant (#71); continuing without the lock would let two instances write one state file | ✓ Good — Phase 13 |
+| Derived workspace bindings are keyed by the repository root, never the launch subfolder, and unbound non-git folders record nothing | Subfolder launches must resolve to the same workspace; non-git folders have no stable identity to bind | ✓ Good — Phase 13 |
+| The TUI title renders `name (source)` for explicit, bound, and derived workspaces and exactly `(blank)` for the implicit default | An unconfigured launch should look unconfigured instead of showing the backend name as if chosen | ✓ Good — Phase 13 (Joe's request) |
+| Phase 13 plans went through four Codex convergence cycles then executed with remaining findings accepted; the 13-02 TDD gate (no `feat(13-02)` GREEN commit) was accepted as debt | Each cycle surfaced new source-level facts rather than regressions; the tests exist and pass | ⚠️ Revisit — split behavior fixes out of test commits in later TDD plans |
 
 ## Evolution
 
@@ -144,4 +149,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-19 after v2.3 milestone start*
+*Last updated: 2026-09-20 after Phase 13*

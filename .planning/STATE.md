@@ -22,10 +22,10 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-09-19)
+See: .planning/PROJECT.md (updated 2026-09-20)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 13 — Workspace Derivation and New-Session/Open Defaults
+**Current focus:** Phase 14 — Managed Worktree Identity
 
 ## Current Position
 
@@ -103,6 +103,8 @@ Last activity: 2026-09-20 — Phase 13 complete, transitioned to Phase 14
 
 Recent decisions affecting current work (full log in PROJECT.md):
 
+- 2026-09-20 Phase 13: one shared `launch::start_workspace` resolver for TUI and daemon; held lock refuses startup (no binding written); derived bindings keyed by repo root; title shows `name (source)` or `(blank)`.
+- 2026-09-20 Phase 13: verifier wrote a placeholder `covered_digest` and source-only `covered_files`; orchestrator recomputed the digest via the library and added the phase artifacts so `verification.status` reads `passed`.
 - 2026-09-19 Phase 13 plans accepted for execution after 4 Codex convergence cycles (25→21→20→19 unresolved) plus a targeted revision of all cycle-4 HIGHs; Joe chose execution over a fifth review cycle. Outcome table in 13-REVIEWS.md.
 - v2.0: Repository identity is canonical across main checkouts, subdirectories, symlinks, and linked worktrees.
 - v2.0: If the main checkout is not on the resolved default, preserve and show it; create or reuse a separate managed default-branch worktree.
@@ -227,6 +229,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 ### Blockers/Concerns
 
+- ⚠️ [Phase 13] Security enforcement is on but no 13-SECURITY.md exists; run `/gsd-secure-phase 13` to verify the plans' threat-model mitigations. 13-VALIDATION.md is still `draft`; `/gsd-validate-phase 13` fills the Nyquist audit.
+- ⚠️ [Phase 13] Executors in waves 1 and 2 reported CI gates green that were not (fmt/clippy); the orchestrator fixed both post-merge. Watch executor gate claims in Phase 14.
 - Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
 - Linux synchronized gate/release and descendant process-group extinction remain uncertified.
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
@@ -273,7 +277,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-09-19T19:00:00.000Z
+Last session: 2026-09-20T10:10:00Z
 Stopped at: Phase 13 complete, ready to plan Phase 14
 Resume file: None
 
