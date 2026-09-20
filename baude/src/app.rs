@@ -10514,7 +10514,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("baude-test-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let _ = std::process::Command::new("git").args(&["init"]).current_dir(&tmp).output();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&tmp)
+            .output();
 
         let mut app = App::new(tmp.clone());
         app.remote = None;
@@ -10532,7 +10535,8 @@ mod tests {
     #[test]
     fn test_open_new_session_prefill_outside_repo_with_config_new_session_dir() {
         // Test that when outside a repo with config, prefill shows config.new_session_dir with trailing /
-        let root = std::env::temp_dir().join(format!("baude-test-{}-config-root", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("baude-test-{}-config-root", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
@@ -10558,7 +10562,8 @@ mod tests {
     #[test]
     fn test_open_new_session_prefill_outside_repo_no_config() {
         // Test that when outside a repo without config, prefill shows launch_dir with trailing /
-        let root = std::env::temp_dir().join(format!("baude-test-{}-no-config-root", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("baude-test-{}-no-config-root", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
@@ -10584,7 +10589,8 @@ mod tests {
     #[test]
     fn test_open_new_session_prefill_all_cases_end_with_slash() {
         // Verify that all three prefill cases end with trailing slash
-        let root = std::env::temp_dir().join(format!("baude-test-{}-allcases-root", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("baude-test-{}-allcases-root", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
@@ -10593,7 +10599,10 @@ mod tests {
         let tmp1 = std::env::temp_dir().join(format!("baude-test-case1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp1);
         std::fs::create_dir_all(&tmp1).unwrap();
-        let _ = std::process::Command::new("git").args(&["init"]).current_dir(&tmp1).output();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&tmp1)
+            .output();
         let mut app = App::new(tmp1.clone());
         app.remote = None;
         app.open_new_session_modal();
@@ -10611,7 +10620,10 @@ mod tests {
         app.config.new_session_dir = Some("/tmp/sessions".into());
         app.open_new_session_modal();
         if let Modal::Input { buf, .. } = &app.modal {
-            assert!(buf.ends_with('/'), "Case 2: outside repo with config should end with /");
+            assert!(
+                buf.ends_with('/'),
+                "Case 2: outside repo with config should end with /"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp2);
 
@@ -10624,7 +10636,10 @@ mod tests {
         app.config.new_session_dir = None;
         app.open_new_session_modal();
         if let Modal::Input { buf, .. } = &app.modal {
-            assert!(buf.ends_with('/'), "Case 3: outside repo without config should end with /");
+            assert!(
+                buf.ends_with('/'),
+                "Case 3: outside repo without config should end with /"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp3);
     }
@@ -10632,7 +10647,8 @@ mod tests {
     #[test]
     fn test_admit_repository_same_from_root_and_subfolder() {
         // Test that admitting the same repo from root and subfolder creates only one row
-        let root = std::env::temp_dir().join(format!("baude-test-{}-dedup-root", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("baude-test-{}-dedup-root", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
@@ -10640,7 +10656,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("baude-test-dedup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let _ = std::process::Command::new("git").args(&["init"]).current_dir(&tmp).output();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&tmp)
+            .output();
 
         let mut app = App::new(tmp.clone());
         app.remote = None;
@@ -10656,14 +10675,18 @@ mod tests {
         let _ = app.admit_repository(&subfolder);
         let count2 = app.repository_state.repositories.len();
 
-        assert_eq!(count1, count2, "same repo from root and subfolder should not create duplicates");
+        assert_eq!(
+            count1, count2,
+            "same repo from root and subfolder should not create duplicates"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_admit_repository_deduplication_by_canonical_common_dir() {
         // Test that canonical common dir deduplication prevents duplicates
-        let root = std::env::temp_dir().join(format!("baude-test-{}-canonical-root", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("baude-test-{}-canonical-root", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
@@ -10671,7 +10694,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("baude-test-canonical-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let _ = std::process::Command::new("git").args(&["init"]).current_dir(&tmp).output();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&tmp)
+            .output();
 
         let mut app = App::new(tmp.clone());
         app.remote = None;
@@ -10687,7 +10713,10 @@ mod tests {
         let _ = app.admit_repository(&subfolder);
         let count2 = app.repository_state.repositories.len();
 
-        assert_eq!(count1, count2, "canonical common dir should prevent duplicates");
+        assert_eq!(
+            count1, count2,
+            "canonical common dir should prevent duplicates"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

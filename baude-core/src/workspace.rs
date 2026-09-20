@@ -956,7 +956,13 @@ mod tests {
         };
 
         // Level 1: BAUDE_WORKSPACE wins (beats everything)
-        let ws = resolve_with_hint(Some("explicit-ws"), Some("opencode"), Some("bound"), &config, no_warn);
+        let ws = resolve_with_hint(
+            Some("explicit-ws"),
+            Some("opencode"),
+            Some("bound"),
+            &config,
+            no_warn,
+        );
         assert_eq!(ws.name, "explicit-ws");
 
         // Level 2: Bound wins (no explicit ws_env, no backend_env)
@@ -980,7 +986,13 @@ mod tests {
     fn test_precedence_matrix_baude_workspace_and_backend_both_set() {
         // BAUDE_WORKSPACE should win over BAUDE_BACKEND
         let config = Config::default();
-        let ws = resolve_with_hint(Some("explicit-ws"), Some("opencode"), None, &config, no_warn);
+        let ws = resolve_with_hint(
+            Some("explicit-ws"),
+            Some("opencode"),
+            None,
+            &config,
+            no_warn,
+        );
         assert_eq!(ws.name, "explicit-ws");
     }
 

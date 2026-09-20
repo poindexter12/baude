@@ -142,16 +142,11 @@ pub fn start_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::persist::Config;
     use crate::testing::TestRedirect;
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "baude-launch-{name}-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("baude-launch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -165,7 +160,7 @@ mod tests {
         let repo_dir = scratch("wspc02-repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let _ = std::process::Command::new("git")
-            .args(&["init"])
+            .args(["init"])
             .current_dir(&repo_dir)
             .output();
 
@@ -200,14 +195,16 @@ mod tests {
         let repo_dir = scratch("daemon-parity-repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let _ = std::process::Command::new("git")
-            .args(&["init"])
+            .args(["init"])
             .current_dir(&repo_dir)
             .output();
 
         // Both TUI and daemon should use the same plan_launch function.
         let config_root = scratch("daemon-parity-config");
-        let tui_plan = crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
-        let daemon_plan = crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
+        let tui_plan =
+            crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
+        let daemon_plan =
+            crate::folder_workspace::plan_launch(true, None, None, Some(&config_root), &repo_dir);
 
         // Both should produce the same result (same repo_root discovery).
         assert_eq!(tui_plan.repo_root, daemon_plan.repo_root);

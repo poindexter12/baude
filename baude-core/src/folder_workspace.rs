@@ -107,7 +107,7 @@ pub fn find_binding(root: &Path, launch_dir: &Path, home: &Path) -> Option<Strin
 pub fn plan_launch(
     enabled: bool,
     ws_env: Option<&str>,
-    backend_env: Option<&str>,
+    _backend_env: Option<&str>,
     root: Option<&Path>,
     launch_dir: &Path,
 ) -> LaunchPlan {
@@ -300,7 +300,7 @@ mod tests {
         let _redirect = TestRedirect::new(scratch("find-binding-grandparent-root"));
         let dir = scratch("find-binding-grandparent");
         let grandparent = Path::new("/mem");
-        let parent = Path::new("/mem/api");
+        let _parent = Path::new("/mem/api");
         let launch_dir = Path::new("/mem/api/src");
         let home = Path::new("/home/user");
 
@@ -400,7 +400,7 @@ mod tests {
         let repo_dir = scratch("plan-launch-derive-repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let _ = std::process::Command::new("git")
-            .args(&["init"])
+            .args(["init"])
             .current_dir(&repo_dir)
             .output();
 
