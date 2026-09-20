@@ -297,3 +297,7 @@ Workspace derivation test coverage complete and end-to-end verified with full te
 ## Post-Wave Orchestrator Fix (2026-09-19)
 
 The post-merge gate found `cargo fmt --check` (18 diffs) and `cargo clippy -D warnings` failing after this plan (unused test imports in `launch.rs`, the now-unused `plan_launch` `backend_env` parameter after the gate removal, an unused test variable, and `needless_borrows_for_generic_args` on `Command::args(&["init"])` in baude-core and app.rs tests). Fixed in commits `5a6f94a` and the following `style(13-02)` commit; fmt, clippy, and the full workspace suite (677 passed) are green after the fix.
+
+## TDD Gate Disposition (2026-09-20)
+
+The end-of-phase `tdd.review-checkpoint` reported RED ✓ / GREEN ✗ for this plan: the detector expects a `feat(13-02):` commit after the `test(13-02):` commits, but the two behavior fixes the red tests forced (removing the last `BAUDE_BACKEND` gate in `plan_launch`, consistent trailing slash in prefill) were committed inside the test commits. Joe chose to proceed and record this as accepted debt rather than rewrite history. Recorded in STATE.md Deferred Items.

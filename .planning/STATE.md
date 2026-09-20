@@ -268,6 +268,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 | deferred_items | 07/deferred-items.md: pre-existing docker smoke shellcheck SC2015/SC2034 | acknowledged | 2026-09-03 | v2.0 |
 | deferred_items | 10/deferred-items.md: 10-04 flaky bauded lifecycle test (failed once 356/357, passed on rerun; flake-hunt candidate) | acknowledged | 2026-09-19 | v2.2 |
 | deferred_items | 11/deferred-items.md: pre-existing clippy failures (resolved in 12-01; vendored vt100 lint header had masked baude lints) | acknowledged | 2026-09-19 | v2.2 |
+| tdd_gate | 13/13-02: RED test commits without a feat(13-02) GREEN commit (the two behavior fixes were bundled into the test commits; tests pass, 679 total) | accepted as debt by Joe | 2026-09-20 | v2.3 |
 
 ## Session Continuity
 
