@@ -112,7 +112,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 ### Phase 15: Startup and Idle Performance
 
-**Goal**: Startup is measurable and reaches the first frame quickly without blocking on external services, and an idle baude with many sessions costs near-zero CPU: no unconditional redraws, no polling of dead rows, and an opt-in way to suspend idle Claude children.
+**Goal**: Startup is measurable and reaches the first frame quickly without blocking on external services, and an idle baude with many sessions costs near-zero CPU: no unconditional or timer-driven redraws, no polling of dead rows, and an opt-in way to suspend idle Claude children.
 
 **Depends on**: Phase 14
 
@@ -124,7 +124,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   2. The first frame renders before session restore and the first metadata poll complete
   3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
   4. Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
-  5. With no input and no session activity, baude issues no terminal writes; spinner and flash animate only on rows that are working or waiting
+  5. With no input and no session activity, baude issues no terminal writes; working and waiting rows use static status glyphs (no wall-clock spinner or flash), so the only redraw triggers are input, child output, status transitions, and resize
   6. Idle per-session polling touches only live, non-archived rows and skips unchanged files, so CPU no longer grows with the session count
   7. An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and the user can see which children are suspended
   8. The usage poller can be disabled or slowed from config

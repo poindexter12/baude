@@ -38,7 +38,7 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 - [ ] **PERF-02**: The first frame renders before session restore and the first metadata poll complete; restore runs lazily or off the render path
 - [ ] **PERF-03**: The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
 - [ ] **PERF-04**: Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
-- [ ] **PERF-05**: The TUI redraws only when something changed (dirty flag); spinner and waiting-flash animations run only for rows that are actually working or waiting, so an idle baude sends no terminal writes
+- [ ] **PERF-05**: The TUI redraws only when something changed (dirty flag); working and waiting rows show a static busy/thinking glyph and a static needs-input marker instead of a wall-clock spinner or flash, so an idle baude sends no terminal writes and a working baude repaints only on child output, status transitions, input, or resize
 - [ ] **PERF-06**: Per-session metadata polling runs only for live, non-archived rows and skips unchanged files by mtime, so idle polling cost no longer scales with the number of sessions
 - [ ] **PERF-07**: An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and archiving a row can stop its child rather than only hiding the row
 - [ ] **PERF-08**: The usage poller can be disabled or slowed via config, and it never scans transcripts more often than the configured interval
