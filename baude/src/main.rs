@@ -354,8 +354,7 @@ fn main() -> Result<()> {
         ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
         backend_env: std::env::var("BAUDE_BACKEND").ok(),
     };
-    let started = match baude_core::launch::start_workspace(&launch_dir, &config, env, "state")
-    {
+    let started = match baude_core::launch::start_workspace(&launch_dir, &config, env, "state") {
         Ok(started) => started,
         Err(baude_core::launch::StartError::LockHeld { diag }) => {
             eprintln!("baude: {diag}");
@@ -371,8 +370,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let workspace = started.workspace;
-    let mut startup_notes = Vec::new();
+    let startup_notes = started.notes;
 
     // Auto-start local bauded when auto_daemon is configured. Must run before
     // App::new() reads the env, and before any threads start (set_var is not

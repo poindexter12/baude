@@ -73,11 +73,7 @@ pub struct LaunchPlan {
 ///
 /// This is used to implement stable folder memory: the same repository returns the
 /// same workspace regardless of which subfolder it's launched from.
-pub fn find_binding(
-    root: &Path,
-    launch_dir: &Path,
-    home: &Path,
-) -> Option<String> {
+pub fn find_binding(root: &Path, launch_dir: &Path, home: &Path) -> Option<String> {
     let (file, _) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
 
     let mut current = launch_dir.to_path_buf();
@@ -126,7 +122,7 @@ pub fn plan_launch(
         return LaunchPlan {
             repo_root,
             ..Default::default()
-        }
+        };
     };
 
     // Perform ancestor walk to find a recorded binding.

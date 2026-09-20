@@ -26,6 +26,10 @@ pub struct StartedWorkspace {
     pub workspace: &'static Workspace,
     /// The repository root discovered during startup, if any.
     pub repo_root: Option<PathBuf>,
+    /// Startup notes for the user: folder-memory notes from `plan_launch` plus the
+    /// applied-binding note when folder context is enabled. The caller prints them
+    /// once the terminal is ready (previously assembled inline in `baude/src/main.rs`).
+    pub notes: Vec<String>,
 }
 
 /// Error during startup.
@@ -64,8 +68,7 @@ pub fn start_workspace(
     lock_base: &str,
 ) -> Result<StartedWorkspace, StartError> {
     // Step 1: Canonicalize launch dir (caller usually does this, but be explicit).
-    let launch_dir = std::fs::canonicalize(launch_dir)
-        .unwrap_or_else(|_| launch_dir.to_path_buf());
+    let launch_dir = std::fs::canonicalize(launch_dir).unwrap_or_else(|_| launch_dir.to_path_buf());
 
     // Step 2: Plan the launch (ancestor walk + repo root discovery).
     let plan = crate::folder_workspace::plan_launch(
@@ -76,9 +79,10 @@ pub fn start_workspace(
         &launch_dir,
     );
 
-    // Capture hint and repo_root for later use (plan may be moved).
+    // Capture hint and repo_root for later use; take the folder-memory notes.
     let hint = plan.hint.clone();
     let repo_root = plan.repo_root.clone();
+    let mut notes = plan.notes;
 
     // Step 3: Initialize the workspace cache with the launch context.
     let ws_ctx = crate::workspace::WorkspaceLaunchContext {
@@ -86,6 +90,14 @@ pub fn start_workspace(
         repo_root: repo_root.clone(),
     };
     let workspace = crate::workspace::initialize_with_context(config, ws_ctx);
+    if config.folder_context_enabled() {
+        notes.extend(crate::folder_workspace::applied_note(
+            &workspace.name,
+            env.ws_env.as_deref(),
+            env.backend_env.as_deref(),
+            config,
+        ));
+    }
 
     // Step 4: Claim the workspace state lock.
     match persist::claim_workspace_state_lock(lock_base, workspace) {
@@ -103,20 +115,25 @@ pub fn start_workspace(
             Ok(StartedWorkspace {
                 workspace,
                 repo_root,
+                notes,
             })
         }
         Err(StateLockError::Held { holder, .. }) => {
             let diag = match holder {
-                Some(pid) => format!("workspace {} is already open in another baude (pid {})", workspace.name, pid),
-                None => format!("workspace {} is already open in another baude", workspace.name),
+                Some(pid) => format!(
+                    "workspace {} is already open in another baude (pid {})",
+                    workspace.name, pid
+                ),
+                None => format!(
+                    "workspace {} is already open in another baude",
+                    workspace.name
+                ),
             };
             Err(StartError::LockHeld { diag })
         }
-        Err(StateLockError::Io { path, source }) => {
-            Err(StartError::LockIo {
-                path,
-                detail: source.to_string(),
-            })
-        }
+        Err(StateLockError::Io { path, source }) => Err(StartError::LockIo {
+            path,
+            detail: source.to_string(),
+        }),
     }
 }
