@@ -4055,12 +4055,16 @@ impl App {
     }
 
     fn open_new_session_modal(&mut self) {
-        let buf = match &self.config.new_session_dir {
-            Some(d) => {
-                let d = d.trim_end_matches('/');
-                format!("{d}/")
-            }
-            None => format!("{}", self.launch_dir.display()),
+        let buf = if let Some(repo_root) = baude_core::git::repo_root(&self.launch_dir) {
+            // Inside a repository: prefill with repo root
+            format!("{}/", repo_root.display())
+        } else if let Some(d) = &self.config.new_session_dir {
+            // Outside a repository: use new_session_dir if configured
+            let d = d.trim_end_matches('/');
+            format!("{d}/")
+        } else {
+            // Fallback: use launch dir
+            format!("{}", self.launch_dir.display())
         };
         self.modal = Modal::Input {
             kind: InputKind::NewSessionPath,

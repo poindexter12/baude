@@ -348,68 +348,31 @@ fn main() -> Result<()> {
 
     let config = baude_core::persist::load_config();
 
-    // Folder-workspace memory: consult this folder's remembered workspace and
-    // pin the process-wide resolution BEFORE anything reads workspace::active()
-    // (ensure_daemon below is the first reader — the auto-daemon must serve
-    // the same workspace). Explicit BAUDE_WORKSPACE/BAUDE_BACKEND always win;
-    // the folder_context kill switch disables both consulting and recording.
-    // Only this TUI launch path passes a hint — the statusline/hook/
-    // permission-mcp subcommands exited above and resolve untouched.
-    let ws_env = std::env::var("BAUDE_WORKSPACE").ok();
-    let backend_env = std::env::var("BAUDE_BACKEND").ok();
-    let memory_root = baude_core::persist::config_dir();
-    let plan = baude_core::folder_workspace::plan_launch(
-        config.folder_context_enabled(),
-        ws_env.as_deref(),
-        backend_env.as_deref(),
-        Some(&memory_root),
-        &launch_dir,
-    );
-    let workspace = baude_core::workspace::initialize(&config, plan.hint.as_deref());
-
-    // One writer per workspace. Claim the state lock BEFORE the terminal, the
-    // daemon, or any folder-memory write: a second baude on a held lock used
-    // to start in a degraded mode where every later action failed with
-    // "persistence is blocked" and nothing named the real cause (#71). Refuse
-    // here instead, once, while stderr is still a normal terminal.
-    // A lock we cannot even open (unwritable config dir) is NOT a refusal:
-    // that path still degrades through App::restore the way it always has.
-    if let Err(baude_core::persist::StateLockError::Held { path, holder }) =
-        baude_core::persist::claim_workspace_state_lock("state", workspace)
+    // Shared workspace startup: folder-workspace memory, initialization, lock,
+    // and binding recording. One writer per workspace — refusal is fatal.
+    let env = baude_core::launch::StartEnv {
+        ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
+        backend_env: std::env::var("BAUDE_BACKEND").ok(),
+    };
+    let started = match baude_core::launch::start_workspace(&launch_dir, &config, env, "state")
     {
-        match holder {
-            Some(pid) => eprintln!(
-                "baude: workspace {} is already open in another baude (pid {pid}).",
-                workspace.name
-            ),
-            None => eprintln!(
-                "baude: workspace {} is already open in another baude.",
-                workspace.name
-            ),
+        Ok(started) => started,
+        Err(baude_core::launch::StartError::LockHeld { diag }) => {
+            eprintln!("baude: {diag}");
+            eprintln!(
+                "       Quit that instance, or run this one in another workspace: \
+                 BAUDE_WORKSPACE=<name> baude"
+            );
+            std::process::exit(1);
         }
-        eprintln!(
-            "       Quit that instance, or run this one in another workspace: \
-             BAUDE_WORKSPACE=<name> baude"
-        );
-        eprintln!("       lock: {}", path.display());
-        std::process::exit(1);
-    }
+        Err(baude_core::launch::StartError::LockIo { path, detail }) => {
+            eprintln!("baude: lock I/O error: {}: {}", path.display(), detail);
+            std::process::exit(1);
+        }
+    };
 
-    let mut startup_notes = plan.notes;
-    if config.folder_context_enabled() {
-        startup_notes.extend(baude_core::folder_workspace::applied_note(
-            &workspace.name,
-            ws_env.as_deref(),
-            backend_env.as_deref(),
-            &config,
-        ));
-        baude_core::folder_workspace::record(
-            Some(&memory_root),
-            &launch_dir,
-            &workspace.name,
-            baude_core::pty::now_ms(),
-        );
-    }
+    let workspace = started.workspace;
+    let mut startup_notes = Vec::new();
 
     // Auto-start local bauded when auto_daemon is configured. Must run before
     // App::new() reads the env, and before any threads start (set_var is not

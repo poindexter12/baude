@@ -220,7 +220,11 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style(app.focus == Focus::Sidebar))
-        .title(concat!(" baude v", env!("CARGO_PKG_VERSION"), " "));
+        .title(format!(
+            " baude v{} — {} ",
+            env!("CARGO_PKG_VERSION"),
+            baude_core::workspace::active().title_label()
+        ));
     let list_area = block.inner(area);
     frame.render_widget(block, area);
 

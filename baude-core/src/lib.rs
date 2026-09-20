@@ -11,6 +11,7 @@ pub mod bridge;
 pub mod folder_workspace;
 pub mod git;
 pub mod hook;
+pub mod launch;
 pub mod lifecycle;
 pub mod meta;
 pub mod permission;

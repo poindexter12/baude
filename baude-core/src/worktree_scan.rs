@@ -435,6 +435,7 @@ fn state_inventory(
             backend: crate::backend::backend_for(None),
             daemon_url: None,
             daemon_port: None,
+            source: crate::workspace::WorkspaceSource::Default,
         };
         for base in STATE_BASES {
             let mut names = vec![handle.state_file(base)];

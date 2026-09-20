@@ -23,7 +23,7 @@
 //! volume is legitimate history.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -61,13 +61,51 @@ pub struct FolderWorkspaceEntry {
 #[derive(Debug, Default, PartialEq)]
 pub struct LaunchPlan {
     pub hint: Option<String>,
+    pub repo_root: Option<PathBuf>,
     pub notes: Vec<String>,
+}
+
+/// Find a recorded folder binding by walking up the directory tree from `launch_dir`.
+///
+/// Walks upward checking for recorded bindings at each ancestor, stopping at the
+/// home directory boundary (returns false when home is reached) or filesystem root.
+/// Returns the first matching workspace name or `None`.
+///
+/// This is used to implement stable folder memory: the same repository returns the
+/// same workspace regardless of which subfolder it's launched from.
+pub fn find_binding(
+    root: &Path,
+    launch_dir: &Path,
+    home: &Path,
+) -> Option<String> {
+    let (file, _) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+
+    let mut current = launch_dir.to_path_buf();
+    loop {
+        let key = folder_key(&current);
+        if let Some(entry) = file.folders.get(&key) {
+            return Some(entry.workspace.clone());
+        }
+
+        // Stop if we've reached home.
+        if current == home {
+            return None;
+        }
+
+        // Stop if we've reached the root.
+        if !current.pop() {
+            return None;
+        }
+    }
 }
 
 /// Decide the launch hint for one TUI start. Consults the store only when the
 /// feature is enabled AND neither env var already names the workspace — an
 /// explicit invocation must not even read remembered history. `root: None` is
 /// the in-memory mode (tests): no file I/O at all.
+///
+/// Discovers the repository root (if inside a git repository) and performs an
+/// ancestor walk to find recorded folder bindings, stopping at the home directory.
 pub fn plan_launch(
     enabled: bool,
     ws_env: Option<&str>,
@@ -75,18 +113,32 @@ pub fn plan_launch(
     root: Option<&Path>,
     launch_dir: &Path,
 ) -> LaunchPlan {
+    // Discover repository root via git (succeeds only if inside a repo).
+    let repo_root = crate::git::repo_root(launch_dir);
+
     if !enabled || ws_env.is_some() || backend_env.is_some() {
-        return LaunchPlan::default();
+        return LaunchPlan {
+            repo_root,
+            ..Default::default()
+        };
     }
     let Some(root) = root else {
-        return LaunchPlan::default();
+        return LaunchPlan {
+            repo_root,
+            ..Default::default()
+        }
     };
-    let (file, corrupted) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+
+    // Perform ancestor walk to find a recorded binding.
+    let home = crate::persist::home_dir();
+    let hint = find_binding(root, launch_dir, &home);
+
+    // Check if the folder-workspaces file is corrupted (for diagnostics).
+    let (_, corrupted) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+
     let mut plan = LaunchPlan {
-        hint: file
-            .folders
-            .get(&folder_key(launch_dir))
-            .map(|entry| entry.workspace.clone()),
+        hint,
+        repo_root,
         notes: Vec::new(),
     };
     if corrupted {
@@ -131,6 +183,7 @@ pub fn record(root: Option<&Path>, launch_dir: &Path, workspace: &str, now_ms: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TestRedirect;
     use std::path::PathBuf;
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
@@ -146,6 +199,7 @@ mod tests {
 
     #[test]
     fn records_and_recalls_one_folder_preserving_others() {
+        let _redirect = TestRedirect::new(scratch("roundtrip-root"));
         let dir = scratch("roundtrip");
         record(Some(&dir), Path::new("/mem/api"), "opencode", 10);
         record(Some(&dir), Path::new("/mem/web"), "work", 20);
@@ -169,6 +223,7 @@ mod tests {
 
     #[test]
     fn unknown_folder_disabled_switch_or_env_never_consult_memory() {
+        let _redirect = TestRedirect::new(scratch("gates-root"));
         let dir = scratch("gates");
         record(Some(&dir), Path::new("/mem/api"), "opencode", 5);
 
@@ -197,6 +252,7 @@ mod tests {
 
     #[test]
     fn corrupt_file_degrades_to_no_memory_with_one_note_and_heals_on_record() {
+        let _redirect = TestRedirect::new(scratch("corrupt-root"));
         let dir = scratch("corrupt");
         std::fs::write(dir.join(FILE_NAME), b"{not json").unwrap();
         let plan = plan_launch(true, None, None, Some(&dir), Path::new("/mem/api"));
