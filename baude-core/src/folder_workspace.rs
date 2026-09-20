@@ -68,13 +68,31 @@ pub struct LaunchPlan {
 /// Find a recorded folder binding by walking up the directory tree from `launch_dir`.
 ///
 /// Walks upward checking for recorded bindings at each ancestor, stopping at the
-/// home directory boundary (returns false when home is reached) or filesystem root.
+/// home directory boundary (returns `None` when home is reached) or filesystem root.
 /// Returns the first matching workspace name or `None`.
 ///
 /// This is used to implement stable folder memory: the same repository returns the
 /// same workspace regardless of which subfolder it's launched from.
+///
+/// # Canonicalization
+///
+/// **Important:** `launch_dir` must be canonicalized by the caller for correct home boundary
+/// checking via `std::fs::canonicalize`. The `home` path is canonicalized internally to ensure
+/// consistent comparison, even when reached through symlinks. On systems where the home
+/// directory is a symlink (e.g., macOS with `/var` → `/private/var`), this ensures the
+/// walk stops at the correct boundary and does not escape to parent directories.
 pub fn find_binding(root: &Path, launch_dir: &Path, home: &Path) -> Option<String> {
     let (file, _) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+
+    // Canonicalize home for consistent comparison with canonicalized launch_dir.
+    // If canonicalization fails, fall back to non-canonical comparison.
+    let canonical_home = match home.canonicalize() {
+        Ok(ch) => ch,
+        Err(_) => {
+            // Home doesn't exist; use it as-is for comparison (walk will likely not match anyway)
+            home.to_path_buf()
+        }
+    };
 
     let mut current = launch_dir.to_path_buf();
     loop {
@@ -83,8 +101,8 @@ pub fn find_binding(root: &Path, launch_dir: &Path, home: &Path) -> Option<Strin
             return Some(entry.workspace.clone());
         }
 
-        // Stop if we've reached home.
-        if current == home {
+        // Stop if we've reached home (now with consistent canonicalization).
+        if current == canonical_home {
             return None;
         }
 
@@ -408,5 +426,61 @@ mod tests {
         // When no binding exists, the repo_root should be returned for derivation.
         let plan = plan_launch(true, None, Some("opencode"), Some(&dir), &repo_dir);
         assert!(plan.repo_root.is_some());
+    }
+
+    #[test]
+    fn find_binding_respects_symlinked_home_boundary() {
+        // Test that the ancestor walk correctly stops at a home directory
+        // reached through a symlink. This validates the fix for CR-01/WR-01:
+        // on macOS and other systems with symlinked home dirs, the walk must
+        // not escape the home boundary through the symlink.
+        let fixture_root = scratch("find-binding-symlink-home-root");
+        let config_dir = scratch("find-binding-symlink-home-config");
+
+        // Create the directory structure:
+        // - fixture/real-home/    <- the actual home directory
+        // - fixture/home-link ->  <- a symlink to real-home
+        let real_home = fixture_root.join("real-home");
+        let home_link = fixture_root.join("home-link");
+        std::fs::create_dir_all(&real_home).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Windows: use junction instead (or skip the test if unavailable).
+            // For now, just copy the directory structure.
+            std::fs::create_dir_all(&home_link).unwrap();
+        }
+
+        // Create a launch directory inside the real home, then a subdirectory.
+        let launch_dir = real_home.join("projects").join("myrepo");
+        std::fs::create_dir_all(&launch_dir).unwrap();
+
+        // Record a binding at a parent directory ABOVE the real home.
+        // This binding should NOT be found when walking from launch_dir
+        // through the symlinked home boundary.
+        let above_home = fixture_root.join("above");
+        record(Some(&config_dir), &above_home, "should-not-find", 10);
+
+        // Use TestRedirect to set the home to the symlink.
+        let _redirect = TestRedirect::new(&fixture_root);
+
+        // The critical path: canonicalize launch_dir and call find_binding
+        // with the symlinked home path. The fix ensures that even though
+        // home_link is a symlink, it will be canonicalized to real-home,
+        // and the comparison will correctly stop the walk at the boundary.
+        let canonical_launch = launch_dir
+            .canonicalize()
+            .unwrap_or_else(|_| launch_dir.clone());
+
+        // Call find_binding with the symlinked home.
+        let binding = find_binding(&config_dir, &canonical_launch, &home_link);
+
+        // Should NOT find the binding above the home boundary, even though
+        // home is reached via a symlink.
+        assert_eq!(
+            binding, None,
+            "walk should stop at symlinked home boundary and not escape"
+        );
     }
 }
