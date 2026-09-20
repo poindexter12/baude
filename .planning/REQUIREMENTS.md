@@ -12,18 +12,18 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 
 ### Workspace derivation
 
-- [ ] **WSPC-01**: With no explicit workspace, baude walks up from the launch dir to the nearest recorded folder binding and uses that workspace
-- [ ] **WSPC-02**: With no binding on any ancestor, baude derives the workspace from the launch repository root's folder name (sanitized) and records a binding for that root so later launches are stable
-- [ ] **WSPC-03**: Explicit `BAUDE_WORKSPACE`, config `workspace`, and the `folder_context` flow keep priority over derivation, and the README documents the full precedence and the derivation rule
-- [ ] **WSPC-04**: `bauded` resolves the workspace by the same rule for the same launch dir, so TUI and daemon agree on the workspace
-- [ ] **WSPC-05**: The TUI shows a clear title at the top naming the active workspace (and whether it was explicit, bound, or derived); when no workspace applies it shows a placeholder such as `(blank)`
+- [x] **WSPC-01**: With no explicit workspace, baude walks up from the launch dir to the nearest recorded folder binding and uses that workspace
+- [x] **WSPC-02**: With no binding on any ancestor, baude derives the workspace from the launch repository root's folder name (sanitized) and records a binding for that root so later launches are stable
+- [x] **WSPC-03**: Explicit `BAUDE_WORKSPACE`, config `workspace`, and the `folder_context` flow keep priority over derivation, and the README documents the full precedence and the derivation rule
+- [x] **WSPC-04**: `bauded` resolves the workspace by the same rule for the same launch dir, so TUI and daemon agree on the workspace
+- [x] **WSPC-05**: The TUI shows a clear title at the top naming the active workspace (and whether it was explicit, bound, or derived); when no workspace applies it shows a placeholder such as `(blank)`
 
 ### New-session and open defaults
 
-- [ ] **OPEN-01**: The `n` new-session prompt prefills the git toplevel of the launch dir when baude was launched inside a repository
-- [ ] **OPEN-02**: Config `new_session_dir` is used as the prefill only when the launch dir is outside any repository
-- [ ] **OPEN-03**: Launching baude from a subfolder of a repository admits and focuses the same repository row as launching from its root
-- [ ] **OPEN-04**: Clone-on-demand keeps its `clone_base_dir` destination semantics; only directory-open paths change, and the README documents the new defaults
+- [x] **OPEN-01**: The `n` new-session prompt prefills the git toplevel of the launch dir when baude was launched inside a repository
+- [x] **OPEN-02**: Config `new_session_dir` is used as the prefill only when the launch dir is outside any repository
+- [x] **OPEN-03**: Launching baude from a subfolder of a repository admits and focuses the same repository row as launching from its root
+- [x] **OPEN-04**: Clone-on-demand keeps its `clone_base_dir` destination semantics; only directory-open paths change, and the README documents the new defaults
 
 ### Managed worktree identity
 
@@ -89,15 +89,15 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WSPC-01 | Phase 13 | Pending |
-| WSPC-02 | Phase 13 | Pending |
-| WSPC-03 | Phase 13 | Pending |
-| WSPC-04 | Phase 13 | Pending |
-| WSPC-05 | Phase 13 | Pending |
-| OPEN-01 | Phase 13 | Pending |
-| OPEN-02 | Phase 13 | Pending |
-| OPEN-03 | Phase 13 | Pending |
-| OPEN-04 | Phase 13 | Pending |
+| WSPC-01 | Phase 13 | Complete |
+| WSPC-02 | Phase 13 | Complete |
+| WSPC-03 | Phase 13 | Complete |
+| WSPC-04 | Phase 13 | Complete |
+| WSPC-05 | Phase 13 | Complete |
+| OPEN-01 | Phase 13 | Complete |
+| OPEN-02 | Phase 13 | Complete |
+| OPEN-03 | Phase 13 | Complete |
+| OPEN-04 | Phase 13 | Complete |
 | WTID-01 | Phase 14 | Pending |
 | WTID-02 | Phase 14 | Pending |
 | WTID-03 | Phase 14 | Pending |
@@ -114,6 +114,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SHIP-05 | Phase 17 | Pending |
 
 **Coverage:**
+
 - v2.3 requirements: 23 total
 - Mapped to phases: 23
 - Unmapped: 0 ✓

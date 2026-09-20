@@ -22,7 +22,7 @@ covered_files:
   - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-02-SUMMARY.md
   - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-03-PLAN.md
   - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-03-SUMMARY.md
-covered_digest: "v1:sha256:7e03e2749dcb0dff32dc041a4f45dd2ba67c0ed80e4474307e18fee4417874dd"
+covered_digest: "v1:sha256:73614dd58540cadd0f328f29b627012657674e0d73062c5c07b494077350135a"
 behavior_unverified: 0
 overrides_applied: 0
 ---
