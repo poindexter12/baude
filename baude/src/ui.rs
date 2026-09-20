@@ -3262,7 +3262,8 @@ mod tests {
         let _fixture = UiFixture::new("title-bound");
         // Override with Bound source (via hint)
         let config = baude_core::persist::Config::default();
-        let ws = baude_core::workspace::resolve_with_hint(None, None, Some("bound-ws"), &config, |_| {});
+        let ws =
+            baude_core::workspace::resolve_with_hint(None, None, Some("bound-ws"), &config, |_| {});
         assert_eq!(ws.source, baude_core::workspace::WorkspaceSource::Bound);
         assert!(ws.title_label().contains("folder binding"));
     }
