@@ -218,3 +218,7 @@ Workspace derivation complete and end-to-end verified with smoke test compilatio
 
 *Phase: 13 (Workspace Derivation and New-Session/Open Defaults)*
 *Completed: 2026-09-20*
+
+## Post-Wave Orchestrator Fix (2026-09-19)
+
+The post-merge gate found `cargo fmt --check` and `cargo clippy -D warnings` failing after this plan: the refactor into `launch::start_workspace` dropped the folder-memory startup notes (`plan.notes` plus `applied_note`) that `main.rs` printed before, leaving an unused `mut Vec` and an unused `workspace` binding. Fixed in commit `0e0a810` (`StartedWorkspace.notes` added and printed by `main.rs`) and `rustfmt` applied in the follow-up style commit. Full workspace tests: 646 passed, 0 failed after the fix.
