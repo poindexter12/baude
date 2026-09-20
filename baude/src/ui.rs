@@ -660,7 +660,22 @@ fn remote_status(r: &RemoteInfo) -> Status {
 fn remote_header(app: &App, width: usize) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let label = if app.remote_snap.ok {
-        "⇄ remote".to_string()
+        // Display daemon workspace with source label, matching local title format
+        match (
+            &app.remote_snap.daemon_workspace,
+            &app.remote_snap.daemon_workspace_source,
+        ) {
+            (Some(ws), Some(source)) => {
+                // "(blank)" for default source, otherwise "name (source)"
+                if source == "blank" {
+                    format!("⇄ remote: {} (blank)", ws)
+                } else {
+                    format!("⇄ remote: {} ({})", ws, source)
+                }
+            }
+            (Some(ws), None) => format!("⇄ remote: {}", ws),
+            _ => "⇄ remote".to_string(),
+        }
     } else {
         "⇄ remote (offline)".to_string()
     };

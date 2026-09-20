@@ -7937,6 +7937,8 @@ mod tests {
             ],
             fetched_ms: 1,
             ok: true,
+            daemon_workspace: None,
+            daemon_workspace_source: None,
         };
 
         assert!(app.repository_state.repositories.is_empty());
@@ -8076,6 +8078,8 @@ mod tests {
             sessions: vec![remote(62, "sleepy", true), remote(51, "busy-bee", false)],
             fetched_ms: 1,
             ok: true,
+            daemon_workspace: None,
+            daemon_workspace_source: None,
         };
 
         // Hidden default: archived rows (local and remote) leave selection

@@ -62,6 +62,14 @@ pub struct RemoteInfo {
     /// for back-compat with a daemon that omits it.
     #[serde(default)]
     pub gsd_active_phase: Option<String>,
+    /// Daemon workspace source label ("explicit", "folder binding", "derived",
+    /// or "blank" for default). Comes from the daemon's /info endpoint.
+    /// `#[serde(default)]` for backward-compat with older daemons.
+    /// Currently stored here for testing; daemon workspace source is primarily
+    /// accessed from RemoteSnapshot.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub workspace_source: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -70,6 +78,10 @@ pub struct RemoteSnapshot {
     /// `now_ms()` at fetch time — waiting timers tick client-side from here.
     pub fetched_ms: u64,
     pub ok: bool,
+    /// Daemon's workspace name from /info endpoint (for displaying daemon identity).
+    pub daemon_workspace: Option<String>,
+    /// Daemon's workspace source from /info endpoint (explicit/bound/derived/blank).
+    pub daemon_workspace_source: Option<String>,
 }
 
 /// Background poller for one daemon.
@@ -84,19 +96,39 @@ impl RemotePoller {
         let data = Arc::new(Mutex::new(RemoteSnapshot::default()));
         let shared = Arc::clone(&data);
         let url = format!("{base}/sessions");
+        let info_url = format!("{base}/info");
         std::thread::spawn(move || loop {
+            // Fetch sessions list
             let fetched = ureq::get(&url)
                 .timeout(REQUEST_TIMEOUT)
                 .call()
                 .ok()
                 .and_then(|r| r.into_json::<Vec<RemoteInfo>>().ok());
+
+            // Fetch daemon workspace info from /info
+            let daemon_info = ureq::get(&info_url)
+                .timeout(REQUEST_TIMEOUT)
+                .call()
+                .ok()
+                .and_then(|r| r.into_json::<serde_json::Value>().ok());
+
             if let Ok(mut d) = shared.lock() {
                 match fetched {
                     Some(sessions) => {
+                        let daemon_workspace = daemon_info
+                            .as_ref()
+                            .and_then(|v| v["workspace"].as_str())
+                            .map(str::to_string);
+                        let daemon_workspace_source = daemon_info
+                            .as_ref()
+                            .and_then(|v| v["workspace_source"].as_str())
+                            .map(str::to_string);
                         *d = RemoteSnapshot {
                             sessions,
                             fetched_ms: now_ms(),
                             ok: true,
+                            daemon_workspace,
+                            daemon_workspace_source,
                         }
                     }
                     // Keep the stale list visible, just mark it offline.
@@ -391,5 +423,22 @@ mod tests {
             r.activity[1].notification_type.as_deref(),
             Some("permission")
         );
+    }
+
+    /// A daemon that includes workspace_source (WSPC-05) deserializes it
+    /// correctly. An older daemon that omits it defaults to None.
+    #[test]
+    fn remote_info_deserializes_workspace_source() {
+        // With workspace_source field
+        let json = r#"{"id":7,"name":"alpha","status":"working",
+            "workspace_source":"derived"}"#;
+        let r: RemoteInfo = serde_json::from_str(json).expect("deserialize with workspace_source");
+        assert_eq!(r.workspace_source.as_deref(), Some("derived"));
+
+        // Without workspace_source field (older daemon) — defaults to None
+        let json_old = r#"{"id":7,"name":"alpha","status":"working"}"#;
+        let r_old: RemoteInfo = serde_json::from_str(json_old)
+            .expect("deserialize without workspace_source (backward-compat)");
+        assert_eq!(r_old.workspace_source, None);
     }
 }

@@ -171,15 +171,44 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("BAUDED_BIND").ok())
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
-    // Identity is resolved explicitly, once, from a config loaded once, BEFORE
-    // the first reader. `default_claude_cmd`, `Manager::new`, `restore`, the
-    // metadata poll thread and every API handler reach `workspace::active()`,
-    // directly or through `backend::active()`; the daemon passes no folder hint
-    // (only the TUI launch path has a launch directory to remember). Precedence
-    // is unchanged: `initialize` still consults BAUDE_WORKSPACE/BAUDE_BACKEND
-    // ahead of this config, exactly as the previous lazy resolution did.
+    // Daemon startup mirrors TUI startup: canonicalize the current directory,
+    // call the shared workspace resolver, claim the lock, and record any
+    // derived bindings. The daemon's lock base is "daemon-state" to distinguish
+    // it from the TUI's "state" lock.
+    let launch_dir = match std::fs::canonicalize(std::env::current_dir()?) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("failed to canonicalize current directory: {e}");
+            std::process::exit(1);
+        }
+    };
     let config = baude_core::persist::load_config();
-    let _ = baude_core::workspace::initialize(&config, None);
+    let env = baude_core::launch::StartEnv {
+        ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
+        backend_env: std::env::var("BAUDE_BACKEND").ok(),
+    };
+    let _started =
+        match baude_core::launch::start_workspace(&launch_dir, &config, env, "daemon-state") {
+            Ok(started) => {
+                // Print startup notes if any (folder-memory hints, applied bindings)
+                for note in &started.notes {
+                    println!("  {note}");
+                }
+                started
+            }
+            Err(baude_core::launch::StartError::LockHeld { diag }) => {
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            Err(baude_core::launch::StartError::LockIo { path, detail }) => {
+                eprintln!(
+                    "failed to claim workspace lock at {}: {}",
+                    path.display(),
+                    detail
+                );
+                std::process::exit(1);
+            }
+        };
 
     let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();

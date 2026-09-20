@@ -121,9 +121,18 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
 async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
     let ws = baude_core::workspace::active();
     let persistence = lock(&state).persistence_status();
+    // workspace_source shows how the workspace was resolved: "(explicit)",
+    // "(folder binding)", "(derived)", or "(blank)" for default. Trim
+    // parentheses for the API response.
+    let workspace_source = ws
+        .display_hint()
+        .trim_matches('(')
+        .trim_matches(')')
+        .to_string();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
+        "workspace_source": workspace_source,
         "version": env!("CARGO_PKG_VERSION"),
         "persistence": persistence,
     }))
@@ -1747,6 +1756,52 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = app.oneshot(get("/sessions")).await.unwrap();
         assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn info_endpoint_includes_workspace_source() {
+        let _scope = api_scope("info-test");
+        let state = Arc::new(Mutex::new(Manager::new("claude".to_string(), true)));
+        let app = super::router(Arc::clone(&state));
+
+        // Test that /info includes workspace_source field
+        let req = Request::builder().uri("/info").body(Body::empty()).unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify /info response includes required fields
+        assert!(
+            json["workspace"].is_string(),
+            "workspace field must be a string"
+        );
+        assert!(
+            json["backend"].is_string(),
+            "backend field must be a string"
+        );
+        assert!(
+            json["workspace_source"].is_string(),
+            "workspace_source field must be a string"
+        );
+        assert!(
+            json["version"].is_string(),
+            "version field must be a string"
+        );
+        assert!(
+            json["persistence"].is_object(),
+            "persistence field must be an object"
+        );
+
+        // workspace_source should be one of the four valid source labels
+        let source = json["workspace_source"].as_str().unwrap();
+        assert!(
+            ["explicit", "folder binding", "derived", "blank"].contains(&source),
+            "workspace_source must be one of: explicit, folder binding, derived, blank (got: {})",
+            source
+        );
     }
 }
 
