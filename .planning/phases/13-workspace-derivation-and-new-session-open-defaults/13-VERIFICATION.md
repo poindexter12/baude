@@ -16,7 +16,13 @@ covered_files:
   - bauded/src/main.rs
   - bauded/src/api.rs
   - README.md
-covered_digest: "v1:sha256:6eeceeeeebbf3fdf6a5e43ce926441ea2904be130659abfd8a8e312ac4d4d3e2"
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-01-PLAN.md
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-01-SUMMARY.md
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-02-PLAN.md
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-02-SUMMARY.md
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-03-PLAN.md
+  - .planning/phases/13-workspace-derivation-and-new-session-open-defaults/13-03-SUMMARY.md
+covered_digest: "v1:sha256:7e03e2749dcb0dff32dc041a4f45dd2ba67c0ed80e4474307e18fee4417874dd"
 behavior_unverified: 0
 overrides_applied: 0
 ---
