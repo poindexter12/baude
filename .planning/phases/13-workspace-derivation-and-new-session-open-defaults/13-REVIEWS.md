@@ -1,12 +1,12 @@
 ---
 phase: 13
 reviewers: [codex]
-reviewed_at: 2026-09-20T03:00:53Z
+reviewed_at: 2026-09-20T04:15:30Z
 plans_reviewed: [13-01-PLAN.md, 13-02-PLAN.md, 13-03-PLAN.md]
 models:
-  codex: "unknown"
+  codex: "gpt-5.6-sol"
 model_sources:
-  codex: "unknown"
+  codex: "banner"
 ---
 
 # Cross-AI Plan Review — Phase 13
@@ -15,174 +15,188 @@ model_sources:
 ## Plan-Revision Conflicts
 <!-- gsd:plan-revision-conflicts:end -->
 
-## 13-01
+## Convergence Cycle 2
 
-### Summary
+Reviewed against repository commit `8f08072`. Source access was available.
 
-The plan identifies the correct modules, but its proposed data flow cannot implement repository-derived workspaces as written. The current startup API carries only one undifferentiated folder hint, records the launch directory rather than the repository root, and suppresses that hint when `BAUDE_BACKEND` is set. Because `baude/src/main.rs` is excluded from the files modified, the plan cannot supply or persist the additional derivation information required by WSPC-02.
+**Overall verdict: not yet converged.** Most cycle-1 findings are now represented in the plan text, but several mechanisms still conflict with the live code or with locked decisions. The largest blockers are:
 
-### Strengths
+- `BAUDE_BACKEND` still suppresses `plan_launch`, so the proposed precedence cannot work.
+- Non-repository launches are still planned to record bindings, contrary to the phase decision.
+- The daemon plan assumes a startup lock that does not exist.
+- The proposed daemon "parity" test calls the same core function twice and cannot detect daemon wiring failures.
 
-- The new-session change targets the correct seam. `open_new_session_modal()` currently prefers `new_session_dir` and otherwise uses `launch_dir`, so inserting `git::repo_root(&self.launch_dir)` there directly addresses OPEN-01/02 ([app.rs:4057](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4057)). The existing helper invokes `git rev-parse --show-toplevel` ([git.rs:1734](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:1734)).
-- The proposed ancestor lookup builds on the correct canonical key mechanism: `folder_key()` canonicalizes before serializing the path ([breadcrumbs.rs:114](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/breadcrumbs.rs:114)).
-- The UI location is appropriate. The sidebar block owns the existing top title ([ui.rs:218](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:218)), while the status line already displays `workspace::active().display_label()` ([ui.rs:1275](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:1275)).
-- The existing TUI startup claims the workspace state lock before recording folder memory ([main.rs:370](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:370), [main.rs:398](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:398)), which is a sound ordering to preserve.
-- Workspace sanitization already implements the required ASCII-safe substitution policy ([workspace.rs:99](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:99)).
+### 13-01
 
-### Concerns
+#### Summary
 
-- **HIGH — Repository derivation has no executable data path.** `LaunchPlan` currently contains only `hint` and `notes` ([folder_workspace.rs:59](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:59)); `plan_launch()` receives neither a repository root nor a home boundary ([folder_workspace.rs:71](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:71)). The plan does not modify `baude/src/main.rs`, even though that is where the repository root must be discovered and where the resolved inputs are assembled.
-- **HIGH — Derived bindings would be written under the wrong key.** Startup currently records `launch_dir -> workspace` ([main.rs:406](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:406)). WSPC-02 requires a derived binding keyed by the repository root. Calling `find_binding()` does not change the recording target, and the plan explicitly says recording remains unchanged.
-- **HIGH — The proposed resolver cannot distinguish a bound workspace from a derived workspace.** `resolve_with_hint()` accepts only `Option<&str>` ([workspace.rs:132](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:132)). Passing either result as `hint` makes it impossible to assign `WorkspaceSource::Bound` versus `WorkspaceSource::Derived`. The action mentions “derived repo root provided,” but proposes no parameter or structured input for it.
-- **HIGH — The existing precedence contradicts the locked Phase 13 chain.** `plan_launch()` refuses to consult memory whenever `BAUDE_BACKEND` exists ([folder_workspace.rs:78](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:78)), and `resolve_with_hint()` also suppresses hints under `BAUDE_BACKEND` ([workspace.rs:139](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:139)). The declared new order places a folder binding and derivation ahead of `BAUDE_BACKEND`. Plan 01 neither explicitly removes both suppressions nor tests the changed rule.
-- **HIGH — The default title violates WSPC-05.** Formatting `display_label() + display_hint()` will render `Claude Code (default)`, because `display_label()` maps the implicit `claude` workspace to “Claude Code” ([workspace.rs:73](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:73)). The requirement calls for `(blank)` when no explicit, bound, or derived workspace applies.
-- **MEDIUM — Source classification is underspecified.** The enum has only `Explicit`, `Bound`, `Derived`, and `Default`, but the action does not clearly classify config `workspace`, `BAUDE_BACKEND`, or config `backend`. This matters because the context says explicit config should be visible, while backend-only fallback should not masquerade as repository derivation.
-- **MEDIUM — Home-boundary resolution must use the guarded resolver.** The repository already provides `persist::home_dir()`, which honors `TestRedirect` ([persist.rs:904](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:904)). The plan should explicitly use this instead of `dirs::home_dir()` or an unthreaded ambient home.
-- **MEDIUM — The automated verification does not exercise the tracer.** It runs one pre-existing exact-match memory test ([folder_workspace.rs:147](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:147)). It does not compile the TUI changes, test derivation, inspect the title, or exercise the modal.
-- **MEDIUM — The manual smoke procedure mutates real user state.** Launching production `baude` from the supplied worktree invokes the real config root and records folder memory after locking ([main.rs:360](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:360), [main.rs:406](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:406)). This conflicts with the verification statement that `TestRedirect` was active.
+The replanning substantially improves the tracer by adding repository-root data flow, workspace-source tracking, root-keyed persistence, title rendering, and repository-aware new-session defaults. Cycle-1 findings R1–R3 and R5 are directly addressed in the text. However, R4 is not operationally solved because the earlier `folder_workspace::plan_launch` gate still suppresses binding lookup and derivation whenever `BAUDE_BACKEND` is present. The recording policy also contradicts the locked non-git behavior.
 
-### Suggestions
+#### Strengths
 
-- Replace the untyped `hint` with a structured resolution input, for example `LaunchSelection::{Bound, Derived}`, plus a `record_path` or `repo_root`.
-- Make `plan_launch()` perform one coherent operation:
+- Repository-root derivation now has a plausible data path: `LaunchPlan.repo_root` is proposed where the current structure only carries `hint` and `notes` at `baude-core/src/folder_workspace.rs:61-65`. This directly improves cycle-1 R1.
+- Recording after the TUI lock is correctly aligned with the current startup order. The lock is claimed at `baude/src/main.rs:370-396`, while folder memory is written at `baude/src/main.rs:398-411`. This addresses R2's durability concern for the TUI.
+- Source tracking is a sensible solution to R3/R5. The current `Workspace` contains no provenance at `baude-core/src/workspace.rs:46-54`, so adding `WorkspaceSource` is necessary to distinguish bound, derived, explicit, and implicit-default outcomes.
+- The proposed `n` prefill change targets the correct method. Current behavior prefers `new_session_dir` at `baude/src/app.rs:4057-4064`, while the reusable repository-root helper already exists at `baude-core/src/git.rs:1734-1738`.
+- OPEN-03 rests on a real deduplication mechanism: repository admission compares canonical `common_dir` values at `baude/src/app.rs:1914-1937`, and discovery canonicalizes that directory at `baude-core/src/git.rs:321-353`.
+- The home-directory resolver is fixture-aware. `persist::home_dir()` honors `TestRedirect` at `baude-core/src/persist.rs:914-922`, supporting cycle-1 R7/R9 when actually used.
 
-  1. Find the nearest ancestor binding.
-  2. If absent, discover the repository root.
-  3. Construct a sanitized derived candidate.
-  4. Return both source and repository-root recording target.
+#### Concerns
 
-- Change TUI startup so derived bindings are recorded against `repo_root`; preserve existing explicit-launch recording semantics separately if desired.
-- Encode and test the exact precedence in one resolver: `BAUDE_WORKSPACE > bound > config workspace > derived > BAUDE_BACKEND > config backend > default`.
-- Add a title-specific method that renders `(blank)` for the implicit default instead of composing `display_label()` mechanically.
-- Replace the verification command with targeted core tests plus `cargo test -p baude ...` for modal/UI behavior. Run manual smoke under isolated `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `HOME`.
+- **HIGH — Cycle-1 R4 is only half incorporated.** The plan removes hint suppression inside `workspace::resolve_with_hint`, but `plan_launch` itself immediately returns an empty plan if `backend_env.is_some()` at `baude-core/src/folder_workspace.rs:71-83`. Consequently, no ancestor binding or repository root reaches the resolver, and the promised order `binding/config/derived > BAUDE_BACKEND` remains impossible. The plan only names the suppression at `workspace.rs:139`; it must also change this earlier gate and its module documentation at `folder_workspace.rs:12-16`.
+- **HIGH — Non-repository recording contradicts the locked decision and the plan's own prohibition.** The plan says to use `repo_root` when present and otherwise retain launch-directory recording. Current recording writes any supplied folder at `baude-core/src/folder_workspace.rs:114-128`, and the TUI calls it for every folder-context launch at `baude/src/main.rs:398-411`. That would continue creating bindings for previously unbound non-git folders, despite the decision that such launches derive and record nothing.
+- **HIGH — The proposed resolver API change is not dependency-safe.** Derivation requires passing `repo_root` through `initialize`, whose current public signature accepts only `hint` at `baude-core/src/workspace.rs:276-285`. Plan 13-01 changes the TUI but not `bauded`, which still calls `initialize(&config, None)` at `bauded/src/main.rs:181-182`. Replacing the signature would leave the workspace uncompilable until 13-03 unless a backward-compatible wrapper or new API is specified.
+- **MEDIUM — `config backend` provenance is undefined.** The plan says every precedence level gets a source, but assigns config `workspace` to `Explicit` while saying config `backend` merely "uses backend, not a separate source." Current config backend can determine the workspace name at `baude-core/src/workspace.rs:144-150`. It should be explicitly classified, particularly because WSPC-05 distinguishes configured selection from a truly blank default.
+- **MEDIUM — The title composition does not literally replace the default workspace with `(blank)`.** `display_label()` returns `Claude Code` for the default workspace at `baude-core/src/workspace.rs:73-83`. Formatting `display_label() + "(blank)"` therefore renders `Claude Code (blank)`, not a blank workspace identity. A dedicated title-label method would make the requirement unambiguous.
+- **MEDIUM — Derivation ownership is contradictory.** The plan first says `plan_launch` derives through `workspace::sanitize`, then says the resolver derives from `repo_root`. Today `sanitize` is private to `workspace.rs` at `baude-core/src/workspace.rs:99-111`, so sibling-module derivation will not compile unless visibility changes. One layer should own derivation.
+- **MEDIUM — The smoke/isolation story remains inconsistent.** The automated check only runs the pre-existing exact-match round-trip test. The later instruction launches a real `baude`, while also asserting `TestRedirect` protects the real config. A normal binary launch does not install the fixture redirect used by tests.
+- **LOW — `git::repo_root` is not itself canonicalizing.** It converts command output directly to `PathBuf` at `baude-core/src/git.rs:1734-1738`. Before using it as the durable binding key, the implementation should canonicalize it or document why canonical launch-directory execution guarantees the required form.
 
-### Risk Assessment
+#### Cycle-1 Disposition
 
-**HIGH.** The UI and modal portions are straightforward, but the central WSPC-02 mechanism is absent from the proposed interfaces and file list. Executing the plan literally would likely produce ancestor lookup and source labels without reliable repository derivation or root-level persistence.
+| Finding | Assessment |
+|---|---|
+| R1 repository-root data path | Addressed in text |
+| R2 root-keyed recording | Addressed for repositories |
+| R3 provenance tracking | Addressed |
+| R4 precedence reorder | **Not fully addressed**; `plan_launch` still suppresses on backend env |
+| R5 blank default hint | Partially addressed; final title composition remains ambiguous |
+| R6 source mapping | Partially addressed; config backend unspecified |
+| R7 home resolution | Addressed if `persist::home_dir()` is mandated |
+| R8 meaningful verification | Partially addressed; tracer verification still tests old behavior |
+| R9 fixture containment | Partially addressed; manual smoke is not fixture-isolated |
 
-## 13-02
+#### Suggestions
 
-### Summary
+- Change the initial `plan_launch` gate to suppress only for `BAUDE_WORKSPACE`, not `BAUDE_BACKEND`.
+- Introduce an explicit shared input such as `WorkspaceLaunchContext { bound_hint, repo_root }`, while retaining the existing `initialize(config, hint)` wrapper for callers migrated later.
+- Define a source-aware recording rule. At minimum, do not fall back to recording an unbound non-git `launch_dir`.
+- Assign a provenance value to config `backend`.
+- Add a dedicated `workspace_title_label()` that returns either `"<workspace> (<source>)"` or `(blank)`.
+- Replace the old tracer test with an isolated test that exercises planning, resolution, post-lock recording, recall, and rendered title.
 
-The test plan names many important behaviors, but its tasks do not cover several of its own must-haves. In particular, there is no real precedence/derivation test matrix, no UI rendering test for WSPC-05, and no concrete repository deduplication test. As a result, it would not catch the principal architectural defects in Plan 01.
+#### Risk Assessment
 
-### Strengths
+**HIGH.** The central precedence rule cannot work through the current `plan_launch` gate, and the proposed API migration can temporarily break `bauded`. The non-git recording behavior also violates a locked phase decision.
 
-- Parent, grandparent, nearest-wins, home-boundary, and outside-home cases are the right ancestor-walk matrix.
-- The proposed fixtures can use the repository’s guarded home redirect: `TestRedirect::new()` supplies `<fixture>/home`, config, and data roots ([testing.rs:114](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/testing.rs:114)).
-- The app already has robust isolated repository fixtures that retain both the filesystem redirect and workspace identity ([app.rs:6866](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:6866), [app.rs:6950](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:6950)).
-- Repository identity is genuinely based on the canonical Git common directory ([git.rs:321](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:321)), and `admit_repository()` deduplicates on that value ([app.rs:1914](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1914)).
-- Existing re-admission coverage already demonstrates idempotence for the same path ([app.rs:8404](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:8404)), providing a useful pattern for the new root-versus-subfolder case.
+### 13-02
 
-### Concerns
+#### Summary
 
-- **HIGH — The listed precedence behaviors have no corresponding task.** The must-haves require explicit workspace, binding, config, derived, and backend precedence, but Task 2 only checks four `display_hint()` strings. Existing tests encode the old behavior in which `BAUDE_BACKEND` suppresses a hint ([workspace.rs:757](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:757)). Without replacing that test with the complete Phase 13 matrix, the old rule may remain green.
-- **HIGH — WSPC-02 is not tested end-to-end.** No task verifies “no binding → repository-root basename → sanitized derived workspace → root binding persisted.” Testing `find_binding()` alone cannot establish derivation or recording.
-- **HIGH — OPEN-03 is promised but not concretely implemented.** Task 3’s RED list contains only modal-prefill cases. The behavior mentions admission integration, but there is no named test, setup, or assertion for repository count, checkout count, runtime count, selection, or focus.
-- **HIGH — WSPC-05 lacks a rendering test.** The repository already has a `TestBackend` render helper ([ui.rs:2482](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:2482)), yet `ui.rs` is absent from Plan 02’s files and tasks. A unit test of `display_hint()` would not catch a missing title integration or the incorrect `Claude Code (default)` output.
-- **MEDIUM — “Daemon startup” appears in the must-haves but is not exercised.** No daemon file is modified or compiled by the listed tasks. That assertion belongs in Plan 03 and needs a daemon-facing seam.
-- **MEDIUM — The sanitization requirements are internally inconsistent.** The plan says to reuse the existing `sanitize()`, which returns an empty string for empty input ([workspace.rs:101](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:101)), but the must-haves demand a placeholder or hyphen. No task defines the intended new behavior or its compatibility impact.
-- **MEDIUM — “Always ends with `/`” changes existing behavior.** The current no-config fallback uses `launch_dir.display()` without a slash ([app.rs:4063](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4063)). The plan should call this an intentional normalization, not “consistency with existing behavior.”
-- **MEDIUM — The combined verification command is malformed.** `cargo test` accepts one positional test filter; `cargo test -p baude-core workspace:: folder_workspace:: --lib` should be split into two invocations or run without filters.
+The TDD plan is markedly stronger than cycle 1: it adds a full precedence matrix, end-to-end derivation/recall, UI rendering coverage, prefill cases, and one-instance repository deduplication. R1–R4 and R7–R8 are materially improved. Its main weakness is that some tests exercise lower-level functions without covering the wiring faults that currently defeat the behavior, and one home-boundary expectation conflicts with the specified ancestor walk.
 
-### Suggestions
+#### Strengths
 
-- Add a table-driven resolver test covering every precedence position and expected `WorkspaceSource`, including the declared relationship between binding/derivation and `BAUDE_BACKEND`.
-- Add an end-to-end core test that creates a repository with a hostile/unicode basename, resolves from a child directory, verifies the derived name, records at the repository root, and then resolves from a different child through the binding.
-- Add a UI render test for explicit, bound, derived, and blank-default titles using the existing `UiFixture` and `render()` helper.
-- Implement OPEN-03 using one `App`, not two:
+- The precedence matrix directly targets outdated tests such as `hint_outranks_config_defaults_but_never_env`, which currently asserts backend-env suppression at `baude-core/src/workspace.rs:756-783`.
+- The end-to-end WSPC-02 case is better than isolated lookup tests because current `plan_launch` only performs an exact match at `baude-core/src/folder_workspace.rs:84-97`.
+- UI rendering can be tested with the existing `TestBackend` helper at `baude/src/ui.rs:2482-2495`.
+- The plan correctly uses one `App` instance for root/subfolder deduplication. The live implementation deduplicates against the instance's `repository_state` through canonical common-dir comparison at `baude/src/app.rs:1914-1937`.
+- The prefill tests target the exact current fallback logic at `baude/src/app.rs:4057-4064`.
+- The plan's separate Cargo invocations use valid single-filter syntax, addressing cycle-1 R8.
 
-  - Admit the repository root.
-  - Admit a child directory through `open_repo_session_via()` or the startup route.
-  - Assert one repository, stable checkout/runtime counts, unchanged keys, and selected/focused existing row.
+#### Concerns
 
-- Remove daemon parity from this plan unless it adds a daemon-specific test seam.
-- Decide whether empty workspace sanitization changes globally; if not, remove that unrelated must-have.
+- **HIGH — A resolver-only precedence matrix can pass while startup remains wrong.** Because `plan_launch` discards all context when `BAUDE_BACKEND` is set at `baude-core/src/folder_workspace.rs:78-83`, tests must include the complete `plan_launch → resolve` path for the cases "binding beats backend env" and "derived beats backend env." Testing only `resolve_with_hint` would miss the primary 13-01 defect.
+- **MEDIUM — `launch_dir == home returns None` is not a generally correct expectation.** The locked rule walks "to `$HOME`," and the proposed algorithm checks the current path before stopping. Therefore a binding recorded exactly at home should be eligible. The test should distinguish "no binding at home" from "binding at home."
+- **MEDIUM — The WSPC-02 test does not naturally belong entirely inside `folder_workspace.rs`.** Resolution currently belongs to `workspace.rs`, while post-lock recording occurs in `baude/src/main.rs:370-411`. A folder-module-only test risks simulating rather than testing the actual integration.
+- **MEDIUM — UI source fixtures need an explicit construction seam.** The current helper always creates an explicit config workspace at `baude/src/ui.rs:2351-2379`. It cannot naturally create all four sources without extending `override_for_test` or introducing a title-formatting function that accepts a `Workspace`.
+- **LOW — Task-level verification filters omit some promised cases.** The Task 1 filter contains `find_binding` but not `test_wspc02_end_to_end_derive_persist_recall`; the Task 2 command runs only baude-core tests, not the UI tests; Task 3's primary command omits the deduplication test. The final full-suite gate mitigates this, but task completion could be declared prematurely.
+- **LOW — The empty sanitization case is underspecified.** `sanitize` replaces every invalid character with `-` at `baude-core/src/workspace.rs:99-111`; it only returns empty for empty input. Repository basenames are normally non-empty. If "do not persist empty" is retained as a must-have, the implementation needs an explicit guard and a realistic test.
 
-### Risk Assessment
+#### Cycle-1 Disposition
 
-**HIGH.** The plan gives an impression of broad coverage, but the actual test tasks omit the most failure-prone behaviors: derivation, precedence, root-level recording, title rendering, and subfolder deduplication.
+| Finding | Assessment |
+|---|---|
+| R1 precedence matrix | Addressed, but must include planning layer |
+| R2 derive/persist/recall lifecycle | Addressed in intent |
+| R3 root/subfolder deduplication | Addressed correctly with one app |
+| R4 title rendering tests | Addressed |
+| R5 daemon assertion moved | Addressed |
+| R6 empty sanitization | Defined, but implementation guard remains vague |
+| R7 trailing slash | Addressed |
+| R8 valid test commands | Addressed; task filters could be broader |
 
-## 13-03
+#### Suggestions
 
-### Summary
+- Make the precedence matrix table drive the shared launch resolver, including `plan_launch`, not just `resolve_with_hint`.
+- Change the home test to cover both binding-at-home and no-binding-at-home.
+- Extract pure helpers for resolving a `LaunchPlan`, deciding whether and where to record, and formatting the workspace title.
+- Give each task's automated command all promised tests, or use a broader module filter.
+- In the deduplication test, assert repository count, checkout count, canonical common-dir equality, returned/focused checkout, and selection state separately.
 
-Adding daemon startup parity and updating documentation are appropriate Wave 3 activities, but the daemon work is incomplete and its proposed test is tautological. The plan also requires an `app.rs` integration test while omitting that file from both its frontmatter and task ownership. Most importantly, it explicitly declines to record daemon-derived bindings, contradicting WSPC-04 and the locked context.
+#### Risk Assessment
 
-### Strengths
+**MEDIUM.** The test inventory is strong, but it can still certify the resolver while missing the startup gate that prevents production behavior. Correcting that test boundary would lower the risk substantially.
 
-- The plan correctly identifies that the daemon currently initializes with no folder hint ([bauded/main.rs:174](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:174)).
-- Reusing the same `baude-core` resolution path is the right architectural direction; both binaries already depend on `workspace::initialize()`.
-- The README locations are appropriate. Current folder-memory documentation describes only an exact-folder memory model and the old env suppression rule ([README.md:267](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:267)), while the configuration section still describes `new_session_dir` as the unconditional prefill ([README.md:407](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:407)).
-- Clone behavior is cleanly separated from the new-session prefill. Clone destination selection already uses `clone_base_dir` in a separate path, and the README documents it independently ([README.md:298](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:298)).
-- The existing daemon `/info` endpoint exposes its workspace, and the TUI has a cross-workspace guard ([api.rs:117](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/api.rs:117), [remote.rs:148](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/remote.rs:148)). This provides a useful basis for daemon parity validation.
+### 13-03
 
-### Concerns
+#### Summary
 
-- **HIGH — Daemon-derived bindings are not recorded.** The locked decision requires `bauded` to record derived bindings through the same code path and file. The plan instead says “Do NOT change … recording logic,” but no daemon recording logic exists: startup only loads config and initializes the workspace ([bauded/main.rs:181](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:181)).
-- **HIGH — The parity test proves nothing about daemon wiring.** Calling `plan_launch()` twice in `baude-core` with identical arguments only proves determinism. It would still pass if `bauded/src/main.rs` never called the function. A daemon helper, binary-level test, or shared startup resolver must be exercised.
-- **HIGH — The repository test’s file ownership is inconsistent.** The action requires changes in `baude/src/app.rs`, but `files_modified` and the task’s `<files>` list contain only `bauded/src/main.rs` and `baude-core/src/folder_workspace.rs`. An executor following ownership metadata may omit OPEN-03 entirely.
-- **HIGH — The proposed two-app deduplication design is invalid.** Deduplication happens inside one app’s `repository_state` by matching `observed_common_dir` ([app.rs:1917](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1917)). Two fresh app instances do not share that in-memory state, so “the second admit sees the existing row” is false unless the first state is persisted and restored explicitly. Focus behavior also lives in `open_repo_session_via()` ([app.rs:4727](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4727)), not in a cross-instance identity comparison.
-- **HIGH — The daemon has no launch-directory setup to mirror.** Its startup parses `--bind` and proceeds directly to config loading ([bauded/main.rs:166](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:166)). The plan says to act “after daemon canonicalizes launch_dir (if not already done),” but this step does not exist. It must explicitly define `current_dir()` semantics and canonicalization.
-- **MEDIUM — Binding write ordering is unresolved for the daemon.** `Manager::restore()` obtains durable state through `load_for_workspace()` and then saves ([manager.rs:444](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/manager.rs:444)); state loading claims the workspace lock internally. If daemon recording is added, the plan must ensure a lock refusal does not still teach folder memory.
-- **MEDIUM — Documentation may encode an unresolved precedence contradiction.** The plan demands binding and derivation ahead of `BAUDE_BACKEND`, while existing source and tests treat `BAUDE_BACKEND` as suppressing memory ([workspace.rs:125](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:125)). README work should follow a tested resolver contract, not precede resolution of that discrepancy.
-- **LOW — `grep -c "precedence"` is not meaningful documentation validation.** It cannot confirm order, examples, kill-switch semantics, or preservation of clone behavior.
+The plan correctly identifies daemon canonicalization, shared planning, recording, README updates, and one-instance repository deduplication. Cycle-1 R3–R5 and R7 are substantially addressed. However, its lock-order mechanism is based on an incorrect reading of the source, and its parity test is tautological. As written, R1, R2, and R6 are not actually resolved.
 
-### Suggestions
+#### Strengths
 
-- Extract a shared launch-resolution function in `baude-core` returning workspace candidate, source, repository root, recording target, and notes. Both binaries should call it.
-- In `bauded`, explicitly derive `launch_dir` from `current_dir()`, canonicalize it, run the shared resolver, claim/validate the daemon workspace lock, and only then record a derived binding.
-- Test daemon parity through a daemon-specific helper or subprocess that resolves the same fixture launch directory as the TUI helper. Assert workspace name, source, and on-disk root binding.
-- Add `baude/src/app.rs` to the plan metadata and run the root/subfolder admission twice in one app.
-- Add an API-level check that `/info` reports the derived workspace and consider how the source label is represented for a genuinely remote daemon-backed view.
-- Replace the README grep with targeted assertions or a documentation review checklist tied to each required rule and example.
+- The daemon currently initializes with no folder hint at `bauded/src/main.rs:174-182`, so adding canonicalized `current_dir`, `plan_launch`, and `plan.hint` targets the correct missing integration.
+- Canonicalizing daemon `current_dir` explicitly addresses cycle-1 R5 and mirrors the TUI's launch path normalization at `baude/src/main.rs:343-347`.
+- README work is well scoped to existing outdated sections. Current documentation still says either environment variable suppresses memory at `README.md:287-296` and describes the old precedence at `README.md:456-463`.
+- Clone semantics are genuinely separate from the `n` prefill: clone destination behavior is documented at `README.md:298-313`, while the prefill lives in `open_new_session_modal`.
+- The plan correctly retains the one-app repository test from 13-02 rather than inventing cross-instance deduplication.
 
-### Risk Assessment
+#### Concerns
 
-**HIGH.** The documentation task is sound, but the daemon implementation and OPEN-03 validation are not credible as specified. WSPC-04 would remain only partially implemented.
+- **HIGH — The claimed daemon startup lock does not exist.** `Manager::restore` performs a load, restores sessions, and saves at `bauded/src/manager.rs:442-455`; it does not claim a lock before loading. The repository even documents this debt explicitly: "bauded never claims the workspace lock at startup" at `bauded/src/manager.rs:3031-3035`. The plan's statement that line 444 "loads and locks before recording" is false.
+- **HIGH — Cycle-1 R2 is not addressed by calling `plan_launch` twice.** A determinism test of the same core function cannot catch the current daemon defect where `bauded` passes `None` to `initialize` at `bauded/src/main.rs:181-182`. This test would pass today even though daemon parity is absent.
+- **HIGH — Recording again falls back to non-repository `launch_dir`.** The proposed `plan.repo_root.as_deref().or(Some(&launch_dir))` would record an unbound non-git daemon launch, contradicting the locked decision that such launches derive and record nothing.
+- **HIGH — The recording call is incompatible with the current API.** `folder_workspace::record` currently expects `(root, path, workspace: &str, now_ms)` at `baude-core/src/folder_workspace.rs:118-128`. The proposed call supplies a `Workspace` and omits the timestamp. Plan 13-01 does not say the signature will change.
+- **MEDIUM — Lock ownership and error policy are unspecified.** To guarantee "lock refusal prevents binding write," the daemon must explicitly call `claim_workspace_state_lock("daemon-state", workspace)` before recording and before `Manager::restore`. `STATE_BASE` is private inside `manager.rs` at `bauded/src/manager.rs:32-36`, so the plan must either expose a helper or deliberately duplicate the stable base name. It must also specify whether `Held` and `Io` abort startup or degrade.
+- **MEDIUM — The daemon provenance shown by the TUI remains local-only.** The title proposal reads `workspace::active()` in the TUI. The daemon exposes only workspace name/backend through `/info` at `bauded/src/api.rs:117-126`; it does not expose whether its workspace was bound or derived. If the locked "daemon-backed views show the daemon's workspace the same way" includes provenance, more API work is required.
+- **MEDIUM — Documentation wording is internally inconsistent.** The README action says implicit default is labeled `(default)`, while acceptance requires `(blank)`. The code contract should be fixed first and documented consistently.
+- **LOW — The README grep is fragile.** Requiring the entire precedence chain on one line may fail well-formatted wrapped Markdown, while still not verifying examples, daemon parity, title labels, or non-git behavior.
 
-## Cross-plan assessment
+#### Cycle-1 Disposition
 
-The three plans need replanning before execution. The principal issue is that Phase 13 is modeled as an extension of the existing single `hint`, but the requirements introduce two distinct lower-precedence inputs—ancestor binding and repository derivation—with different source labels and recording behavior.
+| Finding | Assessment |
+|---|---|
+| R1 daemon recording | Requested, but post-lock mechanism is incorrect |
+| R2 parity test | **Not addressed**; determinism is not binary parity |
+| R3 ownership metadata | Addressed |
+| R4 one-app dedup test | Addressed |
+| R5 daemon canonicalization | Addressed |
+| R6 lock/write ordering | **Not addressed**; assumed lock is absent |
+| R7 docs after tests | Addressed |
+| R8 targeted grep | Improved slightly, but still weak |
 
-A safer dependency structure would be:
+#### Suggestions
 
-1. **13-01:** Introduce a typed shared launch resolver, exact precedence, repository-root derivation, root binding persistence, and source-aware title formatting.
-2. **13-02:** Add the complete resolver matrix, derivation/persistence round trip, UI rendering, modal prefill, and single-app root/subfolder admission tests.
-3. **13-03:** Wire the same resolver into `bauded`, add meaningful daemon/API parity coverage, then update README from the tested contract.
+- Add an explicit daemon startup sequence in `bauded/src/main.rs`:
+  1. Canonicalize `current_dir`.
+  2. Build the shared launch plan.
+  3. Resolve the workspace.
+  4. Claim `daemon-state` lock.
+  5. Record only when the recording policy allows it.
+  6. Construct and restore `Manager`.
+- Specify error handling for both `StateLockError::Held` and `StateLockError::Io`.
+- Replace the tautological parity test with either a shared `resolve_launch_context` helper used directly by both entry points and tested once, plus call-site tests proving both binaries invoke it; or a `bauded` startup helper test using the same fixture inputs as the TUI startup helper.
+- Keep daemon recording in `main.rs`, where the launch plan and lock result are both available; do not bury it in `Manager::restore`.
+- Use the actual four-argument recording API, or explicitly plan a signature change across both callers.
+- Replace the README grep with section-level assertions or a documentation review checklist.
 
-**Overall risk: HIGH.** As written, the plans can compile portions of the feature while still failing WSPC-02, WSPC-04, WSPC-05, and OPEN-03.
+#### Risk Assessment
+
+**HIGH.** The daemon plan relies on a nonexistent startup lock, and its parity test cannot detect whether daemon startup is wired correctly. Those are direct blockers for WSPC-04 and for the claimed safe recording order.
+
+## Final Assessment
+
+Cycle 2 closes many documentation and test-coverage gaps, but four changes are still required before execution:
+
+1. Remove the `BAUDE_BACKEND` short-circuit from `plan_launch`.
+2. Define a source-aware recording policy that does not record unbound non-git launches.
+3. Make the resolver API migration backward-compatible across waves.
+4. Redesign daemon startup around a real `daemon-state` lock and a genuine call-site parity test.
+
+Until those are incorporated, the phase remains **HIGH risk** despite the stronger test plan.
 
 ---
 
-## Consensus Summary
+*Cycle 2 review completed: 2026-09-20*
 
-### Agreed Concerns
-
-The review identifies consistent, critical gaps across all three plans:
-
-1. **Repository derivation mechanism is architecturally incomplete (all three plans).** The shared problem is that `LaunchPlan` and `resolve_with_hint()` cannot carry the repository root data needed for WSPC-02 persistence. Plan 01 proposes no interface changes to convey derived bindings. Plans 02 and 03 do not test or wire this missing functionality.
-
-2. **Precedence contradictions are unresolved across the board (all three plans).** The existing code suppresses memory hints under `BAUDE_BACKEND`, while the requirement places derived bindings ahead of `BAUDE_BACKEND`. No plan updates the suppression logic, and test coverage does not exercise the declared new precedence.
-
-3. **Critical success criteria lack execution paths (all three plans).** WSPC-05 (title labeling) is not wired in Plan 01 or tested in Plan 02. WSPC-04 (daemon binding recording) is explicitly declined in Plan 03. OPEN-03 (deduplication) assumes cross-instance state sharing that does not exist.
-
-4. **Workspace source classification is insufficiently typed (Plan 01 → Plans 02–03).** The enum distinguishes `Explicit`, `Bound`, `Derived`, `Default`, but the resolver cannot distinguish how each arose. This blocks title rendering and the ability to suppress defaults while preserving explicit and derived choices.
-
-### Highest-Priority Blockers
-
-The review recommends replanning before execution:
-
-- **Plan 01:** Introduce a structured `LaunchResolution` type carrying workspace, source, repository root, and recording target. Export a shared resolver that handles the complete precedence and captures whether the resolution arose from binding, derivation, or fallback. Do not proceed to UI/modal changes until this foundation is solid.
-- **Plan 02:** The current test coverage addresses only fragments of the architecture. Replan to cover complete precedence behavior, repository-root recording + replay, source-aware title rendering, and single-app root/subfolder deduplication.
-- **Plan 03:** Do not record daemon-derived bindings without a typed resolver and explicit workspace lock semantics. The parity test must exercise the shared path in `bauded`, not just prove determinism in `baude-core`.
-
-### Key Strengths
-
-- The phase correctly identifies the right seams (startup, modal, title, daemon).
-- Existing infrastructure (git root resolution, breadcrumb canonicalization, test fixtures) provides a strong foundation.
-- Repository identity deduplication via `observed_common_dir` is sound.
-
-### Risk Assessment
-
-**Overall: HIGH.** The plans can compile and partially function while silently failing multiple locked success criteria. The phase requires architectural clarity before implementation begins.
