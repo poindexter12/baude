@@ -11,6 +11,10 @@ model_sources:
 
 # Cross-AI Plan Review — Phase 13
 
+<!-- gsd:plan-revision-conflicts:begin -->
+## Plan-Revision Conflicts
+<!-- gsd:plan-revision-conflicts:end -->
+
 ## 13-01
 
 ### Summary
