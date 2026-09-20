@@ -26,7 +26,7 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 - Derive the workspace from the launch folder when nothing is passed: nearest recorded folder binding walking up from the launch dir, else the repo root's folder name; explicit env/config still win and the derived binding is recorded.
 - Default new-session and open paths to the launch repository's git root, ahead of `new_session_dir`, which applies only outside any repository.
 - Give managed worktree paths a stable repository identity so `repository-<key>` collisions across TUI and daemon state files (or after a state reset) cannot happen; migrate existing worktrees in place without deleting anything.
-- Make startup measurable and fast: a timing facility, a non-blocking kitty keyboard probe, and lazy or parallel session restore with far fewer full-state fsyncs so the first frame renders before the first metadata poll.
+- Make startup measurable and fast: a timing facility, a non-blocking kitty keyboard probe, and lazy or parallel session restore with far fewer full-state fsyncs so the first frame renders before the first metadata poll; and stop idle baude from draining the battery: redraw only on change, poll only live rows, optionally suspend idle Claude children, and make the usage poller configurable.
 
 ## Requirements
 
@@ -71,7 +71,7 @@ v2.2.0 is the current release and the source baseline for the next milestone. Th
 - [ ] Workspace derives from the launch folder when nothing is passed (nearest ancestor binding, else repo-root name), with explicit env/config still winning.
 - [ ] New-session and open default to the launch repository's git root; `new_session_dir` applies only outside a repository.
 - [ ] Managed worktree paths carry a stable repository identity; no `repository-<key>` collisions across TUI/daemon state or after a reset; existing worktrees migrate in place.
-- [ ] Startup is measurable (timing facility) and fast (non-blocking keyboard probe, lazy/parallel restore, batched state writes, first frame before first poll).
+- [ ] Startup is measurable (timing facility) and fast (non-blocking keyboard probe, lazy/parallel restore, batched state writes, first frame before first poll); idle baude costs near-zero CPU (dirty-flag redraw, live-row-only polling, opt-in idle-child suspension, configurable usage poller).
 
 ### Out of Scope
 

@@ -32,12 +32,16 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 - [ ] **WTID-03**: When a collision is still detected, baude names the repository that owns the path and offers a non-destructive resolution instead of a hard error
 - [ ] **WTID-04**: `baude worktrees scan` reports the owning repository for each managed checkout
 
-### Startup performance
+### Startup and idle performance
 
 - [ ] **PERF-01**: A timing facility (env var or flag) records each startup stage's duration so a slow launch can be diagnosed without a debugger
 - [ ] **PERF-02**: The first frame renders before session restore and the first metadata poll complete; restore runs lazily or off the render path
 - [ ] **PERF-03**: The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
 - [ ] **PERF-04**: Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
+- [ ] **PERF-05**: The TUI redraws only when something changed (dirty flag); spinner and waiting-flash animations run only for rows that are actually working or waiting, so an idle baude sends no terminal writes
+- [ ] **PERF-06**: Per-session metadata polling runs only for live, non-archived rows and skips unchanged files by mtime, so idle polling cost no longer scales with the number of sessions
+- [ ] **PERF-07**: An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and archiving a row can stop its child rather than only hiding the row
+- [ ] **PERF-08**: The usage poller can be disabled or slowed via config, and it never scans transcripts more often than the configured interval
 
 ### Session UX
 
@@ -102,12 +106,16 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PERF-02 | Phase 15 | Pending |
 | PERF-03 | Phase 15 | Pending |
 | PERF-04 | Phase 15 | Pending |
+| PERF-05 | Phase 15 | Pending |
+| PERF-06 | Phase 15 | Pending |
+| PERF-07 | Phase 15 | Pending |
+| PERF-08 | Phase 15 | Pending |
 | UX-01 | Phase 16 | Pending |
 | SHIP-05 | Phase 17 | Pending |
 
 **Coverage:**
-- v2.3 requirements: 19 total
-- Mapped to phases: 19
+- v2.3 requirements: 23 total
+- Mapped to phases: 23
 - Unmapped: 0 ✓
 
 ---

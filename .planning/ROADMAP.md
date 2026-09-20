@@ -49,7 +49,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 - [ ] **Phase 13: Workspace Derivation and New-Session/Open Defaults** - Opening baude from any folder uses the right workspace and repository
 - [ ] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions
-- [ ] **Phase 15: Startup Performance** - Startup is measurable and reaches the first frame quickly
+- [ ] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery
 - [ ] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches
 - [ ] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation
 
@@ -102,13 +102,13 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 **Plans**: TBD
 
-### Phase 15: Startup Performance
+### Phase 15: Startup and Idle Performance
 
-**Goal**: Startup is measurable and reaches the first frame quickly, without blocking on external services.
+**Goal**: Startup is measurable and reaches the first frame quickly without blocking on external services, and an idle baude with many sessions costs near-zero CPU: no unconditional redraws, no polling of dead rows, and an opt-in way to suspend idle Claude children.
 
 **Depends on**: Phase 14
 
-**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04
+**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04, PERF-05, PERF-06, PERF-07, PERF-08
 
 **Success Criteria** (what must be TRUE):
 
@@ -116,6 +116,10 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   2. The first frame renders before session restore and the first metadata poll complete
   3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
   4. Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
+  5. With no input and no session activity, baude issues no terminal writes; spinner and flash animate only on rows that are working or waiting
+  6. Idle per-session polling touches only live, non-archived rows and skips unchanged files, so CPU no longer grows with the session count
+  7. An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and the user can see which children are suspended
+  8. The usage poller can be disabled or slowed from config
 
 **Plans**: TBD
 
@@ -157,7 +161,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 |-------|----------------|--------|-----------|
 | 13. Workspace Derivation and New-Session/Open Defaults | 0/3 | Plans created | - |
 | 14. Managed Worktree Identity | 0/? | Not started | - |
-| 15. Startup Performance | 0/? | Not started | - |
+| 15. Startup and Idle Performance | 0/? | Not started | - |
 | 16. Pane Focus UX | 0/? | Not started | - |
 | 17. Validation and v2.3.0 Release | 0/? | Not started | - |
 
