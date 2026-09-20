@@ -46,7 +46,7 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 ### Session UX
 
 - [ ] **UX-01**: Per-session pane focus (Claude pane or expanded shell pane) is remembered across session switches, and a key moves focus between the two panes while both are visible (GitHub #89)
-- [ ] **UX-02**: Session and checkout rows show a static single-character status code that reads without a key, replacing the filled/empty circle and spinner glyphs: `?` waiting for your input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable; color stays a secondary cue only, and a one-line legend is reachable in-app (sidebar footer or help view). Exact characters are confirmed in Phase 15 discuss; this set is the default
+- [ ] **UX-02**: Session and checkout rows show a static single-character status code that reads without a key, replacing the filled/empty circle and spinner glyphs: `?` waiting for your input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable; each code keeps the existing per-state color (yellow waiting, blue busy, green completed, dark gray exited and archived, gray closed, yellow unavailable) so the colored letter is the icon, and a one-line legend is reachable in-app (sidebar footer or help view). Exact characters are confirmed in Phase 15 discuss; this set is the default
 
 ### Release
 
