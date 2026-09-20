@@ -187,19 +187,13 @@ pub fn resolve_with_context(
                 (derived, WorkspaceSource::Derived)
             } else {
                 // Empty after sanitization, fall through to next rung
-                let fallback_name = sanitize(
-                    backend_env
-                        .or(config.backend.as_deref())
-                        .unwrap_or(DEFAULT),
-                );
+                let fallback_name =
+                    sanitize(backend_env.or(config.backend.as_deref()).unwrap_or(DEFAULT));
                 (fallback_name, WorkspaceSource::Default)
             }
         } else {
-            let fallback_name = sanitize(
-                backend_env
-                    .or(config.backend.as_deref())
-                    .unwrap_or(DEFAULT),
-            );
+            let fallback_name =
+                sanitize(backend_env.or(config.backend.as_deref()).unwrap_or(DEFAULT));
             (fallback_name, WorkspaceSource::Default)
         }
     } else if let Some(be) = backend_env {
