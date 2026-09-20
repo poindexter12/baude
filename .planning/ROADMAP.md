@@ -101,9 +101,13 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   4. `baude worktrees scan` reports the owning repository for each managed checkout and surface any collisions with ownership info
 
 **Plans**: 3 plans
+**Wave 1**
 
 - [x] 14-01-PLAN.md — Marker module and digest resolution (tracer: end-to-end proof of identity scheme)
 - [x] 14-02-PLAN.md — Path composition and collision detection integration
+
+**Wave 3** *(blocked on Wave 1 completion)*
+
 - [x] 14-03-PLAN.md — Admission flows, scan output, and documentation
 
 ### Phase 15: Startup and Idle Performance
