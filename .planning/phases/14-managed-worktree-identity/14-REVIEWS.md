@@ -11,6 +11,10 @@ model_sources:
 
 # Cross-AI Plan Review — Phase 14
 
+<!-- gsd:plan-revision-conflicts:begin -->
+## Plan-Revision Conflicts
+<!-- gsd:plan-revision-conflicts:end -->
+
 # Cross-AI Plan Review
 
 Overall verdict: **revision required before execution**. The digest/marker direction is sound, but the plans do not yet define the central mapping from durable repository identity to the physical managed-directory key. As written, legacy in-place reuse, state-reset recovery, collision fallback, and safe scan/prune behavior are not implementable end to end.
