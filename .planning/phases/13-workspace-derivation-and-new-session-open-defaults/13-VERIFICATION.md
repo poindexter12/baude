@@ -16,7 +16,7 @@ covered_files:
   - bauded/src/main.rs
   - bauded/src/api.rs
   - README.md
-covered_digest: "v1:sha256:phase-13-complete-all-artifacts-wired"
+covered_digest: "v1:sha256:6eeceeeeebbf3fdf6a5e43ce926441ea2904be130659abfd8a8e312ac4d4d3e2"
 behavior_unverified: 0
 overrides_applied: 0
 ---
