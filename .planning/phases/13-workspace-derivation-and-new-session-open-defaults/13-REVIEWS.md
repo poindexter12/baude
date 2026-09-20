@@ -1,10 +1,10 @@
 ---
 phase: 13
 reviewers: [codex]
-reviewed_at: 2026-09-19T20:40:00Z
+reviewed_at: 2026-09-19T21:33:00Z
 plans_reviewed: [13-01-PLAN.md, 13-02-PLAN.md, 13-03-PLAN.md]
 models:
-  codex: "gpt-5.6-sol"
+  codex: "gpt-5.6-sol (reasoning=high)"
 model_sources:
   codex: "banner"
 ---
@@ -15,122 +15,123 @@ model_sources:
 ## Plan-Revision Conflicts
 <!-- gsd:plan-revision-conflicts:end -->
 
-Overall verdict: not converged. The plans have good requirement coverage and a sensible shared-resolver direction, but several executable blockers remain. Cycle 3 should not proceed unchanged: 13-01 and 13-03 would either fail to compile or leave `workspace::active()` uninitialized, and 13-02/13-03 contain test filters that can pass while running zero tests.
-
 ## 13-01
 
 ### Summary
 
-The plan correctly identifies the main integration seams: folder memory, repository-root derivation, workspace resolution, startup recording, new-session prefill, and title rendering. However, its proposed API transition is incompatible with the live workspace initialization model. As written, it bypasses the process-wide workspace cache, uses nonexistent fields/signatures, and omits a source file that must change when `Workspace` gains a field.
+The tracer identifies the right architectural seams—shared resolution, repository-root derivation, source-aware titles, and repo-root prefills—but its startup-lock design is unsafe as written. The proposed helper would lock a filename unrelated to either real state file and would weaken the TUI’s existing refusal behavior. Workspace-source precedence and the test-build initialization model also need to be reconciled before execution.
 
 ### Strengths
 
-- Repository admission already deduplicates by canonical Git common directory, so OPEN-03 is built on the right identity mechanism: `discover_repository()` canonicalizes `--git-common-dir`, and `admit_repository()` matches `observed_common_dir` before allocating a repository key. [git.rs:321](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:321), [app.rs:1914](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1914)
-- Recording at repository root rather than launch subfolder is the correct stabilization mechanism. The current implementation records the exact launch directory, explaining why this change is necessary. [folder_workspace.rs:114](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:114), [main.rs:398](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:398)
-- Moving `BAUDE_BACKEND` below binding/config/derivation is explicitly addressed at both lookup and resolver seams. Currently it suppresses folder lookup and hints. [folder_workspace.rs:67](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:67), [workspace.rs:125](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:125)
-- The new-session change is tightly scoped. The current modal selects `new_session_dir` before launch context, while `git::repo_root()` already provides the required toplevel operation. [app.rs:4057](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4057), [git.rs:1734](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:1734)
+- Centralizing launch resolution is justified. The TUI currently performs folder lookup, initialization, locking, and recording inline, while `bauded` only initializes without a folder hint. A shared resolver would remove real divergence between [baude/src/main.rs:351](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:351) and [bauded/src/main.rs:174](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:174).
+- The repository deduplication premise is correct: `admit_repository` compares canonical Git common directories, not launch paths, at [baude/src/app.rs:1914](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1914). `discover_repository` canonicalizes both the input and common directory at [baude-core/src/git.rs:322](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:322).
+- The plan correctly notices that adding `Workspace.source` requires updating non-resolver struct literals such as [baude-core/src/worktree_scan.rs:431](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/worktree_scan.rs:431).
+- The proposed `n` prefill change targets the correct method. Its present chain selects `new_session_dir` before the launch directory and has no Git-root check at [baude/src/app.rs:4057](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4057).
+- Reusing the existing sidebar chrome is appropriately scoped; the current title is constructed at [baude/src/ui.rs:218](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:218).
 
 ### Concerns
 
-- **HIGH — Replacing `initialize()` with `resolve_with_context()` breaks the active workspace cache.** `initialize()` is the sole production writer to `ACTIVE`; `active()` panics if that initialization did not occur. The next startup step, `ensure_daemon()`, immediately reads `active()`. A pure `resolve_with_context() -> Workspace` cannot replace it. [workspace.rs:269](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:269), [workspace.rs:304](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:304), [main.rs:414](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:414), [main.rs:28](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:28)
-- **HIGH — The claimed backward-compatible `resolve_with_hint` signature is not backward compatible.** The live function takes five arguments—workspace env, backend env, hint, config, and warning callback—and is also used by `resolve`, fixtures, and tests. The plan describes a two-argument wrapper instead. [workspace.rs:116](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:116), [workspace.rs:132](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:132), [workspace.rs:230](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:230)
-- **HIGH — The recording call references a nonexistent `config.root`.** `Config` contains user options but no filesystem root; the existing startup obtains the root through `persist::config_dir()`. In addition, `record()` expects `Option<&Path>`, not a plain path. [persist.rs:940](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:940), [main.rs:358](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:358), [folder_workspace.rs:118](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:118)
-- **HIGH — Adding `Workspace.source` requires another production file modification.** `worktree_scan.rs` constructs `Workspace` directly with a struct literal; adding a required field causes compilation failure. It is absent from this plan’s `files_modified`. [worktree_scan.rs:430](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/worktree_scan.rs:430)
-- **HIGH — The prescribed ownership of `LaunchPlan` fields produces a partial-move problem.** The plan moves `plan.hint` and `plan.repo_root` into `WorkspaceLaunchContext`, then later reads `plan.repo_root` for recording. Because both are owned values, the later access will not compile without cloning, borrowing, or destructuring into separate locals. The current `LaunchPlan` already owns its hint, and the proposed root is likewise owned. [folder_workspace.rs:59](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:59)
-- **MEDIUM — `title_label()` does not necessarily show the workspace name.** The plan builds the title from `display_label()`, but that method intentionally returns `Claude Code` or `opencode` when workspace name equals backend, and returns `name · backend` for custom names. That is different from the required active workspace name. [workspace.rs:73](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:73)
-- **MEDIUM — Source classification is internally inconsistent.** The task logic says no hint/no repo becomes `Default`, while 13-02 expects `BAUDE_BACKEND` and config backend to be `Explicit`. The live resolver treats those values as workspace-name inputs, so this needs an explicit decision rather than an implicit fallback. [workspace.rs:144](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:144)
+- **HIGH — The proposed lock name does not protect either real state file.** `claim_workspace_state_lock(base, ws)` locks the file produced by `ws.state_file(base)` at [baude-core/src/persist.rs:536](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:536). The plan hardcodes `"workspace-state"`, while the TUI uses `"state"` and the daemon uses `"daemon-state"` ([baude/src/main.rs:377](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:377), [bauded/src/manager.rs:36](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/manager.rs:36)). That creates a third, irrelevant lock and leaves the actual files to be claimed later by restore.
+- **HIGH — Continuing after `StateLockError::Held` regresses validated single-writer behavior.** Today the TUI exits immediately and names the holder at [baude/src/main.rs:370](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:370). If startup continues, restore reports blocked persistence because the real loader also claims the state lock at [baude-core/src/persist.rs:338](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:338). This recreates the degraded-start behavior that issue #71 removed.
+- **HIGH — Derivation precedence contradicts itself.** The plan says derivation occurs only when `backend_env` is absent, but its required order places derived repository names before `BAUDE_BACKEND`. The current resolver combines workspace-name selection and backend selection at [baude-core/src/workspace.rs:144](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:144) and [baude-core/src/workspace.rs:159](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:159); the new implementation must explicitly separate those decisions.
+- **HIGH — The proposed startup tests conflict with the test-support identity model.** Production uses a process-wide `OnceLock`, but test builds deliberately do not write it ([baude-core/src/workspace.rs:199](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:199)). Test initialization instead requires an already-live workspace override and otherwise asserts at [baude-core/src/workspace.rs:288](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:288). “Call `start_workspace`, then assert ACTIVE was seeded” is therefore not a valid in-process unit-test contract.
+- **MEDIUM — `StartedWorkspace` cannot own the lock as described.** The lock API returns `Result<(), _>` and retains file handles in the global `HELD_STATE_LOCKS` map ([baude-core/src/persist.rs:470](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:470), [baude-core/src/persist.rs:607](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:607)). A `lock_held: bool` reports status but is not an RAII guard, so the plan’s “returned to caller” and “must not drop” language is inaccurate.
+- **MEDIUM — Repository-root canonicality is assumed, not guaranteed by the helper.** `git::repo_root` returns Git stdout directly without canonicalizing it at [baude-core/src/git.rs:1734](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/git.rs:1734). Binding keys canonicalize later, but the plan should make the stored `repo_root` contract explicit.
+- **MEDIUM — Home-boundary correctness needs canonical paths on both sides.** Launch directories are canonicalized, while `persist::home_dir()` returns the redirected or OS home path without canonicalization at [baude-core/src/persist.rs:914](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:914). A symlinked home can defeat a simple `current == home` stopping condition.
+- **MEDIUM — Plan ownership is contradictory.** Plan 13-01 says the daemon should call the new helper, but `bauded/src/main.rs` is neither in its modified-file list nor scheduled until 13-03. This makes it unclear whether wave 1 must compile with one or two adopters.
 
 ### Suggestions
 
-- Add `initialize_with_context(config, context) -> &'static Workspace`, preserving the existing production and test-support cache behavior. Make `initialize(config, hint)` a compatibility wrapper.
-- Preserve the current five-argument pure resolver API, or introduce `resolve_with_context(ws_env, backend_env, context, config, warn)` and keep `resolve_with_hint(...)` unchanged.
-- Use `memory_root = persist::config_dir()` and pass `Some(&memory_root)` to `record()`.
-- Destructure the launch plan before resolution, cloning only if truly necessary:
-  `let LaunchPlan { hint, repo_root, notes } = plan;`
-- Update `worktree_scan.rs`, preferably through a constructor that prevents future struct-literal breakage.
-- Build the title from `Workspace.name`; append backend display separately only if desired.
-- Define all seven source outcomes in one table, including `BAUDE_BACKEND` and config backend.
+- Split the helper into:
+
+  1. A pure `resolve_launch` returning the launch plan and resolved workspace.
+  2. Per-binary lock/record orchestration using the correct base (`state` or `daemon-state`) and contention policy.
+
+- Preserve the TUI’s current `Held => exit` behavior. `Io => continue degraded` may remain consistent with the current code.
+- Define workspace-name selection separately from backend binding. In particular, a derived name should still win when `BAUDE_BACKEND` only chooses that derived workspace’s backend.
+- Decide one source classification for all seven precedence levels, including `BAUDE_BACKEND` and config `backend`, and encode it in a table-driven resolver test.
+- Canonicalize both the Git root and home boundary before walking or comparing.
+- Test the pure resolver in-process; reserve production cache/startup assertions for subprocess tests or a dedicated test-only startup seam.
 
 ### Risk Assessment
 
-**HIGH.** The pure-resolver substitution would panic during startup, and the live signatures and struct construction guarantee compilation failures unless the plan is corrected.
+**HIGH.** The intended feature architecture is sound, but the lock base and contention policy can invalidate the single-writer guarantee. The precedence and test-cache contradictions are also likely to produce either incorrect behavior or an unexecutable test plan.
 
 ## 13-02
 
 ### Summary
 
-The planned test matrix is broad and generally maps well to WSPC-01/02/03/05 and OPEN-01/02/03. Its most serious problem is mechanical: most verification filters do not match the proposed test names, so Cargo can report success after running zero tests. Some “end-to-end” cases also stop below the binary startup seams where the highest-risk bugs reside.
+The test inventory is broad and requirement-oriented, especially around precedence and deduplication. However, the first task’s verification cannot execute the promised startup test, and the proposed lock-refusal cases cannot be produced reliably in one process with the current re-entrant lock implementation.
 
 ### Strengths
 
-- The ancestor-walk matrix covers nearest-wins, home inclusion, home boundary, outside-home behavior, and missing bindings. This fills the narrow exact-match coverage in the current implementation. [folder_workspace.rs:71](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:71)
-- The full precedence matrix is necessary because existing tests explicitly encode the old rule that `BAUDE_BACKEND` suppresses hints. [workspace.rs:756](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:756)
-- The root-versus-subfolder admission test targets the real deduplication predicate rather than path-string equality. [app.rs:1915](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1915)
-- Rendering through the existing `TestBackend` helper is an appropriate way to validate visible title text. [ui.rs:2482](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:2482)
+- The ancestor-walk cases cover nearest-wins, home inclusion, home stopping, no-match, and outside-home traversal—good coverage for the proposed extension to the current exact lookup at [baude-core/src/folder_workspace.rs:84](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:84).
+- Replacing the old backend-suppression expectation is necessary. The existing test explicitly asserts that `BAUDE_BACKEND` suppresses hints at [baude-core/src/workspace.rs:756](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:756).
+- The root-versus-subfolder admission test exercises the correct identity mechanism: repository rows are matched by `observed_common_dir` at [baude/src/app.rs:1917](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1917).
+- Avoiding process-wide environment mutation is appropriate because the test harness is parallel and the repository already uses thread-local redirects for isolation at [baude-core/src/testing.rs:82](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/testing.rs:82).
 
 ### Concerns
 
-- **HIGH — The automated filters will run zero matching tests.** For example, the plan names `test_find_binding_at_parent` but invokes the filter `folder_workspace::tests::find_binding`; the intervening `test_` means the substring does not match. The same mismatch affects `test_precedence_matrix...`, `test_display_hint...`, `test_open_new_session...`, and `test_daemon_startup...`. Cargo exits successfully when zero tests match.
-- **MEDIUM — The WSPC-02 “end-to-end” test bypasses the actual startup integration.** A test inside `folder_workspace.rs` that manually calls planning, resolution, recording, and planning again cannot catch the 13-01 failure to install `workspace::active()` or its incorrect recording root/signature. The real integration currently occurs in `baude/src/main.rs`. [main.rs:349](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:349)
-- **MEDIUM — Environment mutation is unnecessary and risks parallel-test interference.** Both `plan_launch()` and the pure workspace resolver already accept environment values as parameters. Tests should pass `Some("opencode")` rather than mutate `BAUDE_BACKEND` globally. [folder_workspace.rs:71](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:71), [workspace.rs:132](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:132)
-- **MEDIUM — The empty-name guard is not actually verified.** `test_sanitize_empty_input` proves only that sanitization returns an empty string. It does not prove resolution falls through or that no empty binding is persisted.
-- **MEDIUM — Source fixture support is underspecified.** The current `override_for_test()` accepts only config and a binding hint, so it cannot construct a derived source. “Extend it or add a fixture seam” is too open-ended for a final-cycle plan. [workspace.rs:242](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:242)
-- **LOW — The deduplication assertion should exercise the public admission route.** Direct `admit_repository()` verifies identity reuse, but focus behavior is completed through `open_repo_session_via()`, which sets focus and records context after admission. [app.rs:4727](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4727)
+- **HIGH — Task 1’s command filters out its own startup test.** The test is specified in `launch.rs::tests`, but the command runs only `folder_workspace::tests`. Since `launch.rs` is a separate module and does not currently exist, that invocation cannot run `test_wspc02_start_workspace_derives_persists_recalls`; the plan then greps for a different name, `test_wspc02_end_to_end`.
+- **HIGH — A same-process `Held` test will not work.** `hold_state_lock` treats a path already held by this process as successful at [baude-core/src/persist.rs:574](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:574). Testing genuine contention therefore requires another process or a test-only injected lock failure.
+- **HIGH — “ACTIVE was cached” remains incompatible with support builds.** `active()` reads a thread-local fixture override in tests at [baude-core/src/workspace.rs:319](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/workspace.rs:319), not the production cache. The planned assertion must be rewritten around that behavior.
+- **MEDIUM — The precedence expectations disagree with 13-01.** This plan classifies config backend as `Explicit`, while 13-01 says config backend is not a separate source and otherwise describes fallback as `Default`. Tests cannot stabilize an undefined contract.
+- **MEDIUM — Repository admission is not a lightweight row-only operation.** It resolves the default branch, may create a managed worktree, persists state, and activates a runtime at [baude/src/app.rs:1949](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:1949) through [baude/src/app.rs:2052](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:2052). The test needs the existing spawn/persistence stubs, not merely a temporary Git repository.
+- **LOW — This is regression testing rather than strict TDD.** Most implementation is delivered in 13-01, so the described RED→GREEN loop in wave 2 cannot drive the feature’s initial design.
 
 ### Suggestions
 
-- Use filters guaranteed to match, such as `find_binding`, `test_precedence_matrix`, or exact names including `test_`. Add `-- --exact` where appropriate.
-- Require each verification to show a nonzero test count, or run the complete module/package test target.
-- Add a startup helper that performs “plan → initialize-with-context → lock → record” and test that helper directly.
-- Pass env inputs explicitly rather than calling `set_var`.
-- Add a test proving an empty derived name neither becomes the workspace nor reaches `record()`.
-- Define one explicit test-only constructor for `WorkspaceSource` variants.
-- Test selection/focus via `open_repo_session_via()` in addition to direct repository-count assertions.
+- Run launch and folder-workspace tests separately, using their exact module paths and exact test names.
+- Use a subprocess for real lock contention, matching existing production semantics, or add a narrow test-only failure injection at the lock boundary.
+- Test source resolution through pure `resolve_with_context`; separately test fixture initialization through `override_for_test_with_source`.
+- Reuse existing app fixture helpers and spawn stubs when testing `admit_repository`.
+- Add a linked-worktree case for `OPEN-01`, since `git rev-parse --show-toplevel` intentionally returns the selected worktree root, as noted at [baude/src/app.rs:2814](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:2814).
 
 ### Risk Assessment
 
-**MEDIUM.** The proposed behavioral coverage is good, but the current commands provide false-green results and the tests miss the startup-cache and recording integration where the largest failures can occur.
+**MEDIUM-HIGH.** Coverage goals are strong, but several promised tests either will not run or cannot stimulate the claimed behavior with existing APIs. Correcting the lock and identity seams would reduce this to medium or low.
 
 ## 13-03
 
 ### Summary
 
-Daemon parity and documentation are correctly assigned to a final integration plan, but the daemon task is not executable against the live persistence API. Its lock strategy assumes a returned guard that does not exist, continues after lock refusal into guaranteed persistence failure, and verifies parity with a tautological core-only test. It also explicitly defers daemon source provenance despite the phase decision requiring daemon-backed views to show the same source information.
+Daemon parity and documentation belong in this phase, and exposing provenance through `/info` is the right API direction. The plan does not yet trace that response into persistent remote UI state, however, and it inherits the critical startup-lock defect from 13-01.
 
 ### Strengths
 
-- The plan correctly recognizes that current daemon startup has no launch-folder planning at all; it initializes with `None` immediately before manager restoration. [bauded/main.rs:174](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:174)
-- Canonicalizing daemon `current_dir()` before repository discovery is appropriate and mirrors TUI startup.
-- Recording before any daemon state mutation is directionally sound.
-- The README scope is comprehensive and preserves clone destination semantics, which currently live in a separate documented flow. [README.md:298](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:298)
+- `/info` is the correct endpoint to extend: it already represents daemon workspace identity and currently returns workspace, backend, version, and persistence state at [bauded/src/api.rs:117](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/api.rs:117).
+- Adding source provenance is backward-compatible for JSON consumers that ignore unknown fields. The existing remote client already treats missing newer session fields through `#[serde(default)]`, as demonstrated at [baude/src/remote.rs:30](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/remote.rs:30).
+- The documentation work correctly targets stale text: README currently states that either workspace or backend environment variables suppress folder memory at [README.md:287](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:287).
+- Clone destination behavior is genuinely isolated from new-session prefill. It remains in `prompt_clone_dest`, using `clone_base_dir`, at [baude/src/app.rs:4701](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/app.rs:4701).
 
 ### Concerns
 
-- **HIGH — Daemon startup repeats the cache-initialization failure from 13-01.** Calling `resolve_with_context()` instead of `initialize()` leaves `workspace::active()` unset; `Manager::new`, `restore()`, API handlers, and polling rely on it. [bauded/main.rs:174](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:174), [manager.rs:444](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/manager.rs:444)
-- **HIGH — The proposed lock call is incompatible with the real API.** `claim_workspace_state_lock()` takes `&Workspace`, not `&ws.name`, returns `Result<(), StateLockError>`, and stores the acquired file lock in a process-global map. There is no `_lock_guard` to hold or release around `Manager::restore()`. [persist.rs:531](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:531), [persist.rs:568](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:568)
-- **HIGH — Continuing after `Held` is unsafe and contradicts the persistence mechanism.** `Manager::restore()` immediately calls a loader that acquires the same daemon-state lock. If another process holds it, restoration fails, the manager marks persistence blocked, and subsequent saves also fail. The result is a second live daemon that can serve requests but cannot safely persist them. [persist.rs:338](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:338), [manager.rs:474](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/manager.rs:474), [persist.rs:611](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:611)
-- **HIGH — `config.root` is again nonexistent and `record()` requires `Option<&Path>`.** [persist.rs:940](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/persist.rs:940), [folder_workspace.rs:118](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude-core/src/folder_workspace.rs:118)
-- **HIGH — The parity test is tautological.** Calling `canonicalize → plan_launch → resolve_with_context` twice inside `baude-core` does not exercise `bauded/src/main.rs`, lock handling, recording, or initialization. It would still pass if daemon startup remained unchanged at `initialize(&config, None)`. [bauded/main.rs:181](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:181)
-- **HIGH — WSPC-05 daemon-backed provenance remains uncovered.** `/info` returns workspace name and backend only, and the client reads only the workspace name. The plan’s explicit provenance deferral means a remote/daemon-backed view cannot know whether the daemon chose its workspace explicitly, from a binding, or by derivation. [api.rs:117](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/api.rs:117), [remote.rs:131](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/remote.rs:131)
-- **MEDIUM — The README rebinding guidance is misleading.** Config `workspace` is below an existing folder binding, so setting it alone cannot override that binding. The existing README reflects the old suppression behavior and requires a careful rewrite. [README.md:287](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/README.md:287)
-- **MEDIUM — README grep verification checks presence, not order or accuracy.** A document with an incorrectly ordered precedence list would still pass.
+- **HIGH — Remote provenance has no complete data path.** `/info` is currently fetched only inside `daemon_workspace()` during session creation, reduced to `Option<String>`, and discarded at [baude/src/remote.rs:131](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/remote.rs:131). `RemoteSnapshot` contains only sessions, fetch time, and online status at [baude/src/remote.rs:67](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/remote.rs:67), while `remote_header` sees only `app.remote_snap` at [baude/src/ui.rs:656](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/ui.rs:656). “Store it in `RemoteContext or similar`” is not executable because no such type exists.
+- **HIGH — It inherits the wrong shared lock base and weakened contention policy.** The daemon’s actual state loader uses `daemon-state` at [bauded/src/manager.rs:444](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/manager.rs:444). A shared helper claiming `workspace-state` neither protects it nor proves parity.
+- **HIGH — The parity test does not test two startup paths.** Both mains are entry-point code, not callable functions. Calling `start_workspace` twice tests one helper twice; it does not verify that both binaries canonicalize arguments, supply the correct lock base, and retain the returned state. Current startup differences are visible in [baude/src/main.rs:343](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:343) and [bauded/src/main.rs:166](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/bauded/src/main.rs:166).
+- **MEDIUM — Remote default formatting does not match the local contract.** Local `title_label()` is planned to render only `(blank)` for default, but the remote format is fixed as `remote: {name} ({source})`, producing `remote: claude (blank)`. That contradicts the stated “matching local title format.”
+- **MEDIUM — Older daemon behavior is unspecified.** An older `/info` response lacks `workspace_source`. The new client should deserialize a typed optional/default field and select an explicit fallback rather than assuming the field exists.
+- **MEDIUM — Canonicalization behavior differs from the TUI.** The TUI currently falls back to the original path when canonicalization fails at [baude/src/main.rs:343](/Users/joese/.local/share/baude/worktrees/smoke/repository-1/primary-3/baude/src/main.rs:343); the daemon action proposes propagating canonicalization failure with `?`. “Same rule for the same launch directory” should use identical behavior.
+- **LOW — Documentation verification is mostly keyword-based.** The proposed grep/awk checks cannot prove the seven entries occur in the correct order or that clone documentation was unchanged.
 
 ### Suggestions
 
-- Reuse `initialize_with_context()` in daemon startup.
-- Call `claim_workspace_state_lock("daemon-state", workspace)`. Treat `Held` as startup refusal, matching the single-writer invariant. Decide explicitly whether `Io` preserves the existing degraded behavior.
-- Use `persist::config_dir()` and `Some(&memory_root)` for folder-memory calls.
-- Extract a shared `resolve_launch(config, launch_dir, env)` helper in `baude-core`, then have both binaries invoke it. Test each binary-facing wrapper or at least a factored daemon startup helper.
-- Add a daemon test proving:
-  - ancestor binding selection;
-  - derivation and repository-root recording;
-  - no recording for non-repository launches;
-  - no binding write after state-lock refusal.
-- Either add `workspace_source` to `/info` and consume it in the TUI, or explicitly revise WSPC-05/CONTEXT.md. Silent deferral is not convergence.
-- Verify README precedence structurally, or review the rendered section rather than relying only on keyword greps.
+- Introduce a typed `DaemonInfo` such as `{ workspace, backend, workspace_source: Option<_> }`.
+- Fetch `/info` when `RemotePoller` starts or alongside `/sessions`, store the result in `RemoteSnapshot`, and render from that stable snapshot. Preserve the existing cross-workspace guard using the same typed response.
+- Define the old-daemon fallback explicitly—likely source unavailable rather than falsely labeling it explicit or derived.
+- For genuine binary parity, extract thin TUI/daemon argument-to-startup-input functions or use subprocess smoke tests. Do not call the same helper twice and label it cross-binary coverage.
+- Generate README precedence from a numbered list and test its ordered markers, rather than only grepping for words.
 
 ### Risk Assessment
 
-**HIGH.** The lock and initialization mechanisms do not match the source, the proposed parity test cannot detect incorrect daemon wiring, and one locked phase behavior—daemon-backed workspace provenance—is knowingly left incomplete.
+**HIGH.** Daemon resolution is necessary, but the current plan lacks the actual `/info → poller → app snapshot → UI` chain and relies on the unsafe lock design from 13-01.
 
-Final recommendation: revise before execution. The minimum convergence fixes are an `initialize_with_context` API, correct persistence/config-root calls, explicit source classification, updates for every `Workspace` constructor, nonzero-test verification, a real daemon-startup test seam, and resolution of the daemon provenance requirement.
+## Cross-plan assessment
+
+Overall risk is **HIGH until revised**. The plans cover every phase requirement conceptually, but three design contracts must be fixed before execution:
+
+1. Lock the actual state base and preserve the TUI’s refusal-on-contention behavior.
+2. Specify one non-contradictory workspace/source precedence table, separating workspace naming from backend binding.
+3. Align tests with the thread-local test identity system and use subprocesses or injection for real lock contention.
+
+After those corrections, the phase is well-bounded: repository identity and clone behavior already have suitable seams, and the remaining implementation is primarily resolver plumbing, UI labeling, and documentation.
