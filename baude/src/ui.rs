@@ -3244,4 +3244,51 @@ mod tests {
         assert!(!narrow.is_empty());
         assert_eq!(outer_app.config_for_test().auto_archive_minutes, Some(7));
     }
+
+    #[test]
+    fn title_rendering_shows_workspace_with_explicit_source() {
+        let _fixture = UiFixture::new("title-explicit");
+        // Override with Explicit source
+        let config = baude_core::persist::Config::default();
+        let ws = baude_core::workspace::resolve(Some("explicit-ws"), None, &config, |_| {});
+        let _override = baude_core::workspace::override_for_test(&config, None);
+        // The workspace name and "(explicit)" label should be in the title
+        assert_eq!(ws.display_hint(), "(explicit)");
+        assert!(ws.title_label().contains("explicit"));
+    }
+
+    #[test]
+    fn title_rendering_shows_workspace_with_bound_source() {
+        let _fixture = UiFixture::new("title-bound");
+        // Override with Bound source (via hint)
+        let config = baude_core::persist::Config::default();
+        let ws = baude_core::workspace::resolve_with_hint(None, None, Some("bound-ws"), &config, |_| {});
+        assert_eq!(ws.source, baude_core::workspace::WorkspaceSource::Bound);
+        assert!(ws.title_label().contains("folder binding"));
+    }
+
+    #[test]
+    fn title_rendering_shows_workspace_with_derived_source() {
+        let _fixture = UiFixture::new("title-derived");
+        // Override with Derived source (via repo_root context)
+        let config = baude_core::persist::Config::default();
+        let ctx = baude_core::workspace::WorkspaceLaunchContext {
+            hint: None,
+            repo_root: Some("/repos/test-repo".into()),
+        };
+        let ws = baude_core::workspace::resolve_with_context(None, None, &ctx, &config, |_| {});
+        assert_eq!(ws.source, baude_core::workspace::WorkspaceSource::Derived);
+        assert!(ws.title_label().contains("derived"));
+    }
+
+    #[test]
+    fn title_rendering_with_default_source_shows_blank() {
+        let _fixture = UiFixture::new("title-default");
+        // Override with Default source
+        let config = baude_core::persist::Config::default();
+        let ws = baude_core::workspace::resolve(None, None, &config, |_| {});
+        assert_eq!(ws.source, baude_core::workspace::WorkspaceSource::Default);
+        assert_eq!(ws.title_label(), "(blank)");
+        assert_ne!(ws.title_label(), ws.name);
+    }
 }

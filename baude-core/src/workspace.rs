@@ -944,4 +944,124 @@ mod tests {
         assert_eq!(ws.backend.name(), "claude");
         assert_eq!(ws.legacy_state_file("state"), None);
     }
+
+    #[test]
+    fn test_precedence_matrix_all_seven_levels() {
+        // Test precedence order per the plan:
+        // 1. BAUDE_WORKSPACE > 2. bound > 3. config workspace > 4. derived > 5. BAUDE_BACKEND > 6. config backend > 7. default
+        let config = Config {
+            workspace: Some("config-ws".into()),
+            backend: Some("claude".into()),
+            ..Config::default()
+        };
+
+        // Level 1: BAUDE_WORKSPACE wins (beats everything)
+        let ws = resolve_with_hint(Some("explicit-ws"), Some("opencode"), Some("bound"), &config, no_warn);
+        assert_eq!(ws.name, "explicit-ws");
+
+        // Level 2: Bound wins (no explicit ws_env, no backend_env)
+        let ws = resolve_with_hint(None, None, Some("bound"), &config, no_warn);
+        assert_eq!(ws.name, "bound");
+
+        // Level 3: Config workspace wins (no explicit ws_env, no bound, no backend_env)
+        let ws = resolve_with_hint(None, None, None, &config, no_warn);
+        assert_eq!(ws.name, "config-ws");
+
+        // Level 5: BAUDE_BACKEND is NOT suppressed anymore (per D-02 reorder)
+        let ws = resolve_with_hint(None, Some("opencode"), None, &Config::default(), no_warn);
+        assert_eq!(ws.name, "opencode");
+
+        // Level 7: Default when nothing else matches
+        let ws = resolve(None, None, &Config::default(), no_warn);
+        assert_eq!(ws.name, "claude");
+    }
+
+    #[test]
+    fn test_precedence_matrix_baude_workspace_and_backend_both_set() {
+        // BAUDE_WORKSPACE should win over BAUDE_BACKEND
+        let config = Config::default();
+        let ws = resolve_with_hint(Some("explicit-ws"), Some("opencode"), None, &config, no_warn);
+        assert_eq!(ws.name, "explicit-ws");
+    }
+
+    #[test]
+    fn test_display_hint_explicit() {
+        // Create a workspace with Explicit source
+        let config = Config::default();
+        let ws = resolve(Some("test"), None, &config, no_warn);
+        assert_eq!(ws.source, WorkspaceSource::Explicit);
+        assert_eq!(ws.display_hint(), "(explicit)");
+    }
+
+    #[test]
+    fn test_display_hint_bound() {
+        // Create a workspace with Bound source (via hint)
+        let config = Config::default();
+        let ws = resolve_with_hint(None, None, Some("test"), &config, no_warn);
+        assert_eq!(ws.source, WorkspaceSource::Bound);
+        assert_eq!(ws.display_hint(), "(folder binding)");
+    }
+
+    #[test]
+    fn test_display_hint_derived() {
+        // Create a workspace with Derived source (via repo_root context)
+        let ctx = WorkspaceLaunchContext {
+            hint: None,
+            repo_root: Some("/repos/test-project".into()),
+        };
+        let config = Config::default();
+        let ws = resolve_with_context(None, None, &ctx, &config, no_warn);
+        assert_eq!(ws.source, WorkspaceSource::Derived);
+        assert_eq!(ws.display_hint(), "(derived)");
+    }
+
+    #[test]
+    fn test_display_hint_default() {
+        // Create a workspace with Default source
+        let config = Config::default();
+        let ws = resolve(None, None, &config, no_warn);
+        assert_eq!(ws.source, WorkspaceSource::Default);
+        assert_eq!(ws.display_hint(), "(blank)");
+    }
+
+    #[test]
+    fn test_display_hint_default_returns_blank_not_name() {
+        let config = Config::default();
+        let ws = resolve(None, None, &config, no_warn);
+        assert_eq!(ws.display_hint(), "(blank)");
+        assert_ne!(ws.display_hint(), "claude");
+    }
+
+    #[test]
+    fn test_title_label_default_returns_blank() {
+        let config = Config::default();
+        let ws = resolve(None, None, &config, no_warn);
+        assert_eq!(ws.title_label(), "(blank)");
+    }
+
+    #[test]
+    fn test_title_label_other_sources_format() {
+        let config = Config::default();
+
+        // Explicit
+        let ws = resolve(Some("myws"), None, &config, no_warn);
+        assert_eq!(ws.title_label(), "myws (explicit)");
+
+        // Bound
+        let ws = resolve_with_hint(None, None, Some("bound"), &config, no_warn);
+        assert_eq!(ws.title_label(), "bound (folder binding)");
+
+        // Derived
+        let ctx = WorkspaceLaunchContext {
+            hint: None,
+            repo_root: Some("/repos/derived-project".into()),
+        };
+        let ws = resolve_with_context(None, None, &ctx, &config, no_warn);
+        assert_eq!(ws.title_label(), "derived-project (derived)");
+    }
+
+    #[test]
+    fn test_sanitize_empty_input() {
+        assert_eq!(sanitize(""), "");
+    }
 }
