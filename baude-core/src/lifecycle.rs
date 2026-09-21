@@ -1323,7 +1323,9 @@ pub fn ensure_repository(
             #[cfg(unix)]
             let digest = {
                 use std::os::unix::ffi::OsStrExt;
-                crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
+                crate::repository::compute_repository_digest(
+                    snapshot.common_dir.as_os_str().as_bytes(),
+                )
             };
             #[cfg(not(unix))]
             let digest = {
@@ -1364,17 +1366,15 @@ pub fn prepare_activation(
 
     // Get the physical_key from the SavedRepository entry, or use the repository key as fallback
     let repo_key_str = repository.get().to_string();
-    let physical_key = state.physical_key(repository).unwrap_or_else(|| &repo_key_str);
+    let physical_key = state
+        .physical_key(repository)
+        .unwrap_or_else(|| &repo_key_str);
 
     Ok(PreparedActivation {
         request: ActivationRequest {
             repository,
             branch: branch.to_owned(),
-            managed_path: git::managed_branch_worktree_path(
-                physical_key,
-                checkout.get(),
-                branch,
-            ),
+            managed_path: git::managed_branch_worktree_path(physical_key, checkout.get(), branch),
         },
         checkout,
         first_seen_order,
@@ -3310,8 +3310,10 @@ mod tests {
         ));
         let mut state = crate::repository::RepositoryState::default();
         let key = state.allocate_repository_key().expect("allocate key");
-        let common_dir = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test"));
-        let main_worktree = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test/.git"));
+        let common_dir =
+            crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test"));
+        let main_worktree =
+            crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test/.git"));
 
         let repo = crate::repository::SavedRepository {
             key,
@@ -3353,7 +3355,11 @@ mod tests {
         };
 
         let key = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
-        let repo = state.repositories.iter().find(|r| r.key == key).expect("find repository");
+        let repo = state
+            .repositories
+            .iter()
+            .find(|r| r.key == key)
+            .expect("find repository");
         assert!(!repo.physical_key.is_empty(), "physical_key should be set");
     }
 
@@ -3381,7 +3387,8 @@ mod tests {
         };
 
         let key1 = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
-        let key2 = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository again");
+        let key2 =
+            super::ensure_repository(&mut state, &snapshot).expect("ensure_repository again");
         assert_eq!(key1, key2, "same common dir should return same key");
     }
 
@@ -3408,9 +3415,14 @@ mod tests {
             worktrees: vec![],
         };
 
-        let key1 = super::ensure_repository(&mut state, &make_snapshot("/tmp/test3")).expect("ensure_repository 1");
-        let key2 = super::ensure_repository(&mut state, &make_snapshot("/tmp/test4")).expect("ensure_repository 2");
-        assert_ne!(key1, key2, "different common dirs should return different keys");
+        let key1 = super::ensure_repository(&mut state, &make_snapshot("/tmp/test3"))
+            .expect("ensure_repository 1");
+        let key2 = super::ensure_repository(&mut state, &make_snapshot("/tmp/test4"))
+            .expect("ensure_repository 2");
+        assert_ne!(
+            key1, key2,
+            "different common dirs should return different keys"
+        );
     }
 
     #[test]
@@ -3451,13 +3463,21 @@ mod tests {
         };
 
         // First insert
-        let key = super::ensure_repository(&mut state, &make_snapshot("/tmp/test5", "/tmp/test5/.git")).expect("ensure_repository");
+        let key =
+            super::ensure_repository(&mut state, &make_snapshot("/tmp/test5", "/tmp/test5/.git"))
+                .expect("ensure_repository");
         assert_eq!(state.repositories.len(), 1, "should have one repository");
 
         // Update with different main worktree
-        let key2 = super::ensure_repository(&mut state, &make_snapshot("/tmp/test5", "/tmp/test5/.git2")).expect("ensure_repository again");
+        let key2 =
+            super::ensure_repository(&mut state, &make_snapshot("/tmp/test5", "/tmp/test5/.git2"))
+                .expect("ensure_repository again");
         assert_eq!(key, key2, "should reuse same key for same common dir");
-        assert_eq!(state.repositories.len(), 1, "should still have one repository");
+        assert_eq!(
+            state.repositories.len(),
+            1,
+            "should still have one repository"
+        );
     }
 
     #[test]
@@ -3484,7 +3504,14 @@ mod tests {
         };
 
         let key = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
-        let repo = state.repositories.iter().find(|r| r.key == key).expect("find repository");
-        assert!(matches!(repo.health, crate::repository::RepositoryHealth::Available), "health should be Available");
+        let repo = state
+            .repositories
+            .iter()
+            .find(|r| r.key == key)
+            .expect("find repository");
+        assert!(
+            matches!(repo.health, crate::repository::RepositoryHealth::Available),
+            "health should be Available"
+        );
     }
 }

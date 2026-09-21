@@ -865,7 +865,7 @@ mod tests {
                     let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
                     barrier.wait();
                     let resolved = baude_core::workspace::active().name.clone();
-                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    let managed = baude_core::git::managed_default_worktree_path("7", 11);
                     barrier.wait();
                     assert_eq!(resolved, workspace);
                     assert!(

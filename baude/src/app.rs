@@ -1990,10 +1990,11 @@ impl App {
             Some(key) => key,
             None => self.repository_state.allocate_checkout_key()?,
         };
-        let physical_key = self.repository_state.physical_key(repository_key)
+        let physical_key = self
+            .repository_state
+            .physical_key(repository_key)
             .ok_or_else(|| anyhow::anyhow!("Repository key not found in state"))?;
-        let managed_path =
-            git::managed_default_worktree_path(physical_key, checkout_key.get());
+        let managed_path = git::managed_default_worktree_path(physical_key, checkout_key.get());
         let outcome = git::ensure_default_worktree(&snapshot, &default, &managed_path)?;
         let (record, managed_by_baude) = match outcome {
             git::DefaultWorktreeOutcome::Main(record)
@@ -7060,7 +7061,7 @@ mod tests {
     fn admission_fixture_contains_managed_worktrees() {
         let fixture = admission_repo("containment-guard");
         let root = fixture.root().to_path_buf();
-        let allocated = baude_core::git::managed_default_worktree_path(1, 2);
+        let allocated = baude_core::git::managed_default_worktree_path("1", 2);
         assert!(
             allocated.starts_with(&root),
             "admission_repo must pin the managed worktree root inside its fixture \
@@ -7099,7 +7100,7 @@ mod tests {
                     // shared cache cannot be masked by sequential execution.
                     barrier.wait();
                     let resolved = baude_core::workspace::active().name.clone();
-                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    let managed = baude_core::git::managed_default_worktree_path("7", 11);
                     barrier.wait();
                     assert_eq!(
                         resolved, name,
@@ -7336,6 +7337,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
         add_checkout(&mut state, CheckoutRole::ManagedBranch, true);
@@ -7358,6 +7360,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
         state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/repo/one"));
@@ -7643,6 +7646,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo/project")),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
         state.checkouts[0].session.name = "project:main".into();
@@ -7860,8 +7864,12 @@ mod tests {
 
         let mut allocation = baseline_state.clone();
         let next_checkout = allocation.allocate_checkout_key().unwrap();
+        let physical_key = app
+            .repository_state
+            .physical_key(repository)
+            .expect("repository has physical_key");
         let collision = baude_core::git::managed_branch_worktree_path(
-            repository.get(),
+            physical_key,
             next_checkout.get(),
             "collision",
         );
@@ -8062,6 +8070,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo")),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
         state.checkouts[0].observed_path = PersistedPath::from_path(Path::new("/repo/closed"));
@@ -8219,6 +8228,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
         state.checkouts[0].managed_by_baude = true;
@@ -8247,6 +8257,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
         let checkout_key = state.checkouts[0].key;
@@ -8554,6 +8565,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
         });
 
         let created = app
@@ -8718,6 +8730,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
         });
         let before = app.repository_state.clone();
 
@@ -8865,6 +8878,7 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                physical_key: repository.get().to_string(),
             });
             let branch = format!("feature/{label}");
 
@@ -10153,6 +10167,7 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(Path::new(main)),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                physical_key: key.get().to_string(),
             });
             key
         };

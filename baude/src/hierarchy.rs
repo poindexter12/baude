@@ -676,6 +676,7 @@ mod tests {
             observed_main_worktree: path(main),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: key.get().to_string(),
         });
         key
     }

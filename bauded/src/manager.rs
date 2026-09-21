@@ -1312,6 +1312,7 @@ impl Manager {
                     } else {
                         RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
                     },
+                    physical_key: key.get().to_string(),
                 });
                 key
             }
@@ -2816,6 +2817,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         state.checkouts.push(SavedCheckout::new(
             checkout_key,

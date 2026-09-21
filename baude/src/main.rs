@@ -1212,6 +1212,7 @@ mod worktrees_cli_tests {
                 observed_main_worktree: PersistedPath::from_path(&main),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                physical_key: allocated.get().to_string(),
             });
             self.write_state("state-claude.json", state);
         }

@@ -581,8 +581,16 @@ fn collect_references(
             workspace: workspace.to_string(),
             key,
         });
-        claim(Some(key.to_string()), &repository.observed_main_worktree, references);
-        claim(Some(key.to_string()), &repository.observed_common_dir, references);
+        claim(
+            Some(key.to_string()),
+            &repository.observed_main_worktree,
+            references,
+        );
+        claim(
+            Some(key.to_string()),
+            &repository.observed_common_dir,
+            references,
+        );
     }
     for checkout in &state.checkouts {
         let key = checkout.repository_key.get();
@@ -592,7 +600,11 @@ fn collect_references(
         });
         claim(Some(key.to_string()), &checkout.observed_path, references);
         claim(Some(key.to_string()), &checkout.session.cwd, references);
-        claim(Some(key.to_string()), &checkout.session.repo_root, references);
+        claim(
+            Some(key.to_string()),
+            &checkout.session.repo_root,
+            references,
+        );
     }
     for standalone in &state.standalone_sessions {
         // Standalone sessions carry no repository key, so the claim they make
@@ -1013,8 +1025,8 @@ fn repository_key(name: &str) -> Option<String> {
     let key_str = name.strip_prefix("repository-")?;
 
     // Try parsing as legacy decimal (u64)
-    if let Ok(_num) = key_str.parse::<u64>() {
-        if format!("repository-{}", key_str) == name {
+    if let Ok(num) = key_str.parse::<u64>() {
+        if format!("repository-{num}") == name {
             return Some(key_str.to_string());
         }
     }
@@ -1100,7 +1112,10 @@ fn empty_at_every_level(path: &Path, depth: u32) -> std::io::Result<bool> {
         let child = entry?.path();
         let metadata = std::fs::symlink_metadata(&child)?;
         // Skip the marker file — it does not count as contents
-        if child.file_name().map_or(false, |name| name == ".baude-marker.json") {
+        if child
+            .file_name()
+            .is_some_and(|name| name == ".baude-marker.json")
+        {
             continue;
         }
         // A symlink is an entry like any other: `is_dir()` is false for it
@@ -2487,7 +2502,11 @@ mod tests {
                 "a recorded repository key is positive proof of liveness: {found:?}"
             );
             assert!(
-                references(found).contains(&("claude".to_string(), Some("7".to_string()), ReferenceMatch::Key)),
+                references(found).contains(&(
+                    "claude".to_string(),
+                    Some("7".to_string()),
+                    ReferenceMatch::Key
+                )),
                 "the key match must be named in the evidence: {found:?}"
             );
         }
@@ -3641,7 +3660,9 @@ mod tests {
             let unapproved = fixture.dir("claude", "repository-11");
             let mut report = scan_ok(&fixture);
             assert_eq!(report.candidates.len(), 2);
-            report.candidates.retain(|found| found.repository_key == "9");
+            report
+                .candidates
+                .retain(|found| found.repository_key == "9");
 
             let pruned = prune_ok(&fixture, &report, true);
 

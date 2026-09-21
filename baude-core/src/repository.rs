@@ -1371,7 +1371,9 @@ mod tests {
         let repo = SavedRepository {
             key,
             observed_common_dir: common_dir,
-            observed_main_worktree: PersistedPath::from_path(std::path::Path::new("/tmp/test/.git")),
+            observed_main_worktree: PersistedPath::from_path(std::path::Path::new(
+                "/tmp/test/.git",
+            )),
             first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
             health: RepositoryHealth::Available,
             physical_key: physical_key_value.clone(),
