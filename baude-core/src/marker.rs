@@ -196,7 +196,7 @@ pub fn read_marker(dir: &Path) -> Result<MarkerRead, io::Error> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
