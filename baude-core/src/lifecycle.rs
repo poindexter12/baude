@@ -1319,13 +1319,24 @@ pub fn ensure_repository(
         None => {
             let key = state.allocate_repository_key()?;
             let first_seen_order = state.allocate_first_seen_order()?;
+            // Compute physical_key as digest of the canonical common dir
+            #[cfg(unix)]
+            let digest = {
+                use std::os::unix::ffi::OsStrExt;
+                crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
+            };
+            #[cfg(not(unix))]
+            let digest = {
+                // Fallback for non-Unix systems: use the legacy counter key
+                key.get().to_string()
+            };
             state.repositories.push(SavedRepository {
                 key,
                 observed_common_dir: common.clone(),
                 observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                 first_seen_order,
                 health: RepositoryHealth::Available,
-                physical_key: String::new(),
+                physical_key: digest,
             });
             key
         }
