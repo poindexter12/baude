@@ -3838,9 +3838,40 @@ mod tests {
             std::process::id()
         ));
         let fixture = ScanFixture::new();
-        // TODO: This test will be implemented when ownership discovery is added
-        // For now, just verify the Candidate struct has the owner field
-        let _report = scan_ok(&fixture);
+
+        // Create a repository directory with a valid marker
+        // Use a valid hex format: 12 hex digits
+        let repo_dir = fixture.dir("claude", "repository-abcdef123456");
+        let known_path = std::path::PathBuf::from("/tmp/my-repository");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let marker_meta = crate::marker::MarkerMetadata {
+                canonical_common_dir: known_path.as_os_str().as_bytes().to_vec(),
+                scheme_version: 1,
+                recorded_at_ms: 1000,
+            };
+            crate::marker::write_marker(&repo_dir, &marker_meta).expect("write marker");
+        }
+
+        let report = scan_ok(&fixture);
+
+        // Find the candidate we created
+        let candidate = candidate(&report, "claude", "repository-abcdef123456");
+        assert!(
+            candidate.owner.is_some(),
+            "owner should be populated from marker"
+        );
+        let owner = candidate.owner.as_ref().unwrap();
+        assert_eq!(owner.canonical_common_dir, known_path);
+        assert_eq!(
+            owner.display_name,
+            Some(crate::repository::repository_display_name(&known_path))
+        );
+
+        // Verify marker file still exists unchanged (read-only contract)
+        let marker_path = repo_dir.join(".baude-marker.json");
+        assert!(marker_path.exists(), "marker file should still exist");
     }
 
     #[test]
@@ -3851,7 +3882,47 @@ mod tests {
             std::process::id()
         ));
         let fixture = ScanFixture::new();
-        // TODO: This test will be implemented when ownership discovery is added
-        let _report = scan_ok(&fixture);
+
+        // Create a repository directory with a real git checkout inside
+        // Use a valid hex format: 12 hex digits
+        let repo_dir = fixture.dir("claude", "repository-fedcba654321");
+        let checkout_dir = repo_dir.join("primary-1");
+        std::fs::create_dir(&checkout_dir).expect("create checkout dir");
+
+        // Initialize a real git repository inside the checkout
+        git_ok(&checkout_dir, &["init", "-q", "."]);
+        git_ok(&checkout_dir, &["config", "user.name", "Baude Test"]);
+        git_ok(
+            &checkout_dir,
+            &["config", "user.email", "baude@example.invalid"],
+        );
+        std::fs::write(checkout_dir.join("tracked.txt"), b"test\n").expect("write tracked file");
+        git_ok(&checkout_dir, &["add", "tracked.txt"]);
+        git_ok(&checkout_dir, &["commit", "-q", "-m", "test commit"]);
+
+        let report = scan_ok(&fixture);
+
+        // Find the candidate we created
+        let candidate = candidate(&report, "claude", "repository-fedcba654321");
+        assert!(
+            candidate.owner.is_some(),
+            "owner should be discovered from checkout"
+        );
+        let owner = candidate.owner.as_ref().unwrap();
+        // The canonical common dir should match what git reports
+        let git_snapshot =
+            crate::git::discover_repository(&checkout_dir).expect("discover git repository");
+        assert_eq!(owner.canonical_common_dir, git_snapshot.common_dir);
+        assert!(
+            owner.display_name.is_some(),
+            "display_name should be populated"
+        );
+
+        // Verify no marker was created during scan (read-only contract)
+        let marker_path = repo_dir.join(".baude-marker.json");
+        assert!(
+            !marker_path.exists(),
+            "marker should not be created by scan"
+        );
     }
 }

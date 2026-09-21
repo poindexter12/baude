@@ -1967,7 +1967,72 @@ mod keyboard_negotiation_tests {
     #[test]
     fn scan_output_includes_owner() {
         // Verify that scan text and JSON output includes ownership information
-        // TODO: Implement when ownership discovery is added to worktree_scan
-        // This test verifies that print_scan_summary formats owner information correctly
+        let owner_path = std::path::PathBuf::from("/tmp/demo/.git");
+        let owner_display = "demo".to_string();
+
+        // Construct a ScanReport with one candidate that has ownership info
+        let candidate = baude_core::worktree_scan::Candidate {
+            relative: vec!["claude".to_string(), "repository-abcdef123456".to_string()],
+            workspace: "claude".to_string(),
+            repository_key: "abcdef123456".to_string(),
+            verdict: baude_core::worktree_scan::Verdict::Live { evidence: vec![] },
+            owner: Some(baude_core::worktree_scan::OwnershipInfo {
+                canonical_common_dir: owner_path.clone(),
+                display_name: Some(owner_display.clone()),
+            }),
+        };
+
+        let report = baude_core::worktree_scan::ScanReport {
+            format_version: baude_core::worktree_scan::REPORT_FORMAT_VERSION,
+            worktrees_base: baude_core::repository::PersistedPath::from_path(
+                &std::path::PathBuf::from("/tmp/worktrees"),
+            ),
+            config_dir: baude_core::repository::PersistedPath::from_path(
+                &std::path::PathBuf::from("/tmp/config"),
+            ),
+            candidates: vec![candidate],
+            state_inventory: baude_core::worktree_scan::StateInventorySummary {
+                workspaces_checked: vec!["claude".to_string()],
+                files_checked: vec![],
+                files_absent: vec![],
+                complete: true,
+            },
+        };
+
+        // Test text output includes owner info
+        let mut text_output = Vec::new();
+        print_scan_summary(&report, &mut text_output);
+        let text = String::from_utf8(text_output).expect("text output is valid UTF-8");
+        assert!(
+            text.contains("demo"),
+            "text output should contain owner display name"
+        );
+        assert!(
+            text.contains("/tmp/demo/.git"),
+            "text output should contain owner canonical dir"
+        );
+        assert!(
+            text.contains("owner:"),
+            "text output should contain 'owner:' label"
+        );
+
+        // Test JSON output includes owner info
+        let json = serde_json::to_value(&report).expect("report should serialize to JSON");
+        assert!(
+            json["candidates"][0]["owner"].is_object(),
+            "JSON should have owner object"
+        );
+        assert_eq!(
+            json["candidates"][0]["owner"]["display_name"].as_str(),
+            Some("demo"),
+            "JSON owner should have correct display_name"
+        );
+        assert_eq!(
+            json["candidates"][0]["owner"]["canonical_common_dir"]
+                .as_str()
+                .map(|p| p.ends_with("/tmp/demo/.git")),
+            Some(true),
+            "JSON owner should have correct canonical_common_dir"
+        );
     }
 }

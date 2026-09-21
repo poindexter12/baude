@@ -10757,9 +10757,9 @@ mod tests {
 
     #[test]
     fn admission_collision_sets_status() {
-        // TODO: Placeholder test — actual collision scenario requires engineering
-        // a foreign marker in pre-allocated managed path.
-        // See continuation context for implementation details.
+        // Verify that when manager admits a repository and a collision is detected,
+        // it sets the status message with collision information.
+        use std::os::unix::ffi::OsStrExt;
         let root = std::env::temp_dir().join(format!(
             "baude-test-{}-collision-status",
             std::process::id()
@@ -10768,30 +10768,112 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
 
-        // Create a simple repository
+        // Create a repository with proper remote setup
         let repo_dir = root.join("repo");
+        let origin_dir = root.join("repo-origin.git");
         std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&origin_dir).unwrap();
 
-        // Initialize as git repo
-        let _ = std::process::Command::new("git")
-            .args(["init"])
+        // Initialize origin as bare repo
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(&origin_dir)
+            .output()
+            .expect("git init origin");
+
+        // Initialize local repo
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", "."])
             .current_dir(&repo_dir)
-            .output();
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git config user.email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git config user.name");
+        std::fs::write(repo_dir.join("file.txt"), b"test\n").expect("write file");
+        std::process::Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "test"])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git commit");
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", origin_dir.to_str().unwrap()])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git remote add");
+        std::process::Command::new("git")
+            .args(["push", "-q", "-u", "origin", "main"])
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git push");
+
+        // Pre-seed a foreign marker in the repository's allocated digest directory
+        let worktrees_base = baude_core::testing::worktrees_base_override()
+            .expect("test redirect should set worktrees base")
+            .join("baude/worktrees");
+        let base = worktrees_base.join("claude");
+        std::fs::create_dir_all(&base).expect("create worktrees base");
+        // Compute digest from the git common dir (what ensure_repository will use)
+        let snapshot =
+            baude_core::git::discover_repository(&repo_dir).expect("discover repository");
+        let digest = baude_core::repository::compute_repository_digest(
+            snapshot.common_dir.as_os_str().as_bytes(),
+        );
+        let target_dir = base.join(format!("repository-{digest}"));
+        std::fs::create_dir_all(&target_dir).expect("create collision directory");
+
+        // Write a foreign marker (belonging to a different repo)
+        let foreign_path = std::path::PathBuf::from("/tmp/foreign-repo/.git");
+        let foreign_marker = baude_core::marker::MarkerMetadata {
+            canonical_common_dir: foreign_path.as_os_str().as_bytes().to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1000,
+        };
+        baude_core::marker::write_marker(&target_dir, &foreign_marker)
+            .expect("write foreign marker");
 
         let mut app = App::new(repo_dir.clone());
         app.remote = None;
         let _workspace = baude_core::workspace::override_for_test(&app.config, None);
         app.persistence_root_for_test = Some(root.join("state"));
 
-        // Admit repository
-        let result = app.admit_repository(&repo_dir);
-        assert!(result.is_ok(), "admission should succeed");
-
-        // When collision is returned, message should be set
-        // This test verifies the signature handles Option<CollisionReport>
+        // Activate a branch worktree - this is where collision detection happens
+        let result = app.activate_branch_worktree(&repo_dir, "feature/test");
         assert!(
-            !app.repository_state.repositories.is_empty(),
-            "repository should be recorded"
+            result.is_ok(),
+            "activation should succeed despite collision: {result:?}"
+        );
+
+        // Verify the message starts with collision: and contains expected info
+        let msg = app
+            .message
+            .as_ref()
+            .map(|(msg, _)| msg)
+            .expect("message should be set");
+        assert!(
+            msg.starts_with("collision:"),
+            "message should indicate collision, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/tmp/foreign-repo/.git"),
+            "message should contain foreign owner path"
+        );
+        assert!(
+            msg.contains("repository-") && msg.contains("-2"),
+            "message should contain allocated -2 path"
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -4299,36 +4299,126 @@ mod tests {
     #[test]
     fn info_reports_collisions() {
         // Verify that the /info endpoint returns collisions when manager has recorded them
-        let _fixture = ManagerFixture::new("info-reports-collisions");
+        let fixture = ManagerFixture::new("info-reports-collisions");
         let mut m = mgr();
 
-        // Get /info endpoint response - should have empty collisions initially
-        // This test verifies the structure is present and serializable
-        // In a full integration test, we would trigger a collision and verify it's reported
-        // For now, we test that the endpoint doesn't panic and returns valid data
+        // Pre-seed a collision report into the manager
+        let collision_report = baude_core::lifecycle::CollisionReport {
+            requested_path: std::path::PathBuf::from("/some/requested/path"),
+            allocated_path: std::path::PathBuf::from("/some/allocated-2"),
+            owner_common_dir: Some(std::path::PathBuf::from("/tmp/owner/.git")),
+            owner_display: "owner-display".to_string(),
+            requester_common_dir: std::path::PathBuf::from("/tmp/requester/.git"),
+            requester_display: "requester-display".to_string(),
+            reason: baude_core::lifecycle::CollisionReason::ForeignMarker,
+        };
+        m.collisions.push(collision_report.clone());
+
+        // Build the info payload
+        let json = serde_json::json!({
+            "workspace": baude_core::workspace::active().name,
+            "backend": baude_core::workspace::active().backend.name(),
+            "collision_count": m.collisions.len(),
+            "collisions": m.collisions,
+        });
+
+        // Verify collision is reported
+        assert_eq!(json["collision_count"], 1);
         assert_eq!(
-            m.collisions.len(),
-            0,
-            "manager should start with no collisions"
+            json["collisions"][0]["owner_display"].as_str(),
+            Some("owner-display")
+        );
+        assert_eq!(
+            json["collisions"][0]["reason"].as_str(),
+            Some("ForeignMarker")
         );
 
         m.kill_all();
+        drop(fixture);
     }
 
     #[test]
     fn manager_admission_collision_recorded() {
         // Verify that when manager admits a repository and a collision is detected,
         // it records the collision report and can be queried via /info
-        let _fixture = ManagerFixture::new("manager-admission-collision-recorded");
-        let mut m = mgr();
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = ManagerFixture::new("manager-admission-collision-recorded");
+        let mut m = Manager::new("sh -c 'sleep 30'".into(), true); // Use persistence
+        let state_root = fixture.subdir("state");
+        m.persist_at_for_test(&state_root, fixture.workspace(), None);
 
-        // Manager's collisions vector should be accessible and tracked
-        // This test verifies the data structure is in place and properly initialized
+        // Create a real git repository with proper remote setup
+        let repo = fixture.subdir("test-repo");
+        let origin = fixture.subdir("test-repo-origin.git");
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Baude Test"]);
+        git(&repo, &["config", "user.email", "baude@example.invalid"]);
+        std::fs::write(repo.join("file.txt"), b"test\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-q", "-m", "test"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // Pre-seed a foreign marker in the repository's allocated digest directory
+        // ManagerFixture defaults to "claude" workspace
+        let workspace = "claude";
+        let worktrees_base = baude_core::testing::worktrees_base_override()
+            .expect("test redirect should set worktrees base")
+            .join("baude/worktrees");
+        let base = worktrees_base.join(workspace);
+        std::fs::create_dir_all(&base).expect("create worktrees base");
+
+        // Compute digest from the git common dir (what ensure_repository will use)
+        let snapshot = baude_core::git::discover_repository(&repo).expect("discover repository");
+        let digest = baude_core::repository::compute_repository_digest(
+            snapshot.common_dir.as_os_str().as_bytes(),
+        );
+        let target_dir = base.join(format!("repository-{digest}"));
+        std::fs::create_dir_all(&target_dir).expect("create collision directory");
+
+        // Write a foreign marker (belonging to a different repo)
+        let foreign_path = std::path::PathBuf::from("/tmp/foreign-repo/.git");
+        let foreign_marker = baude_core::marker::MarkerMetadata {
+            canonical_common_dir: foreign_path.as_os_str().as_bytes().to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1000,
+        };
+        baude_core::marker::write_marker(&target_dir, &foreign_marker)
+            .expect("write foreign marker");
+
+        // Activate a branch worktree - this is where collision detection happens
+        let result = m.activate_branch_worktree(&repo, "feature/test", None);
+
+        // The activation should succeed despite the collision
         assert!(
-            m.collisions.is_empty(),
-            "collisions vector should be initialized as empty"
+            result.is_ok(),
+            "activation should succeed despite collision: {result:?}"
+        );
+
+        // Verify collision was recorded
+        assert_eq!(
+            m.collisions.len(),
+            1,
+            "manager should have recorded one collision"
+        );
+        assert_eq!(
+            m.collisions[0].reason,
+            baude_core::lifecycle::CollisionReason::ForeignMarker
+        );
+        assert!(
+            m.collisions[0]
+                .allocated_path
+                .to_string_lossy()
+                .contains("-2"),
+            "allocated path should have -2 suffix: {}",
+            m.collisions[0].allocated_path.display()
         );
 
         m.kill_all();
+        drop(fixture);
     }
 }
