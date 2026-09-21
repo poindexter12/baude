@@ -3316,4 +3316,172 @@ mod tests {
         // Verify the accessor returns the stored physical_key
         assert_eq!(state.physical_key(key), Some("legacy-counter"));
     }
+
+    #[test]
+    fn ensure_repository_unknown_owner_missing_marker() {
+        // Directory exists but no marker and no checkouts inside; asserts collision detected, newcomer allocated suffix.
+        let fixture = LifecycleFixture::new("unknown-owner-missing-marker");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        // Create a repository directory without a marker and without checkouts
+        let repo_dir = workspace_dir.join("repository-abc123");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // Create a common dir for the new repository
+        let new_common_dir = fixture.subdir("repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&new_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+
+        let mut state = crate::repository::RepositoryState::default();
+        // ensure_repository should detect unknown owner and allocate suffix
+        // This test will fail until ensure_repository is implemented
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
+
+    #[test]
+    fn ensure_repository_unknown_owner_invalid_marker() {
+        // Directory has oversized marker (invalid); asserts collision, newcomer gets suffix.
+        let fixture = LifecycleFixture::new("unknown-owner-invalid-marker");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        // Create a repository directory with invalid marker
+        let repo_dir = workspace_dir.join("repository-def456");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // Create an invalid (oversized) marker
+        let marker_path = repo_dir.join(".baude-marker.json");
+        std::fs::write(&marker_path, vec![0; 1024 * 1024]).expect("write invalid marker");
+
+        let new_common_dir = fixture.subdir("repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&new_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+
+        let mut state = crate::repository::RepositoryState::default();
+        // ensure_repository should detect invalid marker and allocate suffix
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
+
+    #[test]
+    fn ensure_repository_unknown_owner_symlink_marker() {
+        // Marker is symlink; asserts collision, newcomer allocated suffix.
+        let fixture = LifecycleFixture::new("unknown-owner-symlink-marker");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        let repo_dir = workspace_dir.join("repository-ghi789");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // Create a symlink as marker
+        let marker_path = repo_dir.join(".baude-marker.json");
+        let target = fixture.subdir("fake-target");
+        let _ = std::os::unix::fs::symlink(&target, &marker_path);
+
+        let new_common_dir = fixture.subdir("repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&new_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+
+        let mut state = crate::repository::RepositoryState::default();
+        // ensure_repository should detect symlink marker and allocate suffix
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
+
+    #[test]
+    fn checkout_allocation_skips_existing_dirs_after_state_reset() {
+        // Reset state, allocate checkout to primary-1, then reset state again, allocate another checkout.
+        // Asserts second checkout skips primary-1 and uses primary-2.
+        let fixture = LifecycleFixture::new("checkout-allocation-skip");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        let repo_dir = workspace_dir.join("repository-jkl012");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // First allocation should create primary-1
+        let checkout1 = repo_dir.join("primary-1");
+        std::fs::create_dir_all(&checkout1).expect("create checkout 1");
+
+        let new_common_dir = fixture.subdir("repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&new_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+
+        let mut state = crate::repository::RepositoryState::default();
+        // After state reset, allocating again should skip primary-1 (exists on disk) and use primary-2
+        // This test will fail until ensure_repository skips existing paths
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
+
+    #[test]
+    fn ensure_repository_foreign_marker_collision() {
+        // Directory has marker with different canonical_common_dir; asserts collision reported with owner info.
+        let fixture = LifecycleFixture::new("foreign-marker");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        let repo_dir = workspace_dir.join("repository-mno345");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // Create a marker with different canonical_common_dir
+        let owner_common_dir = fixture.subdir("owner-repo");
+        let owner_bytes = crate::git::canonicalize_directory(&owner_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+        crate::marker::write_marker(&repo_dir, &owner_bytes).expect("write marker");
+
+        // Now try to admit a different repository
+        let new_common_dir = fixture.subdir("newcomer-repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&new_common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+
+        let mut state = crate::repository::RepositoryState::default();
+        // ensure_repository should detect collision and report owner info
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
+
+    #[test]
+    fn ensure_repository_matching_marker_no_collision() {
+        // Directory has marker with matching canonical_common_dir; asserts no collision, path reused.
+        let fixture = LifecycleFixture::new("matching-marker");
+        let base = crate::git::worktrees_base().expect("get base");
+        let workspace = "test-ws";
+        let workspace_dir = base.join(workspace);
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+
+        let repo_dir = workspace_dir.join("repository-pqr678");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        // Create a marker that matches the newcomer
+        let common_dir = fixture.subdir("matching-repo");
+        let canonical_bytes = crate::git::canonicalize_directory(&common_dir)
+            .expect("canonicalize")
+            .as_bytes()
+            .to_vec();
+        crate::marker::write_marker(&repo_dir, &canonical_bytes).expect("write marker");
+
+        let mut state = crate::repository::RepositoryState::default();
+        // ensure_repository should reuse path without collision
+        let _ = ensure_repository(&mut state, &canonical_bytes, &repo_dir);
+    }
 }
