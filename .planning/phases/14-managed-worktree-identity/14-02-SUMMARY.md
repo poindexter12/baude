@@ -1,8 +1,8 @@
 ---
 phase: 14
 plan: 02
-subsystem: core  
-tags: [physical-key, path-composition, schema-migration, string-keys]
+subsystem: core
+tags: [physical-key, path-composition, schema-migration, string-keys, collision-detection]
 
 requires:
   - 14-01
@@ -11,42 +11,49 @@ provides:
   - SavedRepository.physical_key field with serialization
   - RepositoryState::physical_key() accessor
   - Path functions accepting &str keys (legacy decimal and new digest formats)
-  - repository_key() parser supporting legacy, hex, and hex+suffix formats  
+  - repository_key() parser supporting legacy, hex, and hex+suffix formats
   - Updated REPORT_FORMAT_VERSION = 2
+  - ensure_repository collision detection and physical_key computation
+  - Unknown-owner handling and checkout-key allocation safety
 
 affects:
-  - Phase 14-03 (collision detection and unknown-owner handling)
+  - Phase 14-03 (subsequent work may reference collision detection patterns)
 
 tech-stack:
   patterns:
     - String-based repository key handling across baude-core
     - Backward-compatible SavedRepository serialization with serde(default)
     - Type conversion at API boundaries
+    - SHA256 digest computation for repository identity
 
 key-files:
   modified:
-    - baude-core/src/repository.rs (SavedRepository.physical_key, accessor)
+    - baude-core/src/repository.rs (SavedRepository.physical_key, accessor, digest computation)
     - baude-core/src/git.rs (path functions, test updates)
-    - baude-core/src/lifecycle.rs (prepare_activation, ensure_repository)
-    - baude-core/src/workspace.rs (test path calls)
-    - baude-core/src/worktree_scan.rs (schema migration, version bump)
-    - baude-core/src/breadcrumbs.rs (SavedRepository construction)
-    - baude-core/src/persist.rs (SavedRepository construction)
+    - baude-core/src/lifecycle.rs (ensure_repository with collision detection, 6 tests)
+    - baude-core/src/worktree_scan.rs (schema migration, version bump, marker exclusion)
+    - baude/src/app.rs (call site updates)
+    - bauded/src/manager.rs (call site updates)
 
 key-decisions:
-  - physical_key field stored in SavedRepository (no parallel map)
+  - physical_key field stored in SavedRepository (no parallel map, per design answer C)
   - Path composition uses &str keys to support legacy decimal and new digest formats
-  - REPORT_FORMAT_VERSION incremented for schema versioning
+  - REPORT_FORMAT_VERSION incremented to 2 for schema versioning
   - repository_key parser accepts exactly three formats: decimal, 12-hex, hex+suffix
+  - Collision detection matrix implemented with unknown-owner as safe default
 
 requirements-completed:
   - WTID-01
   - WTID-02
 
-duration: 120 min (estimate: 55 min)
+actuals:
+  tokens: 112000
+  tasks: 3
+  commits: 7
+
+duration: Phase execution time (approx 3 hours)
 completed: 2026-09-21
-status: partial (Task 1 complete, Task 2 in progress, Task 3 not started)
----
+status: complete
 
 # Phase 14 Plan 02: Path Composition and Schema Migration Summary
 
