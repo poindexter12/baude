@@ -166,9 +166,12 @@ All 9 marker tests passing:
 | Gate | Exit Code | Status |
 |------|-----------|--------|
 | cargo fmt --all -- --check | 0 | PASS |
-| cargo clippy --all-targets -- -D warnings | (running) | TBD |
+| cargo clippy --all-targets -- -D warnings | 0 | PASS (after orchestrator fix, see below) |
 | cargo build --workspace | 0 | PASS |
+| cargo test --workspace | 0 | PASS (689 passed, 0 failed; baseline 680) |
 | cargo test --lib marker -- --nocapture | 0 | PASS (9/9) |
+
+Orchestrator post-wave notes (2026-09-21): the executor session was cut off by a machine sleep after its summary commit. Re-running the gates found clippy exit 101 (unused test imports because `mod tests` was gated on `any(test, feature = "test-support")`); fixed by gating on `cfg(test)` only. `Cargo.lock` (sha2, base64 for baude-core) was left uncommitted and was committed by the orchestrator. Commits landed as feat+chore+docs without a preceding `test(14-01)` commit; recorded as accepted TDD-gate debt, same disposition as 13-02.
 
 ## Next Phase Readiness
 
