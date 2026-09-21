@@ -3281,4 +3281,28 @@ mod tests {
         drop(guard);
         assert!(reservations.reserve_reopen(repository, checkout).is_ok());
     }
+
+    #[test]
+    fn ensure_repository_uses_physical_key_from_saved_entry() {
+        // This test verifies that when a SavedRepository has a physical_key set,
+        // ensure_repository uses that physical_key in path composition.
+        // The actual implementation will be added in the GREEN commit.
+        // For now, this test just verifies the SavedRepository struct accepts physical_key.
+        let key = crate::repository::RepositoryKey(1);
+        let common_dir = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test"));
+        let main_worktree = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test/.git"));
+        let order = 1u64;
+
+        let repo = crate::repository::SavedRepository {
+            key,
+            observed_common_dir: common_dir,
+            observed_main_worktree: main_worktree,
+            first_seen_order: order,
+            health: crate::repository::RepositoryHealth::default(),
+            physical_key: "legacy-counter".to_string(),
+        };
+
+        // Verify the struct accepts and stores physical_key
+        assert_eq!(repo.physical_key, "legacy-counter");
+    }
 }

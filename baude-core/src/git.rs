@@ -2698,9 +2698,9 @@ mod tests {
         activate_branch, activate_branch_with_post_add_hook, classify_branch, discover_repository,
         ensure_default_worktree, existing_branch_add_arguments, inspect_removal,
         inspect_removal_status, inspect_removal_status_with_program, inspect_submodules,
-        inspect_submodules_with_program, managed_branch_worktree_path, new_branch_add_arguments,
-        parse_clone_target, parse_removal_status, parse_submodule_status, parse_worktree_porcelain,
-        reconcile_checkout, removal_status_arguments, remove_verified_worktree,
+        inspect_submodules_with_program, managed_branch_worktree_path, managed_default_worktree_path,
+        new_branch_add_arguments, parse_clone_target, parse_removal_status, parse_submodule_status,
+        parse_worktree_porcelain, reconcile_checkout, removal_status_arguments, remove_verified_worktree,
         remove_verified_worktree_with_post_remove_hook, resolve_default_branch,
         verified_remove_arguments, BranchActivation, BranchActivationError,
         BranchActivationOutcome, DefaultBranchUnavailable, DefaultWorktreeOutcome, InspectionError,
@@ -4618,5 +4618,49 @@ mod tests {
         assert!(parse_clone_target("baude").is_none());
         assert!(parse_clone_target("https://github.com/").is_none());
         assert!(parse_clone_target("a/b/c").is_none());
+    }
+
+    #[test]
+    fn managed_default_worktree_path_accepts_string_digest() {
+        let path = managed_default_worktree_path("abcdef123456", 1);
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("repository-abcdef123456"));
+        assert!(path_str.contains("primary-1"));
+    }
+
+    #[test]
+    fn managed_branch_worktree_path_accepts_string_digest() {
+        let path = managed_branch_worktree_path("abcdef123456", 2, "feature/foo");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("repository-abcdef123456"));
+        assert!(path_str.ends_with("feature_f-2"));
+    }
+
+    #[test]
+    fn legacy_counter_path_composition_still_works() {
+        let path = managed_default_worktree_path("1", 1);
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("repository-1"));
+        assert!(path_str.contains("primary-1"));
+    }
+
+    #[test]
+    fn path_composition_is_unchanged() {
+        let digest_key = "abcdef123456";
+        let legacy_key = "1";
+        let suffixed_key = "abcdef123456-2";
+
+        let digest_path = managed_default_worktree_path(digest_key, 1);
+        let legacy_path = managed_default_worktree_path(legacy_key, 1);
+        let suffixed_path = managed_default_worktree_path(suffixed_key, 1);
+
+        let digest_str = digest_path.to_string_lossy();
+        let legacy_str = legacy_path.to_string_lossy();
+        let suffixed_str = suffixed_path.to_string_lossy();
+
+        // All should follow repository-<key>/<role>-<checkout_key> shape
+        assert!(digest_str.contains("repository-abcdef123456/primary-1"));
+        assert!(legacy_str.contains("repository-1/primary-1"));
+        assert!(suffixed_str.contains("repository-abcdef123456-2/primary-1"));
     }
 }

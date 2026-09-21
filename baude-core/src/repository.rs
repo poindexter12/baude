@@ -1346,4 +1346,27 @@ mod tests {
             assert!(exhausted.validate().is_ok());
         }
     }
+
+    #[test]
+    fn physical_key_accessor_returns_entry_value() {
+        let mut state = RepositoryState::default();
+        let key = state.allocate_repository_key().expect("allocate key");
+        let common_dir = PersistedPath::from_path(std::path::Path::new("/tmp/test"));
+        let physical_key_value = "digest-value".to_string();
+
+        let mut repo = SavedRepository {
+            key,
+            observed_common_dir: common_dir,
+            observed_main_worktree: PersistedPath::from_path(std::path::Path::new("/tmp/test/.git")),
+            first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
+            health: RepositoryHealth::default(),
+            physical_key: physical_key_value.clone(),
+        };
+
+        state.repositories.insert(key, repo);
+
+        // Verify the accessor returns the stored physical_key
+        let retrieved = state.physical_key(key);
+        assert_eq!(retrieved, Some(physical_key_value.as_str()));
+    }
 }
