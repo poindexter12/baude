@@ -1456,10 +1456,29 @@ pub fn ensure_repository(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
-    // Design G: the directory exists before its marker, and the marker is what
-    // lets a later admission find this directory again after a state reset.
-    let _ = std::fs::create_dir_all(&allocated_path);
-    let _ = crate::marker::write_marker(&allocated_path, &marker_meta);
+    // Design G: the directory (created above) exists before its marker, and the
+    // marker is what lets a later admission find this directory again after a
+    // state reset. A failed write must therefore fail the admission: swallowing
+    // it would leave an unclaimed directory that the next run treats as
+    // unknown-owner and sidesteps with a needless suffix (review CR-01).
+    match crate::marker::write_marker(&allocated_path, &marker_meta) {
+        Ok(_) => {}
+        Err(crate::marker::MarkerError::OwnedByOther(existing)) => {
+            return Err(LifecycleError::Topology(format!(
+                "repository directory {} was claimed by another repository ({}) between the \
+                 collision check and the marker write; retry the admission",
+                allocated_path.display(),
+                String::from_utf8_lossy(&existing.canonical_common_dir)
+            )));
+        }
+        Err(crate::marker::MarkerError::UnknownOwner(reason)) => {
+            return Err(LifecycleError::Topology(format!(
+                "could not record ownership marker in {}: {:?}",
+                allocated_path.display(),
+                reason
+            )));
+        }
+    }
 
     // Create new repository entry
     state.repositories.push(SavedRepository {
@@ -1559,8 +1578,9 @@ fn check_collision(
                         reason: CollisionReason::UnknownOwner("no evidence".to_string()),
                     }))
                 }
-                Err(_) => {
-                    // Couldn't determine ownership, treat as unknown owner
+                Err(error) => {
+                    // Couldn't determine ownership: fail closed as unknown owner,
+                    // but keep the I/O error text so the report is diagnosable.
                     let requester_display =
                         crate::repository::repository_display_name(requester_common_dir);
                     Ok(Some(CollisionReport {
@@ -1570,7 +1590,7 @@ fn check_collision(
                         owner_display: "unknown owner".to_string(),
                         requester_common_dir: requester_common_dir.to_path_buf(),
                         requester_display,
-                        reason: CollisionReason::UnknownOwner("io error".to_string()),
+                        reason: CollisionReason::UnknownOwner(format!("io error: {error}")),
                     }))
                 }
             }
@@ -1700,36 +1720,52 @@ fn allocate_suffixed_repository_path(
     let workspace_name = workspace.name.as_str();
     let base = git::worktrees_base().join(workspace_name);
 
-    // Try suffixes starting from 2
-    for suffix in 2..=1000 {
+    std::fs::create_dir_all(&base).map_err(|e| {
+        LifecycleError::Topology(format!(
+            "failed to create worktrees base {}: {e}",
+            base.display()
+        ))
+    })?;
+    const MAX_SUFFIX: u32 = 1000;
+    // Try suffixes starting from 2. The claim is `create_dir` (exclusive), not
+    // exists-then-create, so two admissions racing for the same suffix cannot
+    // both win: the loser sees AlreadyExists and inspects the winner's marker
+    // (review WR-03).
+    for suffix in 2..=MAX_SUFFIX {
         let suffixed_key = format!("{}-{}", physical_key, suffix);
         let candidate = base.join(format!("repository-{}", suffixed_key));
-
-        // Check if this path exists and if it's ours
-        if candidate.exists() {
-            // Check if it's marked as ours
-            match crate::marker::read_marker(&candidate) {
-                Ok(crate::marker::MarkerRead::Valid(meta))
-                    if meta.canonical_common_dir == our_bytes =>
-                {
-                    // Already ours from an earlier admission: reuse it.
-                    return Ok(candidate);
-                }
-                _ => {
-                    // Foreign, invalid, or missing marker in a suffixed dir: never
-                    // touch it, try the next suffix.
-                    continue;
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match crate::marker::read_marker(&candidate) {
+                    Ok(crate::marker::MarkerRead::Valid(meta))
+                        if meta.canonical_common_dir == our_bytes =>
+                    {
+                        // Already ours from an earlier admission: reuse it.
+                        return Ok(candidate);
+                    }
+                    _ => {
+                        // Foreign, invalid, or missing marker in a suffixed dir:
+                        // never touch it, try the next suffix.
+                        continue;
+                    }
                 }
             }
-        } else {
-            // Directory doesn't exist, this suffix is free
-            return Ok(candidate);
+            Err(e) => {
+                return Err(LifecycleError::Topology(format!(
+                    "failed to create suffixed repository directory {}: {e}",
+                    candidate.display()
+                )));
+            }
         }
     }
 
-    Err(LifecycleError::Topology(
-        "could not allocate suffixed repository path".to_string(),
-    ))
+    Err(LifecycleError::Topology(format!(
+        "could not allocate a suffixed repository directory for repository-{physical_key}: \
+         all of -2 through -{MAX_SUFFIX} under {} are taken by other repositories or unreadable \
+         markers; remove stale directories there and retry (review WR-04)",
+        base.display()
+    )))
 }
 
 /// Allocate a checkout key while skipping any keys whose paths already exist on disk.
