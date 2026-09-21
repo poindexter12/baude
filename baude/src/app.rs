@@ -7905,6 +7905,7 @@ mod tests {
             app.repository_state.checkouts.len(),
             baseline_state.checkouts.len() + 1
         );
+        app.session_mut(runtime).unwrap().kill();
         app.kill_all();
         std::fs::remove_dir_all(&collision).unwrap();
         git(
