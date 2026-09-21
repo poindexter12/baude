@@ -100,7 +100,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
   3. When a collision is detected, baude names the repository that owns the path and offers non-destructive resolution instead of a hard error
   4. `baude worktrees scan` reports the owning repository for each managed checkout and surface any collisions with ownership info
 
-**Plans**: 1/3 plans executed
+**Plans**: 2/3 plans executed
 **Wave 1**
 
 - [x] 14-01-PLAN.md — Marker module and digest resolution (tracer: end-to-end proof of identity scheme)
@@ -169,7 +169,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 13. Workspace Derivation and New-Session/Open Defaults | 3/3 | Complete    | 2026-09-20 |
-| 14. Managed Worktree Identity | 1/3 | In Progress|  |
+| 14. Managed Worktree Identity | 2/3 | In Progress|  |
 | 15. Startup and Idle Performance | 0/? | Not started | - |
 | 16. Pane Focus UX | 0/? | Not started | - |
 | 17. Validation and v2.3.0 Release | 0/? | Not started | - |

@@ -278,6 +278,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 | deferred_items | 11/deferred-items.md: pre-existing clippy failures (resolved in 12-01; vendored vt100 lint header had masked baude lints) | acknowledged | 2026-09-19 | v2.2 |
 | tdd_gate | 13/13-02: RED test commits without a feat(13-02) GREEN commit (the two behavior fixes were bundled into the test commits; tests pass, 679 total) | accepted as debt by Joe | 2026-09-20 | v2.3 |
 | tdd_gate | 14/14-01: tests and implementation landed in one feat(14-01) commit with no preceding test(14-01) RED commit (executor cut off by machine sleep; 9 marker tests pass, 689 total) | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| tdd_gate | 14/14-02 Task 3: redo executor landed feat/style/docs with no preceding test(14-02) commit; the orchestrator's follow-up fix also bundled tests and implementation in one fix(14-02) commit | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 14/14-02: two executors reported Task 3 complete with tests that asserted only on entry count; two agents claimed workspace gates green while only baude-core ran. Orchestrator now greps contract symbols and reads test bodies before the next wave | process note, no code debt remaining (708 tests, gates green) | 2026-09-21 |
 
 ## Session Continuity
 

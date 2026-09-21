@@ -292,3 +292,5 @@ Previous post-wave fix (cross-crate call sites):
 *Plan: 14-02 (Physical key resolution and scan schema)*  
 *Wave: 2*  
 *Status: 70% complete (Task 1 ✓, Task 2 in progress, Task 3 deferred)*
+
+Orchestrator post-wave notes, second pass (2026-09-21): after the hardening agent, `cargo test --workspace` still failed (app.rs `hierarchy_action_matrix_dispatches_only_authorized_local_actions` expected the old PathCollision error for a pre-existing checkout dir) and the rewritten `ensure_repository_foreign_marker_collision` was still hollow (one `!is_empty()` assert). The orchestrator wrote real foreign-marker and suffixed-dir-reuse tests, which exposed two implementation defects fixed in the same commit: the CollisionReport's `allocated_path` was never updated after suffix allocation, and the suffix allocator skipped the requester's own `-2` directory. The app test was updated to the non-destructive skip. Final gates: fmt 0, clippy 0, build 0, `cargo test --workspace` 0 with 708 passed / 0 failed (baseline 689). Executor commits for Task 3 landed as feat/style/docs without a preceding test commit (TDD-gate debt, same disposition as 13-02 and 14-01).
