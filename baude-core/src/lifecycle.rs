@@ -1304,7 +1304,7 @@ impl From<ValidationError> for LifecycleError {
 }
 
 /// Reason for a collision during repository admission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CollisionReason {
     /// Directory has a marker for a different repository.
     ForeignMarker,
@@ -1315,7 +1315,7 @@ pub enum CollisionReason {
 }
 
 /// Report of a collision when admitting a repository to a managed path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CollisionReport {
     /// The path that the newcomer requested (without suffix).
     pub requested_path: PathBuf,
@@ -4187,6 +4187,107 @@ mod tests {
             state.repositories.len(),
             1,
             "should have only one repository entry"
+        );
+    }
+
+    #[test]
+    fn ensure_repository_tui_and_daemon_compute_same_physical_key() {
+        // Verify that TUI and daemon compute identical physical_key for the same repository
+        // by calling ensure_repository twice with separate state instances (simulating
+        // TUI and daemon working independently).
+        let _fixture = LifecycleFixture::new("tui-daemon-same-key");
+        let mut state1 = RepositoryState::default();
+        let mut state2 = RepositoryState::default();
+
+        let snapshot = crate::git::RepositorySnapshot {
+            canonical_input: PathBuf::from("/tmp/test/repo"),
+            common_dir: PathBuf::from("/tmp/test/repo"),
+            main_worktree: PathBuf::from("/tmp/test/repo/.git"),
+            selected_worktree: crate::git::WorktreeRecord {
+                path: PathBuf::from("/tmp/test/repo"),
+                branch: None,
+                bare: false,
+                detached: false,
+                locked: false,
+                prunable: false,
+            },
+            worktrees: vec![],
+        };
+
+        // First call (simulating TUI)
+        let (key1, collision1) =
+            super::ensure_repository(&mut state1, &snapshot).expect("TUI admission");
+        assert!(collision1.is_none(), "first admission should not collide");
+
+        // Second call with separate state (simulating daemon)
+        let (key2, collision2) =
+            super::ensure_repository(&mut state2, &snapshot).expect("daemon admission");
+        assert!(collision2.is_none(), "first daemon admission should not collide");
+
+        // Both should compute the same key
+        assert_eq!(
+            key1, key2,
+            "TUI and daemon should compute identical physical_key for same repository"
+        );
+    }
+
+    #[test]
+    fn ensure_repository_tui_and_daemon_collision_identical() {
+        // Verify that TUI and daemon handle collisions identically by:
+        // - Re-admitting the same repository (which returns None for collision)
+        // - Verifying both TUI and daemon return identical results
+        let _fixture = LifecycleFixture::new("tui-daemon-collision");
+        let mut state_tui = RepositoryState::default();
+        let mut state_daemon = RepositoryState::default();
+
+        let snapshot = crate::git::RepositorySnapshot {
+            canonical_input: PathBuf::from("/tmp/test/repo"),
+            common_dir: PathBuf::from("/tmp/test/repo"),
+            main_worktree: PathBuf::from("/tmp/test/repo/.git"),
+            selected_worktree: crate::git::WorktreeRecord {
+                path: PathBuf::from("/tmp/test/repo"),
+                branch: None,
+                bare: false,
+                detached: false,
+                locked: false,
+                prunable: false,
+            },
+            worktrees: vec![],
+        };
+
+        // TUI: admit repo1, then re-admit it (no collision)
+        let (_key_tui1, collision_tui1) =
+            super::ensure_repository(&mut state_tui, &snapshot).expect("TUI first admission");
+        assert!(collision_tui1.is_none(), "first admission should not collide");
+
+        let (_key_tui2, collision_tui2) =
+            super::ensure_repository(&mut state_tui, &snapshot).expect("TUI re-admission");
+        assert!(collision_tui2.is_none(), "re-admission should not collide");
+
+        // Daemon: same repo, same pattern
+        let (_key_daemon1, collision_daemon1) =
+            super::ensure_repository(&mut state_daemon, &snapshot).expect("daemon first admission");
+        assert!(
+            collision_daemon1.is_none(),
+            "first admission should not collide"
+        );
+
+        let (_key_daemon2, collision_daemon2) =
+            super::ensure_repository(&mut state_daemon, &snapshot).expect("daemon re-admission");
+        assert!(
+            collision_daemon2.is_none(),
+            "re-admission should not collide"
+        );
+
+        // Both TUI and daemon should handle the same repository identically
+        // (both return None for collision on re-admission of the same repo)
+        assert_eq!(
+            collision_tui1, collision_daemon1,
+            "TUI and daemon should handle first admission identically"
+        );
+        assert_eq!(
+            collision_tui2, collision_daemon2,
+            "TUI and daemon should handle re-admission identically"
         );
     }
 }
