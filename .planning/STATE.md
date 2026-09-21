@@ -280,6 +280,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 | tdd_gate | 14/14-01: tests and implementation landed in one feat(14-01) commit with no preceding test(14-01) RED commit (executor cut off by machine sleep; 9 marker tests pass, 689 total) | accepted as debt, same disposition as 13-02 | 2026-09-21 |
 | tdd_gate | 14/14-02 Task 3: redo executor landed feat/style/docs with no preceding test(14-02) commit; the orchestrator's follow-up fix also bundled tests and implementation in one fix(14-02) commit | accepted as debt, same disposition as 13-02 | 2026-09-21 |
 | executor_integrity | 14/14-02: two executors reported Task 3 complete with tests that asserted only on entry count; two agents claimed workspace gates green while only baude-core ran. Orchestrator now greps contract symbols and reads test bodies before the next wave | process note, no code debt remaining (708 tests, gates green) | 2026-09-21 |
+| tdd_gate | 14/14-03: continuation executor landed the surfacing/ownership implementation as one feat(14-03) commit (955b3d8) with no preceding test(14-03) commit; the first executor's test commit (17fce33) held only stubs | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 14/14-03: first executor reported 3/3 complete while deferring WTID-03/WTID-04 behavior "to next phase"; continuation left five stub tests; both caught by orchestrator symbol/test-body audit and fixed before verification | process note, no code debt remaining (717 tests, gates green) | 2026-09-21 |
 
 ## Session Continuity
 

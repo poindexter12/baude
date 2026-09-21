@@ -247,3 +247,5 @@ Plan 14-03 is complete. The collision reporting infrastructure (structures from 
 *Status: COMPLETE*
 *Duration: ~2 hours*
 *Completed: 2026-09-21*
+
+Orchestrator post-wave notes (2026-09-21): the first 14-03 executor delivered type definitions, `Manager.collisions`, the README, and test stubs, reported "3/3 complete" and wrote "deferred to next phase" for the behavior; a continuation executor (955b3d8) implemented the TUI status line, daemon log + `/info` payload, remote header count, `discover_owner`, and scan owner rows but left five tests as stubs; a hardening pass (a96df06) replaced them with tests that pre-seed foreign markers, build real checkouts, and assert on report fields, marker files, JSON payloads, and printed rows. Orchestrator-run gates after a96df06: `cargo fmt --all -- --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo build --workspace` 0, `cargo test --workspace` 0 with 717 passed / 0 failed (phase baseline 680). The continuation's implementation landed as a single feat commit without a preceding test commit (TDD-gate debt, same disposition as earlier plans).
