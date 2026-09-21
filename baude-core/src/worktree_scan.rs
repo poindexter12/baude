@@ -851,6 +851,65 @@ impl std::error::Error for ScanError {}
 // (T-08-25: the acting process resolves the tree it acts on), which is the only
 // caller there has ever been (#72, WR-01).
 
+/// Discover ownership information for a managed repository directory.
+///
+/// Returns OwnershipInfo if the directory's ownership can be determined:
+/// 1. From a marker file (if valid)
+/// 2. From the first checkout inside (if marker is missing)
+/// 3. None if ownership cannot be determined
+fn discover_owner(repository_dir: &Path) -> Option<OwnershipInfo> {
+    // Try to read marker file first
+    if let Ok(marker_read) = crate::marker::read_marker(repository_dir) {
+        match marker_read {
+            crate::marker::MarkerRead::Valid(meta) => {
+                // Convert marker bytes to PathBuf
+                #[cfg(unix)]
+                let canonical_dir = {
+                    use std::os::unix::ffi::OsStrExt;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(&meta.canonical_common_dir))
+                };
+                #[cfg(not(unix))]
+                let canonical_dir = {
+                    PathBuf::from(String::from_utf8_lossy(&meta.canonical_common_dir).into_owned())
+                };
+
+                let display_name = Some(crate::repository::repository_display_name(&canonical_dir));
+                return Some(OwnershipInfo {
+                    canonical_common_dir: canonical_dir,
+                    display_name,
+                });
+            }
+            crate::marker::MarkerRead::Missing => {
+                // Try to discover from first checkout
+                if let Ok(entries) = std::fs::read_dir(repository_dir) {
+                    for entry in entries.flatten() {
+                        if let Ok(metadata) = entry.metadata() {
+                            if metadata.is_dir() {
+                                let path = entry.path();
+                                // Try to discover git facts from this directory
+                                if let Ok(snapshot) = crate::git::discover_repository(&path) {
+                                    let display_name =
+                                        Some(crate::repository::repository_display_name(
+                                            &snapshot.common_dir,
+                                        ));
+                                    return Some(OwnershipInfo {
+                                        canonical_common_dir: snapshot.common_dir.clone(),
+                                        display_name,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            crate::marker::MarkerRead::Invalid(_) => {
+                // Invalid marker, return None
+            }
+        }
+    }
+    None
+}
+
 /// Enumerate and classify candidates under an explicit worktrees root.
 ///
 /// Read-only, unconditionally: no temporary file, no lock, no probe directory,
@@ -961,7 +1020,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
                 workspace,
                 repository_key,
                 verdict: classify(evidence),
-                owner: None, // TODO: implement ownership discovery from marker or checkout
+                owner: discover_owner(&path),
             }
         })
         .collect();

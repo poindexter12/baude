@@ -120,7 +120,8 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
 /// 404 here; clients treat that as "claude workspace, old version".
 async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
     let ws = baude_core::workspace::active();
-    let persistence = lock(&state).persistence_status();
+    let manager = lock(&state);
+    let persistence = manager.persistence_status();
     // workspace_source shows how the workspace was resolved: "(explicit)",
     // "(folder binding)", "(derived)", or "(blank)" for default. Trim
     // parentheses for the API response.
@@ -129,12 +130,16 @@ async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
         .trim_matches('(')
         .trim_matches(')')
         .to_string();
+    let collisions = manager.collisions.clone();
+    let collision_count = collisions.len();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
         "workspace_source": workspace_source,
         "version": env!("CARGO_PKG_VERSION"),
         "persistence": persistence,
+        "collisions": collisions,
+        "collision_count": collision_count,
     }))
 }
 

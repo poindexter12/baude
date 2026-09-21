@@ -82,6 +82,8 @@ pub struct RemoteSnapshot {
     pub daemon_workspace: Option<String>,
     /// Daemon's workspace source from /info endpoint (explicit/bound/derived/blank).
     pub daemon_workspace_source: Option<String>,
+    /// Count of collisions detected by daemon since start.
+    pub daemon_collision_count: u32,
 }
 
 /// Background poller for one daemon.
@@ -123,12 +125,18 @@ impl RemotePoller {
                             .as_ref()
                             .and_then(|v| v["workspace_source"].as_str())
                             .map(str::to_string);
+                        let daemon_collision_count = daemon_info
+                            .as_ref()
+                            .and_then(|v| v["collision_count"].as_u64())
+                            .unwrap_or(0)
+                            as u32;
                         *d = RemoteSnapshot {
                             sessions,
                             fetched_ms: now_ms(),
                             ok: true,
                             daemon_workspace,
                             daemon_workspace_source,
+                            daemon_collision_count,
                         }
                     }
                     // Keep the stale list visible, just mark it offline.

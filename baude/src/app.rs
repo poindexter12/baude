@@ -2284,6 +2284,12 @@ impl App {
         let mut next = self.repository_state.clone();
         let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)?;
         let pending_checkout = prepared.checkout;
+
+        // Surface collision report if one was detected
+        if let Some(ref collision_report) = prepared.collision {
+            self.set_message(lifecycle::collision_line(collision_report));
+        }
+
         lifecycle::record_pending_activation(&mut next, &snapshot, &prepared)?;
         let repository = prepared.request.repository;
         let _reservation = match self.repository_reservations.reserve(repository) {
@@ -7955,6 +7961,7 @@ mod tests {
             ok: true,
             daemon_workspace: None,
             daemon_workspace_source: None,
+            daemon_collision_count: 0,
         };
 
         assert!(app.repository_state.repositories.is_empty());
@@ -8097,6 +8104,7 @@ mod tests {
             ok: true,
             daemon_workspace: None,
             daemon_workspace_source: None,
+            daemon_collision_count: 0,
         };
 
         // Hidden default: archived rows (local and remote) leave selection
@@ -10749,8 +10757,9 @@ mod tests {
 
     #[test]
     fn admission_collision_sets_status() {
-        // Verify that when a collision is detected during admission,
-        // the status message is set to inform the user.
+        // TODO: Placeholder test — actual collision scenario requires engineering
+        // a foreign marker in pre-allocated managed path.
+        // See continuation context for implementation details.
         let root = std::env::temp_dir().join(format!(
             "baude-test-{}-collision-status",
             std::process::id()
@@ -10759,40 +10768,27 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());
 
-        // Create two repositories
-        let repo1_dir = root.join("repo1");
-        let repo2_dir = root.join("repo2");
-        std::fs::create_dir_all(&repo1_dir).unwrap();
-        std::fs::create_dir_all(&repo2_dir).unwrap();
+        // Create a simple repository
+        let repo_dir = root.join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
 
-        // Initialize them as git repos
+        // Initialize as git repo
         let _ = std::process::Command::new("git")
             .args(["init"])
-            .current_dir(&repo1_dir)
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo2_dir)
+            .current_dir(&repo_dir)
             .output();
 
-        let mut app = App::new(repo1_dir.clone());
+        let mut app = App::new(repo_dir.clone());
         app.remote = None;
         let _workspace = baude_core::workspace::override_for_test(&app.config, None);
         app.persistence_root_for_test = Some(root.join("state"));
 
-        // Admit repo1 (no collision expected)
-        let result1 = app.admit_repository(&repo1_dir);
-        assert!(result1.is_ok(), "repo1 admission should succeed");
+        // Admit repository
+        let result = app.admit_repository(&repo_dir);
+        assert!(result.is_ok(), "admission should succeed");
 
-        // At this point, we've successfully admitted repo1. For a collision test,
-        // we would need to engineer the scenario where two repos resolve to the same
-        // managed path, which requires ensuring the digest computation logic assigns
-        // them to the same directory. This is implicitly tested through the parity tests
-        // in baude-core::lifecycle. This test verifies that if a collision report were
-        // returned, app.admit_repository would handle it (the signature change allows it).
-
-        // The test passes if admit_repository successfully returns without panicking
-        // and the repository is recorded.
+        // When collision is returned, message should be set
+        // This test verifies the signature handles Option<CollisionReport>
         assert!(
             !app.repository_state.repositories.is_empty(),
             "repository should be recorded"

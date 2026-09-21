@@ -659,7 +659,7 @@ fn remote_status(r: &RemoteInfo) -> Status {
 
 fn remote_header(app: &App, width: usize) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
-    let label = if app.remote_snap.ok {
+    let mut label = if app.remote_snap.ok {
         // Display daemon workspace with source label, matching local title format
         match (
             &app.remote_snap.daemon_workspace,
@@ -679,6 +679,15 @@ fn remote_header(app: &App, width: usize) -> Line<'static> {
     } else {
         "⇄ remote (offline)".to_string()
     };
+
+    // Append collision warning if count > 0
+    if app.remote_snap.daemon_collision_count > 0 {
+        label.push_str(&format!(
+            " ⚠ {} collisions",
+            app.remote_snap.daemon_collision_count
+        ));
+    }
+
     let label = truncate(&label, width.saturating_sub(3).max(1));
     Line::from(vec![Span::raw("  "), Span::styled(label, dim)])
 }

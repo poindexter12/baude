@@ -1334,6 +1334,25 @@ pub struct CollisionReport {
     pub reason: CollisionReason,
 }
 
+/// Format a collision report as a single-line status message.
+///
+/// Format: `collision: <requested_path> is owned by <owner_display> (<owner_common_dir>); <requester_display> (<requester_common_dir>) allocated <allocated_path>`
+pub fn collision_line(report: &CollisionReport) -> String {
+    let owner_info = match &report.owner_common_dir {
+        Some(dir) => format!("{} ({})", report.owner_display, dir.display()),
+        None => format!("{} (unknown owner)", report.owner_display),
+    };
+
+    format!(
+        "collision: {} is owned by {}; {} ({}) allocated {}",
+        report.requested_path.display(),
+        owner_info,
+        report.requester_display,
+        report.requester_common_dir.display(),
+        report.allocated_path.display()
+    )
+}
+
 /// Reconcile or create the durable repository parent represented by Git facts.
 pub fn ensure_repository(
     state: &mut RepositoryState,
@@ -2542,9 +2561,9 @@ mod tests {
         execute_activation_with_post_git_hook, mark_activation_recovery, plan_close, plan_reopen,
         prepare_activation, reconcile_activation_recovery, reconcile_teardown_recovery,
         record_pending_activation, revoke_removal_authority, ActivationRecoveryResolution,
-        ActivationRequest, CloseEffect, CloseRequest, CollisionReason, LifecycleError,
-        LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
-        TeardownRecoveryResolution,
+        ActivationRequest, CloseEffect, CloseRequest, CollisionReason, CollisionReport,
+        LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime,
+        RepositoryReservations, TeardownRecoveryResolution,
     };
     use crate::backend::SpawnMode;
     use crate::git::{self, ReconciliationUnavailable};
@@ -4296,6 +4315,47 @@ mod tests {
         assert_eq!(
             collision_tui2, collision_daemon2,
             "TUI and daemon should handle re-admission identically"
+        );
+    }
+
+    #[test]
+    fn collision_line_names_owner_requester_and_paths() {
+        let report = CollisionReport {
+            requested_path: PathBuf::from("/data/worktrees/workspace/repository-abc123"),
+            allocated_path: PathBuf::from("/data/worktrees/workspace/repository-abc123-2"),
+            owner_common_dir: Some(PathBuf::from("/home/user/projects/myrepo/.git")),
+            owner_display: "my-repo".to_string(),
+            requester_common_dir: PathBuf::from("/mnt/drive/other-repo/.git"),
+            requester_display: "other-repo".to_string(),
+            reason: CollisionReason::ForeignMarker,
+        };
+
+        let line = super::collision_line(&report);
+
+        // Check that the line contains expected components
+        assert!(
+            line.contains("collision:"),
+            "line should start with collision:"
+        );
+        assert!(
+            line.contains("repository-abc123"),
+            "line should contain requested path"
+        );
+        assert!(
+            line.contains("my-repo"),
+            "line should contain owner display name"
+        );
+        assert!(
+            line.contains("/home/user/projects/myrepo/.git"),
+            "line should contain owner common dir"
+        );
+        assert!(
+            line.contains("other-repo"),
+            "line should contain requester display name"
+        );
+        assert!(
+            line.contains("repository-abc123-2"),
+            "line should contain allocated path"
         );
     }
 }

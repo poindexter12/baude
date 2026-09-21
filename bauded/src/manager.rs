@@ -876,6 +876,12 @@ impl Manager {
         let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)
             .map_err(anyhow::Error::new)?;
         let pending_checkout = prepared.checkout;
+
+        // Track collision report if detected
+        if let Some(ref collision_report) = prepared.collision {
+            self.collisions.push(collision_report.clone());
+        }
+
         lifecycle::record_pending_activation(&mut next, &snapshot, &prepared)
             .map_err(anyhow::Error::new)?;
         let repository = prepared.request.repository;

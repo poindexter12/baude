@@ -802,11 +802,29 @@ fn print_scan_summary(
             group.len()
         );
         for candidate in group {
+            let owner_text = if let Some(owner) = &candidate.owner {
+                format!(
+                    " (owner: {})",
+                    if let Some(display_name) = &owner.display_name {
+                        format!(
+                            "{} ({})",
+                            display_name,
+                            owner.canonical_common_dir.display()
+                        )
+                    } else {
+                        owner.canonical_common_dir.display().to_string()
+                    }
+                )
+            } else {
+                String::new()
+            };
+
             let _ = writeln!(
                 out,
-                "  {:<13} {}  [{}]",
+                "  {:<13} {}{}  [{}]",
                 verdict_label(&candidate.verdict),
                 candidate.relative.join("/"),
+                owner_text,
                 verdict_phrase(&candidate.verdict)
             );
         }
