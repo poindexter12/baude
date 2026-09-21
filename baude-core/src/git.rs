@@ -1776,7 +1776,7 @@ pub(crate) fn worktrees_base() -> PathBuf {
 /// Deterministic workspace-local allocation for a durable primary checkout.
 /// The opaque keys are scoped by the active workspace state file, so include
 /// the workspace name to keep independent backends from sharing a path.
-pub fn managed_default_worktree_path(repository_key: u64, checkout_key: u64) -> PathBuf {
+pub fn managed_default_worktree_path(repository_key: &str, checkout_key: u64) -> PathBuf {
     worktrees_base()
         .join(&crate::workspace::active().name)
         .join(format!("repository-{repository_key}"))
@@ -1797,7 +1797,7 @@ fn sanitize(name: &str) -> String {
 
 /// Stable workspace-local path for a durable managed branch checkout.
 pub fn managed_branch_worktree_path(
-    repository_key: u64,
+    repository_key: &str,
     checkout_key: u64,
     branch: &str,
 ) -> PathBuf {
@@ -4439,9 +4439,9 @@ mod tests {
                     None,
                 );
 
-                let slash = managed_branch_worktree_path(7, 11, "feature/a");
-                let dash = managed_branch_worktree_path(7, 12, "feature-a");
-                let other_repository = managed_branch_worktree_path(8, 11, "feature/a");
+                let slash = managed_branch_worktree_path("7", 11, "feature/a");
+                let dash = managed_branch_worktree_path("7", 12, "feature-a");
+                let other_repository = managed_branch_worktree_path("8", 11, "feature/a");
                 assert_ne!(slash, dash);
                 assert_ne!(slash, other_repository);
                 assert!(slash.to_string_lossy().contains("repository-7"));
@@ -4451,7 +4451,7 @@ mod tests {
                     .to_string_lossy()
                     .ends_with("-11"));
 
-                let unicode = managed_branch_worktree_path(7, 13, &"界".repeat(40));
+                let unicode = managed_branch_worktree_path("7", 13, &"界".repeat(40));
                 let component = unicode.file_name().unwrap().to_string_lossy();
                 assert!(!component.is_empty());
                 assert!(component.len() <= 48 + "-13".len());
@@ -4622,6 +4622,17 @@ mod tests {
 
     #[test]
     fn managed_default_worktree_path_accepts_string_digest() {
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-string-digest-{}",
+            std::process::id()
+        ));
+        let _identity = crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some("test-ws".to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        );
         let path = managed_default_worktree_path("abcdef123456", 1);
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("repository-abcdef123456"));
@@ -4630,14 +4641,36 @@ mod tests {
 
     #[test]
     fn managed_branch_worktree_path_accepts_string_digest() {
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-branch-string-{}",
+            std::process::id()
+        ));
+        let _identity = crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some("test-ws".to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        );
         let path = managed_branch_worktree_path("abcdef123456", 2, "feature/foo");
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("repository-abcdef123456"));
-        assert!(path_str.ends_with("feature_f-2"));
+        assert!(path_str.ends_with("feature-foo-2"));
     }
 
     #[test]
     fn legacy_counter_path_composition_still_works() {
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-legacy-counter-{}",
+            std::process::id()
+        ));
+        let _identity = crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some("test-ws".to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        );
         let path = managed_default_worktree_path("1", 1);
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("repository-1"));
@@ -4646,6 +4679,17 @@ mod tests {
 
     #[test]
     fn path_composition_is_unchanged() {
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-path-unchanged-{}",
+            std::process::id()
+        ));
+        let _identity = crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some("test-ws".to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        );
         let digest_key = "abcdef123456";
         let legacy_key = "1";
         let suffixed_key = "abcdef123456-2";

@@ -311,6 +311,8 @@ pub struct SavedRepository {
     pub observed_main_worktree: PersistedPath,
     pub first_seen_order: u64,
     pub health: RepositoryHealth,
+    #[serde(default)]
+    pub physical_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -915,6 +917,17 @@ impl RepositoryState {
         }
         self.validate_standalone_lifecycles()
     }
+
+    /// Retrieve the physical key string for a repository.
+    ///
+    /// Returns the physical_key stored in the SavedRepository entry for the given key,
+    /// or None if the key is not found.
+    pub fn physical_key(&self, key: RepositoryKey) -> Option<&str> {
+        self.repositories
+            .iter()
+            .find(|repo| repo.key == key)
+            .map(|repo| repo.physical_key.as_str())
+    }
 }
 
 /// Compute a stable repository digest from canonical common directory bytes.
@@ -983,6 +996,7 @@ mod tests {
             observed_main_worktree: path("/repo"),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            physical_key: String::new(),
         }
     }
 
@@ -1354,16 +1368,16 @@ mod tests {
         let common_dir = PersistedPath::from_path(std::path::Path::new("/tmp/test"));
         let physical_key_value = "digest-value".to_string();
 
-        let mut repo = SavedRepository {
+        let repo = SavedRepository {
             key,
             observed_common_dir: common_dir,
             observed_main_worktree: PersistedPath::from_path(std::path::Path::new("/tmp/test/.git")),
             first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
-            health: RepositoryHealth::default(),
+            health: RepositoryHealth::Available,
             physical_key: physical_key_value.clone(),
         };
 
-        state.repositories.insert(key, repo);
+        state.repositories.push(repo);
 
         // Verify the accessor returns the stored physical_key
         let retrieved = state.physical_key(key);

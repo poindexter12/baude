@@ -1325,6 +1325,7 @@ pub fn ensure_repository(
                 observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                 first_seen_order,
                 health: RepositoryHealth::Available,
+                physical_key: String::new(),
             });
             key
         }
@@ -1349,12 +1350,17 @@ pub fn prepare_activation(
     let repository = ensure_repository(state, snapshot)?;
     let checkout = state.allocate_checkout_key()?;
     let first_seen_order = state.allocate_first_seen_order()?;
+
+    // Get the physical_key from the SavedRepository entry, or use the repository key as fallback
+    let repo_key_str = repository.get().to_string();
+    let physical_key = state.physical_key(repository).unwrap_or_else(|| &repo_key_str);
+
     Ok(PreparedActivation {
         request: ActivationRequest {
             repository,
             branch: branch.to_owned(),
             managed_path: git::managed_branch_worktree_path(
-                repository.get(),
+                physical_key,
                 checkout.get(),
                 branch,
             ),
@@ -2456,6 +2462,7 @@ mod tests {
             observed_main_worktree: path("/repo"),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: String::new(),
         });
         state.checkouts.push(SavedCheckout {
             key: checkout,
@@ -3285,24 +3292,28 @@ mod tests {
     #[test]
     fn ensure_repository_uses_physical_key_from_saved_entry() {
         // This test verifies that when a SavedRepository has a physical_key set,
-        // ensure_repository uses that physical_key in path composition.
-        // The actual implementation will be added in the GREEN commit.
-        // For now, this test just verifies the SavedRepository struct accepts physical_key.
-        let key = crate::repository::RepositoryKey(1);
+        // the accessor returns it correctly.
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-physical-key-{}",
+            std::process::id()
+        ));
+        let mut state = crate::repository::RepositoryState::default();
+        let key = state.allocate_repository_key().expect("allocate key");
         let common_dir = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test"));
         let main_worktree = crate::repository::PersistedPath::from_path(std::path::Path::new("/tmp/test/.git"));
-        let order = 1u64;
 
         let repo = crate::repository::SavedRepository {
             key,
             observed_common_dir: common_dir,
             observed_main_worktree: main_worktree,
-            first_seen_order: order,
-            health: crate::repository::RepositoryHealth::default(),
+            first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
+            health: crate::repository::RepositoryHealth::Available,
             physical_key: "legacy-counter".to_string(),
         };
 
-        // Verify the struct accepts and stores physical_key
-        assert_eq!(repo.physical_key, "legacy-counter");
+        state.repositories.push(repo);
+
+        // Verify the accessor returns the stored physical_key
+        assert_eq!(state.physical_key(key), Some("legacy-counter"));
     }
 }

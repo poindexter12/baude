@@ -519,7 +519,7 @@ mod tests {
                 // Both identities are now live at once.
                 barrier.wait();
                 let first = active().name.clone();
-                let managed = crate::git::managed_default_worktree_path(7, 11);
+                let managed = crate::git::managed_default_worktree_path("7", 11);
                 // Hold both through the second read.
                 barrier.wait();
                 (first, active().name.clone(), managed)
@@ -660,13 +660,13 @@ mod tests {
         let _identity = override_for_test(&literal("compose-ws"), None);
         let base = root.join("data").join("baude").join("worktrees");
         assert_eq!(
-            crate::git::managed_default_worktree_path(7, 11),
+            crate::git::managed_default_worktree_path("7", 11),
             base.join("compose-ws")
                 .join("repository-7")
                 .join("primary-11")
         );
         assert_eq!(
-            crate::git::managed_branch_worktree_path(7, 12, "feature/a"),
+            crate::git::managed_branch_worktree_path("7", 12, "feature/a"),
             base.join("compose-ws")
                 .join("repository-7")
                 .join("feature-a-12")
