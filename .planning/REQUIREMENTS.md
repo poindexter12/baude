@@ -27,10 +27,10 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 
 ### Managed worktree identity
 
-- [ ] **WTID-01**: Two repositories can never resolve to the same managed worktree path, across TUI and daemon state files and after a state file reset
-- [ ] **WTID-02**: Existing managed checkouts are recognized under the new identity scheme in place, with nothing moved, re-cloned, or deleted
-- [ ] **WTID-03**: When a collision is still detected, baude names the repository that owns the path and offers a non-destructive resolution instead of a hard error
-- [ ] **WTID-04**: `baude worktrees scan` reports the owning repository for each managed checkout
+- [x] **WTID-01**: Two repositories can never resolve to the same managed worktree path, across TUI and daemon state files and after a state file reset
+- [x] **WTID-02**: Existing managed checkouts are recognized under the new identity scheme in place, with nothing moved, re-cloned, or deleted
+- [x] **WTID-03**: When a collision is still detected, baude names the repository that owns the path and offers a non-destructive resolution instead of a hard error
+- [x] **WTID-04**: `baude worktrees scan` reports the owning repository for each managed checkout
 
 ### Startup and idle performance
 
@@ -99,10 +99,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | OPEN-02 | Phase 13 | Complete |
 | OPEN-03 | Phase 13 | Complete |
 | OPEN-04 | Phase 13 | Complete |
-| WTID-01 | Phase 14 | Pending |
-| WTID-02 | Phase 14 | Pending |
-| WTID-03 | Phase 14 | Pending |
-| WTID-04 | Phase 14 | Pending |
+| WTID-01 | Phase 14 | Complete |
+| WTID-02 | Phase 14 | Complete |
+| WTID-03 | Phase 14 | Complete |
+| WTID-04 | Phase 14 | Complete |
 | PERF-01 | Phase 15 | Pending |
 | PERF-02 | Phase 15 | Pending |
 | PERF-03 | Phase 15 | Pending |

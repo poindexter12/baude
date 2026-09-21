@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.3
 milestone_name: Launch Defaults and Startup Speed
-current_phase: 14
-current_phase_name: Managed Worktree Identity
-status: executing
-stopped_at: Phase 13 complete, ready to plan Phase 14
-last_updated: "2026-09-20T19:29:22.670Z"
-last_activity: 2026-09-20
-last_activity_desc: Phase 13 complete, transitioned to Phase 14
-state_head: cffd87e9faba814353b95f661e6bea5eba48d972
+current_phase: 15
+current_phase_name: Startup and Idle Performance
+status: planning
+stopped_at: Phase 14 complete, ready to plan Phase 15
+last_updated: "2026-09-21T19:55:47.117Z"
+last_activity: 2026-09-21
+last_activity_desc: Phase 14 complete, transitioned to Phase 15
+state_head: 82fa1913722c6c2c94821196b2d01aa97e58e804
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 6
-  completed_plans: 3
-  percent: 20
+  completed_plans: 6
+  percent: 40
 ---
 
 # Project State
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-09-20)
 
 ## Current Position
 
-Phase: 14 (Managed Worktree Identity) — READY TO EXECUTE
+Phase: 15 — Startup and Idle Performance
 Plan: Not started
-Status: Ready to execute
-Last activity: 2026-09-20 — Phase 13 complete, transitioned to Phase 14
+Status: Ready to plan
+Last activity: 2026-09-21 — Phase 14 complete, transitioned to Phase 15
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Last activity: 2026-09-20 — Phase 13 complete, transitioned to Phase 14
 | 11 | 4 | - | - |
 | 8 | 8 | - | - |
 | 13 | 3 | - | - |
+| 14 | 3 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -286,7 +287,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-09-20T10:10:00Z
-Stopped at: Phase 13 complete, ready to plan Phase 14
+Stopped at: Phase 14 complete, ready to plan Phase 15
 Resume file: None
 
 ## Operator Next Steps
