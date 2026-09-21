@@ -870,7 +870,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     // present. Pass two adds state evidence, which cannot run first: the state
     // inventory's expected-filename set is the UNION of the workspaces seen here
     // with the ones discovered in the config directory.
-    let mut observed: Vec<(PathBuf, String, String, u64, Vec<Evidence>)> = Vec::new();
+    let mut observed: Vec<(PathBuf, String, String, String, Vec<Evidence>)> = Vec::new();
     let mut workspaces = std::collections::BTreeSet::new();
     for workspace_entry in sorted_entries(&base).map_err(|error| ScanError::BaseUnreadable {
         path: base.clone(),
@@ -928,7 +928,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             evidence.extend(state_evidence(
                 &inventory,
                 &workspace,
-                repository_key,
+                &repository_key,
                 &path,
             ));
             evidence.extend(inventory.uncertainty.iter().cloned());
@@ -944,7 +944,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     // Sorted by (workspace, key) rather than by directory-iteration order, so
     // two scans of an unchanged tree compare and serialize identically.
     candidates.sort_by(|left, right| {
-        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+        (&left.workspace, &left.repository_key).cmp(&(&right.workspace, &right.repository_key))
     });
 
     Ok(ScanReport {
@@ -1099,6 +1099,10 @@ fn empty_at_every_level(path: &Path, depth: u32) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(path)? {
         let child = entry?.path();
         let metadata = std::fs::symlink_metadata(&child)?;
+        // Skip the marker file — it does not count as contents
+        if child.file_name().map_or(false, |name| name == ".baude-marker.json") {
+            continue;
+        }
         // A symlink is an entry like any other: `is_dir()` is false for it
         // here, so the tree is correctly not empty and is never followed.
         if !metadata.is_dir() {

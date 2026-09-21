@@ -670,6 +670,7 @@ fn evidence_phrase(evidence: &baude_core::worktree_scan::Evidence) -> String {
             matched,
         } => {
             let key = repository_key
+                .as_deref()
                 .map(|key| format!("key {key}"))
                 .unwrap_or_else(|| "no key".to_string());
             format!("referenced by state (workspace {workspace}, {key}, {matched:?} match)")
@@ -782,7 +783,7 @@ fn print_scan_summary(
             .iter()
             .filter(|candidate| candidate.workspace == workspace)
             .collect();
-        group.sort_by_key(|candidate| candidate.repository_key);
+        group.sort_by(|left, right| left.repository_key.cmp(&right.repository_key));
         let count = |label: &str| {
             group
                 .iter()

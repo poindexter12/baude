@@ -1931,6 +1931,7 @@ impl App {
                     observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                     first_seen_order,
                     health: RepositoryHealth::Available,
+                    physical_key: key.get().to_string(),
                 });
                 key
             }
@@ -1989,8 +1990,10 @@ impl App {
             Some(key) => key,
             None => self.repository_state.allocate_checkout_key()?,
         };
+        let physical_key = self.repository_state.physical_key(repository_key)
+            .ok_or_else(|| anyhow::anyhow!("Repository key not found in state"))?;
         let managed_path =
-            git::managed_default_worktree_path(repository_key.get(), checkout_key.get());
+            git::managed_default_worktree_path(physical_key, checkout_key.get());
         let outcome = git::ensure_default_worktree(&snapshot, &default, &managed_path)?;
         let (record, managed_by_baude) = match outcome {
             git::DefaultWorktreeOutcome::Main(record)

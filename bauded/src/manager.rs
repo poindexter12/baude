@@ -1043,6 +1043,7 @@ impl Manager {
                 } else {
                     RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
                 },
+                physical_key: key.get().to_string(),
             });
             key
         };
