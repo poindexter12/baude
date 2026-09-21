@@ -126,17 +126,36 @@ Collision detection and unknown-owner matrix deferred to next session due to Tas
 
 ## Build Status
 
-**Current:** Partial compilation
-- Task 1 code: ✓ Compiles successfully
-- Task 2 code: ⚠️ Type mismatches in worktree_scan internal state handling (3-5 errors)
-  - Line 913: `observed` vector tuple type conflict
-  - Lines 931, 939: state_evidence parameter/argument mismatch
-  - Repository key u64 vs String conversions in internal state loops
+**Final:** ✓ All gates passing
 
-**CI Gates (Task 1 baseline):**
+**CI Gates (Orchestrator post-wave fix):**
 - `cargo fmt --all -- --check`: 0 (PASS)
-- `cargo build --workspace`: ⚠️ FAIL (Task 2 compilation errors)
-- `cargo test --workspace`: ⚠️ FAIL (build failure)
+- `cargo clippy --all-targets -- -D warnings`: 0 (PASS)
+- `cargo build --workspace`: 0 (PASS)
+- `cargo test --workspace`: 707 passed / 0 failed (PASS)
+
+**Orchestrator post-wave notes (2026-09-21):**
+
+The executor's wave 2 completed baude-core only. This post-wave fix addressed cross-crate call sites and tests:
+
+**Files modified:**
+- bauded/src/api.rs (1 site): path function call with string key
+- bauded/src/manager.rs (2 sites): SavedRepository physical_key initializers
+- baude/src/app.rs (10 sites): SavedRepository physical_key initializers + test collision path
+- baude/src/hierarchy.rs (1 site): SavedRepository physical_key initializer
+- baude/src/ui.rs (3 sites): SavedRepository physical_key initializers
+- baude/src/main.rs (1 site): SavedRepository physical_key initializer
+- baude-core/src/git.rs (fmt only)
+- baude-core/src/lifecycle.rs (fmt only)
+- baude-core/src/repository.rs (fmt only)
+- baude-core/src/worktree_scan.rs: Fixed repository_key round-trip validation logic (line 1028: now checks `format!("repository-{num}")` instead of `format!("repository-{}", key_str)`)
+
+**Production code sites requiring physical_key accessor:** 
+- baude/src/app.rs:7868-7872 (collision path test computation)
+- lifecycle.rs:1369-1371 already implements the accessor pattern correctly
+
+**Critical bug fix:**
+- worktree_scan.rs repository_key function had inverted round-trip validation that always accepted leading-zero formats like "repository-007" when it should only accept formats that round-trip through u64 formatting
 
 ## Deviations from Plan
 
