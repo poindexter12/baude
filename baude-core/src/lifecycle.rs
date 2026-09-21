@@ -522,6 +522,7 @@ pub struct PreparedActivation {
     pub request: ActivationRequest,
     pub checkout: CheckoutKey,
     pub first_seen_order: u64,
+    pub collision: Option<CollisionReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1744,7 +1745,7 @@ pub fn prepare_activation(
     snapshot: &RepositorySnapshot,
     branch: &str,
 ) -> Result<PreparedActivation, LifecycleError> {
-    let (repository, _collision) = ensure_repository(state, snapshot)?;
+    let (repository, collision) = ensure_repository(state, snapshot)?;
     let first_seen_order = state.allocate_first_seen_order()?;
 
     // Get the physical_key from the SavedRepository entry, or use the repository key as fallback
@@ -1768,6 +1769,7 @@ pub fn prepare_activation(
         },
         checkout,
         first_seen_order,
+        collision,
     })
 }
 
@@ -4222,7 +4224,10 @@ mod tests {
         // Second call with separate state (simulating daemon)
         let (key2, collision2) =
             super::ensure_repository(&mut state2, &snapshot).expect("daemon admission");
-        assert!(collision2.is_none(), "first daemon admission should not collide");
+        assert!(
+            collision2.is_none(),
+            "first daemon admission should not collide"
+        );
 
         // Both should compute the same key
         assert_eq!(
@@ -4258,7 +4263,10 @@ mod tests {
         // TUI: admit repo1, then re-admit it (no collision)
         let (_key_tui1, collision_tui1) =
             super::ensure_repository(&mut state_tui, &snapshot).expect("TUI first admission");
-        assert!(collision_tui1.is_none(), "first admission should not collide");
+        assert!(
+            collision_tui1.is_none(),
+            "first admission should not collide"
+        );
 
         let (_key_tui2, collision_tui2) =
             super::ensure_repository(&mut state_tui, &snapshot).expect("TUI re-admission");

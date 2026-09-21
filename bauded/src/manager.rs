@@ -96,6 +96,7 @@ pub struct Manager {
     pub persistence_dirty: bool,
     persistence_error: Option<String>,
     /// Collisions detected during repository admissions since daemon start.
+    #[allow(dead_code)]
     pub collisions: Vec<CollisionReport>,
     #[cfg(test)]
     persistence_target_for_test: Option<(PathBuf, String)>,
@@ -4293,13 +4294,17 @@ mod tests {
     fn info_reports_collisions() {
         // Verify that the /info endpoint returns collisions when manager has recorded them
         let _fixture = ManagerFixture::new("info-reports-collisions");
-        let m = mgr();
+        let mut m = mgr();
 
         // Get /info endpoint response - should have empty collisions initially
         // This test verifies the structure is present and serializable
         // In a full integration test, we would trigger a collision and verify it's reported
         // For now, we test that the endpoint doesn't panic and returns valid data
-        assert_eq!(m.collisions.len(), 0, "manager should start with no collisions");
+        assert_eq!(
+            m.collisions.len(),
+            0,
+            "manager should start with no collisions"
+        );
 
         m.kill_all();
     }
@@ -4309,7 +4314,7 @@ mod tests {
         // Verify that when manager admits a repository and a collision is detected,
         // it records the collision report and can be queried via /info
         let _fixture = ManagerFixture::new("manager-admission-collision-recorded");
-        let m = mgr();
+        let mut m = mgr();
 
         // Manager's collisions vector should be accessible and tracked
         // This test verifies the data structure is in place and properly initialized

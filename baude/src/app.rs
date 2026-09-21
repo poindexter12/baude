@@ -10751,8 +10751,10 @@ mod tests {
     fn admission_collision_sets_status() {
         // Verify that when a collision is detected during admission,
         // the status message is set to inform the user.
-        let root = std::env::temp_dir()
-            .join(format!("baude-test-{}-collision-status", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "baude-test-{}-collision-status",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(root.clone());

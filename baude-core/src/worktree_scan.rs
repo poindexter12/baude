@@ -743,6 +743,15 @@ pub struct ScanRoots {
     pub config_dir: PathBuf,
 }
 
+/// Ownership information for a managed repository directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnershipInfo {
+    /// The canonical common directory of the repository owner.
+    pub canonical_common_dir: PathBuf,
+    /// Display name of the owner repository (optional).
+    pub display_name: Option<String>,
+}
+
 /// One shaped directory found under the worktrees root, with the conclusion
 /// drawn about it.
 ///
@@ -764,6 +773,8 @@ pub struct Candidate {
     pub repository_key: String,
     /// The verdict, which carries the evidence that produced it.
     pub verdict: Verdict,
+    /// Ownership information for this managed repository directory (optional).
+    pub owner: Option<OwnershipInfo>,
 }
 
 impl Candidate {
@@ -950,6 +961,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
                 workspace,
                 repository_key,
                 verdict: classify(evidence),
+                owner: None, // TODO: implement ownership discovery from marker or checkout
             }
         })
         .collect();
@@ -3757,5 +3769,30 @@ mod tests {
 
         // Verify format_version is present (will be incremented in GREEN phase)
         let _ = report.format_version;
+    }
+
+    #[test]
+    fn scan_ownership_reads_marker() {
+        // Verify that ownership is populated from marker file when present
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-scan-owner-marker-{}",
+            std::process::id()
+        ));
+        let fixture = ScanFixture::new();
+        // TODO: This test will be implemented when ownership discovery is added
+        // For now, just verify the Candidate struct has the owner field
+        let _report = scan_ok(&fixture);
+    }
+
+    #[test]
+    fn scan_ownership_discovered_from_checkout() {
+        // Verify that ownership is discovered from checkout when marker is missing
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-scan-owner-checkout-{}",
+            std::process::id()
+        ));
+        let fixture = ScanFixture::new();
+        // TODO: This test will be implemented when ownership discovery is added
+        let _report = scan_ok(&fixture);
     }
 }

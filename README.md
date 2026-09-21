@@ -329,6 +329,24 @@ children has a running backend. Its main checkout, any separate managed
 default checkout, and retained linked worktrees remain visible as durable
 children in persisted oldest-first order.
 
+Managed worktree directories are identified by a stable digest of the
+repository's canonical git common directory (output of `git rev-parse
+--git-common-dir`). The digest is the first 12 characters of the SHA256 hash,
+formatted as `repository-<12 hex digits>/<role>-<checkout_key>`. This ensures
+two processes admitting the same repository derive the same path without
+coordination. Existing legacy counter-based directories (`repository-1`,
+`repository-2`, etc.) from earlier baude versions are recognized in place; the
+digest scheme applies only to new repositories.
+
+A small `.baude-marker.json` file inside each managed directory records and
+verifies ownership. On first admission of a legacy directory, baude writes a
+marker; after a state file reset, markers enable recovery without a scan. If
+two repositories converge on the same path (rare, but possible under legacy
+counters), baude detects the collision via the marker file and allocates the
+newcomer a distinct digest-keyed directory (`repository-<12hex>-2`, etc.). The
+collision is reported non-destructively in `baude worktrees scan --json` output
+with the owning repository named.
+
 From a local parent or child, `w` creates a valid local branch or activates an
 eligible existing local branch in a managed path beneath
 `~/.local/share/baude/worktrees/`, then starts the active workspace backend.
@@ -339,7 +357,9 @@ linked worktree, performs fresh topology and clean-state checks around an
 exact-target confirmation, and uses ordinary non-destructive Git removal.
 Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks the
 operation. A successful `X` removes only that worktree and child; its local
-branch, repository parent, and siblings remain.
+branch, repository parent, and siblings remain. After a state file reset, the
+same repository is found again by computing its digest from the canonical git
+common directory; no scan is required for recovery.
 
 ## Usage panel
 

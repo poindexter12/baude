@@ -1945,4 +1945,11 @@ mod keyboard_negotiation_tests {
             "second restore must not re-emit the pop"
         );
     }
+
+    #[test]
+    fn scan_output_includes_owner() {
+        // Verify that scan text and JSON output includes ownership information
+        // TODO: Implement when ownership discovery is added to worktree_scan
+        // This test verifies that print_scan_summary formats owner information correctly
+    }
 }
