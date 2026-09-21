@@ -215,11 +215,13 @@ name = "baude-core"
 version = "2.1.5"
 dependencies = [
  "anyhow",
+ "base64",
  "dirs",
  "libc",
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
  "vt100",
 ]
