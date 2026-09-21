@@ -1367,9 +1367,7 @@ pub fn ensure_repository(
     #[cfg(unix)]
     let digest = {
         use std::os::unix::ffi::OsStrExt;
-        crate::repository::compute_repository_digest(
-            snapshot.common_dir.as_os_str().as_bytes(),
-        )
+        crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
     };
     #[cfg(not(unix))]
     let digest = {
@@ -1385,12 +1383,7 @@ pub fn ensure_repository(
         .join(format!("repository-{}", digest));
 
     // Check for collisions on disk
-    let collision_report = check_collision(
-        &target_dir,
-        &digest,
-        &snapshot.common_dir,
-        state,
-    )?;
+    let collision_report = check_collision(&target_dir, &digest, &snapshot.common_dir, state)?;
 
     let (allocated_path, actual_physical_key) = if let Some(_report) = &collision_report {
         // Collision detected, allocate suffixed path
@@ -1409,8 +1402,9 @@ pub fn ensure_repository(
     };
 
     // Create the directory if it doesn't exist
-    std::fs::create_dir_all(&allocated_path)
-        .map_err(|e| LifecycleError::Topology(format!("failed to create repository directory: {}", e)))?;
+    std::fs::create_dir_all(&allocated_path).map_err(|e| {
+        LifecycleError::Topology(format!("failed to create repository directory: {}", e))
+    })?;
 
     // Write marker (only if not already there with matching content)
     #[cfg(unix)]
@@ -1420,7 +1414,11 @@ pub fn ensure_repository(
     };
     #[cfg(not(unix))]
     let canonical_bytes = {
-        snapshot.common_dir.to_string_lossy().into_owned().into_bytes()
+        snapshot
+            .common_dir
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes()
     };
 
     let marker_meta = crate::marker::MarkerMetadata {
@@ -1469,7 +1467,10 @@ fn check_collision(
             };
             #[cfg(not(unix))]
             let our_canonical_bytes = {
-                requester_common_dir.to_string_lossy().into_owned().into_bytes()
+                requester_common_dir
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes()
             };
 
             if meta.canonical_common_dir == our_canonical_bytes {
@@ -1477,9 +1478,11 @@ fn check_collision(
                 Ok(None)
             } else {
                 // Marker belongs to a different repository
-                let owner_common_dir = PathBuf::from(String::from_utf8_lossy(&meta.canonical_common_dir).into_owned());
+                let owner_common_dir =
+                    PathBuf::from(String::from_utf8_lossy(&meta.canonical_common_dir).into_owned());
                 let owner_display = crate::repository::repository_display_name(&owner_common_dir);
-                let requester_display = crate::repository::repository_display_name(requester_common_dir);
+                let requester_display =
+                    crate::repository::repository_display_name(requester_common_dir);
 
                 Ok(Some(CollisionReport {
                     requested_path: target_dir.clone(),
@@ -1497,8 +1500,10 @@ fn check_collision(
             match discover_checkout_owner(target_dir, requester_common_dir) {
                 Ok(Some(owner_common_dir)) => {
                     // Found a checkout that proves a different ownership
-                    let owner_display = crate::repository::repository_display_name(&owner_common_dir);
-                    let requester_display = crate::repository::repository_display_name(requester_common_dir);
+                    let owner_display =
+                        crate::repository::repository_display_name(&owner_common_dir);
+                    let requester_display =
+                        crate::repository::repository_display_name(requester_common_dir);
 
                     Ok(Some(CollisionReport {
                         requested_path: target_dir.clone(),
@@ -1512,7 +1517,8 @@ fn check_collision(
                 }
                 Ok(None) => {
                     // No checkouts found -> unknown owner, treat as collision
-                    let requester_display = crate::repository::repository_display_name(requester_common_dir);
+                    let requester_display =
+                        crate::repository::repository_display_name(requester_common_dir);
                     Ok(Some(CollisionReport {
                         requested_path: target_dir.clone(),
                         allocated_path: target_dir.clone(),
@@ -1525,7 +1531,8 @@ fn check_collision(
                 }
                 Err(_) => {
                     // Couldn't determine ownership, treat as unknown owner
-                    let requester_display = crate::repository::repository_display_name(requester_common_dir);
+                    let requester_display =
+                        crate::repository::repository_display_name(requester_common_dir);
                     Ok(Some(CollisionReport {
                         requested_path: target_dir.clone(),
                         allocated_path: target_dir.clone(),
@@ -1541,7 +1548,8 @@ fn check_collision(
         Ok(crate::marker::MarkerRead::Invalid(reason)) => {
             // Invalid marker, treat as unknown owner
             let reason_str = format!("{:?}", reason);
-            let requester_display = crate::repository::repository_display_name(requester_common_dir);
+            let requester_display =
+                crate::repository::repository_display_name(requester_common_dir);
 
             Ok(Some(CollisionReport {
                 requested_path: target_dir.clone(),
@@ -1555,7 +1563,8 @@ fn check_collision(
         }
         Err(_) => {
             // I/O error reading marker, treat as unknown owner
-            let requester_display = crate::repository::repository_display_name(requester_common_dir);
+            let requester_display =
+                crate::repository::repository_display_name(requester_common_dir);
             Ok(Some(CollisionReport {
                 requested_path: target_dir.clone(),
                 allocated_path: target_dir.clone(),
@@ -1605,7 +1614,11 @@ fn discover_checkout_owner(
                 };
                 #[cfg(not(unix))]
                 let checkout_common_bytes = {
-                    snapshot.common_dir.to_string_lossy().into_owned().into_bytes()
+                    snapshot
+                        .common_dir
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes()
                 };
 
                 #[cfg(unix)]
@@ -1615,7 +1628,10 @@ fn discover_checkout_owner(
                 };
                 #[cfg(not(unix))]
                 let our_bytes = {
-                    requester_common_dir.to_string_lossy().into_owned().into_bytes()
+                    requester_common_dir
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes()
                 };
 
                 if checkout_common_bytes != our_bytes {
@@ -2468,9 +2484,9 @@ mod tests {
         execute_activation_with_post_git_hook, mark_activation_recovery, plan_close, plan_reopen,
         prepare_activation, reconcile_activation_recovery, reconcile_teardown_recovery,
         record_pending_activation, revoke_removal_authority, ActivationRecoveryResolution,
-        ActivationRequest, CloseEffect, CloseRequest, CollisionReason,
-        LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime,
-        RepositoryReservations, TeardownRecoveryResolution,
+        ActivationRequest, CloseEffect, CloseRequest, CollisionReason, LifecycleError,
+        LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime, RepositoryReservations,
+        TeardownRecoveryResolution,
     };
     use crate::backend::SpawnMode;
     use crate::git::{self, ReconciliationUnavailable};
@@ -3678,9 +3694,7 @@ mod tests {
         #[cfg(unix)]
         let digest = {
             use std::os::unix::ffi::OsStrExt;
-            crate::repository::compute_repository_digest(
-                snapshot.common_dir.as_os_str().as_bytes(),
-            )
+            crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
         };
         #[cfg(not(unix))]
         let digest = "test_digest".to_string();
@@ -3689,17 +3703,27 @@ mod tests {
         std::fs::create_dir_all(&target_dir).ok();
 
         // Admit the repository - should detect unknown owner collision
-        let (key, collision) = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
+        let (key, collision) =
+            super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
 
         // Verify collision was detected
         assert!(collision.is_some(), "should detect unknown owner collision");
         let report = collision.unwrap();
-        assert!(matches!(report.reason, CollisionReason::UnknownOwner(_)), "reason should be UnknownOwner");
-        assert_eq!(report.owner_common_dir, None, "unknown owner should have no common_dir");
+        assert!(
+            matches!(report.reason, CollisionReason::UnknownOwner(_)),
+            "reason should be UnknownOwner"
+        );
+        assert_eq!(
+            report.owner_common_dir, None,
+            "unknown owner should have no common_dir"
+        );
         assert_eq!(report.owner_display, "unknown owner");
 
         // Verify the allocated path has a suffix
-        assert!(report.allocated_path.to_string_lossy().contains("-"), "allocated path should have suffix");
+        assert!(
+            report.allocated_path.to_string_lossy().contains("-"),
+            "allocated path should have suffix"
+        );
 
         // Verify the repository entry was created
         let repo = state
@@ -3709,7 +3733,10 @@ mod tests {
             .expect("find repository");
         assert!(!repo.physical_key.is_empty(), "physical_key should be set");
         // The physical_key should include the suffix
-        assert!(repo.physical_key.contains("-"), "physical_key should include suffix for collision");
+        assert!(
+            repo.physical_key.contains("-"),
+            "physical_key should include suffix for collision"
+        );
     }
 
     #[test]
@@ -3741,9 +3768,7 @@ mod tests {
         #[cfg(unix)]
         let digest = {
             use std::os::unix::ffi::OsStrExt;
-            crate::repository::compute_repository_digest(
-                snapshot.common_dir.as_os_str().as_bytes(),
-            )
+            crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
         };
         #[cfg(not(unix))]
         let digest = "test_digest2".to_string();
@@ -3756,13 +3781,23 @@ mod tests {
         std::fs::write(&marker_path, vec![b'x'; 100_000]).ok();
 
         // Admit the repository - should detect invalid marker
-        let (key, collision) = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
+        let (key, collision) =
+            super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
 
         // Verify collision was detected
-        assert!(collision.is_some(), "should detect invalid marker collision");
+        assert!(
+            collision.is_some(),
+            "should detect invalid marker collision"
+        );
         let report = collision.unwrap();
-        assert!(matches!(report.reason, CollisionReason::UnknownOwner(_)), "reason should be UnknownOwner");
-        assert_eq!(report.owner_common_dir, None, "unknown owner should have no common_dir");
+        assert!(
+            matches!(report.reason, CollisionReason::UnknownOwner(_)),
+            "reason should be UnknownOwner"
+        );
+        assert_eq!(
+            report.owner_common_dir, None,
+            "unknown owner should have no common_dir"
+        );
     }
 
     #[test]
@@ -3794,9 +3829,7 @@ mod tests {
         #[cfg(unix)]
         let digest = {
             use std::os::unix::ffi::OsStrExt;
-            crate::repository::compute_repository_digest(
-                snapshot.common_dir.as_os_str().as_bytes(),
-            )
+            crate::repository::compute_repository_digest(snapshot.common_dir.as_os_str().as_bytes())
         };
         #[cfg(not(unix))]
         let digest = "test_digest3".to_string();
@@ -3815,12 +3848,19 @@ mod tests {
         }
 
         // Admit the repository - should detect symlink marker
-        let (key, collision) = super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
+        let (key, collision) =
+            super::ensure_repository(&mut state, &snapshot).expect("ensure_repository");
 
         // Verify collision was detected
-        assert!(collision.is_some(), "should detect symlink marker collision");
+        assert!(
+            collision.is_some(),
+            "should detect symlink marker collision"
+        );
         let report = collision.unwrap();
-        assert!(matches!(report.reason, CollisionReason::UnknownOwner(_)), "reason should be UnknownOwner");
+        assert!(
+            matches!(report.reason, CollisionReason::UnknownOwner(_)),
+            "reason should be UnknownOwner"
+        );
     }
 
     #[test]
@@ -3842,7 +3882,11 @@ mod tests {
 
         // Allocate checkout after reset - starts from 1 again
         let checkout3 = state.allocate_checkout_key().expect("allocate checkout 3");
-        assert_eq!(checkout3.get(), 1, "allocate after reset should start from 1");
+        assert_eq!(
+            checkout3.get(),
+            1,
+            "allocate after reset should start from 1"
+        );
     }
 
     #[test]
@@ -3898,7 +3942,11 @@ mod tests {
         };
         #[cfg(not(unix))]
         let owner_bytes = {
-            snapshot1.common_dir.to_string_lossy().into_owned().into_bytes()
+            snapshot1
+                .common_dir
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
         };
 
         let owner_marker = crate::marker::MarkerMetadata {
@@ -3946,13 +3994,25 @@ mod tests {
         };
 
         // Admit the repository once
-        let (key1, collision1) = super::ensure_repository(&mut state, &snapshot).expect("first admit");
-        assert!(collision1.is_none(), "first admit should not report collision");
+        let (key1, collision1) =
+            super::ensure_repository(&mut state, &snapshot).expect("first admit");
+        assert!(
+            collision1.is_none(),
+            "first admit should not report collision"
+        );
 
         // Admit the same repository again
-        let (key2, collision2) = super::ensure_repository(&mut state, &snapshot).expect("second admit");
+        let (key2, collision2) =
+            super::ensure_repository(&mut state, &snapshot).expect("second admit");
         assert_eq!(key1, key2, "should reuse the same key");
-        assert!(collision2.is_none(), "second admit of same repository should not report collision");
-        assert_eq!(state.repositories.len(), 1, "should have only one repository entry");
+        assert!(
+            collision2.is_none(),
+            "second admit of same repository should not report collision"
+        );
+        assert_eq!(
+            state.repositories.len(),
+            1,
+            "should have only one repository entry"
+        );
     }
 }
