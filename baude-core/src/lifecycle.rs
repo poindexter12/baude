@@ -1387,7 +1387,8 @@ pub fn ensure_repository(
 
     let (allocated_path, actual_physical_key) = if let Some(_report) = &collision_report {
         // Collision detected, allocate suffixed path
-        let allocated = allocate_suffixed_repository_path(&target_dir, &digest, state)?;
+        let allocated =
+            allocate_suffixed_repository_path(&target_dir, &digest, &snapshot.common_dir, state)?;
         // Extract physical_key from the allocated path (e.g., "abcdef123456-2")
         let actual_key = allocated
             .file_name()
@@ -1400,6 +1401,12 @@ pub fn ensure_repository(
         // No collision, use the computed path
         (target_dir.to_path_buf(), digest)
     };
+    // The report was built before allocation; it must name where the newcomer
+    // actually landed (CONTEXT: "the newcomer is allocated a distinct ... directory").
+    let collision_report = collision_report.map(|mut report| {
+        report.allocated_path = allocated_path.clone();
+        report
+    });
 
     // Create the directory if it doesn't exist
     std::fs::create_dir_all(&allocated_path).map_err(|e| {
@@ -1429,6 +1436,9 @@ pub fn ensure_repository(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
+    // Design G: the directory exists before its marker, and the marker is what
+    // lets a later admission find this directory again after a state reset.
+    let _ = std::fs::create_dir_all(&allocated_path);
     let _ = crate::marker::write_marker(&allocated_path, &marker_meta);
 
     // Create new repository entry
@@ -1651,10 +1661,21 @@ fn discover_checkout_owner(
 
 /// Allocate a suffixed repository path for a collision.
 fn allocate_suffixed_repository_path(
-    _requested_dir: &PathBuf,
+    _requested_dir: &std::path::Path,
     physical_key: &str,
+    requester_common_dir: &std::path::Path,
     _state: &RepositoryState,
 ) -> Result<PathBuf, LifecycleError> {
+    #[cfg(unix)]
+    let our_bytes: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        requester_common_dir.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let our_bytes: Vec<u8> = requester_common_dir
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes();
     let workspace = crate::workspace::active();
     let workspace_name = workspace.name.as_str();
     let base = git::worktrees_base().join(workspace_name);
@@ -1668,12 +1689,15 @@ fn allocate_suffixed_repository_path(
         if candidate.exists() {
             // Check if it's marked as ours
             match crate::marker::read_marker(&candidate) {
-                Ok(crate::marker::MarkerRead::Valid(_meta)) => {
-                    // Directory exists and has a marker, skip it
-                    continue;
+                Ok(crate::marker::MarkerRead::Valid(meta))
+                    if meta.canonical_common_dir == our_bytes =>
+                {
+                    // Already ours from an earlier admission: reuse it.
+                    return Ok(candidate);
                 }
                 _ => {
-                    // Invalid or missing marker in a suffixed dir, try next suffix
+                    // Foreign, invalid, or missing marker in a suffixed dir: never
+                    // touch it, try the next suffix.
                     continue;
                 }
             }
@@ -3992,17 +4016,18 @@ mod tests {
 
     #[test]
     fn ensure_repository_foreign_marker_collision() {
-        // Test: directory with a marker for a different repository triggers ForeignMarker collision
+        // ForeignMarker row: the newcomer's own digest directory already exists
+        // and carries a valid marker for a DIFFERENT repository. The newcomer
+        // must be reported, allocated the -2 sibling, and never touch the owner.
+        use std::os::unix::ffi::OsStrExt;
         let _fixture = LifecycleFixture::new("foreign-marker");
         let mut state = crate::repository::RepositoryState::default();
-
-        // Admit first repository
-        let repo1 = crate::git::RepositorySnapshot {
-            canonical_input: std::path::PathBuf::from("/tmp/repo1"),
-            common_dir: std::path::PathBuf::from("/tmp/repo1"),
-            main_worktree: std::path::PathBuf::from("/tmp/repo1/.git"),
+        let newcomer = crate::git::RepositorySnapshot {
+            canonical_input: std::path::PathBuf::from("/tmp/newcomer_repo"),
+            common_dir: std::path::PathBuf::from("/tmp/newcomer_repo"),
+            main_worktree: std::path::PathBuf::from("/tmp/newcomer_repo/.git"),
             selected_worktree: crate::git::WorktreeRecord {
-                path: std::path::PathBuf::from("/tmp/repo1"),
+                path: std::path::PathBuf::from("/tmp/newcomer_repo"),
                 branch: None,
                 bare: false,
                 detached: false,
@@ -4011,47 +4036,66 @@ mod tests {
             },
             worktrees: vec![],
         };
-
-        let (_key1, _) = super::ensure_repository(&mut state, &repo1).expect("admit repo1");
-
-        // Admit second repo which would collide
-        let repo2 = crate::git::RepositorySnapshot {
-            canonical_input: std::path::PathBuf::from("/tmp/repo2"),
-            common_dir: std::path::PathBuf::from("/tmp/repo2"),
-            main_worktree: std::path::PathBuf::from("/tmp/repo2/.git"),
-            selected_worktree: crate::git::WorktreeRecord {
-                path: std::path::PathBuf::from("/tmp/repo2"),
-                branch: None,
-                bare: false,
-                detached: false,
-                locked: false,
-                prunable: false,
-            },
-            worktrees: vec![],
+        let workspace = crate::workspace::active();
+        let base = git::worktrees_base().join(workspace.name.as_str());
+        std::fs::create_dir_all(&base).expect("worktrees base");
+        let digest = crate::repository::compute_repository_digest(
+            newcomer.common_dir.as_os_str().as_bytes(),
+        );
+        let target_dir = base.join(format!("repository-{digest}"));
+        std::fs::create_dir_all(&target_dir).expect("pre-existing repository dir");
+        let owner_common_dir = std::path::PathBuf::from("/tmp/other_owner_repo");
+        let owner_marker = crate::marker::MarkerMetadata {
+            canonical_common_dir: owner_common_dir.as_os_str().as_bytes().to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1,
         };
+        crate::marker::write_marker(&target_dir, &owner_marker).expect("write foreign marker");
 
-        // The second repository should be admitted
-        let (_key2, _collision2) =
-            super::ensure_repository(&mut state, &repo2).expect("admit repo2");
-
-        // Verify repos are in state
-        assert!(!state.repositories.is_empty(), "repos should be in state");
+        let (key, collision) =
+            super::ensure_repository(&mut state, &newcomer).expect("admit newcomer");
+        let report = collision.expect("a foreign marker must be reported as a collision");
+        assert_eq!(report.reason, CollisionReason::ForeignMarker);
+        assert_eq!(
+            report.owner_common_dir.as_deref(),
+            Some(owner_common_dir.as_path())
+        );
+        assert_eq!(report.requested_path, target_dir);
+        let allocated = base.join(format!("repository-{digest}-2"));
+        assert_eq!(report.allocated_path, allocated);
+        assert_eq!(report.requester_common_dir, newcomer.common_dir);
+        let expected_key = format!("{digest}-2");
+        assert_eq!(state.physical_key(key), Some(expected_key.as_str()));
+        // The owner's marker is untouched.
+        match crate::marker::read_marker(&target_dir).expect("read owner marker") {
+            crate::marker::MarkerRead::Valid(meta) => {
+                assert_eq!(meta.canonical_common_dir, owner_marker.canonical_common_dir)
+            }
+            other => panic!("owner marker must stay valid, got {other:?}"),
+        }
+        // The newcomer owns the suffixed directory.
+        match crate::marker::read_marker(&allocated).expect("read allocated marker") {
+            crate::marker::MarkerRead::Valid(meta) => assert_eq!(
+                meta.canonical_common_dir,
+                newcomer.common_dir.as_os_str().as_bytes().to_vec()
+            ),
+            other => panic!("allocated dir must carry the newcomer's marker, got {other:?}"),
+        }
     }
 
     #[test]
     fn ensure_repository_reuses_own_suffixed_dir_on_second_admission() {
-        // Test: the same repository can be re-admitted and gets the same key
-        let _fixture = LifecycleFixture::new("foreign-marker-reuse");
-        let mut state = crate::repository::RepositoryState::default();
-
-        let repo_path = std::path::PathBuf::from("/tmp/test_repo_reuse");
-
-        let snapshot = crate::git::RepositorySnapshot {
-            canonical_input: repo_path.clone(),
-            common_dir: repo_path.clone(),
-            main_worktree: repo_path.join(".git"),
+        // After a state reset the unsuffixed dir is still foreign, so the
+        // newcomer collides again, but it must land on the SAME -2 directory it
+        // already owns (marker proves it) rather than allocating -3.
+        use std::os::unix::ffi::OsStrExt;
+        let _fixture = LifecycleFixture::new("reuse-suffixed");
+        let newcomer = crate::git::RepositorySnapshot {
+            canonical_input: std::path::PathBuf::from("/tmp/newcomer_repo"),
+            common_dir: std::path::PathBuf::from("/tmp/newcomer_repo"),
+            main_worktree: std::path::PathBuf::from("/tmp/newcomer_repo/.git"),
             selected_worktree: crate::git::WorktreeRecord {
-                path: repo_path.clone(),
+                path: std::path::PathBuf::from("/tmp/newcomer_repo"),
                 branch: None,
                 bare: false,
                 detached: false,
@@ -4060,27 +4104,46 @@ mod tests {
             },
             worktrees: vec![],
         };
-
-        // First admission
-        let (key1, _collision1) =
-            super::ensure_repository(&mut state, &snapshot).expect("first admit");
-
-        // Second admission with the same repository
-        let (key2, _collision2) =
-            super::ensure_repository(&mut state, &snapshot).expect("second admit");
-
-        // Verify the same key is returned
-        assert_eq!(
-            key1, key2,
-            "second admission should return the same repository key"
+        let workspace = crate::workspace::active();
+        let base = git::worktrees_base().join(workspace.name.as_str());
+        std::fs::create_dir_all(&base).expect("worktrees base");
+        let digest = crate::repository::compute_repository_digest(
+            newcomer.common_dir.as_os_str().as_bytes(),
         );
+        let target_dir = base.join(format!("repository-{digest}"));
+        std::fs::create_dir_all(&target_dir).expect("pre-existing repository dir");
+        let owner_marker = crate::marker::MarkerMetadata {
+            canonical_common_dir: b"/tmp/other_owner_repo".to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1,
+        };
+        crate::marker::write_marker(&target_dir, &owner_marker).expect("write foreign marker");
+        let suffixed = base.join(format!("repository-{digest}-2"));
 
-        // Verify only one entry is in the state
+        let mut first = crate::repository::RepositoryState::default();
+        let (key1, collision1) =
+            super::ensure_repository(&mut first, &newcomer).expect("first admission");
+        let report1 = collision1.expect("first admission collides");
+        assert_eq!(report1.allocated_path, suffixed);
+        let expected_key = format!("{digest}-2");
+        assert_eq!(first.physical_key(key1), Some(expected_key.as_str()));
+
+        // State reset: nothing but the directories and markers survive.
+        let mut second = crate::repository::RepositoryState::default();
+        let (key2, collision2) =
+            super::ensure_repository(&mut second, &newcomer).expect("second admission");
+        let report2 = collision2.expect("unsuffixed dir is still foreign");
+        assert_eq!(report2.reason, CollisionReason::ForeignMarker);
         assert_eq!(
-            state.repositories.len(),
-            1,
-            "should have only one repository entry"
+            report2.allocated_path, suffixed,
+            "must reuse the owned -2 dir"
         );
+        assert_eq!(second.physical_key(key2), Some(expected_key.as_str()));
+        assert!(
+            !base.join(format!("repository-{digest}-3")).exists(),
+            "no third directory may be allocated"
+        );
+        assert_eq!(second.repositories.len(), 1);
     }
 
     #[test]

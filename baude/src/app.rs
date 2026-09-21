@@ -7867,9 +7867,10 @@ mod tests {
         let physical_key = app
             .repository_state
             .physical_key(repository)
-            .expect("repository has physical_key");
+            .expect("repository has physical_key")
+            .to_string();
         let collision = baude_core::git::managed_branch_worktree_path(
-            physical_key,
+            &physical_key,
             next_checkout.get(),
             "collision",
         );
@@ -7880,28 +7881,31 @@ mod tests {
             },
             "collision".into(),
         );
+        // Phase 14 (WTID-03): a pre-existing directory at the composed checkout
+        // path is skipped, not fatal. The branch lands on the next key and the
+        // occupied directory is left untouched.
         assert_eq!(
             app.message.as_ref().unwrap().0,
-            format!(
-                "Cannot create or activate “collision” in “repo”: the managed worktree path “{}” collides with existing filesystem or Git state. Move or reconcile that path, then press w to retry.",
-                collision.display()
-            )
+            "created worktree for collision"
         );
-        assert_eq!(app.repository_state, baseline_state);
-        assert_eq!(app.runtime_checkouts, baseline_runtimes);
-        assert_eq!(app.ordered_ids(), baseline_order);
-        assert_eq!(app.selected_id, baseline_selection);
+        assert!(
+            !collision.join(".git").exists(),
+            "the occupied directory must not be reused as a worktree"
+        );
+        let skipped_to = baude_core::git::managed_branch_worktree_path(
+            &physical_key,
+            next_checkout.get() + 1,
+            "collision",
+        );
+        assert!(
+            skipped_to.join(".git").exists(),
+            "branch worktree must land on the next key"
+        );
         assert_eq!(
-            Command::new("git")
-                .args(["worktree", "list", "--porcelain"])
-                .current_dir(&repo)
-                .output()
-                .unwrap()
-                .stdout,
-            worktree_inventory
+            app.repository_state.checkouts.len(),
+            baseline_state.checkouts.len() + 1
         );
-
-        app.session_mut(runtime).unwrap().kill();
+        app.kill_all();
         std::fs::remove_dir_all(&collision).unwrap();
         git(
             &repo,
