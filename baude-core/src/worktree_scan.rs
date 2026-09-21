@@ -1379,7 +1379,7 @@ pub fn prune_at(
         outcomes.push(PruneOutcome {
             relative: candidate.relative.clone(),
             workspace: candidate.workspace.clone(),
-            repository_key: candidate.repository_key,
+            repository_key: candidate.repository_key.clone(),
             disposition,
         });
     }
@@ -1395,12 +1395,12 @@ pub fn prune_at(
         outcomes.push(PruneOutcome {
             relative: candidate.relative.clone(),
             workspace: candidate.workspace.clone(),
-            repository_key: candidate.repository_key,
+            repository_key: candidate.repository_key.clone(),
             disposition: PruneDisposition::Unapproved,
         });
     }
     outcomes.sort_by(|left, right| {
-        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+        (&left.workspace, &left.repository_key).cmp(&(&right.workspace, &right.repository_key))
     });
 
     Ok(PruneReport {
