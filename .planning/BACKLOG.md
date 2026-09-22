@@ -160,3 +160,110 @@ flag (prompt is the explicit opt-in, so it should win over a config default);
 
 **Workaround (UAT):** override with `BAUDE_CLAUDE_CMD=claude` so the base cmd has
 no permission flag and prompt mode engages.
+
+---
+
+## Captured 2026-09-22
+
+### BL-06 — release-please silently skips a commit whose body nests parentheses; no release PR opens
+
+**Observation (2026-09-22, #93 / #94):** The squash commit for #93 (`ace9894`)
+quoted the runtime error `ContradictoryLifecycle(CheckoutKey(1))` in its body.
+release-please v17 (`googleapis/release-please-action@v4`) logged
+`commit could not be parsed ... unexpected token '(' at 13:35`, counted zero
+releasable commits, reported the run as **success**, and opened no 2.3.1 PR.
+An empty carrier commit (#94) was needed to cut the release. The parser treats
+an opening parenthesis inside the body like a scope opener and demands a
+closing one; any nested pair fails the whole message, and nothing in CI says
+so.
+
+**Impact:** Every fix that quotes Rust error text, a `Foo(Bar(1))` value, or a
+function call with a call inside it will ship no release and leave the
+changelog missing the fix. The failure is silent at every step: PR checks are
+green, the merge is green, the release-please run is green.
+
+**Fix:** A commit-message check owned by this repo, in the same shape as
+`scripts/assert-real-roots-untouched.sh`:
+
+- `scripts/check-commit-message.sh <file|-> ` rejects nested parentheses in
+  the header or body, reports `line:col`, and exits non-zero.
+  `--self-test` exercises the cases below against synthetic messages.
+- `--range <base>..<head>` checks every non-merge commit in a PR; CI runs it
+  in the `check` job over `origin/main..HEAD` **and** over the PR title, since
+  a squash merge takes its header from the title.
+- A `commit-msg` hook at `.githooks/commit-msg` calling the script, enabled
+  with `git config core.hooksPath .githooks`, documented in README.
+- Oracle: the check must agree with the parser release-please actually uses
+  (`@conventional-commits/parser`). Where `node` is available, `--self-test`
+  runs each case through both and asserts the verdicts match, so the check
+  never drifts from the thing it guards.
+
+**Tests (write-up; `--self-test` implements these):**
+
+| # | Message | Expected |
+|---|---------|----------|
+| 1 | `fix(core): plain header` | pass |
+| 2 | header with squash suffix `... (#93)` | pass |
+| 3 | body with one level: `passes validate() and foo(bar)` | pass |
+| 4 | body quoting `ContradictoryLifecycle(CheckoutKey(1))` | **fail**, names `13:35`-style position |
+| 5 | nested parens inside a fenced code block in the body | **fail** (the parser has no notion of fences) |
+| 6 | footer `Refs #92, #93.` | pass |
+| 7 | header scope nesting `fix(core(x)): ...` | **fail** |
+| 8 | `--range` with one bad commit among three good | **fail**, names the sha |
+| 9 | `--range` containing a merge commit | merge commit skipped |
+| 10 | unbalanced `(` in the body | verdict taken from the oracle; recorded in the self-test, not assumed |
+| 11 | `--self-test` with `node` present | every case agrees with `@conventional-commits/parser` |
+
+**Status:** open. Background thread started 2026-09-22 from the #92 session.
+
+---
+
+### BL-07 — One unreconcilable retained checkout kills every restored session (Phase A all-or-nothing) — #92 design item
+
+**Observation (2026-09-22, #92):** 2.3.0 defers every save made during
+restore into Phase A's single durable write (`finish_restore_phase_a`). If that
+write fails validation, every gated session is killed: "N restored session(s)
+were stopped and none was released". #93 removed the one cause seen in the
+wild (a protected row keeping a stale `owned_runtime`), but the structure is
+unchanged: any future per-row contradiction, from any of the restore
+reconcilers, is again a total outage instead of one refused row. 2.2.0's
+per-row save and rollback contained this by accident, not design.
+
+**Where a row can still go wrong before Phase A:** `reconcile_teardown_recoveries`,
+`reconcile_activation_recoveries`, `restore_standalones`, the launch-directory
+admission, and `plan_reopen`'s success path, whose `debug_assert!(next.validate())`
+has the same blind spot #93 fixed on the blocked path (`validate()` never checks
+lifecycle against runtime; `validate_lifecycle_views()` does).
+
+**Candidates (decision needed):**
+- (a) Every restore-time transition validates on a clone with both validators
+  before committing to `App` state, the way `plan_reopen` now does. A row that
+  cannot be made valid is refused with its own message and never dispatched.
+- (b) On Phase A save failure, isolate instead of kill: map the
+  `ValidationError` to its checkout or standalone key, stop only that row, retry
+  the save once, release the rest.
+- (c) Both: (a) as the rule, (b) as the backstop.
+
+**Tests (write-up):**
+
+1. Parametrize `restore_survives_one_unreconcilable_checkout_with_a_stale_runtime`
+   over every `ReconciliationUnavailable` variant (`Missing`, `PathChanged`,
+   `BranchChanged`, `Detached`, `LockedOrPrunable`, `IdentityChanged`,
+   `Discovery`): the bad row ends `Protected` with no runtime, the others
+   restore and release, `save_attempts_for_test == 1`.
+2. Same with the stale row's lifecycle at `Launching(gen)` and `Stopping(gen)`,
+   not only `Running(gen)`.
+3. A standalone session whose record contradicts its runtime: same isolation.
+4. Launch-directory admission that fails validation does not take saved
+   sessions down.
+5. Phase A save failure attributable to one row (inject a validation failure
+   for a single key): that row is stopped and the message names it; the other
+   N-1 release. This is the new behavior under (b).
+6. Phase A save failure attributable to no row (`AtomicFailure::Write`, the
+   existing `restore_save_failure_kills_paused_children...` test): unchanged.
+7. Fixture: the seeded shape "Running + dead-pid runtime + moved branch" from
+   #93 becomes a shared helper so the above do not each rebuild it. This is
+   the fixture-realism gap that let #92 through (`.planning` fixture note).
+
+**Status:** open. Needs the (a)/(b)/(c) decision; candidate for the next
+milestone's reliability phase.
