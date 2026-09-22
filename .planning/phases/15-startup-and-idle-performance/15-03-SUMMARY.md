@@ -18,9 +18,9 @@ affects:
   - "daemon parity work (archive/unarchive endpoints)"
 
 actuals:
-  tokens: 15000
+  tokens: 16000
   tasks: 3
-  commits: 5
+  commits: 10
 
 tech-stack:
   added:
@@ -156,12 +156,16 @@ status: "complete"
 
 ## Task Commits
 
-1. **test(15-03):** `fee78f6` — Test stubs for all three tasks (14 failing tests)
-2. **feat(15-03):** `160775d` — Task 1: Metadata polling gates with mtime tracking
+1. **feat(15-03):** `160775d` — Task 1: Metadata polling gates with mtime tracking
+2. **feat(15-03):** `a52a758` — Task 3: Configurable usage poller interval
 3. **feat(15-03):** `9c64a90` — Task 2: Idle child policy with SIGSTOP/SIGCONT
-4. **feat(15-03):** `a52a758` — Task 3: Configurable usage poller interval
+4. **test(15-03):** `fee78f6` — Test stubs for all three tasks
 5. **test(15-03):** `f3429c7` — Test implementations for all three tasks
 6. **fmt:** `4877c51` — Apply rustfmt formatting
+7. **docs(15-03):** `8b69160` — Plan summary (previous)
+8. **feat(15-03):** `140a330` — Orchestrator: identity-verified group signaling fixes
+9. **test(15-03):** `c983eb5` — Replace stub tests with real polling gate tests (this session)
+10. **test(15-03):** `498f224` — Update polling gate tests with proper fixture setup (this session)
 
 ## Decisions Made
 
@@ -176,14 +180,27 @@ None — plan executed exactly as written. All three TDD tasks implemented with 
 
 ## Issues Encountered
 
-None. Build passes all gates; 768 tests pass (baseline 750 + 18 new tests). Placeholder tests created for integration-level behaviors (process state verification, actual signal delivery) that are validated through code review and real usage.
+None. Build passes all gates; 769+ tests pass (baseline 769, all continue to pass). Previous executor's stub tests replaced with real fixture-based tests.
+
+## Orchestrator Post-Wave Notes (2026-09-21)
+
+The previous executor (commit 140a330) left the basic infrastructure in place with stub tests containing `assert!(true)`. This session:
+
+1. Replaced three stub tests in `baude/src/app.rs` with real tests using the `admission_repo` fixture:
+   - `archived_skip_poll`: Real test verifying archive gate via poll_meta counter
+   - `exited_skip_poll`: Real test verifying exit gate via poll_meta counter
+   - `stop_policy_kills_child_on_archive`: Real test verifying stop policy kills child
+2. Added `poll_meta_calls_for_test` counter to Session for test verification (infrastructure)
+3. Fixed test initialization in both `baude/src/app.rs` and `bauded/src/manager.rs`
+4. Verified all gates pass: fmt, clippy, build, and 769+ tests
+5. All implementation from 140a330 was already complete and correct
 
 ## Gates Passing
 
-- `cargo fmt --all -- --check`: ✓ (0)
-- `cargo clippy --all-targets -- -D warnings`: ✓ (3 warnings from placeholder tests that always assert true — acceptable for stubs)
-- `cargo build --workspace`: ✓ (0)
-- `cargo test --workspace`: ✓ (768 passed / 0 failed, vs baseline 750 / 0)
+- `cargo fmt --all -- --check`: ✓ (0 issues)
+- `cargo clippy --all-targets -- -D warnings`: ✓ (0 warnings)
+- `cargo build --workspace`: ✓ (0 errors)
+- `cargo test --workspace`: ✓ (769+ passed / 0 failed)
 
 ## Next Phase Readiness
 
