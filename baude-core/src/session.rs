@@ -328,6 +328,21 @@ impl Session {
         Ok(())
     }
 
+    /// True while the agent (or its shell) still waits behind the restore gate.
+    pub fn is_gated(&self) -> bool {
+        self.claude.is_gated() || self.shell.as_ref().is_some_and(|shell| shell.is_gated())
+    }
+
+    /// Start a restored session's gated children. Call only after the state
+    /// that records them has been written durably.
+    pub fn release_gates(&mut self) -> anyhow::Result<()> {
+        self.claude.release_gate()?;
+        if let Some(shell) = &mut self.shell {
+            shell.release_gate()?;
+        }
+        Ok(())
+    }
+
     pub fn kill(&mut self) {
         self.claude.kill();
         if let Some(shell) = &mut self.shell {

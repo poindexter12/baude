@@ -42,23 +42,23 @@ impl PausedPty {
         &self.identity
     }
 
-    /// Release the paused child by writing the gate token to stdin.
-    /// Consumes the PausedPty, writes the gate token, spawns the reader thread,
-    /// and returns the live Pty.
-    pub fn release(mut self) -> Result<Pty> {
+    /// Release the gate immediately: the command starts now.
+    pub fn release(self) -> Result<Pty> {
+        let mut pty = self.into_gated()?;
+        pty.release_gate()?;
+        Ok(pty)
+    }
+
+    /// Turn the paused handle into a live `Pty` WITHOUT releasing the gate. The
+    /// reader thread starts (the gate shell prints nothing until the token
+    /// arrives), so the session can be constructed and shown while its record
+    /// is still being made durable; `Pty::release_gate` starts the command.
+    pub fn into_gated(mut self) -> Result<Pty> {
         let parts = self
             .parts
             .take()
             .ok_or_else(|| anyhow::anyhow!("pty already released"))?;
-
-        // Write gate token to release the child from the stdin gate
-        let mut writer = parts.writer;
-        writer
-            .write_all(format!("{GATE_TOKEN}\n").as_bytes())
-            .and_then(|_| writer.flush())
-            .context("failed to write gate token")?;
-
-        // Create the parser and other shared structures
+        let writer = parts.writer;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(parts.rows, parts.cols, 2000)));
         let last_output_ms = Arc::new(AtomicU64::new(now_ms()));
         let exited = Arc::new(AtomicBool::new(false));
@@ -108,6 +108,7 @@ impl PausedPty {
             exited,
             size: (parts.rows, parts.cols),
             subscribers,
+            gated: true,
         })
     }
 
@@ -135,6 +136,10 @@ pub struct Pty {
     size: (u16, u16), // (rows, cols)
     /// Live raw-output subscribers (remote attach). Pruned on send failure.
     subscribers: Subscribers,
+    /// True while the child still waits behind the registration gate. A gated
+    /// Pty is live (reader thread running, writer held) but the command has
+    /// not started; `release_gate` writes the token that starts it.
+    gated: bool,
 }
 
 /// Written to the paused child's stdin once its identity is durably recorded.
@@ -590,6 +595,25 @@ impl Pty {
             let _ = child.kill();
         }
         self.exited.store(true, Ordering::Relaxed);
+    }
+
+    /// True while the child is still held behind the registration gate.
+    pub fn is_gated(&self) -> bool {
+        self.gated
+    }
+
+    /// Write the gate token so a gated child starts its command. No-op once
+    /// released. Only call after the child's identity is durably recorded.
+    pub fn release_gate(&mut self) -> Result<()> {
+        if !self.gated {
+            return Ok(());
+        }
+        self.writer
+            .write_all(format!("{GATE_TOKEN}\n").as_bytes())
+            .and_then(|_| self.writer.flush())
+            .context("failed to write gate token")?;
+        self.gated = false;
+        Ok(())
     }
 
     /// Stop the child and confirm that it has exited before reporting success.

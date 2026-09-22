@@ -547,10 +547,16 @@ pub struct App {
     remove_stop_error_for_test: Option<String>,
     #[cfg(test)]
     remove_git_refusal_for_test: bool,
-    /// Two-phase restore state: set to true during Phase A and Phase B
-    pub restoring: bool,
-    /// Restore work queue (None when not restoring)
-    pub restore_queue: Option<persist::RestoreQueue>,
+    /// Restore Phase A: while set, durable saves are coalesced into the single
+    /// write `finish_restore_phase_a` performs, so N restored sessions cost one
+    /// fsync and no gated child is released before its record is durable.
+    deferring_saves: bool,
+    deferred_save_pending: std::cell::Cell<bool>,
+    /// Restore Phase B: gated sessions still awaiting release, released one per
+    /// loop iteration by `restore_step`.
+    restore_total: usize,
+    restore_released: usize,
+    restore_releasing: bool,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -823,8 +829,11 @@ impl App {
             remove_stop_error_for_test: None,
             #[cfg(test)]
             remove_git_refusal_for_test: false,
-            restoring: false,
-            restore_queue: None,
+            deferring_saves: false,
+            deferred_save_pending: std::cell::Cell::new(false),
+            restore_total: 0,
+            restore_released: 0,
+            restore_releasing: false,
         }
     }
 
@@ -1299,6 +1308,8 @@ impl App {
                 return;
             }
         };
+        // Restore Phase A begins: every save below is deferred into one write.
+        self.deferring_saves = true;
         if let Err(error) = self.reconcile_teardown_recoveries() {
             self.set_message(format!("teardown recovery: {error}"));
         }
@@ -1309,18 +1320,6 @@ impl App {
             self.set_message(format!("standalone recovery: {error}"));
         }
         let active = active_restore_checkouts(&self.repository_state);
-
-        // Initialize restore queue for two-phase restore
-        let session_count = active.len();
-        if session_count > 0 {
-            self.restore_queue = Some(persist::RestoreQueue {
-                phase: persist::RestorePhase::PausedAndRegistered,
-                total_count: session_count,
-                current_index: 0,
-                paused_sessions: Vec::new(),
-            });
-        }
-
         for key in active {
             if let Err(error) = self.ensure_primary(key) {
                 self.set_message(format!("restore primary: {error}"));
@@ -1368,43 +1367,72 @@ impl App {
             .context_last_selected_id()
             .filter(|id| ids.contains(id))
             .or_else(|| ids.first().copied());
+        // Everything restore spawned (saved sessions and the launch-dir admission)
+        // is gated and registered: write the state once, then Phase B releases.
+        self.finish_restore_phase_a();
     }
 
-    /// Phase A of restore: spawn paused sessions, register identities, perform one durable save.
-    pub(crate) fn restore_phase_a(&mut self) -> Result<(), String> {
-        if let Some(queue) = &mut self.restore_queue {
-            if queue.phase != persist::RestorePhase::PausedAndRegistered {
-                return Ok(());
+    /// End of restore Phase A: perform the one durable save that covers every
+    /// identity registered while saves were deferred. On success the gated
+    /// sessions become Phase B work for `restore_step`; on failure they are
+    /// stopped without ever being released, so no child runs unrecorded.
+    fn finish_restore_phase_a(&mut self) {
+        self.deferring_saves = false;
+        let gated = self.sessions.iter().filter(|s| s.is_gated()).count();
+        if self.deferred_save_pending.replace(false) {
+            if let Err(error) = self.save_durable_status() {
+                for session in self.sessions.iter_mut().filter(|s| s.is_gated()) {
+                    session.kill();
+                }
+                self.restore_total = 0;
+                self.restore_released = 0;
+                self.restore_releasing = false;
+                self.set_message(format!(
+                    "restore save failed: {error}; {gated} restored session(s) were stopped and none was released"
+                ));
+                self.dirty = true;
+                return;
             }
-
-            // For now, transition to Phase B immediately (full implementation would spawn paused sessions)
-            queue.phase = persist::RestorePhase::Unpausing;
-            queue.current_index = 0;
-            self.restoring = true;
+        }
+        self.restore_total = gated;
+        self.restore_released = 0;
+        self.restore_releasing = gated > 0;
+        // Phase B reports `restoring k/N` as it releases; with nothing gated
+        // there is nothing new to draw, so leave `dirty` alone.
+        if gated > 0 {
             self.dirty = true;
         }
-        Ok(())
     }
 
-    /// Phase B of restore: unpause and admit one session per tick.
-    pub(crate) fn restore_phase_b(&mut self) -> Result<bool, String> {
-        if let Some(queue) = &mut self.restore_queue {
-            if queue.phase != persist::RestorePhase::Unpausing {
-                return Ok(false);
-            }
+    /// True while restored sessions still wait behind their gates (Phase B).
+    pub(crate) fn restore_in_progress(&self) -> bool {
+        self.restore_releasing
+    }
 
-            // Check if we're done
-            if queue.current_index >= queue.paused_sessions.len() {
-                return Ok(false);
-            }
-
-            // For now, just increment the index (full implementation would unpause and admit)
-            queue.current_index += 1;
-            self.dirty = true;
-
-            return Ok(queue.current_index < queue.paused_sessions.len());
+    /// Restore Phase B: release exactly one gated session, in sidebar order,
+    /// and report progress. Returns true while more remain.
+    pub(crate) fn restore_step(&mut self) -> bool {
+        if !self.restore_releasing {
+            return false;
         }
-        Ok(false)
+        let mut failure = None;
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.is_gated()) {
+            if let Err(error) = session.release_gates() {
+                failure = Some((session.name.clone(), error.to_string()));
+                session.kill();
+            }
+            self.restore_released += 1;
+        }
+        let (released, total) = (self.restore_released, self.restore_total);
+        match failure {
+            Some((name, error)) => self.set_message(format!(
+                "restoring {released}/{total}: could not start {name}: {error}"
+            )),
+            None => self.set_message(format!("restoring {released}/{total}")),
+        }
+        self.restore_releasing = self.sessions.iter().any(|s| s.is_gated());
+        self.dirty = true;
+        self.restore_releasing
     }
 
     /// Map the folder's `last_selected` breadcrumb back to a live row id.
@@ -1632,6 +1660,12 @@ impl App {
                     "persistence is blocked after a state load failure".into()
                 })
             )));
+        }
+        if self.deferring_saves {
+            // Restore Phase A: remember that a write is owed; `finish_restore_phase_a`
+            // performs it once, before any gated child is released.
+            self.deferred_save_pending.set(true);
+            return Ok(());
         }
         #[cfg(test)]
         self.save_attempts_for_test
@@ -2965,7 +2999,39 @@ impl App {
         .and_then(|runtime| runtime.generation.successor())
         .unwrap_or(RuntimeGeneration::initial());
         let mut registered_shell = None;
-        let claude_result =
+        let claude_result = if self.deferring_saves {
+            // Restore Phase A: spawn behind the gate and keep it closed. The
+            // identity is registered in memory now; `finish_restore_phase_a`
+            // writes the state once, and `restore_step` releases the gate after.
+            Pty::spawn_paused(Some(&plan.cmd), &plan.env, &cwd, rows, cols).and_then(|paused| {
+                let agent = paused.identity().clone();
+                if let Some((shell_rows, shell_cols)) = shell_size {
+                    let shell = Pty::spawn_paused(None, &[], &cwd, shell_rows, shell_cols)?;
+                    let runtime = OwnedRuntime {
+                        generation,
+                        agent: agent.clone(),
+                        shell: ShellOwnership::Owned(shell.identity().clone()),
+                    };
+                    if let Err(error) = self.register_runtime(owner, runtime) {
+                        shell.abort();
+                        paused.abort();
+                        return Err(error);
+                    }
+                    registered_shell = Some(shell.into_gated()?);
+                } else {
+                    let runtime = OwnedRuntime {
+                        generation,
+                        agent: agent.clone(),
+                        shell: ShellOwnership::Closed,
+                    };
+                    if let Err(error) = self.register_runtime(owner, runtime) {
+                        paused.abort();
+                        return Err(error);
+                    }
+                }
+                paused.into_gated()
+            })
+        } else {
             Pty::spawn_registered_with(Some(&plan.cmd), &plan.env, &cwd, rows, cols, |agent| {
                 if let Some((shell_rows, shell_cols)) = shell_size {
                     let shell = Pty::spawn_registered_with(
@@ -2994,7 +3060,8 @@ impl App {
                     self.register_runtime(owner, runtime)?;
                 }
                 Ok(())
-            });
+            })
+        };
         let mut claude = match claude_result {
             Ok(claude) => claude,
             Err(error) => {
@@ -11085,106 +11152,189 @@ mod tests {
         );
     }
 
+    /// Restore fixture: `n` checkout runtimes saved by one App, then a fresh
+    /// App on the same state root ready to be driven through the real loop.
+    fn saved_sessions_fixture(label: &str, n: usize) -> (AdmissionRepo, App, Vec<SelId>, PathBuf) {
+        let fixture = admission_repo(label);
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        for i in 1..n {
+            app.activate_branch_worktree(&repo, &format!("feature/{label}-{i}"))
+                .unwrap();
+        }
+        assert_eq!(app.sessions.len(), n, "fixture created {n} runtimes");
+        let order = app.ordered_ids();
+        app.kill_all();
+        let mut restarted = App::new(repo);
+        restarted.remote = None;
+        restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        restarted.persistence_root_for_test = Some(state_root);
+        (fixture, restarted, order, root)
+    }
+
+    fn loop_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap()
+    }
+
+    fn gated_count(app: &App) -> usize {
+        app.sessions.iter().filter(|s| s.is_gated()).count()
+    }
+
     #[test]
     fn restore_single_durable_save_for_n_sessions() {
-        // Phase A spawns N saved sessions paused, registers their identities,
-        // and calls save_durable_status() exactly once for all N identities.
-        let _scope = isolation_scope("restore-single-save");
-        let mut app = App::new(PathBuf::from("/not-a-repository"));
-
-        // Initialize restore queue with paused sessions
-        app.restore_queue = Some(persist::RestoreQueue {
-            phase: persist::RestorePhase::PausedAndRegistered,
-            total_count: 3,
-            current_index: 0,
-            paused_sessions: Vec::new(),
-        });
-
-        // Phase A should transition to Phase B
-        let result = app.restore_phase_a();
-        assert!(result.is_ok(), "restore phase A should not fail");
-        if let Some(queue) = &app.restore_queue {
-            assert_eq!(
-                queue.phase,
-                persist::RestorePhase::Unpausing,
-                "phase A should transition to phase B"
-            );
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-one-save", 3);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        let first = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert!(first.drew && started, "first frame drawn, restore ran");
+        assert_eq!(app.sessions.len(), 3, "three sessions restored");
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            1,
+            "Phase A performs exactly one durable save for three sessions"
+        );
+        let mut steps = 0;
+        while !finished {
+            crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            steps += 1;
+            assert!(steps < 10, "restore must finish within a few iterations");
         }
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            1,
+            "Phase B releases never save"
+        );
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn restore_save_failure_kills_paused_children_and_records_no_unpaused_child() {
-        // Phase A spawns children paused, save fails, all paused children
-        // are killed and no child is unpaused.
-        let _scope = isolation_scope("restore-save-failure");
-        let mut app = App::new(PathBuf::from("/not-a-repository"));
-        app.restore_queue = Some(persist::RestoreQueue {
-            phase: persist::RestorePhase::PausedAndRegistered,
-            total_count: 2,
-            current_index: 0,
-            paused_sessions: Vec::new(),
-        });
-
-        assert!(
-            app.restore_phase_a().is_ok(),
-            "restore phase A should handle state correctly"
-        );
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-save-fails", 2);
+        app.atomic_failure_for_test = Some(persist::AtomicFailure::Write);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        let first = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert!(first.drew && started);
+        assert!(finished, "a failed save ends the restore");
+        assert!(!app.restore_in_progress());
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(gated_count(&app), 2, "no child was released");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.sessions.iter().any(|s| !s.claude.is_exited()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "held children must be killed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let message = app
+            .message
+            .as_ref()
+            .map(|m| m.0.clone())
+            .unwrap_or_default();
+        assert!(message.starts_with("restore save failed"), "got: {message}");
+        assert!(message.contains("none was released"), "got: {message}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn restore_unpauses_only_after_durable_save() {
-        // Phase A saves (1 durable write), Phase B unpauses one session per tick,
-        // asserts unpaused children run in later ticks than the save.
-        let _scope = isolation_scope("restore-unpauses-after-save");
-        let mut app = App::new(PathBuf::from("/not-a-repository"));
-        app.restore_queue = Some(persist::RestoreQueue {
-            phase: persist::RestorePhase::Unpausing,
-            total_count: 3,
-            current_index: 0,
-            paused_sessions: vec![],
-        });
-
-        // Phase B with no paused sessions should return false (complete)
-        let result = app.restore_phase_b();
-        assert!(
-            result.is_ok() && !result.unwrap(),
-            "phase B with empty queue should return complete"
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-release-order", 2);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert_eq!(app.save_attempts_for_test.get(), 1);
+        assert_eq!(
+            gated_count(&app),
+            1,
+            "one released after the save, one still gated"
         );
+        assert!(app.restore_in_progress() && !finished);
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("second step");
+        assert_eq!(gated_count(&app), 0);
+        assert!(finished && !app.restore_in_progress());
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn restore_incremental_one_per_iteration() {
-        // Phase B: each tick unpauses and admits exactly one session.
-        let _scope = isolation_scope("restore-incremental");
-        let mut app = App::new(PathBuf::from("/not-a-repository"));
-        app.restore_queue = Some(persist::RestoreQueue {
-            phase: persist::RestorePhase::Unpausing,
-            total_count: 3,
-            current_index: 0,
-            paused_sessions: vec![],
-        });
-
-        assert!(
-            app.restore_phase_b().is_ok(),
-            "phase B should handle empty paused sessions"
-        );
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-incremental", 3);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 1");
+        assert_eq!(gated_count(&app), 2, "step 1: Phase A plus one release");
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 2");
+        assert_eq!(gated_count(&app), 1, "step 2: exactly one more release");
+        assert!(!finished);
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 3");
+        assert_eq!(gated_count(&app), 0, "step 3: last release");
+        assert!(finished);
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn restore_progress_visible() {
-        // Restore progress is displayed in status message, showing Phase A vs Phase B.
-        let _scope = isolation_scope("restore-progress");
-        let app = App::new(PathBuf::from("/not-a-repository"));
-        // After restore() is called, restoring should be false (no restore loaded)
-        assert!(!app.restoring, "app should not be restoring by default");
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-progress", 3);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        let msg = |app: &App| {
+            app.message
+                .as_ref()
+                .map(|m| m.0.clone())
+                .unwrap_or_default()
+        };
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 1");
+        assert_eq!(msg(&app), "restoring 1/3");
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 2");
+        assert_eq!(msg(&app), "restoring 2/3");
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("step 3");
+        assert_eq!(msg(&app), "restoring 3/3");
+        assert!(finished);
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn restore_maintains_sidebar_order() {
-        // Sessions are admitted in load order; final sidebar order matches input order.
-        let _scope = isolation_scope("restore-sidebar-order");
-        let app = App::new(PathBuf::from("/not-a-repository"));
-        // No sessions should be created without explicit restoration
-        assert_eq!(app.sessions.len(), 0, "app should start with no sessions");
+        let (_fixture, mut app, order, root) = saved_sessions_fixture("restore-order", 3);
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        let mut steps = 0;
+        while !finished {
+            crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            steps += 1;
+            assert!(steps < 10);
+        }
+        assert_eq!(
+            app.ordered_ids(),
+            order,
+            "restored sidebar order equals the saved order"
+        );
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
