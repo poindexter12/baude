@@ -41,9 +41,9 @@
 - Lines 2323-2354: current key bindings listed (ctrl+q, ctrl+\, ctrl+e, ctrl+n, alt+←/→, ctrl+o, shift+enter)
 
 **README (line 108-138):**
-- Table lists all documented keys; no `ctrl+/` entry.
+- Table lists all documented keys; no `alt+↑`/`alt+↓` entry (only `alt+←/→` for session cycling).
 
-**Collision result:** `ctrl+/` (Ctrl + forward slash) is NOT used anywhere in code, help overlay, or README.
+**Collision result:** `alt+↑`/`alt+↓` are NOT used anywhere in code, help overlay, or README. `ctrl+/` was the first candidate and was REJECTED: it reaches the terminal as raw byte 0x1F, indistinguishable from `ctrl+7`/`ctrl+_` under legacy encoding, the same ambiguity that forces `is_backslash` (app.rs:153) to match both `Char('\\')` and `Char('4')` for `ctrl+\` (0x1C). Arrow keys carry an explicit modifier parameter in their CSI sequence, so no dual-match helper is needed. `alt+↑/↓` is also spatially correct: `pane_rects` (app.rs:563) stacks the shell below Claude.
 
 ## Session Focus Preservation Pattern (cycle_session)
 
@@ -204,7 +204,7 @@ Actual line count in help text:
 - Blank + "press any key" = 2 lines
 - **Total: 24 lines** of content + 2 border rows = 26 rows needed (current: 42, plenty of room)
 
-Adding one line for `ctrl+/` focus toggle fits easily; no height adjustment needed until more lines are added.
+Adding one line for the `alt+↑/↓` pane-focus chord fits easily; no height adjustment needed until more lines are added.
 
 ## README Keys Section
 
@@ -213,7 +213,7 @@ Adding one line for `ctrl+/` focus toggle fits easily; no height adjustment need
 
 Table format with | Key | Where | Action |. Adding a row:
 ```
-| `ctrl+/` | Claude or shell pane | swap focus between Claude pane and expanded shell pane |
+| `alt+↑/↓` | claude or shell pane | move focus to the pane above/below (shell sits below claude) |
 ```
 
 Would be inserted in the "global (any pane)" section (line 2346 area in ui.rs help).

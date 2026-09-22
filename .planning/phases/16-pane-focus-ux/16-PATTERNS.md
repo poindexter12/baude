@@ -91,7 +91,7 @@ fn handle_key(&mut self, key: KeyEvent) {
 ```
 
 **Application in Phase 16:**
-Add the focus-toggle chord (`ctrl+/`) as a new global chord AFTER checking modal state and BEFORE the focus dispatch. It should:
+Add the pane-focus chords (`alt+↑` / `alt+↓`) as new global chords AFTER checking modal state and BEFORE the focus dispatch, beside the existing `alt+←/→` session-cycling arms. They should:
 1. Check if shell is open and visible
 2. If yes and focus is Claude: set focus to Shell
 3. If yes and focus is Shell: set focus to Claude
@@ -244,7 +244,7 @@ fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
 ```
 
 **Application in Phase 16:**
-Focus-toggle chord (`ctrl+/`) should NOT forward to the pane — it is a global action handled in handle_key before dispatch. The forward_key path is unaffected by Phase 16.
+The pane-focus chords (`alt+↑` / `alt+↓`) should NOT forward to the pane — it is a global action handled in handle_key before dispatch. The forward_key path is unaffected by Phase 16.
 
 ## Pattern 10: Focus Dispatch (match on focus)
 

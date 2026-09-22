@@ -7,7 +7,7 @@
 <domain>
 ## Phase Boundary
 
-Pane focus (Claude vs shell) is remembered when the user switches sessions and returns, and a keyboard shortcut swaps focus between the two panes while both are visible. Requirements: UX-01. Out of scope: focus memory surviving a baude restart (session-only for Phase 16; persist-on-exit is deferred), sidebar focus cycling, remote-only pane navigation (remote sessions use the same focus state as local).
+Pane focus (Claude vs shell) is remembered when the user switches sessions and returns, and a keyboard shortcut swaps focus between the two panes while both are visible. Requirements: UX-01. Out of scope: focus memory surviving a baude restart (session-only for Phase 16; persist-on-exit is deferred), sidebar focus cycling, remote pane navigation (remote rows have no shell pane).
 
 </domain>
 
@@ -15,16 +15,22 @@ Pane focus (Claude vs shell) is remembered when the user switches sessions and r
 ## Design Decisions
 
 ### Where the remembered pane lives (D1)
-Session-local field, persisted through `RetainedSessionState` (mirroring `shell_open: bool`), not an app-level map. Reason: focus is per-session state — each session remembers which pane it had focus when last active. This matches the model of `shell_open` and avoids app-level map growth (100+ sessions = 100+ map entries). Remote sessions store focus state in the daemon's `SessionInfo.last_focus_pane` field using the same scheme.
+Session-local field, persisted through `RetainedSessionState` (mirroring `shell_open: bool`), not an app-level map. Reason: focus is per-session state — each session remembers which pane it had focus when last active. This matches the model of `shell_open` and avoids app-level map growth (100+ sessions = 100+ map entries). Remote sessions are excluded: `toggle_shell` (app.rs:5450) handles only Standalone and local checkout rows, and `RemoteAttach` (baude/src/remote.rs:290) carries a single `parser`, so a remote row has no shell pane to focus. Attaching a remote always focuses Claude and the swap key is a no-op there. The daemon is not involved: pane focus is TUI-local state and no field is added to `SessionInfo`.
 
 ### Fallback when shell is closed or missing (D2)
 Focus falls back to Claude, exactly as `cycle_session` (app.rs:5399-5407) already does. When a session switch lands on a target with no open shell, focus is Claude. When the user closes the shell while focused on it, focus goes to Claude (toggle_shell pattern, app.rs:5464). When opening the shell again with `t` or `ctrl+\`, focus goes to Shell (existing `focus_it=true` pattern).
 
 ### Key binding for moving focus between panes (D3)
-`ctrl+/` (forward slash, Ctrl held). Collision check: the code searches for ctrl+q, ctrl+\, ctrl+e, ctrl+n, ctrl+o in handle_key (app.rs:4135-4169); alt+←/→ for cycling; sidebar keys j/k/n/c/?/z/f/q; and pane-forwarded keys. `ctrl+/` does not appear anywhere. It is not assigned in the README, not in the help overlay, and not in app.rs handle_key or sidebar. This key is available.
+`alt+↑` focuses the pane above (Claude) and `alt+↓` the pane below (the shell). Chosen over `ctrl+/` for three reasons:
+
+1. **Spatially true.** `pane_rects` (app.rs:563) stacks the shell BELOW Claude, so up/down names what actually happens.
+2. **Already the family.** `alt+←/→` cycles sessions (app.rs:4145-4152); `alt+↑/↓` extends the same modifier to the other axis, and `alt+↑`/`alt+↓` appear nowhere in `handle_key`, the help overlay, or the README.
+3. **No legacy-encoding trap.** `ctrl+/` reaches the terminal as raw byte 0x1F and is indistinguishable from `ctrl+7`/`ctrl+_` in legacy encoding — the same class of problem the codebase already works around for `ctrl+\`, where `is_backslash` (app.rs:153) must match BOTH `Char('\\')` and `Char('4')` because 0x1C is ambiguous. Arrow keys arrive as unambiguous CSI sequences with a modifier parameter, so no dual-match helper is needed.
+
+Inherited caveat, to be documented: `alt+↑/↓` needs the terminal to send Option/Alt as a modifier, exactly as the README already warns for `alt+←/→` (README line 143).
 
 ### Cycling behavior: Sidebar → Claude → Shell, or Claude ↔ Shell only (D4)
-Claude ↔ Shell only. The requirement says "toggles focus between the Claude pane and the expanded shell pane" — narrow reading: swap the two panes. The sidebar is unreachable from the panes with this key (ctrl+q returns to sidebar). Behavior: `ctrl+/` in Claude pane focuses Shell (if open); `ctrl+/` in Shell pane focuses Claude. In sidebar, the key is not handled (falls through, or can be no-op). When shell is not open, the key is a no-op (or does nothing from Claude either).
+Claude ↔ Shell only. The requirement says "toggles focus between the Claude pane and the expanded shell pane" — narrow reading: swap the two panes. The sidebar is unreachable from the panes with this key (ctrl+q returns to sidebar). Behavior: `alt+↓` from the Claude pane focuses the shell when one is open; `alt+↑` from the shell focuses Claude. In the sidebar both are no-ops (there is no pane focus to move). With no shell open, both are no-ops.
 
 ### Focus memory persistence: restart-proof or session-switch-only (D5)
 Session-switch-only (memory only, not persisted to disk) for Phase 16. Reason: the requirement specifies "remembered when the user switches to a different session and back" — the immediate need is session-switch continuity, not baude restart. Persisting to disk requires adding a field to `RetainedSessionState` and `RetainedStandaloneSessionState` with backward-compat serde(default), and test coverage of state-file loading. Session-only is simpler: use a runtime app field `last_focus: HashMap<SelId, Focus>` or `current_session_focus: Focus` that is populated from the session's `shell_open` state on selection and updated on focus changes.
@@ -69,7 +75,7 @@ The plan task names each changed site and states the reason (one-line).
 - Joe (2026-09-21 requirement): "no way to move focus between the Claude pane and the expanded shell pane directly; the only way is to toggle the shell pane closed and open again" → UX-01 toggles focus directly.
 - Joe (requirement): "switching to another session and back returns focus to the Claude pane, not the shell pane" → focus should be remembered per session across switch-away and switch-back.
 - Baseline: `cycle_session` preserves `Focus::Shell` only if target has open shell; Phase 16 generalizes this to all session-activation paths.
-- Key binding not yet assigned in code or README; candidates checked and `ctrl+/` confirmed free.
+- Key binding not yet assigned in code or README; `alt+↑/↓` confirmed free against handle_key, the help overlay, and the README Keys table.
 
 </specifics>
 
@@ -78,6 +84,6 @@ The plan task names each changed site and states the reason (one-line).
 
 - Focus memory surviving baude restart (Phase 16+ enhancement; requires `RetainedSessionState` field + back-compat serde).
 - Sidebar focus cycling (not in scope; requirement is pane-only).
-- Remote session focus override (remote focus comes from daemon's session state; Phase 16 sends/receives as-is).
+- Remote pane focus: out of scope by construction, remote rows have no shell pane (see D1).
 
 </deferred>
