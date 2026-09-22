@@ -670,46 +670,49 @@ pub(crate) fn inspect_process_identity(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn inspect_process_identity(
+#[repr(C)]
+#[derive(Default)]
+struct ProcBsdInfo {
+    flags: u32,
+    status: u32,
+    xstatus: u32,
     pid: u32,
-) -> std::result::Result<Option<ProcessIdentity>, String> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcBsdInfo {
-        flags: u32,
-        status: u32,
-        xstatus: u32,
-        pid: u32,
-        ppid: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        svuid: u32,
-        svgid: u32,
-        rfu_1: u32,
-        comm: [u8; 16],
-        name: [u8; 32],
-        nfiles: u32,
-        pgid: u32,
-        pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        nice: i32,
-        start_tvsec: u64,
-        start_tvusec: u64,
-    }
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            buffersize: i32,
-        ) -> i32;
-    }
-    const PROC_PIDTBSDINFO: i32 = 3;
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    ruid: u32,
+    rgid: u32,
+    svuid: u32,
+    svgid: u32,
+    rfu_1: u32,
+    comm: [u8; 16],
+    name: [u8; 32],
+    nfiles: u32,
+    pgid: u32,
+    pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    nice: i32,
+    start_tvsec: u64,
+    start_tvusec: u64,
+}
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+const PROC_PIDTBSDINFO: i32 = 3;
+
+/// One `PROC_PIDTBSDINFO` read, shared by the identity reader and the
+/// stopped-state probe. `None` means the process is gone or the read was
+/// short.
+#[cfg(target_os = "macos")]
+fn proc_bsd_info(pid: u32) -> Option<ProcBsdInfo> {
     let mut info = ProcBsdInfo::default();
     let size = std::mem::size_of::<ProcBsdInfo>();
     // SAFETY: `info` is writable for exactly `size` bytes and proc_pidinfo
@@ -723,16 +726,28 @@ pub(crate) fn inspect_process_identity(
             size as i32,
         )
     };
-    if read == 0 {
+    if read as usize != size || info.pid != pid {
+        return None;
+    }
+    Some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn proc_bsd_status(pid: u32) -> Option<u32> {
+    proc_bsd_info(pid).map(|info| info.status)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect_process_identity(
+    pid: u32,
+) -> std::result::Result<Option<ProcessIdentity>, String> {
+    let Some(info) = proc_bsd_info(pid) else {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(libc::ESRCH) => Ok(None),
             _ => Err(format!("could not inspect pid {pid}: {error}")),
         };
-    }
-    if read as usize != size || info.pid != pid {
-        return Err(format!("incomplete process identity for pid {pid}"));
-    }
+    };
     // SAFETY: getsid only reads kernel process metadata for the supplied pid.
     let session = unsafe { libc::getsid(pid as i32) };
     if session < 0 {
@@ -751,6 +766,38 @@ pub(crate) fn inspect_process_identity(
         process_group: info.pgid as i32,
         session,
     }))
+}
+
+/// Whether this platform can cheaply read a process's job-control state.
+/// When false, [`process_is_stopped`] always answers `None` and callers must
+/// skip confirmation rather than block.
+pub(crate) const STOP_PROBE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// Is this pid currently in the stopped (job-control `T`) state?
+///
+/// `None` means *unknown right now*, not "no": on macOS a `proc_pidinfo` read
+/// can come back short while the process is part-way through `exec`, which is
+/// precisely the window where a stop gets lost. Callers must keep asking
+/// rather than read `None` as success — treating it as success is what let a
+/// running child be reported as suspended.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_stopped(pid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let state = stat[end + 1..].split_whitespace().next()?;
+    Some(state == "T")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_is_stopped(pid: u32) -> Option<bool> {
+    // SSTOP from <sys/proc.h>: the process is stopped for job control.
+    const SSTOP: u32 = 4;
+    proc_bsd_status(pid).map(|status| status == SSTOP)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_is_stopped(_pid: u32) -> Option<bool> {
+    None
 }
 
 fn signal_process_group(

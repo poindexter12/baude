@@ -629,11 +629,46 @@ impl Pty {
         Ok(())
     }
 
-    /// SIGSTOP the verified child (and its process group when it leads one).
+    /// SIGSTOP the verified child (and its process group when it leads one),
+    /// then CONFIRM the stop stuck before reporting success.
+    ///
+    /// Confirmation is not belt-and-braces. Two things swallow a stop. A
+    /// freshly released child is usually part-way through `exec`ing the real
+    /// command, and a stop aimed at that transition can be lost. An
+    /// interactive shell's job-control startup can also leave the process
+    /// running again shortly after it stopped. Either way `kill` returns 0,
+    /// the session is recorded as suspended, and the child keeps running and
+    /// keeps burning battery — the exact cost this feature exists to remove.
+    /// So we re-signal until the process reads stopped on two consecutive
+    /// probes, or fail honestly.
     #[cfg(unix)]
     pub fn suspend(&self) -> Result<()> {
-        self.signal_verified(libc::SIGSTOP)
+        let pid = self.process_identity().pid;
+        if !crate::session::STOP_PROBE_SUPPORTED {
+            return self.signal_verified(libc::SIGSTOP);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut settled = 0u8;
+        loop {
+            if crate::session::process_is_stopped(pid) == Some(true) {
+                settled += 1;
+                // Two consecutive stopped reads: a child that stops and then
+                // resumes itself during job-control setup fails this and gets
+                // signalled again.
+                if settled >= 2 {
+                    return Ok(());
+                }
+            } else {
+                settled = 0;
+                self.signal_verified(libc::SIGSTOP)?;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("child {pid} would not stay stopped");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
+
     #[cfg(not(unix))]
     pub fn suspend(&self) -> Result<()> {
         Ok(())

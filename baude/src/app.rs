@@ -2658,6 +2658,11 @@ impl App {
             lifecycle::ReopenDispatch::Restart { id } => {
                 self.restart_session_with_mode(id, plan.mode)?;
                 self.selected_id = Some(SelId::Checkout(checkout_key));
+                // UX-01: land on the pane this session was last left on. The
+                // sibling Focus and Spawn branches do the same; omitting it
+                // here left a restarted session on whatever pane the previous
+                // selection used (CR-01).
+                self.restore_pane_focus();
                 Ok(LifecycleOutcome::Reopened {
                     checkout: checkout_key,
                     runtime: id,
@@ -11828,6 +11833,42 @@ mod tests {
         assert!(!app.session(runtime).unwrap().pane_focus_shell);
         app.restore_pane_focus();
         assert_eq!(app.focus, Focus::Claude, "no shell, no shell focus");
+        app.kill_all();
+    }
+
+    #[test]
+    fn restarting_an_exited_session_restores_its_pane() {
+        // CR-01 from the phase 16 review: the Restart dispatch branch was the
+        // only one of three that skipped restore_pane_focus(), so pressing `r`
+        // on an exited session left focus wherever the previous selection was.
+        let _scope = isolation_scope("pane-focus-restart");
+        let (_fixture, mut app, runtime) = pane_focus_app("pane-focus-restart");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Shell, "precondition: shell focused");
+        app.remember_pane_focus();
+
+        // The agent exits; the user steps back to the sidebar and presses `r`.
+        app.session_mut(runtime).unwrap().claude.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.session(runtime).unwrap().claude.is_exited() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.focus = Focus::Sidebar;
+        let checkout = app.repository_state.checkouts[0].key;
+        // An exited runtime makes the lifecycle plan a Restart dispatch
+        // (lifecycle.rs: ReopenRuntime::Exited -> ReopenDispatch::Restart).
+        let outcome = app.reopen_checkout(checkout).unwrap();
+        assert!(
+            matches!(outcome, LifecycleOutcome::Reopened { .. }),
+            "expected the Restart dispatch, got {outcome:?}"
+        );
+
+        assert_eq!(
+            app.focus,
+            Focus::Shell,
+            "a restarted session lands on the pane it was left on"
+        );
         app.kill_all();
     }
 
