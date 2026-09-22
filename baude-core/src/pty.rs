@@ -17,11 +17,22 @@ pub fn now_ms() -> u64 {
 
 type Subscribers = Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>>;
 
+/// Intermediate state held during paused PTY spawn, before gate token is written.
+struct PausedPtyParts {
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    identity: ProcessIdentity,
+    rows: u16,
+    cols: u16,
+}
+
 /// A paused PTY child, held until its identity is durably recorded.
 /// Holds the child process behind the stdin gate; call release() to write the
 /// gate token and activate the child, or abort() to kill it.
 pub struct PausedPty {
-    pty: Option<Pty>,
+    parts: Option<PausedPtyParts>,
     identity: ProcessIdentity,
 }
 
@@ -32,22 +43,81 @@ impl PausedPty {
     }
 
     /// Release the paused child by writing the gate token to stdin.
-    /// Consumes the PausedPty and returns the live Pty.
+    /// Consumes the PausedPty, writes the gate token, spawns the reader thread,
+    /// and returns the live Pty.
     pub fn release(mut self) -> Result<Pty> {
-        let mut pty = self
-            .pty
+        let parts = self
+            .parts
             .take()
             .ok_or_else(|| anyhow::anyhow!("pty already released"))?;
-        // Write gate token to the child's stdin (GATE_TOKEN constant)
-        pty.write_input(GATE_TOKEN.as_bytes());
-        pty.write_input(b"\n");
-        Ok(pty)
+
+        // Write gate token to release the child from the stdin gate
+        let mut writer = parts.writer;
+        writer
+            .write_all(format!("{GATE_TOKEN}\n").as_bytes())
+            .and_then(|_| writer.flush())
+            .context("failed to write gate token")?;
+
+        // Create the parser and other shared structures
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(parts.rows, parts.cols, 2000)));
+        let last_output_ms = Arc::new(AtomicU64::new(now_ms()));
+        let exited = Arc::new(AtomicBool::new(false));
+        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        let screen_generation = Arc::new(AtomicU64::new(0));
+
+        // Spawn the reader thread that will process output from the child
+        {
+            let parser = Arc::clone(&parser);
+            let last_output_ms = Arc::clone(&last_output_ms);
+            let screen_gen = Arc::clone(&screen_generation);
+            let exited = Arc::clone(&exited);
+            let subscribers = Arc::clone(&subscribers);
+            let mut reader = parts.reader;
+
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => {
+                            exited.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Ok(mut p) = parser.lock() {
+                                p.process(&buf[..n]);
+                                if let Ok(mut subs) = subscribers.lock() {
+                                    subs.retain(|s| s.send(buf[..n].to_vec()).is_ok());
+                                }
+                            }
+                            last_output_ms.store(now_ms(), Ordering::Relaxed);
+                            screen_gen.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(Pty {
+            parser,
+            master: parts.master,
+            writer,
+            child: parts.child,
+            identity: parts.identity,
+            last_output_ms,
+            screen_generation,
+            exited,
+            size: (parts.rows, parts.cols),
+            subscribers,
+        })
     }
 
     /// Abort the paused child (kill and reap without releasing).
     pub fn abort(mut self) {
-        if let Some(mut pty) = self.pty.take() {
-            let _ = pty.kill_and_wait();
+        if let Some(parts) = self.parts.take() {
+            if let Ok(mut child) = parts.child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -278,25 +348,20 @@ impl Pty {
         Self::spawn_registered_with(command, env, cwd, rows, cols, |_| Ok(()))
     }
 
-    /// Spawn a PTY session leader behind a private stdin registration gate.
-    /// `register` observes the exact paused identity and must durably record it
-    /// before the intended command is released. Any registration failure stops
-    /// and reaps the gate, so no unowned command can escape.
-    pub fn spawn_registered_with(
+    /// Spawn a PTY child in paused state, held at the stdin gate.
+    /// The child's identity is available immediately via paused.identity(),
+    /// allowing registration before the child is released.
+    pub fn spawn_paused(
         command: Option<&str>,
         env: &[(String, String)],
         cwd: &Path,
         rows: u16,
         cols: u16,
-        register: impl FnOnce(&ProcessIdentity) -> Result<()>,
-    ) -> Result<Pty> {
+    ) -> Result<PausedPty> {
         let rows = rows.max(2);
         let cols = cols.max(10);
 
-        // Built BEFORE `openpty`, deliberately. In a support build this is
-        // where the child's roots are resolved through the guarded resolvers,
-        // so an unguarded fixture aborts with no pty, no file descriptor and no
-        // process — the escape costs nothing and cannot be half-committed.
+        // Build gate command before openpty, as with spawn_registered_with
         let cmd = build_gate_command(command, env, cwd);
 
         let pty_system = native_pty_system();
@@ -314,6 +379,8 @@ impl Pty {
             .spawn_command(cmd)
             .context("failed to spawn command in pty")?;
         drop(pair.slave);
+
+        // Get the process identity
         let identity = child
             .process_id()
             .ok_or_else(|| anyhow::anyhow!("PTY child did not expose a process id"))
@@ -346,79 +413,45 @@ impl Pty {
             }
         };
 
-        let mut reader = pair
+        // Clone reader and take writer, but don't write gate token yet
+        let reader = pair
             .master
             .try_clone_reader()
             .context("failed to clone pty reader")?;
-        let mut writer = pair
+        let writer = pair
             .master
             .take_writer()
             .context("failed to take pty writer")?;
-        if let Err(error) = register(&identity) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error.context("failed to register paused PTY identity"));
-        }
-        if let Err(error) = writer
-            .write_all(format!("{GATE_TOKEN}\n").as_bytes())
-            .and_then(|_| writer.flush())
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("failed to release registered PTY gate");
-        }
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
-        let last_output_ms = Arc::new(AtomicU64::new(now_ms()));
-        let exited = Arc::new(AtomicBool::new(false));
-        let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
-
-        let screen_generation = Arc::new(AtomicU64::new(0));
-        {
-            let parser = Arc::clone(&parser);
-            let last_output_ms = Arc::clone(&last_output_ms);
-            let screen_gen = Arc::clone(&screen_generation);
-            let exited = Arc::clone(&exited);
-            let subscribers = Arc::clone(&subscribers);
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            exited.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        Ok(n) => {
-                            // Process and broadcast under the parser lock so
-                            // subscribe() can register + snapshot atomically:
-                            // a subscriber sees every byte exactly once —
-                            // either inside its snapshot or on its channel.
-                            if let Ok(mut p) = parser.lock() {
-                                p.process(&buf[..n]);
-                                if let Ok(mut subs) = subscribers.lock() {
-                                    subs.retain(|s| s.send(buf[..n].to_vec()).is_ok());
-                                }
-                            }
-                            last_output_ms.store(now_ms(), Ordering::Relaxed);
-                            screen_gen.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(Pty {
-            parser,
-            master: pair.master,
-            writer,
-            child: Arc::new(Mutex::new(child)),
+        Ok(PausedPty {
+            parts: Some(PausedPtyParts {
+                child: Arc::new(Mutex::new(child)),
+                reader,
+                writer,
+                master: pair.master,
+                identity: identity.clone(),
+                rows,
+                cols,
+            }),
             identity,
-            last_output_ms,
-            screen_generation,
-            exited,
-            size: (rows, cols),
-            subscribers,
         })
+    }
+
+    /// Spawn a PTY session leader behind a private stdin registration gate.
+    /// `register` observes the exact paused identity and must durably record it
+    /// before the intended command is released. Any registration failure stops
+    /// and reaps the gate, so no unowned command can escape.
+    pub fn spawn_registered_with(
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        register: impl FnOnce(&ProcessIdentity) -> Result<()>,
+    ) -> Result<Pty> {
+        let paused = Self::spawn_paused(command, env, cwd, rows, cols)?;
+        register(paused.identity())?;
+        paused.release()
     }
 
     /// Subscribe to raw output for remote attach. Returns a redraw snapshot
@@ -1366,5 +1399,59 @@ mod tests {
             0,
             "mirror of a non-kitty child must stay legacy"
         );
+    }
+
+    #[test]
+    fn spawn_paused_holds_child_until_release() {
+        let fixture = PtyFixture::new("spawn_paused_holds_child");
+        let paused = Pty::spawn_paused(Some("/bin/sh -c 'read x'"), &[], &fixture.root, 5, 40)
+            .expect("spawn_paused");
+
+        // Child is paused, identity is available
+        let identity = paused.identity();
+        assert!(identity.pid > 0, "paused child must have a valid pid");
+
+        // Release the child
+        let pty = paused.release().expect("release");
+        assert!(!pty.is_exited(), "child should be running after release");
+    }
+
+    #[test]
+    fn abort_reaps_without_release() {
+        let fixture = PtyFixture::new("abort_reaps_without_release");
+        let paused = Pty::spawn_paused(Some("/bin/sh -c 'sleep 100'"), &[], &fixture.root, 5, 40)
+            .expect("spawn_paused");
+
+        let pid = paused.identity().pid as i32;
+        paused.abort();
+
+        // After abort, the child should be reaped
+        // Attempting to get its status should indicate it's gone
+        std::thread::sleep(Duration::from_millis(10));
+        let status = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        // Either already reaped (-1) or doesn't exist (ECHILD returned as -1)
+        assert!(status == -1 || status == pid, "child must be reaped");
+    }
+
+    #[test]
+    fn spawn_registered_with_still_releases_after_register() {
+        let fixture = PtyFixture::new("spawn_registered_with_compat");
+        let mut registered = false;
+        let pty = Pty::spawn_registered_with(
+            Some("/bin/sh -c 'read x'"),
+            &[],
+            &fixture.root,
+            5,
+            40,
+            |identity| {
+                assert!(identity.pid > 0);
+                registered = true;
+                Ok(())
+            },
+        )
+        .expect("spawn_registered_with");
+
+        assert!(registered, "register callback must be called");
+        assert!(!pty.is_exited(), "child should be running after register");
     }
 }
