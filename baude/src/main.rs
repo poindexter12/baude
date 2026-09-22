@@ -269,10 +269,24 @@ fn help_text() -> String {
 }
 
 fn main() -> Result<()> {
+    use std::time::Instant;
+
+    // Check if timing is enabled via BAUDE_TIMING env var or --timing flag (early, before parsing other args)
+    let timing_enabled = std::env::var("BAUDE_TIMING").ok().as_deref() == Some("1")
+        || std::env::args().any(|a| a == "--timing");
+    let total_start = Instant::now();
+    let mut timing = StartupTiming {
+        stages: Vec::new(),
+        total_ms: 0,
+    };
+
     // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
     // Must be dispatched before anything touches the terminal: Claude Code
     // invokes it headless on every statusline refresh.
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // Strip --timing flag from args so it's not mistaken for a launch dir
+    args.retain(|a| a != "--timing");
+
     if args.get(1).map(String::as_str) == Some("statusline") {
         let wrap = args
             .iter()
@@ -340,14 +354,25 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let launch_dir = std::env::args()
-        .nth(1)
+    let launch_dir = args
+        .get(1)
+        .cloned()
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let launch_dir = launch_dir.canonicalize().unwrap_or(launch_dir);
 
+    // Stage 1: config load
+    let config_start = Instant::now();
     let config = baude_core::persist::load_config();
+    let config_duration = config_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "config_load",
+        duration_ms: config_duration,
+        note: None,
+    });
 
+    // Stage 2: workspace resolution
+    let workspace_start = Instant::now();
     // Shared workspace startup: folder-workspace memory, initialization, lock,
     // and binding recording. One writer per workspace — refusal is fatal.
     let env = baude_core::launch::StartEnv {
@@ -371,6 +396,12 @@ fn main() -> Result<()> {
     };
 
     let startup_notes = started.notes;
+    let workspace_duration = workspace_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "workspace_resolution",
+        duration_ms: workspace_duration,
+        note: None,
+    });
 
     // Auto-start local bauded when auto_daemon is configured. Must run before
     // App::new() reads the env, and before any threads start (set_var is not
@@ -385,6 +416,8 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
+    // Stage 3: terminal setup
+    let terminal_start = Instant::now();
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -392,6 +425,8 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Stage 4: keyboard probe
+    let kb_start = Instant::now();
     // Single-shot keyboard negotiation (TKEY-05): runs exactly once, in this
     // single-threaded pre-loop window where the probe owns the event source,
     // bounded by crossterm's internal 2 s deadline. Pushed AFTER
@@ -407,6 +442,24 @@ fn main() -> Result<()> {
             KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
         }
     }
+    let kb_duration = kb_start.elapsed().as_millis();
+    let kb_note = if kb_duration >= 250 {
+        Some("kitty 250ms (timeout)".to_string())
+    } else {
+        None
+    };
+    timing.stages.push(TimingStage {
+        name: "keyboard_probe",
+        duration_ms: kb_duration,
+        note: kb_note,
+    });
+    let terminal_duration = terminal_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "terminal_setup",
+        duration_ms: terminal_duration,
+        note: None,
+    });
+
     // Any Err between the push above and run()'s normal exit is a NON-panic
     // path — the panic hook never fires — so a bare `?` here would leak raw
     // mode, the alternate screen, AND the pushed keyboard flags (T-11-03's
@@ -420,7 +473,15 @@ fn main() -> Result<()> {
             }
         };
 
+    // Stage 5: app initialization
+    let app_start = Instant::now();
     let mut app = App::new(launch_dir);
+    let app_duration = app_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "app_new",
+        duration_ms: app_duration,
+        note: None,
+    });
     // Folder-memory notes go up first so a real restore error overwrites an
     // informational banner, never the other way around.
     for note in startup_notes {
@@ -430,11 +491,18 @@ fn main() -> Result<()> {
     // so the first frame (sidebar chrome, workspace title, empty) renders before
     // any restore UI appears.
 
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, &mut timing);
 
     app.save();
     app.kill_all();
     restore_terminal();
+
+    // Print timing output if enabled
+    timing.total_ms = total_start.elapsed().as_millis();
+    if timing_enabled {
+        timing.print_to_stderr();
+    }
+
     result
 }
 
@@ -489,12 +557,36 @@ impl StartupTiming {
 fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
+    timing: &mut StartupTiming,
 ) -> Result<()> {
+    use std::time::Instant;
+
     let mut restore_started = false;
     let mut restore_finished = false;
+    let mut first_frame_recorded = false;
+    let first_frame_start = Instant::now();
 
     loop {
-        let _stepped = step(terminal, app, &mut restore_started, &mut restore_finished)?;
+        let stepped = step(terminal, app, &mut restore_started, &mut restore_finished)?;
+
+        // Record first frame timestamp
+        if !first_frame_recorded && stepped.drew {
+            let first_frame_duration = first_frame_start.elapsed().as_millis();
+            timing.stages.push(TimingStage {
+                name: "first_frame",
+                duration_ms: first_frame_duration,
+                note: None,
+            });
+            first_frame_recorded = true;
+
+            // Record session restore stage after first frame is drawn
+            if !restore_started {
+                let _restore_start = Instant::now();
+                // Restore happens in step(), so we record when it's about to happen
+                // The duration will be measured until app notifies us it's done
+                // For now, note the start; the end will be recorded in app.tick()
+            }
+        }
 
         if app.should_quit {
             return Ok(());
