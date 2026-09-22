@@ -112,8 +112,17 @@ pub fn write_marker(dir: &Path, meta: &MarkerMetadata) -> Result<MarkerWrite, Ma
             Ok(MarkerWrite::Created)
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Marker already exists; read it and compare ownership
-            match read_marker(dir) {
+            // Marker already exists; read it and compare ownership.
+            //
+            // `create_new` is atomic, but creating the file and writing its
+            // contents are two steps. A racing process that loses the create
+            // can therefore observe a ZERO-LENGTH marker the winner has not
+            // filled in yet, read it as invalid, and conclude "unknown owner"
+            // — which makes the caller allocate a suffixed directory for a
+            // repository baude already owns. Linux CI caught this; macOS
+            // timing hid it. Give the winner a bounded moment to finish
+            // before believing an unreadable marker.
+            match read_marker_settled(dir) {
                 Ok(MarkerRead::Valid(existing)) => {
                     if existing.canonical_common_dir == meta.canonical_common_dir {
                         Ok(MarkerWrite::AlreadyOwned(existing))
@@ -138,6 +147,27 @@ pub fn write_marker(dir: &Path, meta: &MarkerMetadata) -> Result<MarkerWrite, Ma
             format!("Failed to create marker: {}", e),
         ))),
     }
+}
+
+/// [`read_marker`], retried briefly while the marker looks half-written.
+///
+/// Only the transient shapes are retried — a missing file, or one that does
+/// not parse yet. A marker that is still unreadable after the window is
+/// returned as-is, so a genuinely corrupt marker is reported exactly as
+/// before, just ~100 ms later.
+fn read_marker_settled(dir: &Path) -> io::Result<MarkerRead> {
+    const ATTEMPTS: u32 = 10;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut last = read_marker(dir);
+    for _ in 1..ATTEMPTS {
+        match &last {
+            Ok(MarkerRead::Valid(_)) => return last,
+            Ok(MarkerRead::Missing) | Ok(MarkerRead::Invalid(_)) | Err(_) => {}
+        }
+        std::thread::sleep(PAUSE);
+        last = read_marker(dir);
+    }
+    last
 }
 
 /// Read a marker file from a directory.

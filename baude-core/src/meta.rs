@@ -223,6 +223,15 @@ pub struct ClaudeMeta {
     /// Last recorded modification time of hook-events.jsonl. Used to gate reads:
     /// if mtime unchanged, skip read (cost: one stat call only).
     pub last_events_mtime: Option<SystemTime>,
+    /// Sizes seen alongside the mtimes above. mtime ALONE is not a safe gate:
+    /// filesystem timestamp granularity is coarse enough (notably on Linux,
+    /// where CI caught this; macOS APFS hides it with nanosecond stamps) that
+    /// two writes can land in one tick, and a gate that trusts mtime then
+    /// skips a file that really grew. Dropping a `Stop` event that way leaves
+    /// a finished session rendered as busy until something else happens to
+    /// move the mtime. Both sizes must match too before a read is skipped.
+    pub last_session_len: Option<u64>,
+    pub last_events_len: Option<u64>,
 }
 
 impl ClaudeMeta {
@@ -293,15 +302,22 @@ impl ClaudeMeta {
             return;
         };
 
-        // Exact pid match path with mtime gate
-        let session_mtime = fs::metadata(&session_file).and_then(|m| m.modified()).ok();
-        if session_mtime == self.last_session_mtime {
+        // Exact pid match path, gated on mtime AND size (see the field docs:
+        // mtime alone is unsafe at filesystem timestamp granularity).
+        let session_meta = fs::metadata(&session_file).ok();
+        let session_mtime = session_meta.as_ref().and_then(|m| m.modified().ok());
+        let session_len = session_meta.as_ref().map(|m| m.len());
+        if session_mtime.is_some()
+            && session_mtime == self.last_session_mtime
+            && session_len == self.last_session_len
+        {
             return; // Unchanged, skip read
         }
 
         if let Some(v) = read_json(&session_file) {
             self.apply_session_file(&v);
             self.last_session_mtime = session_mtime;
+            self.last_session_len = session_len;
         }
     }
 
@@ -499,9 +515,16 @@ impl ClaudeMeta {
             self.activity.clear();
         }
 
-        // Gate on mtime: if events file mtime unchanged since last poll, skip read
-        let events_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if events_mtime == self.last_events_mtime {
+        // Gate on mtime AND size. The size is the load-bearing half: this file
+        // is append-only, so a growth the mtime failed to register is exactly
+        // the case that must still be read (see the field docs).
+        let events_meta = fs::metadata(&path).ok();
+        let events_mtime = events_meta.as_ref().and_then(|m| m.modified().ok());
+        let events_len = events_meta.as_ref().map(|m| m.len());
+        if events_mtime.is_some()
+            && events_mtime == self.last_events_mtime
+            && events_len == self.last_events_len
+        {
             return; // Unchanged, skip read
         }
 
@@ -566,8 +589,9 @@ impl ClaudeMeta {
             }
         }
         self.offset_events += consumed as u64;
-        // Update mtime tracking after successful read
+        // Record both halves of the gate after a successful read.
         self.last_events_mtime = events_mtime;
+        self.last_events_len = events_len;
     }
 
     /// Context usage bridge file written by statusline hooks (e.g. the GSD
@@ -1525,14 +1549,48 @@ mod tests {
     fn mtime_gate_tracks_last_session_mtime() {
         // Metadata mtime tracking should prevent reads when mtime unchanged
         let mut meta = ClaudeMeta::default();
-        // Verify mtime fields exist and start as None
         assert_eq!(meta.last_session_mtime, None);
         assert_eq!(meta.last_events_mtime, None);
-        // Setting them should work
-        let t = std::time::SystemTime::now();
-        meta.last_session_mtime = Some(t);
-        meta.last_events_mtime = Some(t);
-        assert_eq!(meta.last_session_mtime, Some(t));
-        assert_eq!(meta.last_events_mtime, Some(t));
+        assert_eq!(meta.last_session_len, None);
+        assert_eq!(meta.last_events_len, None);
+
+        // The hazard the size half exists for: two appends inside one
+        // filesystem timestamp tick. Pin the mtime to a fixed value so the
+        // test reproduces coarse-granularity behaviour on any filesystem,
+        // then confirm a grown file is still read.
+        let dir = std::env::temp_dir().join(format!(
+            "baude-meta-gate-{}-{}",
+            std::process::id(),
+            "same-tick"
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("hook-events.jsonl");
+        fs::write(&path, b"{\"schema\":1,\"event\":\"Stop\",\"ts\":1}\n").unwrap();
+        let frozen = fs::metadata(&path).unwrap().modified().unwrap();
+        let first_len = fs::metadata(&path).unwrap().len();
+        meta.last_events_mtime = Some(frozen);
+        meta.last_events_len = Some(first_len);
+
+        // Append more, then force the mtime back to the recorded value: the
+        // file grew but the clock did not move.
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"schema\":1,\"event\":\"Stop\",\"ts\":2}\n")
+            .unwrap();
+        drop(f);
+        let grown_len = fs::metadata(&path).unwrap().len();
+        assert!(grown_len > first_len, "the append must have grown the file");
+
+        let mtime_unchanged = Some(frozen) == meta.last_events_mtime;
+        let len_unchanged = Some(grown_len) == meta.last_events_len;
+        assert!(
+            mtime_unchanged && !len_unchanged,
+            "the scenario under test is: mtime says unchanged, size says grown"
+        );
+        assert!(
+            !(mtime_unchanged && len_unchanged),
+            "an mtime-only gate would skip this read and lose the second Stop event"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
