@@ -90,8 +90,7 @@ use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::crossterm::{execute, queue};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +106,7 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 /// affirmative probe enables enhanced mode. `Err` — crossterm's internal 2 s
 /// deadline elapsing, no tty, Windows — means unsupported means legacy; probe
 /// failures never kill a session (TKEY-05).
+#[allow(dead_code)]
 fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
     matches!(probe(), Ok(true))
 }
@@ -533,11 +533,13 @@ fn main() -> Result<()> {
     let kb_start = Instant::now();
     // Single-shot keyboard negotiation (TKEY-05): runs exactly once, in this
     // single-threaded pre-loop window where the probe owns the event source,
-    // bounded by crossterm's internal 2 s deadline. Pushed AFTER
-    // EnterAlternateScreen so push and pop hit the same per-screen kitty
-    // stack. DISAMBIGUATE only — the REPORT_* flags change other keys' wire
-    // forms and would break the TKEY-02 byte freeze.
-    if negotiate_keyboard(supports_keyboard_enhancement) {
+    // bounded to 250 ms. Pushed AFTER EnterAlternateScreen so push and pop hit
+    // the same per-screen kitty stack. DISAMBIGUATE only — the REPORT_* flags
+    // change other keys' wire forms and would break the TKEY-02 byte freeze.
+    let kb_supported = negotiate_keyboard_bounded(250, || {
+        probe_keyboard_enhancement(&mut StdinProbeIo, Duration::from_millis(250))
+    });
+    if kb_supported {
         let pushed = execute!(
             stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -2698,10 +2700,7 @@ mod keyboard_negotiation_tests {
                 &mut self,
                 _remaining: Duration,
             ) -> std::io::Result<Option<Vec<u8>>> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "read failed",
-                ))
+                Err(std::io::Error::other("read failed"))
             }
         }
         let mut io = ErrorProbeIo;
