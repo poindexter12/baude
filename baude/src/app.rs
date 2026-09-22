@@ -773,6 +773,7 @@ impl App {
             false
         };
 
+        let usage_poll_secs = config.usage_poll_secs();
         App {
             sessions: Vec::new(),
             selected_id: None,
@@ -787,7 +788,7 @@ impl App {
             next_id: 1,
             last_meta_poll: 0,
             polled_meta_once: false,
-            usage: UsagePoller::start(),
+            usage: UsagePoller::start(usage_poll_secs),
             remote,
             remote_snap: RemoteSnapshot::default(),
             remote_snap_prev: RemoteSnapshot::default(),
@@ -6897,7 +6898,7 @@ mod tests {
 
             // Direct construction must be protected too: the guarantee is a
             // property of the poller, not of one blessed helper.
-            let poller = crate::usage::UsagePoller::start();
+            let poller = crate::usage::UsagePoller::start(Some(60));
             assert!(
                 poller.is_inert_for_test(),
                 "a directly constructed UsagePoller still spawned a worker"

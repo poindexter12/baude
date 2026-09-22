@@ -54,16 +54,24 @@ impl UsagePoller {
     /// No thread, no `date`, no `ccusage`. Same signature as the live one, so
     /// no caller — and no fixture — can tell them apart or bypass this.
     #[cfg(test)]
-    pub fn start() -> UsagePoller {
+    pub fn start(config_poll_secs: Option<u64>) -> UsagePoller {
         UsagePoller {
             data: Arc::new(Mutex::new(UsageCosts::default())),
         }
     }
 
     #[cfg(not(test))]
-    pub fn start() -> UsagePoller {
+    pub fn start(config_poll_secs: Option<u64>) -> UsagePoller {
         let data = Arc::new(Mutex::new(UsageCosts::default()));
+
+        // If disabled (Some(0)), return inert poller without spawning thread
+        if config_poll_secs == Some(0) {
+            return UsagePoller { data };
+        }
+
         let shared = Arc::clone(&data);
+        let poll_interval = config_poll_secs.unwrap_or(POLL_SECS);
+
         std::thread::spawn(move || loop {
             let costs = fetch();
             let ok = costs.today_usd.is_some() || costs.week_usd.is_some();
@@ -71,7 +79,7 @@ impl UsagePoller {
                 *d = costs;
             }
             std::thread::sleep(Duration::from_secs(if ok {
-                POLL_SECS
+                poll_interval
             } else {
                 FAIL_POLL_SECS
             }));
