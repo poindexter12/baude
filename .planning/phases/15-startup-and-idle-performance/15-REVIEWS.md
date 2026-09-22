@@ -306,3 +306,12 @@ Cycle 3 should be scheduled after design revision. Plans are well-intentioned an
 Generated with Claude Code
 
 Co-Authored-By: iArx Claude Code <claude-code@iarx.com>
+
+## Convergence Outcome (2026-09-21)
+
+| Cycle | Reviewer | current_high | current_actionable | Replan commits |
+|-------|----------|--------------|--------------------|----------------|
+| 1 | codex | 5 | 8 | e2910a2, 21ca40b, 726351c (orchestrator: verify/behavior alignment) |
+| 2 | codex | 15 | 7 | targeted final fix (see the commit following this record) |
+
+Stalled at cycle 2 (13 -> 22 unresolved). Two cycle 2 HIGHs contradicted plan text the checker had verified (daemon archive scope and identity verification were already present in 15-03) and are rejected with line evidence in the plan ledgers; the rest were real and are resolved in the targeted fix: a `PausedPty` handle so restore can spawn paused and release after one durable save, batched first-frame-gated Phase A, a single raw-fd probe story, daemon timing ownership, an `AtomicU64` screen generation on the PTY, shell PTYs under the idle policy, archive transaction ordering, the remote `suspended` wire field, metadata sources enumerated from code, a pure `poller_plan` for the test-only poller stub, and real rendering tests in 15-04. Joe chose "fix the design-level HIGHs, then execute" at the identical stall point in Phases 13 and 14; the orchestrator applied that precedent here without a third prompt and told him so, with the option to request a cycle 3 instead.
