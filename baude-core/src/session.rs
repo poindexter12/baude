@@ -696,6 +696,10 @@ struct ProcBsdInfo {
     start_tvsec: u64,
     start_tvusec: u64,
 }
+// Gated per item, not once for the group: a single `#[cfg]` applies only to
+// the item that follows it, so gating just the struct above left this `-lproc`
+// link directive compiling on Linux and broke the build there.
+#[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
     fn proc_pidinfo(
@@ -706,6 +710,7 @@ unsafe extern "C" {
         buffersize: i32,
     ) -> i32;
 }
+#[cfg(target_os = "macos")]
 const PROC_PIDTBSDINFO: i32 = 3;
 
 /// One `PROC_PIDTBSDINFO` read, shared by the identity reader and the
