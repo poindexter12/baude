@@ -1,5 +1,68 @@
 # Changelog
 
+## [2.2.0](https://github.com/poindexter12/baude/compare/v2.1.5...v2.2.0) (2026-09-17)
+
+
+### Features
+
+* **08-01:** gate baude_core::testing behind test-support and redirect config_base ([5057c2f](https://github.com/poindexter12/baude/commit/5057c2fd644009a1d70f64ba9abcb66c8b825f7d))
+* **08-01:** unify fixture redirects behind TestRedirect and delete the setters ([7c7abdd](https://github.com/poindexter12/baude/commit/7c7abdd469bcfe1d0a0688afbb9b58ba345de68d))
+* **08-02:** make meta::claude_config_dir redirect-aware and contained ([43880ef](https://github.com/poindexter12/baude/commit/43880ef0c485b8c68cb133614870fd16613deced))
+* **08-02:** route the push stores through the shared config resolver ([39a158e](https://github.com/poindexter12/baude/commit/39a158e29df96d8399319c15f7bbe581635eccff))
+* **08-03:** give app and API fixture owners their own literal identities ([aca9eed](https://github.com/poindexter12/baude/commit/aca9eed705ee21ca0b8eb3d186c73af8ff2610a2))
+* **08-03:** give every remaining app.rs App site a root and identity owner ([08ee473](https://github.com/poindexter12/baude/commit/08ee473487deaca5a066263e5b671bbf1f07b88b))
+* **08-03:** initialize workspace identity at the daemon entry point ([29fe659](https://github.com/poindexter12/baude/commit/29fe65908540dc213cf9887f09578d676d2536ef))
+* **08-03:** make the API router and manager helpers demand an isolation owner ([cbbedb6](https://github.com/poindexter12/baude/commit/cbbedb6452bd4d7a880905a5b51fb6689194bcc3))
+* **08-03:** own root and identity in every UI fixture ([a72075b](https://github.com/poindexter12/baude/commit/a72075ba56deb11ada5774c92eddae76d50c9a32))
+* **08-03:** resolve workspace identity per fixture ahead of the production cache ([daecf0a](https://github.com/poindexter12/baude/commit/daecf0ad6b585204780e3edf71a986c403e14aa9))
+* **08-04:** enumerate and classify the managed worktrees root read-only ([569fe65](https://github.com/poindexter12/baude/commit/569fe6572522085ef93726bfbbb00b71c68e4d9a))
+* **08-04:** implement the agreed removal-authorization predicate ([73001ba](https://github.com/poindexter12/baude/commit/73001babc674916b093ff3b5e9a7a79a814ad253))
+* **08-05:** cross-reference persisted state as ownership evidence ([3139f41](https://github.com/poindexter12/baude/commit/3139f41ce4ae0e69c72abac3e67a3f93021f0d7c))
+* **08-05:** re-verify every approved fact before removing anything ([2c35087](https://github.com/poindexter12/baude/commit/2c35087ace26369de57806605af8174a8478e1ac))
+* **08-06:** assert a suite run leaves the three real roots untouched ([6b9a0dc](https://github.com/poindexter12/baude/commit/6b9a0dc015e5ec9442c3c0e526dc1d2e04725cc2))
+* **08-06:** hold the redirect and identity as fixture fields ([77df5de](https://github.com/poindexter12/baude/commit/77df5de500a534ce368fc6a01b2ce2dd476d2306))
+* **08-07:** give the leak scan an operator-facing preview surface ([10d517e](https://github.com/poindexter12/baude/commit/10d517e192eb5f1c76337458e89890b5617ea00a))
+* **08-08:** contain the PTY child's environment in support builds ([2c49ea0](https://github.com/poindexter12/baude/commit/2c49ea0e5da28ebd5fec90553a67f44d2c37b4f3))
+* **08-08:** make an App's ambient readers inert in test builds ([55466ca](https://github.com/poindexter12/baude/commit/55466caced90bd82f1803ac2019e599ae71b3f9b))
+* **09-01:** guard seed_settings against unsafe settings files (HREG-03) ([948cad3](https://github.com/poindexter12/baude/commit/948cad3f36767d2d8cbc693d23ed4e77a45d9234))
+* **09-03:** implement quoted hook command + round-trip recognizer ([d8a4ce2](https://github.com/poindexter12/baude/commit/d8a4ce22200b0bcc66ba06adf777ccdd0a5e92fe))
+* **09-04:** guard .mcp.json seeding via shared read_settings_guarded ([34586af](https://github.com/poindexter12/baude/commit/34586af64a16bbd3d2387a474bbe307c50981b1b))
+* **09-04:** surface seed warnings on all remaining spawn paths ([12d3228](https://github.com/poindexter12/baude/commit/12d3228fddec21b4a3a56252ea1f03095588d47c))
+* **10-01:** OSC8 link slice end-to-end — parse, collect, validate, open (GREEN) ([c343c52](https://github.com/poindexter12/baude/commit/c343c52db2a329dc77598307f28737f8233b6169))
+* **10-02:** link grid fidelity, caps, and formatted OSC8 re-emission ([7fb13db](https://github.com/poindexter12/baude/commit/7fb13db5980bcb02092bc22db2a4b2ca5ad1a278))
+* **10-03:** bare-URL wrap-join detection with punctuation trim ([1e84bd4](https://github.com/poindexter12/baude/commit/1e84bd493e927e8fc37bf7edee99572b957dbd6e))
+* **10-04:** overlay navigation, hint letters, c/y copy, width-safe truncation ([0353952](https://github.com/poindexter12/baude/commit/035395224b935ea2d06251ac990d2b632febb172))
+* **10-04:** render-parity attach filter + top-to-bottom link ordering ([bdeeb22](https://github.com/poindexter12/baude/commit/bdeeb22960f46761172377c71e22e9ddb7535af4))
+* **11-01:** negotiated Shift+Enter path — probe, gated push, encode, pop ([b98acb0](https://github.com/poindexter12/baude/commit/b98acb08b263517be6428ce8a5ea57b7b433dda6))
+* **11-02:** kitty keyboard-mode tracking in the vt100 fork ([77f1f3f](https://github.com/poindexter12/baude/commit/77f1f3f204dd5362825f07ece3fb86b69f0d1782))
+* **11-03:** shift+enter row in the help overlay global section ([b1dc419](https://github.com/poindexter12/baude/commit/b1dc419ef17c3380571b6e04ceadad5430b948d4))
+* **11-04:** forward_key consults the observed child kitty push (both branches) ([9c7b6a3](https://github.com/poindexter12/baude/commit/9c7b6a368dd663966981025bd3efb66d6a2d3c43))
+* **11-04:** subscribe snapshot replays active child kitty push ([ffa89f8](https://github.com/poindexter12/baude/commit/ffa89f85930253b55346489bd1f539e8a94ffa68))
+
+
+### Bug Fixes
+
+* **08:** CR-01 route every home resolution through a guarded resolver ([94085f6](https://github.com/poindexter12/baude/commit/94085f6e7d2ed5e69a2b8e12f321dfd8e30702ff))
+* **08:** CR-02 run the last-window gate on the preview path too ([2c8bf99](https://github.com/poindexter12/baude/commit/2c8bf995d91a348ae32ff00f09d9a6c1ac4ef97a))
+* **08:** WR-01 make persist::real_home_dir private so the CR-01 guard is compiler-enforced ([08349bf](https://github.com/poindexter12/baude/commit/08349bfb636986e403d3cf8eb44696a8aa0b9336))
+* **08:** WR-01 pair the leak scanner's roots with real resolvers on both halves ([086c3b4](https://github.com/poindexter12/baude/commit/086c3b42f5c1df5d2cdaf8164e25f6e2f953c5ac))
+* **08:** WR-02 exit nonzero when a prune removal was attempted and failed ([624724b](https://github.com/poindexter12/baude/commit/624724b7e1a0d1639b11445adc785fe20991cc67))
+* **08:** WR-02 make prune's exit-code policy a real exhaustive match ([afaac7f](https://github.com/poindexter12/baude/commit/afaac7f5b16b6db668186b340ba031be296a2591))
+* **08:** WR-03 abort when a fixture child root cannot be created ([7b8a202](https://github.com/poindexter12/baude/commit/7b8a202a997d76a6870b395b5e34cbb8f64d920c))
+* **08:** WR-03 keep a read-only preview on exit 0 by scoping the failure rule to the confirmed path ([0ef294d](https://github.com/poindexter12/baude/commit/0ef294d99c3025a549c38ab98d9f285766665df6))
+* **08:** WR-04 apply caller env before the protected gate keys in the shipped branch ([17fa0a0](https://github.com/poindexter12/baude/commit/17fa0a050599bd1a237926cb12270763365a9431))
+* **08:** WR-04 correct WORKTREES_EXIT_FAILED's stale "Nothing was removed" claim ([e1c4e32](https://github.com/poindexter12/baude/commit/e1c4e32913dfaba8093f4f93efa8799258f776aa))
+* **08:** WR-05 resolve both operands before the observer's own-state overlap check ([ed4555a](https://github.com/poindexter12/baude/commit/ed4555a4969ec7d02652b375d66f575d1f9322f6))
+* **09:** WR-01 aggregate seed warnings into one TUI message, dedup stderr per file ([290391f](https://github.com/poindexter12/baude/commit/290391f72d92379f78e9e45bf41d672751921052))
+* **10:** CR-01 fail closed on vte OSC param-table saturation ([b511f8b](https://github.com/poindexter12/baude/commit/b511f8bfdcb15bc92a78814aec544aecb035dbab))
+* **10:** WR-01 swallow paste while a non-input modal is open ([c55e9d7](https://github.com/poindexter12/baude/commit/c55e9d7362543ec48213be6ba6bdb6ab8fe659f3))
+* **10:** WR-02 fallible per-OS clipboard sink; honest copy messaging ([fe2a927](https://github.com/poindexter12/baude/commit/fe2a9277eae6c2771cc65db517ef5f323bcce2ed))
+* **10:** WR-03 wide-char continuation cells carry the link id ([d917f10](https://github.com/poindexter12/baude/commit/d917f10fd03db0e4c27989b00d02b385fafd0972))
+* **11:** WR-01 restore terminal on Terminal::new error after kitty push ([1d7ece6](https://github.com/poindexter12/baude/commit/1d7ece6dea89e9d0ad96707393a86759a908f20a))
+* **11:** WR-02 per-screen kitty stacks so alt-screen residue cannot poison main input ([b64f04e](https://github.com/poindexter12/baude/commit/b64f04e324cec26210b74ad9d99783a94d4f8846))
+* **11:** WR-03 replay full per-screen kitty stack depth in subscribe snapshot ([a3200e6](https://github.com/poindexter12/baude/commit/a3200e66f7013526a4706e0e9cdb12f13544fda2))
+* **12-01:** make the clippy gate green end to end ([b4d482a](https://github.com/poindexter12/baude/commit/b4d482aaf9db8e34cf4da5125f0715b3d1990b91))
+
 ## [2.1.5](https://github.com/poindexter12/baude/compare/v2.1.4...v2.1.5) (2026-09-13)
 
 
