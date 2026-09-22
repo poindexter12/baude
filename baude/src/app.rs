@@ -3868,6 +3868,7 @@ impl App {
             self.last_meta_poll = now_ms();
             self.polled_meta_once = true;
             let mut changed = false;
+            let mut policy_notes: Vec<String> = Vec::new();
             for s in &mut self.sessions {
                 // Skip archived and exited sessions to avoid polling dead rows
                 if s.archived || s.claude.is_exited() {
@@ -3881,12 +3882,20 @@ impl App {
 
                 // Apply idle_child_policy on auto-archive
                 if !was_archived && s.archived && !s.archived_by_user {
-                    match self.config.idle_child_policy().as_str() {
-                        "suspend" => s.suspend_idle_child(),
-                        "stop" => s.kill(),
-                        _ => {} // "keep" or unknown: do nothing
+                    match self.config.idle_child_policy() {
+                        persist::IdleChildPolicy::Suspend => {
+                            if let Err(error) = s.suspend_idle_child() {
+                                policy_notes
+                                    .push(format!("{}: could not suspend: {error}", s.name));
+                            }
+                        }
+                        persist::IdleChildPolicy::Stop => s.stop_idle_child(),
+                        persist::IdleChildPolicy::Keep => {}
                     }
                 }
+            }
+            for note in policy_notes {
+                self.set_message(note);
             }
             if changed {
                 self.save();
@@ -11377,7 +11386,7 @@ mod tests {
         // Auto-archive should apply the idle_child_policy (basic smoke test)
         let config = baude_core::persist::Config::default();
         let policy = config.idle_child_policy();
-        assert_eq!(policy, "keep"); // Default is "keep"
+        assert_eq!(policy, persist::IdleChildPolicy::Keep); // Default is keep
     }
 
     #[test]

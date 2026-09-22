@@ -597,36 +597,63 @@ impl Pty {
         self.exited.store(true, Ordering::Relaxed);
     }
 
-    /// Send SIGSTOP to the child process group, pausing execution.
-    /// Unix-only; no-op on other platforms.
+    /// Re-verify the recorded identity against the live process (pid AND
+    /// start time), then deliver `signal`. A group leader gets the signal for
+    /// its whole group so the gate shell's child stops with it; a mismatch or a
+    /// vanished child is an error and nothing is signaled (pid reuse guard).
     #[cfg(unix)]
-    pub fn suspend(&self) {
-        let pi = self.process_identity();
-        let pgid = pi.process_group;
-        unsafe {
-            let _ = libc::kill(pgid, libc::SIGSTOP);
+    fn signal_verified(&self, signal: libc::c_int) -> Result<()> {
+        let recorded = self.process_identity();
+        let live = crate::session::inspect_process_identity(recorded.pid)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("child {} is gone; refusing to signal", recorded.pid))?;
+        if live.pid != recorded.pid || live.start_time != recorded.start_time {
+            anyhow::bail!(
+                "child {} identity changed (start_time {} vs recorded {}); refusing to signal a reused pid",
+                recorded.pid,
+                live.start_time,
+                recorded.start_time
+            );
         }
+        let target = if live.process_group == live.pid as i32 {
+            -live.process_group
+        } else {
+            live.pid as i32
+        };
+        // SAFETY: kill(2) on a target we just verified; no memory is touched.
+        let rc = unsafe { libc::kill(target, signal) };
+        if rc != 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                .context(format!("kill({target}, {signal})")));
+        }
+        Ok(())
     }
 
-    #[cfg(not(unix))]
-    pub fn suspend(&self) {
-        // Non-Unix: no-op
-    }
-
-    /// Send SIGCONT to the child process group, resuming execution.
-    /// Unix-only; no-op on other platforms.
+    /// SIGSTOP the verified child (and its process group when it leads one).
     #[cfg(unix)]
-    pub fn resume(&self) {
-        let pi = self.process_identity();
-        let pgid = pi.process_group;
-        unsafe {
-            let _ = libc::kill(pgid, libc::SIGCONT);
-        }
+    pub fn suspend(&self) -> Result<()> {
+        self.signal_verified(libc::SIGSTOP)
+    }
+    #[cfg(not(unix))]
+    pub fn suspend(&self) -> Result<()> {
+        Ok(())
     }
 
+    /// SIGCONT the verified child (and its process group when it leads one).
+    #[cfg(unix)]
+    pub fn resume(&self) -> Result<()> {
+        self.signal_verified(libc::SIGCONT)
+    }
     #[cfg(not(unix))]
-    pub fn resume(&self) {
-        // Non-Unix: no-op
+    pub fn resume(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Test seam: make the recorded identity disagree with the live process so
+    /// the pid-reuse guard can be exercised without racing a real reuse.
+    #[cfg(test)]
+    pub(crate) fn corrupt_identity_for_test(&mut self) {
+        self.identity.start_time = self.identity.start_time.wrapping_add(1);
     }
 
     /// True while the child is still held behind the registration gate.

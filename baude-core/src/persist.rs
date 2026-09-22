@@ -1035,23 +1035,22 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Resolved idle child policy: BAUDE_IDLE_CHILD_POLICY env, then
-    /// `idle_child_policy`, then "keep" (default: do nothing).
-    pub fn idle_child_policy(&self) -> String {
-        std::env::var("BAUDE_IDLE_CHILD_POLICY")
-            .ok()
-            .or_else(|| self.idle_child_policy.clone())
-            .unwrap_or_else(|| "keep".to_string())
+    /// Resolved idle child policy: `BAUDE_IDLE_CHILD_POLICY`, then the config
+    /// field, then `Keep`. See [`idle_child_policy_from`].
+    pub fn idle_child_policy(&self) -> IdleChildPolicy {
+        idle_child_policy_from(
+            std::env::var("BAUDE_IDLE_CHILD_POLICY").ok().as_deref(),
+            self.idle_child_policy.as_deref(),
+        )
     }
 
-    /// Resolved usage poller interval in seconds: BAUDE_USAGE_POLL_SECS env,
-    /// then `usage_poll_secs`, then None (uses default constant).
-    /// Some(0) disables the poller.
+    /// Resolved usage poller interval: `BAUDE_USAGE_POLL_SECS`, then the
+    /// config field, then `None` (the poller's default). `Some(0)` disables.
     pub fn usage_poll_secs(&self) -> Option<u64> {
-        std::env::var("BAUDE_USAGE_POLL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .or(self.usage_poll_secs)
+        usage_poll_secs_from(
+            std::env::var("BAUDE_USAGE_POLL_SECS").ok().as_deref(),
+            self.usage_poll_secs,
+        )
     }
 }
 
@@ -1191,6 +1190,46 @@ pub(crate) fn load_named_at(
             cause: error.to_string(),
         })?;
     Ok(LoadOutcome::Current(current))
+}
+
+/// What happens to a session's Claude child (and its shell) when the row is
+/// archived, by the auto-archive timer or by hand. `Keep` is today's behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleChildPolicy {
+    Keep,
+    Suspend,
+    Stop,
+}
+
+impl IdleChildPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdleChildPolicy::Keep => "keep",
+            IdleChildPolicy::Suspend => "suspend",
+            IdleChildPolicy::Stop => "stop",
+        }
+    }
+}
+
+/// Pure resolver behind [`Config::idle_child_policy`]: env value first, then
+/// the config field; unknown or empty values fall back to `Keep` so a typo can
+/// never stop or suspend children. Tests pass the env value directly.
+pub fn idle_child_policy_from(env: Option<&str>, field: Option<&str>) -> IdleChildPolicy {
+    let parse = |raw: &str| match raw.trim().to_ascii_lowercase().as_str() {
+        "suspend" => Some(IdleChildPolicy::Suspend),
+        "stop" => Some(IdleChildPolicy::Stop),
+        "keep" => Some(IdleChildPolicy::Keep),
+        _ => None,
+    };
+    env.and_then(parse)
+        .or_else(|| field.and_then(parse))
+        .unwrap_or(IdleChildPolicy::Keep)
+}
+
+/// Pure resolver behind [`Config::usage_poll_secs`]: a parseable env value
+/// wins, an unparseable one is ignored, then the config field.
+pub fn usage_poll_secs_from(env: Option<&str>, field: Option<u64>) -> Option<u64> {
+    env.and_then(|raw| raw.trim().parse::<u64>().ok()).or(field)
 }
 
 #[cfg(test)]
@@ -1996,47 +2035,62 @@ mod tests {
 
     #[test]
     fn idle_child_policy_env_override() {
-        // Environment variable should override config value
-        let config = Config {
-            idle_child_policy: Some("keep".to_string()),
-            ..Default::default()
-        };
-        // Without env var, config value is used
-        assert_eq!(config.idle_child_policy(), "keep");
-        // The env override is read by idle_child_policy() method
-        // We can't set env vars in tests per guidelines, but we verify the config method works
+        use super::{idle_child_policy_from, IdleChildPolicy};
+        assert_eq!(
+            idle_child_policy_from(Some("suspend"), Some("keep")),
+            IdleChildPolicy::Suspend,
+            "env wins over the config field"
+        );
+        assert_eq!(
+            idle_child_policy_from(None, Some("stop")),
+            IdleChildPolicy::Stop
+        );
+        assert_eq!(
+            idle_child_policy_from(Some("STOP"), None),
+            IdleChildPolicy::Stop
+        );
+        assert_eq!(
+            idle_child_policy_from(Some("bogus"), Some("suspend")),
+            IdleChildPolicy::Suspend,
+            "an unknown env value is ignored, not treated as keep"
+        );
+        assert_eq!(idle_child_policy_from(None, None), IdleChildPolicy::Keep);
+        let config = super::Config::default();
+        assert_eq!(config.idle_child_policy(), IdleChildPolicy::Keep);
     }
 
     #[test]
     fn usage_poll_secs_option_parses() {
-        // Config usage_poll_secs should parse correctly
-        let config = Config {
+        use super::usage_poll_secs_from;
+        assert_eq!(usage_poll_secs_from(None, Some(30)), Some(30));
+        assert_eq!(usage_poll_secs_from(None, None), None);
+        let config = super::Config {
             usage_poll_secs: Some(30),
-            ..Default::default()
+            ..super::Config::default()
         };
         assert_eq!(config.usage_poll_secs(), Some(30));
     }
 
     #[test]
     fn usage_poll_secs_zero_disables() {
-        // Config usage_poll_secs=0 should disable poller
-        let config = Config {
-            usage_poll_secs: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(config.usage_poll_secs(), Some(0));
+        use super::usage_poll_secs_from;
+        assert_eq!(usage_poll_secs_from(Some("0"), Some(60)), Some(0));
+        assert_eq!(usage_poll_secs_from(None, Some(0)), Some(0));
     }
 
     #[test]
     fn usage_poll_secs_env_override() {
-        // Environment variable should override config value
-        let config = Config {
-            usage_poll_secs: Some(60),
-            ..Default::default()
-        };
-        // Without env var, config value is used
-        assert_eq!(config.usage_poll_secs(), Some(60));
-        // The env override is read by usage_poll_secs() method
-        // We can't set env vars in tests per guidelines, but we verify the config method works
+        use super::usage_poll_secs_from;
+        assert_eq!(
+            usage_poll_secs_from(Some("30"), Some(60)),
+            Some(30),
+            "env wins"
+        );
+        assert_eq!(
+            usage_poll_secs_from(Some("not-a-number"), Some(60)),
+            Some(60),
+            "an unparseable env value falls back to the field"
+        );
+        assert_eq!(usage_poll_secs_from(Some(" 15 "), None), Some(15));
     }
 }

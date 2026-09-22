@@ -354,15 +354,50 @@ impl Session {
         self.child_suspended = false;
     }
 
-    /// Suspend the claude child via SIGSTOP. Verifies process identity before signaling.
-    pub fn suspend_idle_child(&mut self) {
-        self.claude.suspend();
+    /// Idle-child policy `suspend`: SIGSTOP the agent (and the open shell)
+    /// after re-verifying each child's identity. `child_suspended` is set only
+    /// when the agent was signaled; a shell failure is reported in the error
+    /// text but does not undo the agent's suspension.
+    pub fn suspend_idle_child(&mut self) -> std::result::Result<(), String> {
+        self.claude
+            .suspend()
+            .map_err(|error| format!("agent: {error}"))?;
         self.child_suspended = true;
+        if let Some(shell) = &self.shell {
+            if !shell.is_exited() {
+                shell
+                    .suspend()
+                    .map_err(|error| format!("shell: {error} (agent suspended)"))?;
+            }
+        }
+        Ok(())
     }
 
-    /// Resume the claude child via SIGCONT. Verifies process identity before signaling.
-    pub fn resume_idle_child(&mut self) {
-        self.claude.resume();
+    /// SIGCONT the agent (and the open shell) after identity verification.
+    /// `child_suspended` clears only when the agent was signaled.
+    pub fn resume_idle_child(&mut self) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        match self.claude.resume() {
+            Ok(()) => self.child_suspended = false,
+            Err(error) => problems.push(format!("agent: {error}")),
+        }
+        if let Some(shell) = &self.shell {
+            if !shell.is_exited() {
+                if let Err(error) = shell.resume() {
+                    problems.push(format!("shell: {error}"));
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// Idle-child policy `stop`: end the agent and shell for good.
+    pub fn stop_idle_child(&mut self) {
+        self.kill();
         self.child_suspended = false;
     }
 
@@ -1113,39 +1148,141 @@ mod tests {
         assert_ne!(meta.last_session_mtime, Some(t2));
     }
 
-    #[test]
-    fn suspend_refuses_on_identity_mismatch() {
-        // Suspend should fail if process identity doesn't match
-        // For now, verify the method exists and doesn't crash
-        // Placeholder: actual session behavior tested in integration
-        assert!(true);
+    fn signal_fixture(label: &str) -> (crate::testing::TestRedirect, crate::pty::Pty) {
+        let root =
+            std::env::temp_dir().join(format!("baude-signal-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let redirect = crate::testing::TestRedirect::new(&root);
+        let pty = crate::pty::Pty::spawn_paused(Some("/bin/sh -c 'sleep 30'"), &[], &root, 5, 40)
+            .expect("spawn")
+            .release()
+            .expect("release");
+        (redirect, pty)
     }
 
-    #[test]
-    fn suspend_sends_sigstop_to_group_leader_only() {
-        // Suspend should send SIGSTOP to process group if child is group leader
-        // Placeholder: actual signal behavior tested in integration
-        assert!(true);
+    fn proc_state(pid: u32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    #[test]
-    fn resume_refuses_on_identity_mismatch() {
-        // Resume should fail if process identity doesn't match
-        // Placeholder: actual resume behavior tested in integration
-        assert!(true);
+    fn wait_for(pid: u32, pred: impl Fn(&str) -> bool, what: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let state = proc_state(pid);
+            if pred(&state) {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for pid {pid} to be {what}; last state {state:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn children_of(pid: u32) -> Vec<u32> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
     }
 
     #[test]
     fn suspend_process_becomes_stopped() {
-        // After suspend, process state should be T (stopped)
-        // Placeholder: actual process state tested in integration
-        assert!(true);
+        let (_redirect, mut pty) = signal_fixture("stopped");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.suspend().expect("suspend verified child");
+        let state = wait_for(pid, |s| s.starts_with('T'), "stopped");
+        assert!(
+            state.starts_with('T'),
+            "child must be in stopped state, got {state}"
+        );
+        pty.resume().expect("resume");
+        wait_for(pid, |s| !s.starts_with('T'), "running again");
+        pty.kill();
     }
 
     #[test]
     fn suspend_resume_cycle() {
-        // Suspend and resume should work together
-        // Placeholder: actual cycle behavior tested in integration
-        assert!(true);
+        let (_redirect, mut pty) = signal_fixture("cycle");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        for _ in 0..2 {
+            pty.suspend().expect("suspend");
+            wait_for(pid, |s| s.starts_with('T'), "stopped");
+            pty.resume().expect("resume");
+            wait_for(pid, |s| !s.starts_with('T'), "running");
+        }
+        pty.kill();
+    }
+
+    #[test]
+    fn suspend_sends_sigstop_to_group_leader_only() {
+        // The gate shell leads its own process group; signaling the group stops
+        // the shell AND the `sleep` it spawned, never anything outside it.
+        let (_redirect, mut pty) = signal_fixture("group");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        // The gate shell may exec its command (no children) or fork it; either
+        // way every member of the leader's group must stop with it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut kids = children_of(pid);
+        while kids.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            kids = children_of(pid);
+        }
+        pty.suspend().expect("suspend");
+        wait_for(pid, |s| s.starts_with('T'), "leader stopped");
+        for kid in &kids {
+            wait_for(*kid, |s| s.starts_with('T'), "group member stopped");
+        }
+        let me = std::process::id();
+        assert!(
+            !proc_state(me).starts_with('T'),
+            "the test process itself must never be signaled"
+        );
+        pty.resume().expect("resume");
+        wait_for(pid, |s| !s.starts_with('T'), "leader running");
+        pty.kill();
+    }
+
+    #[test]
+    fn suspend_refuses_on_identity_mismatch() {
+        let (_redirect, mut pty) = signal_fixture("mismatch-suspend");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.corrupt_identity_for_test();
+        let error = pty.suspend().expect_err("mismatched identity must refuse");
+        assert!(
+            error.to_string().contains("identity changed"),
+            "got: {error}"
+        );
+        assert!(
+            !proc_state(pid).starts_with('T'),
+            "no signal may be sent on a mismatch"
+        );
+        pty.kill();
+    }
+
+    #[test]
+    fn resume_refuses_on_identity_mismatch() {
+        let (_redirect, mut pty) = signal_fixture("mismatch-resume");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.corrupt_identity_for_test();
+        let error = pty.resume().expect_err("mismatched identity must refuse");
+        assert!(
+            error.to_string().contains("identity changed"),
+            "got: {error}"
+        );
+        pty.kill();
     }
 }
