@@ -132,6 +132,7 @@ async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
         .to_string();
     let collisions = manager.collisions.clone();
     let collision_count = collisions.len();
+    let startup_ms = manager.startup_timing.to_hashmap();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
@@ -140,6 +141,7 @@ async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
         "persistence": persistence,
         "collisions": collisions,
         "collision_count": collision_count,
+        "startup_ms": startup_ms,
     }))
 }
 
@@ -1806,6 +1808,45 @@ mod tests {
             ["explicit", "folder binding", "derived", "blank"].contains(&source),
             "workspace_source must be one of: explicit, folder binding, derived, blank (got: {})",
             source
+        );
+    }
+
+    #[test]
+    fn startup_timing_recorded_on_manager() {
+        let _scope = api_scope("startup-timing");
+        let manager = crate::manager::Manager::new("test".into(), false);
+        // Manager should have a startup_timing field (even if empty for this test)
+        assert_eq!(manager.startup_timing.total_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn info_reports_daemon_startup_ms() {
+        let (_scope, app) = app();
+        let request = Request::builder()
+            .uri("/info")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Check that startup_ms is present and is an object
+        assert!(
+            json["startup_ms"].is_object(),
+            "startup_ms field must be an object"
+        );
+
+        // Check that it contains a total field
+        assert!(
+            json["startup_ms"]["total"].is_number(),
+            "startup_ms.total field must be a number"
         );
     }
 }

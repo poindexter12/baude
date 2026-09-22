@@ -104,6 +104,8 @@ pub struct Manager {
     atomic_failure_for_test: Option<persist::AtomicFailure>,
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
+    /// Startup timing stages (config load, state load, listener bound, etc.)
+    pub startup_timing: crate::timing::StartupTiming,
 }
 
 #[derive(Serialize)]
@@ -440,6 +442,7 @@ impl Manager {
             atomic_failure_for_test: None,
             #[cfg(test)]
             spawn_error_for_test: None,
+            startup_timing: crate::timing::StartupTiming::new(0),
         }
     }
 

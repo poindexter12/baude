@@ -8,6 +8,7 @@ mod manager;
 mod notify;
 mod permission_bridge;
 mod push;
+mod timing;
 mod transcript;
 mod web;
 
