@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.1](https://github.com/poindexter12/baude/compare/v2.3.0...v2.3.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **core:** restore survives one unreconcilable retained checkout ([#94](https://github.com/poindexter12/baude/issues/94)) ([a47e9ec](https://github.com/poindexter12/baude/commit/a47e9ec9d2abdc5a0c1ef4a39d6d8ad7296c2a72))
+
 ## [2.3.0](https://github.com/poindexter12/baude/compare/v2.2.0...v2.3.0) (2026-09-22)
 
 
