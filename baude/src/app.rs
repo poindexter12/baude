@@ -3763,11 +3763,9 @@ impl App {
             .sessions
             .iter()
             .any(|s| !s.archived && s.status() == baude_core::session::Status::Waiting);
-        if has_waiting_rows {
-            if now_ms().saturating_sub(self.last_waiting_update) >= 1000 {
-                self.dirty = true;
-                self.last_waiting_update = now_ms();
-            }
+        if has_waiting_rows && now_ms().saturating_sub(self.last_waiting_update) >= 1000 {
+            self.dirty = true;
+            self.last_waiting_update = now_ms();
         }
 
         if let Some(r) = &self.remote {
@@ -10951,7 +10949,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let app = App::new(tmp.clone());
         // App starts with no sessions
         assert!(app.sessions.is_empty());
         // Verify last_known_screen_gen map exists and is empty

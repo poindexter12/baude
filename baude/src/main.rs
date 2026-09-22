@@ -87,15 +87,13 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
 }
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
 use ratatui::crossterm::{execute, queue};
-use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use app::App;
@@ -1892,6 +1890,10 @@ mod worktrees_cli_tests {
 #[cfg(test)]
 mod keyboard_negotiation_tests {
     use super::*;
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    };
+    use ratatui::layout::Rect;
 
     /// Byte-subsequence offset finder: the pop bytes are pure ASCII, but
     /// offset comparison on `&[u8]` avoids lossy string conversion questions.
@@ -2125,8 +2127,9 @@ mod keyboard_negotiation_tests {
         // Test: timing stage recording infrastructure exists.
         // Simplified: verify Instant and now_ms() work
         let start = std::time::Instant::now();
-        let elapsed = start.elapsed().as_millis();
-        assert!(elapsed >= 0, "timing should measure elapsed time");
+        let _elapsed = start.elapsed().as_millis();
+        // Instant and elapsed() work correctly
+        assert!(!start.elapsed().is_zero());
     }
 
     #[test]
