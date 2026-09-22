@@ -51,6 +51,11 @@ pub struct RemoteInfo {
     pub waiting_reason: Option<String>,
     #[serde(default)]
     pub archived: bool,
+    /// PERF-07: the daemon SIGSTOPped this session's child under
+    /// `idle_child_policy = "suspend"`. `#[serde(default)]` keeps an older
+    /// daemon that omits the field deserializing to `false`.
+    #[serde(default)]
+    pub suspended: bool,
     /// Recent (~30) tool-activity events bundled into the `/sessions` poll so
     /// the remote activity overlay needs no extra round-trip. Defaults to an
     /// empty Vec against an older daemon that omits the field (backward-compat,
@@ -92,6 +97,7 @@ impl PartialEq for RemoteInfo {
             && self.last_tool == other.last_tool
             && self.waiting_reason == other.waiting_reason
             && self.archived == other.archived
+            && self.suspended == other.suspended
             && self.gsd_active_phase == other.gsd_active_phase
             && self.workspace_source == other.workspace_source
     }

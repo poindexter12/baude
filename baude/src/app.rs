@@ -839,6 +839,16 @@ impl App {
     }
 
     /// Cached today/week costs from the ccusage background poller.
+    /// True when the usage poller is configured off (`usage_poll_secs = 0`).
+    pub fn usage_poll_disabled(&self) -> bool {
+        self.usage.is_disabled()
+    }
+
+    #[cfg(test)]
+    pub fn disable_usage_poller_for_test(&mut self) {
+        self.usage = UsagePoller::start(Some(0));
+    }
+
     pub fn usage_costs(&self) -> UsageCosts {
         self.usage.costs()
     }
@@ -3870,6 +3880,7 @@ impl App {
             self.polled_meta_once = true;
             let mut changed = false;
             let mut policy_notes: Vec<String> = Vec::new();
+            let policy = self.config.idle_child_policy();
             for s in &mut self.sessions {
                 // Skip archived and exited sessions to avoid polling dead rows
                 if s.archived || s.claude.is_exited() {
@@ -3881,17 +3892,10 @@ impl App {
                 let was_archived = s.archived;
                 changed |= s.auto_archive_tick(self.auto_archive_ms);
 
-                // Apply idle_child_policy on auto-archive
+                // Apply idle_child_policy on auto-archive (PERF-07).
                 if !was_archived && s.archived && !s.archived_by_user {
-                    match self.config.idle_child_policy() {
-                        persist::IdleChildPolicy::Suspend => {
-                            if let Err(error) = s.suspend_idle_child() {
-                                policy_notes
-                                    .push(format!("{}: could not suspend: {error}", s.name));
-                            }
-                        }
-                        persist::IdleChildPolicy::Stop => s.stop_idle_child(),
-                        persist::IdleChildPolicy::Keep => {}
+                    if let Some(note) = s.apply_idle_child_policy(policy) {
+                        policy_notes.push(note);
                     }
                 }
             }
@@ -5118,13 +5122,21 @@ impl App {
         match self.selected_id {
             Some(SelId::Checkout(key)) => {
                 if let Some(id) = self.runtime_checkouts.get(&key).copied() {
+                    let policy = self.config.idle_child_policy();
                     let Some(s) = self.session_mut(id) else {
                         return;
                     };
                     s.set_archived(!s.archived);
                     let msg = if s.archived { "archived" } else { "unarchived" };
                     self.set_message(msg.into());
+                    // Persist the intent first, then apply the idle-child policy.
                     self.save();
+                    let note = self
+                        .session_mut(id)
+                        .and_then(|s| s.apply_idle_child_policy(policy));
+                    if let Some(note) = note {
+                        self.set_message(note);
+                    }
                     return;
                 }
                 let before = self.repository_state.clone();
@@ -5156,11 +5168,19 @@ impl App {
             }
             Some(SelId::Standalone(key)) => {
                 if let Some(id) = self.runtime_standalones.get(&key).copied() {
+                    let policy = self.config.idle_child_policy();
                     let Some(s) = self.session_mut(id) else {
                         return;
                     };
                     s.set_archived(!s.archived);
+                    // Persist the intent first, then apply the idle-child policy.
                     self.save();
+                    let note = self
+                        .session_mut(id)
+                        .and_then(|s| s.apply_idle_child_policy(policy));
+                    if let Some(note) = note {
+                        self.set_message(note);
+                    }
                     return;
                 }
                 let before = self.repository_state.clone();
@@ -11448,10 +11468,54 @@ mod tests {
 
     #[test]
     fn auto_archive_applies_idle_child_policy() {
-        // Auto-archive should apply the idle_child_policy (basic smoke test)
-        let config = baude_core::persist::Config::default();
-        let policy = config.idle_child_policy();
-        assert_eq!(policy, persist::IdleChildPolicy::Keep); // Default is keep
+        // A real tick: a long-waiting session auto-archives and, under
+        // policy=suspend, its child is SIGSTOPped (ps state `T`).
+        let fixture = admission_repo("auto-archive-policy");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.idle_child_policy = Some("suspend".into());
+        app.persistence_root_for_test = Some(state_root);
+        let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+        let idle = 60_000;
+        app.auto_archive_ms = idle;
+        let pid = app.session(runtime).unwrap().claude.process_identity().pid;
+        fn state(pid: u32) -> String {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while state(pid).is_empty() || state(pid).starts_with('T') {
+            assert!(std::time::Instant::now() < deadline, "child never ran");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.session_mut(runtime).unwrap().meta.claude_status =
+            Some((false, baude_core::meta::now_unix_ms() - 2 * idle));
+        app.tick();
+        let s = app.session(runtime).unwrap();
+        assert!(
+            s.archived && !s.archived_by_user,
+            "long-waiting session parks"
+        );
+        assert!(s.child_suspended, "auto-archive applies policy=suspend");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while !state(pid).starts_with('T') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never stopped; state {}",
+                state(pid)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -11491,5 +11555,72 @@ mod tests {
 
         app.kill_all();
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn manual_archive_applies_idle_child_policy_and_unarchive_resumes() {
+        let fixture = admission_repo("manual-archive-policy");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.idle_child_policy = Some("suspend".into());
+        app.persistence_root_for_test = Some(state_root);
+        let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+        let key = app.repository_state.checkouts[0].key;
+        app.selected_id = Some(SelId::Checkout(key));
+        let pid = app.session(runtime).unwrap().claude.process_identity().pid;
+        fn state(pid: u32) -> String {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn wait(pid: u32, pred: &dyn Fn(&str) -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while !pred(&state(pid)) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pid {pid} state {}",
+                    state(pid)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        wait(pid, &|s| !s.is_empty() && !s.starts_with('T'));
+        app.toggle_archive();
+        let s = app.session(runtime).unwrap();
+        assert!(
+            s.archived && s.child_suspended,
+            "manual archive suspends under policy=suspend"
+        );
+        wait(pid, &|s| s.starts_with('T'));
+        // The sidebar row names the parked child (PERF-07 surfacing).
+        app.show_archived = true;
+        let backend = ratatui::backend::TestBackend::new(160, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("· suspended"), "{rendered}");
+        app.toggle_archive();
+        let s = app.session(runtime).unwrap();
+        assert!(
+            !s.archived && !s.child_suspended,
+            "unarchive resumes the child"
+        );
+        wait(pid, &|s| !s.starts_with('T'));
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

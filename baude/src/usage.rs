@@ -25,18 +25,41 @@
 #[cfg(not(test))]
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
 use std::time::Duration;
 
 #[cfg(not(test))]
 use serde_json::Value;
 
-#[cfg(not(test))]
 const POLL_SECS: u64 = 60;
 /// Back off when ccusage is missing/broken — don't spawn a failing process
 /// every minute forever.
-#[cfg(not(test))]
 const FAIL_POLL_SECS: u64 = 300;
+
+/// What the poller does for a configured interval (PERF-08). Pure, so the
+/// decision is testable while the worker thread stays `cfg(not(test))`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollerPlan {
+    Disabled,
+    Enabled {
+        interval: Duration,
+        /// Sleep after a failed `ccusage` run: never shorter than the
+        /// configured interval, so a slow schedule is honored on failure too.
+        failure_backoff: Duration,
+    },
+}
+
+pub(crate) fn poller_plan(usage_poll_secs: Option<u64>) -> PollerPlan {
+    match usage_poll_secs {
+        Some(0) => PollerPlan::Disabled,
+        secs => {
+            let interval = Duration::from_secs(secs.unwrap_or(POLL_SECS));
+            PollerPlan::Enabled {
+                interval,
+                failure_backoff: interval.max(Duration::from_secs(FAIL_POLL_SECS)),
+            }
+        }
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct UsageCosts {
@@ -46,6 +69,7 @@ pub struct UsageCosts {
 
 pub struct UsagePoller {
     data: Arc<Mutex<UsageCosts>>,
+    disabled: bool,
 }
 
 impl UsagePoller {
@@ -54,39 +78,46 @@ impl UsagePoller {
     /// No thread, no `date`, no `ccusage`. Same signature as the live one, so
     /// no caller — and no fixture — can tell them apart or bypass this.
     #[cfg(test)]
-    pub fn start(_config_poll_secs: Option<u64>) -> UsagePoller {
+    pub fn start(config_poll_secs: Option<u64>) -> UsagePoller {
         UsagePoller {
             data: Arc::new(Mutex::new(UsageCosts::default())),
+            disabled: poller_plan(config_poll_secs) == PollerPlan::Disabled,
         }
     }
 
     #[cfg(not(test))]
     pub fn start(config_poll_secs: Option<u64>) -> UsagePoller {
         let data = Arc::new(Mutex::new(UsageCosts::default()));
-
-        // If disabled (Some(0)), return inert poller without spawning thread
-        if config_poll_secs == Some(0) {
-            return UsagePoller { data };
-        }
-
+        let (interval, failure_backoff) = match poller_plan(config_poll_secs) {
+            PollerPlan::Disabled => {
+                return UsagePoller {
+                    data,
+                    disabled: true,
+                }
+            }
+            PollerPlan::Enabled {
+                interval,
+                failure_backoff,
+            } => (interval, failure_backoff),
+        };
         let shared = Arc::clone(&data);
-        let poll_interval = config_poll_secs.unwrap_or(POLL_SECS);
-
         std::thread::spawn(move || loop {
             let costs = fetch();
             let ok = costs.today_usd.is_some() || costs.week_usd.is_some();
             if let Ok(mut d) = shared.lock() {
                 *d = costs;
             }
-            std::thread::sleep(Duration::from_secs(if ok {
-                poll_interval
-            } else {
-                FAIL_POLL_SECS
-            }));
+            std::thread::sleep(if ok { interval } else { failure_backoff });
         });
-        UsagePoller { data }
+        UsagePoller {
+            data,
+            disabled: false,
+        }
     }
-
+    /// True when `usage_poll_secs` is 0: no worker runs and the footer says so.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
     pub fn costs(&self) -> UsageCosts {
         self.data.lock().map(|d| d.clone()).unwrap_or_default()
     }
@@ -164,29 +195,49 @@ mod tests {
 
     #[test]
     fn poll_disabled_spawns_no_thread() {
-        // UsagePoller with disabled config should not spawn thread
+        assert_eq!(poller_plan(Some(0)), PollerPlan::Disabled);
         let poller = UsagePoller::start(Some(0));
-        // Test variant doesn't spawn thread regardless, so verify it's inert
+        assert!(poller.is_disabled(), "Some(0) disables the poller");
         assert!(
             poller.is_inert_for_test(),
-            "disabled poller should be inert"
+            "no worker holds the shared data"
         );
     }
 
     #[test]
     fn poll_disabled_returns_inert_poller() {
-        // Disabled poller should still be valid
         let poller = UsagePoller::start(Some(0));
-        // In test mode, this always returns inert. Verify it doesn't panic on access.
-        let _ = poller.costs();
-        assert!(poller.is_inert_for_test());
+        let costs = poller.costs();
+        assert!(costs.today_usd.is_none() && costs.week_usd.is_none());
+        assert!(poller.is_disabled());
     }
 
     #[test]
     fn poll_enabled_spawns_thread() {
-        // UsagePoller with enabled config should spawn thread (in non-test)
-        let poller = UsagePoller::start(Some(30));
-        // Test variant doesn't spawn thread; this just verifies it returns inert in test mode
-        assert!(poller.is_inert_for_test());
+        // The worker itself is compiled out under test; the plan it would run is not.
+        assert_eq!(
+            poller_plan(None),
+            PollerPlan::Enabled {
+                interval: Duration::from_secs(POLL_SECS),
+                failure_backoff: Duration::from_secs(FAIL_POLL_SECS),
+            }
+        );
+        assert_eq!(
+            poller_plan(Some(30)),
+            PollerPlan::Enabled {
+                interval: Duration::from_secs(30),
+                failure_backoff: Duration::from_secs(FAIL_POLL_SECS),
+            },
+            "a short interval keeps the default failure back-off"
+        );
+        assert_eq!(
+            poller_plan(Some(600)),
+            PollerPlan::Enabled {
+                interval: Duration::from_secs(600),
+                failure_backoff: Duration::from_secs(600),
+            },
+            "failure back-off never runs ccusage more often than the configured interval"
+        );
+        assert!(!UsagePoller::start(Some(30)).is_disabled());
     }
 }

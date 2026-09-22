@@ -406,6 +406,37 @@ impl Session {
         self.child_suspended = false;
     }
 
+    /// Apply the configured idle-child policy after this row's archive state
+    /// changed (PERF-07). Archived: `Suspend` stops the agent and shell,
+    /// `Stop` kills them, `Keep` does nothing. Unarchived with a suspended
+    /// child: resume it. Shared by the TUI and the daemon so both surfaces
+    /// behave identically. Returns a human-readable note when a signal fails.
+    pub fn apply_idle_child_policy(
+        &mut self,
+        policy: crate::persist::IdleChildPolicy,
+    ) -> Option<String> {
+        use crate::persist::IdleChildPolicy;
+        if self.archived {
+            match policy {
+                IdleChildPolicy::Suspend => self
+                    .suspend_idle_child()
+                    .err()
+                    .map(|error| format!("{}: could not suspend: {error}", self.name)),
+                IdleChildPolicy::Stop => {
+                    self.stop_idle_child();
+                    None
+                }
+                IdleChildPolicy::Keep => None,
+            }
+        } else if self.child_suspended {
+            self.resume_idle_child()
+                .err()
+                .map(|error| format!("{}: could not resume: {error}", self.name))
+        } else {
+            None
+        }
+    }
+
     pub fn runtime_snapshot(&self) -> std::result::Result<RuntimeSnapshot, String> {
         let snapshot = RuntimeSnapshot::new(
             self.claude.process_identity().clone(),

@@ -82,6 +82,9 @@ pub struct Manager {
     persist: bool,
     /// Waiting this long auto-archives a session; 0 disables.
     pub auto_archive_ms: u64,
+    /// PERF-07: what happens to a session's child when its row is archived
+    /// (by the timer or by hand). Read once from config at daemon start.
+    pub idle_child_policy: persist::IdleChildPolicy,
     /// PERM-02: per-session wake handle for the permission long-poll. Set/clear
     /// pending state happens UNDER the manager lock; the bridge/handler then
     /// `notified().await`s on this Arc OUTSIDE the lock so one pending
@@ -185,6 +188,8 @@ pub struct SessionInfo {
     pub session_cost_usd: Option<f64>,
     pub claude_session_id: Option<String>,
     pub archived: bool,
+    /// PERF-07: the child is SIGSTOPped under `idle_child_policy = "suspend"`.
+    pub suspended: bool,
     /// A bounded (~30) tail of the session's recent hook events so the remote
     /// TUI overlay rides the existing `/sessions` poll without an extra round
     /// trip. The full ring is served by `GET /sessions/{id}/activity`.
@@ -299,6 +304,12 @@ where
 /// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
     persist::load_config().auto_archive_ms()
+}
+
+/// BAUDE_IDLE_CHILD_POLICY env, then config.json `idle_child_policy`
+/// (`keep` | `suspend` | `stop`), then `keep`.
+pub fn default_idle_child_policy() -> persist::IdleChildPolicy {
+    persist::load_config().idle_child_policy()
 }
 
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
@@ -428,6 +439,7 @@ impl Manager {
             claude_cmd,
             persist,
             auto_archive_ms: default_auto_archive_ms(),
+            idle_child_policy: default_idle_child_policy(),
             permission_notify: HashMap::new(),
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
@@ -2352,9 +2364,28 @@ impl Manager {
     pub fn poll(&mut self) {
         let mut changed = false;
         let idle = self.auto_archive_ms;
+        let policy = self.idle_child_policy;
+        let mut notes = Vec::new();
         for s in &mut self.sessions {
+            // PERF-06: archived and exited rows are never polled for metadata;
+            // they still tick so an auto-archived row can re-engage.
+            if s.archived || s.claude.is_exited() {
+                changed |= s.auto_archive_tick(idle);
+                continue;
+            }
             s.poll_meta();
+            let was_archived = s.archived;
             changed |= s.auto_archive_tick(idle);
+            // PERF-07: a fresh auto-archive applies the idle-child policy,
+            // exactly as the TUI tick does.
+            if !was_archived && s.archived && !s.archived_by_user {
+                if let Some(note) = s.apply_idle_child_policy(policy) {
+                    notes.push(note);
+                }
+            }
+        }
+        for note in notes {
+            eprintln!("idle child policy: {note}");
         }
         if changed {
             self.save();
@@ -2369,7 +2400,15 @@ impl Manager {
         let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
         match self.save_checked() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Persist the intent first, then apply the idle-child policy
+                // (PERF-07); a failed save leaves the child untouched.
+                let policy = self.idle_child_policy;
+                if let Some(note) = self.session_mut(id)?.apply_idle_child_policy(policy) {
+                    eprintln!("idle child policy: {note}");
+                }
+                Ok(())
+            }
             Err(error) if error.replacement_committed() => Err(MutationError::Persistence(error)),
             Err(error) => {
                 let s = self.session_mut(id)?;
@@ -2378,6 +2417,13 @@ impl Manager {
                 Err(MutationError::Persistence(error))
             }
         }
+    }
+
+    /// Test-only: override the idle-child policy without touching config.json
+    /// or the process environment.
+    #[cfg(test)]
+    pub fn set_idle_child_policy_for_test(&mut self, policy: persist::IdleChildPolicy) {
+        self.idle_child_policy = policy;
     }
 
     /// Test-only: pin a session's resolved Claude `session_id` so handlers
@@ -2544,6 +2590,7 @@ fn session_info(s: &Session) -> SessionInfo {
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
         archived: s.archived,
+        suspended: s.child_suspended,
         activity: {
             // Bounded recent set (~30) for the remote TUI overlay; the full
             // ring is served by GET /sessions/{id}/activity.
@@ -3988,6 +4035,121 @@ mod tests {
         m.set_archived(id, false).unwrap();
         assert!(!m.info(id).unwrap().archived);
         assert!(m.set_archived(99, true).is_err());
+        m.kill_all();
+    }
+
+    fn proc_state(pid: u32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn wait_for_state(pid: u32, pred: impl Fn(&str) -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let state = proc_state(pid);
+            if pred(&state) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for pid {pid} to be {what}; last state {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn child_pid(m: &Manager, id: u64) -> u32 {
+        m.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .expect("session")
+            .claude
+            .process_identity()
+            .pid
+    }
+
+    #[test]
+    fn daemon_archive_endpoint_suspends_and_unarchive_resumes() {
+        let _fixture = ManagerFixture::new("daemon-archive-suspends");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Suspend);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        m.set_archived(id, true).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            info.archived && info.suspended,
+            "archive suspends under policy=suspend"
+        );
+        wait_for_state(pid, |st| st.starts_with('T'), "stopped");
+        m.set_archived(id, false).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            !info.archived && !info.suspended,
+            "unarchive resumes the child"
+        );
+        wait_for_state(
+            pid,
+            |st| !st.is_empty() && !st.starts_with('T'),
+            "running again",
+        );
+        m.kill_all();
+    }
+
+    #[test]
+    fn daemon_archive_keeps_child_under_default_policy() {
+        let _fixture = ManagerFixture::new("daemon-archive-keep");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Keep);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        m.set_archived(id, true).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            info.archived && !info.suspended,
+            "keep leaves the child alone"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!proc_state(pid).starts_with('T'), "keep never SIGSTOPs");
+        m.kill_all();
+    }
+
+    #[test]
+    fn daemon_auto_archive_applies_idle_child_policy() {
+        let _fixture = ManagerFixture::new("daemon-auto-archive-policy");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Suspend);
+        let idle = 60_000;
+        m.auto_archive_ms = idle;
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        // Fake a session that went idle well past the threshold.
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        s.meta.claude_status = Some((false, now_unix_ms() - 2 * idle));
+        m.poll();
+        let info = m.info(id).unwrap();
+        assert!(info.archived, "long-waiting session should auto-archive");
+        assert!(info.suspended, "auto-archive applies policy=suspend");
+        wait_for_state(pid, |st| st.starts_with('T'), "stopped");
+        m.kill_all();
+    }
+
+    #[test]
+    fn session_info_reports_suspended() {
+        let _fixture = ManagerFixture::new("session-info-suspended");
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        assert!(!m.info(id).unwrap().suspended);
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        s.archived = true;
+        s.suspend_idle_child().expect("suspend");
+        assert!(m.info(id).unwrap().suspended);
         m.kill_all();
     }
 

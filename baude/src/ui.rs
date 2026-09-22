@@ -313,6 +313,10 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
                 current_parent_line = None;
                 let selected = app.selected_id == Some(SelId::Standalone(standalone.key));
                 let start = lines.len();
+                let suspended = standalone
+                    .runtime_id
+                    .and_then(|id| app.session(id))
+                    .is_some_and(|s| s.child_suspended);
                 standalone_row(
                     &mut lines,
                     standalone,
@@ -320,6 +324,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
                     focused,
                     width,
                     compact_rows,
+                    suspended,
                 );
                 if selected {
                     selected_line = Some((start, lines.len().saturating_sub(1)));
@@ -576,6 +581,7 @@ fn checkout_row(
     lines.push(meta);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn standalone_row(
     lines: &mut Vec<Line<'static>>,
     row: &LocalStandaloneRow,
@@ -583,6 +589,7 @@ fn standalone_row(
     focused: bool,
     width: usize,
     compact: bool,
+    suspended: bool,
 ) {
     let (icon, style, state) = match row.status {
         LocalStatus::Waiting => ("●", Style::default().fg(Color::Yellow), "waiting"),
@@ -601,6 +608,8 @@ fn standalone_row(
             },
         ),
     };
+    // PERF-07: an archived row whose child is SIGSTOPped says so.
+    let state = if suspended { "suspended" } else { state };
     let name_style = if selected {
         Style::default()
             .fg(Color::White)
@@ -771,6 +780,10 @@ fn remote_meta_line(r: &RemoteInfo, selected: bool, focused: bool, width: usize)
         // saturated color on this line always means "alarm".
         chips.push((format!("ph{phase}"), base));
     }
+    if r.suspended {
+        // PERF-07: the daemon parked this child under idle_child_policy=suspend.
+        chips.push(("suspended".into(), Style::default().fg(Color::DarkGray)));
+    }
     if chips.is_empty() {
         chips.push(("—".into(), base));
     }
@@ -931,14 +944,28 @@ fn draw_usage_footer(frame: &mut Frame, app: &App, area: Rect) {
     let session_cost = app.selected().and_then(|s| s.meta.session_cost_usd);
     let (r5h, rweek) = app.rate_limits();
 
-    let lines = vec![
-        Line::from(Span::styled("─".repeat(width), dim)),
-        cost_row("sess", human_cost(session_cost)),
-        cost_row("today", human_cost(costs.today_usd)),
-        cost_row("week", human_cost(costs.week_usd)),
-        rate_line("5h", r5h, width),
-        rate_line("wk", rweek, width),
-    ];
+    // PERF-08: `usage_poll_secs = 0` never spawns the poller, so the
+    // today/week rows would stay blank forever. Say so instead; `sess` and
+    // the rate windows come from per-session metadata and still work.
+    let lines = if app.usage_poll_disabled() {
+        vec![
+            Line::from(Span::styled("─".repeat(width), dim)),
+            cost_row("sess", human_cost(session_cost)),
+            Line::from(Span::styled(" usage: off", dim)),
+            Line::from(Span::styled(" (usage_poll_secs = 0)", dim)),
+            rate_line("5h", r5h, width),
+            rate_line("wk", rweek, width),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("─".repeat(width), dim)),
+            cost_row("sess", human_cost(session_cost)),
+            cost_row("today", human_cost(costs.today_usd)),
+            cost_row("week", human_cost(costs.week_usd)),
+            rate_line("5h", r5h, width),
+            rate_line("wk", rweek, width),
+        ]
+    };
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1014,6 +1041,11 @@ fn meta_line(s: &Session, selected: bool, focused: bool, width: usize) -> Line<'
             // saturated color on this line always means "alarm".
             chips.push((format!("ph{phase}"), base));
         }
+    }
+    if s.child_suspended {
+        // PERF-07: the child is SIGSTOPped under idle_child_policy=suspend;
+        // a live-runtime row renders chips, so the state rides here.
+        chips.push(("suspended".into(), Style::default().fg(Color::DarkGray)));
     }
     if chips.is_empty() {
         chips.push(("—".into(), base));
@@ -1708,6 +1740,9 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 ];
                 if let Some(tool) = &r.last_tool {
                     lines.push(row("tool", tool.clone()));
+                }
+                if r.suspended {
+                    lines.push(row("child", "suspended".into()));
                 }
                 // PERM-04: surface *why* the session is waiting ("permission"
                 // flags a pending approve/deny request handled from the phone).
@@ -3127,6 +3162,21 @@ mod tests {
             .iter()
             .any(|cell| cell.bg == Color::Indexed(237)));
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::Cyan));
+    }
+
+    #[test]
+    fn usage_footer_says_off_when_poller_disabled() {
+        // PERF-08: with `usage_poll_secs = 0` the poller never starts, so the
+        // footer must say so instead of showing permanently blank cost rows.
+        let (_fixture, mut app, _repository) = hierarchy_fixture();
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains(" today"), "{rendered}");
+        assert!(!rendered.contains("usage: off"), "{rendered}");
+        app.disable_usage_poller_for_test();
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("usage: off"), "{rendered}");
+        assert!(rendered.contains("usage_poll_secs = 0"), "{rendered}");
+        assert!(!rendered.contains(" today"), "{rendered}");
     }
 
     #[test]
