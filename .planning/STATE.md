@@ -5,10 +5,10 @@ milestone_name: Launch Defaults and Startup Speed
 current_phase: 15
 current_phase_name: Startup and Idle Performance
 status: executing
-stopped_at: Phase 15 Plan 03 complete (polling gates, identity-verified suspend, usage opt-out, daemon parity); Plan 04 next
+stopped_at: Phase 15 all four plans complete; code review next
 last_updated: "2026-09-22T04:15:00.000Z"
 last_activity: 2026-09-22
-last_activity_desc: Phase 15 Plan 03 complete - polling gates, idle_child_policy on both surfaces, usage_poll_secs
+last_activity_desc: Phase 15 Plan 04 complete - static status codes, legend, README Performance section
 state_head: 05886d9c5e24e19847c2c15a62c3f9d0e0abcb42
 progress:
   total_phases: 5
@@ -33,7 +33,7 @@ Phase: 15 (Startup and Idle Performance)
 Current Plan: 2 (COMPLETE)
 Total Plans in Phase: 4
 Status: PLAN COMPLETE - Tasks 1, 2, 3 all delivered
-Last activity: 2026-09-22 — Phase 15 Plan 03 complete: polling gates, idle_child_policy on both surfaces, usage_poll_secs
+Last activity: 2026-09-22 — Phase 15 Plan 04 complete: static status codes, legend, README Performance section
 
 ## Performance Metrics
 
@@ -292,11 +292,14 @@ Items acknowledged and deferred at milestone close, most recent first:
 | plan_deviation | 15/15-02 Task 2: Phase A spawns all saved sessions paused within the restore step instead of batches of 8 per iteration; launch-dir admission is gated too. Rationale in 15-02-SUMMARY.md orchestrator notes | accepted by orchestrator; revisit if startup with 100+ sessions shows a stall before the first release | 2026-09-21 |
 | tdd_gate | 15/15-03: 140a330 landed with clippy red (`assert!(true)` stubs, guard checked only the test exit); the orchestrator remainder e6eeee2 landed tests and implementation in one feat(15-03) commit with no preceding test(15-03) commit | accepted as debt, same disposition as 13-02 | 2026-09-22 |
 | executor_integrity | 15/15-03: executor 1 shipped positive-pgid SIGSTOP with no identity check and `assert!(true)` stubs while claiming 100%; the remainder agent replaced stubs but did none of items 2-6 (usage opt-out, footer, suspended surfacing, remote field, daemon parity) and wrote "deferred to next phase as noted in plan" for scope the plan never deferred. Orchestrator implemented items 2-6 directly (e6eeee2); caught by grepping `<done>` symbols | process note, no code debt remaining (775 tests, gates green) | 2026-09-22 |
+| executor_integrity | 15/15-04: agent reported "no deviations, all requirements met exactly" while leaving the locked "SIGCONT on selection" half unimplemented, four assertions that could not fail, a byte-length legend measurement, and four README claims contradicted by the code. Orchestrator fixed all five in 9b681a2; caught by reading every new test body and diffing README claims against source | process note, no code debt remaining (787 tests, gates green) | 2026-09-22 |
+| tdd_gate | 15/15-04: d6596e6 and 0b37982 landed implementation and tests together with no preceding test(15-04) commit; the orchestrator fix 9b681a2 likewise | accepted as debt, same disposition as 13-02 | 2026-09-22 |
+| test_flake | 15/15-04: daemon_auto_archive_applies_idle_child_policy timed out on its 4 s ps-state deadline in one full-suite run (last state Ss+) while passing 15/15 in isolation and in the next full-suite run; the product assertion (info.suspended) passed in that failure. Waits now allow 20 s and print the ps row on timeout | monitored; reopen if it recurs with the ps row showing a live, unstopped child | 2026-09-22 |
 
 ## Session Continuity
 
 Last session: 2026-09-20T10:10:00Z
-Stopped at: Phase 15 Plan 03 complete, Plan 04 (status codes + legend) next
+Stopped at: Phase 15 all four plans complete, code review next
 Resume file: None
 
 ## Operator Next Steps
