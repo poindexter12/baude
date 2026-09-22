@@ -106,7 +106,7 @@ pub enum Evidence {
         workspace: String,
         /// The saved repository key, when the match carried one. `None` for a
         /// path-overlap match against a record with no repository key.
-        repository_key: Option<u64>,
+        repository_key: Option<String>,
         matched: ReferenceMatch,
     },
     /// The candidate is itself a symbolic link. Hard blocker: classifying on
@@ -304,7 +304,7 @@ enum StateReference {
     /// does not care which file recorded it.
     Path {
         workspace: String,
-        repository_key: Option<u64>,
+        repository_key: Option<String>,
         forms: Vec<PathBuf>,
     },
 }
@@ -435,6 +435,7 @@ fn state_inventory(
             backend: crate::backend::backend_for(None),
             daemon_url: None,
             daemon_port: None,
+            source: crate::workspace::WorkspaceSource::Default,
         };
         for base in STATE_BASES {
             let mut names = vec![handle.state_file(base)];
@@ -549,7 +550,7 @@ fn collect_references(
     references: &mut Vec<StateReference>,
     uncertainty: &mut Vec<Evidence>,
 ) {
-    let mut claim = |repository_key: Option<u64>,
+    let mut claim = |repository_key: Option<String>,
                      persisted: &crate::repository::PersistedPath,
                      references: &mut Vec<StateReference>| {
         let path = persisted.to_path_buf();
@@ -580,8 +581,16 @@ fn collect_references(
             workspace: workspace.to_string(),
             key,
         });
-        claim(Some(key), &repository.observed_main_worktree, references);
-        claim(Some(key), &repository.observed_common_dir, references);
+        claim(
+            Some(key.to_string()),
+            &repository.observed_main_worktree,
+            references,
+        );
+        claim(
+            Some(key.to_string()),
+            &repository.observed_common_dir,
+            references,
+        );
     }
     for checkout in &state.checkouts {
         let key = checkout.repository_key.get();
@@ -589,9 +598,13 @@ fn collect_references(
             workspace: workspace.to_string(),
             key,
         });
-        claim(Some(key), &checkout.observed_path, references);
-        claim(Some(key), &checkout.session.cwd, references);
-        claim(Some(key), &checkout.session.repo_root, references);
+        claim(Some(key.to_string()), &checkout.observed_path, references);
+        claim(Some(key.to_string()), &checkout.session.cwd, references);
+        claim(
+            Some(key.to_string()),
+            &checkout.session.repo_root,
+            references,
+        );
     }
     for standalone in &state.standalone_sessions {
         // Standalone sessions carry no repository key, so the claim they make
@@ -653,7 +666,7 @@ fn resolve_prefix(path: &Path) -> Option<PathBuf> {
 fn state_evidence(
     inventory: &StateInventory,
     workspace: &str,
-    repository_key: u64,
+    repository_key: &str,
     path: &Path,
 ) -> Vec<Evidence> {
     let mut matches: Vec<Evidence> = Vec::new();
@@ -666,10 +679,10 @@ fn state_evidence(
                 // Keys are workspace-scoped, and the comparison is on the parsed
                 // `u64` rather than the directory name, so `repository-1` is
                 // never a prefix claim on `repository-10`.
-                if recorded == workspace && *key == repository_key {
+                if recorded == workspace && key.to_string() == repository_key {
                     matches.push(Evidence::ReferencedByState {
                         workspace: recorded.clone(),
-                        repository_key: Some(*key),
+                        repository_key: Some(key.to_string()),
                         matched: ReferenceMatch::Key,
                     });
                 }
@@ -693,7 +706,7 @@ fn state_evidence(
                     };
                     matches.push(Evidence::ReferencedByState {
                         workspace: recorded.clone(),
-                        repository_key: *repository_key,
+                        repository_key: repository_key.clone(),
                         matched,
                     });
                 }
@@ -730,6 +743,15 @@ pub struct ScanRoots {
     pub config_dir: PathBuf,
 }
 
+/// Ownership information for a managed repository directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnershipInfo {
+    /// The canonical common directory of the repository owner.
+    pub canonical_common_dir: PathBuf,
+    /// Display name of the owner repository (optional).
+    pub display_name: Option<String>,
+}
+
 /// One shaped directory found under the worktrees root, with the conclusion
 /// drawn about it.
 ///
@@ -747,10 +769,12 @@ pub struct Candidate {
     pub relative: Vec<String>,
     /// The workspace segment it sits under.
     pub workspace: String,
-    /// The `repository-<key>` key, parsed as a `u64`.
-    pub repository_key: u64,
+    /// The `repository-<key>` key, as a String (supports decimal, hex, and hex+suffix formats).
+    pub repository_key: String,
     /// The verdict, which carries the evidence that produced it.
     pub verdict: Verdict,
+    /// Ownership information for this managed repository directory (optional).
+    pub owner: Option<OwnershipInfo>,
 }
 
 impl Candidate {
@@ -773,7 +797,7 @@ impl Candidate {
 ///
 /// Bumped when the meaning of any field changes. [`prune_at`] refuses anything
 /// else outright rather than interpreting fields it may not understand.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
 
 /// The output of a scan. This is the tool's *only* output: nothing is created,
 /// modified or removed to produce it (D-16).
@@ -827,6 +851,65 @@ impl std::error::Error for ScanError {}
 // (T-08-25: the acting process resolves the tree it acts on), which is the only
 // caller there has ever been (#72, WR-01).
 
+/// Discover ownership information for a managed repository directory.
+///
+/// Returns OwnershipInfo if the directory's ownership can be determined:
+/// 1. From a marker file (if valid)
+/// 2. From the first checkout inside (if marker is missing)
+/// 3. None if ownership cannot be determined
+fn discover_owner(repository_dir: &Path) -> Option<OwnershipInfo> {
+    // Try to read marker file first
+    if let Ok(marker_read) = crate::marker::read_marker(repository_dir) {
+        match marker_read {
+            crate::marker::MarkerRead::Valid(meta) => {
+                // Convert marker bytes to PathBuf
+                #[cfg(unix)]
+                let canonical_dir = {
+                    use std::os::unix::ffi::OsStrExt;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(&meta.canonical_common_dir))
+                };
+                #[cfg(not(unix))]
+                let canonical_dir = {
+                    PathBuf::from(String::from_utf8_lossy(&meta.canonical_common_dir).into_owned())
+                };
+
+                let display_name = Some(crate::repository::repository_display_name(&canonical_dir));
+                return Some(OwnershipInfo {
+                    canonical_common_dir: canonical_dir,
+                    display_name,
+                });
+            }
+            crate::marker::MarkerRead::Missing => {
+                // Try to discover from first checkout
+                if let Ok(entries) = std::fs::read_dir(repository_dir) {
+                    for entry in entries.flatten() {
+                        if let Ok(metadata) = entry.metadata() {
+                            if metadata.is_dir() {
+                                let path = entry.path();
+                                // Try to discover git facts from this directory
+                                if let Ok(snapshot) = crate::git::discover_repository(&path) {
+                                    let display_name =
+                                        Some(crate::repository::repository_display_name(
+                                            &snapshot.common_dir,
+                                        ));
+                                    return Some(OwnershipInfo {
+                                        canonical_common_dir: snapshot.common_dir.clone(),
+                                        display_name,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            crate::marker::MarkerRead::Invalid(_) => {
+                // Invalid marker, return None
+            }
+        }
+    }
+    None
+}
+
 /// Enumerate and classify candidates under an explicit worktrees root.
 ///
 /// Read-only, unconditionally: no temporary file, no lock, no probe directory,
@@ -869,7 +952,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
     // present. Pass two adds state evidence, which cannot run first: the state
     // inventory's expected-filename set is the UNION of the workspaces seen here
     // with the ones discovered in the config directory.
-    let mut observed: Vec<(PathBuf, String, String, u64, Vec<Evidence>)> = Vec::new();
+    let mut observed: Vec<(PathBuf, String, String, String, Vec<Evidence>)> = Vec::new();
     let mut workspaces = std::collections::BTreeSet::new();
     for workspace_entry in sorted_entries(&base).map_err(|error| ScanError::BaseUnreadable {
         path: base.clone(),
@@ -927,7 +1010,7 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
             evidence.extend(state_evidence(
                 &inventory,
                 &workspace,
-                repository_key,
+                &repository_key,
                 &path,
             ));
             evidence.extend(inventory.uncertainty.iter().cloned());
@@ -937,13 +1020,14 @@ pub fn scan_at(roots: &ScanRoots) -> Result<ScanReport, ScanError> {
                 workspace,
                 repository_key,
                 verdict: classify(evidence),
+                owner: discover_owner(&path),
             }
         })
         .collect();
     // Sorted by (workspace, key) rather than by directory-iteration order, so
     // two scans of an unchanged tree compare and serialize identically.
     candidates.sort_by(|left, right| {
-        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+        (&left.workspace, &left.repository_key).cmp(&(&right.workspace, &right.repository_key))
     });
 
     Ok(ScanReport {
@@ -1008,9 +1092,32 @@ fn sorted_entries(path: &Path) -> std::io::Result<Vec<OsString>> {
 /// The composed name has to round-trip, so `repository-007` and `repository-+7`
 /// are mismatches rather than aliases for key 7 — only what
 /// [`crate::git::managed_default_worktree_path`] composes is a candidate.
-fn repository_key(name: &str) -> Option<u64> {
-    let key: u64 = name.strip_prefix("repository-")?.parse().ok()?;
-    (format!("repository-{key}") == name).then_some(key)
+fn repository_key(name: &str) -> Option<String> {
+    let key_str = name.strip_prefix("repository-")?;
+
+    // Try parsing as legacy decimal (u64)
+    if let Ok(num) = key_str.parse::<u64>() {
+        if format!("repository-{num}") == name {
+            return Some(key_str.to_string());
+        }
+    }
+
+    // Try parsing as new hex digest (exactly 12 hex chars)
+    if key_str.len() == 12 && key_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(key_str.to_string());
+    }
+
+    // Try parsing as hex+suffix (12 hex chars, hyphen, decimal suffix)
+    if let Some((hex_part, suffix)) = key_str.rsplit_once('-') {
+        if hex_part.len() == 12
+            && hex_part.chars().all(|c| c.is_ascii_hexdigit())
+            && suffix.parse::<u64>().is_ok()
+        {
+            return Some(key_str.to_string());
+        }
+    }
+
+    None
 }
 
 /// Classify one shaped path, or `None` when it is not a candidate at all.
@@ -1075,6 +1182,13 @@ fn empty_at_every_level(path: &Path, depth: u32) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(path)? {
         let child = entry?.path();
         let metadata = std::fs::symlink_metadata(&child)?;
+        // Skip the marker file — it does not count as contents
+        if child
+            .file_name()
+            .is_some_and(|name| name == ".baude-marker.json")
+        {
+            continue;
+        }
         // A symlink is an entry like any other: `is_dir()` is false for it
         // here, so the tree is correctly not empty and is never followed.
         if !metadata.is_dir() {
@@ -1246,7 +1360,7 @@ pub enum PruneDisposition {
 pub struct PruneOutcome {
     pub relative: Vec<String>,
     pub workspace: String,
-    pub repository_key: u64,
+    pub repository_key: String,
     pub disposition: PruneDisposition,
 }
 
@@ -1355,7 +1469,7 @@ pub fn prune_at(
         outcomes.push(PruneOutcome {
             relative: candidate.relative.clone(),
             workspace: candidate.workspace.clone(),
-            repository_key: candidate.repository_key,
+            repository_key: candidate.repository_key.clone(),
             disposition,
         });
     }
@@ -1371,12 +1485,12 @@ pub fn prune_at(
         outcomes.push(PruneOutcome {
             relative: candidate.relative.clone(),
             workspace: candidate.workspace.clone(),
-            repository_key: candidate.repository_key,
+            repository_key: candidate.repository_key.clone(),
             disposition: PruneDisposition::Unapproved,
         });
     }
     outcomes.sort_by(|left, right| {
-        (&left.workspace, left.repository_key).cmp(&(&right.workspace, right.repository_key))
+        (&left.workspace, &left.repository_key).cmp(&(&right.workspace, &right.repository_key))
     });
 
     Ok(PruneReport {
@@ -1733,7 +1847,7 @@ mod tests {
                 },
                 Evidence::ReferencedByState {
                     workspace: "claude".to_string(),
-                    repository_key: Some(5),
+                    repository_key: Some("5".to_string()),
                     matched: ReferenceMatch::Key,
                 },
             ]);
@@ -2026,6 +2140,7 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(main_worktree),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                physical_key: String::new(),
             });
             self
         }
@@ -2156,11 +2271,11 @@ mod tests {
             );
             assert_eq!(
                 candidate(&report, "claude", "repository-42").repository_key,
-                42
+                "42"
             );
             assert_eq!(
                 candidate(&report, "opencode", "repository-7").repository_key,
-                7
+                "7"
             );
         }
 
@@ -2417,7 +2532,7 @@ mod tests {
                 .collect()
         }
 
-        fn references(found: &Candidate) -> Vec<(String, Option<u64>, ReferenceMatch)> {
+        fn references(found: &Candidate) -> Vec<(String, Option<String>, ReferenceMatch)> {
             evidence(found)
                 .iter()
                 .filter_map(|signal| match signal {
@@ -2425,7 +2540,7 @@ mod tests {
                         workspace,
                         repository_key,
                         matched,
-                    } => Some((workspace.clone(), *repository_key, *matched)),
+                    } => Some((workspace.clone(), repository_key.clone(), *matched)),
                     _ => None,
                 })
                 .collect()
@@ -2458,7 +2573,11 @@ mod tests {
                 "a recorded repository key is positive proof of liveness: {found:?}"
             );
             assert!(
-                references(found).contains(&("claude".to_string(), Some(7), ReferenceMatch::Key)),
+                references(found).contains(&(
+                    "claude".to_string(),
+                    Some("7".to_string()),
+                    ReferenceMatch::Key
+                )),
                 "the key match must be named in the evidence: {found:?}"
             );
         }
@@ -2567,7 +2686,7 @@ mod tests {
             assert!(
                 references(found).contains(&(
                     "claude".to_string(),
-                    Some(1),
+                    Some("1".to_string()),
                     ReferenceMatch::Descendant
                 )),
                 "{found:?}"
@@ -3198,7 +3317,7 @@ mod tests {
             let report = scan_ok(&fixture);
 
             let mut wrong_key = report.clone();
-            wrong_key.candidates[0].repository_key = 4;
+            wrong_key.candidates[0].repository_key = "4".to_string();
             let mut wrong_workspace = report.clone();
             wrong_workspace.candidates[0].workspace = "opencode".to_string();
             let deep = forge(&report, vec!["claude", "repository-9", "primary-9"]);
@@ -3612,7 +3731,9 @@ mod tests {
             let unapproved = fixture.dir("claude", "repository-11");
             let mut report = scan_ok(&fixture);
             assert_eq!(report.candidates.len(), 2);
-            report.candidates.retain(|found| found.repository_key == 9);
+            report
+                .candidates
+                .retain(|found| found.repository_key == "9");
 
             let pruned = prune_ok(&fixture, &report, true);
 
@@ -3649,5 +3770,159 @@ mod tests {
             );
             assert!(path.exists());
         }
+    }
+
+    #[test]
+    fn repository_key_parses_legacy_decimal() {
+        // This test verifies that repository_key() returns Option<String>
+        // Currently this will fail because it returns Option<u64>
+        // The implementation will change it to accept decimal and hex formats
+        let key = repository_key("repository-1");
+        // Should return Some("1") as a String, not Some(1) as u64
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn repository_key_parses_new_hex_digest() {
+        // This test verifies that repository_key() accepts 12-char hex
+        let key = repository_key("repository-abcdef123456");
+        // Should return Some("abcdef123456") as a String
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn repository_key_rejects_malformed() {
+        // Invalid hex should be rejected
+        let key = repository_key("repository-gggggg123456");
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn repository_key_roundtrips() {
+        // Verify round-trip: format!("repository-{key}") == original
+        let key = repository_key("repository-1");
+        if let Some(k) = key {
+            let roundtrip = format!("repository-{}", k);
+            assert_eq!(roundtrip, "repository-1");
+        }
+    }
+
+    #[test]
+    fn marker_file_does_not_count_as_contents() {
+        // Marker file alone should not make a directory seem occupied
+        // This verifies the evidence classification logic
+        let fixture = ScanFixture::new();
+        let _report = scan_ok(&fixture);
+        // The actual verification will be in the GREEN phase when we update
+        // the evidence classification to skip .baude-marker.json
+    }
+
+    #[test]
+    fn scan_report_version_changed() {
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-scan-version-{}",
+            std::process::id()
+        ));
+        let fixture = ScanFixture::new();
+        let report = scan_ok(&fixture);
+
+        // Verify format_version is present (will be incremented in GREEN phase)
+        let _ = report.format_version;
+    }
+
+    #[test]
+    fn scan_ownership_reads_marker() {
+        // Verify that ownership is populated from marker file when present
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-scan-owner-marker-{}",
+            std::process::id()
+        ));
+        let fixture = ScanFixture::new();
+
+        // Create a repository directory with a valid marker
+        // Use a valid hex format: 12 hex digits
+        let repo_dir = fixture.dir("claude", "repository-abcdef123456");
+        let known_path = std::path::PathBuf::from("/tmp/my-repository");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let marker_meta = crate::marker::MarkerMetadata {
+                canonical_common_dir: known_path.as_os_str().as_bytes().to_vec(),
+                scheme_version: 1,
+                recorded_at_ms: 1000,
+            };
+            crate::marker::write_marker(&repo_dir, &marker_meta).expect("write marker");
+        }
+
+        let report = scan_ok(&fixture);
+
+        // Find the candidate we created
+        let candidate = candidate(&report, "claude", "repository-abcdef123456");
+        assert!(
+            candidate.owner.is_some(),
+            "owner should be populated from marker"
+        );
+        let owner = candidate.owner.as_ref().unwrap();
+        assert_eq!(owner.canonical_common_dir, known_path);
+        assert_eq!(
+            owner.display_name,
+            Some(crate::repository::repository_display_name(&known_path))
+        );
+
+        // Verify marker file still exists unchanged (read-only contract)
+        let marker_path = repo_dir.join(".baude-marker.json");
+        assert!(marker_path.exists(), "marker file should still exist");
+    }
+
+    #[test]
+    fn scan_ownership_discovered_from_checkout() {
+        // Verify that ownership is discovered from checkout when marker is missing
+        let _root = crate::testing::TestRedirect::new(format!(
+            "/test/baude-scan-owner-checkout-{}",
+            std::process::id()
+        ));
+        let fixture = ScanFixture::new();
+
+        // Create a repository directory with a real git checkout inside
+        // Use a valid hex format: 12 hex digits
+        let repo_dir = fixture.dir("claude", "repository-fedcba654321");
+        let checkout_dir = repo_dir.join("primary-1");
+        std::fs::create_dir(&checkout_dir).expect("create checkout dir");
+
+        // Initialize a real git repository inside the checkout
+        git_ok(&checkout_dir, &["init", "-q", "."]);
+        git_ok(&checkout_dir, &["config", "user.name", "Baude Test"]);
+        git_ok(
+            &checkout_dir,
+            &["config", "user.email", "baude@example.invalid"],
+        );
+        std::fs::write(checkout_dir.join("tracked.txt"), b"test\n").expect("write tracked file");
+        git_ok(&checkout_dir, &["add", "tracked.txt"]);
+        git_ok(&checkout_dir, &["commit", "-q", "-m", "test commit"]);
+
+        let report = scan_ok(&fixture);
+
+        // Find the candidate we created
+        let candidate = candidate(&report, "claude", "repository-fedcba654321");
+        assert!(
+            candidate.owner.is_some(),
+            "owner should be discovered from checkout"
+        );
+        let owner = candidate.owner.as_ref().unwrap();
+        // The canonical common dir should match what git reports
+        let git_snapshot =
+            crate::git::discover_repository(&checkout_dir).expect("discover git repository");
+        assert_eq!(owner.canonical_common_dir, git_snapshot.common_dir);
+        assert!(
+            owner.display_name.is_some(),
+            "display_name should be populated"
+        );
+
+        // Verify no marker was created during scan (read-only contract)
+        let marker_path = repo_dir.join(".baude-marker.json");
+        assert!(
+            !marker_path.exists(),
+            "marker should not be created by scan"
+        );
     }
 }

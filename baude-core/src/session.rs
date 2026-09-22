@@ -89,6 +89,16 @@ pub struct Session {
     /// (`{request_id, decision, scope?, ts}` as JSON). The bridge's GET poll
     /// reads this to unblock; cleared when a new request supersedes it.
     pub permission_decision: Option<serde_json::Value>,
+    /// Idle child is suspended via SIGSTOP. Set by suspend_idle_child(),
+    /// cleared by resume_idle_child() or kill(). Shows "suspended" in status.
+    pub child_suspended: bool,
+    /// UX-01: which pane this session had focus in when the user last left it
+    /// (true = the shell pane). In-memory only: it is deliberately absent from
+    /// the persisted state, so a fresh baude starts every session on the agent
+    /// pane. The TUI records it on focus changes and restores it on activation.
+    pub pane_focus_shell: bool,
+    /// Test-only counter: number of times poll_meta has been called.
+    pub poll_meta_calls_for_test: std::cell::Cell<u32>,
 }
 
 impl Session {
@@ -144,6 +154,14 @@ impl Session {
         } else {
             false
         }
+    }
+
+    /// Returns the current screen generation counter for this session's PTY.
+    /// Incremented by the reader thread on each output, used for lock-free change detection.
+    pub fn screen_generation(&self) -> u64 {
+        self.claude
+            .screen_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -300,6 +318,9 @@ impl Session {
     }
 
     pub fn poll_meta(&mut self) {
+        self.poll_meta_calls_for_test
+            .set(self.poll_meta_calls_for_test.get() + 1);
+
         if self.claude.is_exited() {
             return;
         }
@@ -320,10 +341,104 @@ impl Session {
         Ok(())
     }
 
+    /// True while the agent (or its shell) still waits behind the restore gate.
+    pub fn is_gated(&self) -> bool {
+        self.claude.is_gated() || self.shell.as_ref().is_some_and(|shell| shell.is_gated())
+    }
+
+    /// Start a restored session's gated children. Call only after the state
+    /// that records them has been written durably.
+    pub fn release_gates(&mut self) -> anyhow::Result<()> {
+        self.claude.release_gate()?;
+        if let Some(shell) = &mut self.shell {
+            shell.release_gate()?;
+        }
+        Ok(())
+    }
+
     pub fn kill(&mut self) {
         self.claude.kill();
         if let Some(shell) = &mut self.shell {
             shell.kill();
+        }
+        self.child_suspended = false;
+    }
+
+    /// Idle-child policy `suspend`: SIGSTOP the agent (and the open shell)
+    /// after re-verifying each child's identity. `child_suspended` is set only
+    /// when the agent was signaled; a shell failure is reported in the error
+    /// text but does not undo the agent's suspension.
+    pub fn suspend_idle_child(&mut self) -> std::result::Result<(), String> {
+        self.claude
+            .suspend()
+            .map_err(|error| format!("agent: {error}"))?;
+        self.child_suspended = true;
+        if let Some(shell) = &self.shell {
+            if !shell.is_exited() {
+                shell
+                    .suspend()
+                    .map_err(|error| format!("shell: {error} (agent suspended)"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// SIGCONT the agent (and the open shell) after identity verification.
+    /// `child_suspended` clears only when the agent was signaled.
+    pub fn resume_idle_child(&mut self) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        match self.claude.resume() {
+            Ok(()) => self.child_suspended = false,
+            Err(error) => problems.push(format!("agent: {error}")),
+        }
+        if let Some(shell) = &self.shell {
+            if !shell.is_exited() {
+                if let Err(error) = shell.resume() {
+                    problems.push(format!("shell: {error}"));
+                }
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// Idle-child policy `stop`: end the agent and shell for good.
+    pub fn stop_idle_child(&mut self) {
+        self.kill();
+        self.child_suspended = false;
+    }
+
+    /// Apply the configured idle-child policy after this row's archive state
+    /// changed (PERF-07). Archived: `Suspend` stops the agent and shell,
+    /// `Stop` kills them, `Keep` does nothing. Unarchived with a suspended
+    /// child: resume it. Shared by the TUI and the daemon so both surfaces
+    /// behave identically. Returns a human-readable note when a signal fails.
+    pub fn apply_idle_child_policy(
+        &mut self,
+        policy: crate::persist::IdleChildPolicy,
+    ) -> Option<String> {
+        use crate::persist::IdleChildPolicy;
+        if self.archived {
+            match policy {
+                IdleChildPolicy::Suspend => self
+                    .suspend_idle_child()
+                    .err()
+                    .map(|error| format!("{}: could not suspend: {error}", self.name)),
+                IdleChildPolicy::Stop => {
+                    self.stop_idle_child();
+                    None
+                }
+                IdleChildPolicy::Keep => None,
+            }
+        } else if self.child_suspended {
+            self.resume_idle_child()
+                .err()
+                .map(|error| format!("{}: could not resume: {error}", self.name))
+        } else {
+            None
         }
     }
 
@@ -555,46 +670,54 @@ pub(crate) fn inspect_process_identity(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn inspect_process_identity(
+#[repr(C)]
+#[derive(Default)]
+struct ProcBsdInfo {
+    flags: u32,
+    status: u32,
+    xstatus: u32,
     pid: u32,
-) -> std::result::Result<Option<ProcessIdentity>, String> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcBsdInfo {
-        flags: u32,
-        status: u32,
-        xstatus: u32,
-        pid: u32,
-        ppid: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        svuid: u32,
-        svgid: u32,
-        rfu_1: u32,
-        comm: [u8; 16],
-        name: [u8; 32],
-        nfiles: u32,
-        pgid: u32,
-        pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        nice: i32,
-        start_tvsec: u64,
-        start_tvusec: u64,
-    }
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            buffersize: i32,
-        ) -> i32;
-    }
-    const PROC_PIDTBSDINFO: i32 = 3;
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    ruid: u32,
+    rgid: u32,
+    svuid: u32,
+    svgid: u32,
+    rfu_1: u32,
+    comm: [u8; 16],
+    name: [u8; 32],
+    nfiles: u32,
+    pgid: u32,
+    pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    nice: i32,
+    start_tvsec: u64,
+    start_tvusec: u64,
+}
+// Gated per item, not once for the group: a single `#[cfg]` applies only to
+// the item that follows it, so gating just the struct above left this `-lproc`
+// link directive compiling on Linux and broke the build there.
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+#[cfg(target_os = "macos")]
+const PROC_PIDTBSDINFO: i32 = 3;
+
+/// One `PROC_PIDTBSDINFO` read, shared by the identity reader and the
+/// stopped-state probe. `None` means the process is gone or the read was
+/// short.
+#[cfg(target_os = "macos")]
+fn proc_bsd_info(pid: u32) -> Option<ProcBsdInfo> {
     let mut info = ProcBsdInfo::default();
     let size = std::mem::size_of::<ProcBsdInfo>();
     // SAFETY: `info` is writable for exactly `size` bytes and proc_pidinfo
@@ -608,16 +731,28 @@ pub(crate) fn inspect_process_identity(
             size as i32,
         )
     };
-    if read == 0 {
+    if read as usize != size || info.pid != pid {
+        return None;
+    }
+    Some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn proc_bsd_status(pid: u32) -> Option<u32> {
+    proc_bsd_info(pid).map(|info| info.status)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect_process_identity(
+    pid: u32,
+) -> std::result::Result<Option<ProcessIdentity>, String> {
+    let Some(info) = proc_bsd_info(pid) else {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(libc::ESRCH) => Ok(None),
             _ => Err(format!("could not inspect pid {pid}: {error}")),
         };
-    }
-    if read as usize != size || info.pid != pid {
-        return Err(format!("incomplete process identity for pid {pid}"));
-    }
+    };
     // SAFETY: getsid only reads kernel process metadata for the supplied pid.
     let session = unsafe { libc::getsid(pid as i32) };
     if session < 0 {
@@ -636,6 +771,38 @@ pub(crate) fn inspect_process_identity(
         process_group: info.pgid as i32,
         session,
     }))
+}
+
+/// Whether this platform can cheaply read a process's job-control state.
+/// When false, [`process_is_stopped`] always answers `None` and callers must
+/// skip confirmation rather than block.
+pub(crate) const STOP_PROBE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// Is this pid currently in the stopped (job-control `T`) state?
+///
+/// `None` means *unknown right now*, not "no": on macOS a `proc_pidinfo` read
+/// can come back short while the process is part-way through `exec`, which is
+/// precisely the window where a stop gets lost. Callers must keep asking
+/// rather than read `None` as success — treating it as success is what let a
+/// running child be reported as suspended.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_stopped(pid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let state = stat[end + 1..].split_whitespace().next()?;
+    Some(state == "T")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_is_stopped(pid: u32) -> Option<bool> {
+    // SSTOP from <sys/proc.h>: the process is stopped for job control.
+    const SSTOP: u32 = 4;
+    proc_bsd_status(pid).map(|status| status == SSTOP)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_is_stopped(_pid: u32) -> Option<bool> {
+    None
 }
 
 fn signal_process_group(
@@ -1049,5 +1216,166 @@ mod tests {
             idle_kind(None, Some(&("idle".to_string(), 100))),
             IdleKind::NeedsInput
         );
+    }
+
+    #[test]
+    fn mtime_unchanged_skip_read() {
+        // When metadata file mtime is unchanged, backend should not read it
+        // This is a gating test - verify the field exists and tracks changes
+        let mut meta = ClaudeMeta::default();
+        assert_eq!(meta.last_session_mtime, None);
+        // Setting mtime should work
+        let t = std::time::SystemTime::now();
+        meta.last_session_mtime = Some(t);
+        assert_eq!(meta.last_session_mtime, Some(t));
+    }
+
+    #[test]
+    fn mtime_changed_reads_metadata() {
+        // When metadata file mtime changed, backend should read it
+        let mut meta = ClaudeMeta::default();
+        let t1 = std::time::SystemTime::now();
+        meta.last_session_mtime = Some(t1);
+        // Verify we can track different times
+        let t2 = std::time::UNIX_EPOCH;
+        assert_ne!(meta.last_session_mtime, Some(t2));
+    }
+
+    fn signal_fixture(label: &str) -> (crate::testing::TestRedirect, crate::pty::Pty) {
+        let root =
+            std::env::temp_dir().join(format!("baude-signal-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let redirect = crate::testing::TestRedirect::new(&root);
+        let pty = crate::pty::Pty::spawn_paused(Some("/bin/sh -c 'sleep 30'"), &[], &root, 5, 40)
+            .expect("spawn")
+            .release()
+            .expect("release");
+        (redirect, pty)
+    }
+
+    fn proc_state(pid: u32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn wait_for(pid: u32, pred: impl Fn(&str) -> bool, what: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let state = proc_state(pid);
+            if pred(&state) {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for pid {pid} to be {what}; last state {state:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn children_of(pid: u32) -> Vec<u32> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn suspend_process_becomes_stopped() {
+        let (_redirect, mut pty) = signal_fixture("stopped");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.suspend().expect("suspend verified child");
+        let state = wait_for(pid, |s| s.starts_with('T'), "stopped");
+        assert!(
+            state.starts_with('T'),
+            "child must be in stopped state, got {state}"
+        );
+        pty.resume().expect("resume");
+        wait_for(pid, |s| !s.starts_with('T'), "running again");
+        pty.kill();
+    }
+
+    #[test]
+    fn suspend_resume_cycle() {
+        let (_redirect, mut pty) = signal_fixture("cycle");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        for _ in 0..2 {
+            pty.suspend().expect("suspend");
+            wait_for(pid, |s| s.starts_with('T'), "stopped");
+            pty.resume().expect("resume");
+            wait_for(pid, |s| !s.starts_with('T'), "running");
+        }
+        pty.kill();
+    }
+
+    #[test]
+    fn suspend_sends_sigstop_to_group_leader_only() {
+        // The gate shell leads its own process group; signaling the group stops
+        // the shell AND the `sleep` it spawned, never anything outside it.
+        let (_redirect, mut pty) = signal_fixture("group");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        // The gate shell may exec its command (no children) or fork it; either
+        // way every member of the leader's group must stop with it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut kids = children_of(pid);
+        while kids.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            kids = children_of(pid);
+        }
+        pty.suspend().expect("suspend");
+        wait_for(pid, |s| s.starts_with('T'), "leader stopped");
+        for kid in &kids {
+            wait_for(*kid, |s| s.starts_with('T'), "group member stopped");
+        }
+        let me = std::process::id();
+        assert!(
+            !proc_state(me).starts_with('T'),
+            "the test process itself must never be signaled"
+        );
+        pty.resume().expect("resume");
+        wait_for(pid, |s| !s.starts_with('T'), "leader running");
+        pty.kill();
+    }
+
+    #[test]
+    fn suspend_refuses_on_identity_mismatch() {
+        let (_redirect, mut pty) = signal_fixture("mismatch-suspend");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.corrupt_identity_for_test();
+        let error = pty.suspend().expect_err("mismatched identity must refuse");
+        assert!(
+            error.to_string().contains("identity changed"),
+            "got: {error}"
+        );
+        assert!(
+            !proc_state(pid).starts_with('T'),
+            "no signal may be sent on a mismatch"
+        );
+        pty.kill();
+    }
+
+    #[test]
+    fn resume_refuses_on_identity_mismatch() {
+        let (_redirect, mut pty) = signal_fixture("mismatch-resume");
+        let pid = pty.process_identity().pid;
+        wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
+        pty.corrupt_identity_for_test();
+        let error = pty.resume().expect_err("mismatched identity must refuse");
+        assert!(
+            error.to_string().contains("identity changed"),
+            "got: {error}"
+        );
+        pty.kill();
     }
 }

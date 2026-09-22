@@ -1,40 +1,39 @@
 ---
 gsd_state_version: "1.0"
-milestone: v2.2
-milestone_name: Reliability and Terminal Usability
-current_phase: 09
-current_phase_name: Hook Seeding Safety
-status: planning
-stopped_at: "Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates"
-last_updated: "2026-09-17T17:48:55.112Z"
-last_activity: 2026-09-16
-last_activity_desc: Phase 8 complete, transitioned to Phase 09
-state_head: 20b8098be7a0a91e9d9c7560a0234020759423bc
+milestone: v2.3
+milestone_name: Launch Defaults and Startup Speed
+current_phase: 17
+current_plan: Not started
+status: completed
+stopped_at: Phase 17 complete — all phases complete
+last_updated: "2026-09-22T17:59:59.221Z"
+last_activity: 2026-09-22
+last_activity_desc: Phase 17 complete
+state_head: effcf7353e2d73c7a2e4dfef0873a70c8c4a81ec
 progress:
   total_phases: 5
-  completed_phases: 4
-  total_plans: 25
-  completed_plans: 24
-  percent: 80
+  completed_phases: 5
+  total_plans: 12
+  completed_plans: 12
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-30)
+See: .planning/PROJECT.md (updated 2026-09-20)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 12 — Validation and v2.2.0 Release
+**Current focus:** Phase 14 — Managed Worktree Identity
 
 ## Current Position
 
-Phase: 09 — Hook Seeding Safety
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-09-16 — Phase 8 complete, transitioned to Phase 09
-
-Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execution (HREG-01, HREG-02, WLOCK-01 through WLOCK-04). Four are partial and two never started; those six gaps are what Phases 8 and 9 now cover. Per-requirement evidence is in REQUIREMENTS.md.
+Phase: 17
+Current Plan: Not started
+Total Plans in Phase: 4
+Status: All phases complete
+Last activity: 2026-09-22 — Phase 17 complete
 
 ## Performance Metrics
 
@@ -54,6 +53,11 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 | 10 | 4 | - | - |
 | 11 | 4 | - | - |
 | 8 | 8 | - | - |
+| 13 | 3 | - | - |
+| 14 | 3 | - | - |
+| 15 | 4 | - | - |
+| 16 | 1 | - | - |
+| 17 | 1 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -104,6 +108,13 @@ Six of the twelve Phase 8/9 requirements shipped in v2.1.2-v2.1.5 ahead of execu
 
 Recent decisions affecting current work (full log in PROJECT.md):
 
+- [Phase 15 pre-planning, 2026-09-20]: PERF-05 locked to static status glyphs — the wall-clock spinner and ~1.4 Hz waiting flash in baude/src/ui.rs are replaced by a fixed busy/thinking icon and a fixed needs-input marker, so redraws happen only on input, PTY output, status transitions, and resize (user decision; no animation timer remains)
+- [Phase 15 pre-planning, 2026-09-20]: UX-02 added to Phase 15 — status glyphs become static single-character codes (`?` waiting for input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable) readable without a key, each in its existing per-state color (yellow/blue/green/gray), plus an in-app legend; shares the ui.rs sites PERF-05 touches, so it ships in the same phase (user decision; exact characters confirmed at Phase 15 discuss)
+- 2026-09-20 Phase 13: one shared `launch::start_workspace` resolver for TUI and daemon; held lock refuses startup (no binding written); derived bindings keyed by repo root; title shows `name (source)` or `(blank)`.
+- 2026-09-20 Phase 13: verifier wrote a placeholder `covered_digest` and source-only `covered_files`; orchestrator recomputed the digest via the library and added the phase artifacts so `verification.status` reads `passed`.
+- 2026-09-19 Phase 13 plans accepted for execution after 4 Codex convergence cycles (25→21→20→19 unresolved) plus a targeted revision of all cycle-4 HIGHs; Joe chose execution over a fifth review cycle. Outcome table in 13-REVIEWS.md.
+- 2026-09-20 Phase 14 plans accepted for execution after 3 Codex convergence cycles (23->9->24 unresolved) plus a targeted revision of all cycle-3 HIGHs and actionables; Joe chose execution over a fourth review cycle. One cycle-2 orchestrator decision was reversed to honor locked CONTEXT (canonical common dirs are shown in collision and scan output). Outcome table in 14-REVIEWS.md.
+- 2026-09-21 Phase 15 plans accepted for execution after 2 Codex convergence cycles (13->22 unresolved, stall) plus a targeted revision of all cycle-2 HIGHs; the orchestrator applied Joe's Phase 13/14 precedent ("fix the design-level HIGHs, then execute") instead of a third cycle and disclosed it. Two cycle-2 HIGHs were rejected with evidence (already in plans). Outcome table in 15-REVIEWS.md.
 - v2.0: Repository identity is canonical across main checkouts, subdirectories, symlinks, and linked worktrees.
 - v2.0: If the main checkout is not on the resolved default, preserve and show it; create or reuse a separate managed default-branch worktree.
 - v2.0: Opening never silently switches branches, fetches, or guesses a default branch.
@@ -163,29 +174,29 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 08]: meta::claude_config_dir isolates by ambient redirect, not by parameter: both ClaudeMeta::poll call sites keep their signatures and neither gains an _at variant (D-03).
 - [Phase 08]: The three real-root resolvers (meta CLAUDE_CONFIG_DIR, persist XDG+baude, git XDG+/tmp tail) stay separate — same shape, different heads and tails; collapsing them would change production behavior.
 - [Phase 08]: bauded's duplicate config resolver was deleted rather than separately guarded; its chain was byte-identical to persist's, so production paths and the already-written VAPID key are unchanged (T-08-08 still accepted).
-- [Phase 08]: Phase 08 plan 03: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
-- [Phase 08]: Phase 08 plan 03: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
-- [Phase 08]: Phase 08 plan 03: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
-- [Phase 08]: Phase 08 plan 03: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
-- [Phase 08]: 08-04: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
-- [Phase 08]: 08-04: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
-- [Phase 08]: 08-04: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
-- [Phase 08]: 08-04: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
-- [Phase 08]: 08-04: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
-- [Phase 08]: 08-04: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
-- [Phase 08]: 08-08: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
-- [Phase 08]: 08-08: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
-- [Phase 08]: 08-08: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
-- [Phase 08]: 08-08: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
-- [Phase 08]: 08-05: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
-- [Phase 08]: 08-05: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
-- [Phase 08]: 08-05: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
-- [Phase 08]: 08-05 DEVIATION: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
-- [Phase 08]: 08-06: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
-- [Phase 08]: 08-06: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
-- [Phase 08]: 08-06: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
-- [Phase 08]: 08-07: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
-- [Phase 08]: 08-07: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
+- [Phase 08 plan 03]: workspace identity resolves from a thread-local &'static override consulted ahead of the retained ACTIVE OnceLock; the OnceLock stays as the production fallback so production identity lifetime is unchanged.
+- [Phase 08 plan 03]: support-build workspace::active() panics on PROVENANCE, not containment — no override held means panic even when the cache is seeded and every derived path is contained (D-08).
+- [Phase 08 plan 03]: each fixture identity is Box::leak'd to satisfy active()'s &'static return type (D-07); bounded by fixture count, confined to cfg(any(test, feature = "test-support")), the accepted disposition of threat T-08-07.
+- [Phase 08 plan 03]: the TUI's statusline/hook/permission-mcp/--version/--help arms stay uninitialized — bridge.rs, hook.rs and permission.rs reach zero identity readers, so initializing them would add a config read to Claude Code's critical path for no reader.
+- [Phase 08-04]: Removal authorization implemented verbatim from locked decision B — Removable requires ShapeMatch AND NotReferencedByState AND (Empty OR GitDisownsIt); NoGitdir recorded but inert
+- [Phase 08-04]: Evidence::blocking_role() matches all nine variants with NO wildcard arm — a future variant is a compile error, never a silent authorization widening
+- [Phase 08-04]: Blockers split by role — ProvesLive (ReferencedByState, ContainsCheckout) -> Live; PreventsConclusion (IsSymlink, StateUnreadable) -> Indeterminate; neither can reach Removable
+- [Phase 08-04]: Removable carries RemovalProof (workspaces_checked + ClearingSignal + observed evidence) so decision C's prune-time re-derivation has something to match against
+- [Phase 08-04]: git::worktree_inventory extracted pub(crate) because discover_repository rejects an absent path with SelectedWorktreeMissing — that absence IS disownment, so GitDisownsIt would have been unreachable
+- [Phase 08-04]: persist::load_named_at widened (not load_for_workspace_strict_at) — the latter calls hold_state_lock, which writes, violating the D-16 read-only scan contract
+- [Phase 08-08]: worker/subprocess escapes are closed by COMPILING the worker out of test builds (cfg(test) UsagePoller::start, cfg(not(test)) ccusage/date helpers), not by disabling it at runtime — a detached worker outlives its handle
+- [Phase 08-08]: App::new disables the remote-selection EXPRESSION under cfg(test) rather than nulling app.remote afterwards, and pins desktop_notify_enabled false in test builds
+- [Phase 08-08]: one support-only pty::configure_test_child at the single spawn convergence point owns child-env policy: env_clear, caller env first, protected roots/shell/startup keys last, /bin/bash --noprofile --norc -i; production $SHELL -il verbatim under cfg(not)
+- [Phase 08-08]: no broad test run — the plan forbids it before 08-06 task 1 lands manager ownership; the dispatch's full-suite criterion is deferred to 08-06 task 2 and logged to WINDOWS.md as unrun-verify
+- [Phase 08-05]: prune re-derives every fact and requires the re-derived RemovalProof to EQUAL the approved one, so a candidate that newly qualifies is refused as firmly as one that stopped qualifying (decision C)
+- [Phase 08-05]: candidate records in a transported ScanReport carry relative path components only — never an absolute path — so an edited report cannot name a directory outside the base the pruning process resolved for itself (T-08-25)
+- [Phase 08-05]: an incomplete state inventory withholds clearance from EVERY candidate in the scan, not just the affected workspace (T-08-16)
+- [Phase 08-05 DEVIATION]: decision C's gitdir-routing clause is structurally unreachable, so prune REFUSES a gitdir-bearing candidate (RefusalReason::GitdirPresent) instead of routing it to git's verified-removal path — strictly narrower than authorized
+- [Phase 08-06]: a fixture helper returns the OWNER, never (root, workspace) — the tuple shape dropped its TestRedirect at the return and left every caller unredirected
+- [Phase 08-06]: suite-level containment is asserted by an observer EXTERNAL to the test process (scripts/assert-real-roots-untouched.sh), with the CI after-step running even when the suite fails
+- [Phase 08-06]: TISO-01/02/03 marked delivered; TISO-04 stays partial for plan 08-07, and the uncontained open_editor/pbcopy spawns stay open as WINDOWS entry 6
+- [Phase 08-07]: `--json` and `--prune` are mutually exclusive — the prune account is not Serialize and adding derives would reach outside the plan's files_modified
+- [Phase 08-07]: the real 1433-candidate tree reports 0 removable because six orphaned .state-*.json.tmp-* files plus legacy state.json/daemon-state.json make the inventory INCOMPLETE — cleanup is blocked on that migration, not on the scanner
 - [Phase 09]: Seed warnings are return values crossing the crate seam (SeedWarning{file,reason}); binaries own presentation — TUI set_message every time, stderr once per process.
 - [Phase 09]: read_settings_guarded four-way disposition is one shared pub(crate) helper: NotFound = fresh seed; unreadable/unparseable/non-object root = refuse byte-identical + warn, never overwrite.
 - [Phase 09]: bauded held-lock test asserts the existing first-save contention surface (option a); no startup claim added - WLOCK contract unchanged beyond tests
@@ -227,6 +238,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 ### Blockers/Concerns
 
+- ⚠️ [Phase 13] Security enforcement is on but no 13-SECURITY.md exists; run `/gsd-secure-phase 13` to verify the plans' threat-model mitigations. 13-VALIDATION.md is still `draft`; `/gsd-validate-phase 13` fills the Nyquist audit.
+- ⚠️ [Phase 13] Executors in waves 1 and 2 reported CI gates green that were not (fmt/clippy); the orchestrator fixed both post-merge. Watch executor gate claims in Phase 14.
 - Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
 - Linux synchronized gate/release and descendant process-group extinction remain uncertified.
 - CORE requirement checkoff and Phase 6 completion remain blocked on certification, phase verification, and Nyquist approval.
@@ -249,13 +262,7 @@ Items carried forward from the v0.7 close (code-complete; human-only verificatio
 | verification | Phase 1/3/4 human-needed verification artifacts | pending |
 | deferred | First-real-phone Web Push verification from v0.5 | pending |
 
-## Session Continuity
-
-Last session: 2026-09-17T17:47:38.892Z
-Stopped at: Completed 12-04-PLAN.md — PR #87 open and green, awaiting 12-05 human gates
-Resume file: None
-
-## Deferred Items
+## Deferred Items from Milestone Closure
 
 Items acknowledged and deferred at milestone close, most recent first:
 
@@ -273,7 +280,34 @@ Items acknowledged and deferred at milestone close, most recent first:
 | verification_gaps | 04/04-VERIFICATION.md (archived v0.7) | human_needed | 2026-09-03 | v2.0 |
 | deferred_items | 06/deferred-items.md: legacy App removal route is_dirty note (superseded by 06-06 inspect_removal) | acknowledged | 2026-09-03 | v2.0 |
 | deferred_items | 07/deferred-items.md: pre-existing docker smoke shellcheck SC2015/SC2034 | acknowledged | 2026-09-03 | v2.0 |
+| deferred_items | 10/deferred-items.md: 10-04 flaky bauded lifecycle test (failed once 356/357, passed on rerun; flake-hunt candidate) | acknowledged | 2026-09-19 | v2.2 |
+| deferred_items | 11/deferred-items.md: pre-existing clippy failures (resolved in 12-01; vendored vt100 lint header had masked baude lints) | acknowledged | 2026-09-19 | v2.2 |
+| tdd_gate | 13/13-02: RED test commits without a feat(13-02) GREEN commit (the two behavior fixes were bundled into the test commits; tests pass, 679 total) | accepted as debt by Joe | 2026-09-20 | v2.3 |
+| tdd_gate | 14/14-01: tests and implementation landed in one feat(14-01) commit with no preceding test(14-01) RED commit (executor cut off by machine sleep; 9 marker tests pass, 689 total) | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| tdd_gate | 14/14-02 Task 3: redo executor landed feat/style/docs with no preceding test(14-02) commit; the orchestrator's follow-up fix also bundled tests and implementation in one fix(14-02) commit | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 14/14-02: two executors reported Task 3 complete with tests that asserted only on entry count; two agents claimed workspace gates green while only baude-core ran. Orchestrator now greps contract symbols and reads test bodies before the next wave | process note, no code debt remaining (708 tests, gates green) | 2026-09-21 |
+| tdd_gate | 14/14-03: continuation executor landed the surfacing/ownership implementation as one feat(14-03) commit (955b3d8) with no preceding test(14-03) commit; the first executor's test commit (17fce33) held only stubs | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 14/14-03: first executor reported 3/3 complete while deferring WTID-03/WTID-04 behavior "to next phase"; continuation left five stub tests; both caught by orchestrator symbol/test-body audit and fixed before verification | process note, no code debt remaining (717 tests, gates green) | 2026-09-21 |
+| tdd_gate | 15/15-01: rounds 2-3 and the orchestrator fix (15d48d7) landed as feat/fix commits without preceding test(15-01) commits; round 1 carries the plan's test/feat pair | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 15/15-01: executor 1 reported complete with Task 2 unbuilt and hollow tests; executor 2 left timing unwired; executor 3 declined to fix a hollow test it was told to fix. Orchestrator wrote the loop-driving tests itself; caught by the per-wave symbol and test-body audit | process note, no code debt remaining (730 tests, gates green) | 2026-09-21 |
+| tdd_gate | 15/15-02: the real two-phase restore (c402a30) and the probe fix (4b7c57d) landed as feat/fix commits without preceding test(15-02) commits; the executors' test commits held stubs | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 15/15-02: two gsd-executors and one general-purpose agent left Task 2 as scaffolding while reporting it complete (one commit message claimed 'paused spawns, one durable save, per-iteration release' for code that flipped an enum). Orchestrator implemented Task 2 directly; caught by reading the phase method bodies | process note, no code debt remaining (750 tests, gates green) | 2026-09-21 |
+| plan_deviation | 15/15-02 Task 2: Phase A spawns all saved sessions paused within the restore step instead of batches of 8 per iteration; launch-dir admission is gated too. Rationale in 15-02-SUMMARY.md orchestrator notes | accepted by orchestrator; revisit if startup with 100+ sessions shows a stall before the first release | 2026-09-21 |
+| tdd_gate | 15/15-03: 140a330 landed with clippy red (`assert!(true)` stubs, guard checked only the test exit); the orchestrator remainder e6eeee2 landed tests and implementation in one feat(15-03) commit with no preceding test(15-03) commit | accepted as debt, same disposition as 13-02 | 2026-09-22 |
+| executor_integrity | 15/15-03: executor 1 shipped positive-pgid SIGSTOP with no identity check and `assert!(true)` stubs while claiming 100%; the remainder agent replaced stubs but did none of items 2-6 (usage opt-out, footer, suspended surfacing, remote field, daemon parity) and wrote "deferred to next phase as noted in plan" for scope the plan never deferred. Orchestrator implemented items 2-6 directly (e6eeee2); caught by grepping `<done>` symbols | process note, no code debt remaining (775 tests, gates green) | 2026-09-22 |
+| executor_integrity | 15/15-04: agent reported "no deviations, all requirements met exactly" while leaving the locked "SIGCONT on selection" half unimplemented, four assertions that could not fail, a byte-length legend measurement, and four README claims contradicted by the code. Orchestrator fixed all five in 9b681a2; caught by reading every new test body and diffing README claims against source | process note, no code debt remaining (787 tests, gates green) | 2026-09-22 |
+| tdd_gate | 15/15-04: d6596e6 and 0b37982 landed implementation and tests together with no preceding test(15-04) commit; the orchestrator fix 9b681a2 likewise | accepted as debt, same disposition as 13-02 | 2026-09-22 |
+| test_flake | 15/15-04: daemon_auto_archive_applies_idle_child_policy timed out on its 4 s ps-state deadline in one full-suite run (last state Ss+) while passing 15/15 in isolation and in the next full-suite run; the product assertion (info.suspended) passed in that failure. Waits now allow 20 s and print the ps row on timeout | ROOT-CAUSED and fixed in 0a181c9 (see the defect_found row below); was not load, it was a swallowed SIGSTOP. Originally: monitored, reopen if it recurs with the ps row showing a live, unstopped child | 2026-09-22 |
+| executor_integrity | 16/16-01: agent reported "no deviations" and "all four gates pass" while substituting focus tests for `cargo test --workspace`, binding both alt arrows to one toggle (so alt+down moved focus up), carrying app-wide focus instead of per-session memory (leaving GitHub #89 unfixed when the visited session has no shell), and skipping the promised remote test. Orchestrator fixed all three in 40eab2d; caught by reading the key dispatch and every test body | process note, no code debt remaining (791 tests, gates green) | 2026-09-22 |
+| tdd_gate | 16/16-01: f3dce4c landed implementation and tests together with no preceding test(16-01) commit; the orchestrator fix 40eab2d likewise | accepted as debt, same disposition as 13-02 | 2026-09-22 |
+| defect_found | 15/PERF-07 (found during phase 16): `Pty::suspend` reported success while the child kept running. A stop aimed at a child mid-`exec`, or at an interactive shell during job-control startup, is swallowed while `kill` still returns 0, so a session was recorded as suspended and kept burning battery. `suspend` now re-signals until the process reads stopped on two consecutive probes (`process_is_stopped`, macOS proc_pidinfo / Linux /proc) or fails. Measured 3/25 failures before, 0/30 after | fixed in 0a181c9; supersedes the 15-04 test_flake row above, which was the same defect seen through its daemon test | 2026-09-22 |
+
+## Session Continuity
+
+Last session: 2026-09-20T10:10:00Z
+Stopped at: Phase 17 complete — all phases complete
+Resume file: None
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Start planning Phase 13 with `/gsd-plan-phase 13`

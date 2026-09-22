@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 use baude_core::backend;
 use baude_core::git;
-use baude_core::lifecycle::{self, LifecycleOutcome, RepositoryReservations};
+use baude_core::lifecycle::{self, CollisionReport, LifecycleOutcome, RepositoryReservations};
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
@@ -82,6 +82,9 @@ pub struct Manager {
     persist: bool,
     /// Waiting this long auto-archives a session; 0 disables.
     pub auto_archive_ms: u64,
+    /// PERF-07: what happens to a session's child when its row is archived
+    /// (by the timer or by hand). Read once from config at daemon start.
+    pub idle_child_policy: persist::IdleChildPolicy,
     /// PERM-02: per-session wake handle for the permission long-poll. Set/clear
     /// pending state happens UNDER the manager lock; the bridge/handler then
     /// `notified().await`s on this Arc OUTSIDE the lock so one pending
@@ -95,12 +98,17 @@ pub struct Manager {
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
     persistence_error: Option<String>,
+    /// Collisions detected during repository admissions since daemon start.
+    #[allow(dead_code)]
+    pub collisions: Vec<CollisionReport>,
     #[cfg(test)]
     persistence_target_for_test: Option<(PathBuf, String)>,
     #[cfg(test)]
     atomic_failure_for_test: Option<persist::AtomicFailure>,
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
+    /// Startup timing stages (config load, state load, listener bound, etc.)
+    pub startup_timing: crate::timing::StartupTiming,
 }
 
 #[derive(Serialize)]
@@ -180,6 +188,8 @@ pub struct SessionInfo {
     pub session_cost_usd: Option<f64>,
     pub claude_session_id: Option<String>,
     pub archived: bool,
+    /// PERF-07: the child is SIGSTOPped under `idle_child_policy = "suspend"`.
+    pub suspended: bool,
     /// A bounded (~30) tail of the session's recent hook events so the remote
     /// TUI overlay rides the existing `/sessions` poll without an extra round
     /// trip. The full ring is served by `GET /sessions/{id}/activity`.
@@ -294,6 +304,12 @@ where
 /// `auto_archive_minutes`, then 30.
 pub fn default_auto_archive_ms() -> u64 {
     persist::load_config().auto_archive_ms()
+}
+
+/// BAUDE_IDLE_CHILD_POLICY env, then config.json `idle_child_policy`
+/// (`keep` | `suspend` | `stop`), then `keep`.
+pub fn default_idle_child_policy() -> persist::IdleChildPolicy {
+    persist::load_config().idle_child_policy()
 }
 
 /// The command run per session: BAUDE_CLAUDE_CMD env, then config.json
@@ -423,6 +439,7 @@ impl Manager {
             claude_cmd,
             persist,
             auto_archive_ms: default_auto_archive_ms(),
+            idle_child_policy: default_idle_child_policy(),
             permission_notify: HashMap::new(),
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
@@ -430,12 +447,14 @@ impl Manager {
             persistence_blocked: false,
             persistence_dirty: false,
             persistence_error: None,
+            collisions: Vec::new(),
             #[cfg(test)]
             persistence_target_for_test: None,
             #[cfg(test)]
             atomic_failure_for_test: None,
             #[cfg(test)]
             spawn_error_for_test: None,
+            startup_timing: crate::timing::StartupTiming::new(0),
         }
     }
 
@@ -872,6 +891,12 @@ impl Manager {
         let prepared = lifecycle::prepare_activation(&mut next, &snapshot, branch)
             .map_err(anyhow::Error::new)?;
         let pending_checkout = prepared.checkout;
+
+        // Track collision report if detected
+        if let Some(ref collision_report) = prepared.collision {
+            self.collisions.push(collision_report.clone());
+        }
+
         lifecycle::record_pending_activation(&mut next, &snapshot, &prepared)
             .map_err(anyhow::Error::new)?;
         let repository = prepared.request.repository;
@@ -1043,6 +1068,7 @@ impl Manager {
                 } else {
                     RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
                 },
+                physical_key: key.get().to_string(),
             });
             key
         };
@@ -1257,6 +1283,9 @@ impl Manager {
             unarchived_at_ms: None,
             pending_permission: None,
             permission_decision: None,
+            child_suspended: false,
+            pane_focus_shell: false,
+            poll_meta_calls_for_test: std::cell::Cell::new(0),
         });
         Ok(id)
     }
@@ -1311,6 +1340,7 @@ impl Manager {
                     } else {
                         RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
                     },
+                    physical_key: key.get().to_string(),
                 });
                 key
             }
@@ -2335,9 +2365,28 @@ impl Manager {
     pub fn poll(&mut self) {
         let mut changed = false;
         let idle = self.auto_archive_ms;
+        let policy = self.idle_child_policy;
+        let mut notes = Vec::new();
         for s in &mut self.sessions {
+            // PERF-06: archived and exited rows are never polled for metadata;
+            // they still tick so an auto-archived row can re-engage.
+            if s.archived || s.claude.is_exited() {
+                changed |= s.auto_archive_tick(idle);
+                continue;
+            }
             s.poll_meta();
+            let was_archived = s.archived;
             changed |= s.auto_archive_tick(idle);
+            // PERF-07: a fresh auto-archive applies the idle-child policy,
+            // exactly as the TUI tick does.
+            if !was_archived && s.archived && !s.archived_by_user {
+                if let Some(note) = s.apply_idle_child_policy(policy) {
+                    notes.push(note);
+                }
+            }
+        }
+        for note in notes {
+            eprintln!("idle child policy: {note}");
         }
         if changed {
             self.save();
@@ -2352,7 +2401,15 @@ impl Manager {
         let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
         match self.save_checked() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Persist the intent first, then apply the idle-child policy
+                // (PERF-07); a failed save leaves the child untouched.
+                let policy = self.idle_child_policy;
+                if let Some(note) = self.session_mut(id)?.apply_idle_child_policy(policy) {
+                    eprintln!("idle child policy: {note}");
+                }
+                Ok(())
+            }
             Err(error) if error.replacement_committed() => Err(MutationError::Persistence(error)),
             Err(error) => {
                 let s = self.session_mut(id)?;
@@ -2361,6 +2418,13 @@ impl Manager {
                 Err(MutationError::Persistence(error))
             }
         }
+    }
+
+    /// Test-only: override the idle-child policy without touching config.json
+    /// or the process environment.
+    #[cfg(test)]
+    pub fn set_idle_child_policy_for_test(&mut self, policy: persist::IdleChildPolicy) {
+        self.idle_child_policy = policy;
     }
 
     /// Test-only: pin a session's resolved Claude `session_id` so handlers
@@ -2527,6 +2591,7 @@ fn session_info(s: &Session) -> SessionInfo {
         session_cost_usd: s.meta.session_cost_usd,
         claude_session_id: s.meta.session_id.clone(),
         archived: s.archived,
+        suspended: s.child_suspended,
         activity: {
             // Bounded recent set (~30) for the remote TUI overlay; the full
             // ring is served by GET /sessions/{id}/activity.
@@ -2815,6 +2880,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: repository_key.get().to_string(),
         });
         state.checkouts.push(SavedCheckout::new(
             checkout_key,
@@ -3973,6 +4039,130 @@ mod tests {
         m.kill_all();
     }
 
+    fn proc_state(pid: u32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Poll `ps` until the child reaches the wanted state. The whole workspace
+    /// suite runs these PTY tests in parallel, so the budget is generous; on
+    /// timeout the panic carries the full `ps` row (state, start time, command)
+    /// because a wrong-looking state usually means a recycled pid, not a missed
+    /// signal.
+    fn wait_for_state(pid: u32, pred: impl Fn(&str) -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = proc_state(pid);
+            if pred(&state) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let row = std::process::Command::new("ps")
+                    .args(["-o", "pid=,stat=,lstart=,command=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+                panic!("timed out waiting for pid {pid} to be {what}; last state {state:?}; ps row: {row}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn child_pid(m: &Manager, id: u64) -> u32 {
+        m.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .expect("session")
+            .claude
+            .process_identity()
+            .pid
+    }
+
+    #[test]
+    fn daemon_archive_endpoint_suspends_and_unarchive_resumes() {
+        let _fixture = ManagerFixture::new("daemon-archive-suspends");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Suspend);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        m.set_archived(id, true).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            info.archived && info.suspended,
+            "archive suspends under policy=suspend"
+        );
+        wait_for_state(pid, |st| st.starts_with('T'), "stopped");
+        m.set_archived(id, false).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            !info.archived && !info.suspended,
+            "unarchive resumes the child"
+        );
+        wait_for_state(
+            pid,
+            |st| !st.is_empty() && !st.starts_with('T'),
+            "running again",
+        );
+        m.kill_all();
+    }
+
+    #[test]
+    fn daemon_archive_keeps_child_under_default_policy() {
+        let _fixture = ManagerFixture::new("daemon-archive-keep");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Keep);
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        m.set_archived(id, true).unwrap();
+        let info = m.info(id).unwrap();
+        assert!(
+            info.archived && !info.suspended,
+            "keep leaves the child alone"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!proc_state(pid).starts_with('T'), "keep never SIGSTOPs");
+        m.kill_all();
+    }
+
+    #[test]
+    fn daemon_auto_archive_applies_idle_child_policy() {
+        let _fixture = ManagerFixture::new("daemon-auto-archive-policy");
+        let mut m = mgr();
+        m.set_idle_child_policy_for_test(baude_core::persist::IdleChildPolicy::Suspend);
+        let idle = 60_000;
+        m.auto_archive_ms = idle;
+        let id = m.create("/tmp", None, None).unwrap().id;
+        let pid = child_pid(&m, id);
+        wait_for_state(pid, |st| !st.is_empty() && !st.starts_with('T'), "running");
+        // Fake a session that went idle well past the threshold.
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        s.meta.claude_status = Some((false, now_unix_ms() - 2 * idle));
+        m.poll();
+        let info = m.info(id).unwrap();
+        assert!(info.archived, "long-waiting session should auto-archive");
+        assert!(info.suspended, "auto-archive applies policy=suspend");
+        wait_for_state(pid, |st| st.starts_with('T'), "stopped");
+        m.kill_all();
+    }
+
+    #[test]
+    fn session_info_reports_suspended() {
+        let _fixture = ManagerFixture::new("session-info-suspended");
+        let mut m = mgr();
+        let id = m.create("/tmp", None, None).unwrap().id;
+        assert!(!m.info(id).unwrap().suspended);
+        let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        s.archived = true;
+        s.suspend_idle_child().expect("suspend");
+        assert!(m.info(id).unwrap().suspended);
+        m.kill_all();
+    }
+
     #[test]
     fn manual_unarchive_survives_the_auto_archive_tick() {
         let _fixture = ManagerFixture::new("manual-unarchive-survives-the-auto-archive-tick");
@@ -4281,5 +4471,131 @@ mod tests {
         });
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "allow");
         m.kill_all();
+    }
+
+    #[test]
+    fn info_reports_collisions() {
+        // Verify that the /info endpoint returns collisions when manager has recorded them
+        let fixture = ManagerFixture::new("info-reports-collisions");
+        let mut m = mgr();
+
+        // Pre-seed a collision report into the manager
+        let collision_report = baude_core::lifecycle::CollisionReport {
+            requested_path: std::path::PathBuf::from("/some/requested/path"),
+            allocated_path: std::path::PathBuf::from("/some/allocated-2"),
+            owner_common_dir: Some(std::path::PathBuf::from("/tmp/owner/.git")),
+            owner_display: "owner-display".to_string(),
+            requester_common_dir: std::path::PathBuf::from("/tmp/requester/.git"),
+            requester_display: "requester-display".to_string(),
+            reason: baude_core::lifecycle::CollisionReason::ForeignMarker,
+        };
+        m.collisions.push(collision_report.clone());
+
+        // Build the info payload
+        let json = serde_json::json!({
+            "workspace": baude_core::workspace::active().name,
+            "backend": baude_core::workspace::active().backend.name(),
+            "collision_count": m.collisions.len(),
+            "collisions": m.collisions,
+        });
+
+        // Verify collision is reported
+        assert_eq!(json["collision_count"], 1);
+        assert_eq!(
+            json["collisions"][0]["owner_display"].as_str(),
+            Some("owner-display")
+        );
+        assert_eq!(
+            json["collisions"][0]["reason"].as_str(),
+            Some("ForeignMarker")
+        );
+
+        m.kill_all();
+        drop(fixture);
+    }
+
+    #[test]
+    fn manager_admission_collision_recorded() {
+        // Verify that when manager admits a repository and a collision is detected,
+        // it records the collision report and can be queried via /info
+        use std::os::unix::ffi::OsStrExt;
+        let fixture = ManagerFixture::new("manager-admission-collision-recorded");
+        let mut m = Manager::new("sh -c 'sleep 30'".into(), true); // Use persistence
+        let state_root = fixture.subdir("state");
+        m.persist_at_for_test(&state_root, fixture.workspace(), None);
+
+        // Create a real git repository with proper remote setup
+        let repo = fixture.subdir("test-repo");
+        let origin = fixture.subdir("test-repo-origin.git");
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Baude Test"]);
+        git(&repo, &["config", "user.email", "baude@example.invalid"]);
+        std::fs::write(repo.join("file.txt"), b"test\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-q", "-m", "test"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // Pre-seed a foreign marker in the repository's allocated digest directory
+        // ManagerFixture defaults to "claude" workspace
+        let workspace = "claude";
+        let worktrees_base = baude_core::testing::worktrees_base_override()
+            .expect("test redirect should set worktrees base")
+            .join("baude/worktrees");
+        let base = worktrees_base.join(workspace);
+        std::fs::create_dir_all(&base).expect("create worktrees base");
+
+        // Compute digest from the git common dir (what ensure_repository will use)
+        let snapshot = baude_core::git::discover_repository(&repo).expect("discover repository");
+        let digest = baude_core::repository::compute_repository_digest(
+            snapshot.common_dir.as_os_str().as_bytes(),
+        );
+        let target_dir = base.join(format!("repository-{digest}"));
+        std::fs::create_dir_all(&target_dir).expect("create collision directory");
+
+        // Write a foreign marker (belonging to a different repo)
+        let foreign_path = std::path::PathBuf::from("/tmp/foreign-repo/.git");
+        let foreign_marker = baude_core::marker::MarkerMetadata {
+            canonical_common_dir: foreign_path.as_os_str().as_bytes().to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1000,
+        };
+        baude_core::marker::write_marker(&target_dir, &foreign_marker)
+            .expect("write foreign marker");
+
+        // Activate a branch worktree - this is where collision detection happens
+        let result = m.activate_branch_worktree(&repo, "feature/test", None);
+
+        // The activation should succeed despite the collision
+        assert!(
+            result.is_ok(),
+            "activation should succeed despite collision: {result:?}"
+        );
+
+        // Verify collision was recorded
+        assert_eq!(
+            m.collisions.len(),
+            1,
+            "manager should have recorded one collision"
+        );
+        assert_eq!(
+            m.collisions[0].reason,
+            baude_core::lifecycle::CollisionReason::ForeignMarker
+        );
+        assert!(
+            m.collisions[0]
+                .allocated_path
+                .to_string_lossy()
+                .contains("-2"),
+            "allocated path should have -2 suffix: {}",
+            m.collisions[0].allocated_path.display()
+        );
+
+        m.kill_all();
+        drop(fixture);
     }
 }

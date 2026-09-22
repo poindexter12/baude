@@ -120,12 +120,28 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
 /// 404 here; clients treat that as "claude workspace, old version".
 async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
     let ws = baude_core::workspace::active();
-    let persistence = lock(&state).persistence_status();
+    let manager = lock(&state);
+    let persistence = manager.persistence_status();
+    // workspace_source shows how the workspace was resolved: "(explicit)",
+    // "(folder binding)", "(derived)", or "(blank)" for default. Trim
+    // parentheses for the API response.
+    let workspace_source = ws
+        .display_hint()
+        .trim_matches('(')
+        .trim_matches(')')
+        .to_string();
+    let collisions = manager.collisions.clone();
+    let collision_count = collisions.len();
+    let startup_ms = manager.startup_timing.to_hashmap();
     Json(serde_json::json!({
         "workspace": ws.name,
         "backend": ws.backend.name(),
+        "workspace_source": workspace_source,
         "version": env!("CARGO_PKG_VERSION"),
         "persistence": persistence,
+        "collisions": collisions,
+        "collision_count": collision_count,
+        "startup_ms": startup_ms,
     }))
 }
 
@@ -856,7 +872,7 @@ mod tests {
                     let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
                     barrier.wait();
                     let resolved = baude_core::workspace::active().name.clone();
-                    let managed = baude_core::git::managed_default_worktree_path(7, 11);
+                    let managed = baude_core::git::managed_default_worktree_path("7", 11);
                     barrier.wait();
                     assert_eq!(resolved, workspace);
                     assert!(
@@ -1747,6 +1763,83 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = app.oneshot(get("/sessions")).await.unwrap();
         assert_eq!(body_json(res).await, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn info_endpoint_includes_workspace_source() {
+        let _scope = api_scope("info-test");
+        let state = Arc::new(Mutex::new(Manager::new("claude".to_string(), true)));
+        let app = super::router(Arc::clone(&state));
+
+        // Test that /info includes workspace_source field
+        let req = Request::builder().uri("/info").body(Body::empty()).unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify /info response includes required fields
+        assert!(
+            json["workspace"].is_string(),
+            "workspace field must be a string"
+        );
+        assert!(
+            json["backend"].is_string(),
+            "backend field must be a string"
+        );
+        assert!(
+            json["workspace_source"].is_string(),
+            "workspace_source field must be a string"
+        );
+        assert!(
+            json["version"].is_string(),
+            "version field must be a string"
+        );
+        assert!(
+            json["persistence"].is_object(),
+            "persistence field must be an object"
+        );
+
+        // workspace_source should be one of the four valid source labels
+        let source = json["workspace_source"].as_str().unwrap();
+        assert!(
+            ["explicit", "folder binding", "derived", "blank"].contains(&source),
+            "workspace_source must be one of: explicit, folder binding, derived, blank (got: {})",
+            source
+        );
+    }
+
+    #[test]
+    fn startup_timing_recorded_on_manager() {
+        let _scope = api_scope("startup-timing");
+        let manager = crate::manager::Manager::new("test".into(), false);
+        // Manager should have a startup_timing field (even if empty for this test)
+        assert_eq!(manager.startup_timing.total_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn info_reports_daemon_startup_ms() {
+        let (_scope, app) = app();
+        let request = Request::builder().uri("/info").body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Check that startup_ms is present and is an object
+        assert!(
+            json["startup_ms"].is_object(),
+            "startup_ms field must be an object"
+        );
+
+        // Check that it contains a total field
+        assert!(
+            json["startup_ms"]["total"].is_number(),
+            "startup_ms.total field must be a number"
+        );
     }
 }
 

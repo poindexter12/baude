@@ -17,3 +17,6 @@ opencode.json
 # Baude-seeded backend hook config (runtime artifact, per-machine paths).
 .codex/
 .claude/settings.local.json
+
+# GSD per-machine dispatch state
+.gsd/

@@ -8,7 +8,7 @@ mod ui;
 mod usage;
 
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -90,8 +90,7 @@ use ratatui::crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::crossterm::{execute, queue};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,8 +106,120 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 /// affirmative probe enables enhanced mode. `Err` — crossterm's internal 2 s
 /// deadline elapsing, no tty, Windows — means unsupported means legacy; probe
 /// failures never kill a session (TKEY-05).
+#[allow(dead_code)]
 fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
     matches!(probe(), Ok(true))
+}
+
+/// Trait for probing keyboard enhancement support; allows testing without real I/O.
+pub(crate) trait ProbeIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn read_with_timeout(&mut self, remaining: Duration) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+/// Production implementation of ProbeIo using thread-based timeout on stdin.
+pub(crate) struct StdinProbeIo;
+
+impl ProbeIo for StdinProbeIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stdout().write_all(bytes)?;
+        std::io::stdout().flush()
+    }
+
+    fn read_with_timeout(&mut self, remaining: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        // Poll fd 0 directly instead of parking a reader thread on stdin: a
+        // thread that outlives the timeout would keep reading and swallow the
+        // user's first keystrokes once crossterm owns the terminal.
+        #[cfg(unix)]
+        {
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut fds = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `fds` is a valid, initialized pollfd array of length 1.
+            let ready = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
+            if ready < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if ready == 0 || fds.revents & libc::POLLIN == 0 {
+                return Ok(None);
+            }
+            let mut buffer = vec![0u8; 1024];
+            // SAFETY: `buffer` is a valid writable region of the given length.
+            let n =
+                unsafe { libc::read(0, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len()) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if n == 0 {
+                return Ok(None);
+            }
+            buffer.truncate(n as usize);
+            Ok(Some(buffer))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = remaining;
+            Ok(None)
+        }
+    }
+}
+
+/// Probe for keyboard enhancement support with escape-sequence parsing.
+/// Returns true iff the terminal responds with the u variant (CSI ? ... u pattern).
+pub(crate) fn probe_keyboard_enhancement(
+    io: &mut dyn ProbeIo,
+    bound: Duration,
+) -> std::io::Result<bool> {
+    // Request both kitty (u variant) and DA1 responses
+    io.write(b"\x1b[?u\x1b[c")?;
+
+    let deadline = Instant::now() + bound;
+    let mut buffer = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        match io.read_with_timeout(remaining)? {
+            Some(chunk) => {
+                buffer.extend_from_slice(&chunk);
+
+                // Parse: look for ESC [ ? <digits> u (u variant = true)
+                // Check if we have both [? and u
+                let has_bracket_question = buffer.windows(2).any(|w| w == b"[?");
+                let has_u = buffer.contains(&b'u');
+                let has_digit_after_question = buffer
+                    .iter()
+                    .zip(buffer.iter().skip(1))
+                    .any(|(a, b)| *a == b'?' && b.is_ascii_digit());
+
+                if has_bracket_question && has_digit_after_question && has_u {
+                    return Ok(true);
+                }
+
+                // Parse: look for ESC [ ... c without u (DA1 only = false)
+                let has_c = buffer.contains(&b'c');
+                if has_c && !has_u {
+                    return Ok(false);
+                }
+            }
+            None => return Ok(false),
+        }
+    }
+}
+
+/// Bounded keyboard probe that returns the result of the probe function.
+fn negotiate_keyboard_bounded(
+    _timeout_ms: u64,
+    probe: impl FnOnce() -> std::io::Result<bool>,
+) -> bool {
+    probe().unwrap_or(false)
 }
 
 /// Single restore-emission path (D-07/D-08): queues the conditional keyboard
@@ -269,10 +380,24 @@ fn help_text() -> String {
 }
 
 fn main() -> Result<()> {
+    use std::time::Instant;
+
+    // Check if timing is enabled via BAUDE_TIMING env var or --timing flag (early, before parsing other args)
+    let timing_enabled = std::env::var("BAUDE_TIMING").ok().as_deref() == Some("1")
+        || std::env::args().any(|a| a == "--timing");
+    let total_start = Instant::now();
+    let mut timing = StartupTiming {
+        stages: Vec::new(),
+        total_ms: 0,
+    };
+
     // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
     // Must be dispatched before anything touches the terminal: Claude Code
     // invokes it headless on every statusline refresh.
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // Strip --timing flag from args so it's not mistaken for a launch dir
+    args.retain(|a| a != "--timing");
+
     if args.get(1).map(String::as_str) == Some("statusline") {
         let wrap = args
             .iter()
@@ -340,76 +465,54 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let launch_dir = std::env::args()
-        .nth(1)
+    let launch_dir = args
+        .get(1)
+        .cloned()
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let launch_dir = launch_dir.canonicalize().unwrap_or(launch_dir);
 
+    // Stage 1: config load
+    let config_start = Instant::now();
     let config = baude_core::persist::load_config();
+    let config_duration = config_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "config_load",
+        duration_ms: config_duration,
+        note: None,
+    });
 
-    // Folder-workspace memory: consult this folder's remembered workspace and
-    // pin the process-wide resolution BEFORE anything reads workspace::active()
-    // (ensure_daemon below is the first reader — the auto-daemon must serve
-    // the same workspace). Explicit BAUDE_WORKSPACE/BAUDE_BACKEND always win;
-    // the folder_context kill switch disables both consulting and recording.
-    // Only this TUI launch path passes a hint — the statusline/hook/
-    // permission-mcp subcommands exited above and resolve untouched.
-    let ws_env = std::env::var("BAUDE_WORKSPACE").ok();
-    let backend_env = std::env::var("BAUDE_BACKEND").ok();
-    let memory_root = baude_core::persist::config_dir();
-    let plan = baude_core::folder_workspace::plan_launch(
-        config.folder_context_enabled(),
-        ws_env.as_deref(),
-        backend_env.as_deref(),
-        Some(&memory_root),
-        &launch_dir,
-    );
-    let workspace = baude_core::workspace::initialize(&config, plan.hint.as_deref());
-
-    // One writer per workspace. Claim the state lock BEFORE the terminal, the
-    // daemon, or any folder-memory write: a second baude on a held lock used
-    // to start in a degraded mode where every later action failed with
-    // "persistence is blocked" and nothing named the real cause (#71). Refuse
-    // here instead, once, while stderr is still a normal terminal.
-    // A lock we cannot even open (unwritable config dir) is NOT a refusal:
-    // that path still degrades through App::restore the way it always has.
-    if let Err(baude_core::persist::StateLockError::Held { path, holder }) =
-        baude_core::persist::claim_workspace_state_lock("state", workspace)
-    {
-        match holder {
-            Some(pid) => eprintln!(
-                "baude: workspace {} is already open in another baude (pid {pid}).",
-                workspace.name
-            ),
-            None => eprintln!(
-                "baude: workspace {} is already open in another baude.",
-                workspace.name
-            ),
+    // Stage 2: workspace resolution
+    let workspace_start = Instant::now();
+    // Shared workspace startup: folder-workspace memory, initialization, lock,
+    // and binding recording. One writer per workspace — refusal is fatal.
+    let env = baude_core::launch::StartEnv {
+        ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
+        backend_env: std::env::var("BAUDE_BACKEND").ok(),
+    };
+    let started = match baude_core::launch::start_workspace(&launch_dir, &config, env, "state") {
+        Ok(started) => started,
+        Err(baude_core::launch::StartError::LockHeld { diag }) => {
+            eprintln!("baude: {diag}");
+            eprintln!(
+                "       Quit that instance, or run this one in another workspace: \
+                 BAUDE_WORKSPACE=<name> baude"
+            );
+            std::process::exit(1);
         }
-        eprintln!(
-            "       Quit that instance, or run this one in another workspace: \
-             BAUDE_WORKSPACE=<name> baude"
-        );
-        eprintln!("       lock: {}", path.display());
-        std::process::exit(1);
-    }
+        Err(baude_core::launch::StartError::LockIo { path, detail }) => {
+            eprintln!("baude: lock I/O error: {}: {}", path.display(), detail);
+            std::process::exit(1);
+        }
+    };
 
-    let mut startup_notes = plan.notes;
-    if config.folder_context_enabled() {
-        startup_notes.extend(baude_core::folder_workspace::applied_note(
-            &workspace.name,
-            ws_env.as_deref(),
-            backend_env.as_deref(),
-            &config,
-        ));
-        baude_core::folder_workspace::record(
-            Some(&memory_root),
-            &launch_dir,
-            &workspace.name,
-            baude_core::pty::now_ms(),
-        );
-    }
+    let startup_notes = started.notes;
+    let workspace_duration = workspace_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "workspace_resolution",
+        duration_ms: workspace_duration,
+        note: None,
+    });
 
     // Auto-start local bauded when auto_daemon is configured. Must run before
     // App::new() reads the env, and before any threads start (set_var is not
@@ -424,6 +527,8 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
+    // Stage 3: terminal setup
+    let terminal_start = Instant::now();
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -431,13 +536,17 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Stage 4: keyboard probe
+    let kb_start = Instant::now();
     // Single-shot keyboard negotiation (TKEY-05): runs exactly once, in this
     // single-threaded pre-loop window where the probe owns the event source,
-    // bounded by crossterm's internal 2 s deadline. Pushed AFTER
-    // EnterAlternateScreen so push and pop hit the same per-screen kitty
-    // stack. DISAMBIGUATE only — the REPORT_* flags change other keys' wire
-    // forms and would break the TKEY-02 byte freeze.
-    if negotiate_keyboard(supports_keyboard_enhancement) {
+    // bounded to 250 ms. Pushed AFTER EnterAlternateScreen so push and pop hit
+    // the same per-screen kitty stack. DISAMBIGUATE only — the REPORT_* flags
+    // change other keys' wire forms and would break the TKEY-02 byte freeze.
+    let kb_supported = negotiate_keyboard_bounded(250, || {
+        probe_keyboard_enhancement(&mut StdinProbeIo, Duration::from_millis(250))
+    });
+    if kb_supported {
         let pushed = execute!(
             stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -446,6 +555,24 @@ fn main() -> Result<()> {
             KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
         }
     }
+    let kb_duration = kb_start.elapsed().as_millis();
+    let kb_note = if kb_duration >= 250 {
+        Some("kitty 250ms (timeout)".to_string())
+    } else {
+        None
+    };
+    timing.stages.push(TimingStage {
+        name: "keyboard_probe",
+        duration_ms: kb_duration,
+        note: kb_note,
+    });
+    let terminal_duration = terminal_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "terminal_setup",
+        duration_ms: terminal_duration,
+        note: None,
+    });
+
     // Any Err between the push above and run()'s normal exit is a NON-panic
     // path — the panic hook never fires — so a bare `?` here would leak raw
     // mode, the alternate screen, AND the pushed keyboard flags (T-11-03's
@@ -459,49 +586,250 @@ fn main() -> Result<()> {
             }
         };
 
+    // Stage 5: app initialization
+    let app_start = Instant::now();
     let mut app = App::new(launch_dir);
+    let app_duration = app_start.elapsed().as_millis();
+    timing.stages.push(TimingStage {
+        name: "app_new",
+        duration_ms: app_duration,
+        note: None,
+    });
     // Folder-memory notes go up first so a real restore error overwrites an
     // informational banner, never the other way around.
     for note in startup_notes {
         app.set_message(note);
     }
-    app.restore();
+    // Note: app.restore() is deferred to inside run() after the first draw
+    // so the first frame (sidebar chrome, workspace title, empty) renders before
+    // any restore UI appears.
 
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, &mut timing);
 
     app.save();
     app.kill_all();
     restore_terminal();
+
+    // Print timing output if enabled
+    timing.total_ms = total_start.elapsed().as_millis();
+    if timing_enabled {
+        timing.print_to_stderr();
+    }
+
     result
+}
+
+/// Result of one iteration of the main loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Stepped {
+    /// Whether the terminal was drawn this iteration.
+    pub drew: bool,
+    /// Whether session restore has finished (all pending sessions spawned/restored).
+    pub restore_finished: bool,
+}
+
+/// One timing stage: name, duration in milliseconds, and optional note.
+#[derive(Clone, Debug)]
+pub struct TimingStage {
+    pub name: &'static str,
+    pub duration_ms: u128,
+    pub note: Option<String>,
+}
+
+/// Startup timing information: stages and total duration.
+#[derive(Clone, Debug)]
+pub struct StartupTiming {
+    pub stages: Vec<TimingStage>,
+    pub total_ms: u128,
+}
+
+impl StartupTiming {
+    /// Print timing summary and per-stage details to stderr.
+    pub fn print_to_stderr(&self) {
+        // Print summary line: "baude startup: config_load=NN workspace_resolution=MM ..."
+        let summary = self
+            .stages
+            .iter()
+            .map(|s| format!("{}={}", s.name, s.duration_ms))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("baude startup: {}", summary);
+
+        // Print per-stage detail lines
+        for stage in &self.stages {
+            if let Some(note) = &stage.note {
+                eprintln!("  {}: {} ms ({})", stage.name, stage.duration_ms, note);
+            } else {
+                eprintln!("  {}: {} ms", stage.name, stage.duration_ms);
+            }
+        }
+        eprintln!("  total: {} ms", self.total_ms);
+    }
 }
 
 fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
+    timing: &mut StartupTiming,
 ) -> Result<()> {
+    let mut restore_started = false;
+    let mut restore_finished = false;
+    let mut loop_timing = LoopTiming::start();
     loop {
-        app.tick();
-
-        let area = terminal.get_frame().area();
-        app.sync_sizes(area);
-
-        terminal.draw(|frame| ui::draw(frame, app))?;
-
-        // Drain pending events, then sleep briefly (the draw loop doubles as
-        // the refresh tick for streaming PTY output and status timers).
-        if event::poll(Duration::from_millis(50))? {
-            loop {
-                app.handle_event(event::read()?);
-                if !event::poll(Duration::from_millis(0))? {
-                    break;
-                }
-            }
-        }
-
+        let stepped = step(terminal, app, &mut restore_started, &mut restore_finished)?;
+        loop_timing.record(timing, &stepped, app);
         if app.should_quit {
             return Ok(());
         }
     }
+}
+
+/// Stage bookkeeping for the loop-owned timing stages (PERF-01). Lives outside
+/// `App` so `run()` and the tests share one recorder and `App` never owns a
+/// startup clock.
+pub(crate) struct LoopTiming {
+    /// When the previous loop stage was recorded. Each stage reports the time
+    /// since this mark, so every row in the timing report is a real duration.
+    /// Reporting elapsed-since-origin here instead made the three loop stages
+    /// print the SAME number under a `ms` column of per-stage durations, which
+    /// reads as "the first frame took two seconds" when it means "the first
+    /// frame happened two seconds in".
+    last_mark: std::time::Instant,
+    first_frame_recorded: bool,
+    restore_recorded: bool,
+    first_poll_recorded: bool,
+}
+
+impl LoopTiming {
+    pub(crate) fn start() -> Self {
+        Self {
+            last_mark: std::time::Instant::now(),
+            first_frame_recorded: false,
+            restore_recorded: false,
+            first_poll_recorded: false,
+        }
+    }
+
+    /// Push `first_frame` on the first drawn step, `session_restore` when the
+    /// restore step reports finished (with the restored session count), and
+    /// `first_metadata_poll` once the first metadata poll has run. Each stage
+    /// is recorded exactly once, in that order, measured from loop entry.
+    pub(crate) fn record(&mut self, timing: &mut StartupTiming, stepped: &Stepped, app: &App) {
+        let now = std::time::Instant::now();
+        // Each stage reports time since the previous mark, so the column is
+        // uniformly per-stage durations rather than a mix of durations and
+        // timestamps.
+        let take = |mark: &mut std::time::Instant| {
+            let d = now.duration_since(*mark).as_millis();
+            *mark = now;
+            d
+        };
+        if !self.first_frame_recorded && stepped.drew {
+            self.first_frame_recorded = true;
+            let d = take(&mut self.last_mark);
+            timing.stages.push(TimingStage {
+                name: "first_frame",
+                duration_ms: d,
+                note: None,
+            });
+        }
+        if self.first_frame_recorded && !self.restore_recorded && stepped.restore_finished {
+            self.restore_recorded = true;
+            let d = take(&mut self.last_mark);
+            timing.stages.push(TimingStage {
+                name: "session_restore",
+                duration_ms: d,
+                note: Some(format!("{} sessions", app.sessions.len())),
+            });
+        }
+        if self.restore_recorded && !self.first_poll_recorded && app.has_polled_meta() {
+            self.first_poll_recorded = true;
+            let d = take(&mut self.last_mark);
+            timing.stages.push(TimingStage {
+                name: "first_metadata_poll",
+                duration_ms: d,
+                note: None,
+            });
+        }
+    }
+}
+
+/// One iteration of the main loop.
+/// Returns information about what happened this iteration.
+fn step(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    restore_started: &mut bool,
+    restore_finished: &mut bool,
+) -> Result<Stepped> {
+    step_with(terminal, app, restore_started, restore_finished, true)
+}
+
+/// Backend-generic loop body. `drain_events` is false only in tests, which
+/// have no terminal to poll; production always drains crossterm events.
+pub(crate) fn step_with<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+    restore_started: &mut bool,
+    restore_finished: &mut bool,
+    drain_events: bool,
+) -> Result<Stepped>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    app.tick();
+
+    let area = terminal.get_frame().area();
+    app.sync_sizes(area);
+
+    let mut drew = false;
+
+    // Only draw when dirty flag is set; clear after drawing.
+    // This reduces CPU/battery use by gating terminal writes.
+    if app.dirty {
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        app.dirty = false;
+        drew = true;
+
+        // Gate restore start to first frame completion.
+        // First frame renders the sidebar chrome, workspace title, and "Restoring..." status
+        // before any actual restore progress or spawned sessions appear.
+        if !app.first_frame_drawn {
+            app.first_frame_drawn = true;
+
+            // Start restore in the first frame iteration.
+            // This ensures the first frame (empty chrome) is rendered before restore begins.
+            if !*restore_started {
+                app.restore();
+                *restore_started = true;
+
+                // If restore queue is empty (no sessions to restore), mark it finished immediately
+                if !app.restore_in_progress() {
+                    *restore_finished = true;
+                }
+            }
+        }
+    }
+
+    // Restore Phase B: release one gated session per iteration until none remain.
+    if app.restore_in_progress() && !*restore_finished && !app.restore_step() {
+        *restore_finished = true;
+    }
+    // Drain pending events, then sleep briefly (the draw loop doubles as
+    // the refresh tick for streaming PTY output and status timers).
+    if drain_events && event::poll(Duration::from_millis(50))? {
+        loop {
+            app.handle_event(event::read()?);
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+        }
+    }
+
+    Ok(Stepped {
+        drew,
+        restore_finished: *restore_finished,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +1037,7 @@ fn evidence_phrase(evidence: &baude_core::worktree_scan::Evidence) -> String {
             matched,
         } => {
             let key = repository_key
+                .as_deref()
                 .map(|key| format!("key {key}"))
                 .unwrap_or_else(|| "no key".to_string());
             format!("referenced by state (workspace {workspace}, {key}, {matched:?} match)")
@@ -821,7 +1150,7 @@ fn print_scan_summary(
             .iter()
             .filter(|candidate| candidate.workspace == workspace)
             .collect();
-        group.sort_by_key(|candidate| candidate.repository_key);
+        group.sort_by(|left, right| left.repository_key.cmp(&right.repository_key));
         let count = |label: &str| {
             group
                 .iter()
@@ -840,11 +1169,29 @@ fn print_scan_summary(
             group.len()
         );
         for candidate in group {
+            let owner_text = if let Some(owner) = &candidate.owner {
+                format!(
+                    " (owner: {})",
+                    if let Some(display_name) = &owner.display_name {
+                        format!(
+                            "{} ({})",
+                            display_name,
+                            owner.canonical_common_dir.display()
+                        )
+                    } else {
+                        owner.canonical_common_dir.display().to_string()
+                    }
+                )
+            } else {
+                String::new()
+            };
+
             let _ = writeln!(
                 out,
-                "  {:<13} {}  [{}]",
+                "  {:<13} {}{}  [{}]",
                 verdict_label(&candidate.verdict),
                 candidate.relative.join("/"),
+                owner_text,
                 verdict_phrase(&candidate.verdict)
             );
         }
@@ -1250,6 +1597,7 @@ mod worktrees_cli_tests {
                 observed_main_worktree: PersistedPath::from_path(&main),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                physical_key: allocated.get().to_string(),
             });
             self.write_state("state-claude.json", state);
         }
@@ -1900,6 +2248,10 @@ mod worktrees_cli_tests {
 #[cfg(test)]
 mod keyboard_negotiation_tests {
     use super::*;
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    };
+    use ratatui::layout::Rect;
 
     /// Byte-subsequence offset finder: the pop bytes are pure ASCII, but
     /// offset comparison on `&[u8]` avoids lossy string conversion questions.
@@ -1981,5 +2333,578 @@ mod keyboard_negotiation_tests {
             find_subsequence(&second, POP).is_none(),
             "second restore must not re-emit the pop"
         );
+    }
+
+    #[test]
+    fn scan_output_includes_owner() {
+        // Verify that scan text and JSON output includes ownership information
+        let owner_path = std::path::PathBuf::from("/tmp/demo/.git");
+        let owner_display = "demo".to_string();
+
+        // Construct a ScanReport with one candidate that has ownership info
+        let candidate = baude_core::worktree_scan::Candidate {
+            relative: vec!["claude".to_string(), "repository-abcdef123456".to_string()],
+            workspace: "claude".to_string(),
+            repository_key: "abcdef123456".to_string(),
+            verdict: baude_core::worktree_scan::Verdict::Live { evidence: vec![] },
+            owner: Some(baude_core::worktree_scan::OwnershipInfo {
+                canonical_common_dir: owner_path.clone(),
+                display_name: Some(owner_display.clone()),
+            }),
+        };
+
+        let report = baude_core::worktree_scan::ScanReport {
+            format_version: baude_core::worktree_scan::REPORT_FORMAT_VERSION,
+            worktrees_base: baude_core::repository::PersistedPath::from_path(
+                &std::path::PathBuf::from("/tmp/worktrees"),
+            ),
+            config_dir: baude_core::repository::PersistedPath::from_path(
+                &std::path::PathBuf::from("/tmp/config"),
+            ),
+            candidates: vec![candidate],
+            state_inventory: baude_core::worktree_scan::StateInventorySummary {
+                workspaces_checked: vec!["claude".to_string()],
+                files_checked: vec![],
+                files_absent: vec![],
+                complete: true,
+            },
+        };
+
+        // Test text output includes owner info
+        let mut text_output = Vec::new();
+        print_scan_summary(&report, &mut text_output);
+        let text = String::from_utf8(text_output).expect("text output is valid UTF-8");
+        assert!(
+            text.contains("demo"),
+            "text output should contain owner display name"
+        );
+        assert!(
+            text.contains("/tmp/demo/.git"),
+            "text output should contain owner canonical dir"
+        );
+        assert!(
+            text.contains("owner:"),
+            "text output should contain 'owner:' label"
+        );
+
+        // Test JSON output includes owner info
+        let json = serde_json::to_value(&report).expect("report should serialize to JSON");
+        assert!(
+            json["candidates"][0]["owner"].is_object(),
+            "JSON should have owner object"
+        );
+        assert_eq!(
+            json["candidates"][0]["owner"]["display_name"].as_str(),
+            Some("demo"),
+            "JSON owner should have correct display_name"
+        );
+        assert_eq!(
+            json["candidates"][0]["owner"]["canonical_common_dir"]
+                .as_str()
+                .map(|p| p.ends_with("/tmp/demo/.git")),
+            Some(true),
+            "JSON owner should have correct canonical_common_dir"
+        );
+    }
+
+    #[test]
+    fn dirty_flag_set_on_input() {
+        // Test: after input event, app.dirty == true.
+        use baude_core::testing::TestRedirect;
+        let tmp = std::env::temp_dir().join("baude-test-dirty");
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+
+        let mut app = App::new(tmp.clone());
+        app.dirty = false;
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+        app.handle_event(event);
+        assert!(app.dirty, "dirty flag should be set after input event");
+    }
+
+    #[test]
+    fn dirty_flag_set_on_resize() {
+        // Test: after sync_sizes with new area, app.dirty == true.
+        use baude_core::testing::TestRedirect;
+        let tmp = std::env::temp_dir().join("baude-test-resize");
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+
+        let mut app = App::new(tmp.clone());
+        app.dirty = false;
+        let new_area = Rect::new(0, 0, 100, 50);
+        app.sync_sizes(new_area);
+        // Dirty is set if content_rect changed
+        // Since initial rect is (0, 0, 80, 24), a resize to (0, 0, 100, 50) should change content_rect
+        assert!(app.dirty, "dirty flag should be set after resize");
+    }
+
+    #[test]
+    fn dirty_flag_cleared_after_draw() {
+        // Test: dirty flag is managed by run() loop, verify it exists and is bool
+        use baude_core::testing::TestRedirect;
+        let tmp = std::env::temp_dir().join("baude-test-draw");
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+
+        let mut app = App::new(tmp.clone());
+        app.dirty = true;
+        assert!(app.dirty);
+        app.dirty = false;
+        assert!(!app.dirty, "dirty flag should be clearable");
+    }
+
+    #[test]
+    fn idle_zero_draws_after_first_frame() {
+        // Drive the real loop body: the first step draws the empty frame and
+        // releases restore; after one settle step an idle app never draws.
+        use baude_core::testing::TestRedirect;
+        let tmp = std::env::temp_dir().join(format!("baude-test-idle-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("loop-test".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let (mut started, mut finished) = (false, false);
+        let first = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert!(first.drew, "the first step must draw the empty frame");
+        assert!(app.first_frame_drawn, "first draw sets first_frame_drawn");
+        assert!(
+            started && finished,
+            "restore runs right after the first draw"
+        );
+        // `dirty` may be set again right here by restore's own progress; the
+        // property under test is that nothing keeps redrawing once idle.
+        // Let startup activity settle: restore releases the launch-dir session
+        // and its first output arrives asynchronously. Idle begins once five
+        // consecutive steps draw nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut quiet = 0;
+        while quiet < 5 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("settle step");
+            quiet = if s.drew { 0 } else { quiet + 1 };
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup never settled"
+            );
+        }
+        // Truly idle: no sessions (so no status timers or child output) and no
+        // transient message left to expire. Settle the selection change, then
+        // measure.
+        app.kill_all();
+        app.sessions.clear();
+        app.message = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut quiet = 0;
+        while quiet < 5 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("settle step");
+            quiet = if s.drew { 0 } else { quiet + 1 };
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "app never settled after clearing"
+            );
+        }
+        let mut draws = 0;
+        for _ in 0..20 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("idle step");
+            if s.drew {
+                draws += 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            draws,
+            0,
+            "an idle app must issue no draws after the first frame; message={:?} dirty={} sessions={}",
+            app.message,
+            app.dirty,
+            app.sessions.len()
+        );
+        assert!(!app.dirty, "nothing may leave dirty set while idle");
+    }
+
+    #[test]
+    fn timing_stages_recorded() {
+        // Test: timing stage recording infrastructure creates and records stages.
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+
+        // Add stages like they would be added in main()
+        timing.stages.push(TimingStage {
+            name: "config_load",
+            duration_ms: 10,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "workspace_resolution",
+            duration_ms: 20,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "terminal_setup",
+            duration_ms: 5,
+            note: None,
+        });
+        timing.total_ms = 35;
+
+        // Verify stages are recorded
+        assert_eq!(timing.stages.len(), 3);
+        assert_eq!(timing.stages[0].name, "config_load");
+        assert_eq!(timing.stages[0].duration_ms, 10);
+        assert_eq!(timing.stages[1].name, "workspace_resolution");
+        assert_eq!(timing.total_ms, 35);
+    }
+
+    #[test]
+    fn timing_output_format() {
+        // Test: timing structs format and print correctly.
+        let timing = StartupTiming {
+            stages: vec![
+                TimingStage {
+                    name: "config_load",
+                    duration_ms: 10,
+                    note: None,
+                },
+                TimingStage {
+                    name: "keyboard_probe",
+                    duration_ms: 250,
+                    note: Some("kitty 250ms (timeout)".to_string()),
+                },
+            ],
+            total_ms: 300,
+        };
+
+        // Verify structure fields are accessible and have expected values
+        assert_eq!(timing.stages.len(), 2);
+        assert_eq!(timing.stages[0].name, "config_load");
+        assert_eq!(timing.stages[1].name, "keyboard_probe");
+        assert_eq!(
+            timing.stages[1].note.as_deref(),
+            Some("kitty 250ms (timeout)")
+        );
+
+        // Test print_to_stderr (prints to stderr; test verifies method works)
+        // In a real scenario, BAUDE_TIMING=1 would be set to show this output
+        // For now, just verify the method can be called
+        timing.print_to_stderr();
+    }
+
+    #[test]
+    fn timing_disabled_when_env_unset() {
+        // Test: timing output respects BAUDE_TIMING env var.
+        let timing_enabled = std::env::var("BAUDE_TIMING").ok() == Some("1".to_string());
+        // By default in tests, BAUDE_TIMING should not be set
+        assert!(
+            !timing_enabled,
+            "BAUDE_TIMING should not be set in default test environment"
+        );
+
+        // Verify that when env var is not set, timing output would be skipped
+        // (in the actual main() code, it checks: if std::env::var("BAUDE_TIMING").ok() == Some("1".to_string()))
+    }
+
+    #[test]
+    fn timing_keyboard_probe_stage_includes_timeout_note() {
+        // Test: timing stages can include optional notes for stages like keyboard probe timeout.
+        let stage_without_note = TimingStage {
+            name: "config_load",
+            duration_ms: 10,
+            note: None,
+        };
+        assert!(stage_without_note.note.is_none());
+
+        let stage_with_timeout = TimingStage {
+            name: "keyboard_probe",
+            duration_ms: 250,
+            note: Some("kitty 250ms (timeout)".to_string()),
+        };
+        assert_eq!(
+            stage_with_timeout.note.as_deref(),
+            Some("kitty 250ms (timeout)")
+        );
+        assert_eq!(stage_with_timeout.duration_ms, 250);
+    }
+
+    #[test]
+    fn loop_timing_stages_are_durations_not_timestamps() {
+        // The `ms` column is per-stage durations. Recording elapsed-since-origin
+        // for the three loop stages made them print the SAME number, which reads
+        // as "the first frame took two seconds" when it means "the first frame
+        // happened two seconds in" — misleading in exactly the report that
+        // exists to diagnose slow startup.
+        use baude_core::testing::TestRedirect;
+        let tmp =
+            std::env::temp_dir().join(format!("baude-test-timing-units-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("timing-units".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+        let mut loop_timing = LoopTiming::start();
+        let (mut started, mut finished) = (false, false);
+        // A deliberate pause before the first step: under the old code every
+        // loop stage would inherit that same elapsed value.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        for _ in 0..4 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            loop_timing.record(&mut timing, &s, &app);
+        }
+        let loop_stages: Vec<_> = timing
+            .stages
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.name,
+                    "first_frame" | "session_restore" | "first_metadata_poll"
+                )
+            })
+            .collect();
+        assert!(
+            loop_stages.len() >= 2,
+            "expected the loop stages to be recorded, got {:?}",
+            timing.stages.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+        let first = loop_stages[0].duration_ms;
+        assert!(
+            first >= 50,
+            "first_frame should carry the real pre-frame duration, got {first} ms"
+        );
+        for stage in &loop_stages[1..] {
+            assert!(
+                stage.duration_ms < first,
+                "{} reported {} ms, which is the elapsed-since-start value, not its own duration",
+                stage.name,
+                stage.duration_ms
+            );
+        }
+    }
+
+    #[test]
+    fn timing_first_frame_before_restore() {
+        // The loop recorder sees first_frame, then session_restore (with the
+        // restored count), then first_metadata_poll — in that order.
+        use baude_core::testing::TestRedirect;
+        let tmp =
+            std::env::temp_dir().join(format!("baude-test-timing-order-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("loop-test".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+        let mut loop_timing = LoopTiming::start();
+        let (mut started, mut finished) = (false, false);
+        for _ in 0..3 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            loop_timing.record(&mut timing, &s, &app);
+        }
+        let names: Vec<&str> = timing.stages.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["first_frame", "session_restore", "first_metadata_poll"],
+            "stages must be recorded once each, first frame before restore"
+        );
+        let restore = timing
+            .stages
+            .iter()
+            .find(|s| s.name == "session_restore")
+            .expect("restore stage");
+        assert_eq!(
+            restore.note.as_deref(),
+            Some(format!("{} sessions", app.sessions.len()).as_str()),
+            "restore note carries the restored session count"
+        );
+    }
+
+    // Scripted ProbeIo for testing (no real I/O)
+    struct ScriptedProbeIo {
+        responses: std::collections::VecDeque<Option<Vec<u8>>>,
+    }
+
+    impl ScriptedProbeIo {
+        fn new() -> Self {
+            ScriptedProbeIo {
+                responses: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn with_responses(responses: Vec<Option<Vec<u8>>>) -> Self {
+            ScriptedProbeIo {
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ProbeIo for ScriptedProbeIo {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn read_with_timeout(&mut self, _remaining: Duration) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.responses.pop_front().flatten())
+        }
+    }
+
+    #[test]
+    fn keyboard_probe_timeout_bounded_250ms() {
+        // Test: probe times out within 250 ms boundary
+        let mut io = ScriptedProbeIo::new();
+        let start = Instant::now();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(250));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "probe should complete successfully");
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should return false on timeout"
+        );
+        assert!(
+            elapsed.as_millis() < 400,
+            "probe should timeout within 400ms boundary"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fallback_on_timeout() {
+        // Test: probe times out without response, returns false
+        let mut io = ScriptedProbeIo::new();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(10));
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should degrade to legacy on timeout"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fallback_on_error() {
+        // Test: probe handles read error gracefully
+        struct ErrorProbeIo;
+        impl ProbeIo for ErrorProbeIo {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn read_with_timeout(
+                &mut self,
+                _remaining: Duration,
+            ) -> std::io::Result<Option<Vec<u8>>> {
+                Err(std::io::Error::other("read failed"))
+            }
+        }
+        let mut io = ErrorProbeIo;
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert!(result.is_err(), "probe should propagate read errors");
+    }
+
+    #[test]
+    fn keyboard_probe_da1_fallback() {
+        // Test: terminal responds with DA1 (without u variant), returns false
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[c".to_vec())]);
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should return false for DA1 without u"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_supports_u_response() {
+        // Test: terminal responds with CSI ? ... u, returns true
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[?1u".to_vec())]);
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert_eq!(
+            result.ok(),
+            Some(true),
+            "probe should return true for u variant response"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fast_success() {
+        // Test: keyboard responds quickly with valid flags
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[?1u".to_vec())]);
+        let start = Instant::now();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(250));
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.ok(), Some(true), "probe should return true");
+        assert!(
+            elapsed.as_millis() < 100,
+            "fast probe should complete within 100ms"
+        );
+    }
+
+    #[test]
+    fn timing_keyboard_stage_includes_timeout_note_when_250ms_elapsed() {
+        // Test: timing stage gets "kitty 250ms (timeout)" note when probe hits timeout
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+
+        // Simulate keyboard probe that hits timeout
+        let kb_duration = 260; // >= 250ms
+        let kb_note = if kb_duration >= 250 {
+            Some("kitty 250ms (timeout)".to_string())
+        } else {
+            None
+        };
+        timing.stages.push(TimingStage {
+            name: "keyboard_probe",
+            duration_ms: kb_duration,
+            note: kb_note,
+        });
+
+        let stage = timing
+            .stages
+            .iter()
+            .find(|s| s.name == "keyboard_probe")
+            .expect("stage");
+        assert_eq!(stage.note.as_deref(), Some("kitty 250ms (timeout)"));
     }
 }

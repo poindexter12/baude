@@ -217,6 +217,21 @@ pub struct ClaudeMeta {
     /// accepts EITHER a resolved session_id (claude) or this flag (opencode),
     /// or the first message could never be delivered. Never set by claude.
     pub backend_ready: bool,
+    /// Last recorded modification time of session.json. Used to gate reads:
+    /// if mtime unchanged, skip read (cost: one stat call only).
+    pub last_session_mtime: Option<SystemTime>,
+    /// Last recorded modification time of hook-events.jsonl. Used to gate reads:
+    /// if mtime unchanged, skip read (cost: one stat call only).
+    pub last_events_mtime: Option<SystemTime>,
+    /// Sizes seen alongside the mtimes above. mtime ALONE is not a safe gate:
+    /// filesystem timestamp granularity is coarse enough (notably on Linux,
+    /// where CI caught this; macOS APFS hides it with nanosecond stamps) that
+    /// two writes can land in one tick, and a gate that trusts mtime then
+    /// skips a file that really grew. Dropping a `Stop` event that way leaves
+    /// a finished session rendered as busy until something else happens to
+    /// move the mtime. Both sizes must match too before a read is skipped.
+    pub last_session_len: Option<u64>,
+    pub last_events_len: Option<u64>,
 }
 
 impl ClaudeMeta {
@@ -243,38 +258,66 @@ impl ClaudeMeta {
     /// Find this session's `sessions/<pid>.json`. Exact pid match wins
     /// (sessions spawned with `exec claude` — the child IS claude); otherwise
     /// match by cwd and pick the file whose start time is closest to ours.
+    ///
+    /// Gate on mtime: if mtime unchanged since last poll, skip read (cost: one stat call).
     fn poll_session_file(&mut self, cwd: &Path, pid: Option<u32>, spawn_unix_ms: u64) {
         let dir = claude_config_dir().join("sessions");
-        if let Some(pid) = pid {
-            if let Some(v) = read_json(&dir.join(format!("{pid}.json"))) {
-                self.apply_session_file(&v);
-                return;
+
+        // Check mtime before reading (low-cost stat call)
+        let session_file = if let Some(pid) = pid {
+            dir.join(format!("{pid}.json"))
+        } else {
+            // Fallback path: we'll need to scan, so mtime gate doesn't apply
+            let session_mtime = fs::metadata(&dir).and_then(|m| m.modified()).ok();
+            if session_mtime == self.last_session_mtime {
+                return; // Unchanged, skip entire scan
             }
-        }
-        let cwd_str = cwd.to_string_lossy();
-        let Ok(entries) = fs::read_dir(&dir) else {
+            self.last_session_mtime = session_mtime;
+
+            let cwd_str = cwd.to_string_lossy();
+            let Ok(entries) = fs::read_dir(&dir) else {
+                return;
+            };
+            let mut best: Option<(u64, Value)> = None;
+            for entry in entries.flatten() {
+                let Some(v) = read_json(&entry.path()) else {
+                    continue;
+                };
+                if v["cwd"].as_str() != Some(cwd_str.as_ref()) {
+                    continue;
+                }
+                let started = v["startedAt"].as_u64().unwrap_or(0);
+                // Ignore session files that predate this baude session.
+                if started + 20_000 < spawn_unix_ms {
+                    continue;
+                }
+                let dist = started.abs_diff(spawn_unix_ms);
+                if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                    best = Some((dist, v));
+                }
+            }
+            if let Some((_, v)) = best {
+                self.apply_session_file(&v);
+            }
             return;
         };
-        let mut best: Option<(u64, Value)> = None;
-        for entry in entries.flatten() {
-            let Some(v) = read_json(&entry.path()) else {
-                continue;
-            };
-            if v["cwd"].as_str() != Some(cwd_str.as_ref()) {
-                continue;
-            }
-            let started = v["startedAt"].as_u64().unwrap_or(0);
-            // Ignore session files that predate this baude session.
-            if started + 20_000 < spawn_unix_ms {
-                continue;
-            }
-            let dist = started.abs_diff(spawn_unix_ms);
-            if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
-                best = Some((dist, v));
-            }
+
+        // Exact pid match path, gated on mtime AND size (see the field docs:
+        // mtime alone is unsafe at filesystem timestamp granularity).
+        let session_meta = fs::metadata(&session_file).ok();
+        let session_mtime = session_meta.as_ref().and_then(|m| m.modified().ok());
+        let session_len = session_meta.as_ref().map(|m| m.len());
+        if session_mtime.is_some()
+            && session_mtime == self.last_session_mtime
+            && session_len == self.last_session_len
+        {
+            return; // Unchanged, skip read
         }
-        if let Some((_, v)) = best {
+
+        if let Some(v) = read_json(&session_file) {
             self.apply_session_file(&v);
+            self.last_session_mtime = session_mtime;
+            self.last_session_len = session_len;
         }
     }
 
@@ -471,6 +514,20 @@ impl ClaudeMeta {
             self.last_stop = None;
             self.activity.clear();
         }
+
+        // Gate on mtime AND size. The size is the load-bearing half: this file
+        // is append-only, so a growth the mtime failed to register is exactly
+        // the case that must still be read (see the field docs).
+        let events_meta = fs::metadata(&path).ok();
+        let events_mtime = events_meta.as_ref().and_then(|m| m.modified().ok());
+        let events_len = events_meta.as_ref().map(|m| m.len());
+        if events_mtime.is_some()
+            && events_mtime == self.last_events_mtime
+            && events_len == self.last_events_len
+        {
+            return; // Unchanged, skip read
+        }
+
         let Ok(mut f) = fs::File::open(&path) else {
             return;
         };
@@ -532,6 +589,9 @@ impl ClaudeMeta {
             }
         }
         self.offset_events += consumed as u64;
+        // Record both halves of the gate after a successful read.
+        self.last_events_mtime = events_mtime;
+        self.last_events_len = events_len;
     }
 
     /// Context usage bridge file written by statusline hooks (e.g. the GSD
@@ -1483,5 +1543,54 @@ mod tests {
         assert_eq!(meta.transcript_path(), Some(transcript.as_path()));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mtime_gate_tracks_last_session_mtime() {
+        // Metadata mtime tracking should prevent reads when mtime unchanged
+        let mut meta = ClaudeMeta::default();
+        assert_eq!(meta.last_session_mtime, None);
+        assert_eq!(meta.last_events_mtime, None);
+        assert_eq!(meta.last_session_len, None);
+        assert_eq!(meta.last_events_len, None);
+
+        // The hazard the size half exists for: two appends inside one
+        // filesystem timestamp tick. Pin the mtime to a fixed value so the
+        // test reproduces coarse-granularity behaviour on any filesystem,
+        // then confirm a grown file is still read.
+        let dir = std::env::temp_dir().join(format!(
+            "baude-meta-gate-{}-{}",
+            std::process::id(),
+            "same-tick"
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("hook-events.jsonl");
+        fs::write(&path, b"{\"schema\":1,\"event\":\"Stop\",\"ts\":1}\n").unwrap();
+        let frozen = fs::metadata(&path).unwrap().modified().unwrap();
+        let first_len = fs::metadata(&path).unwrap().len();
+        meta.last_events_mtime = Some(frozen);
+        meta.last_events_len = Some(first_len);
+
+        // Append more, then force the mtime back to the recorded value: the
+        // file grew but the clock did not move.
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"schema\":1,\"event\":\"Stop\",\"ts\":2}\n")
+            .unwrap();
+        drop(f);
+        let grown_len = fs::metadata(&path).unwrap().len();
+        assert!(grown_len > first_len, "the append must have grown the file");
+
+        let mtime_unchanged = Some(frozen) == meta.last_events_mtime;
+        let len_unchanged = Some(grown_len) == meta.last_events_len;
+        assert!(
+            mtime_unchanged && !len_unchanged,
+            "the scenario under test is: mtime says unchanged, size says grown"
+        );
+        assert!(
+            !(mtime_unchanged && len_unchanged),
+            "an mtime-only gate would skip this read and lose the second Stop event"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

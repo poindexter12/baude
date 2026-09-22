@@ -201,6 +201,7 @@ version = "2.2.0"
 dependencies = [
  "anyhow",
  "baude-core",
+ "libc",
  "percent-encoding",
  "ratatui",
  "serde",
@@ -215,11 +216,13 @@ name = "baude-core"
 version = "2.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "dirs",
  "libc",
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
  "vt100",
 ]

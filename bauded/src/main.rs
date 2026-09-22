@@ -8,6 +8,7 @@ mod manager;
 mod notify;
 mod permission_bridge;
 mod push;
+mod timing;
 mod transcript;
 mod web;
 
@@ -171,18 +172,61 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("BAUDED_BIND").ok())
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
-    // Identity is resolved explicitly, once, from a config loaded once, BEFORE
-    // the first reader. `default_claude_cmd`, `Manager::new`, `restore`, the
-    // metadata poll thread and every API handler reach `workspace::active()`,
-    // directly or through `backend::active()`; the daemon passes no folder hint
-    // (only the TUI launch path has a launch directory to remember). Precedence
-    // is unchanged: `initialize` still consults BAUDE_WORKSPACE/BAUDE_BACKEND
-    // ahead of this config, exactly as the previous lazy resolution did.
-    let config = baude_core::persist::load_config();
-    let _ = baude_core::workspace::initialize(&config, None);
+    // Record total startup time
+    let total_start = std::time::Instant::now();
+    let mut startup_timing = timing::StartupTiming::new(0);
 
+    // Daemon startup mirrors TUI startup: canonicalize the current directory,
+    // call the shared workspace resolver, claim the lock, and record any
+    // derived bindings. The daemon's lock base is "daemon-state" to distinguish
+    // it from the TUI's "state" lock.
+    let config_start = std::time::Instant::now();
+    let launch_dir = match std::fs::canonicalize(std::env::current_dir()?) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("failed to canonicalize current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let config = baude_core::persist::load_config();
+    startup_timing.add_stage("config_load", config_start.elapsed().as_millis());
+
+    let env = baude_core::launch::StartEnv {
+        ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
+        backend_env: std::env::var("BAUDE_BACKEND").ok(),
+    };
+    let _started =
+        match baude_core::launch::start_workspace(&launch_dir, &config, env, "daemon-state") {
+            Ok(started) => {
+                // Print startup notes if any (folder-memory hints, applied bindings)
+                for note in &started.notes {
+                    println!("  {note}");
+                }
+                started
+            }
+            Err(baude_core::launch::StartError::LockHeld { diag }) => {
+                eprintln!("{diag}");
+                std::process::exit(1);
+            }
+            Err(baude_core::launch::StartError::LockIo { path, detail }) => {
+                eprintln!(
+                    "failed to claim workspace lock at {}: {}",
+                    path.display(),
+                    detail
+                );
+                std::process::exit(1);
+            }
+        };
+
+    let state_start = std::time::Instant::now();
     let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();
+    startup_timing.add_stage("state_load", state_start.elapsed().as_millis());
+
+    let listener_start = std::time::Instant::now();
+    // Record timing stages before moving manager
+    let mut timing_for_mgr = startup_timing.clone();
+
     let state = Arc::new(Mutex::new(manager));
     // opencode prompt mode: every restored session needs its permission
     // watcher back (create/restart wire theirs in the API handlers).
@@ -231,6 +275,15 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    timing_for_mgr.add_stage("listener_bound", listener_start.elapsed().as_millis());
+    timing_for_mgr.total_ms = total_start.elapsed().as_millis();
+
+    // Update manager with final timing
+    {
+        let mut m = lock(&state);
+        m.startup_timing = timing_for_mgr;
+    }
+
     let ws = baude_core::workspace::active();
     println!(
         "bauded listening on http://{bind} — {} ({restored} session(s) restored)",

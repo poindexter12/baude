@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2"
 anyhow.workspace = true
 # `dirs` is deliberately NOT a dependency of this crate. Every home resolution
 # goes through `baude_core::persist::home_dir`, which is guarded; keeping the

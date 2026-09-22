@@ -304,3 +304,101 @@ claimed before the gate is answered.
 - [ ] Do not hand-write the v2.2.0 changelog. release-please generates and owns
       `CHANGELOG.md`; a hand-written file is overwritten on the release branch.
 
+
+---
+
+## Merge Authorization
+
+**Merge authorized by:** Joe Seymour on 2026-09-17
+
+- PR [#87](https://github.com/poindexter12/baude/pull/87) merged into `main` as a
+  **merge commit** (`aa12cb2ee0045ce5e6426618a85ab83c43f0cf57`) at
+  2026-09-17T18:24:17Z. Merge-commit rather than squash so release-please sees
+  every conventional commit; PR #86's `docs:`-titled squash cut no release and is
+  the precedent that decided this.
+- All 11 checks were green at merge time, including the three required contexts
+  `check (macos-14)`, `check (ubuntu-22.04)` and `docker`, plus CodeQL and
+  artifact-readiness on all four release targets.
+- Authorization was given in response to an explicit one-way-door checkpoint that
+  named the consequence (release-please cutting a v2.2.0 release PR) and the
+  `release:hold` timing hazard.
+
+### Release PR and the hold
+
+- release-please opened [#88](https://github.com/poindexter12/baude/pull/88)
+  (`chore(main): release 2.2.0`) 80 seconds after the merge.
+- **The `release:hold` label did not exist in this repository.** The first
+  labelling attempt failed with `'release:hold' not found`, leaving #88 carrying
+  only `release:minor` + `autorelease: pending` — precisely the state
+  `release-automerge.yml` selects for its `*/30` cron. The label was created
+  (`B60205`, "Blocks release-automerge: requires explicit human authorization to
+  publish") and applied; `autoMergeRequest` is `none`.
+- Hold verified against the workflow itself, not assumed:
+  `release-automerge.yml:40-42` filters
+  `select([.labels[].name] | index("release:hold") | not)`, so #88 is now
+  excluded from auto-merge.
+- **Worth fixing at leisure:** the escape hatch documented at
+  `release-automerge.yml:8` depended on a label nobody had created, so every
+  prior minor release was auto-mergeable with no way to veto it. The label now
+  exists permanently.
+
+## Publish Authorization
+
+**Publish authorized by:** Joe Seymour on 2026-09-19
+
+Authorization given at plan 12-05's second blocking-human checkpoint, after an
+earlier deliberate deferral on 2026-09-17. The deferral and this authorization
+are both recorded; the hold was lifted only by this line.
+
+### Evidence the authorization rests on
+
+- Release PR [#88](https://github.com/poindexter12/baude/pull/88)
+  `chore(main): release 2.2.0`, MERGEABLE/CLEAN, 11/11 checks green, bumping
+  `2.1.5 -> 2.2.0` across `.release-please-manifest.json`, root `Cargo.toml`,
+  `baude/`, `baude-core/`, `bauded/` and `Cargo.lock`, with the
+  `x-release-please-version` pin on `baude-core` moving in step.
+- CHANGELOG generated from the full conventional-commit set — the merge-commit
+  strategy chosen at PR #87 worked: every phase 8-11 `feat` is present. A squash
+  would have collapsed this to one line or cut no release at all (PR #86's
+  precedent).
+- Phases 8-11 all COMPLETE with `verification_status: passed`, re-verified at
+  HEAD `ee6fa3c` on 2026-09-18 with no regressions: 646 tests / 0 failed,
+  `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+  both exit 0.
+
+### What this authorization does NOT claim
+
+SHIP-03's human evidence is a labeled bulk attestation, not a leg-by-leg
+walkthrough, and three signed gaps ride into this release unclosed:
+
+1. LINK-01's label-vs-destination distinction was never visually narrated.
+2. The reported mouse-click link opening was iTerm2's own URL handling, not
+   baude's keyboard activation path.
+3. TKEY-01/TKEY-02 rest on automated coverage plus a set-level attestation, not
+   on a confirmed live keystroke.
+
+The Linux smoke session was never run; legs 1-4 and 8-9 there are covered only
+by `check (ubuntu-22.04)`, and legs 5-7 and 10-12 are deferred with sign-off.
+
+v2.2.0 ships on strong automated evidence and thin human-observed evidence, and
+that distinction is recorded here deliberately so a future bug report can be
+read against what was actually checked.
+
+### Published artifacts — verified 2026-09-19
+
+| Check | Result |
+|---|---|
+| Release PR #88 merged | `1c37551ad8ecb2fced18ecb3220136e81eb7bb8b`, 2026-09-19T17:01:16Z |
+| Tag `v2.2.0` | pushed, points at the merge sha |
+| GitHub release | published 2026-09-19T17:01:29Z, `isDraft: false`, `isPrerelease: false` |
+| Release workflow (run 35456777276) | success — all 8 jobs: 4 `build`, 2 `image`, `image-manifest`, `publish` |
+| Tarballs | 4 targets: aarch64/x86_64 × apple-darwin/unknown-linux-gnu, plus `SHA256SUMS.txt` |
+| Checksum | `shasum -a 256 -c` on the downloaded aarch64-apple-darwin tarball → `OK` |
+| Contents | extracts to exactly `baude` + `bauded` (the two-binary shape) |
+| Version agreement | extracted binaries report `baude 2.2.0` and `bauded 2.2.0` — matching tag, manifests and release notes |
+| Container | `image` (amd64 + arm64) and `image-manifest` jobs succeeded; multi-arch manifest pushed |
+
+Verification was performed against the *published* artifact — downloaded from the
+release, checksum-verified, extracted and executed — not against a local build.
+
+**Release URL:** https://github.com/poindexter12/baude/releases/tag/v2.2.0

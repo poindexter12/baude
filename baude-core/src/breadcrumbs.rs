@@ -338,6 +338,7 @@ mod tests {
             observed_main_worktree: path(checkout),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: String::new(),
         });
         let key = state.allocate_checkout_key().unwrap();
         let order = state.allocate_first_seen_order().unwrap();

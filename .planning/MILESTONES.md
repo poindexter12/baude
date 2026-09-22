@@ -1,5 +1,32 @@
 # Milestones
 
+## v2.2 Reliability and Terminal Usability (Shipped: 2026-09-19)
+
+**Phases completed:** 5 phases (8-12), 25 plans, 49 tasks
+**Release:** v2.2.0 via release-please (PR #88); source range v2.1.0..v2.2.0 = 205 commits, 154 files, +43,947/-2,013
+**Timeline:** 2026-09-08 (v2.1.0 baseline) -> 2026-09-19 (v2.2.0 published); GSD phases executed 2026-09-13 -> 2026-09-19
+**Closeout type:** override_closeout
+**Known verification overrides:** 2 newly acknowledged, 12 carried forward from a prior close (see STATE.md Deferred Items)
+
+**Delivered:** Everyday session management is safer (no hook accumulation, actionable lock diagnostics, leak-proof test fixtures, a fail-closed worktree leak scan) and the terminal is more usable (clickable OSC8 and bare-URL links with preview and copy, negotiated Shift+Enter newlines with a legacy fallback), validated and shipped as v2.2.0.
+
+**Key accomplishments:**
+
+- Test isolation: one `TestRedirect` owns every fixture path across all three crates (cargo feature, escape guard aborts any test that reaches the real home) and `workspace::active()` resolves per fixture, so tests can no longer leak or race through global state (#72).
+- Worktree leak scan: `baude worktrees scan` classifies every managed `repository-<key>` candidate through a fail-closed verdict; removal is reachable only behind a saved report plus two opt-ins and never deletes real user worktrees.
+- Hook seeding safety: guarded `settings.local.json` and `.mcp.json` seeding never overwrites unreadable or unparseable settings, seeds an always-quoted shell-safe hook command, and surfaces warnings on all spawn paths (#70, HREG-03/04); WLOCK diagnostics pinned by tests (#71).
+- Clickable terminal links: a vendored vt100 fork carries per-cell OSC8 link ids; the `ctrl+o` hint overlay collects OSC8 and RFC 3986 bare URLs at gesture time with destination preview, copy, and an argv-only validated opener, with remote-attach parity.
+- Negotiated multiline input: a bounded kitty keyboard probe gates Shift+Enter (ESC CR to Claude, CR to shell, CSI-u only for kitty children) with conditional pop on restore and a byte-frozen legacy fallback corpus.
+- Release validation: clippy restored from exit 101 to 0 (the vendored fork's lint header had masked two real lints), README updated for links, mouse, scrollback and lock recovery, 174 phase commits rebased and pushed conflict-free, smoke evidence recorded, v2.2.0 published.
+
+### Known Gaps
+
+- Phase 12 was executed (5/5 plans) but never run through `/gsd-verify-work`; closed by override. SHIP-03 and SHIP-04 were marked Complete from 12-03, 12-04 and 12-05 summary evidence rather than a VERIFICATION.md.
+- No GSD `v2.2` tag was created; the release-please tag `v2.2.0` is the ship marker.
+- One flaky bauded lifecycle test (Phase 10 note) remains a flake-hunt candidate.
+
+---
+
 ## v2.0 Local TUI Dogfood Release (Shipped: 2026-09-03)
 
 **Phases completed:** 3 phases, 16 plans, 38 tasks
@@ -64,8 +91,9 @@ through GSD phases).
 
 ## Current
 
-- **v0.7 — Native Claude integration** (in planning): replace inferred session
-  state with first-party Claude Code data. Full plan: `docs/plans/tier-1-native-claude-integration.md`.
+- **Next milestone** (in planning via `/gsd-new-milestone`): default the workspace
+  and new/open paths to the repository root baude was launched from, and stop
+  cross-repo `repository-<key>` worktree path collisions.
 
 ## Notes
 

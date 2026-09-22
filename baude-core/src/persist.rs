@@ -774,6 +774,7 @@ fn migrate_legacy(
                 observed_main_worktree: main_worktree.clone(),
                 first_seen_order,
                 health: repository_health,
+                physical_key: String::new(),
             });
             repositories.insert(identity, key);
             key
@@ -826,7 +827,6 @@ fn migrate_legacy(
 pub struct State {
     pub sessions: Vec<SavedSession>,
 }
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedSession {
@@ -990,6 +990,13 @@ pub struct Config {
     /// Scope the sidebar to the sessions previously used from the launch
     /// folder (breadcrumbs). Default true; BAUDE_FOLDER_CONTEXT=0 overrides.
     pub folder_context: Option<bool>,
+    /// Idle child process policy when auto-archiving: "keep" (default, no-op),
+    /// "suspend" (send SIGSTOP to child's process group), or "stop" (kill child).
+    /// BAUDE_IDLE_CHILD_POLICY overrides. Applied on auto-archive and manual archive.
+    pub idle_child_policy: Option<String>,
+    /// Usage poller interval in seconds; 0 disables the poller.
+    /// BAUDE_USAGE_POLL_SECS overrides. Defaults to 60.
+    pub usage_poll_secs: Option<u64>,
 }
 
 /// One `workspaces.<name>` config entry. All fields optional.
@@ -1026,6 +1033,24 @@ impl Config {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .or(self.folder_context)
             .unwrap_or(true)
+    }
+
+    /// Resolved idle child policy: `BAUDE_IDLE_CHILD_POLICY`, then the config
+    /// field, then `Keep`. See [`idle_child_policy_from`].
+    pub fn idle_child_policy(&self) -> IdleChildPolicy {
+        idle_child_policy_from(
+            std::env::var("BAUDE_IDLE_CHILD_POLICY").ok().as_deref(),
+            self.idle_child_policy.as_deref(),
+        )
+    }
+
+    /// Resolved usage poller interval: `BAUDE_USAGE_POLL_SECS`, then the
+    /// config field, then `None` (the poller's default). `Some(0)` disables.
+    pub fn usage_poll_secs(&self) -> Option<u64> {
+        usage_poll_secs_from(
+            std::env::var("BAUDE_USAGE_POLL_SECS").ok().as_deref(),
+            self.usage_poll_secs,
+        )
     }
 }
 
@@ -1167,6 +1192,46 @@ pub(crate) fn load_named_at(
     Ok(LoadOutcome::Current(current))
 }
 
+/// What happens to a session's Claude child (and its shell) when the row is
+/// archived, by the auto-archive timer or by hand. `Keep` is today's behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleChildPolicy {
+    Keep,
+    Suspend,
+    Stop,
+}
+
+impl IdleChildPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdleChildPolicy::Keep => "keep",
+            IdleChildPolicy::Suspend => "suspend",
+            IdleChildPolicy::Stop => "stop",
+        }
+    }
+}
+
+/// Pure resolver behind [`Config::idle_child_policy`]: env value first, then
+/// the config field; unknown or empty values fall back to `Keep` so a typo can
+/// never stop or suspend children. Tests pass the env value directly.
+pub fn idle_child_policy_from(env: Option<&str>, field: Option<&str>) -> IdleChildPolicy {
+    let parse = |raw: &str| match raw.trim().to_ascii_lowercase().as_str() {
+        "suspend" => Some(IdleChildPolicy::Suspend),
+        "stop" => Some(IdleChildPolicy::Stop),
+        "keep" => Some(IdleChildPolicy::Keep),
+        _ => None,
+    };
+    env.and_then(parse)
+        .or_else(|| field.and_then(parse))
+        .unwrap_or(IdleChildPolicy::Keep)
+}
+
+/// Pure resolver behind [`Config::usage_poll_secs`]: a parseable env value
+/// wins, an unparseable one is ignored, then the config field.
+pub fn usage_poll_secs_from(env: Option<&str>, field: Option<u64>) -> Option<u64> {
+    env.and_then(|raw| raw.trim().parse::<u64>().ok()).or(field)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,6 +1285,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&main),
             first_seen_order: repository_order,
             health: RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged),
+            physical_key: String::new(),
         });
         state.checkouts.push(SavedCheckout::new(
             checkout_key,
@@ -1295,6 +1361,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&root),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            physical_key: String::new(),
         };
         let identity = ProcessIdentity {
             pid: 4242,
@@ -1964,5 +2031,66 @@ mod tests {
             Err(LoadError::InvalidState { .. })
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_child_policy_env_override() {
+        use super::{idle_child_policy_from, IdleChildPolicy};
+        assert_eq!(
+            idle_child_policy_from(Some("suspend"), Some("keep")),
+            IdleChildPolicy::Suspend,
+            "env wins over the config field"
+        );
+        assert_eq!(
+            idle_child_policy_from(None, Some("stop")),
+            IdleChildPolicy::Stop
+        );
+        assert_eq!(
+            idle_child_policy_from(Some("STOP"), None),
+            IdleChildPolicy::Stop
+        );
+        assert_eq!(
+            idle_child_policy_from(Some("bogus"), Some("suspend")),
+            IdleChildPolicy::Suspend,
+            "an unknown env value is ignored, not treated as keep"
+        );
+        assert_eq!(idle_child_policy_from(None, None), IdleChildPolicy::Keep);
+        let config = super::Config::default();
+        assert_eq!(config.idle_child_policy(), IdleChildPolicy::Keep);
+    }
+
+    #[test]
+    fn usage_poll_secs_option_parses() {
+        use super::usage_poll_secs_from;
+        assert_eq!(usage_poll_secs_from(None, Some(30)), Some(30));
+        assert_eq!(usage_poll_secs_from(None, None), None);
+        let config = super::Config {
+            usage_poll_secs: Some(30),
+            ..super::Config::default()
+        };
+        assert_eq!(config.usage_poll_secs(), Some(30));
+    }
+
+    #[test]
+    fn usage_poll_secs_zero_disables() {
+        use super::usage_poll_secs_from;
+        assert_eq!(usage_poll_secs_from(Some("0"), Some(60)), Some(0));
+        assert_eq!(usage_poll_secs_from(None, Some(0)), Some(0));
+    }
+
+    #[test]
+    fn usage_poll_secs_env_override() {
+        use super::usage_poll_secs_from;
+        assert_eq!(
+            usage_poll_secs_from(Some("30"), Some(60)),
+            Some(30),
+            "env wins"
+        );
+        assert_eq!(
+            usage_poll_secs_from(Some("not-a-number"), Some(60)),
+            Some(60),
+            "an unparseable env value falls back to the field"
+        );
+        assert_eq!(usage_poll_secs_from(Some(" 15 "), None), Some(15));
     }
 }

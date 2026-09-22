@@ -118,6 +118,7 @@ through to Claude.
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
 | `ctrl+o` | anywhere | link hints (inspect/copy/open urls) |
+| `alt+↑/↓` | claude or shell pane | move focus to the pane above/below (shell sits below claude) |
 | `shift+enter` | claude pane | insert a newline without submitting |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
@@ -140,9 +141,9 @@ through to Claude.
 To close from a pane, press `ctrl+q` to return to the sidebar, then `x`.
 `ctrl+x` passes through unchanged for opencode, nano, and other terminal apps.
 
-`alt+←/→` needs your terminal to send Option/Alt as a modifier — on macOS
+`alt+←/→` and `alt+↑/↓` need your terminal to send Option/Alt as a modifier — on macOS
 Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
-this chord shadows Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
+these chords shadow Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
 and `ctrl+n` are intercepted everywhere, so they never reach the shell pane's
 readline (end-of-line, next-history) or the AI CLI.
 
@@ -229,13 +230,26 @@ compatibility is guaranteed anywhere else. Each release records the exact
 terminal identities and OS versions the gestures were observed in, in that
 release's smoke evidence.
 
-## Status icons
+## Status codes
 
-- `●` waiting for your input — flashes in place, with a wait timer
-- `◐` working — animated spinner
-- `✗` exited (`r` to restart)
+Status is shown as a static single-character code in the sidebar, never
+animated. Each row displays its code in a fixed color:
 
-Waiting is detected from PTY output silence: the CLI streams spinner output
+- `?` waiting for your input (yellow, bold) — with a wait timer
+- `B` busy — claude is working (blue)
+- `✓` completed — turn finished, your move (green)
+- `✗` exited (dark gray; `r` to restart)
+- `-` closed checkout, no live session (gray)
+- `A` archived (dark gray)
+- `!` unavailable or missing (yellow)
+
+The codes are static: nothing in the sidebar animates, so an idle baude
+issues zero terminal writes. A one-line legend
+(`? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable`)
+sits above the usage footer when the terminal is at least 21 rows tall, and
+`?` (help) lists the codes.
+
+Waiting is detected from PTY output silence: the CLI streams output
 continuously while working, so ~2s of quiet means it's your turn. Better
 sources take precedence when present
 (`exited > hook event > session file > output silence`): Claude Code's own
@@ -266,6 +280,8 @@ sessions never send push notifications.
 
 ## Folder context
 
+### Session breadcrumbs
+
 baude leaves breadcrumbs per launch folder: the sessions a run actually used
 (opened, typed into, created with `w`, or admitted) are recorded against the
 folder baude was started in, and the next launch from that folder scopes the
@@ -281,19 +297,26 @@ is ever written into your repositories. Entries reference sessions by path,
 prune automatically when a checkout or folder leaves durable state, and a
 corrupt file just means a fresh context. Remote (`⇄ remote`) rows are not
 scoped in this release: launch-folder attribution isn't reliable for daemon
-sessions, so they always render. Set `folder_context: false` in config (or
-`BAUDE_FOLDER_CONTEXT=0`) to disable recording and filtering entirely.
+sessions, so they always render.
+
+### Workspace memory (ancestor walk)
 
 Folder memory also covers the [workspace](#workspaces): every launch records
-which workspace the folder ran in
-(`~/.config/baude/folder-workspaces.json`), and a later plain `baude` there
-comes back up in that workspace — same backend, daemon, and state pool.
-Precedence: an explicit `BAUDE_WORKSPACE` or `BAUDE_BACKEND` always wins and
-suppresses the memory for that run (while still teaching the folder for the
-next one); the remembered workspace outranks the config `workspace`/`backend`
-defaults; with no memory, resolution is unchanged. When memory changes the
-outcome the status line notes `workspace <name> (folder history)`. The
-`folder_context` kill switch above disables this too.
+which workspace the folder ran in (`~/.config/baude/folder-workspaces.json`).
+
+**Walk behavior:** When you launch baude, it walks up from your launch directory checking each ancestor folder for a recorded binding. The first binding found is used; if no binding exists at any level, the walk returns None and precedence continues to the next tier.
+
+**Boundary:** The walk stops at your home directory (`$HOME`) and does not continue above it. If your launch directory is outside your home (e.g., in `/tmp`), the walk stops at the filesystem root.
+
+**Recording:** When you launch from a new repository without a binding, baude derives the workspace name from the repository root's folder name and records the binding for that repository root, so future launches from any subfolder of that repository use the same workspace.
+
+**Override or rebind:** To use a different workspace for a folder path, use one of these approaches in order of priority:
+1. Set `BAUDE_WORKSPACE` environment variable (highest priority)
+2. Delete the binding from `~/.config/baude/folder-workspaces.json` and re-launch to record a new derived binding
+3. Set the config `workspace` key — but note that ancestor bindings have priority, so if a parent folder has a recorded binding, the config value does not override it
+4. To override an ancestor binding, use `BAUDE_WORKSPACE` env var
+
+**Kill switch:** Set config `folder_context: false` to disable folder memory entirely; the walk is skipped and precedence goes directly to config workspace key (if any), BAUDE_BACKEND, config backend, then default. This also disables session breadcrumbs.
 
 ## Cloning
 
@@ -320,6 +343,24 @@ children has a running backend. Its main checkout, any separate managed
 default checkout, and retained linked worktrees remain visible as durable
 children in persisted oldest-first order.
 
+Managed worktree directories are identified by a stable digest of the
+repository's canonical git common directory (output of `git rev-parse
+--git-common-dir`). The digest is the first 12 characters of the SHA256 hash,
+formatted as `repository-<12 hex digits>/<role>-<checkout_key>`. This ensures
+two processes admitting the same repository derive the same path without
+coordination. Existing legacy counter-based directories (`repository-1`,
+`repository-2`, etc.) from earlier baude versions are recognized in place; the
+digest scheme applies only to new repositories.
+
+A small `.baude-marker.json` file inside each managed directory records and
+verifies ownership. On first admission of a legacy directory, baude writes a
+marker; after a state file reset, markers enable recovery without a scan. If
+two repositories converge on the same path (rare, but possible under legacy
+counters), baude detects the collision via the marker file and allocates the
+newcomer a distinct digest-keyed directory (`repository-<12hex>-2`, etc.). The
+collision is reported non-destructively in `baude worktrees scan --json` output
+with the owning repository named.
+
 From a local parent or child, `w` creates a valid local branch or activates an
 eligible existing local branch in a managed path beneath
 `~/.local/share/baude/worktrees/`, then starts the active workspace backend.
@@ -330,7 +371,9 @@ linked worktree, performs fresh topology and clean-state checks around an
 exact-target confirmation, and uses ordinary non-destructive Git removal.
 Dirty, conflicted, locked, submodule-unsafe, or indeterminate state blocks the
 operation. A successful `X` removes only that worktree and child; its local
-branch, repository parent, and siblings remain.
+branch, repository parent, and siblings remain. After a state file reset, the
+same repository is found again by computing its digest from the canonical git
+common directory; no scan is required for recovery.
 
 ## Usage panel
 
@@ -432,6 +475,92 @@ the profile's shell.
   (with sound, once per turn), a finished turn, or an exit (both silent).
   Covers local and remote sidebar sessions; archived sessions are muted.
   Default `true` (no-op off macOS); `BAUDE_NOTIFY=0` env overrides.
+- `idle_child_policy` — what happens to a session's Claude child (and its
+  shell pane) when the row is archived, by the idle timer or by `a`: `keep`
+  (default, today's behavior), `suspend` (SIGSTOP the child's process group;
+  the row reads `suspended`, and unarchiving, attaching with enter, or typing
+  into it sends SIGCONT), or `stop` (kill the child; the row becomes
+  `✗ exited` and `r` restarts it). Unix signals; the daemon applies the same
+  policy. `BAUDE_IDLE_CHILD_POLICY` env overrides.
+- `usage_poll_secs` — how often the background usage poller refreshes the
+  footer's today/week costs, default `60`. `0` never starts the poller
+  thread (the footer shows `usage: off`). `BAUDE_USAGE_POLL_SECS` env
+  overrides.
+
+## Performance
+
+baude aims for minimal CPU and battery cost while idle.
+
+### Startup Timing
+
+To diagnose slow startup, run with the `BAUDE_TIMING=1` environment
+variable:
+
+```sh
+BAUDE_TIMING=1 baude
+```
+
+Timing stages will be printed to stderr when baude exits:
+
+- `config_load` — Config file read and parsed
+- `workspace_resolution` — Folder bindings and repository root derived
+- `keyboard_probe` — Kitty keyboard protocol negotiation (250 ms timeout)
+- `terminal_setup` — Terminal::new and mode setup
+- `app_new` — App struct initialized
+- `first_frame` — First frame drawn (before session restore)
+- `session_restore` — saved sessions admitted and released (the note
+  carries the session count)
+- `first_metadata_poll` — First metadata poll cycle completed
+- `total` — Wall-clock duration from startup to exit
+
+bauded (the daemon) records its own stages (`config_load`, `state_load`,
+`listener_bound`) and exposes them as `startup_ms` on the `/info` API
+endpoint.
+
+### Idle Behavior
+
+With no input or status changes, baude issues zero terminal writes: the
+loop redraws only when input, PTY output, a status change, or a resize
+marks the frame dirty. Status codes are static single-character glyphs that
+never animate; the waiting-row timer redraws once a second only while a
+waiting row is visible. Archived and exited rows are never polled for
+metadata, unchanged session and event files are skipped on mtime, and the
+first frame paints before saved sessions are restored (restore then releases
+one session per loop iteration).
+
+A one-line legend appears above the usage footer when the terminal is at
+least 21 rows tall (the usage footer itself needs 20).
+
+### idle_child_policy
+
+When a row is archived, by the idle timer after `auto_archive_minutes` or
+by hand with `a`, the policy decides what happens to its Claude child and
+shell pane:
+
+- `keep` — leave the child running (default, today's behavior)
+- `suspend` — verify the child's process identity, then SIGSTOP its process
+  group; the row reads `suspended`. Unarchiving, attaching with enter, or
+  typing into the session sends SIGCONT.
+- `stop` — kill the child; the row becomes `✗ exited` and `r` restarts it
+
+The daemon applies the same policy on its archive endpoint and on
+auto-archive. Override with `BAUDE_IDLE_CHILD_POLICY=suspend` or
+`BAUDE_IDLE_CHILD_POLICY=stop`.
+
+### usage_poll_secs
+
+The usage poller runs in a background thread and refreshes the footer's
+today/week costs every N seconds (default 60; after a failure it backs off
+to the larger of 300 seconds and the interval). Set to `0` to disable:
+
+```json
+{
+  "usage_poll_secs": 0
+}
+```
+
+Or override with `BAUDE_USAGE_POLL_SECS=30` (seconds). When disabled, the
+footer shows `usage: off`.
 
 ## Workspaces
 
@@ -453,22 +582,49 @@ histories. Custom workspaces are declared in config:
 }
 ```
 
-`BAUDE_WORKSPACE` selects the workspace; with neither env var set, the launch
-folder's remembered workspace comes next (see "Folder context"), then config
-`workspace`, then the backend name. A workspace's backend binding **wins over
-`BAUDE_BACKEND`** —
-the env var can't cross-wire a workspace onto the wrong backend (a conflict
-warns and is ignored). The status bar shows the active workspace and its
-platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces,
-`⬢ work · Claude Code` / `⬢ oss · opencode` for named ones.
+### Workspace selection: precedence order
 
-Daemons serve exactly one workspace: `bauded` reads `BAUDE_WORKSPACE` at
-startup, namespaces its state, and reports its identity at `GET /info`; the
-TUI refuses to create sessions through a daemon serving a different
-workspace. `auto_daemon` runs one daemon per workspace on its own port
-(claude `8642`, opencode `8643`, custom via `daemon_port`). The `claude`
-workspace reads the legacy un-suffixed state files on first run, so existing
-session lists survive the upgrade.
+Workspace selection follows a precedence order, from highest to lowest priority:
+
+1. **BAUDE_WORKSPACE environment variable** — explicit, overrides all
+2. **Folder binding from ancestor walk** — nearest recorded binding wins (see "Folder context")
+3. **config `workspace` key** — explicit config in `~/.config/baude/config.json`
+4. **Derived workspace name from repository root** — only when inside a git repository
+5. **BAUDE_BACKEND environment variable**
+6. **config `backend` key** — `~/.config/baude/config.json`
+7. **Default workspace name** — `claude`
+
+A workspace's backend binding **wins over `BAUDE_BACKEND`** — the env var can't cross-wire a workspace onto the wrong backend (a conflict warns and is ignored). The status bar shows the active workspace and its platform: `⬢ Claude Code` / `⬢ opencode` for the implicit workspaces, `⬢ work · Claude Code` / `⬢ oss · opencode` for named ones.
+
+### When does derivation apply?
+
+Derivation applies **only when launched inside a git repository** (determined by git's repo root discovery) **and no higher-precedence source** (BAUDE_WORKSPACE, folder binding, or config workspace) is found. When you launch from a git repository for the first time, baude derives the workspace name from the repository root's folder name and records the binding so future launches from any subfolder of that repository use the same workspace.
+
+Unbound non-git folders skip derivation and use the remaining chain (BAUDE_BACKEND, config backend, default). Nothing is derived or recorded for those folders.
+
+### Examples
+
+- **Launch from ~/Code/github.com/iarx-com/baude/src (repo subfolder) with no explicit settings:**
+  - Inside a git repo, no binding exists → derives workspace `baude` from repo root folder name
+  - Binding recorded: next launch from any subfolder of that repo comes up in `baude`
+
+- **Launch from ~/Code/github.com/poindexter12/baude with binding recorded as poindexter12:**
+  - Folder binding found → uses bound workspace `poindexter12`
+  - Ancestor walk takes precedence over derivation
+
+- **Launch from ~/Documents (not a git repo) with no binding or config:**
+  - Not a git repo, no binding exists → skips derivation
+  - Uses default `claude` workspace
+
+### Daemon workspace resolution
+
+The daemon (`bauded`) applies the same workspace selection rules as the TUI. When launched, `bauded` walks the folder-workspaces.json for bindings, derives workspace names from repository roots, and records new bindings using the same logic as `baude`. This ensures that switching between TUI and daemon does not change your active workspace for a given directory.
+
+### Legacy state files
+
+The `claude` workspace reads the legacy un-suffixed state files on first run, so existing session lists survive the upgrade.
+
+`auto_daemon` runs one daemon per workspace on its own port (claude `8642`, opencode `8643`, custom via `daemon_port`).
 
 ### When a workspace is already open
 
@@ -521,6 +677,27 @@ Recovery, in order:
 `bauded` does not claim the lock at startup, so a daemon contending for a
 workspace surfaces the same pid-and-path diagnostic at its first state save
 rather than at launch.
+
+### New-session defaults
+
+The `n` command opens a prompt to create a new session. Path prefill defaults based on your launch location:
+
+- **Inside a git repository:** The default is that repository's root path (allowing you to easily create sessions in the same repository)
+- **Outside a repository:** The default is the `new_session_dir` config option (if set), otherwise your launch directory
+
+You can always type a different path; the prefill is a convenience only.
+
+### TUI title display
+
+The top title bar shows the active workspace name and how it was selected. The format is `baude v<version> — <workspace-name> (<source>)`.
+
+**Source labels:**
+- `(explicit)` — workspace selected via BAUDE_WORKSPACE environment variable or config `workspace` key
+- `(folder binding)` — workspace found by ancestor walk through recorded folder bindings
+- `(derived)` — workspace derived from repository root folder name
+- `(blank)` — implicit default (no explicit setting, no binding, no derivation)
+
+This makes it clear at a glance which workspace you're in and why.
 
 ## opencode backend
 

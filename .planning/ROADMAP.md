@@ -1,20 +1,15 @@
 # Roadmap: baude
 
-## Overview
-
-v2.2 Reliability and Terminal Usability continues after completed Phase 7. Close the remaining test-isolation and hook-seeding gaps first, then deliver clickable HTTP(S) terminal links, negotiated multiline input, and validation through the existing v2.2.0 release workflow.
-
-**Re-scoped 2026-09-13.** Releases v2.1.2 through v2.1.5 shipped fixes for issues #70, #71, #72 and #78 before this milestone began executing. Every Phase 8 and Phase 9 requirement was re-verified against main at v2.1.5: six are delivered, four are partial, two were never started. Phases 8 and 9 are narrowed to the verified remainder. Phases 10 through 12 are unchanged.
-
 ## Milestones
 
-- [x] **v0.7 Session Visibility**: Phases 1-4, shipped 2026-07-02 ([archive](milestones/v0.7-ROADMAP.md))
-- [x] **v2.0 Local TUI Dogfood Release**: Phases 5-7, shipped 2026-09-03 ([archive](milestones/v2.0-ROADMAP.md))
-- [ ] **v2.2 Reliability and Terminal Usability**: Phases 8-12, proposed
+- ✅ **v0.7 Session Visibility** — Phases 1-4 (shipped 2026-07-02) ([archive](milestones/v0.7-ROADMAP.md))
+- ✅ **v2.0 Local TUI Dogfood Release** — Phases 5-7 (shipped 2026-09-03) ([archive](milestones/v2.0-ROADMAP.md))
+- ✅ **v2.2 Reliability and Terminal Usability** — Phases 8-12 (shipped 2026-09-19 as v2.2.0) ([archive](milestones/v2.2-ROADMAP.md))
+- 🚧 **v2.3 Launch Defaults and Startup Speed** — Phases 13-17 (in progress)
 
-v2.1.0 is the source baseline for this milestone and does not add a roadmap phase. Historical milestone labels and dates above retain the previous roadmap index; archived records remain authoritative for prior work.
+v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases.
 
-## Completed Phases
+## Phases
 
 <details>
 <summary>✅ v0.7 Session Visibility (Phases 1-4) — SHIPPED 2026-07-02</summary>
@@ -39,202 +34,152 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 </details>
 
-## v2.2 Reliability and Terminal Usability
+<details>
+<summary>✅ v2.2 Reliability and Terminal Usability (Phases 8-12) — SHIPPED 2026-09-19</summary>
 
-- [x] **Phase 8: Test Isolation and Fixture Ownership** (narrowed): Close the config, workspace-identity, escape-guard and leak-preview gaps left after v2.1.4. (completed 2026-09-16)
-- [x] **Phase 9: Hook Seeding Safety** (narrowed): Stop silently replacing unparseable settings and seed a shell-safe executable path. (completed 2026-09-15)
-- [x] **Phase 10: Clickable Terminal Links**: Expose safe link activation, destination preview, and copy using authoritative screen metadata. (completed 2026-09-16)
-- [x] **Phase 11: Negotiated Multiline Input**: Support Shift+Enter where capability is verified, with honest fallback elsewhere. (completed 2026-09-16)
-- [ ] **Phase 12: Validation and v2.2.0 Release**: Complete regression, CI, terminal smoke, documentation, and release validation.
+- [x] Phase 8: Test Isolation and Fixture Ownership (8/8 plans) — completed 2026-09-16
+- [x] Phase 9: Hook Seeding Safety (4/4 plans) — completed 2026-09-15
+- [x] Phase 10: Clickable Terminal Links (4/4 plans) — completed 2026-09-16
+- [x] Phase 11: Negotiated Multiline Input (4/4 plans) — completed 2026-09-16
+- [x] Phase 12: Validation and v2.2.0 Release (5/5 plans) — completed 2026-09-19 (closed by override; see MILESTONES.md Known Gaps)
+
+</details>
+
+## v2.3 Launch Defaults and Startup Speed (Phases 13-17)
+
+- [x] **Phase 13: Workspace Derivation and New-Session/Open Defaults** - Opening baude from any folder uses the right workspace and repository (completed 2026-09-20)
+- [x] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions (completed 2026-09-21)
+- [x] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery (completed 2026-09-22)
+- [x] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches (completed 2026-09-22)
+- [x] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation (completed 2026-09-22)
 
 ## Phase Details
 
-### Phase 8: Test Isolation and Fixture Ownership
+### Phase 13: Workspace Derivation and New-Session/Open Defaults
 
-**Goal**: Running the suite cannot read or write the developer's real config, state, or `~/.claude`, and suspected historical leaks can be inspected before anyone deletes anything.
-**Depends on**: Nothing within v2.2. This phase precedes test-heavy milestone work.
-**Requirements**: TISO-01 (remainder), TISO-02 (remainder), TISO-03 (remainder), TISO-04
+**Goal**: Opening baude from any folder automatically uses the right workspace and repository, with recorded defaults and explicit config still winning.
 
-**Already delivered (v2.1.4, PR #82)**: managed worktrees and repos are confined to per-label temp roots; `REQUIRE_WORKTREES_OVERRIDE` turns a managed-worktree escape into a failing assert; state persistence is redirectable; test redirects are thread-local and no test mutates the parent process HOME/XDG.
+**Depends on**: Nothing (first phase of this milestone)
 
-**Success Criteria**:
+**Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, WSPC-05, OPEN-01, OPEN-02, OPEN-03, OPEN-04
 
-1. Config resolution (`persist::config_dir`, `meta::claude_config_dir`) accepts a test redirect, and no test run reads or writes the real `~/.config/baude` or `~/.claude` — including `bauded` push-subscription and VAPID key storage.
-2. Workspace identity is resolvable per fixture rather than through a process-wide `OnceLock` seeded from the developer's real environment, so concurrent fixtures cannot share or race one identity.
-3. The escape guard covers config, state, and `~/.claude` paths as it already covers managed worktrees, and is armed independently of whether some earlier fixture in the same test binary happened to arm it.
-4. A developer can enumerate and preview suspected leaked test worktrees under the real data root without deleting them; removal requires verified ownership plus separate approval, and a missing gitdir alone never authorizes it.
+**Success Criteria** (what must be TRUE):
 
-**Plans**: 8/8 plans executed
+  1. User launches baude from a subfolder of a repository and the correct workspace is used (either from a recorded folder binding or derived from the repo root folder name)
+  2. The new-session (`n`) prompt prefills the git toplevel when launched inside a repo, or the configured `new_session_dir` when launched outside any repository
+  3. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `BAUDE_BACKEND` env/config still override derivation and recorded bindings
+  4. Launching baude from different subfolders of the same repository and from its root all admit the same repository row (no duplicates)
+  5. The README documents the full derivation rule, precedence chain, and examples for workspace and default-path selection
+  6. The top title of the TUI names the active workspace and how it was chosen, or shows a `(blank)` placeholder when none applies, so the landing workspace is visible at a glance
 
-Plans:
-
+**Plans**: 3/3 plans executed
 **Wave 1**
 
-- [x] 08-01-PLAN.md — Tracer: cross-crate test-support gate, unified RAII redirect guard, complete setter migration (11-file scope warning remains)
-
-**Wave 2 (after 08-01)**
-
-- [x] 08-02-PLAN.md — `~/.claude` redirect and `bauded` push/VAPID resolver dedup
-- [x] 08-03-PLAN.md — Per-fixture identity, explicit initialization, retained app/API/UI guard owners; owner-only verification
-
-**Wave 3 (after identity/resolver prerequisites)**
-
-- [x] 08-04-PLAN.md — Leak scan: evidence/verdict model and read-only enumeration (pending human decision)
-- [x] 08-08-PLAN.md — Inert App workers, UI ownership regressions and contained PTY child environments
-
-**Wave 4**
-
-- [x] 08-05-PLAN.md — Complete state inventory and report-bound re-verifying prune (after 08-04, pending human decision)
-- [x] 08-06-PLAN.md — Shared `bauded` fixture helper and suite-level assertion (after 08-08; first broad-test boundary)
-
-**Wave 5 (after 08-05 and 08-06)**
-
-- [x] 08-07-PLAN.md — `baude worktrees` CLI surface: grouped report, JSON preview input, two-flag prune
-
-### Phase 9: Hook Seeding Safety
-
-**Goal**: Seeding a project's hooks never destroys a user's existing settings and never emits a command string the shell will mis-execute.
-**Depends on**: Phase 8 for isolated regression coverage.
-**Requirements**: HREG-03, HREG-04 (remainder)
-
-**Already delivered (v2.1.2 PR #77, v2.1.3 PR #80, v2.1.5 PR #84)**: all four lifecycle events converge to one baude-owned registration regardless of install path (HREG-01); custom hooks, mixed groups, matcher groups, the bare fallback and unrelated keys survive reconciliation verbatim (HREG-02); and the full workspace-lock contract — refusal before session operations, no takeover, diagnostic pid with recovery guidance, and `try_lock` rather than file existence deciding contention (WLOCK-01 through WLOCK-04).
-
-**Success Criteria**:
-
-1. An existing `.claude/settings.local.json` or `.mcp.json` that cannot be read or parsed is left untouched rather than overwritten with baude's seed alone, and the user receives an actionable warning naming the file.
-2. The seeded hook command quotes or otherwise escapes the executable path, so an install path containing a space, `$`, `;`, or a backtick invokes exactly that executable. Verified 2026-09-13: hook commands are executed through a shell, so the current unquoted `format!("{} hook", ...)` is a live defect.
-3. The seed recognizer matches the quoted form, so quoting does not reintroduce the per-path accumulation that HREG-01 fixed.
-4. Regression tests cover a malformed settings file, a spaced install path end to end, and the two behaviors verified by inspection only in v2.1.3: reopening a workspace whose lock file remains after the OS lock released, and `bauded` encountering a held lock.
-
-**Plans**: 4/4 plans executed
-
-Plans:
-
-**Wave 1**
-
-- [x] 09-01-PLAN.md — Tracer: guarded `seed_settings` + `SeedWarning` seam end to end (trait ripple, TUI add-session surface)
-- [x] 09-02-PLAN.md — Lock regression tests: leftover-lock-file reopen (persist) + bauded held-lock pid diagnostic
-
-**Wave 2**
-
-- [x] 09-03-PLAN.md — TDD: POSIX-quoted hook command, both-form recognizer with round-trip validation, `sh -c` E2E
-- [x] 09-04-PLAN.md — `.mcp.json` guard (command stays argv data), remaining spawn-path surfaces, app-level malformed-settings tests
-
-### Phase 10: Clickable Terminal Links
-
-**Goal**: Users can inspect, copy, and explicitly open validated HTTP(S) destinations while terminal rendering, selection, and remote attachment remain authoritative and safe.
-**Depends on**: Phase 8 for isolated parser and interaction tests; not technically dependent on Phase 9.
-**Requirements**: LINK-01, LINK-02, LINK-03, LINK-04, LINK-05, LINK-06, LINK-07, LINK-08
-
-**Success Criteria**:
-
-1. Labeled OSC8 links open their actual HTTP(S) destination, and users can preview or copy the destination before opening.
-2. Bare HTTP(S) URLs, including soft-wrapped URLs, retain valid characters without surrounding prose punctuation.
-3. Link metadata remains attached to the correct cells through scrolling, scrollback, wrapping, resizing, overwrites, and erasure in local and attached remote terminals.
-4. A documented explicit gesture activates links while selection, drag-copy, scrolling, and supported child mouse behavior remain usable; output alone never opens a link.
-5. Unsupported, malformed, or control-bearing targets remain non-activatable; allowed targets are passed as data to the opener, and failures leave the session running with a useful error.
-
-**Plans**: 4/4 plans executed
-**UI hint**: yes
-
-Plans:
-
-**Wave 1**
-
-- [x] 10-01-PLAN.md — Tracer: vendored vt100 fork + end-to-end OSC8 slice (ctrl+o → overlay shows destination → validated open via injected opener seam); gesture docs + fork provenance
-
-**Wave 2** (10-02 and 10-03 run in parallel — no file overlap)
-
-- [x] 10-02-PLAN.md — TDD: fork grid fidelity (scroll/wrap/resize/overwrite/erase-strip, intern caps, `;` rejoin) + contents_formatted OSC8 re-emission with snapshot round-trip (remote parity)
-- [x] 10-03-PLAN.md — TDD: bare-URL wrap-join detection with punctuation trim + full validate_http_url matrix (pure links.rs)
-
-**Wave 3**
-
-- [x] 10-04-PLAN.md — Overlay completion (navigation, copy via injected sink, no-links state), gesture call-site integration incl. remote attach, LINK-04 non-interference proof, opener failure surface + phase-gate full suite
-
-### Phase 11: Negotiated Multiline Input
-
-**Goal**: Users can insert newlines with Shift+Enter on verified terminal paths without changing existing key behavior or leaking terminal modes.
-**Depends on**: Phase 8 for isolated input/lifecycle tests; not technically dependent on Phase 10.
-**Requirements**: TKEY-01, TKEY-02, TKEY-03, TKEY-04, TKEY-05
-
-**Success Criteria**:
-
-1. Shift+Enter inserts a newline without submitting Claude/claudex prompts on documented, tested terminal paths.
-2. Ordinary Enter, Ctrl-C, navigation keys, and existing baude shortcuts retain their behavior.
-3. Terminals that cannot distinguish Shift+Enter retain legacy behavior, with documented setup or fallback guidance.
-4. The prior outer-terminal keyboard mode is restored on controlled exit, failure, and suspend paths, then re-established on resume.
-5. Negotiation cannot block startup/input indefinitely, and enhanced sequences are sent only on a verified outer-terminal/child-input path.
-
-**Plans**: 4/4 plans executed
-
-Plans:
-**Wave 1**
-
-- [x] 11-01-PLAN.md — Tracer: bounded probe seam, gated push/pop through restore_terminal, EncodeCtx-conditional Shift+Enter arm, legacy byte corpus (wave 1)
-- [x] 11-02-PLAN.md — TDD: vt100 fork kitty keyboard-mode tracking + kitty_keyboard() accessor (wave 1)
-- [x] 11-03-PLAN.md — Help overlay + README supported-terminals/fallback guidance (wave 1)
+- [x] 13-01-PLAN.md — Implement workspace derivation and TUI title end-to-end
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [x] 11-04-PLAN.md — Child-verification wiring: forward_key observed-push gate + subscribe() kitty replay (wave 2)
-
-### Phase 12: Validation and v2.2.0 Release
-
-**Goal**: Maintainers have observed regression, CI, documentation, and terminal evidence sufficient to publish v2.2.0 through the existing release process.
-**Depends on**: Phases 8, 9, 10, and 11.
-**Requirements**: SHIP-01, SHIP-02, SHIP-03, SHIP-04
-
-**Success Criteria**:
-
-1. Focused and workspace regression tests, formatting, clippy, and supported-platform CI checks pass after test isolation is in place.
-2. Users can find documented activation/preview/copy gestures, tested terminal support, multiline setup/fallback, and lock recovery.
-3. Real macOS/Linux terminal smoke evidence covers links, selection, scrollback, mouse behavior, Shift+Enter, ordinary Enter, and restoration.
-4. v2.2.0 can be published through the existing release workflow with matching versions, release notes, and supported binary/container outputs, only after verification passes.
-
-**Plans**: 4/5 plans executed
-
-Plans:
-**Wave 1**
-
-- [x] 12-01-PLAN.md — Clippy remediation (3 proven edits) and the full local CI-parity bracket, before any push [SHIP-01]
-- [x] 12-02-PLAN.md — README gap-fill: link hints, mouse/selection/scrollback, tested terminals, workspace-lock recovery [SHIP-02]
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 12-03-PLAN.md — 12-SMOKE-EVIDENCE.md: structured 12-leg checklist, provenance-stamped, maintainer-observed [SHIP-03]
+- [x] 13-02-PLAN.md — Comprehensive unit and integration tests for resolution, prefill, and deduplication
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [x] 12-04-PLAN.md — Merge train: rebase, push, PR, and the first CI evidence ever taken on phases 8-11 [SHIP-01, SHIP-04]
+- [x] 13-03-PLAN.md — Daemon parity and README documentation
 
-**Wave 4** *(blocked on Wave 3 completion)*
+### Phase 14: Managed Worktree Identity
 
-- [ ] 12-05-PLAN.md — v2.2.0 release with the release:hold blocking-human publish gate [SHIP-04]
+**Goal**: Managed worktrees carry stable repository identity preventing cross-repo collisions and enabling safe in-place migration.
 
-## Progress
+**Depends on**: Phase 13
 
-**Execution Order**: Phase 8 → Phase 9 → Phase 10 → Phase 11 → Phase 12
+**Requirements**: WTID-01, WTID-02, WTID-03, WTID-04
+
+**Success Criteria** (what must be TRUE):
+
+  1. Two repositories never resolve to the same managed worktree path, verified across TUI and daemon state files and after a state reset
+  2. Existing managed checkouts work unchanged under the new identity scheme (no deletions, no re-cloning, in-place migration)
+  3. When a collision is detected, baude names the repository that owns the path and offers non-destructive resolution instead of a hard error
+  4. `baude worktrees scan` reports the owning repository for each managed checkout and surface any collisions with ownership info
+
+**Plans**: 3/3 plans executed
+**Wave 1**
+
+- [x] 14-01-PLAN.md — Marker module and digest resolution (tracer: end-to-end proof of identity scheme)
+- [x] 14-02-PLAN.md — Path composition and collision detection integration
+
+**Wave 3** *(blocked on Wave 1 completion)*
+
+- [x] 14-03-PLAN.md — Admission flows, scan output, and documentation
+
+### Phase 15: Startup and Idle Performance
+
+**Goal**: Startup is measurable and reaches the first frame quickly without blocking on external services, and an idle baude with many sessions costs near-zero CPU: no unconditional or timer-driven redraws, no polling of dead rows, and an opt-in way to suspend idle Claude children.
+
+**Depends on**: Phase 14
+
+**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04, PERF-05, PERF-06, PERF-07, PERF-08, UX-02
+
+**Success Criteria** (what must be TRUE):
+
+  1. A timing facility (env var or flag) logs each startup stage's duration so a slow launch can be diagnosed without a debugger
+  2. The first frame renders before session restore and the first metadata poll complete
+  3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
+  4. Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
+  5. With no input and no session activity, baude issues no terminal writes; working and waiting rows use static status glyphs (no wall-clock spinner or flash), so the only redraw triggers are input, child output, status transitions, and resize
+  6. Idle per-session polling touches only live, non-archived rows and skips unchanged files, so CPU no longer grows with the session count
+  7. An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and the user can see which children are suspended
+  8. The usage poller can be disabled or slowed from config
+  9. Every session and checkout row shows a static single-character status code (`?` waiting, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable) in its existing per-state color, readable without a key, with an in-app legend; the old circle and spinner glyphs are gone
+
+**Plans**: TBD
+
+- [x] 15-01-PLAN.md
+- [x] 15-02-PLAN.md
+- [x] 15-03-PLAN.md
+- [x] 15-04-PLAN.md
+
+### Phase 16: Pane Focus UX
+
+**Goal**: Users can keep consistent pane focus (Claude or shell) across session switches.
+
+**Depends on**: Phase 15
+
+**Requirements**: UX-01
+
+**Success Criteria** (what must be TRUE):
+
+  1. Pane focus (Claude pane or expanded shell pane) is remembered when the user switches to a different session and back
+  2. A keyboard shortcut toggles focus between the Claude pane and shell pane while both are visible
+
+**Plans**: TBD
+
+- [x] 16-01-PLAN.md
+
+### Phase 17: Validation and v2.3.0 Release
+
+**Goal**: v2.3.0 is published after tests, CI, and smoke validation confirm stability and the new features work end-to-end.
+
+**Depends on**: Phase 16
+
+**Requirements**: SHIP-05
+
+**Success Criteria** (what must be TRUE):
+
+  1. All tests pass (`cargo test --workspace`)
+  2. Clippy reports no warnings (`cargo clippy -D warnings`)
+  3. Terminal smoke test confirms the new defaults, workspace derivation, and startup performance work end-to-end
+  4. Release notes and README reflect the new workspace derivation behavior, new-session defaults, worktree identity scheme, and startup improvements
+
+**Plans**: TBD
+
+## Progress Table
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 8. Test Isolation and Fixture Ownership (narrowed) | 8/8 | Complete    | 2026-09-16 |
-| 9. Hook Seeding Safety (narrowed) | 4/4 | Complete    | 2026-09-15 |
-| 10. Clickable Terminal Links | 4/4 | Complete    | 2026-09-16 |
-| 11. Negotiated Multiline Input | 4/4 | Complete    | 2026-09-16 |
-| 12. Validation and v2.2.0 Release | 4/5 | In Progress|  |
-
-## Planning Notes
-
-- The existing vt100 screen model remains authoritative. A pinned parser fork is an option to verify, not a mandated dependency.
-- Link metadata follows one grid through local and remote paths, not a second terminal model.
-- Outer terminal keyboard negotiation stays separate from child input encoding.
-- Repository/worktree test effects must stay inside injected fixture roots, never real user HOME/XDG directories.
-- Historical leak cleanup is preview-only unless ownership and approval are separately verified; normal cleanup of newly created owned fixtures remains automatic.
-- No SIGKILL or power-loss restoration guarantee is claimed.
-- Release approval requires observed tests, CI, and terminal smoke evidence.
-- A closed GitHub issue does not retire a requirement. Phases 8 and 9 were narrowed only after each requirement was re-verified against code on main; see REQUIREMENTS.md for per-requirement evidence.
-- Proxy monitoring, extra URL schemes, forced lock takeover, full terminal-engine replacement, and PWA redesign remain out of scope.
+| 13. Workspace Derivation and New-Session/Open Defaults | 3/3 | Complete    | 2026-09-20 |
+| 14. Managed Worktree Identity | 3/3 | Complete    | 2026-09-21 |
+| 15. Startup and Idle Performance | 4/4 | Complete    | 2026-09-22 |
+| 16. Pane Focus UX | 1/1 | Complete    | 2026-09-22 |
+| 17. Validation and v2.3.0 Release | 1/1 | Complete    | 2026-09-22 |
 
 ## Backlog
 
@@ -245,4 +190,4 @@ See `.planning/BACKLOG.md`:
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
 
 ---
-*Last updated: 2026-09-13. Phases 8 and 9 re-scoped against shipped v2.1.2-v2.1.5 code.*
+*Last updated: 2026-09-19. Roadmap created for v2.3 milestone.*

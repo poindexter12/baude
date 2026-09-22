@@ -48,7 +48,8 @@
     "security_block_on": "high",
     "ui_review": false,
     "use_worktrees": true,
-    "_auto_chain_active": false
+    "_auto_chain_active": false,
+    "plan_review_convergence": true
   },
   "ship": {
     "pr_body_sections": []
