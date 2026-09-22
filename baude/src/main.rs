@@ -11,6 +11,7 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use baude_core::persist;
 
 fn daemon_is_up(url: &str) -> bool {
     ureq::get(&format!("{url}/sessions"))
@@ -780,14 +781,38 @@ where
         if !app.first_frame_drawn {
             app.first_frame_drawn = true;
 
-            // Start restore in the next iteration after first draw is complete.
+            // Start restore in the first frame iteration.
             // This ensures the first frame (empty chrome) is rendered before restore begins.
             if !*restore_started {
                 app.restore();
                 *restore_started = true;
-                // Whole restore runs in this one step for now; 15-02 makes it
-                // incremental and moves this flag to the end of its queue.
-                *restore_finished = true;
+
+                // If restore queue is empty (no sessions to restore), mark it finished immediately
+                if app.restore_queue.is_none() {
+                    *restore_finished = true;
+                }
+            }
+        }
+    }
+
+    // Drive the two-phase restore incrementally on each iteration while active.
+    if app.restore_queue.is_some() && !*restore_finished {
+        // Run Phase A if in PausedAndRegistered phase
+        if app.restore_queue.as_ref().map(|q| q.phase)
+            == Some(persist::RestorePhase::PausedAndRegistered)
+        {
+            let _ = app.restore_phase_a();
+        }
+
+        // Run Phase B if in Unpausing phase
+        if app.restore_queue.as_ref().map(|q| q.phase) == Some(persist::RestorePhase::Unpausing) {
+            if let Ok(more_remain) = app.restore_phase_b() {
+                if !more_remain {
+                    // All sessions released, restore complete
+                    app.restore_queue = None;
+                    app.restoring = false;
+                    *restore_finished = true;
+                }
             }
         }
     }

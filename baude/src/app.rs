@@ -548,11 +548,9 @@ pub struct App {
     #[cfg(test)]
     remove_git_refusal_for_test: bool,
     /// Two-phase restore state: set to true during Phase A and Phase B
-    #[allow(dead_code)]
-    restoring: bool,
+    pub restoring: bool,
     /// Restore work queue (None when not restoring)
-    #[allow(dead_code)]
-    restore_queue: Option<persist::RestoreQueue>,
+    pub restore_queue: Option<persist::RestoreQueue>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -1311,6 +1309,18 @@ impl App {
             self.set_message(format!("standalone recovery: {error}"));
         }
         let active = active_restore_checkouts(&self.repository_state);
+
+        // Initialize restore queue for two-phase restore
+        let session_count = active.len();
+        if session_count > 0 {
+            self.restore_queue = Some(persist::RestoreQueue {
+                phase: persist::RestorePhase::PausedAndRegistered,
+                total_count: session_count,
+                current_index: 0,
+                paused_sessions: Vec::new(),
+            });
+        }
+
         for key in active {
             if let Err(error) = self.ensure_primary(key) {
                 self.set_message(format!("restore primary: {error}"));
@@ -1361,7 +1371,6 @@ impl App {
     }
 
     /// Phase A of restore: spawn paused sessions, register identities, perform one durable save.
-    #[allow(dead_code)]
     pub(crate) fn restore_phase_a(&mut self) -> Result<(), String> {
         if let Some(queue) = &mut self.restore_queue {
             if queue.phase != persist::RestorePhase::PausedAndRegistered {
@@ -1372,12 +1381,12 @@ impl App {
             queue.phase = persist::RestorePhase::Unpausing;
             queue.current_index = 0;
             self.restoring = true;
+            self.dirty = true;
         }
         Ok(())
     }
 
     /// Phase B of restore: unpause and admit one session per tick.
-    #[allow(dead_code)]
     pub(crate) fn restore_phase_b(&mut self) -> Result<bool, String> {
         if let Some(queue) = &mut self.restore_queue {
             if queue.phase != persist::RestorePhase::Unpausing {
