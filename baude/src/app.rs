@@ -3110,6 +3110,7 @@ impl App {
             unarchived_at_ms: None,
             pending_permission: None,
             permission_decision: None,
+            child_suspended: false,
         };
         self.sessions.push(session);
         match owner {
@@ -3874,7 +3875,17 @@ impl App {
                     continue;
                 }
                 s.poll_meta();
+                let was_archived = s.archived;
                 changed |= s.auto_archive_tick(self.auto_archive_ms);
+
+                // Apply idle_child_policy on auto-archive
+                if !was_archived && s.archived && !s.archived_by_user {
+                    match self.config.idle_child_policy().as_str() {
+                        "suspend" => s.suspend_idle_child(),
+                        "stop" => s.kill(),
+                        _ => {} // "keep" or unknown: do nothing
+                    }
+                }
             }
             if changed {
                 self.save();

@@ -1271,6 +1271,7 @@ impl Manager {
             unarchived_at_ms: None,
             pending_permission: None,
             permission_decision: None,
+            child_suspended: false,
         });
         Ok(id)
     }

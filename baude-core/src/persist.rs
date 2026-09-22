@@ -990,6 +990,13 @@ pub struct Config {
     /// Scope the sidebar to the sessions previously used from the launch
     /// folder (breadcrumbs). Default true; BAUDE_FOLDER_CONTEXT=0 overrides.
     pub folder_context: Option<bool>,
+    /// Idle child process policy when auto-archiving: "keep" (default, no-op),
+    /// "suspend" (send SIGSTOP to child's process group), or "stop" (kill child).
+    /// BAUDE_IDLE_CHILD_POLICY overrides. Applied on auto-archive and manual archive.
+    pub idle_child_policy: Option<String>,
+    /// Usage poller interval in seconds; 0 disables the poller.
+    /// BAUDE_USAGE_POLL_SECS overrides. Defaults to 60.
+    pub usage_poll_secs: Option<u64>,
 }
 
 /// One `workspaces.<name>` config entry. All fields optional.
@@ -1026,6 +1033,25 @@ impl Config {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .or(self.folder_context)
             .unwrap_or(true)
+    }
+
+    /// Resolved idle child policy: BAUDE_IDLE_CHILD_POLICY env, then
+    /// `idle_child_policy`, then "keep" (default: do nothing).
+    pub fn idle_child_policy(&self) -> String {
+        std::env::var("BAUDE_IDLE_CHILD_POLICY")
+            .ok()
+            .or_else(|| self.idle_child_policy.clone())
+            .unwrap_or_else(|| "keep".to_string())
+    }
+
+    /// Resolved usage poller interval in seconds: BAUDE_USAGE_POLL_SECS env,
+    /// then `usage_poll_secs`, then None (uses default constant).
+    /// Some(0) disables the poller.
+    pub fn usage_poll_secs(&self) -> Option<u64> {
+        std::env::var("BAUDE_USAGE_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .or(self.usage_poll_secs)
     }
 }
 

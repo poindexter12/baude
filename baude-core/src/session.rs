@@ -89,6 +89,9 @@ pub struct Session {
     /// (`{request_id, decision, scope?, ts}` as JSON). The bridge's GET poll
     /// reads this to unblock; cleared when a new request supersedes it.
     pub permission_decision: Option<serde_json::Value>,
+    /// Idle child is suspended via SIGSTOP. Set by suspend_idle_child(),
+    /// cleared by resume_idle_child() or kill(). Shows "suspended" in status.
+    pub child_suspended: bool,
 }
 
 impl Session {
@@ -348,6 +351,19 @@ impl Session {
         if let Some(shell) = &mut self.shell {
             shell.kill();
         }
+        self.child_suspended = false;
+    }
+
+    /// Suspend the claude child via SIGSTOP. Verifies process identity before signaling.
+    pub fn suspend_idle_child(&mut self) {
+        self.claude.suspend();
+        self.child_suspended = true;
+    }
+
+    /// Resume the claude child via SIGCONT. Verifies process identity before signaling.
+    pub fn resume_idle_child(&mut self) {
+        self.claude.resume();
+        self.child_suspended = false;
     }
 
     pub fn runtime_snapshot(&self) -> std::result::Result<RuntimeSnapshot, String> {

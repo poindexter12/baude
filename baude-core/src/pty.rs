@@ -597,6 +597,38 @@ impl Pty {
         self.exited.store(true, Ordering::Relaxed);
     }
 
+    /// Send SIGSTOP to the child process group, pausing execution.
+    /// Unix-only; no-op on other platforms.
+    #[cfg(unix)]
+    pub fn suspend(&self) {
+        let pi = self.process_identity();
+        let pgid = pi.process_group;
+        unsafe {
+            let _ = libc::kill(pgid, libc::SIGSTOP);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn suspend(&self) {
+        // Non-Unix: no-op
+    }
+
+    /// Send SIGCONT to the child process group, resuming execution.
+    /// Unix-only; no-op on other platforms.
+    #[cfg(unix)]
+    pub fn resume(&self) {
+        let pi = self.process_identity();
+        let pgid = pi.process_group;
+        unsafe {
+            let _ = libc::kill(pgid, libc::SIGCONT);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn resume(&self) {
+        // Non-Unix: no-op
+    }
+
     /// True while the child is still held behind the registration gate.
     pub fn is_gated(&self) -> bool {
         self.gated
