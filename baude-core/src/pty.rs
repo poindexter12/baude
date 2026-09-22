@@ -17,6 +17,41 @@ pub fn now_ms() -> u64 {
 
 type Subscribers = Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>>;
 
+/// A paused PTY child, held until its identity is durably recorded.
+/// Holds the child process behind the stdin gate; call release() to write the
+/// gate token and activate the child, or abort() to kill it.
+pub struct PausedPty {
+    pty: Option<Pty>,
+    identity: ProcessIdentity,
+}
+
+impl PausedPty {
+    /// Returns the exact ProcessIdentity of the paused child.
+    pub fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+
+    /// Release the paused child by writing the gate token to stdin.
+    /// Consumes the PausedPty and returns the live Pty.
+    pub fn release(mut self) -> Result<Pty> {
+        let mut pty = self
+            .pty
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pty already released"))?;
+        // Write gate token to the child's stdin (GATE_TOKEN constant)
+        pty.write_input(GATE_TOKEN.as_bytes());
+        pty.write_input(b"\n");
+        Ok(pty)
+    }
+
+    /// Abort the paused child (kill and reap without releasing).
+    pub fn abort(mut self) {
+        if let Some(mut pty) = self.pty.take() {
+            let _ = pty.kill_and_wait();
+        }
+    }
+}
+
 /// One embedded terminal: a PTY with a child process and a vt100 screen model.
 pub struct Pty {
     pub parser: Arc<Mutex<vt100::Parser>>,

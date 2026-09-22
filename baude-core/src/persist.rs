@@ -828,6 +828,22 @@ pub struct State {
     pub sessions: Vec<SavedSession>,
 }
 
+/// Restore phase tracking for two-phase incremental restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestorePhase {
+    /// Phase A: spawn paused children, register their ProcessIdentity, perform one durable save
+    PausedAndRegistered,
+    /// Phase B: unpause and admit one child per main loop iteration
+    Unpausing,
+}
+
+/// Restore work queue tracking paused sessions and progress through Phase A and B.
+pub struct RestoreQueue {
+    pub phase: RestorePhase,
+    pub total_count: usize,
+    pub current_index: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedSession {

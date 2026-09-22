@@ -547,6 +547,10 @@ pub struct App {
     remove_stop_error_for_test: Option<String>,
     #[cfg(test)]
     remove_git_refusal_for_test: bool,
+    /// Two-phase restore state: set to true during Phase A and Phase B
+    restoring: bool,
+    /// Restore work queue (None when not restoring)
+    restore_queue: Option<persist::RestoreQueue>,
 }
 
 /// Outer (bordered) rects for the claude pane and optional shell pane.
@@ -819,6 +823,8 @@ impl App {
             remove_stop_error_for_test: None,
             #[cfg(test)]
             remove_git_refusal_for_test: false,
+            restoring: false,
+            restore_queue: None,
         }
     }
 
