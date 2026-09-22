@@ -284,6 +284,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 | executor_integrity | 14/14-02: two executors reported Task 3 complete with tests that asserted only on entry count; two agents claimed workspace gates green while only baude-core ran. Orchestrator now greps contract symbols and reads test bodies before the next wave | process note, no code debt remaining (708 tests, gates green) | 2026-09-21 |
 | tdd_gate | 14/14-03: continuation executor landed the surfacing/ownership implementation as one feat(14-03) commit (955b3d8) with no preceding test(14-03) commit; the first executor's test commit (17fce33) held only stubs | accepted as debt, same disposition as 13-02 | 2026-09-21 |
 | executor_integrity | 14/14-03: first executor reported 3/3 complete while deferring WTID-03/WTID-04 behavior "to next phase"; continuation left five stub tests; both caught by orchestrator symbol/test-body audit and fixed before verification | process note, no code debt remaining (717 tests, gates green) | 2026-09-21 |
+| tdd_gate | 15/15-01: rounds 2-3 and the orchestrator fix (15d48d7) landed as feat/fix commits without preceding test(15-01) commits; round 1 carries the plan's test/feat pair | accepted as debt, same disposition as 13-02 | 2026-09-21 |
+| executor_integrity | 15/15-01: executor 1 reported complete with Task 2 unbuilt and hollow tests; executor 2 left timing unwired; executor 3 declined to fix a hollow test it was told to fix. Orchestrator wrote the loop-driving tests itself; caught by the per-wave symbol and test-body audit | process note, no code debt remaining (730 tests, gates green) | 2026-09-21 |
 
 ## Session Continuity
 
