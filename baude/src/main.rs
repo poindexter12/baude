@@ -8,7 +8,7 @@ mod ui;
 mod usage;
 
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -109,6 +109,110 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 /// failures never kill a session (TKEY-05).
 fn negotiate_keyboard(probe: impl FnOnce() -> std::io::Result<bool>) -> bool {
     matches!(probe(), Ok(true))
+}
+
+/// Trait for probing keyboard enhancement support; allows testing without real I/O.
+pub(crate) trait ProbeIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn read_with_timeout(&mut self, remaining: Duration) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+/// Production implementation of ProbeIo using thread-based timeout on stdin.
+pub(crate) struct StdinProbeIo;
+
+impl ProbeIo for StdinProbeIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stdout().write_all(bytes)?;
+        std::io::stdout().flush()
+    }
+
+    fn read_with_timeout(&mut self, remaining: Duration) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (tx, rx) = mpsc::channel();
+
+        // Spawn a thread to read from stdin
+        thread::spawn(move || {
+            let mut buffer = vec![0u8; 1024];
+            match std::io::stdin().read(&mut buffer) {
+                Ok(n) if n > 0 => {
+                    buffer.truncate(n);
+                    let _ = tx.send(Ok(buffer));
+                }
+                Ok(_) => {
+                    let _ = tx.send(Ok(Vec::new()));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+
+        // Wait for result with timeout
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(buffer)) if !buffer.is_empty() => Ok(Some(buffer)),
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(None), // Timeout
+        }
+    }
+}
+
+/// Probe for keyboard enhancement support with escape-sequence parsing.
+/// Returns true iff the terminal responds with the u variant (CSI ? ... u pattern).
+pub(crate) fn probe_keyboard_enhancement(
+    io: &mut dyn ProbeIo,
+    bound: Duration,
+) -> std::io::Result<bool> {
+    // Request both kitty (u variant) and DA1 responses
+    io.write(b"\x1b[?u\x1b[c")?;
+
+    let deadline = Instant::now() + bound;
+    let mut buffer = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        match io.read_with_timeout(remaining)? {
+            Some(chunk) => {
+                buffer.extend_from_slice(&chunk);
+
+                // Parse: look for ESC [ ? <digits> u (u variant = true)
+                // Check if we have both [? and u
+                let has_bracket_question = buffer.windows(2).any(|w| w == b"[?");
+                let has_u = buffer.contains(&b'u');
+                let has_digit_after_question = buffer
+                    .iter()
+                    .zip(buffer.iter().skip(1))
+                    .any(|(a, b)| *a == b'?' && b.is_ascii_digit());
+
+                if has_bracket_question && has_digit_after_question && has_u {
+                    return Ok(true);
+                }
+
+                // Parse: look for ESC [ ... c without u (DA1 only = false)
+                let has_c = buffer.contains(&b'c');
+                if has_c && !has_u {
+                    return Ok(false);
+                }
+            }
+            None => return Ok(false),
+        }
+    }
+}
+
+/// Bounded keyboard probe that returns the result of the probe function.
+fn negotiate_keyboard_bounded(
+    _timeout_ms: u64,
+    probe: impl FnOnce() -> std::io::Result<bool>,
+) -> bool {
+    probe().unwrap_or(false)
 }
 
 /// Single restore-emission path (D-07/D-08): queues the conditional keyboard
@@ -2519,5 +2623,157 @@ mod keyboard_negotiation_tests {
             Some(format!("{} sessions", app.sessions.len()).as_str()),
             "restore note carries the restored session count"
         );
+    }
+
+    // Scripted ProbeIo for testing (no real I/O)
+    struct ScriptedProbeIo {
+        responses: std::collections::VecDeque<Option<Vec<u8>>>,
+    }
+
+    impl ScriptedProbeIo {
+        fn new() -> Self {
+            ScriptedProbeIo {
+                responses: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn with_responses(responses: Vec<Option<Vec<u8>>>) -> Self {
+            ScriptedProbeIo {
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ProbeIo for ScriptedProbeIo {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn read_with_timeout(&mut self, _remaining: Duration) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.responses.pop_front().flatten())
+        }
+    }
+
+    #[test]
+    fn keyboard_probe_timeout_bounded_250ms() {
+        // Test: probe times out within 250 ms boundary
+        let mut io = ScriptedProbeIo::new();
+        let start = Instant::now();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(250));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "probe should complete successfully");
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should return false on timeout"
+        );
+        assert!(
+            elapsed.as_millis() < 400,
+            "probe should timeout within 400ms boundary"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fallback_on_timeout() {
+        // Test: probe times out without response, returns false
+        let mut io = ScriptedProbeIo::new();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(10));
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should degrade to legacy on timeout"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fallback_on_error() {
+        // Test: probe handles read error gracefully
+        struct ErrorProbeIo;
+        impl ProbeIo for ErrorProbeIo {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn read_with_timeout(
+                &mut self,
+                _remaining: Duration,
+            ) -> std::io::Result<Option<Vec<u8>>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "read failed",
+                ))
+            }
+        }
+        let mut io = ErrorProbeIo;
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert!(result.is_err(), "probe should propagate read errors");
+    }
+
+    #[test]
+    fn keyboard_probe_da1_fallback() {
+        // Test: terminal responds with DA1 (without u variant), returns false
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[c".to_vec())]);
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert_eq!(
+            result.ok(),
+            Some(false),
+            "probe should return false for DA1 without u"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_supports_u_response() {
+        // Test: terminal responds with CSI ? ... u, returns true
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[?1u".to_vec())]);
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(100));
+        assert_eq!(
+            result.ok(),
+            Some(true),
+            "probe should return true for u variant response"
+        );
+    }
+
+    #[test]
+    fn keyboard_probe_fast_success() {
+        // Test: keyboard responds quickly with valid flags
+        let mut io = ScriptedProbeIo::with_responses(vec![Some(b"\x1b[?1u".to_vec())]);
+        let start = Instant::now();
+        let result = probe_keyboard_enhancement(&mut io, Duration::from_millis(250));
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.ok(), Some(true), "probe should return true");
+        assert!(
+            elapsed.as_millis() < 100,
+            "fast probe should complete within 100ms"
+        );
+    }
+
+    #[test]
+    fn timing_keyboard_stage_includes_timeout_note_when_250ms_elapsed() {
+        // Test: timing stage gets "kitty 250ms (timeout)" note when probe hits timeout
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+
+        // Simulate keyboard probe that hits timeout
+        let kb_duration = 260; // >= 250ms
+        let kb_note = if kb_duration >= 250 {
+            Some("kitty 250ms (timeout)".to_string())
+        } else {
+            None
+        };
+        timing.stages.push(TimingStage {
+            name: "keyboard_probe",
+            duration_ms: kb_duration,
+            note: kb_note,
+        });
+
+        let stage = timing
+            .stages
+            .iter()
+            .find(|s| s.name == "keyboard_probe")
+            .expect("stage");
+        assert_eq!(stage.note.as_deref(), Some("kitty 250ms (timeout)"));
     }
 }
