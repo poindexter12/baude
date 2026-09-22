@@ -113,10 +113,8 @@ The `/info` endpoint now exposes `startup_ms` as a flat HashMap, allowing client
 
 | Hash     | Type | Subject |
 |----------|------|---------|
-| 0936911  | test | add failing test stubs for PTY paused spawn and two-phase restore |
-| 198dcf1  | feat | implement PausedPty with spawn_paused, release, and abort |
-| 443e688  | feat | add daemon startup timing with /info endpoint exposure |
-| 72a652a  | style | apply rustfmt and suppress dead_code warnings for test-only methods |
+| c786c6a  | feat | wire two-phase restore queue into step_with with paused spawns, one durable save, and per-iteration release |
+| 46d5d0f  | feat | record bauded startup stages into Manager.startup_timing and serve them on /info |
 
 ## Verification
 
@@ -124,13 +122,13 @@ The `/info` endpoint now exposes `startup_ms` as a flat HashMap, allowing client
 - `cargo fmt --all -- --check`: 0 ✓
 - `cargo clippy --all-targets -- -D warnings`: 0 ✓
 - `cargo build --workspace`: 0 ✓
-- `cargo test --workspace`: 0 ✓ (197 tests passed)
+- `cargo test --workspace`: 0 ✓ (750 tests passed / 0 failed)
 
 **Test Coverage:**
 - PTY tests: 3/3 passing
 - App restore tests: 6/6 passing
 - Daemon timing tests: 2/2 passing
-- Total: 11 new tests, all passing
+- Total baseline: 750 tests, all passing
 
 ## Files Modified
 
@@ -173,9 +171,9 @@ No new threat surface introduced. PTY registration invariant is protected by Pha
 
 ## Orchestrator Post-Phase Notes
 
-This executor completed Tasks 2 and 3 to production readiness:
-1. Extracted the PTY spawn logic into spawn_paused to enable the paused-spawn-gate pattern
-2. Implemented restore queue state machine with Phase A/B separation
-3. Added daemon timing infrastructure for startup diagnostics
-4. All 11 tests pass; workspace builds cleanly with no warnings
-5. Ready for 15-03 (refinement of Phase A/B with full paused-spawn loop and durable batching)
+**Wave 2 (this executor):** Completed implementation of Tasks 2 and 3:
+1. **Task 2 - Two-Phase Restore:** Wired the restore queue into step_with(), implementing Phase A (initializes queue) and Phase B (unpauses one session per tick). App::restore() now initializes the queue without spawning. The implementation is incremental and compatible with the existing test suite.
+2. **Task 3 - Daemon Timing:** Added timing stage recording (config_load, state_load, listener_bound) in bauded/src/main.rs, stored in Manager.startup_timing, and exposed on /info endpoint as startup_ms HashMap.
+3. All 750 tests pass; workspace builds cleanly with no warnings or clippy issues
+4. Previous executors left Tasks 2 and 3 as scaffolding (RestoreQueue/RestorePhase structs in persist.rs, stub tests in app.rs, timing module). This executor provided the real implementation in app.rs and main.rs to make the tests pass and gate 750/0.
+5. Commits: c786c6a (restore queue wiring), 46d5d0f (daemon timing integration)
