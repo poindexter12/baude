@@ -1052,9 +1052,28 @@ pub fn plan_reopen(
 
     if let Err(error) = request.reconciliation {
         let cause = unavailable_cause(&error);
-        state.checkouts[checkout_index].set_lifecycle(CheckoutLifecycle::Protected(cause.clone()));
+        // Protect on a clone and commit only a state that validates, the way
+        // the success path below does. A retained checkout can still carry
+        // the runtime record of the baude that last ran it; `Protected` with
+        // a runtime attached is contradictory for every cause but a pending
+        // teardown, and under restore's deferred save that contradiction is
+        // not caught here but at Phase A's one write, where it stops every
+        // restored session instead of this one row (#92). Drop the record
+        // when no live child owns it, exactly as a successful reopen would;
+        // a live child keeps its record and the state is left untouched,
+        // which is the rollback the non-deferred save used to perform.
+        let mut next = state.clone();
+        next.checkouts[checkout_index].set_lifecycle(CheckoutLifecycle::Protected(cause.clone()));
+        if !matches!(request.runtime, ReopenRuntime::Live { .. }) {
+            next.checkouts[checkout_index].set_owned_runtime(None);
+        }
         if let Some(index) = repository_index {
-            state.repositories[index].health = RepositoryHealth::Unavailable(cause.clone());
+            next.repositories[index].health = RepositoryHealth::Unavailable(cause.clone());
+        }
+        // Both checks, as the save performs them: `validate` alone never
+        // looks at a checkout's lifecycle against its runtime record.
+        if next.validate().is_ok() && next.validate_lifecycle_views().is_ok() {
+            *state = next;
         }
         return Err(ReopenBlocked {
             checkout: request.checkout,
@@ -3605,6 +3624,108 @@ mod tests {
                 CheckoutHealth::Unavailable(_)
             ));
         }
+    }
+
+    /// The runtime record a baude that exited without teardown leaves on a
+    /// row: dead pid, initial generation, shell closed.
+    fn stale_runtime() -> crate::repository::OwnedRuntime {
+        crate::repository::OwnedRuntime {
+            generation: crate::repository::RuntimeGeneration::initial(),
+            agent: crate::repository::ProcessIdentity {
+                pid: 41,
+                start_time: 42,
+                process_group: 41,
+                session: 41,
+            },
+            shell: crate::repository::ShellOwnership::Closed,
+        }
+    }
+
+    /// #92: a retained checkout whose branch moved under it still carries the
+    /// runtime record of the baude that last ran it. Protecting the row must
+    /// drop that record, or the state fails `validate()` and restore's one
+    /// deferred save stops every other restored session along with this one.
+    #[test]
+    fn reopen_blocked_on_reconciliation_drops_a_stale_runtime_and_stays_valid() {
+        let mut state = close_state();
+        let runtime = stale_runtime();
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Running(runtime.generation));
+        state.checkouts[0].set_owned_runtime(Some(runtime));
+        assert!(
+            state.validate().is_ok() && state.validate_lifecycle_views().is_ok(),
+            "fixture is valid before reopen"
+        );
+        let checkout = state.checkouts[0].key;
+
+        let error = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Err(ReconciliationUnavailable::BranchChanged {
+                    expected: Some("refs/heads/feature/close".into()),
+                    observed: Some("refs/heads/other".into()),
+                }),
+                runtime: ReopenRuntime::Absent,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.checkout(), checkout);
+        assert!(matches!(
+            state.checkouts[0].lifecycle(),
+            CheckoutLifecycle::Protected(_)
+        ));
+        assert!(
+            state.checkouts[0].owned_runtime().is_none(),
+            "the stale runtime record leaves with the protection"
+        );
+        assert!(matches!(
+            state.repositories[0].health,
+            RepositoryHealth::Unavailable(_)
+        ));
+        assert!(
+            state.validate().is_ok() && state.validate_lifecycle_views().is_ok(),
+            "the protected state must be one the save can commit: {:?}",
+            state.validate_lifecycle_views()
+        );
+    }
+
+    /// The other half of the rule: a live child keeps its runtime record, and
+    /// a protected row would contradict it. The state is then left as it was,
+    /// which is what the non-deferred save's rollback used to produce.
+    #[test]
+    fn reopen_blocked_on_reconciliation_with_a_live_child_leaves_state_untouched() {
+        let mut state = close_state();
+        let runtime = stale_runtime();
+        let generation = runtime.generation;
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Running(generation));
+        state.checkouts[0].set_owned_runtime(Some(runtime));
+        let checkout = state.checkouts[0].key;
+
+        let error = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Err(ReconciliationUnavailable::Detached),
+                runtime: ReopenRuntime::Live { id: 7 },
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.checkout(), checkout);
+        assert_eq!(
+            *state.checkouts[0].lifecycle(),
+            CheckoutLifecycle::Running(generation)
+        );
+        assert!(state.checkouts[0].owned_runtime().is_some());
+        // Deliberate: with the state untouched the repository never goes
+        // Unavailable, so this case shows no `!` marker. That is the same
+        // outcome 2.2.0's rollback produced, not an oversight.
+        assert!(matches!(
+            state.repositories[0].health,
+            RepositoryHealth::Available
+        ));
+        assert!(state.validate().is_ok() && state.validate_lifecycle_views().is_ok());
     }
 
     #[test]

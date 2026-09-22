@@ -11407,6 +11407,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// #92: one retained checkout whose branch moved under it must degrade to
+    /// its own "restore primary" refusal, not fail Phase A's one deferred
+    /// save and stop every other restored session with it. The saved rows
+    /// still carry the killed children's runtime records, the shape a baude
+    /// that exited without teardown leaves behind.
+    #[test]
+    fn restore_survives_one_unreconcilable_checkout_with_a_stale_runtime() {
+        let (fixture, mut app, _order, root) = saved_sessions_fixture("restore-one-moved", 3);
+        let moved_branch = "refs/heads/feature/restore-one-moved-1";
+        let listing = std::process::Command::new("git")
+            .args([
+                "-C",
+                &fixture.path().to_string_lossy(),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
+            .output()
+            .expect("git worktree list");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let moved = listing
+            .split("\n\n")
+            .find(|block| block.contains(&format!("branch {moved_branch}")))
+            .and_then(|block| block.lines().find_map(|l| l.strip_prefix("worktree ")))
+            .map(PathBuf::from)
+            .expect("the fixture's first managed worktree");
+        let status = std::process::Command::new("git")
+            .args([
+                "-C",
+                &moved.to_string_lossy(),
+                "checkout",
+                "-q",
+                "-b",
+                "moved-elsewhere",
+            ])
+            .status()
+            .expect("git checkout -b");
+        assert!(
+            status.success(),
+            "move the branch under the retained checkout"
+        );
+
+        let mut terminal = loop_terminal();
+        let (mut started, mut finished) = (false, false);
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            1,
+            "Phase A's one save landed"
+        );
+        assert_eq!(
+            app.sessions.len(),
+            2,
+            "the moved checkout is refused; the other two restore"
+        );
+        assert_eq!(
+            gated_count(&app),
+            1,
+            "one released after the save, one still gated"
+        );
+        assert!(app.restore_in_progress() && !finished);
+        let protected = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|c| c.observed_branch.as_deref() == Some(moved_branch))
+            .expect("the moved checkout is still recorded");
+        assert!(matches!(
+            protected.lifecycle(),
+            CheckoutLifecycle::Protected(_)
+        ));
+        assert!(
+            protected.owned_runtime().is_none(),
+            "its stale runtime record left with the protection"
+        );
+        assert!(app.repository_state.validate().is_ok());
+
+        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("second step");
+        assert_eq!(gated_count(&app), 0);
+        assert!(finished && !app.restore_in_progress());
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn restore_unpauses_only_after_durable_save() {
         let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-release-order", 2);
