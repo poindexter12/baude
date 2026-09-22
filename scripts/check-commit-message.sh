@@ -51,7 +51,7 @@ check_message() {
         if (character == "(") {
           depth++
           if (depth > 1) {
-            printf "%s:%d:%d: nested parentheses are not parseable by release-please\\n", label, NR, column > "/dev/stderr"
+            printf "%s:%d:%d: nested parentheses are not parseable by release-please\n", label, NR, column > "/dev/stderr"
             failed = 1
             exit 1
           }
