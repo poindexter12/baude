@@ -11,6 +11,10 @@ model_sources:
 
 # Cross-AI Plan Review — Phase 15: Startup and Idle Performance
 
+<!-- gsd:plan-revision-conflicts:begin -->
+## Plan-Revision Conflicts
+<!-- gsd:plan-revision-conflicts:end -->
+
 ## 15-01
 
 **Verdict**: Close, with clarifications needed.
