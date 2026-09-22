@@ -559,37 +559,67 @@ fn run(
     app: &mut App,
     timing: &mut StartupTiming,
 ) -> Result<()> {
-    use std::time::Instant;
-
     let mut restore_started = false;
     let mut restore_finished = false;
-    let mut first_frame_recorded = false;
-    let first_frame_start = Instant::now();
-
+    let mut loop_timing = LoopTiming::start();
     loop {
         let stepped = step(terminal, app, &mut restore_started, &mut restore_finished)?;
-
-        // Record first frame timestamp
-        if !first_frame_recorded && stepped.drew {
-            let first_frame_duration = first_frame_start.elapsed().as_millis();
-            timing.stages.push(TimingStage {
-                name: "first_frame",
-                duration_ms: first_frame_duration,
-                note: None,
-            });
-            first_frame_recorded = true;
-
-            // Record session restore stage after first frame is drawn
-            if !restore_started {
-                let _restore_start = Instant::now();
-                // Restore happens in step(), so we record when it's about to happen
-                // The duration will be measured until app notifies us it's done
-                // For now, note the start; the end will be recorded in app.tick()
-            }
-        }
-
+        loop_timing.record(timing, &stepped, app);
         if app.should_quit {
             return Ok(());
+        }
+    }
+}
+
+/// Stage bookkeeping for the loop-owned timing stages (PERF-01). Lives outside
+/// `App` so `run()` and the tests share one recorder and `App` never owns a
+/// startup clock.
+pub(crate) struct LoopTiming {
+    origin: std::time::Instant,
+    first_frame_recorded: bool,
+    restore_recorded: bool,
+    first_poll_recorded: bool,
+}
+
+impl LoopTiming {
+    pub(crate) fn start() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            first_frame_recorded: false,
+            restore_recorded: false,
+            first_poll_recorded: false,
+        }
+    }
+
+    /// Push `first_frame` on the first drawn step, `session_restore` when the
+    /// restore step reports finished (with the restored session count), and
+    /// `first_metadata_poll` once the first metadata poll has run. Each stage
+    /// is recorded exactly once, in that order, measured from loop entry.
+    pub(crate) fn record(&mut self, timing: &mut StartupTiming, stepped: &Stepped, app: &App) {
+        let elapsed = self.origin.elapsed().as_millis();
+        if !self.first_frame_recorded && stepped.drew {
+            self.first_frame_recorded = true;
+            timing.stages.push(TimingStage {
+                name: "first_frame",
+                duration_ms: elapsed,
+                note: None,
+            });
+        }
+        if self.first_frame_recorded && !self.restore_recorded && stepped.restore_finished {
+            self.restore_recorded = true;
+            timing.stages.push(TimingStage {
+                name: "session_restore",
+                duration_ms: elapsed,
+                note: Some(format!("{} sessions", app.sessions.len())),
+            });
+        }
+        if self.restore_recorded && !self.first_poll_recorded && app.has_polled_meta() {
+            self.first_poll_recorded = true;
+            timing.stages.push(TimingStage {
+                name: "first_metadata_poll",
+                duration_ms: elapsed,
+                note: None,
+            });
         }
     }
 }
@@ -602,6 +632,21 @@ fn step(
     restore_started: &mut bool,
     restore_finished: &mut bool,
 ) -> Result<Stepped> {
+    step_with(terminal, app, restore_started, restore_finished, true)
+}
+
+/// Backend-generic loop body. `drain_events` is false only in tests, which
+/// have no terminal to poll; production always drains crossterm events.
+pub(crate) fn step_with<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+    restore_started: &mut bool,
+    restore_finished: &mut bool,
+    drain_events: bool,
+) -> Result<Stepped>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     app.tick();
 
     let area = terminal.get_frame().area();
@@ -627,13 +672,16 @@ fn step(
             if !*restore_started {
                 app.restore();
                 *restore_started = true;
+                // Whole restore runs in this one step for now; 15-02 makes it
+                // incremental and moves this flag to the end of its queue.
+                *restore_finished = true;
             }
         }
     }
 
     // Drain pending events, then sleep briefly (the draw loop doubles as
     // the refresh tick for streaming PTY output and status timers).
-    if event::poll(Duration::from_millis(50))? {
+    if drain_events && event::poll(Duration::from_millis(50))? {
         loop {
             app.handle_event(event::read()?);
             if !event::poll(Duration::from_millis(0))? {
@@ -2277,23 +2325,48 @@ mod keyboard_negotiation_tests {
 
     #[test]
     fn idle_zero_draws_after_first_frame() {
-        // Test: verify first_frame_drawn gate is in place
+        // Drive the real loop body: the first step draws the empty frame and
+        // releases restore; after one settle step an idle app never draws.
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-idle");
+        let tmp = std::env::temp_dir().join(format!("baude-test-idle-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let _redirect = TestRedirect::new(&tmp);
-
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("loop-test".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
         let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let (mut started, mut finished) = (false, false);
+        let first = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first step");
+        assert!(first.drew, "the first step must draw the empty frame");
+        assert!(app.first_frame_drawn, "first draw sets first_frame_drawn");
         assert!(
-            !app.first_frame_drawn,
-            "first_frame_drawn should start as false"
+            started && finished,
+            "restore runs right after the first draw"
         );
-        // In run loop, after first draw, it's set to true
-        app.first_frame_drawn = true;
-        assert!(
-            app.first_frame_drawn,
-            "first_frame_drawn should be settable"
+        assert!(!app.dirty, "the draw clears dirty");
+        // One settle step absorbs any note restore itself queued.
+        let _ = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("settle step");
+        let mut draws = 0;
+        for _ in 0..20 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("idle step");
+            if s.drew {
+                draws += 1;
+            }
+        }
+        assert_eq!(
+            draws, 0,
+            "an idle app must issue no draws after the first frame"
         );
+        assert!(!app.dirty, "nothing may leave dirty set while idle");
     }
 
     #[test]
@@ -2402,43 +2475,49 @@ mod keyboard_negotiation_tests {
 
     #[test]
     fn timing_first_frame_before_restore() {
-        // Test: timing stages are recorded in order, with first_frame before session_restore.
+        // The loop recorder sees first_frame, then session_restore (with the
+        // restored count), then first_metadata_poll — in that order.
+        use baude_core::testing::TestRedirect;
+        let tmp =
+            std::env::temp_dir().join(format!("baude-test-timing-order-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("loop-test".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
         let mut timing = StartupTiming {
             stages: Vec::new(),
-            total_ms: 100,
+            total_ms: 0,
         };
-
-        timing.stages.push(TimingStage {
-            name: "app_new",
-            duration_ms: 10,
-            note: None,
-        });
-        timing.stages.push(TimingStage {
-            name: "first_frame",
-            duration_ms: 15,
-            note: None,
-        });
-        timing.stages.push(TimingStage {
-            name: "session_restore",
-            duration_ms: 50,
-            note: Some("3 sessions".to_string()),
-        });
-
-        // Verify stages are in order
-        assert_eq!(timing.stages.len(), 3);
-        let first_frame_idx = timing.stages.iter().position(|s| s.name == "first_frame");
-        let restore_idx = timing
+        let mut loop_timing = LoopTiming::start();
+        let (mut started, mut finished) = (false, false);
+        for _ in 0..3 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            loop_timing.record(&mut timing, &s, &app);
+        }
+        let names: Vec<&str> = timing.stages.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["first_frame", "session_restore", "first_metadata_poll"],
+            "stages must be recorded once each, first frame before restore"
+        );
+        let restore = timing
             .stages
             .iter()
-            .position(|s| s.name == "session_restore");
-
-        assert!(
-            first_frame_idx.is_some() && restore_idx.is_some(),
-            "both first_frame and session_restore stages should exist"
-        );
-        assert!(
-            first_frame_idx < restore_idx,
-            "first_frame should come before session_restore"
+            .find(|s| s.name == "session_restore")
+            .expect("restore stage");
+        assert_eq!(
+            restore.note.as_deref(),
+            Some(format!("{} sessions", app.sessions.len()).as_str()),
+            "restore note carries the restored session count"
         );
     }
 }

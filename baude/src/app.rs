@@ -474,6 +474,9 @@ pub struct App {
     content_rect: Rect,
     next_id: u64,
     last_meta_poll: u64,
+    /// Set by the first per-session metadata poll; the timing stage keys on
+    /// this rather than the clock so a frozen test clock cannot hide it.
+    polled_meta_once: bool,
     usage: UsagePoller,
     /// Remote daemon client (config `daemon_url` / BAUDE_DAEMON_URL).
     pub remote: Option<RemotePoller>,
@@ -773,6 +776,7 @@ impl App {
             content_rect: Rect::new(0, 0, 80, 24),
             next_id: 1,
             last_meta_poll: 0,
+            polled_meta_once: false,
             usage: UsagePoller::start(),
             remote,
             remote_snap: RemoteSnapshot::default(),
@@ -3721,6 +3725,11 @@ impl App {
         }
     }
 
+    /// True once the first per-session metadata poll has run (PERF-01 stage).
+    pub fn has_polled_meta(&self) -> bool {
+        self.polled_meta_once
+    }
+
     pub fn tick(&mut self) {
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
@@ -3729,8 +3738,11 @@ impl App {
             }
         }
         self.poll_pending_clones();
-        if now_ms().saturating_sub(self.last_meta_poll) >= META_POLL_MS {
+        // The first tick always polls so the first frame is followed by fresh
+        // metadata immediately; afterwards polls are spaced by META_POLL_MS.
+        if !self.polled_meta_once || now_ms().saturating_sub(self.last_meta_poll) >= META_POLL_MS {
             self.last_meta_poll = now_ms();
+            self.polled_meta_once = true;
             let mut changed = false;
             for s in &mut self.sessions {
                 s.poll_meta();
@@ -10990,27 +11002,31 @@ mod tests {
 
     #[test]
     fn restore_does_not_start_before_first_frame() {
-        // Test: first_frame_drawn gate exists and gates restore logic.
-        use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-restore");
-        let _ = std::fs::create_dir_all(&tmp);
-        let _redirect = TestRedirect::new(&tmp);
-
-        let mut app = App::new(tmp.clone());
-        // first_frame_drawn starts false
+        // With nothing to draw, a step must not restore; the first draw
+        // releases restore in the same step, after the frame is out.
+        let _scope = isolation_scope("restore-gate");
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let (mut started, mut finished) = (false, false);
+        // The first size sync legitimately dirties the app; settle it so the
+        // quiet step proves the restore gate rather than the resize path.
+        app.sync_sizes(terminal.get_frame().area());
+        app.dirty = false;
+        let quiet = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("quiet step");
+        assert!(!quiet.drew, "nothing dirty, nothing drawn");
         assert!(
-            !app.first_frame_drawn,
-            "first_frame_drawn should start false"
+            !started && !finished && !app.first_frame_drawn,
+            "restore must not start before the first frame"
         );
-        // Code that would use this gate: if first_frame_drawn { restore_progress... }
-        if app.first_frame_drawn {
-            // Restore would only run here
-        }
-        // Set it and verify it's true
-        app.first_frame_drawn = true;
+        app.dirty = true;
+        let first = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+            .expect("first draw");
+        assert!(first.drew && app.first_frame_drawn, "first frame drawn");
         assert!(
-            app.first_frame_drawn,
-            "first_frame_drawn should be settable to true"
+            started && first.restore_finished,
+            "restore runs only once the first frame is drawn"
         );
     }
 }
