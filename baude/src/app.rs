@@ -492,6 +492,15 @@ pub struct App {
     /// Sidebar `f` toggle: reveal rows outside the launch folder's context.
     /// Runtime-only — every launch starts scoped.
     pub show_all_context: bool,
+    /// Dirty flag: set by input events, resize, status changes, PTY output, message changes.
+    /// Cleared after each terminal.draw(). Gates terminal redraws to reduce CPU/battery use.
+    pub dirty: bool,
+    /// Gates session restore start to first draw completion. Set to true after first draw.
+    pub first_frame_drawn: bool,
+    /// Per-session screen generation tracking for change detection without channels.
+    pub last_known_screen_gen: std::collections::HashMap<u64, u64>,
+    /// Timestamp (ms) of last waiting-row timer update. Used for 1 Hz refresh when waiting rows visible.
+    last_waiting_update: u64,
     /// Breadcrumbs for the launch folder (None: feature disabled, or not
     /// restored yet). Records which sessions runs from this folder used and
     /// scopes the sidebar to them.
@@ -771,6 +780,10 @@ impl App {
             selection: None,
             show_archived: false,
             show_all_context: false,
+            dirty: true,
+            first_frame_drawn: false,
+            last_known_screen_gen: HashMap::new(),
+            last_waiting_update: 0,
             folder_context: None,
             folder_context_enabled,
             #[cfg(test)]
@@ -10877,5 +10890,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generation_counter_detects_pty_output() {
+        // Test: after PTY output, screen_generation() increases, and App.tick() marks dirty.
+        // TODO: implement session with mock PTY, trigger output, verify dirty flag set
+        panic!("TODO: implement generation_counter_detects_pty_output");
+    }
+
+    #[test]
+    fn generation_counter_marks_dirty_once() {
+        // Test: multiple ticks after generation change only set dirty once (on first mismatch).
+        // TODO: verify dirty cleared after draw, re-polled on next change
+        panic!("TODO: implement generation_counter_marks_dirty_once");
+    }
+
+    #[test]
+    fn idle_no_dirty_after_first_frame() {
+        // Test: first tick draws (dirty=true), subsequent 50 idle ticks all have dirty=false.
+        // TODO: verify no input, no session changes, dirty stays false
+        panic!("TODO: implement idle_no_dirty_after_first_frame");
+    }
+
+    #[test]
+    fn restore_does_not_start_before_first_frame() {
+        // Test: first_frame_drawn gate blocks restore start in first tick, allows in second.
+        // TODO: verify restore_progress not updated until app.first_frame_drawn is true
+        panic!("TODO: implement restore_does_not_start_before_first_frame");
     }
 }

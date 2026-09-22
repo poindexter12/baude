@@ -25,6 +25,7 @@ pub struct Pty {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     identity: ProcessIdentity,
     pub last_output_ms: Arc<AtomicU64>,
+    pub screen_generation: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     size: (u16, u16), // (rows, cols)
     /// Live raw-output subscribers (remote attach). Pruned on send failure.
@@ -337,9 +338,11 @@ impl Pty {
         let exited = Arc::new(AtomicBool::new(false));
         let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
 
+        let screen_generation = Arc::new(AtomicU64::new(0));
         {
             let parser = Arc::clone(&parser);
             let last_output_ms = Arc::clone(&last_output_ms);
+            let screen_gen = Arc::clone(&screen_generation);
             let exited = Arc::clone(&exited);
             let subscribers = Arc::clone(&subscribers);
             std::thread::spawn(move || {
@@ -362,6 +365,7 @@ impl Pty {
                                 }
                             }
                             last_output_ms.store(now_ms(), Ordering::Relaxed);
+                            screen_gen.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -375,6 +379,7 @@ impl Pty {
             child: Arc::new(Mutex::new(child)),
             identity,
             last_output_ms,
+            screen_generation,
             exited,
             size: (rows, cols),
             subscribers,

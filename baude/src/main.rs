@@ -446,7 +446,16 @@ fn run(
         let area = terminal.get_frame().area();
         app.sync_sizes(area);
 
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        // Only draw when dirty flag is set; clear after drawing.
+        // This reduces CPU/battery use by gating terminal writes.
+        if app.dirty {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            app.dirty = false;
+            // Gate restore start to first frame completion.
+            if !app.first_frame_drawn {
+                app.first_frame_drawn = true;
+            }
+        }
 
         // Drain pending events, then sleep briefly (the draw loop doubles as
         // the refresh tick for streaming PTY output and status timers).
@@ -2034,5 +2043,68 @@ mod keyboard_negotiation_tests {
             Some(true),
             "JSON owner should have correct canonical_common_dir"
         );
+    }
+
+    #[test]
+    fn dirty_flag_set_on_input() {
+        // Test: after input event, app.dirty == true.
+        // TODO: create app, call handle_event with input, assert dirty flag
+        panic!("TODO: implement dirty_flag_set_on_input");
+    }
+
+    #[test]
+    fn dirty_flag_set_on_resize() {
+        // Test: after sync_sizes with new area, app.dirty == true.
+        // TODO: create app, call sync_sizes with different area, assert dirty flag
+        panic!("TODO: implement dirty_flag_set_on_resize");
+    }
+
+    #[test]
+    fn dirty_flag_cleared_after_draw() {
+        // Test: after terminal.draw(), app.dirty == false.
+        // TODO: set app.dirty=true, simulate draw, assert dirty==false
+        panic!("TODO: implement dirty_flag_cleared_after_draw");
+    }
+
+    #[test]
+    fn idle_zero_draws_after_first_frame() {
+        // Test: idle app issues zero terminal draws after first frame.
+        // TODO: create app with TestBackend, run 100 ticks with no input, assert draw_count==1
+        panic!("TODO: implement idle_zero_draws_after_first_frame");
+    }
+
+    #[test]
+    fn timing_stages_recorded() {
+        // Test: env BAUDE_TIMING=1, startup records stage names in output.
+        // TODO: set env var, init app, check timing output contains stage names
+        panic!("TODO: implement timing_stages_recorded");
+    }
+
+    #[test]
+    fn timing_output_format() {
+        // Test: timing output format is "baude startup: stage1=NN stage2=MM ...".
+        // TODO: verify output format and per-stage detail lines
+        panic!("TODO: implement timing_output_format");
+    }
+
+    #[test]
+    fn timing_disabled_when_env_unset() {
+        // Test: env BAUDE_TIMING unset, timing not printed to stderr.
+        // TODO: unset env var, init app, verify no timing output
+        panic!("TODO: implement timing_disabled_when_env_unset");
+    }
+
+    #[test]
+    fn timing_keyboard_probe_stage_includes_timeout_note() {
+        // Test: keyboard probe timeout noted in timing output.
+        // TODO: trigger probe timeout, check timing output includes note
+        panic!("TODO: implement timing_keyboard_probe_stage_includes_timeout_note");
+    }
+
+    #[test]
+    fn timing_first_frame_before_restore() {
+        // Test: first_frame timestamp precedes session_restore in output.
+        // TODO: verify timing output order
+        panic!("TODO: implement timing_first_frame_before_restore");
     }
 }

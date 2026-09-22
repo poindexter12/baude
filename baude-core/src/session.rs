@@ -145,6 +145,12 @@ impl Session {
             false
         }
     }
+
+    /// Returns the current screen generation counter for this session's PTY.
+    /// Incremented by the reader thread on each output, used for lock-free change detection.
+    pub fn screen_generation(&self) -> u64 {
+        self.claude.screen_generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Pure precedence decision shared by [`Session::status`] /
