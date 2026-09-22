@@ -245,7 +245,7 @@ animated. Each row displays its code in a fixed color:
 The codes are static: nothing in the sidebar animates, so an idle baude
 issues zero terminal writes. A one-line legend
 (`? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable`)
-sits above the usage footer when the terminal is at least 20 rows tall, and
+sits above the usage footer when the terminal is at least 21 rows tall, and
 `?` (help) lists the codes.
 
 Waiting is detected from PTY output silence: the CLI streams output
@@ -474,15 +474,17 @@ the profile's shell.
   (with sound, once per turn), a finished turn, or an exit (both silent).
   Covers local and remote sidebar sessions; archived sessions are muted.
   Default `true` (no-op off macOS); `BAUDE_NOTIFY=0` env overrides.
-- `idle_child_policy` — when a session auto-archives, the idle Claude child
-  can be `keep` (default, today's behavior), `suspend` (SIGSTOP the process
-  group; resumes on unarchive or selection), or `stop` (kill the child; row
-  becomes exited and is resumable with `r`). Unix only; other platforms
-  treat `suspend` like `keep`. `BAUDE_IDLE_CHILD_POLICY` env overrides.
-- `usage_poll_secs` — interval for the usage-poller thread to refresh the
-  footer's usage display; default matches today's polling interval. Set to
-  `0` to disable the poller entirely (footer shows `usage: off`).
-  `BAUDE_USAGE_POLL_SECS` env overrides.
+- `idle_child_policy` — what happens to a session's Claude child (and its
+  shell pane) when the row is archived, by the idle timer or by `a`: `keep`
+  (default, today's behavior), `suspend` (SIGSTOP the child's process group;
+  the row reads `suspended`, and unarchiving, attaching with enter, or typing
+  into it sends SIGCONT), or `stop` (kill the child; the row becomes
+  `✗ exited` and `r` restarts it). Unix signals; the daemon applies the same
+  policy. `BAUDE_IDLE_CHILD_POLICY` env overrides.
+- `usage_poll_secs` — how often the background usage poller refreshes the
+  footer's today/week costs, default `60`. `0` never starts the poller
+  thread (the footer shows `usage: off`). `BAUDE_USAGE_POLL_SECS` env
+  overrides.
 
 ## Performance
 
@@ -505,42 +507,50 @@ Timing stages will be printed to stderr when baude exits:
 - `terminal_setup` — Terminal::new and mode setup
 - `app_new` — App struct initialized
 - `first_frame` — First frame drawn (before session restore)
-- `session_restore` — All saved sessions admitted (N sessions per second)
+- `session_restore` — saved sessions admitted and released (the note
+  carries the session count)
 - `first_metadata_poll` — First metadata poll cycle completed
 - `total` — Wall-clock duration from startup to exit
 
-bauded (the daemon) exposes the same stages as a `startup_ms` map on the
-`/info` API endpoint.
+bauded (the daemon) records its own stages (`config_load`, `state_load`,
+`listener_bound`) and exposes them as `startup_ms` on the `/info` API
+endpoint.
 
 ### Idle Behavior
 
-With no input or status changes, baude issues zero terminal writes. Status
-codes are static single-character glyphs that never animate. The waiting-row
-timer updates at 1 Hz only when waiting rows are visible. Archived and
-exited rows are skipped during metadata polling, and unchanged files are
-gated on mtime comparison.
+With no input or status changes, baude issues zero terminal writes: the
+loop redraws only when input, PTY output, a status change, or a resize
+marks the frame dirty. Status codes are static single-character glyphs that
+never animate; the waiting-row timer redraws once a second only while a
+waiting row is visible. Archived and exited rows are never polled for
+metadata, unchanged session and event files are skipped on mtime, and the
+first frame paints before saved sessions are restored (restore then releases
+one session per loop iteration).
 
 A one-line legend appears above the usage footer when the terminal is at
-least 20 rows tall.
+least 21 rows tall (the usage footer itself needs 20).
 
 ### idle_child_policy
 
-When a session auto-archives after `auto_archive_minutes`, the idle Claude
-child process can be controlled:
+When a row is archived, by the idle timer after `auto_archive_minutes` or
+by hand with `a`, the policy decides what happens to its Claude child and
+shell pane:
 
-- `keep` — Leave the child running (default, today's behavior)
-- `suspend` — Send SIGSTOP to the child's process group; resumes on
-  unarchive or selection (Unix only)
-- `stop` — Terminate the child; becomes exited and is resumable with the
-  restart key
+- `keep` — leave the child running (default, today's behavior)
+- `suspend` — verify the child's process identity, then SIGSTOP its process
+  group; the row reads `suspended`. Unarchiving, attaching with enter, or
+  typing into the session sends SIGCONT.
+- `stop` — kill the child; the row becomes `✗ exited` and `r` restarts it
 
-Override with `BAUDE_IDLE_CHILD_POLICY=suspend` or
+The daemon applies the same policy on its archive endpoint and on
+auto-archive. Override with `BAUDE_IDLE_CHILD_POLICY=suspend` or
 `BAUDE_IDLE_CHILD_POLICY=stop`.
 
 ### usage_poll_secs
 
 The usage poller runs in a background thread and refreshes the footer's
-usage display every N seconds. Set to `0` to disable:
+today/week costs every N seconds (default 60; after a failure it backs off
+to the larger of 300 seconds and the interval). Set to `0` to disable:
 
 ```json
 {

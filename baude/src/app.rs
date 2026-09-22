@@ -2881,6 +2881,25 @@ impl App {
         }
     }
 
+    /// PERF-07: attaching to or typing into a row whose child was SIGSTOPped
+    /// under `idle_child_policy = "suspend"` resumes it (the locked decision:
+    /// SIGCONT on unarchive or selection). The archived flag is untouched; a
+    /// manual archive still sticks until `a`, an automatic one lifts on its
+    /// own once the child is busy again.
+    fn wake_selected_if_suspended(&mut self) {
+        let Some(s) = self.selected_mut() else { return };
+        if !s.child_suspended {
+            return;
+        }
+        let note = s
+            .resume_idle_child()
+            .err()
+            .map(|error| format!("{}: could not resume: {error}", s.name));
+        if let Some(note) = note {
+            self.set_message(note);
+        }
+    }
+
     fn unique_name(&self, base: &str) -> String {
         if !self.sessions.iter().any(|s| s.name == base) {
             return base.to_string();
@@ -4183,6 +4202,8 @@ impl App {
                 return;
             }
         }
+        // Input into a suspended child must reach a running process.
+        self.wake_selected_if_suspended();
         let Some(s) = self.selected_mut() else { return };
         let pty = if to_shell {
             match s.shell.as_mut() {
@@ -4255,6 +4276,8 @@ impl App {
                 return;
             }
         }
+        // Input into a suspended child must reach a running process.
+        self.wake_selected_if_suspended();
         let Some(s) = self.selected_mut() else { return };
         let pty = if to_shell {
             match s.shell.as_mut() {
@@ -4366,7 +4389,10 @@ impl App {
         if let Some(SelId::Standalone(key)) = self.selected_id {
             let target = self.selected_target_label();
             match self.reopen_standalone(key) {
-                Ok(_) => self.record_context_use(SelId::Standalone(key)),
+                Ok(_) => {
+                    self.record_context_use(SelId::Standalone(key));
+                    self.wake_selected_if_suspended();
+                }
                 Err(error) => self.set_message(format!(
                     "Cannot reopen “{target}”: {error}; no runtime was started."
                 )),
@@ -4388,6 +4414,7 @@ impl App {
                 self.selected_id = Some(SelId::Checkout(checkout));
                 self.focus = Focus::Claude;
                 self.record_context_use(SelId::Checkout(checkout));
+                self.wake_selected_if_suspended();
                 return;
             }
         }
@@ -11491,7 +11518,7 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while state(pid).is_empty() || state(pid).starts_with('T') {
             assert!(std::time::Instant::now() < deadline, "child never ran");
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -11505,7 +11532,7 @@ mod tests {
             "long-waiting session parks"
         );
         assert!(s.child_suspended, "auto-archive applies policy=suspend");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !state(pid).starts_with('T') {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -11580,13 +11607,19 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
         fn wait(pid: u32, pred: &dyn Fn(&str) -> bool) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            // Generous under a fully parallel workspace suite; the panic
+            // carries the whole ps row so a recycled pid is distinguishable
+            // from a signal that never landed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while !pred(&state(pid)) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "pid {pid} state {}",
-                    state(pid)
-                );
+                if std::time::Instant::now() >= deadline {
+                    let row = std::process::Command::new("ps")
+                        .args(["-o", "pid=,stat=,lstart=,command=", "-p", &pid.to_string()])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+                    panic!("pid {pid} never reached the wanted state; ps row: {row}");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
@@ -11622,5 +11655,116 @@ mod tests {
         wait(pid, &|s| !s.starts_with('T'));
         app.kill_all();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typing_into_suspended_session_resumes_it() {
+        // Locked decision: SIGCONT on unarchive OR selection. Forwarding a key
+        // to a suspended child (attach + type) must wake it first.
+        let fixture = admission_repo("typing-resumes");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.idle_child_policy = Some("suspend".into());
+        app.persistence_root_for_test = Some(state_root);
+        let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+        let key = app.repository_state.checkouts[0].key;
+        app.selected_id = Some(SelId::Checkout(key));
+        let pid = app.session(runtime).unwrap().claude.process_identity().pid;
+        fn state(pid: u32) -> String {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn wait(pid: u32, pred: &dyn Fn(&str) -> bool) {
+            // Generous under a fully parallel workspace suite; the panic
+            // carries the whole ps row so a recycled pid is distinguishable
+            // from a signal that never landed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !pred(&state(pid)) {
+                if std::time::Instant::now() >= deadline {
+                    let row = std::process::Command::new("ps")
+                        .args(["-o", "pid=,stat=,lstart=,command=", "-p", &pid.to_string()])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+                    panic!("pid {pid} never reached the wanted state; ps row: {row}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        wait(pid, &|s| !s.is_empty() && !s.starts_with('T'));
+        app.toggle_archive();
+        assert!(app.session(runtime).unwrap().child_suspended);
+        wait(pid, &|s| s.starts_with('T'));
+        // Still archived (manual archive sticks) but selected: a keystroke wakes it.
+        app.forward_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), false);
+        assert!(
+            !app.session(runtime).unwrap().child_suspended,
+            "forward_key resumes a suspended child"
+        );
+        wait(pid, &|s| !s.is_empty() && !s.starts_with('T'));
+        // Attaching (enter on the row) also wakes it.
+        app.session_mut(runtime)
+            .unwrap()
+            .suspend_idle_child()
+            .unwrap();
+        wait(pid, &|s| s.starts_with('T'));
+        app.open_local_target();
+        assert!(
+            !app.session(runtime).unwrap().child_suspended,
+            "open resumes"
+        );
+        wait(pid, &|s| !s.is_empty() && !s.starts_with('T'));
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn status_bar_counts_use_codes() {
+        // UX-02: the bottom-bar counters use the static codes, never the old
+        // animated glyphs. One live session is exactly one of the three.
+        let fixture = admission_repo("status-bar-codes");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.admit_repository(&repo).unwrap().expect("runtime");
+        app.message = None;
+        app.focus = super::Focus::Sidebar;
+        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("? 1 waiting")
+                || rendered.contains("B 1 busy")
+                || rendered.contains("✓ 1 done"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("● 1") && !rendered.contains("◐ 1"),
+            "{rendered}"
+        );
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

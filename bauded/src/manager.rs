@@ -4046,17 +4046,26 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// Poll `ps` until the child reaches the wanted state. The whole workspace
+    /// suite runs these PTY tests in parallel, so the budget is generous; on
+    /// timeout the panic carries the full `ps` row (state, start time, command)
+    /// because a wrong-looking state usually means a recycled pid, not a missed
+    /// signal.
     fn wait_for_state(pid: u32, pred: impl Fn(&str) -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let state = proc_state(pid);
             if pred(&state) {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for pid {pid} to be {what}; last state {state:?}"
-            );
+            if Instant::now() >= deadline {
+                let row = std::process::Command::new("ps")
+                    .args(["-o", "pid=,stat=,lstart=,command=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+                panic!("timed out waiting for pid {pid} to be {what}; last state {state:?}; ps row: {row}");
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
     }

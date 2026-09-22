@@ -192,7 +192,7 @@ const LEGEND: [(UiRowStatus, &str); 7] = [
 ];
 
 /// Full legend text (also quoted in README and asserted by tests).
-#[allow(dead_code)]
+#[cfg(test)]
 const LEGEND_TEXT: &str =
     "? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable";
 
@@ -204,10 +204,10 @@ fn legend_line(width: usize) -> Line<'static> {
         let code_span = Span::styled(code, style);
         let label_span = Span::styled(format!(" {}", label), Style::default().fg(Color::DarkGray));
 
-        // Estimate width: code (1) + space (1) + label length
-        let entry_width = 1 + 1 + label.len() + if i < LEGEND.len() - 1 { 2 } else { 0 };
+        // Cell width: code (1) + space (1) + label, plus the gap to the next entry.
+        let entry_width = 1 + 1 + cell_width(label) + if i < LEGEND.len() - 1 { 2 } else { 0 };
 
-        if spans.iter().map(|s| s.content.len()).sum::<usize>() + entry_width > width {
+        if spans.iter().map(|s| cell_width(&s.content)).sum::<usize>() + entry_width > width {
             break;
         }
 
@@ -906,8 +906,8 @@ fn session_row(
     let ui_status = session_status_to_ui(status, archived);
     let (icon, icon_style) = status_code(ui_status);
 
-    // The name never flashes: the pulsing icon and timer already carry the
-    // needs-input signal, and a whole flashing word drowns out the selection
+    // The name stays plain: the yellow `?` and the timer already carry the
+    // needs-input signal, and a colored name would drown out the selection
     // cue once a few sessions are waiting. A selected dead session caps at
     // Gray — findable, but never as alive-looking as a running one.
     let name_style = if archived || matches!(status, Status::Exited) {
@@ -3570,49 +3570,23 @@ mod tests {
 
     #[test]
     fn rendered_rows_use_static_codes() {
-        let _fixture = UiFixture::new("static-codes");
-        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        // UX-02: closed checkouts render `-`, archived rows `A`, and two idle
+        // renders half a second apart are byte-identical (nothing animates).
+        let (_fixture, mut app, _repository) = hierarchy_fixture();
         app.remote = None;
-
-        // Render and verify no animation glyphs remain
+        app.focus = Focus::Sidebar;
         let (rendered, _) = render(&app, 100, 30);
-        // Old animation glyphs should not appear
-        assert!(
-            !rendered.contains("◐")
-                && !rendered.contains("◓")
-                && !rendered.contains("◑")
-                && !rendered.contains("◒"),
-            "spinner glyphs should not appear"
-        );
-
-        // Render twice with 500ms apart and verify buffers are identical (no animation)
-        let (rendered1, _) = render(&app, 100, 30);
+        assert!(rendered.contains("- repository:develop"), "{rendered}");
+        assert!(rendered.contains("! repository:missing"), "{rendered}");
+        for glyph in ["◐", "◓", "◑", "◒", "●", "○"] {
+            assert!(!rendered.contains(glyph), "{glyph} remains: {rendered}");
+        }
+        app.show_archived = true;
+        let (first, _) = render(&app, 100, 30);
+        assert!(first.contains("A repository:archived"), "{first}");
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let (rendered2, _) = render(&app, 100, 30);
-        assert_eq!(
-            rendered1, rendered2,
-            "idle renders should be identical (no animation)"
-        );
-    }
-
-    #[test]
-    fn status_bar_counts_use_codes() {
-        let _fixture = UiFixture::new("status-codes");
-        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
-
-        // Render and check that status bar uses the new codes
-        let (rendered, _) = render(&app, 100, 30);
-
-        // The status bar should contain "? waiting" and "B busy" if those rows exist,
-        // but at minimum we verify the format strings are used
-        assert!(
-            !rendered.contains("● ") || rendered.contains("? "),
-            "status bar should use ? not ●"
-        );
-        assert!(
-            !rendered.contains("◐ ") || rendered.contains("B "),
-            "status bar should use B not ◐"
-        );
+        let (second, _) = render(&app, 100, 30);
+        assert_eq!(first, second, "idle renders must not change over time");
     }
 
     #[test]
@@ -3639,56 +3613,55 @@ mod tests {
     #[test]
     fn legend_line_stops_before_overflow() {
         use super::legend_line;
-
-        let narrow = legend_line(30);
-        let narrow_content = narrow.to_string();
-        // At 30 chars, we expect fewer codes than at 80
-        assert!(
-            narrow_content.contains("?"),
-            "legend should always start with ?"
-        );
-        // Should not contain all codes
-        let wide = legend_line(80);
-        let wide_content = wide.to_string();
-        assert!(
-            wide_content.len() >= narrow_content.len(),
-            "wider legend should have at least as many codes"
-        );
+        // Entries are dropped whole from the right; nothing is clipped mid-word.
+        let narrow = legend_line(30).to_string();
+        assert!(narrow.contains("? waiting"), "{narrow}");
+        assert!(narrow.contains("B busy"), "{narrow}");
+        assert!(!narrow.contains("!"), "{narrow}");
+        assert!(!narrow.contains("unavailable"), "{narrow}");
+        assert!(super::cell_width(&narrow) <= 30, "{narrow}");
+        let wide = legend_line(80).to_string();
+        assert!(wide.contains("! unavailable"), "{wide}");
+        assert_eq!(wide.trim(), super::LEGEND_TEXT);
     }
 
     #[test]
     fn legend_text_matches_constant() {
-        use super::LEGEND_TEXT;
-
-        assert_eq!(
-            LEGEND_TEXT,
-            "? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable"
-        );
+        // The README quotes LEGEND_TEXT; derive it from LEGEND so they cannot drift.
+        use super::{status_code, LEGEND, LEGEND_TEXT};
+        let derived = LEGEND
+            .iter()
+            .map(|(status, label)| format!("{} {label}", status_code(*status).0))
+            .collect::<Vec<_>>()
+            .join("  ");
+        assert_eq!(derived, LEGEND_TEXT);
     }
 
     #[test]
     fn legend_rendered_when_height_allows() {
-        let _fixture = UiFixture::new("legend-height");
-        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
-
-        // Render at (160, 30): should have room for legend
+        let (_fixture, app, _repository) = hierarchy_fixture();
+        // 30 rows: legend row above the usage footer, all entries fit at 160 cols.
         let (rendered, _) = render(&app, 160, 30);
-        assert!(
-            rendered.contains("? waiting") || rendered.contains("waiting"),
-            "at 30 rows, legend should be visible"
-        );
+        assert!(rendered.contains("? waiting  B busy  ✓ done"), "{rendered}");
+        assert!(rendered.contains(" today "), "{rendered}");
+        // The sidebar block sits above the one-row status bar, so a 21-row
+        // terminal is the smallest that carries the legend.
+        let (rendered, _) = render(&app, 160, 21);
+        assert!(rendered.contains("? waiting"), "{rendered}");
+        assert!(rendered.contains(" today "), "{rendered}");
     }
 
     #[test]
     fn legend_omitted_below_threshold() {
-        let _fixture = UiFixture::new("legend-small");
-        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
-
-        // Render at (100, 19): should NOT have room for legend, but footer might be there
-        let (rendered, _) = render(&app, 100, 19);
-        // At 19 rows we're below the threshold for legend, but footer (with usage) might be present
-        // The test should just verify that the layout is still valid
-        assert!(!rendered.is_empty(), "render should succeed at 19 rows");
+        let (_fixture, app, _repository) = hierarchy_fixture();
+        // 20 rows keeps today's layout exactly: usage footer, no legend row.
+        let (rendered, _) = render(&app, 160, 20);
+        assert!(rendered.contains(" today "), "{rendered}");
+        assert!(!rendered.contains("? waiting"), "{rendered}");
+        // 19 rows: neither footer nor legend.
+        let (rendered, _) = render(&app, 160, 19);
+        assert!(!rendered.contains(" today "), "{rendered}");
+        assert!(!rendered.contains("? waiting"), "{rendered}");
     }
 
     #[test]
