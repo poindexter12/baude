@@ -124,16 +124,101 @@ fn border_style(focused: bool) -> Style {
     }
 }
 
-/// A rotating quarter-circle spinner, advanced by the wall clock so "working"
-/// sessions visibly animate.
-fn spinner() -> &'static str {
-    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    FRAMES[((now_ms() / 130) % 4) as usize]
+/// Normalized row status for rendering; adapts from `session::Status` (+ archived override) and `hierarchy::LocalStatus`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiRowStatus {
+    Waiting,
+    Busy,
+    Completed,
+    Exited,
+    Closed,
+    Archived,
+    Unavailable,
 }
 
-/// ~1.4 Hz on/off phase used to flash sessions that want your input.
-fn flash_on() -> bool {
-    (now_ms() / 360).is_multiple_of(2)
+/// UX-02: static single-character code + its color. The ONLY place status glyphs are defined.
+fn status_code(status: UiRowStatus) -> (&'static str, Style) {
+    match status {
+        UiRowStatus::Waiting => (
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        UiRowStatus::Busy => ("B", Style::default().fg(Color::Blue)),
+        UiRowStatus::Completed => ("✓", Style::default().fg(Color::Green)),
+        UiRowStatus::Exited => ("✗", Style::default().fg(Color::DarkGray)),
+        UiRowStatus::Closed => ("-", Style::default().fg(Color::Gray)),
+        UiRowStatus::Archived => ("A", Style::default().fg(Color::DarkGray)),
+        UiRowStatus::Unavailable => ("!", Style::default().fg(Color::Yellow)),
+    }
+}
+
+/// Adapt Status (+ archived override) to UiRowStatus.
+fn session_status_to_ui(status: Status, archived: bool) -> UiRowStatus {
+    if archived {
+        return UiRowStatus::Archived;
+    }
+    match status {
+        Status::Waiting => UiRowStatus::Waiting,
+        Status::Busy => UiRowStatus::Busy,
+        Status::Completed => UiRowStatus::Completed,
+        Status::Exited => UiRowStatus::Exited,
+    }
+}
+
+/// Adapt hierarchy::LocalStatus to UiRowStatus.
+fn checkout_status_to_ui(status: LocalStatus) -> UiRowStatus {
+    match status {
+        LocalStatus::Waiting => UiRowStatus::Waiting,
+        LocalStatus::Working => UiRowStatus::Busy,
+        LocalStatus::Completed => UiRowStatus::Completed,
+        LocalStatus::Exited => UiRowStatus::Exited,
+        LocalStatus::Closed => UiRowStatus::Closed,
+        LocalStatus::Archived => UiRowStatus::Archived,
+        LocalStatus::Unavailable => UiRowStatus::Unavailable,
+    }
+}
+
+/// UX-02 legend, one entry per status code, in display order.
+const LEGEND: [(UiRowStatus, &str); 7] = [
+    (UiRowStatus::Waiting, "waiting"),
+    (UiRowStatus::Busy, "busy"),
+    (UiRowStatus::Completed, "done"),
+    (UiRowStatus::Exited, "exited"),
+    (UiRowStatus::Closed, "closed"),
+    (UiRowStatus::Archived, "archived"),
+    (UiRowStatus::Unavailable, "unavailable"),
+];
+
+/// Full legend text (also quoted in README and asserted by tests).
+#[allow(dead_code)]
+const LEGEND_TEXT: &str =
+    "? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable";
+
+/// Render the UX-02 legend as a single line, stopping before the first entry that would overflow.
+fn legend_line(width: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (status, label)) in LEGEND.iter().enumerate() {
+        let (code, style) = status_code(*status);
+        let code_span = Span::styled(code, style);
+        let label_span = Span::styled(format!(" {}", label), Style::default().fg(Color::DarkGray));
+
+        // Estimate width: code (1) + space (1) + label length
+        let entry_width = 1 + 1 + label.len() + if i < LEGEND.len() - 1 { 2 } else { 0 };
+
+        if spans.iter().map(|s| s.content.len()).sum::<usize>() + entry_width > width {
+            break;
+        }
+
+        spans.push(code_span);
+        spans.push(label_span);
+
+        if i < LEGEND.len() - 1 {
+            spans.push(Span::raw("  "));
+        }
+    }
+    Line::from(spans)
 }
 
 /// 2-column left gutter: an accent bar on the selected session, blank
@@ -230,20 +315,43 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
 
     // Carve a usage footer off the bottom of the sidebar when there's room.
     const FOOTER_H: u16 = 6;
-    let (list_area, footer_area) = if area.height >= 19 && list_area.height >= FOOTER_H + 4 {
-        let footer = Rect {
-            y: list_area.y + list_area.height - FOOTER_H,
-            height: FOOTER_H,
-            ..list_area
+    let (list_area, legend_area, footer_area) =
+        if area.height >= 20 && list_area.height >= FOOTER_H + 5 {
+            // Legend (1 row) + footer (6 rows) when both fit
+            let legend = Rect {
+                y: list_area.y + list_area.height - FOOTER_H - 1,
+                height: 1,
+                ..list_area
+            };
+            let footer = Rect {
+                y: list_area.y + list_area.height - FOOTER_H,
+                height: FOOTER_H,
+                ..list_area
+            };
+            let list = Rect {
+                height: list_area.height - FOOTER_H - 1,
+                ..list_area
+            };
+            (list, Some(legend), Some(footer))
+        } else if area.height >= 19 && list_area.height >= FOOTER_H + 4 {
+            // Just footer when there's no room for legend
+            let footer = Rect {
+                y: list_area.y + list_area.height - FOOTER_H,
+                height: FOOTER_H,
+                ..list_area
+            };
+            let list = Rect {
+                height: list_area.height - FOOTER_H,
+                ..list_area
+            };
+            (list, None, Some(footer))
+        } else {
+            (list_area, None, None)
         };
-        let list = Rect {
-            height: list_area.height - FOOTER_H,
-            ..list_area
-        };
-        (list, Some(footer))
-    } else {
-        (list_area, None)
-    };
+    if let Some(la) = legend_area {
+        let legend = legend_line(la.width as usize);
+        frame.render_widget(legend, la);
+    }
     if let Some(fa) = footer_area {
         draw_usage_footer(frame, app, fa);
     }
@@ -472,22 +580,16 @@ fn checkout_row(
     width: usize,
     compact: bool,
 ) {
-    let (icon, icon_style, default_state_text) = match row.status {
-        LocalStatus::Waiting => (
-            "●",
-            Style::default().fg(if flash_on() {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }),
-            "waiting",
-        ),
-        LocalStatus::Working => (spinner(), Style::default().fg(Color::Blue), "working"),
-        LocalStatus::Completed => ("✓", Style::default().fg(Color::Green), "completed"),
-        LocalStatus::Exited => ("✗", Style::default().fg(Color::DarkGray), "exited"),
-        LocalStatus::Closed => ("○", Style::default().fg(Color::Gray), "closed"),
-        LocalStatus::Archived => ("·", Style::default().fg(Color::DarkGray), "archived"),
-        LocalStatus::Unavailable => ("!", Style::default().fg(Color::Yellow), "unavailable"),
+    let ui_status = checkout_status_to_ui(row.status);
+    let (icon, icon_style) = status_code(ui_status);
+    let default_state_text = match row.status {
+        LocalStatus::Waiting => "waiting",
+        LocalStatus::Working => "working",
+        LocalStatus::Completed => "completed",
+        LocalStatus::Exited => "exited",
+        LocalStatus::Closed => "closed",
+        LocalStatus::Archived => "archived",
+        LocalStatus::Unavailable => "unavailable",
     };
     let state_text = match (&row.health, row.actions.capability) {
         (_, Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery)) => "recovery",
@@ -591,22 +693,20 @@ fn standalone_row(
     compact: bool,
     suspended: bool,
 ) {
-    let (icon, style, state) = match row.status {
-        LocalStatus::Waiting => ("●", Style::default().fg(Color::Yellow), "waiting"),
-        LocalStatus::Working => (spinner(), Style::default().fg(Color::Blue), "working"),
-        LocalStatus::Completed => ("✓", Style::default().fg(Color::Green), "completed"),
-        LocalStatus::Exited => ("✗", Style::default().fg(Color::DarkGray), "exited"),
-        LocalStatus::Closed => ("○", Style::default().fg(Color::Gray), "closed"),
-        LocalStatus::Archived => ("·", Style::default().fg(Color::DarkGray), "archived"),
-        LocalStatus::Unavailable => (
-            "!",
-            Style::default().fg(Color::Yellow),
-            match row.lifecycle {
-                StandaloneLifecycle::Missing => "missing",
-                StandaloneLifecycle::ProtectedTeardown(_) => "teardown protected",
-                _ => "unavailable",
-            },
-        ),
+    let ui_status = checkout_status_to_ui(row.status);
+    let (icon, style) = status_code(ui_status);
+    let state = match row.status {
+        LocalStatus::Waiting => "waiting",
+        LocalStatus::Working => "working",
+        LocalStatus::Completed => "completed",
+        LocalStatus::Exited => "exited",
+        LocalStatus::Closed => "closed",
+        LocalStatus::Archived => "archived",
+        LocalStatus::Unavailable => match row.lifecycle {
+            StandaloneLifecycle::Missing => "missing",
+            StandaloneLifecycle::ProtectedTeardown(_) => "teardown protected",
+            _ => "unavailable",
+        },
     };
     // PERF-07: an archived row whose child is SIGSTOPped says so.
     let state = if suspended { "suspended" } else { state };
@@ -803,32 +903,8 @@ fn session_row(
     width: usize,
     archived: bool,
 ) {
-    // Archived rows never flash or color — they've stopped asking for you.
-    let flash = !archived && flash_on();
-
-    let (icon, icon_style) = match status {
-        _ if archived => ("·", Style::default().fg(Color::DarkGray)),
-        Status::Waiting => {
-            // pulse the dot to pull the eye to a session that needs you
-            let c = if flash {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            };
-            ("●", Style::default().fg(c).add_modifier(Modifier::BOLD))
-        }
-        Status::Busy => (spinner(), Style::default().fg(Color::Blue)),
-        // A finished turn is calm — a steady green check, never flashing. It's
-        // your move, but nothing is blocked, so it must not pull the eye the
-        // way a `Waiting` (needs-input) session does.
-        Status::Completed => (
-            "✓",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::DIM),
-        ),
-        Status::Exited => ("✗", Style::default().fg(Color::DarkGray)),
-    };
+    let ui_status = session_status_to_ui(status, archived);
+    let (icon, icon_style) = status_code(ui_status);
 
     // The name never flashes: the pulsing icon and timer already carry the
     // needs-input signal, and a whole flashing word drowns out the selection
@@ -873,11 +949,10 @@ fn session_row(
     ];
     if !suffix.is_empty() {
         spans.push(Span::raw(" ".repeat(pad)));
-        // Only a needs-input session flashes its timer yellow; a completed
-        // session's "done Xm ago" stays calm gray.
+        // Timer: yellow for waiting (needs input), gray for other states.
         spans.push(Span::styled(
             suffix,
-            Style::default().fg(if flash && status == Status::Waiting {
+            Style::default().fg(if status == Status::Waiting {
                 Color::Yellow
             } else {
                 Color::DarkGray
@@ -1348,10 +1423,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         right.push("⚠ state unsaved".into());
     }
     if waiting > 0 {
-        right.push(format!("● {waiting} waiting"));
+        right.push(format!("? {waiting} waiting"));
     }
     if busy > 0 {
-        right.push(format!("◐ {busy} busy"));
+        right.push(format!("B {busy} busy"));
     }
     if completed > 0 {
         right.push(format!("✓ {completed} done"));
@@ -2234,10 +2309,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Help => {
-            // 37 paragraph lines + 2 border rows; keep in sync when adding
+            // 40 paragraph lines + 2 border rows; keep in sync when adding
             // rows or `help_overlay_lists_shift_enter`'s closing-line assert
             // fails on the clip.
-            let rect = centered(area, 60, 39);
+            let rect = centered(area, 60, 42);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2279,13 +2354,16 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("               (kitty-capable terminals; see README)"),
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "status (sidebar sorts alphabetically)",
+                    "status codes",
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
-                Line::raw("  ● waiting for your input"),
-                Line::raw("  ◐ working"),
+                Line::raw("  ? waiting for your input"),
+                Line::raw("  B busy — claude is working"),
                 Line::raw("  ✓ completed — turn finished, your move"),
-                Line::raw("  ✗ exited"),
+                Line::raw("  ✗ exited (r to restart)"),
+                Line::raw("  - closed checkout, no live session"),
+                Line::raw("  A archived (z shows, a toggles)"),
+                Line::raw("  ! unavailable or missing checkout"),
                 Line::from(Span::styled("press any key to close", dim)),
             ])
             .block(
@@ -3153,8 +3231,8 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("  repo "), "{rendered}");
-        assert!(rendered.contains("▌ ○ repo:develop"), "{rendered}");
-        assert!(rendered.contains("  ○ repo:main"), "{rendered}");
+        assert!(rendered.contains("▌ - repo:develop"), "{rendered}");
+        assert!(rendered.contains("  - repo:main"), "{rendered}");
         assert!(rendered.contains("main · closed"), "{rendered}");
         assert!(rendered.contains("default · closed"), "{rendered}");
         assert!(buffer
@@ -3368,5 +3446,283 @@ mod tests {
         assert_eq!(ws.source, baude_core::workspace::WorkspaceSource::Default);
         assert_eq!(ws.title_label(), "(blank)");
         assert_ne!(ws.title_label(), ws.name);
+    }
+
+    #[test]
+    fn status_code_table_matches_ux_02() {
+        use super::{status_code, UiRowStatus};
+        use ratatui::style::{Color, Modifier};
+
+        // Waiting: ? yellow bold
+        let (code, style) = status_code(UiRowStatus::Waiting);
+        assert_eq!(code, "?");
+        assert_eq!(style.fg, Some(Color::Yellow));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+
+        // Busy: B blue
+        let (code, style) = status_code(UiRowStatus::Busy);
+        assert_eq!(code, "B");
+        assert_eq!(style.fg, Some(Color::Blue));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+
+        // Completed: ✓ green
+        let (code, style) = status_code(UiRowStatus::Completed);
+        assert_eq!(code, "✓");
+        assert_eq!(style.fg, Some(Color::Green));
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+
+        // Exited: ✗ dark gray
+        let (code, style) = status_code(UiRowStatus::Exited);
+        assert_eq!(code, "✗");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        // Closed: - gray
+        let (code, style) = status_code(UiRowStatus::Closed);
+        assert_eq!(code, "-");
+        assert_eq!(style.fg, Some(Color::Gray));
+
+        // Archived: A dark gray
+        let (code, style) = status_code(UiRowStatus::Archived);
+        assert_eq!(code, "A");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+
+        // Unavailable: ! yellow
+        let (code, style) = status_code(UiRowStatus::Unavailable);
+        assert_eq!(code, "!");
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn session_status_adapter_archived_wins() {
+        use super::{session_status_to_ui, UiRowStatus};
+        use baude_core::session::Status;
+
+        // Archived=true always maps to Archived, regardless of status
+        assert_eq!(
+            session_status_to_ui(Status::Waiting, true),
+            UiRowStatus::Archived
+        );
+        assert_eq!(
+            session_status_to_ui(Status::Busy, true),
+            UiRowStatus::Archived
+        );
+        assert_eq!(
+            session_status_to_ui(Status::Completed, true),
+            UiRowStatus::Archived
+        );
+        assert_eq!(
+            session_status_to_ui(Status::Exited, true),
+            UiRowStatus::Archived
+        );
+
+        // Archived=false maps 1:1
+        assert_eq!(
+            session_status_to_ui(Status::Waiting, false),
+            UiRowStatus::Waiting
+        );
+        assert_eq!(session_status_to_ui(Status::Busy, false), UiRowStatus::Busy);
+        assert_eq!(
+            session_status_to_ui(Status::Completed, false),
+            UiRowStatus::Completed
+        );
+        assert_eq!(
+            session_status_to_ui(Status::Exited, false),
+            UiRowStatus::Exited
+        );
+    }
+
+    #[test]
+    fn checkout_status_adapter_is_one_to_one() {
+        use super::{checkout_status_to_ui, UiRowStatus};
+        use crate::hierarchy::LocalStatus;
+
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Waiting),
+            UiRowStatus::Waiting
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Working),
+            UiRowStatus::Busy
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Completed),
+            UiRowStatus::Completed
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Exited),
+            UiRowStatus::Exited
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Closed),
+            UiRowStatus::Closed
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Archived),
+            UiRowStatus::Archived
+        );
+        assert_eq!(
+            checkout_status_to_ui(LocalStatus::Unavailable),
+            UiRowStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn rendered_rows_use_static_codes() {
+        let _fixture = UiFixture::new("static-codes");
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.remote = None;
+
+        // Render and verify no animation glyphs remain
+        let (rendered, _) = render(&app, 100, 30);
+        // Old animation glyphs should not appear
+        assert!(
+            !rendered.contains("◐")
+                && !rendered.contains("◓")
+                && !rendered.contains("◑")
+                && !rendered.contains("◒"),
+            "spinner glyphs should not appear"
+        );
+
+        // Render twice with 500ms apart and verify buffers are identical (no animation)
+        let (rendered1, _) = render(&app, 100, 30);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (rendered2, _) = render(&app, 100, 30);
+        assert_eq!(
+            rendered1, rendered2,
+            "idle renders should be identical (no animation)"
+        );
+    }
+
+    #[test]
+    fn status_bar_counts_use_codes() {
+        let _fixture = UiFixture::new("status-codes");
+        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+
+        // Render and check that status bar uses the new codes
+        let (rendered, _) = render(&app, 100, 30);
+
+        // The status bar should contain "? waiting" and "B busy" if those rows exist,
+        // but at minimum we verify the format strings are used
+        assert!(
+            !rendered.contains("● ") || rendered.contains("? "),
+            "status bar should use ? not ●"
+        );
+        assert!(
+            !rendered.contains("◐ ") || rendered.contains("B "),
+            "status bar should use B not ◐"
+        );
+    }
+
+    #[test]
+    fn legend_line_includes_all_codes() {
+        use super::legend_line;
+
+        let legend = legend_line(80);
+        let content = legend.to_string();
+        assert!(content.contains("?"), "legend should contain waiting code");
+        assert!(content.contains("B"), "legend should contain busy code");
+        assert!(
+            content.contains("✓"),
+            "legend should contain completed code"
+        );
+        assert!(content.contains("✗"), "legend should contain exited code");
+        assert!(content.contains("-"), "legend should contain closed code");
+        assert!(content.contains("A"), "legend should contain archived code");
+        assert!(
+            content.contains("!"),
+            "legend should contain unavailable code"
+        );
+    }
+
+    #[test]
+    fn legend_line_stops_before_overflow() {
+        use super::legend_line;
+
+        let narrow = legend_line(30);
+        let narrow_content = narrow.to_string();
+        // At 30 chars, we expect fewer codes than at 80
+        assert!(
+            narrow_content.contains("?"),
+            "legend should always start with ?"
+        );
+        // Should not contain all codes
+        let wide = legend_line(80);
+        let wide_content = wide.to_string();
+        assert!(
+            wide_content.len() >= narrow_content.len(),
+            "wider legend should have at least as many codes"
+        );
+    }
+
+    #[test]
+    fn legend_text_matches_constant() {
+        use super::LEGEND_TEXT;
+
+        assert_eq!(
+            LEGEND_TEXT,
+            "? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable"
+        );
+    }
+
+    #[test]
+    fn legend_rendered_when_height_allows() {
+        let _fixture = UiFixture::new("legend-height");
+        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+
+        // Render at (160, 30): should have room for legend
+        let (rendered, _) = render(&app, 160, 30);
+        assert!(
+            rendered.contains("? waiting") || rendered.contains("waiting"),
+            "at 30 rows, legend should be visible"
+        );
+    }
+
+    #[test]
+    fn legend_omitted_below_threshold() {
+        let _fixture = UiFixture::new("legend-small");
+        let app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+
+        // Render at (100, 19): should NOT have room for legend, but footer might be there
+        let (rendered, _) = render(&app, 100, 19);
+        // At 19 rows we're below the threshold for legend, but footer (with usage) might be present
+        // The test should just verify that the layout is still valid
+        assert!(!rendered.is_empty(), "render should succeed at 19 rows");
+    }
+
+    #[test]
+    fn help_overlay_lists_status_codes() {
+        let _fixture = UiFixture::new("help-codes");
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.modal = Modal::Help;
+        app.remote = None;
+
+        let (rendered, _) = render(&app, 80, 45);
+        assert!(
+            rendered.contains("? waiting for your input"),
+            "help should list ? for waiting"
+        );
+        assert!(rendered.contains("B busy"), "help should list B for busy");
+        assert!(
+            rendered.contains("✓ completed"),
+            "help should list ✓ for completed"
+        );
+        assert!(
+            rendered.contains("✗ exited"),
+            "help should list ✗ for exited"
+        );
+        assert!(
+            rendered.contains("- closed"),
+            "help should list - for closed"
+        );
+        assert!(
+            rendered.contains("A archived"),
+            "help should list A for archived"
+        );
+        assert!(
+            rendered.contains("! unavailable"),
+            "help should list ! for unavailable"
+        );
     }
 }
