@@ -2309,10 +2309,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Help => {
-            // 40 paragraph lines + 2 border rows; keep in sync when adding
+            // 41 paragraph lines + 2 border rows; keep in sync when adding
             // rows or `help_overlay_lists_shift_enter`'s closing-line assert
             // fails on the clip.
-            let rect = centered(area, 60, 42);
+            let rect = centered(area, 60, 43);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
