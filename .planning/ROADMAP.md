@@ -51,7 +51,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 - [x] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions (completed 2026-09-21)
 - [x] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery (completed 2026-09-22)
 - [x] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches (completed 2026-09-22)
-- [ ] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation
+- [x] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation (completed 2026-09-22)
 
 ## Phase Details
 
@@ -179,7 +179,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 | 14. Managed Worktree Identity | 3/3 | Complete    | 2026-09-21 |
 | 15. Startup and Idle Performance | 4/4 | Complete    | 2026-09-22 |
 | 16. Pane Focus UX | 1/1 | Complete    | 2026-09-22 |
-| 17. Validation and v2.3.0 Release | 0/? | Not started | - |
+| 17. Validation and v2.3.0 Release | 1/1 | Complete    | 2026-09-22 |
 
 ## Backlog
 

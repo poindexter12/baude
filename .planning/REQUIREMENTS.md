@@ -50,7 +50,7 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 
 ### Release
 
-- [ ] **SHIP-05**: A maintainer can publish v2.3.0 through the existing release-please workflow only after tests, CI, and a terminal smoke pass succeed, with README and release notes reflecting the new defaults
+- [x] **SHIP-05**: A maintainer can publish v2.3.0 through the existing release-please workflow only after tests, CI, and a terminal smoke pass succeed, with README and release notes reflecting the new defaults
 
 ## Future Requirements
 
@@ -113,7 +113,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PERF-08 | Phase 15 | Complete |
 | UX-01 | Phase 16 | Complete |
 | UX-02 | Phase 15 | Complete |
-| SHIP-05 | Phase 17 | Pending |
+| SHIP-05 | Phase 17 | Complete |
 
 **Coverage:**
 
