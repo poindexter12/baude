@@ -7,10 +7,11 @@ covered_files:
   - .planning/phases/16-pane-focus-ux/16-01-PLAN.md
   - .planning/phases/16-pane-focus-ux/16-01-SUMMARY.md
   - baude-core/src/session.rs
+  - baude-core/src/pty.rs
   - baude/src/app.rs
   - baude/src/ui.rs
   - README.md
-covered_digest: v1:sha256:fe3ee1eff41df6c12ec6f29f41053e832e830194d7724221ef4bf967da9a3481
+covered_digest: v1:sha256:cf75eb1044e8467f6e63e148733ffb7d526b19f44e2370ad880cb9676be21760
 re_verification: false
 overrides_applied: 0
 behavior_unverified: 0
@@ -22,7 +23,7 @@ behavior_unverified: 0
 
 **Verified:** 2026-09-22
 **Status:** PASSED
-**Re-verification:** No
+**Re-verification:** Digest refreshed after the review fixes in 0a181c9 (Restart-branch focus restore; suspend re-signals until the stop sticks). Both criteria re-checked against the current source; 792 tests green.
 
 ## Goal Achievement Summary
 
