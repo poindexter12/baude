@@ -118,6 +118,7 @@ through to Claude.
 | `ctrl+n` | anywhere | new session (steps out to the sidebar) |
 | `alt+←/→` | anywhere | cycle to the prev/next actionable checkout/session child (wraps; skips archived and closed rows) |
 | `ctrl+o` | anywhere | link hints (inspect/copy/open urls) |
+| `alt+↑/↓` | claude or shell pane | move focus to the pane above/below (shell sits below claude) |
 | `shift+enter` | claude pane | insert a newline without submitting |
 | `enter` | sidebar | open a parent's default child, attach a live child, or reopen an eligible retained child |
 | `j/k` `↑/↓` | sidebar | select repository parents, checkout children, or flat remote rows |
@@ -140,9 +141,9 @@ through to Claude.
 To close from a pane, press `ctrl+q` to return to the sidebar, then `x`.
 `ctrl+x` passes through unchanged for opencode, nano, and other terminal apps.
 
-`alt+←/→` needs your terminal to send Option/Alt as a modifier — on macOS
+`alt+←/→` and `alt+↑/↓` need your terminal to send Option/Alt as a modifier — on macOS
 Terminal and iTerm2 enable this with "Use Option as Meta key". While attached,
-this chord shadows Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
+these chords shadow Claude's own alt+←/→ word navigation. Likewise `ctrl+e`,
 and `ctrl+n` are intercepted everywhere, so they never reach the shell pane's
 readline (end-of-line, next-history) or the AI CLI.
 

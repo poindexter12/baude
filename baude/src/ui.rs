@@ -2350,6 +2350,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  ctrl+o      link hints (inspect/copy/open urls)"),
                 Line::raw("  ctrl+q, x   close session"),
                 Line::raw("  alt+←/→     cycle sessions (skips archived + closed)"),
+                Line::raw("  alt+↑/↓     move focus between claude and shell panes"),
                 Line::raw("  shift+enter  newline in claude pane"),
                 Line::raw("               (kitty-capable terminals; see README)"),
                 Line::raw(""),
