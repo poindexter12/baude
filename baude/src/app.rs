@@ -2479,18 +2479,8 @@ impl App {
                     return self.reopen_checkout(activation.checkout);
                 }
                 self.selected_id = Some(SelId::Checkout(activation.checkout));
-                // Preserve shell focus if shell is open on the selected runtime
-                if self.focus == Focus::Shell {
-                    let has_shell = self
-                        .session(runtime)
-                        .map(|s| s.shell_open && s.shell.is_some())
-                        .unwrap_or(false);
-                    if !has_shell {
-                        self.focus = Focus::Claude;
-                    }
-                } else {
-                    self.focus = Focus::Claude;
-                }
+                // UX-01: land on the pane this session was last left on.
+                self.restore_pane_focus();
                 return Ok(LifecycleOutcome::Focused {
                     checkout: activation.checkout,
                     runtime,
@@ -2570,18 +2560,8 @@ impl App {
         }
         self.runtime_checkouts.insert(activation.checkout, id);
         self.selected_id = Some(SelId::Checkout(activation.checkout));
-        // Preserve shell focus if shell is open on the activated session
-        if self.focus == Focus::Shell {
-            let has_shell = self
-                .session(id)
-                .map(|s| s.shell_open && s.shell.is_some())
-                .unwrap_or(false);
-            if !has_shell {
-                self.focus = Focus::Claude;
-            }
-        } else {
-            self.focus = Focus::Claude;
-        }
+        // UX-01: land on the pane this session was last left on.
+        self.restore_pane_focus();
         Ok(activation.outcome(Some(id)))
     }
 
@@ -2668,18 +2648,8 @@ impl App {
         match plan.dispatch {
             lifecycle::ReopenDispatch::Focus { id } => {
                 self.selected_id = Some(SelId::Checkout(checkout_key));
-                // Preserve shell focus if shell is open on the reopened session
-                if self.focus == Focus::Shell {
-                    let has_shell = self
-                        .session(id)
-                        .map(|s| s.shell_open && s.shell.is_some())
-                        .unwrap_or(false);
-                    if !has_shell {
-                        self.focus = Focus::Claude;
-                    }
-                } else {
-                    self.focus = Focus::Claude;
-                }
+                // UX-01: land on the pane this session was last left on.
+                self.restore_pane_focus();
                 Ok(LifecycleOutcome::Focused {
                     checkout: checkout_key,
                     runtime: id,
@@ -2712,18 +2682,8 @@ impl App {
                 }
                 self.runtime_checkouts.insert(checkout_key, id);
                 self.selected_id = Some(SelId::Checkout(checkout_key));
-                // Preserve shell focus if shell is open on the spawned session
-                if self.focus == Focus::Shell {
-                    let has_shell = self
-                        .session(id)
-                        .map(|s| s.shell_open && s.shell.is_some())
-                        .unwrap_or(false);
-                    if !has_shell {
-                        self.focus = Focus::Claude;
-                    }
-                } else {
-                    self.focus = Focus::Claude;
-                }
+                // UX-01: land on the pane this session was last left on.
+                self.restore_pane_focus();
                 Ok(LifecycleOutcome::Reopened {
                     checkout: checkout_key,
                     runtime: id,
@@ -3185,6 +3145,7 @@ impl App {
             pending_permission: None,
             permission_decision: None,
             child_suspended: false,
+            pane_focus_shell: false,
             poll_meta_calls_for_test: std::cell::Cell::new(0),
         };
         self.sessions.push(session);
@@ -3327,18 +3288,8 @@ impl App {
     ) -> Result<u64> {
         if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
             self.selected_id = Some(SelId::Checkout(checkout));
-            // Preserve shell focus if shell is open on the restored runtime
-            if self.focus == Focus::Shell {
-                let has_shell = self
-                    .session(id)
-                    .map(|s| s.shell_open && s.shell.is_some())
-                    .unwrap_or(false);
-                if !has_shell {
-                    self.focus = Focus::Claude;
-                }
-            } else {
-                self.focus = Focus::Claude;
-            }
+            // UX-01: land on the pane this session was last left on.
+            self.restore_pane_focus();
             return Ok(id);
         }
         let lifecycle = self
@@ -3392,18 +3343,8 @@ impl App {
         }
         self.runtime_checkouts.insert(checkout, id);
         self.selected_id = Some(SelId::Checkout(checkout));
-        // Preserve shell focus if shell is open on the restored runtime
-        if self.focus == Focus::Shell {
-            let has_shell = self
-                .session(id)
-                .map(|s| s.shell_open && s.shell.is_some())
-                .unwrap_or(false);
-            if !has_shell {
-                self.focus = Focus::Claude;
-            }
-        } else {
-            self.focus = Focus::Claude;
-        }
+        // UX-01: land on the pane this session was last left on.
+        self.restore_pane_focus();
         Ok(id)
     }
 
@@ -4217,11 +4158,12 @@ impl App {
             return;
         }
         if alt && matches!(key.code, KeyCode::Up) {
-            self.swap_pane_focus();
+            // The shell is stacked below the agent pane: up means agent.
+            self.move_pane_focus(false);
             return;
         }
         if alt && matches!(key.code, KeyCode::Down) {
-            self.swap_pane_focus();
+            self.move_pane_focus(true);
             return;
         }
         if ctrl && matches!(key.code, KeyCode::Char('e')) {
@@ -4248,28 +4190,60 @@ impl App {
         }
     }
 
-    fn swap_pane_focus(&mut self) {
-        // Remote rows have no shell pane, so this is a no-op for them.
+    /// UX-01: record which pane the selected session is focused on, so
+    /// returning to it later lands on the same pane. Called before the
+    /// selection moves and after any deliberate pane-focus change.
+    fn remember_pane_focus(&mut self) {
+        let shell = match self.focus {
+            Focus::Shell => true,
+            Focus::Claude => false,
+            // Sidebar focus says nothing about which pane the user wants.
+            Focus::Sidebar => return,
+        };
+        if let Some(session) = self.selected_mut() {
+            session.pane_focus_shell = shell;
+        }
+    }
+
+    /// UX-01: focus the pane this session was last left on, falling back to
+    /// the agent pane when it has no usable shell. Used by every path that
+    /// attaches to a session.
+    fn restore_pane_focus(&mut self) {
+        let wants_shell = self
+            .selected()
+            .is_some_and(|s| s.pane_focus_shell && s.shell_open && s.shell.is_some());
+        self.focus = if wants_shell {
+            Focus::Shell
+        } else {
+            Focus::Claude
+        };
+    }
+
+    /// UX-01: `alt+↑` / `alt+↓` move focus between the stacked panes. The
+    /// shell sits BELOW the agent pane (`pane_rects`), so the direction is
+    /// literal rather than a toggle: `alt+↑` always lands on the agent pane
+    /// and `alt+↓` always lands on the shell. No-op from the sidebar, with no
+    /// usable shell, or on a remote row (which has no shell pane at all,
+    /// because `toggle_shell` has no remote branch).
+    fn move_pane_focus(&mut self, to_shell: bool) {
         if matches!(self.selected_id, Some(SelId::Remote(_))) {
             return;
         }
-
-        // Check if shell is open and available on the selected session
+        if self.focus == Focus::Sidebar {
+            return;
+        }
         let has_shell = self
             .selected()
-            .map(|s| s.shell_open && s.shell.is_some())
-            .unwrap_or(false);
-
+            .is_some_and(|s| s.shell_open && s.shell.is_some());
         if !has_shell {
-            return; // No-op if shell is not open
+            return;
         }
-
-        // Swap focus between Claude and Shell; no-op from Sidebar
-        match self.focus {
-            Focus::Claude => self.focus = Focus::Shell,
-            Focus::Shell => self.focus = Focus::Claude,
-            Focus::Sidebar => {} // No-op from sidebar
-        }
+        self.focus = if to_shell {
+            Focus::Shell
+        } else {
+            Focus::Claude
+        };
+        self.remember_pane_focus();
     }
 
     fn forward_key(&mut self, key: KeyEvent, to_shell: bool) {
@@ -4510,18 +4484,8 @@ impl App {
                 .is_some_and(|session| !session.claude.is_exited())
             {
                 self.selected_id = Some(SelId::Checkout(checkout));
-                // Preserve shell focus if shell is open on the selected runtime
-                if self.focus == Focus::Shell {
-                    let has_shell = self
-                        .session(runtime)
-                        .map(|s| s.shell_open && s.shell.is_some())
-                        .unwrap_or(false);
-                    if !has_shell {
-                        self.focus = Focus::Claude;
-                    }
-                } else {
-                    self.focus = Focus::Claude;
-                }
+                // UX-01: land on the pane this session was last left on.
+                self.restore_pane_focus();
                 self.record_context_use(SelId::Checkout(checkout));
                 self.wake_selected_if_suspended();
                 return;
@@ -5432,6 +5396,8 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i64) {
+        // UX-01: the row we are leaving keeps the pane it was left on.
+        self.remember_pane_focus();
         let ids = self.ordered_ids();
         if ids.is_empty() {
             return;
@@ -5454,6 +5420,8 @@ impl App {
     /// wrapping around. When attached, stays attached to the same kind of
     /// pane — falling back to the claude pane if the new session has no shell.
     fn cycle_session(&mut self, delta: i64) {
+        // UX-01: the row we are leaving keeps the pane it was left on.
+        self.remember_pane_focus();
         // Cycling is for switching between live work: repository parents,
         // archived rows (even while revealed by `z`), and closed checkouts
         // are all skipped. j/k still reaches everything visible, and typing
@@ -5501,14 +5469,10 @@ impl App {
         self.shell_scroll = 0;
         self.selection = None;
         self.selected_id = Some(ids[next as usize]);
-        if self.focus == Focus::Shell {
-            let has_shell = self
-                .selected()
-                .map(|s| s.shell_open && s.shell.is_some())
-                .unwrap_or(false);
-            if !has_shell {
-                self.focus = Focus::Claude;
-            }
+        // UX-01: land on the pane the target session was last left on,
+        // rather than dragging this session's pane across.
+        if self.focus != Focus::Sidebar {
+            self.restore_pane_focus();
         }
     }
 
@@ -5571,6 +5535,7 @@ impl App {
         };
         if s.shell_open {
             s.shell_open = false;
+            s.pane_focus_shell = false;
             if self.focus == Focus::Shell {
                 self.focus = Focus::Claude;
             }
@@ -5581,6 +5546,7 @@ impl App {
                 Ok(()) => {
                     if focus_it {
                         self.focus = Focus::Shell;
+                        self.remember_pane_focus();
                     }
                 }
                 Err(e) => self.set_message(format!("shell: {e}")),
@@ -6886,7 +6852,7 @@ mod link_open {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_restore_checkouts, checkout_for_runtime, inner, local_admission_route, pane_rects,
+        active_restore_checkouts, checkout_for_runtime, local_admission_route,
         require_same_checkout_path, App, Focus, LocalAdmissionRoute, Modal, SelId,
     };
     use crate::hierarchy::LocalRow;
@@ -11768,6 +11734,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// UX-01 fixture: a repository with one admitted runtime whose shell pane
+    /// is open, selected, and focused on the agent pane.
+    fn pane_focus_app(label: &str) -> (AdmissionRepo, App, u64) {
+        let fixture = admission_repo(label);
+        let repo = fixture.path().to_path_buf();
+        let state_root = repo.parent().unwrap().join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+        let key = app.repository_state.checkouts[0].key;
+        app.selected_id = Some(SelId::Checkout(key));
+        app.session_mut(runtime)
+            .unwrap()
+            .open_shell(10, 40)
+            .unwrap();
+        app.focus = Focus::Claude;
+        (fixture, app, runtime)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn alt_arrows_move_pane_focus_by_direction_not_toggle() {
+        // The shell is stacked BELOW the agent pane, so the keys are literal:
+        // down always lands on the shell, up always lands on the agent pane.
+        // A toggle bound to both keys would make alt+down move focus UP.
+        let _scope = isolation_scope("pane-focus-direction");
+        let (_fixture, mut app, _runtime) = pane_focus_app("pane-focus-direction");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Shell, "alt+down focuses the shell below");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Shell, "alt+down again stays on the shell");
+        app.handle_key(alt(KeyCode::Up));
+        assert_eq!(app.focus, Focus::Claude, "alt+up focuses the agent pane");
+        app.handle_key(alt(KeyCode::Up));
+        assert_eq!(
+            app.focus,
+            Focus::Claude,
+            "alt+up again stays on the agent pane"
+        );
+        app.kill_all();
+    }
+
+    #[test]
+    fn alt_arrows_are_noops_without_a_shell_and_from_the_sidebar() {
+        let _scope = isolation_scope("pane-focus-noop");
+        let (_fixture, mut app, runtime) = pane_focus_app("pane-focus-noop");
+        // From the sidebar the keys say nothing about panes.
+        app.focus = Focus::Sidebar;
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Sidebar, "sidebar focus is untouched");
+        // With no shell open there is no second pane to reach.
+        app.focus = Focus::Claude;
+        app.session_mut(runtime).unwrap().shell_open = false;
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Claude, "no shell means no move");
+        app.kill_all();
+    }
+
+    #[test]
+    fn pane_focus_survives_a_visit_to_a_session_without_a_shell() {
+        // This is the issue #89 behavior. Leaving a shell-focused session for
+        // one with no shell used to drag the agent pane back with it, so
+        // returning landed on the agent pane. Focus is per session now.
+        let _scope = isolation_scope("pane-focus-memory");
+        let (_fixture, mut app, runtime) = pane_focus_app("pane-focus-memory");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Shell, "precondition: shell focused");
+
+        // Visit the repository parent row, which has no panes at all.
+        let repository = app.repository_state.repositories[0].key;
+        app.remember_pane_focus();
+        app.selected_id = Some(SelId::Repository(repository));
+        app.focus = Focus::Claude;
+
+        // Come back the way the sidebar does it.
+        app.selected_id = Some(SelId::Checkout(app.repository_state.checkouts[0].key));
+        app.restore_pane_focus();
+        assert_eq!(
+            app.focus,
+            Focus::Shell,
+            "returning lands on the pane the session was left on"
+        );
+
+        // Closing the shell clears the memory: there is nothing to return to.
+        app.toggle_shell(false);
+        assert!(!app.session(runtime).unwrap().pane_focus_shell);
+        app.restore_pane_focus();
+        assert_eq!(app.focus, Focus::Claude, "no shell, no shell focus");
+        app.kill_all();
+    }
+
+    #[test]
+    fn remote_rows_focus_claude_and_ignore_the_pane_keys() {
+        // Remote rows have no shell pane: `toggle_shell` has no remote branch
+        // and RemoteAttach carries a single parser. Focus must not be left on
+        // a pane that does not exist.
+        let _scope = isolation_scope("pane-focus-remote");
+        let (_fixture, mut app, _runtime) = pane_focus_app("pane-focus-remote");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Shell, "precondition: shell focused");
+        app.selected_id = Some(SelId::Remote(1));
+        app.handle_key(alt(KeyCode::Up));
+        assert_eq!(app.focus, Focus::Shell, "alt+up is a no-op on a remote row");
+        app.handle_key(alt(KeyCode::Down));
+        assert_eq!(
+            app.focus,
+            Focus::Shell,
+            "alt+down is a no-op on a remote row"
+        );
+        app.kill_all();
+    }
+
     #[test]
     fn typing_into_suspended_session_resumes_it() {
         // Locked decision: SIGCONT on unarchive OR selection. Forwarding a key
@@ -11876,153 +11960,6 @@ mod tests {
             "{rendered}"
         );
         app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn focus_swap_claude_to_shell() {
-        // Test: Claude pane focused, shell open, press alt+↑/↓, asserts focus is now Shell
-        let _scope = isolation_scope("focus-swap-claude-to-shell");
-        let fixture = admission_repo("focus-swap-c2s");
-        let repo = fixture.path().to_path_buf();
-        let root = repo.parent().unwrap().to_path_buf();
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&state_root).unwrap();
-        let mut app = App::new(repo.clone());
-        app.remote = None;
-        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
-        app.persistence_root_for_test = Some(state_root);
-        app.admit_repository(&repo).unwrap().expect("runtime");
-        // Select the first checkout
-        if let Some(first_id) = app.ordered_ids().first().copied() {
-            app.selected_id = Some(first_id);
-            if let Some(session) = app.selected_mut() {
-                // Open shell
-                let (_, shell_rect) = pane_rects(ratatui::layout::Rect::new(0, 0, 160, 30), true);
-                let r = shell_rect
-                    .map(inner)
-                    .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 10));
-                session.open_shell(r.height, r.width).unwrap();
-            }
-        }
-        app.focus = Focus::Claude;
-        // Call swap_pane_focus() which should swap Claude -> Shell
-        app.swap_pane_focus();
-        assert_eq!(
-            app.focus,
-            Focus::Shell,
-            "focus should swap from Claude to Shell"
-        );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn focus_swap_shell_to_claude() {
-        // Test: Shell pane focused, press alt+↑/↓, asserts focus is now Claude
-        let _scope = isolation_scope("focus-swap-shell-to-claude");
-        let fixture = admission_repo("focus-swap-s2c");
-        let repo = fixture.path().to_path_buf();
-        let root = repo.parent().unwrap().to_path_buf();
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&state_root).unwrap();
-        let mut app = App::new(repo.clone());
-        app.remote = None;
-        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
-        app.persistence_root_for_test = Some(state_root);
-        app.admit_repository(&repo).unwrap().expect("runtime");
-        // Select the first checkout
-        if let Some(first_id) = app.ordered_ids().first().copied() {
-            app.selected_id = Some(first_id);
-            if let Some(session) = app.selected_mut() {
-                // Open shell
-                let (_, shell_rect) = pane_rects(ratatui::layout::Rect::new(0, 0, 160, 30), true);
-                let r = shell_rect
-                    .map(inner)
-                    .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 10));
-                session.open_shell(r.height, r.width).unwrap();
-            }
-        }
-        app.focus = Focus::Shell;
-        // Call swap_pane_focus() which should swap Shell -> Claude
-        app.swap_pane_focus();
-        assert_eq!(
-            app.focus,
-            Focus::Claude,
-            "focus should swap from Shell to Claude"
-        );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn focus_swap_noop_no_shell() {
-        // Test: Claude focused, shell not open, press alt+↑/↓, asserts focus unchanged
-        let _scope = isolation_scope("focus-swap-noop-no-shell");
-        let fixture = admission_repo("focus-swap-noop");
-        let repo = fixture.path().to_path_buf();
-        let root = repo.parent().unwrap().to_path_buf();
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&state_root).unwrap();
-        let mut app = App::new(repo.clone());
-        app.remote = None;
-        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
-        app.persistence_root_for_test = Some(state_root);
-        app.admit_repository(&repo).unwrap().expect("runtime");
-        // Select the first checkout
-        if let Some(first_id) = app.ordered_ids().first().copied() {
-            app.selected_id = Some(first_id);
-        }
-        app.focus = Focus::Claude;
-        // Shell is not open; swap_pane_focus should be no-op
-        app.swap_pane_focus();
-        assert_eq!(
-            app.focus,
-            Focus::Claude,
-            "focus should remain Claude when shell not open"
-        );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn focus_swap_sidebar_noop() {
-        // Test: Focus is Sidebar, press alt+↑/↓, asserts focus unchanged
-        let _scope = isolation_scope("focus-swap-sidebar-noop");
-        let fixture = admission_repo("focus-swap-sidebar");
-        let repo = fixture.path().to_path_buf();
-        let root = repo.parent().unwrap().to_path_buf();
-        let state_root = root.join("state");
-        std::fs::create_dir_all(&state_root).unwrap();
-        let mut app = App::new(repo.clone());
-        app.remote = None;
-        app.persistence_root_for_test = Some(state_root);
-        app.focus = Focus::Sidebar;
-        // Focus is Sidebar; swap_pane_focus should be no-op
-        app.swap_pane_focus();
-        assert_eq!(app.focus, Focus::Sidebar, "focus should remain Sidebar");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn pane_focus_swap_is_noop_on_remote() {
-        // Test: Remote row selected, send alt+↑/↓, asserts focus unchanged
-        let _scope = isolation_scope("focus-swap-remote-noop");
-        let fixture = admission_repo("focus-swap-remote");
-        let repo = fixture.path().to_path_buf();
-        let root = repo.parent().unwrap().to_path_buf();
-        let mut app = App::new(repo.clone());
-        app.remote = None;
-        // Simulate remote selection
-        app.selected_id = Some(SelId::Remote(1));
-        app.focus = Focus::Claude;
-        // Remote rows have no shell pane, so swap_pane_focus should be no-op
-        app.swap_pane_focus();
-        assert_eq!(
-            app.focus,
-            Focus::Claude,
-            "focus should remain Claude for remote (no-op)"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

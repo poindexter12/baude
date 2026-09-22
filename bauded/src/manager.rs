@@ -1284,6 +1284,7 @@ impl Manager {
             pending_permission: None,
             permission_decision: None,
             child_suspended: false,
+            pane_focus_shell: false,
             poll_meta_calls_for_test: std::cell::Cell::new(0),
         });
         Ok(id)

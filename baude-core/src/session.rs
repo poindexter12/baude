@@ -92,6 +92,11 @@ pub struct Session {
     /// Idle child is suspended via SIGSTOP. Set by suspend_idle_child(),
     /// cleared by resume_idle_child() or kill(). Shows "suspended" in status.
     pub child_suspended: bool,
+    /// UX-01: which pane this session had focus in when the user last left it
+    /// (true = the shell pane). In-memory only: it is deliberately absent from
+    /// the persisted state, so a fresh baude starts every session on the agent
+    /// pane. The TUI records it on focus changes and restores it on activation.
+    pub pane_focus_shell: bool,
     /// Test-only counter: number of times poll_meta has been called.
     pub poll_meta_calls_for_test: std::cell::Cell<u32>,
 }
