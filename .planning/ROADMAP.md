@@ -152,6 +152,8 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 **Plans**: TBD
 
+- [x] 16-01-PLAN.md
+
 ### Phase 17: Validation and v2.3.0 Release
 
 **Goal**: v2.3.0 is published after tests, CI, and smoke validation confirm stability and the new features work end-to-end.
@@ -176,7 +178,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 | 13. Workspace Derivation and New-Session/Open Defaults | 3/3 | Complete    | 2026-09-20 |
 | 14. Managed Worktree Identity | 3/3 | Complete    | 2026-09-21 |
 | 15. Startup and Idle Performance | 4/4 | Complete    | 2026-09-22 |
-| 16. Pane Focus UX | 0/? | Not started | - |
+| 16. Pane Focus UX | 1/1 | In Progress|  |
 | 17. Validation and v2.3.0 Release | 0/? | Not started | - |
 
 ## Backlog
