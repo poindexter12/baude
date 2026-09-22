@@ -72,6 +72,31 @@ pub struct RemoteInfo {
     pub workspace_source: Option<String>,
 }
 
+impl PartialEq for RemoteInfo {
+    /// Compare RemoteInfo for changes relevant to the UI.
+    /// Excludes activity field which is UI-only and doesn't affect view changes.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.title == other.title
+            && self.status == other.status
+            && self.waiting_for_ms == other.waiting_for_ms
+            && self.model == other.model
+            && self.permission_mode == other.permission_mode
+            && self.context_used_pct == other.context_used_pct
+            && self.rate_5h_used_pct == other.rate_5h_used_pct
+            && self.rate_5h_resets_at_unix_s == other.rate_5h_resets_at_unix_s
+            && self.branch == other.branch
+            && self.session_cost_usd == other.session_cost_usd
+            && self.state_source == other.state_source
+            && self.last_tool == other.last_tool
+            && self.waiting_reason == other.waiting_reason
+            && self.archived == other.archived
+            && self.gsd_active_phase == other.gsd_active_phase
+            && self.workspace_source == other.workspace_source
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RemoteSnapshot {
     pub sessions: Vec<RemoteInfo>,
@@ -84,6 +109,18 @@ pub struct RemoteSnapshot {
     pub daemon_workspace_source: Option<String>,
     /// Count of collisions detected by daemon since start.
     pub daemon_collision_count: u32,
+}
+
+impl RemoteSnapshot {
+    /// Compare snapshots for meaningful changes (ignoring time-based fetched_ms).
+    /// Returns true if the view-relevant fields are the same.
+    pub fn same_view(&self, other: &Self) -> bool {
+        self.sessions == other.sessions
+            && self.ok == other.ok
+            && self.daemon_workspace == other.daemon_workspace
+            && self.daemon_workspace_source == other.daemon_workspace_source
+            && self.daemon_collision_count == other.daemon_collision_count
+    }
 }
 
 /// Background poller for one daemon.

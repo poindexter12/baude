@@ -3771,11 +3771,9 @@ impl App {
         if let Some(r) = &self.remote {
             let new_snap = r.snapshot();
             // Mark dirty only if meaningful fields changed (not just fetched_ms timestamp)
-            // Compare session count and ok status to detect meaningful changes
-            let snap_changed = new_snap.sessions.len() != self.remote_snap_prev.sessions.len()
-                || new_snap.ok != self.remote_snap_prev.ok
-                || new_snap.daemon_workspace != self.remote_snap_prev.daemon_workspace;
-            if snap_changed {
+            // Use same_view() to compare sessions, ok, daemon_workspace, and collision_count,
+            // ignoring the time-based fetched_ms field which changes every poll.
+            if !new_snap.same_view(&self.remote_snap_prev) {
                 self.dirty = true;
             }
             self.remote_snap_prev = new_snap.clone();

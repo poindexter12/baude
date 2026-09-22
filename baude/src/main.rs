@@ -426,7 +426,9 @@ fn main() -> Result<()> {
     for note in startup_notes {
         app.set_message(note);
     }
-    app.restore();
+    // Note: app.restore() is deferred to inside run() after the first draw
+    // so the first frame (sidebar chrome, workspace title, empty) renders before
+    // any restore UI appears.
 
     let result = run(&mut terminal, &mut app);
 
@@ -436,42 +438,122 @@ fn main() -> Result<()> {
     result
 }
 
+/// Result of one iteration of the main loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Stepped {
+    /// Whether the terminal was drawn this iteration.
+    pub drew: bool,
+    /// Whether session restore has finished (all pending sessions spawned/restored).
+    pub restore_finished: bool,
+}
+
+/// One timing stage: name, duration in milliseconds, and optional note.
+#[derive(Clone, Debug)]
+pub struct TimingStage {
+    pub name: &'static str,
+    pub duration_ms: u128,
+    pub note: Option<String>,
+}
+
+/// Startup timing information: stages and total duration.
+#[derive(Clone, Debug)]
+pub struct StartupTiming {
+    pub stages: Vec<TimingStage>,
+    pub total_ms: u128,
+}
+
+impl StartupTiming {
+    /// Print timing summary and per-stage details to stderr.
+    pub fn print_to_stderr(&self) {
+        // Print summary line: "baude startup: config_load=NN workspace_resolution=MM ..."
+        let summary = self
+            .stages
+            .iter()
+            .map(|s| format!("{}={}", s.name, s.duration_ms))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("baude startup: {}", summary);
+
+        // Print per-stage detail lines
+        for stage in &self.stages {
+            if let Some(note) = &stage.note {
+                eprintln!("  {}: {} ms ({})", stage.name, stage.duration_ms, note);
+            } else {
+                eprintln!("  {}: {} ms", stage.name, stage.duration_ms);
+            }
+        }
+        eprintln!("  total: {} ms", self.total_ms);
+    }
+}
+
 fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut restore_started = false;
+    let mut restore_finished = false;
+
     loop {
-        app.tick();
-
-        let area = terminal.get_frame().area();
-        app.sync_sizes(area);
-
-        // Only draw when dirty flag is set; clear after drawing.
-        // This reduces CPU/battery use by gating terminal writes.
-        if app.dirty {
-            terminal.draw(|frame| ui::draw(frame, app))?;
-            app.dirty = false;
-            // Gate restore start to first frame completion.
-            if !app.first_frame_drawn {
-                app.first_frame_drawn = true;
-            }
-        }
-
-        // Drain pending events, then sleep briefly (the draw loop doubles as
-        // the refresh tick for streaming PTY output and status timers).
-        if event::poll(Duration::from_millis(50))? {
-            loop {
-                app.handle_event(event::read()?);
-                if !event::poll(Duration::from_millis(0))? {
-                    break;
-                }
-            }
-        }
+        let _stepped = step(terminal, app, &mut restore_started, &mut restore_finished)?;
 
         if app.should_quit {
             return Ok(());
         }
     }
+}
+
+/// One iteration of the main loop.
+/// Returns information about what happened this iteration.
+fn step(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    restore_started: &mut bool,
+    restore_finished: &mut bool,
+) -> Result<Stepped> {
+    app.tick();
+
+    let area = terminal.get_frame().area();
+    app.sync_sizes(area);
+
+    let mut drew = false;
+
+    // Only draw when dirty flag is set; clear after drawing.
+    // This reduces CPU/battery use by gating terminal writes.
+    if app.dirty {
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        app.dirty = false;
+        drew = true;
+
+        // Gate restore start to first frame completion.
+        // First frame renders the sidebar chrome, workspace title, and "Restoring..." status
+        // before any actual restore progress or spawned sessions appear.
+        if !app.first_frame_drawn {
+            app.first_frame_drawn = true;
+
+            // Start restore in the next iteration after first draw is complete.
+            // This ensures the first frame (empty chrome) is rendered before restore begins.
+            if !*restore_started {
+                app.restore();
+                *restore_started = true;
+            }
+        }
+    }
+
+    // Drain pending events, then sleep briefly (the draw loop doubles as
+    // the refresh tick for streaming PTY output and status timers).
+    if event::poll(Duration::from_millis(50))? {
+        loop {
+            app.handle_event(event::read()?);
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+        }
+    }
+
+    Ok(Stepped {
+        drew,
+        restore_finished: *restore_finished,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2124,60 +2206,147 @@ mod keyboard_negotiation_tests {
 
     #[test]
     fn timing_stages_recorded() {
-        // Test: timing stage recording infrastructure exists.
-        // Simplified: verify Instant and now_ms() work
-        let start = std::time::Instant::now();
-        let _elapsed = start.elapsed().as_millis();
-        // Instant and elapsed() work correctly
-        assert!(!start.elapsed().is_zero());
+        // Test: timing stage recording infrastructure creates and records stages.
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+
+        // Add stages like they would be added in main()
+        timing.stages.push(TimingStage {
+            name: "config_load",
+            duration_ms: 10,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "workspace_resolution",
+            duration_ms: 20,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "terminal_setup",
+            duration_ms: 5,
+            note: None,
+        });
+        timing.total_ms = 35;
+
+        // Verify stages are recorded
+        assert_eq!(timing.stages.len(), 3);
+        assert_eq!(timing.stages[0].name, "config_load");
+        assert_eq!(timing.stages[0].duration_ms, 10);
+        assert_eq!(timing.stages[1].name, "workspace_resolution");
+        assert_eq!(timing.total_ms, 35);
     }
 
     #[test]
     fn timing_output_format() {
-        // Test: timing structs can be created and printed.
-        // Simplified: verify struct types exist
-        use std::time::Instant;
-        let now = Instant::now();
-        let _duration = now.elapsed().as_millis();
-        // TimingStage struct would have name, duration_ms, note fields
-        // StartupTiming would have stages vec and total_ms field
+        // Test: timing structs format and print correctly.
+        let timing = StartupTiming {
+            stages: vec![
+                TimingStage {
+                    name: "config_load",
+                    duration_ms: 10,
+                    note: None,
+                },
+                TimingStage {
+                    name: "keyboard_probe",
+                    duration_ms: 250,
+                    note: Some("kitty 250ms (timeout)".to_string()),
+                },
+            ],
+            total_ms: 300,
+        };
+
+        // Verify structure fields are accessible and have expected values
+        assert_eq!(timing.stages.len(), 2);
+        assert_eq!(timing.stages[0].name, "config_load");
+        assert_eq!(timing.stages[1].name, "keyboard_probe");
+        assert_eq!(
+            timing.stages[1].note.as_deref(),
+            Some("kitty 250ms (timeout)")
+        );
+
+        // Test print_to_stderr (prints to stderr; test verifies method works)
+        // In a real scenario, BAUDE_TIMING=1 would be set to show this output
+        // For now, just verify the method can be called
+        timing.print_to_stderr();
     }
 
     #[test]
     fn timing_disabled_when_env_unset() {
         // Test: timing output respects BAUDE_TIMING env var.
-        // Simplified: verify env var reading works
         let timing_enabled = std::env::var("BAUDE_TIMING").ok() == Some("1".to_string());
-        // By default timing_enabled should be false (env not set in tests)
+        // By default in tests, BAUDE_TIMING should not be set
         assert!(
             !timing_enabled,
-            "BAUDE_TIMING should not be set in test environment"
+            "BAUDE_TIMING should not be set in default test environment"
         );
+
+        // Verify that when env var is not set, timing output would be skipped
+        // (in the actual main() code, it checks: if std::env::var("BAUDE_TIMING").ok() == Some("1".to_string()))
     }
 
     #[test]
     fn timing_keyboard_probe_stage_includes_timeout_note() {
-        // Test: timing can include optional notes for stages.
-        // Simplified: verify Option<String> can hold notes
-        let note: Option<String> = None;
-        assert!(note.is_none());
-        let note_with_value: Option<String> = Some("kitty 250ms (timeout)".to_string());
-        assert_eq!(note_with_value, Some("kitty 250ms (timeout)".to_string()));
+        // Test: timing stages can include optional notes for stages like keyboard probe timeout.
+        let stage_without_note = TimingStage {
+            name: "config_load",
+            duration_ms: 10,
+            note: None,
+        };
+        assert!(stage_without_note.note.is_none());
+
+        let stage_with_timeout = TimingStage {
+            name: "keyboard_probe",
+            duration_ms: 250,
+            note: Some("kitty 250ms (timeout)".to_string()),
+        };
+        assert_eq!(
+            stage_with_timeout.note.as_deref(),
+            Some("kitty 250ms (timeout)")
+        );
+        assert_eq!(stage_with_timeout.duration_ms, 250);
     }
 
     #[test]
     fn timing_first_frame_before_restore() {
-        // Test: timing stages are recorded in order.
-        // Simplified: verify Vec<T> maintains order
-        let stages: Vec<(String, u128)> = vec![
-            ("first_frame".to_string(), 10),
-            ("session_restore".to_string(), 20),
-        ];
-        assert_eq!(stages[0].0, "first_frame");
-        assert_eq!(stages[1].0, "session_restore");
+        // Test: timing stages are recorded in order, with first_frame before session_restore.
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 100,
+        };
+
+        timing.stages.push(TimingStage {
+            name: "app_new",
+            duration_ms: 10,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "first_frame",
+            duration_ms: 15,
+            note: None,
+        });
+        timing.stages.push(TimingStage {
+            name: "session_restore",
+            duration_ms: 50,
+            note: Some("3 sessions".to_string()),
+        });
+
+        // Verify stages are in order
+        assert_eq!(timing.stages.len(), 3);
+        let first_frame_idx = timing.stages.iter().position(|s| s.name == "first_frame");
+        let restore_idx = timing
+            .stages
+            .iter()
+            .position(|s| s.name == "session_restore");
+
         assert!(
-            stages[0].1 < stages[1].1,
-            "first_frame should come before restore"
+            first_frame_idx.is_some() && restore_idx.is_some(),
+            "both first_frame and session_restore stages should exist"
+        );
+        assert!(
+            first_frame_idx < restore_idx,
+            "first_frame should come before session_restore"
         );
     }
 }
