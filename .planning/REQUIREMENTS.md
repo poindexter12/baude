@@ -34,19 +34,19 @@ Approved scope: opening baude from any folder with no arguments lands in the rig
 
 ### Startup and idle performance
 
-- [ ] **PERF-01**: A timing facility (env var or flag) records each startup stage's duration so a slow launch can be diagnosed without a debugger
-- [ ] **PERF-02**: The first frame renders before session restore and the first metadata poll complete; restore runs lazily or off the render path
-- [ ] **PERF-03**: The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
-- [ ] **PERF-04**: Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
-- [ ] **PERF-05**: The TUI redraws only when something changed (dirty flag); working and waiting rows show a static busy/thinking glyph and a static needs-input marker instead of a wall-clock spinner or flash, so an idle baude sends no terminal writes and a working baude repaints only on child output, status transitions, input, or resize
-- [ ] **PERF-06**: Per-session metadata polling runs only for live, non-archived rows and skips unchanged files by mtime, so idle polling cost no longer scales with the number of sessions
-- [ ] **PERF-07**: An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and archiving a row can stop its child rather than only hiding the row
-- [ ] **PERF-08**: The usage poller can be disabled or slowed via config, and it never scans transcripts more often than the configured interval
+- [x] **PERF-01**: A timing facility (env var or flag) records each startup stage's duration so a slow launch can be diagnosed without a debugger
+- [x] **PERF-02**: The first frame renders before session restore and the first metadata poll complete; restore runs lazily or off the render path
+- [x] **PERF-03**: The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
+- [x] **PERF-04**: Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
+- [x] **PERF-05**: The TUI redraws only when something changed (dirty flag); working and waiting rows show a static busy/thinking glyph and a static needs-input marker instead of a wall-clock spinner or flash, so an idle baude sends no terminal writes and a working baude repaints only on child output, status transitions, input, or resize
+- [x] **PERF-06**: Per-session metadata polling runs only for live, non-archived rows and skips unchanged files by mtime, so idle polling cost no longer scales with the number of sessions
+- [x] **PERF-07**: An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and archiving a row can stop its child rather than only hiding the row
+- [x] **PERF-08**: The usage poller can be disabled or slowed via config, and it never scans transcripts more often than the configured interval
 
 ### Session UX
 
 - [ ] **UX-01**: Per-session pane focus (Claude pane or expanded shell pane) is remembered across session switches, and a key moves focus between the two panes while both are visible (GitHub #89)
-- [ ] **UX-02**: Session and checkout rows show a static single-character status code that reads without a key, replacing the filled/empty circle and spinner glyphs: `?` waiting for your input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable; each code keeps the existing per-state color (yellow waiting, blue busy, green completed, dark gray exited and archived, gray closed, yellow unavailable) so the colored letter is the icon, and a one-line legend is reachable in-app (sidebar footer or help view). Exact characters are confirmed in Phase 15 discuss; this set is the default
+- [x] **UX-02**: Session and checkout rows show a static single-character status code that reads without a key, replacing the filled/empty circle and spinner glyphs: `?` waiting for your input, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable; each code keeps the existing per-state color (yellow waiting, blue busy, green completed, dark gray exited and archived, gray closed, yellow unavailable) so the colored letter is the icon, and a one-line legend is reachable in-app (sidebar footer or help view). Exact characters are confirmed in Phase 15 discuss; this set is the default
 
 ### Release
 
@@ -103,16 +103,16 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WTID-02 | Phase 14 | Complete |
 | WTID-03 | Phase 14 | Complete |
 | WTID-04 | Phase 14 | Complete |
-| PERF-01 | Phase 15 | Pending |
-| PERF-02 | Phase 15 | Pending |
-| PERF-03 | Phase 15 | Pending |
-| PERF-04 | Phase 15 | Pending |
-| PERF-05 | Phase 15 | Pending |
-| PERF-06 | Phase 15 | Pending |
-| PERF-07 | Phase 15 | Pending |
-| PERF-08 | Phase 15 | Pending |
+| PERF-01 | Phase 15 | Complete |
+| PERF-02 | Phase 15 | Complete |
+| PERF-03 | Phase 15 | Complete |
+| PERF-04 | Phase 15 | Complete |
+| PERF-05 | Phase 15 | Complete |
+| PERF-06 | Phase 15 | Complete |
+| PERF-07 | Phase 15 | Complete |
+| PERF-08 | Phase 15 | Complete |
 | UX-01 | Phase 16 | Pending |
-| UX-02 | Phase 15 | Pending |
+| UX-02 | Phase 15 | Complete |
 | SHIP-05 | Phase 17 | Pending |
 
 **Coverage:**

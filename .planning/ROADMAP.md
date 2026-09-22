@@ -49,7 +49,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 - [x] **Phase 13: Workspace Derivation and New-Session/Open Defaults** - Opening baude from any folder uses the right workspace and repository (completed 2026-09-20)
 - [x] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions (completed 2026-09-21)
-- [ ] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery
+- [x] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery (completed 2026-09-22)
 - [ ] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches
 - [ ] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation
 
@@ -175,7 +175,7 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 |-------|----------------|--------|-----------|
 | 13. Workspace Derivation and New-Session/Open Defaults | 3/3 | Complete    | 2026-09-20 |
 | 14. Managed Worktree Identity | 3/3 | Complete    | 2026-09-21 |
-| 15. Startup and Idle Performance | 4/4 | In Progress|  |
+| 15. Startup and Idle Performance | 4/4 | Complete    | 2026-09-22 |
 | 16. Pane Focus UX | 0/? | Not started | - |
 | 17. Validation and v2.3.0 Release | 0/? | Not started | - |
 
