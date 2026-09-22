@@ -3112,6 +3112,7 @@ impl App {
             pending_permission: None,
             permission_decision: None,
             child_suspended: false,
+            poll_meta_calls_for_test: std::cell::Cell::new(0),
         };
         self.sessions.push(session);
         match owner {
@@ -11367,18 +11368,58 @@ mod tests {
 
     #[test]
     fn archived_skip_poll() {
-        // Archived sessions should not be polled: verify the field exists
-        // and the gating logic in app.tick() works
-        // Test that the polling gate logic is in place by verifying the code compiles
-        // Actual behavior tested in integration tests
-        assert!(true);
+        // Archived sessions should not be polled: verify the gating logic
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("archived-skip-poll", 1);
+
+        // Find the first session
+        let session_idx = 0;
+
+        // Verify poll_meta_calls starts at 0
+        assert_eq!(app.sessions[session_idx].poll_meta_calls_for_test.get(), 0);
+
+        // Archive the session
+        app.sessions[session_idx].archived = true;
+
+        // Call tick which calls poll_meta for non-archived sessions
+        app.tick();
+
+        // Verify poll_meta was NOT called for this archived session
+        assert_eq!(
+            app.sessions[session_idx].poll_meta_calls_for_test.get(),
+            0,
+            "archived session should not be polled"
+        );
+
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn exited_skip_poll() {
-        // Exited sessions should not be polled: verify the is_exited method works
-        // This is a basic behavior test - just verify the field exists
-        assert!(true); // Placeholder: actual polling behavior tested in integration
+        // Exited sessions should not be polled: verify the gating logic
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("exited-skip-poll", 1);
+
+        // Find the first session
+        let session_idx = 0;
+
+        // Verify poll_meta_calls starts at 0
+        assert_eq!(app.sessions[session_idx].poll_meta_calls_for_test.get(), 0);
+
+        // Kill the child process to make it exited
+        app.sessions[session_idx].kill();
+
+        // Call tick which should skip poll_meta for exited sessions
+        app.tick();
+
+        // Verify poll_meta was NOT called for this exited session
+        assert_eq!(
+            app.sessions[session_idx].poll_meta_calls_for_test.get(),
+            0,
+            "exited session should not be polled"
+        );
+
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -11391,8 +11432,28 @@ mod tests {
 
     #[test]
     fn stop_policy_kills_child_on_archive() {
-        // With policy=stop, verify child_suspended is reset by kill()
-        // Basic test: verify the child_suspended field exists and behaves correctly
-        assert!(true); // Placeholder: actual kill behavior tested in integration
+        // With policy=stop, verify child is killed on archive
+        let (_fixture, mut app, _order, root) = saved_sessions_fixture("stop-policy-kills", 1);
+
+        // Find the first session
+        let session_idx = 0;
+
+        // Verify child is not exited initially
+        assert!(!app.sessions[session_idx].claude.is_exited());
+
+        // Call stop_idle_child which simulates the "stop" policy
+        app.sessions[session_idx].stop_idle_child();
+
+        // Verify child is now exited
+        assert!(
+            app.sessions[session_idx].claude.is_exited(),
+            "stop policy should kill the child"
+        );
+
+        // Verify child_suspended is false (killed, not suspended)
+        assert!(!app.sessions[session_idx].child_suspended);
+
+        app.kill_all();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

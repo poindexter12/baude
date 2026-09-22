@@ -92,6 +92,8 @@ pub struct Session {
     /// Idle child is suspended via SIGSTOP. Set by suspend_idle_child(),
     /// cleared by resume_idle_child() or kill(). Shows "suspended" in status.
     pub child_suspended: bool,
+    /// Test-only counter: number of times poll_meta has been called.
+    pub poll_meta_calls_for_test: std::cell::Cell<u32>,
 }
 
 impl Session {
@@ -311,6 +313,9 @@ impl Session {
     }
 
     pub fn poll_meta(&mut self) {
+        self.poll_meta_calls_for_test
+            .set(self.poll_meta_calls_for_test.get() + 1);
+
         if self.claude.is_exited() {
             return;
         }
