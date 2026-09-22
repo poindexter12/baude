@@ -201,6 +201,7 @@ version = "2.1.5"
 dependencies = [
  "anyhow",
  "baude-core",
+ "libc",
  "percent-encoding",
  "ratatui",
  "serde",

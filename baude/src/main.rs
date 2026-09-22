@@ -128,35 +128,42 @@ impl ProbeIo for StdinProbeIo {
     }
 
     fn read_with_timeout(&mut self, remaining: Duration) -> std::io::Result<Option<Vec<u8>>> {
-        use std::io::Read;
-        use std::sync::mpsc;
-        use std::thread;
-
-        let (tx, rx) = mpsc::channel();
-
-        // Spawn a thread to read from stdin
-        thread::spawn(move || {
-            let mut buffer = vec![0u8; 1024];
-            match std::io::stdin().read(&mut buffer) {
-                Ok(n) if n > 0 => {
-                    buffer.truncate(n);
-                    let _ = tx.send(Ok(buffer));
-                }
-                Ok(_) => {
-                    let _ = tx.send(Ok(Vec::new()));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
+        // Poll fd 0 directly instead of parking a reader thread on stdin: a
+        // thread that outlives the timeout would keep reading and swallow the
+        // user's first keystrokes once crossterm owns the terminal.
+        #[cfg(unix)]
+        {
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut fds = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `fds` is a valid, initialized pollfd array of length 1.
+            let ready = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
+            if ready < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-        });
-
-        // Wait for result with timeout
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(buffer)) if !buffer.is_empty() => Ok(Some(buffer)),
-            Ok(Ok(_)) => Ok(None),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(None), // Timeout
+            if ready == 0 || fds.revents & libc::POLLIN == 0 {
+                return Ok(None);
+            }
+            let mut buffer = vec![0u8; 1024];
+            // SAFETY: `buffer` is a valid writable region of the given length.
+            let n =
+                unsafe { libc::read(0, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len()) };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if n == 0 {
+                return Ok(None);
+            }
+            buffer.truncate(n as usize);
+            Ok(Some(buffer))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = remaining;
+            Ok(None)
         }
     }
 }
