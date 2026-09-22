@@ -172,10 +172,15 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("BAUDED_BIND").ok())
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
+    // Record total startup time
+    let total_start = std::time::Instant::now();
+    let mut startup_timing = timing::StartupTiming::new(0);
+
     // Daemon startup mirrors TUI startup: canonicalize the current directory,
     // call the shared workspace resolver, claim the lock, and record any
     // derived bindings. The daemon's lock base is "daemon-state" to distinguish
     // it from the TUI's "state" lock.
+    let config_start = std::time::Instant::now();
     let launch_dir = match std::fs::canonicalize(std::env::current_dir()?) {
         Ok(dir) => dir,
         Err(e) => {
@@ -184,6 +189,8 @@ async fn main() -> Result<()> {
         }
     };
     let config = baude_core::persist::load_config();
+    startup_timing.add_stage("config_load", config_start.elapsed().as_millis());
+
     let env = baude_core::launch::StartEnv {
         ws_env: std::env::var("BAUDE_WORKSPACE").ok(),
         backend_env: std::env::var("BAUDE_BACKEND").ok(),
@@ -211,8 +218,15 @@ async fn main() -> Result<()> {
             }
         };
 
+    let state_start = std::time::Instant::now();
     let mut manager = Manager::new(manager::default_claude_cmd(), true);
     let restored = manager.restore();
+    startup_timing.add_stage("state_load", state_start.elapsed().as_millis());
+
+    let listener_start = std::time::Instant::now();
+    // Record timing stages before moving manager
+    let mut timing_for_mgr = startup_timing.clone();
+
     let state = Arc::new(Mutex::new(manager));
     // opencode prompt mode: every restored session needs its permission
     // watcher back (create/restart wire theirs in the API handlers).
@@ -261,6 +275,15 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    timing_for_mgr.add_stage("listener_bound", listener_start.elapsed().as_millis());
+    timing_for_mgr.total_ms = total_start.elapsed().as_millis();
+
+    // Update manager with final timing
+    {
+        let mut m = lock(&state);
+        m.startup_timing = timing_for_mgr;
+    }
+
     let ws = baude_core::workspace::active();
     println!(
         "bauded listening on http://{bind} — {} ({restored} session(s) restored)",
