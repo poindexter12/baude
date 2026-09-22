@@ -87,7 +87,7 @@ fn ensure_daemon(config: &baude_core::persist::Config) -> Option<String> {
 }
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyboardEnhancementFlags, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
@@ -2108,10 +2108,16 @@ mod keyboard_negotiation_tests {
         let _redirect = TestRedirect::new(&tmp);
 
         let mut app = App::new(tmp.clone());
-        assert!(!app.first_frame_drawn, "first_frame_drawn should start as false");
+        assert!(
+            !app.first_frame_drawn,
+            "first_frame_drawn should start as false"
+        );
         // In run loop, after first draw, it's set to true
         app.first_frame_drawn = true;
-        assert!(app.first_frame_drawn, "first_frame_drawn should be settable");
+        assert!(
+            app.first_frame_drawn,
+            "first_frame_drawn should be settable"
+        );
     }
 
     #[test]
@@ -2140,7 +2146,10 @@ mod keyboard_negotiation_tests {
         // Simplified: verify env var reading works
         let timing_enabled = std::env::var("BAUDE_TIMING").ok() == Some("1".to_string());
         // By default timing_enabled should be false (env not set in tests)
-        assert!(!timing_enabled, "BAUDE_TIMING should not be set in test environment");
+        assert!(
+            !timing_enabled,
+            "BAUDE_TIMING should not be set in test environment"
+        );
     }
 
     #[test]
@@ -2163,6 +2172,9 @@ mod keyboard_negotiation_tests {
         ];
         assert_eq!(stages[0].0, "first_frame");
         assert_eq!(stages[1].0, "session_restore");
-        assert!(stages[0].1 < stages[1].1, "first_frame should come before restore");
+        assert!(
+            stages[0].1 < stages[1].1,
+            "first_frame should come before restore"
+        );
     }
 }

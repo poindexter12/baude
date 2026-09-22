@@ -3747,7 +3747,8 @@ impl App {
                 continue;
             }
             let current_gen = session.screen_generation();
-            let last_known = self.last_known_screen_gen
+            let last_known = self
+                .last_known_screen_gen
                 .get(&session.id)
                 .copied()
                 .unwrap_or(0);
@@ -3758,7 +3759,10 @@ impl App {
         }
 
         // Update waiting-row timer at 1 Hz only when waiting rows are visible
-        let has_waiting_rows = self.sessions.iter().any(|s| !s.archived && s.status() == baude_core::session::Status::Waiting);
+        let has_waiting_rows = self
+            .sessions
+            .iter()
+            .any(|s| !s.archived && s.status() == baude_core::session::Status::Waiting);
         if has_waiting_rows {
             if now_ms().saturating_sub(self.last_waiting_update) >= 1000 {
                 self.dirty = true;
@@ -10998,13 +11002,19 @@ mod tests {
 
         let mut app = App::new(tmp.clone());
         // first_frame_drawn starts false
-        assert!(!app.first_frame_drawn, "first_frame_drawn should start false");
+        assert!(
+            !app.first_frame_drawn,
+            "first_frame_drawn should start false"
+        );
         // Code that would use this gate: if first_frame_drawn { restore_progress... }
         if app.first_frame_drawn {
             // Restore would only run here
         }
         // Set it and verify it's true
         app.first_frame_drawn = true;
-        assert!(app.first_frame_drawn, "first_frame_drawn should be settable to true");
+        assert!(
+            app.first_frame_drawn,
+            "first_frame_drawn should be settable to true"
+        );
     }
 }
