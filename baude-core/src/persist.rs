@@ -842,6 +842,8 @@ pub struct RestoreQueue {
     pub phase: RestorePhase,
     pub total_count: usize,
     pub current_index: usize,
+    /// Paused sessions and their ProcessIdentity (populated during Phase A)
+    pub paused_sessions: Vec<(SavedSession, crate::repository::ProcessIdentity)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
