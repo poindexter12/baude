@@ -11369,23 +11369,35 @@ mod tests {
     #[test]
     fn archived_skip_poll() {
         // Archived sessions should not be polled: verify the gating logic
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("archived-skip-poll", 1);
+        let fixture = admission_repo("archived-skip-poll");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
 
-        // Find the first session
-        let session_idx = 0;
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+
+        // Admit repository to create a session
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert_eq!(app.sessions.len(), 1, "one session created");
 
         // Verify poll_meta_calls starts at 0
-        assert_eq!(app.sessions[session_idx].poll_meta_calls_for_test.get(), 0);
+        assert_eq!(app.sessions[0].poll_meta_calls_for_test.get(), 0);
 
         // Archive the session
-        app.sessions[session_idx].archived = true;
+        app.sessions[0].archived = true;
 
         // Call tick which calls poll_meta for non-archived sessions
         app.tick();
 
         // Verify poll_meta was NOT called for this archived session
         assert_eq!(
-            app.sessions[session_idx].poll_meta_calls_for_test.get(),
+            app.sessions[0].poll_meta_calls_for_test.get(),
             0,
             "archived session should not be polled"
         );
@@ -11397,23 +11409,35 @@ mod tests {
     #[test]
     fn exited_skip_poll() {
         // Exited sessions should not be polled: verify the gating logic
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("exited-skip-poll", 1);
+        let fixture = admission_repo("exited-skip-poll");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
 
-        // Find the first session
-        let session_idx = 0;
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+
+        // Admit repository to create a session
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert_eq!(app.sessions.len(), 1, "one session created");
 
         // Verify poll_meta_calls starts at 0
-        assert_eq!(app.sessions[session_idx].poll_meta_calls_for_test.get(), 0);
+        assert_eq!(app.sessions[0].poll_meta_calls_for_test.get(), 0);
 
         // Kill the child process to make it exited
-        app.sessions[session_idx].kill();
+        app.sessions[0].kill();
 
         // Call tick which should skip poll_meta for exited sessions
         app.tick();
 
         // Verify poll_meta was NOT called for this exited session
         assert_eq!(
-            app.sessions[session_idx].poll_meta_calls_for_test.get(),
+            app.sessions[0].poll_meta_calls_for_test.get(),
             0,
             "exited session should not be polled"
         );
@@ -11433,25 +11457,37 @@ mod tests {
     #[test]
     fn stop_policy_kills_child_on_archive() {
         // With policy=stop, verify child is killed on archive
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("stop-policy-kills", 1);
+        let fixture = admission_repo("stop-policy-kills");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
 
-        // Find the first session
-        let session_idx = 0;
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+
+        // Admit repository to create a session
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert_eq!(app.sessions.len(), 1, "one session created");
 
         // Verify child is not exited initially
-        assert!(!app.sessions[session_idx].claude.is_exited());
+        assert!(!app.sessions[0].claude.is_exited());
 
         // Call stop_idle_child which simulates the "stop" policy
-        app.sessions[session_idx].stop_idle_child();
+        app.sessions[0].stop_idle_child();
 
         // Verify child is now exited
         assert!(
-            app.sessions[session_idx].claude.is_exited(),
+            app.sessions[0].claude.is_exited(),
             "stop policy should kill the child"
         );
 
         // Verify child_suspended is false (killed, not suspended)
-        assert!(!app.sessions[session_idx].child_suspended);
+        assert!(!app.sessions[0].child_suspended);
 
         app.kill_all();
         let _ = std::fs::remove_dir_all(&root);
