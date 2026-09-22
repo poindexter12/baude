@@ -259,9 +259,7 @@ impl ClaudeMeta {
             dir.join(format!("{pid}.json"))
         } else {
             // Fallback path: we'll need to scan, so mtime gate doesn't apply
-            let session_mtime = fs::metadata(&dir)
-                .and_then(|m| m.modified())
-                .ok();
+            let session_mtime = fs::metadata(&dir).and_then(|m| m.modified()).ok();
             if session_mtime == self.last_session_mtime {
                 return; // Unchanged, skip entire scan
             }
@@ -296,9 +294,7 @@ impl ClaudeMeta {
         };
 
         // Exact pid match path with mtime gate
-        let session_mtime = fs::metadata(&session_file)
-            .and_then(|m| m.modified())
-            .ok();
+        let session_mtime = fs::metadata(&session_file).and_then(|m| m.modified()).ok();
         if session_mtime == self.last_session_mtime {
             return; // Unchanged, skip read
         }
@@ -504,9 +500,7 @@ impl ClaudeMeta {
         }
 
         // Gate on mtime: if events file mtime unchanged since last poll, skip read
-        let events_mtime = fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok();
+        let events_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
         if events_mtime == self.last_events_mtime {
             return; // Unchanged, skip read
         }

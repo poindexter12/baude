@@ -167,7 +167,10 @@ mod tests {
         // UsagePoller with disabled config should not spawn thread
         let poller = UsagePoller::start(Some(0));
         // Test variant doesn't spawn thread regardless, so verify it's inert
-        assert!(poller.is_inert_for_test(), "disabled poller should be inert");
+        assert!(
+            poller.is_inert_for_test(),
+            "disabled poller should be inert"
+        );
     }
 
     #[test]
