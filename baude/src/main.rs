@@ -688,7 +688,13 @@ fn run(
 /// `App` so `run()` and the tests share one recorder and `App` never owns a
 /// startup clock.
 pub(crate) struct LoopTiming {
-    origin: std::time::Instant,
+    /// When the previous loop stage was recorded. Each stage reports the time
+    /// since this mark, so every row in the timing report is a real duration.
+    /// Reporting elapsed-since-origin here instead made the three loop stages
+    /// print the SAME number under a `ms` column of per-stage durations, which
+    /// reads as "the first frame took two seconds" when it means "the first
+    /// frame happened two seconds in".
+    last_mark: std::time::Instant,
     first_frame_recorded: bool,
     restore_recorded: bool,
     first_poll_recorded: bool,
@@ -697,7 +703,7 @@ pub(crate) struct LoopTiming {
 impl LoopTiming {
     pub(crate) fn start() -> Self {
         Self {
-            origin: std::time::Instant::now(),
+            last_mark: std::time::Instant::now(),
             first_frame_recorded: false,
             restore_recorded: false,
             first_poll_recorded: false,
@@ -709,28 +715,39 @@ impl LoopTiming {
     /// `first_metadata_poll` once the first metadata poll has run. Each stage
     /// is recorded exactly once, in that order, measured from loop entry.
     pub(crate) fn record(&mut self, timing: &mut StartupTiming, stepped: &Stepped, app: &App) {
-        let elapsed = self.origin.elapsed().as_millis();
+        let now = std::time::Instant::now();
+        // Each stage reports time since the previous mark, so the column is
+        // uniformly per-stage durations rather than a mix of durations and
+        // timestamps.
+        let take = |mark: &mut std::time::Instant| {
+            let d = now.duration_since(*mark).as_millis();
+            *mark = now;
+            d
+        };
         if !self.first_frame_recorded && stepped.drew {
             self.first_frame_recorded = true;
+            let d = take(&mut self.last_mark);
             timing.stages.push(TimingStage {
                 name: "first_frame",
-                duration_ms: elapsed,
+                duration_ms: d,
                 note: None,
             });
         }
         if self.first_frame_recorded && !self.restore_recorded && stepped.restore_finished {
             self.restore_recorded = true;
+            let d = take(&mut self.last_mark);
             timing.stages.push(TimingStage {
                 name: "session_restore",
-                duration_ms: elapsed,
+                duration_ms: d,
                 note: Some(format!("{} sessions", app.sessions.len())),
             });
         }
         if self.restore_recorded && !self.first_poll_recorded && app.has_polled_meta() {
             self.first_poll_recorded = true;
+            let d = take(&mut self.last_mark);
             timing.stages.push(TimingStage {
                 name: "first_metadata_poll",
-                duration_ms: elapsed,
+                duration_ms: d,
                 note: None,
             });
         }
@@ -2626,6 +2643,72 @@ mod keyboard_negotiation_tests {
             Some("kitty 250ms (timeout)")
         );
         assert_eq!(stage_with_timeout.duration_ms, 250);
+    }
+
+    #[test]
+    fn loop_timing_stages_are_durations_not_timestamps() {
+        // The `ms` column is per-stage durations. Recording elapsed-since-origin
+        // for the three loop stages made them print the SAME number, which reads
+        // as "the first frame took two seconds" when it means "the first frame
+        // happened two seconds in" — misleading in exactly the report that
+        // exists to diagnose slow startup.
+        use baude_core::testing::TestRedirect;
+        let tmp =
+            std::env::temp_dir().join(format!("baude-test-timing-units-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _redirect = TestRedirect::new(&tmp);
+        let _identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("timing-units".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let mut app = App::new(tmp.clone());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("test terminal");
+        let mut timing = StartupTiming {
+            stages: Vec::new(),
+            total_ms: 0,
+        };
+        let mut loop_timing = LoopTiming::start();
+        let (mut started, mut finished) = (false, false);
+        // A deliberate pause before the first step: under the old code every
+        // loop stage would inherit that same elapsed value.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        for _ in 0..4 {
+            let s = step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
+                .expect("step");
+            loop_timing.record(&mut timing, &s, &app);
+        }
+        let loop_stages: Vec<_> = timing
+            .stages
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.name,
+                    "first_frame" | "session_restore" | "first_metadata_poll"
+                )
+            })
+            .collect();
+        assert!(
+            loop_stages.len() >= 2,
+            "expected the loop stages to be recorded, got {:?}",
+            timing.stages.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+        let first = loop_stages[0].duration_ms;
+        assert!(
+            first >= 50,
+            "first_frame should carry the real pre-frame duration, got {first} ms"
+        );
+        for stage in &loop_stages[1..] {
+            assert!(
+                stage.duration_ms < first,
+                "{} reported {} ms, which is the elapsed-since-start value, not its own duration",
+                stage.name,
+                stage.duration_ms
+            );
+        }
     }
 
     #[test]
