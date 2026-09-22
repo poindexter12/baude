@@ -149,3 +149,26 @@ pub fn human_cost(usd: Option<f64>) -> String {
         None => "—".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_disabled_spawns_no_thread() {
+        // UsagePoller with disabled config should not spawn thread
+        todo!("Test UsagePoller::start(Some(0)) spawns no thread")
+    }
+
+    #[test]
+    fn poll_disabled_returns_inert_poller() {
+        // Disabled poller should still be valid
+        todo!("Test disabled poller is inert but doesn't panic")
+    }
+
+    #[test]
+    fn poll_enabled_spawns_thread() {
+        // UsagePoller with enabled config should spawn thread
+        todo!("Test UsagePoller::start(Some(30)) spawns thread")
+    }
+}

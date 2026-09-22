@@ -11337,4 +11337,28 @@ mod tests {
         app.kill_all();
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn archived_skip_poll() {
+        // Archived sessions should not be polled
+        todo!("Test that poll_meta is NOT called for archived sessions")
+    }
+
+    #[test]
+    fn exited_skip_poll() {
+        // Exited sessions should not be polled
+        todo!("Test that poll_meta is NOT called for exited sessions")
+    }
+
+    #[test]
+    fn auto_archive_applies_idle_child_policy() {
+        // Auto-archive should apply the idle_child_policy
+        todo!("Test auto-archive applies suspend/stop/keep policy")
+    }
+
+    #[test]
+    fn stop_policy_kills_child_on_archive() {
+        // With policy=stop, archive should kill the child
+        todo!("Test policy=stop kills child, row becomes exited")
+    }
 }

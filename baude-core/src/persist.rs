@@ -1967,4 +1967,28 @@ mod tests {
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn idle_child_policy_env_override() {
+        // Environment variable should override config value
+        todo!("Test BAUDE_IDLE_CHILD_POLICY env override works via pure resolver")
+    }
+
+    #[test]
+    fn usage_poll_secs_option_parses() {
+        // Config usage_poll_secs should parse correctly
+        todo!("Test usage_poll_secs parses from config")
+    }
+
+    #[test]
+    fn usage_poll_secs_zero_disables() {
+        // Config usage_poll_secs=0 should disable poller
+        todo!("Test usage_poll_secs=0 disables poller via pure resolver")
+    }
+
+    #[test]
+    fn usage_poll_secs_env_override() {
+        // Environment variable should override config value
+        todo!("Test BAUDE_USAGE_POLL_SECS env override works via pure resolver")
+    }
 }

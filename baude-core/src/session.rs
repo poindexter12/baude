@@ -1073,4 +1073,46 @@ mod tests {
             IdleKind::NeedsInput
         );
     }
+
+    #[test]
+    fn mtime_unchanged_skip_read() {
+        // When metadata file mtime is unchanged, backend should not read it
+        todo!("Test that backend::read_metadata is NOT called when mtime unchanged")
+    }
+
+    #[test]
+    fn mtime_changed_reads_metadata() {
+        // When metadata file mtime changed, backend should read it
+        todo!("Test that backend::read_metadata IS called when mtime changed")
+    }
+
+    #[test]
+    fn suspend_refuses_on_identity_mismatch() {
+        // Suspend should fail if process identity doesn't match
+        todo!("Test suspend_idle_child returns error when process identity changed")
+    }
+
+    #[test]
+    fn suspend_sends_sigstop_to_group_leader_only() {
+        // Suspend should send SIGSTOP to process group if child is group leader
+        todo!("Test suspend_idle_child sends SIGSTOP to process group")
+    }
+
+    #[test]
+    fn resume_refuses_on_identity_mismatch() {
+        // Resume should fail if process identity doesn't match
+        todo!("Test resume_idle_child returns error when process identity changed")
+    }
+
+    #[test]
+    fn suspend_process_becomes_stopped() {
+        // After suspend, process state should be T (stopped)
+        todo!("Test suspended process has state T")
+    }
+
+    #[test]
+    fn suspend_resume_cycle() {
+        // Suspend and resume should work together
+        todo!("Test suspend/resume cycle maintains process state")
+    }
 }

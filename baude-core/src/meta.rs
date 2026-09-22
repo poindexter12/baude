@@ -217,6 +217,12 @@ pub struct ClaudeMeta {
     /// accepts EITHER a resolved session_id (claude) or this flag (opencode),
     /// or the first message could never be delivered. Never set by claude.
     pub backend_ready: bool,
+    /// Last recorded modification time of session.json. Used to gate reads:
+    /// if mtime unchanged, skip read (cost: one stat call only).
+    pub last_session_mtime: Option<SystemTime>,
+    /// Last recorded modification time of hook-events.jsonl. Used to gate reads:
+    /// if mtime unchanged, skip read (cost: one stat call only).
+    pub last_events_mtime: Option<SystemTime>,
 }
 
 impl ClaudeMeta {
@@ -1483,5 +1489,11 @@ mod tests {
         assert_eq!(meta.transcript_path(), Some(transcript.as_path()));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mtime_gate_tracks_last_session_mtime() {
+        // Metadata mtime tracking should prevent reads when mtime unchanged
+        todo!("Test that ClaudeMeta tracks and gates mtime for session.json and hook-events.jsonl")
     }
 }
