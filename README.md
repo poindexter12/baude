@@ -229,13 +229,26 @@ compatibility is guaranteed anywhere else. Each release records the exact
 terminal identities and OS versions the gestures were observed in, in that
 release's smoke evidence.
 
-## Status icons
+## Status codes
 
-- `●` waiting for your input — flashes in place, with a wait timer
-- `◐` working — animated spinner
-- `✗` exited (`r` to restart)
+Status is shown as a static single-character code in the sidebar, never
+animated. Each row displays its code in a fixed color:
 
-Waiting is detected from PTY output silence: the CLI streams spinner output
+- `?` waiting for your input (yellow, bold) — with a wait timer
+- `B` busy — claude is working (blue)
+- `✓` completed — turn finished, your move (green)
+- `✗` exited (dark gray; `r` to restart)
+- `-` closed checkout, no live session (gray)
+- `A` archived (dark gray)
+- `!` unavailable or missing (yellow)
+
+The codes are static: nothing in the sidebar animates, so an idle baude
+issues zero terminal writes. A one-line legend
+(`? waiting  B busy  ✓ done  ✗ exited  - closed  A archived  ! unavailable`)
+sits above the usage footer when the terminal is at least 20 rows tall, and
+`?` (help) lists the codes.
+
+Waiting is detected from PTY output silence: the CLI streams output
 continuously while working, so ~2s of quiet means it's your turn. Better
 sources take precedence when present
 (`exited > hook event > session file > output silence`): Claude Code's own
@@ -461,6 +474,82 @@ the profile's shell.
   (with sound, once per turn), a finished turn, or an exit (both silent).
   Covers local and remote sidebar sessions; archived sessions are muted.
   Default `true` (no-op off macOS); `BAUDE_NOTIFY=0` env overrides.
+- `idle_child_policy` — when a session auto-archives, the idle Claude child
+  can be `keep` (default, today's behavior), `suspend` (SIGSTOP the process
+  group; resumes on unarchive or selection), or `stop` (kill the child; row
+  becomes exited and is resumable with `r`). Unix only; other platforms
+  treat `suspend` like `keep`. `BAUDE_IDLE_CHILD_POLICY` env overrides.
+- `usage_poll_secs` — interval for the usage-poller thread to refresh the
+  footer's usage display; default matches today's polling interval. Set to
+  `0` to disable the poller entirely (footer shows `usage: off`).
+  `BAUDE_USAGE_POLL_SECS` env overrides.
+
+## Performance
+
+baude aims for minimal CPU and battery cost while idle.
+
+### Startup Timing
+
+To diagnose slow startup, run with the `BAUDE_TIMING=1` environment
+variable:
+
+```sh
+BAUDE_TIMING=1 baude
+```
+
+Timing stages will be printed to stderr when baude exits:
+
+- `config_load` — Config file read and parsed
+- `workspace_resolution` — Folder bindings and repository root derived
+- `keyboard_probe` — Kitty keyboard protocol negotiation (250 ms timeout)
+- `terminal_setup` — Terminal::new and mode setup
+- `app_new` — App struct initialized
+- `first_frame` — First frame drawn (before session restore)
+- `session_restore` — All saved sessions admitted (N sessions per second)
+- `first_metadata_poll` — First metadata poll cycle completed
+- `total` — Wall-clock duration from startup to exit
+
+bauded (the daemon) exposes the same stages as a `startup_ms` map on the
+`/info` API endpoint.
+
+### Idle Behavior
+
+With no input or status changes, baude issues zero terminal writes. Status
+codes are static single-character glyphs that never animate. The waiting-row
+timer updates at 1 Hz only when waiting rows are visible. Archived and
+exited rows are skipped during metadata polling, and unchanged files are
+gated on mtime comparison.
+
+A one-line legend appears above the usage footer when the terminal is at
+least 20 rows tall.
+
+### idle_child_policy
+
+When a session auto-archives after `auto_archive_minutes`, the idle Claude
+child process can be controlled:
+
+- `keep` — Leave the child running (default, today's behavior)
+- `suspend` — Send SIGSTOP to the child's process group; resumes on
+  unarchive or selection (Unix only)
+- `stop` — Terminate the child; becomes exited and is resumable with the
+  restart key
+
+Override with `BAUDE_IDLE_CHILD_POLICY=suspend` or
+`BAUDE_IDLE_CHILD_POLICY=stop`.
+
+### usage_poll_secs
+
+The usage poller runs in a background thread and refreshes the footer's
+usage display every N seconds. Set to `0` to disable:
+
+```json
+{
+  "usage_poll_secs": 0
+}
+```
+
+Or override with `BAUDE_USAGE_POLL_SECS=30` (seconds). When disabled, the
+footer shows `usage: off`.
 
 ## Workspaces
 
