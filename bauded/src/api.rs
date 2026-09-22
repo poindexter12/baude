@@ -1822,19 +1822,11 @@ mod tests {
     #[tokio::test]
     async fn info_reports_daemon_startup_ms() {
         let (_scope, app) = app();
-        let request = Request::builder()
-            .uri("/info")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/info").body(Body::empty()).unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
         // Check that startup_ms is present and is an object

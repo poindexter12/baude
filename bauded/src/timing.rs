@@ -22,6 +22,7 @@ impl StartupTiming {
     }
 
     /// Add a timing stage.
+    #[allow(dead_code)]
     pub fn add_stage(&mut self, name: &'static str, duration_ms: u128) {
         self.stages.push(TimingStage { name, duration_ms });
     }

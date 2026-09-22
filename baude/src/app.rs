@@ -1361,6 +1361,7 @@ impl App {
     }
 
     /// Phase A of restore: spawn paused sessions, register identities, perform one durable save.
+    #[allow(dead_code)]
     pub(crate) fn restore_phase_a(&mut self) -> Result<(), String> {
         if let Some(queue) = &mut self.restore_queue {
             if queue.phase != persist::RestorePhase::PausedAndRegistered {
@@ -1376,6 +1377,7 @@ impl App {
     }
 
     /// Phase B of restore: unpause and admit one session per tick.
+    #[allow(dead_code)]
     pub(crate) fn restore_phase_b(&mut self) -> Result<bool, String> {
         if let Some(queue) = &mut self.restore_queue {
             if queue.phase != persist::RestorePhase::Unpausing {
