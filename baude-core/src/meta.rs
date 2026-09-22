@@ -249,38 +249,63 @@ impl ClaudeMeta {
     /// Find this session's `sessions/<pid>.json`. Exact pid match wins
     /// (sessions spawned with `exec claude` — the child IS claude); otherwise
     /// match by cwd and pick the file whose start time is closest to ours.
+    ///
+    /// Gate on mtime: if mtime unchanged since last poll, skip read (cost: one stat call).
     fn poll_session_file(&mut self, cwd: &Path, pid: Option<u32>, spawn_unix_ms: u64) {
         let dir = claude_config_dir().join("sessions");
-        if let Some(pid) = pid {
-            if let Some(v) = read_json(&dir.join(format!("{pid}.json"))) {
-                self.apply_session_file(&v);
-                return;
+
+        // Check mtime before reading (low-cost stat call)
+        let session_file = if let Some(pid) = pid {
+            dir.join(format!("{pid}.json"))
+        } else {
+            // Fallback path: we'll need to scan, so mtime gate doesn't apply
+            let session_mtime = fs::metadata(&dir)
+                .and_then(|m| m.modified())
+                .ok();
+            if session_mtime == self.last_session_mtime {
+                return; // Unchanged, skip entire scan
             }
-        }
-        let cwd_str = cwd.to_string_lossy();
-        let Ok(entries) = fs::read_dir(&dir) else {
+            self.last_session_mtime = session_mtime;
+
+            let cwd_str = cwd.to_string_lossy();
+            let Ok(entries) = fs::read_dir(&dir) else {
+                return;
+            };
+            let mut best: Option<(u64, Value)> = None;
+            for entry in entries.flatten() {
+                let Some(v) = read_json(&entry.path()) else {
+                    continue;
+                };
+                if v["cwd"].as_str() != Some(cwd_str.as_ref()) {
+                    continue;
+                }
+                let started = v["startedAt"].as_u64().unwrap_or(0);
+                // Ignore session files that predate this baude session.
+                if started + 20_000 < spawn_unix_ms {
+                    continue;
+                }
+                let dist = started.abs_diff(spawn_unix_ms);
+                if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                    best = Some((dist, v));
+                }
+            }
+            if let Some((_, v)) = best {
+                self.apply_session_file(&v);
+            }
             return;
         };
-        let mut best: Option<(u64, Value)> = None;
-        for entry in entries.flatten() {
-            let Some(v) = read_json(&entry.path()) else {
-                continue;
-            };
-            if v["cwd"].as_str() != Some(cwd_str.as_ref()) {
-                continue;
-            }
-            let started = v["startedAt"].as_u64().unwrap_or(0);
-            // Ignore session files that predate this baude session.
-            if started + 20_000 < spawn_unix_ms {
-                continue;
-            }
-            let dist = started.abs_diff(spawn_unix_ms);
-            if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
-                best = Some((dist, v));
-            }
+
+        // Exact pid match path with mtime gate
+        let session_mtime = fs::metadata(&session_file)
+            .and_then(|m| m.modified())
+            .ok();
+        if session_mtime == self.last_session_mtime {
+            return; // Unchanged, skip read
         }
-        if let Some((_, v)) = best {
+
+        if let Some(v) = read_json(&session_file) {
             self.apply_session_file(&v);
+            self.last_session_mtime = session_mtime;
         }
     }
 
@@ -477,6 +502,15 @@ impl ClaudeMeta {
             self.last_stop = None;
             self.activity.clear();
         }
+
+        // Gate on mtime: if events file mtime unchanged since last poll, skip read
+        let events_mtime = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok();
+        if events_mtime == self.last_events_mtime {
+            return; // Unchanged, skip read
+        }
+
         let Ok(mut f) = fs::File::open(&path) else {
             return;
         };
@@ -538,6 +572,8 @@ impl ClaudeMeta {
             }
         }
         self.offset_events += consumed as u64;
+        // Update mtime tracking after successful read
+        self.last_events_mtime = events_mtime;
     }
 
     /// Context usage bridge file written by statusline hooks (e.g. the GSD

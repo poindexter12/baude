@@ -3867,6 +3867,12 @@ impl App {
             self.polled_meta_once = true;
             let mut changed = false;
             for s in &mut self.sessions {
+                // Skip archived and exited sessions to avoid polling dead rows
+                if s.archived || s.claude.is_exited() {
+                    // Still run auto_archive_tick to check if newly archived
+                    changed |= s.auto_archive_tick(self.auto_archive_ms);
+                    continue;
+                }
                 s.poll_meta();
                 changed |= s.auto_archive_tick(self.auto_archive_ms);
             }
