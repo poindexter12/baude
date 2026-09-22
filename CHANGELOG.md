@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0](https://github.com/poindexter12/baude/compare/v2.2.0...v2.3.0) (2026-09-22)
+
+
+### Features
+
+* v2.3 launch defaults and startup speed ([#90](https://github.com/poindexter12/baude/issues/90)) ([ab72a36](https://github.com/poindexter12/baude/commit/ab72a364e25630d8d547cc9f07a6d0413164a1e3))
+
 ## [2.2.0](https://github.com/poindexter12/baude/compare/v2.1.5...v2.2.0) (2026-09-17)
 
 
