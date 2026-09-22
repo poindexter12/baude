@@ -548,8 +548,10 @@ pub struct App {
     #[cfg(test)]
     remove_git_refusal_for_test: bool,
     /// Two-phase restore state: set to true during Phase A and Phase B
+    #[allow(dead_code)]
     restoring: bool,
     /// Restore work queue (None when not restoring)
+    #[allow(dead_code)]
     restore_queue: Option<persist::RestoreQueue>,
 }
 
