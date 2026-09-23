@@ -12,10 +12,23 @@ jobs:
         os: [macos-14, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
+      # PR commit checks compare against origin/main, so checkout needs the
+      # base history rather than Actions' default depth-one checkout.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: self-test the commit-message guard
+        run: bash scripts/check-commit-message.sh --self-test
+      - name: check pull request commits and title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          bash scripts/check-commit-message.sh --range origin/main..HEAD
+          printf '%s\n' "$PR_TITLE" | bash scripts/check-commit-message.sh -
       # The real-root observer proves itself against synthetic trees before it
       # is trusted to judge a suite run.
       - name: self-test the real-root observer

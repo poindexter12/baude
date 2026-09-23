@@ -50,6 +50,19 @@ Verify with `mise exec -- baude --version`. For an isolated source build and
 test environment, follow the
 [local TUI dogfood runbook](docs/local-tui-dogfood.md).
 
+### Contributor commit-message guard
+
+release-please cannot parse nested parentheses in a commit header or body and
+silently omits that commit from a release. Enable this repository's local guard
+once after cloning:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The CI `check` job also validates every PR commit and its title, so squash
+merges cannot introduce the same parser trap.
+
 ## Usage
 
 ```sh
