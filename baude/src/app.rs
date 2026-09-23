@@ -20,6 +20,7 @@ use baude_core::repository::{
     RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState,
     RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout, SavedRepository,
     SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
+    ValidationRow,
 };
 use baude_core::session::{Session, Status};
 
@@ -73,6 +74,51 @@ fn active_restore_checkouts(state: &RepositoryState) -> Vec<CheckoutKey> {
         })
         .map(|checkout| checkout.key)
         .collect()
+}
+
+/// The BL-07 rule, in one place: a restore-time transition runs on a CLONE and
+/// is committed only when it validates the way the durable save will. A row
+/// that cannot be made valid is refused by name and durable state is left
+/// exactly as it was, so the refusal costs that row instead of riding into
+/// Phase A's one deferred write, where it used to stop every restored session
+/// (#92).
+///
+/// `validate()` is not that check: it never looks at a checkout's lifecycle
+/// against its runtime record. `validate_for_save` is, and it is exactly what
+/// `persist::atomic_save_current` performs.
+fn commit_restore_transition<T>(
+    state: &mut RepositoryState,
+    row: &str,
+    mutate: impl FnOnce(&mut RepositoryState) -> T,
+) -> Result<T> {
+    let mut next = state.clone();
+    let value = mutate(&mut next);
+    if let Err(invalid) = next.validate_for_save() {
+        anyhow::bail!("{row} was refused: {invalid}");
+    }
+    *state = next;
+    Ok(value)
+}
+
+/// [`commit_restore_transition`] for a transition already applied in place,
+/// where `before` is the state as it was beforehand. Refusing restores that
+/// snapshot; accepting keeps what the transition built.
+fn keep_restore_transition(
+    state: &mut RepositoryState,
+    row: &str,
+    before: RepositoryState,
+) -> Result<()> {
+    let next = std::mem::replace(state, before);
+    commit_restore_transition(state, row, move |candidate| *candidate = next)
+}
+
+/// A restore-time transition the test harness can make contradictory, so the
+/// per-row guard can be exercised without a shipped reconciler bug to
+/// reproduce. Inert outside the harness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestoreSite {
+    Standalone,
+    LaunchDirectory,
 }
 
 fn require_same_checkout_path(checkout: &SavedCheckout, observed: &Path) -> Result<()> {
@@ -547,6 +593,11 @@ pub struct App {
     remove_stop_error_for_test: Option<String>,
     #[cfg(test)]
     remove_git_refusal_for_test: bool,
+    /// BL-07: make the named restore site produce the contradiction a future
+    /// reconciler bug would, so the per-row guard is exercised against a
+    /// transition that really does build a state the save refuses.
+    #[cfg(test)]
+    contradict_restore_for_test: Option<(RestoreSite, ValidationRow)>,
     /// Restore Phase A: while set, durable saves are coalesced into the single
     /// write `finish_restore_phase_a` performs, so N restored sessions cost one
     /// fsync and no gated child is released before its record is durable.
@@ -830,6 +881,8 @@ impl App {
             remove_stop_error_for_test: None,
             #[cfg(test)]
             remove_git_refusal_for_test: false,
+            #[cfg(test)]
+            contradict_restore_for_test: None,
             deferring_saves: false,
             deferred_save_pending: std::cell::Cell::new(false),
             restore_total: 0,
@@ -1369,7 +1422,27 @@ impl App {
         // Admit the launch directory through the same Git/non-Git classifier as `n`.
         let launch = self.launch_dir.clone();
         if launch.is_dir() {
-            self.open_repo_session_via(launch, LocalAdmissionRoute::LaunchDirectory);
+            // BL-07: the admission mutates durable state in place across
+            // several steps, so its guard is the after-the-fact form of the
+            // same rule. A folder whose admission builds a state the save
+            // would refuse is undone here, with anything it spawned stopped,
+            // rather than taken into Phase A's one write where it stopped
+            // every saved session with it (#92).
+            let before = self.repository_state.clone();
+            let admitted_before: Vec<u64> = self.sessions.iter().map(|s| s.id).collect();
+            self.open_repo_session_via(launch.clone(), LocalAdmissionRoute::LaunchDirectory);
+            if let Some(row) = self.contradiction_for_test(RestoreSite::LaunchDirectory) {
+                assert!(
+                    self.repository_state.contradict_row_for_test(row),
+                    "seeded contradiction names a row that is not there"
+                );
+            }
+            let row = format!("launch directory {}", launch.display());
+            if let Err(refused) = keep_restore_transition(&mut self.repository_state, &row, before)
+            {
+                self.stop_sessions_added_since(&admitted_before);
+                self.set_message(refused.to_string());
+            }
         }
         // Selection: the session last used from this folder when it is still
         // visible, else the first visible row (pre-context behavior).
@@ -1385,26 +1458,60 @@ impl App {
 
     /// End of restore Phase A: perform the one durable save that covers every
     /// identity registered while saves were deferred. On success the gated
-    /// sessions become Phase B work for `restore_step`; on failure they are
-    /// stopped without ever being released, so no child runs unrecorded.
+    /// sessions become Phase B work for `restore_step`.
+    ///
+    /// A failure that names ONE row costs that row: it is stopped and
+    /// disowned, the write is retried once, and the rest go on to Phase B. A
+    /// failure that names no row, or one the isolation cannot repair, still
+    /// stops every gated session without releasing any of them, so no child
+    /// runs unrecorded (#92, BL-07).
     fn finish_restore_phase_a(&mut self) {
         self.deferring_saves = false;
-        let gated = self.sessions.iter().filter(|s| s.is_gated()).count();
         if self.deferred_save_pending.replace(false) {
             if let Err(error) = self.save_durable_status() {
-                for session in self.sessions.iter_mut().filter(|s| s.is_gated()) {
-                    session.kill();
+                // BL-07 backstop: a refusal that names one row costs that row.
+                // Stop it, disown its runtime record so the retry writes a
+                // state the save will take, and release the rest. A refusal
+                // that names no row — an atomic write failure, say — still
+                // stops everything, because nothing narrower is safe (#92).
+                let mut isolated = self.isolate_refused_restore_row(&error);
+                if isolated.is_some() {
+                    #[cfg(test)]
+                    {
+                        // Failure injection models ONE refused write, so the
+                        // retry sees the state isolation actually produced —
+                        // the same convention `save_removal_revocation` uses.
+                        self.atomic_failure_for_test = None;
+                    }
+                    if self.save_durable_status().is_err() {
+                        isolated = None;
+                    }
                 }
-                self.restore_total = 0;
-                self.restore_released = 0;
-                self.restore_releasing = false;
-                self.set_message(format!(
-                    "restore save failed: {error}; {gated} restored session(s) were stopped and none was released"
-                ));
-                self.dirty = true;
-                return;
+                match isolated {
+                    Some(row) => {
+                        self.set_message(format!(
+                            "restore save failed: {error}; {row} was stopped and the rest were restored"
+                        ));
+                        self.dirty = true;
+                    }
+                    None => {
+                        let stopped = self.sessions.iter().filter(|s| s.is_gated()).count();
+                        for session in self.sessions.iter_mut().filter(|s| s.is_gated()) {
+                            session.kill();
+                        }
+                        self.restore_total = 0;
+                        self.restore_released = 0;
+                        self.restore_releasing = false;
+                        self.set_message(format!(
+                            "restore save failed: {error}; {stopped} restored session(s) were stopped and none was released"
+                        ));
+                        self.dirty = true;
+                        return;
+                    }
+                }
             }
         }
+        let gated = self.sessions.iter().filter(|s| s.is_gated()).count();
         self.restore_total = gated;
         self.restore_released = 0;
         self.restore_releasing = gated > 0;
@@ -1413,6 +1520,87 @@ impl App {
         if gated > 0 {
             self.dirty = true;
         }
+    }
+
+    /// BL-07: the one restored row a refused Phase A write names, stopped and
+    /// disowned so the retry has a state the save will take. Its gated child
+    /// goes down the same way the all-or-nothing kill takes children down, so
+    /// no child is left running unrecorded.
+    ///
+    /// `None` when the refusal names no row, names one that is not there, or
+    /// names one that disowning cannot repair: those are exactly the cases
+    /// where stopping a session would cost a row and still leave the save
+    /// refusing, so the caller keeps today's behavior.
+    fn isolate_refused_restore_row(&mut self, error: &persist::SaveError) -> Option<String> {
+        if error.replacement_committed() {
+            return None;
+        }
+        let row = error.validation()?.row()?;
+        let (label, runtime) = match row {
+            ValidationRow::Checkout(key) => {
+                let label = format!(
+                    "checkout {}",
+                    self.repository_state
+                        .checkouts
+                        .iter()
+                        .find(|checkout| checkout.key == key)?
+                        .observed_path
+                        .to_path_buf()
+                        .display()
+                );
+                if !lifecycle::disown_refused_checkout(
+                    &mut self.repository_state,
+                    key,
+                    format!("restore save refused this row: {error}"),
+                ) {
+                    return None;
+                }
+                (label, self.runtime_checkouts.remove(&key))
+            }
+            ValidationRow::Standalone(key) => {
+                let label = format!(
+                    "standalone session {}",
+                    self.repository_state
+                        .standalone_session(key)?
+                        .canonical_path
+                        .to_path_buf()
+                        .display()
+                );
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone found above")
+                    .set_runtime_state(StandaloneLifecycle::Inactive, None);
+                (label, self.runtime_standalones.remove(&key))
+            }
+        };
+        if let Some(id) = runtime {
+            if let Some(session) = self.session_mut(id) {
+                session.kill();
+            }
+            self.sessions.retain(|session| session.id != id);
+        }
+        Some(label)
+    }
+
+    /// BL-07: undo the runtime half of a refused restore-time admission. The
+    /// durable half is the snapshot `keep_restore_transition` already put
+    /// back; this stops and drops whatever the admission spawned, through the
+    /// same shutdown the Phase A kill uses, so no child runs unrecorded.
+    fn stop_sessions_added_since(&mut self, before: &[u64]) {
+        let added: Vec<u64> = self
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .filter(|id| !before.contains(id))
+            .collect();
+        for id in &added {
+            if let Some(session) = self.session_mut(*id) {
+                session.kill();
+            }
+        }
+        self.sessions.retain(|session| !added.contains(&session.id));
+        self.runtime_checkouts.retain(|_, id| !added.contains(id));
+        self.runtime_standalones.retain(|_, id| !added.contains(id));
     }
 
     /// True while restored sessions still wait behind their gates (Phase B).
@@ -1725,8 +1913,11 @@ impl App {
                 ever_launched: standalone.session.ever_launched,
             };
         }
+        // Both validators, the way the write itself performs them, so a
+        // refusal that names one row reaches the caller as a `ValidationError`
+        // it can attribute rather than as a generic save failure (BL-07).
         state
-            .validate()
+            .validate_for_save()
             .map_err(persist::SaveError::before_replacement)?;
         #[cfg(test)]
         if let Some(root) = &self.persistence_root_for_test {
@@ -1758,6 +1949,23 @@ impl App {
 
     fn save_durable(&self) -> Result<()> {
         self.save_durable_status().map_err(anyhow::Error::new)
+    }
+
+    /// BL-07 test seam: the contradiction a case asked this restore site to
+    /// produce. Always `None` outside the test harness, where the field it
+    /// reads does not exist.
+    fn contradiction_for_test(&self, site: RestoreSite) -> Option<ValidationRow> {
+        #[cfg(test)]
+        {
+            self.contradict_restore_for_test
+                .filter(|(target, _)| *target == site)
+                .map(|(_, row)| row)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = site;
+            None
+        }
     }
 
     fn persist_standalone_change(&mut self, before: RepositoryState) -> Result<()> {
@@ -1973,6 +2181,7 @@ impl App {
             })
             .collect();
         let mut failures = Vec::new();
+        let contradict = self.contradiction_for_test(RestoreSite::Standalone);
         for (key, reopen) in entries {
             let result = (|| -> Result<()> {
                 let owned = self
@@ -1995,26 +2204,50 @@ impl App {
                         false,
                     ) {
                         let before = self.repository_state.clone();
-                        self.repository_state
-                            .standalone_session_mut(key)
-                            .expect("standalone key collected above")
-                            .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(generation));
+                        commit_restore_transition(
+                            &mut self.repository_state,
+                            &format!("standalone session {}", key.get()),
+                            |state| {
+                                state
+                                    .standalone_session_mut(key)
+                                    .expect("standalone key collected above")
+                                    .set_lifecycle(StandaloneLifecycle::ProtectedTeardown(
+                                        generation,
+                                    ));
+                            },
+                        )?;
                         self.persist_standalone_change(before)?;
                         return Err(anyhow::Error::new(error));
                     }
                 }
                 let before = self.repository_state.clone();
-                self.repository_state
-                    .standalone_session_mut(key)
-                    .expect("standalone key collected above")
-                    .set_runtime_state(
-                        if reopen {
-                            StandaloneLifecycle::Active
-                        } else {
-                            StandaloneLifecycle::Inactive
-                        },
-                        None,
-                    );
+                // BL-07: the restore transition for this row runs on a clone
+                // and is committed only if the save would take it, so a row
+                // whose record contradicts its runtime is refused here by
+                // name instead of failing Phase A's write for everyone (#92).
+                commit_restore_transition(
+                    &mut self.repository_state,
+                    &format!("standalone session {}", key.get()),
+                    |state| {
+                        state
+                            .standalone_session_mut(key)
+                            .expect("standalone key collected above")
+                            .set_runtime_state(
+                                if reopen {
+                                    StandaloneLifecycle::Active
+                                } else {
+                                    StandaloneLifecycle::Inactive
+                                },
+                                None,
+                            );
+                        if let Some(row) = contradict {
+                            assert!(
+                                state.contradict_row_for_test(row),
+                                "seeded contradiction names a row that is not there"
+                            );
+                        }
+                    },
+                )?;
                 self.persist_standalone_change(before)?;
                 if reopen {
                     self.reopen_standalone(key)?;
@@ -2279,7 +2512,13 @@ impl App {
                 .repository_reservations
                 .reserve(repository)
                 .map_err(|busy| anyhow::anyhow!("{busy:?}"))?;
-            lifecycle::reconcile_activation_recovery(&mut self.repository_state, checkout)?;
+            // BL-07: commit this row's recovery only if the save would accept
+            // it; a refusal names the row and leaves the others reconciled.
+            commit_restore_transition(
+                &mut self.repository_state,
+                &format!("activation recovery for checkout {}", checkout.get()),
+                |state| lifecycle::reconcile_activation_recovery(state, checkout),
+            )??;
         }
         if let Err(error) = self.save_durable_status() {
             self.persistence_dirty = true;
@@ -2314,7 +2553,12 @@ impl App {
                 .repository_reservations
                 .reserve(repository)
                 .map_err(|busy| anyhow::anyhow!("{busy:?}"))?;
-            lifecycle::reconcile_teardown_recovery(&mut self.repository_state, checkout)?;
+            // BL-07: same rule as the activation reconciler above.
+            commit_restore_transition(
+                &mut self.repository_state,
+                &format!("teardown recovery for checkout {}", checkout.get()),
+                |state| lifecycle::reconcile_teardown_recovery(state, checkout),
+            )??;
         }
         if let Err(error) = self.save_durable_status() {
             self.persistence_dirty = true;
@@ -2611,14 +2855,25 @@ impl App {
         )
         .map(|_| ());
         let state_before = self.repository_state.clone();
-        let plan = match lifecycle::plan_reopen(
+        // BL-07: the reopen transition, blocked or planned, is committed only
+        // when the save would accept it. Under restore's deferred write there
+        // is no save here to catch it, and a contradiction carried forward
+        // used to fail Phase A's one write for every restored session (#92).
+        let planned = commit_restore_transition(
             &mut self.repository_state,
-            lifecycle::ReopenRequest {
-                checkout: checkout_key,
-                reconciliation,
-                runtime: runtime_fact,
+            &format!("retained checkout {}", checkout_key.get()),
+            |state| {
+                lifecycle::plan_reopen(
+                    state,
+                    lifecycle::ReopenRequest {
+                        checkout: checkout_key,
+                        reconciliation,
+                        runtime: runtime_fact,
+                    },
+                )
             },
-        ) {
+        )?;
+        let plan = match planned {
             Ok(plan) => plan,
             Err(blocked) => {
                 if let Err(error) = self.save_durable_status() {
@@ -6858,7 +7113,7 @@ mod link_open {
 mod tests {
     use super::{
         active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, Focus, LocalAdmissionRoute, Modal, SelId,
+        require_same_checkout_path, App, Focus, LocalAdmissionRoute, Modal, RestoreSite, SelId,
     };
     use crate::hierarchy::LocalRow;
     use baude_core::lifecycle::{
@@ -6870,7 +7125,7 @@ mod tests {
         CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
         RepositoryHealth, RepositoryState, RetainedSessionState, RetainedStandaloneSessionState,
         SavedCheckout, SavedRepository, SavedStandaloneSession, StandaloneKey, StandaloneLifecycle,
-        UnavailableCause,
+        UnavailableCause, ValidationRow,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -11407,19 +11662,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// #92: one retained checkout whose branch moved under it must degrade to
-    /// its own "restore primary" refusal, not fail Phase A's one deferred
-    /// save and stop every other restored session with it. The saved rows
-    /// still carry the killed children's runtime records, the shape a baude
-    /// that exited without teardown leaves behind.
-    #[test]
-    fn restore_survives_one_unreconcilable_checkout_with_a_stale_runtime() {
-        let (fixture, mut app, _order, root) = saved_sessions_fixture("restore-one-moved", 3);
-        let moved_branch = "refs/heads/feature/restore-one-moved-1";
-        let listing = std::process::Command::new("git")
+    /// The one way a real worktree stops reconciling, one case per
+    /// `git::ReconciliationUnavailable` variant. Every case is an edit to a
+    /// real repository on disk — the way #92 arrived — rather than a state
+    /// literal that asserts the shape restore is supposed to discover.
+    #[derive(Clone, Copy, Debug)]
+    enum BreakCheckout {
+        Missing,
+        PathChanged,
+        BranchChanged,
+        Detached,
+        LockedOrPrunable,
+        IdentityChanged,
+        Discovery,
+    }
+
+    impl BreakCheckout {
+        const ALL: [Self; 7] = [
+            Self::Missing,
+            Self::PathChanged,
+            Self::BranchChanged,
+            Self::Detached,
+            Self::LockedOrPrunable,
+            Self::IdentityChanged,
+            Self::Discovery,
+        ];
+
+        /// Fixture-root-safe label; also the name in every failure message.
+        fn label(self) -> &'static str {
+            match self {
+                Self::Missing => "missing",
+                Self::PathChanged => "path-changed",
+                Self::BranchChanged => "branch-changed",
+                Self::Detached => "detached",
+                Self::LockedOrPrunable => "locked",
+                Self::IdentityChanged => "identity-changed",
+                Self::Discovery => "discovery",
+            }
+        }
+    }
+
+    /// The worktree Git currently reports for `branch`, read out of the real
+    /// repository instead of recomputed from the managed path convention.
+    fn worktree_for_branch(repo: &Path, branch: &str) -> PathBuf {
+        let listing = Command::new("git")
             .args([
                 "-C",
-                &fixture.path().to_string_lossy(),
+                &repo.to_string_lossy(),
                 "worktree",
                 "list",
                 "--porcelain",
@@ -11427,70 +11716,450 @@ mod tests {
             .output()
             .expect("git worktree list");
         let listing = String::from_utf8_lossy(&listing.stdout);
-        let moved = listing
+        listing
             .split("\n\n")
-            .find(|block| block.contains(&format!("branch {moved_branch}")))
+            .find(|block| block.contains(&format!("branch {branch}")))
             .and_then(|block| block.lines().find_map(|l| l.strip_prefix("worktree ")))
             .map(PathBuf::from)
-            .expect("the fixture's first managed worktree");
-        let status = std::process::Command::new("git")
-            .args([
-                "-C",
-                &moved.to_string_lossy(),
-                "checkout",
-                "-q",
-                "-b",
-                "moved-elsewhere",
-            ])
-            .status()
-            .expect("git checkout -b");
-        assert!(
-            status.success(),
-            "move the branch under the retained checkout"
-        );
+            .unwrap_or_else(|| panic!("no worktree holds {branch}"))
+    }
 
+    /// Break one retained worktree on disk so `git::reconcile_checkout`
+    /// refuses it with exactly `how`.
+    fn break_worktree(repo: &Path, worktree: &Path, how: BreakCheckout) {
+        let replace_with_empty_dir = || {
+            std::fs::remove_dir_all(worktree).expect("remove the worktree");
+            std::fs::create_dir_all(worktree).expect("recreate the worktree path");
+        };
+        match how {
+            // The directory is gone: the first thing reconciliation checks.
+            BreakCheckout::Missing => {
+                std::fs::remove_dir_all(worktree).expect("remove the worktree")
+            }
+            // The path still resolves into the SAME repository, but Git
+            // reports a different worktree for it.
+            BreakCheckout::PathChanged => {
+                std::fs::remove_dir_all(worktree).expect("remove the worktree");
+                std::os::unix::fs::symlink(repo, worktree).expect("symlink onto the main worktree");
+            }
+            // The branch moved out from under the retained row (#93).
+            BreakCheckout::BranchChanged => {
+                git(worktree, &["checkout", "-q", "-b", "moved-elsewhere"])
+            }
+            BreakCheckout::Detached => git(worktree, &["checkout", "-q", "--detach", "HEAD"]),
+            BreakCheckout::LockedOrPrunable => {
+                git(repo, &["worktree", "lock", &worktree.to_string_lossy()])
+            }
+            // A different repository now occupies the recorded path.
+            BreakCheckout::IdentityChanged => {
+                replace_with_empty_dir();
+                git(worktree, &["init", "-q", "-b", "main"]);
+                std::fs::write(worktree.join("file"), "elsewhere").expect("seed the impostor");
+                git(worktree, &["add", "file"]);
+                git(
+                    worktree,
+                    &[
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "-c",
+                        "user.name=fixture",
+                        "commit",
+                        "-q",
+                        "-m",
+                        "elsewhere",
+                    ],
+                );
+            }
+            // The path exists and cannot be inspected at all.
+            BreakCheckout::Discovery => {
+                replace_with_empty_dir();
+                std::fs::write(
+                    worktree.join(".git"),
+                    "gitdir: /nonexistent-baude-fixture\n",
+                )
+                .expect("write an unusable gitdir pointer");
+            }
+        }
+    }
+
+    /// The #93 shape, seeded the way #92 actually happened: `n` real checkouts
+    /// on a real repository, every child killed so each retained row keeps a
+    /// dead-pid runtime record at its initial generation, and ONE retained
+    /// worktree broken on disk so restore cannot reconcile it.
+    ///
+    /// Callers that also need the row at `Launching` or `Stopping` retag the
+    /// saved file with [`retag_saved_checkout_lifecycle`] before driving the
+    /// loop.
+    struct StaleRestore {
+        app: App,
+        /// `refs/heads/...` of the broken row, the handle every assertion
+        /// finds it by.
+        broken_branch: String,
+        /// Where the fixture's saved state file lives.
+        state_root: PathBuf,
+        /// The fixture root to remove when the case is done.
+        root: PathBuf,
+        /// Retained so the fixture's redirects outlive the App. Fields drop
+        /// in DECLARATION order, so this one is last to drop it LAST.
+        _fixture: AdmissionRepo,
+    }
+
+    fn stale_restore_fixture(label: &str, n: usize, how: BreakCheckout) -> StaleRestore {
+        let (fixture, app, _order, root) = saved_sessions_fixture(label, n);
+        let broken_branch = format!("refs/heads/feature/{label}-1");
+        let worktree = worktree_for_branch(fixture.path(), &broken_branch);
+        break_worktree(fixture.path(), &worktree, how);
+        let state_root = root.join("state");
+        StaleRestore {
+            app,
+            broken_branch,
+            state_root,
+            root,
+            _fixture: fixture,
+        }
+    }
+
+    /// Move ONE retained checkout's lifecycle tag in the saved state file.
+    /// `Launching`, `Running` and `Stopping` share the same active intent,
+    /// health and runtime record, so only the tag moves and the file still
+    /// loads — the shape a baude killed mid-launch or mid-stop leaves behind.
+    fn retag_saved_checkout_lifecycle(state_root: &Path, branch: &str, tag: &str) {
+        let file = state_root.join(baude_core::workspace::active().state_file("state"));
+        let text = std::fs::read_to_string(&file).expect("saved state file");
+        let mut doc: serde_json::Value = serde_json::from_str(&text).expect("saved state json");
+        let row = doc["state"]["checkouts"]
+            .as_array_mut()
+            .expect("saved checkouts")
+            .iter_mut()
+            .find(|checkout| checkout["observed_branch"].as_str() == Some(branch))
+            .unwrap_or_else(|| panic!("no saved checkout on {branch}"));
+        assert_eq!(
+            row["lifecycle"]["state"].as_str(),
+            Some("running"),
+            "the fixture saves a killed row running"
+        );
+        row["lifecycle"]["state"] = serde_json::Value::String(tag.to_string());
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&doc).expect("state json"),
+        )
+        .unwrap();
+    }
+
+    /// Drive a fixture through restore and Phase B to completion, asserting
+    /// the broken row was refused alone: Phase A still wrote exactly once, the
+    /// other `n - 1` sessions restored and released, and the broken row is
+    /// `Protected` with its stale runtime record gone.
+    fn assert_one_row_refused(stale: &mut StaleRestore, n: usize, case: &str) {
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
-        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
-            .expect("first step");
+        crate::step_with(
+            &mut terminal,
+            &mut stale.app,
+            &mut started,
+            &mut finished,
+            false,
+        )
+        .expect("first step");
         assert_eq!(
-            app.save_attempts_for_test.get(),
+            stale.app.save_attempts_for_test.get(),
             1,
-            "Phase A's one save landed"
+            "{case}: Phase A performs exactly one durable save"
         );
         assert_eq!(
-            app.sessions.len(),
-            2,
-            "the moved checkout is refused; the other two restore"
+            stale.app.sessions.len(),
+            n - 1,
+            "{case}: the broken row is refused and every other row restores"
         );
-        assert_eq!(
-            gated_count(&app),
-            1,
-            "one released after the save, one still gated"
-        );
-        assert!(app.restore_in_progress() && !finished);
-        let protected = app
+        let broken = stale
+            .app
             .repository_state
             .checkouts
             .iter()
-            .find(|c| c.observed_branch.as_deref() == Some(moved_branch))
-            .expect("the moved checkout is still recorded");
-        assert!(matches!(
-            protected.lifecycle(),
-            CheckoutLifecycle::Protected(_)
-        ));
+            .find(|checkout| checkout.observed_branch.as_deref() == Some(&stale.broken_branch))
+            .unwrap_or_else(|| panic!("{case}: the broken checkout is still recorded"));
         assert!(
-            protected.owned_runtime().is_none(),
-            "its stale runtime record left with the protection"
+            matches!(broken.lifecycle(), CheckoutLifecycle::Protected(_)),
+            "{case}: the broken row ends protected, got {:?}",
+            broken.lifecycle()
         );
-        assert!(app.repository_state.validate().is_ok());
+        assert!(
+            broken.owned_runtime().is_none(),
+            "{case}: its stale runtime record left with the protection"
+        );
+        assert!(
+            stale.app.repository_state.validate_for_save().is_ok(),
+            "{case}: restore committed a state the save would refuse"
+        );
+        let mut steps = 0;
+        while !finished {
+            crate::step_with(
+                &mut terminal,
+                &mut stale.app,
+                &mut started,
+                &mut finished,
+                false,
+            )
+            .expect("step");
+            steps += 1;
+            assert!(steps < 10, "{case}: restore must finish in a few steps");
+        }
+        assert_eq!(
+            gated_count(&stale.app),
+            0,
+            "{case}: every good row released"
+        );
+        assert_eq!(
+            stale.app.save_attempts_for_test.get(),
+            1,
+            "{case}: Phase B releases never save"
+        );
+    }
 
-        crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
-            .expect("second step");
-        assert_eq!(gated_count(&app), 0);
-        assert!(finished && !app.restore_in_progress());
+    /// #92: one retained checkout restore cannot reconcile must degrade to its
+    /// own "restore primary" refusal, not fail Phase A's one deferred save and
+    /// stop every other restored session with it. The saved rows still carry
+    /// the killed children's runtime records, the shape a baude that exited
+    /// without teardown leaves behind.
+    ///
+    /// Parametrized over every reason Git can refuse reconciliation, because
+    /// #93 was reported on one of them and the containment has to hold for all
+    /// seven.
+    #[test]
+    fn restore_survives_one_unreconcilable_checkout_with_a_stale_runtime() {
+        for how in BreakCheckout::ALL {
+            let case = how.label();
+            let mut stale = stale_restore_fixture(&format!("restore-cause-{case}"), 3, how);
+            assert_one_row_refused(&mut stale, 3, case);
+            stale.app.kill_all();
+            let _ = std::fs::remove_dir_all(&stale.root);
+        }
+    }
+
+    /// The same containment for a row the previous baude died inside a launch
+    /// or a stop, not only one it had fully running.
+    #[test]
+    fn restore_survives_one_unreconcilable_checkout_mid_launch_or_stop() {
+        for tag in ["launching", "stopping"] {
+            let mut stale =
+                stale_restore_fixture(&format!("restore-{tag}"), 3, BreakCheckout::BranchChanged);
+            retag_saved_checkout_lifecycle(&stale.state_root, &stale.broken_branch, tag);
+            assert_one_row_refused(&mut stale, 3, tag);
+            stale.app.kill_all();
+            let _ = std::fs::remove_dir_all(&stale.root);
+        }
+    }
+
+    /// `saved_sessions_fixture` plus one standalone folder session, so a case
+    /// can refuse a standalone or the launch-directory admission and watch the
+    /// saved checkouts survive it. The keys are read off the App that SAVED
+    /// the state, because the restarted App has none until restore loads them.
+    struct SavedWithStandalone {
+        app: App,
+        standalone: StandaloneKey,
+        /// The checkout the launch-directory admission lands on.
+        primary: CheckoutKey,
+        /// A retained checkout that is not the primary.
+        feature: CheckoutKey,
+        root: PathBuf,
+        /// Fields drop in DECLARATION order, so the fixture is last and its
+        /// redirects outlive the App.
+        _fixture: AdmissionRepo,
+    }
+
+    fn saved_sessions_with_standalone(label: &str, n: usize) -> SavedWithStandalone {
+        assert!(n >= 2, "a non-primary checkout needs at least two");
+        let fixture = admission_repo(label);
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        for i in 1..n {
+            app.activate_branch_worktree(&repo, &format!("feature/{label}-{i}"))
+                .unwrap();
+        }
+        app.admit_standalone(&notes)
+            .unwrap()
+            .expect("standalone runtime");
+        let standalone = app
+            .repository_state
+            .standalone_sessions
+            .first()
+            .expect("one standalone row")
+            .key;
+        let primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .expect("a primary checkout")
+            .key;
+        let feature = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .find(|key| *key != primary)
+            .expect("a non-primary checkout");
+        assert_eq!(app.sessions.len(), n + 1, "{n} checkouts and a standalone");
         app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        let mut restarted = App::new(repo);
+        restarted.remote = None;
+        restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        restarted.persistence_root_for_test = Some(state_root);
+        SavedWithStandalone {
+            app: restarted,
+            standalone,
+            primary,
+            feature,
+            root,
+            _fixture: fixture,
+        }
+    }
+
+    fn message_of(app: &App) -> String {
+        app.message
+            .as_ref()
+            .map(|message| message.0.clone())
+            .unwrap_or_default()
+    }
+
+    /// BL-07(a): a standalone row whose restore transition would contradict
+    /// its own runtime record is refused at that transition, by name. Phase A
+    /// still performs exactly one write and every checkout restores. Without
+    /// the per-row guard the contradiction rides into Phase A's write and
+    /// stops every restored session instead.
+    #[test]
+    fn restore_isolates_a_standalone_whose_record_contradicts_its_runtime() {
+        let mut saved = saved_sessions_with_standalone("restore-standalone-bad", 2);
+        saved.app.contradict_restore_for_test = Some((
+            RestoreSite::Standalone,
+            ValidationRow::Standalone(saved.standalone),
+        ));
+        saved.app.restore();
+        let message = message_of(&saved.app);
+        assert!(
+            message.contains(&format!("standalone session {}", saved.standalone.get())),
+            "the refusal names the standalone row, got: {message}"
+        );
+        assert_eq!(
+            saved.app.save_attempts_for_test.get(),
+            1,
+            "Phase A still performs exactly one durable save"
+        );
+        assert_eq!(
+            saved.app.sessions.len(),
+            2,
+            "both checkouts restored; only the standalone was refused"
+        );
+        assert!(
+            saved.app.repository_state.validate_for_save().is_ok(),
+            "restore never commits a state the save would refuse"
+        );
+        assert!(saved.app.restore_in_progress(), "Phase B has work to do");
+        while saved.app.restore_step() {}
+        assert_eq!(gated_count(&saved.app), 0, "every surviving row released");
+        saved.app.kill_all();
+        let _ = std::fs::remove_dir_all(&saved.root);
+    }
+
+    /// BL-07(a): the launch-directory admission runs after the saved sessions
+    /// are already registered and gated, so an admission that builds a state
+    /// the save would refuse used to take all of them down with it. It is
+    /// undone instead, and the saved sessions restore and release.
+    #[test]
+    fn restore_isolates_a_launch_directory_admission_that_fails_validation() {
+        let mut saved = saved_sessions_with_standalone("restore-launch-bad", 2);
+        saved.app.contradict_restore_for_test = Some((
+            RestoreSite::LaunchDirectory,
+            ValidationRow::Checkout(saved.primary),
+        ));
+        saved.app.restore();
+        let message = message_of(&saved.app);
+        assert!(
+            message.starts_with("launch directory ") && message.contains("was refused"),
+            "the refusal names the launch directory, got: {message}"
+        );
+        assert_eq!(
+            saved.app.save_attempts_for_test.get(),
+            1,
+            "Phase A still performs exactly one durable save"
+        );
+        assert_eq!(
+            saved.app.sessions.len(),
+            3,
+            "every saved session survived the refused admission"
+        );
+        assert!(
+            saved.app.repository_state.validate_for_save().is_ok(),
+            "the refused admission left durable state as it was"
+        );
+        while saved.app.restore_step() {}
+        assert_eq!(gated_count(&saved.app), 0, "every saved session released");
+        saved.app.kill_all();
+        let _ = std::fs::remove_dir_all(&saved.root);
+    }
+
+    /// BL-07(b): the backstop. A Phase A write refused for a reason that names
+    /// ONE row costs that row — stopped, disowned, and named in the message —
+    /// and the write is retried once so the other rows release. This is the
+    /// case the per-row rule cannot catch: the state restore committed is
+    /// valid, and the save refuses it anyway.
+    #[test]
+    fn restore_save_failure_stops_only_the_row_it_names() {
+        let mut saved = saved_sessions_with_standalone("restore-save-one-row", 3);
+        saved.app.atomic_failure_for_test = Some(persist::AtomicFailure::RefusedRow(
+            ValidationRow::Checkout(saved.feature),
+        ));
+        saved.app.restore();
+        let stopped = saved
+            .app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == saved.feature)
+            .expect("the stopped row is still recorded")
+            .clone();
+        let message = message_of(&saved.app);
+        assert!(
+            message.starts_with("restore save failed")
+                && message.contains(&stopped.observed_path.to_path_buf().display().to_string())
+                && message.contains("was stopped and the rest were restored"),
+            "the failure names the one row it cost, got: {message}"
+        );
+        assert_eq!(
+            saved.app.save_attempts_for_test.get(),
+            2,
+            "one refused write, then exactly one retry"
+        );
+        assert_eq!(
+            saved.app.sessions.len(),
+            3,
+            "the named row was stopped; the other two checkouts and the standalone were not"
+        );
+        assert!(
+            matches!(stopped.lifecycle(), CheckoutLifecycle::Protected(_)),
+            "the stopped row is protected, got {:?}",
+            stopped.lifecycle()
+        );
+        assert!(
+            stopped.owned_runtime().is_none(),
+            "the stopped row was disowned so the retry could be written"
+        );
+        assert!(saved.app.restore_in_progress(), "the rest still release");
+        while saved.app.restore_step() {}
+        assert_eq!(gated_count(&saved.app), 0, "the other rows all released");
+        saved.app.kill_all();
+        let _ = std::fs::remove_dir_all(&saved.root);
     }
 
     #[test]

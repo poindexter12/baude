@@ -546,6 +546,73 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// The one row a refusal blames, when it blames one.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ValidationRow {
+    Checkout(CheckoutKey),
+    Standalone(StandaloneKey),
+}
+
+impl ValidationRow {
+    /// The contradiction this row would be refused with. The inverse of
+    /// [`ValidationError::row`], for callers that need to name the refusal
+    /// rather than read one.
+    pub fn contradiction(self) -> ValidationError {
+        match self {
+            Self::Checkout(key) => ValidationError::ContradictoryLifecycle(key),
+            Self::Standalone(key) => ValidationError::ContradictoryStandaloneLifecycle(key),
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Checkout(key) => write!(f, "checkout {}", key.get()),
+            Self::Standalone(key) => write!(f, "standalone session {}", key.get()),
+        }
+    }
+}
+
+impl ValidationError {
+    /// The single checkout or standalone this refusal blames, when stopping
+    /// that one row would resolve it.
+    ///
+    /// Deliberately narrow. A duplicate key, a duplicate order and a path
+    /// conflict each name two rows and blame neither, and an exhausted or
+    /// regressing counter blames the aggregate; isolating a row for any of
+    /// those would stop a session and still hand the save the same refusal
+    /// (BL-07).
+    pub fn row(&self) -> Option<ValidationRow> {
+        match self {
+            Self::ContradictoryLifecycle(key)
+            | Self::MissingCheckout(key)
+            | Self::RetainedCheckoutPathMismatch(key)
+            | Self::RetainedRepositoryPathMismatch(key)
+            | Self::RetainedWorktreeFlagMismatch(key) => Some(ValidationRow::Checkout(*key)),
+            Self::ContradictoryStandaloneLifecycle(key) => Some(ValidationRow::Standalone(*key)),
+            Self::DuplicateRepositoryKey(_)
+            | Self::DuplicateRepositoryIdentity(_)
+            | Self::DuplicateCheckoutKey(_)
+            | Self::DuplicateStandaloneKey(_)
+            | Self::DuplicateStandalonePath(_)
+            | Self::StandaloneCheckoutPathConflict(_)
+            | Self::DuplicateCheckoutOwnership { .. }
+            | Self::DanglingRepositoryKey(_)
+            | Self::DuplicateRole { .. }
+            | Self::RegressingRepositoryCounter
+            | Self::RegressingCheckoutCounter
+            | Self::RegressingStandaloneCounter
+            | Self::RegressingOrderCounter
+            | Self::DuplicateFirstSeenOrder(_)
+            | Self::ExhaustedRepositoryCounter
+            | Self::ExhaustedCheckoutCounter
+            | Self::ExhaustedStandaloneCounter
+            | Self::ExhaustedOrderCounter => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AllocationError {
     RepositoryKeysExhausted,
@@ -563,6 +630,54 @@ impl std::fmt::Display for AllocationError {
 impl std::error::Error for AllocationError {}
 
 impl RepositoryState {
+    /// Every check the durable save performs, in the order it performs them.
+    ///
+    /// `validate()` alone never looks at a checkout's lifecycle against its
+    /// runtime record, so a caller that commits on `validate()` is still free
+    /// to build a state the save will refuse. Under restore that refusal is
+    /// not reached until Phase A's single deferred write, where one bad row
+    /// used to stop every restored session (#92, BL-07). Anything that
+    /// commits a transition it does not immediately save calls this instead.
+    pub fn validate_for_save(&self) -> Result<(), ValidationError> {
+        self.validate()?;
+        self.validate_lifecycle_views()
+    }
+
+    /// Test seam: put one row in the contradictory shape a reconciler bug
+    /// leaves behind — a lifecycle claiming a runtime the row does not
+    /// record. `validate()` cannot see it and [`validate_for_save`] can,
+    /// which is the whole distinction BL-07's per-row guard rests on.
+    /// Returns false when the row is not there. Nothing in the product calls
+    /// this.
+    ///
+    /// [`validate_for_save`]: Self::validate_for_save
+    pub fn contradict_row_for_test(&mut self, row: ValidationRow) -> bool {
+        match row {
+            ValidationRow::Checkout(key) => {
+                let Some(checkout) = self.checkouts.iter_mut().find(|row| row.key == key) else {
+                    return false;
+                };
+                checkout.set_lifecycle(CheckoutLifecycle::Running(RuntimeGeneration::initial()));
+                checkout.set_owned_runtime(None);
+                true
+            }
+            ValidationRow::Standalone(key) => {
+                let Some(standalone) = self
+                    .standalone_sessions
+                    .iter_mut()
+                    .find(|row| row.key == key)
+                else {
+                    return false;
+                };
+                standalone.set_runtime_state(
+                    StandaloneLifecycle::Running(RuntimeGeneration::initial()),
+                    None,
+                );
+                true
+            }
+        }
+    }
+
     pub(crate) fn validate_lifecycle_views(&self) -> Result<(), ValidationError> {
         for checkout in &self.checkouts {
             let views_agree = match &checkout.lifecycle {
