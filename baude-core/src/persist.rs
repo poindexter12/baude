@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::repository::{
     CheckoutHealth, CheckoutRole, PersistedPath, RepositoryHealth, RepositoryState,
-    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause,
+    RetainedSessionState, SavedCheckout, SavedRepository, UnavailableCause, ValidationError,
+    ValidationRow,
 };
 
 pub const SCHEMA_VERSION: u32 = 3;
@@ -243,6 +244,10 @@ pub enum AtomicFailure {
     Sync,
     Rename,
     DirectorySync,
+    /// Refuse the write the way validation refuses one contradictory row,
+    /// so callers can exercise a save failure that names a single checkout
+    /// or standalone rather than the whole file (BL-07).
+    RefusedRow(ValidationRow),
 }
 
 #[derive(Debug)]
@@ -272,6 +277,15 @@ impl SaveError {
 
     pub fn replacement_committed(&self) -> bool {
         self.replacement_committed
+    }
+
+    /// The validation this save refused on, when it refused on one at all.
+    ///
+    /// Restore's Phase A reads it to find the one row a contradiction names,
+    /// so a refusal costs that row instead of every restored session (#92,
+    /// BL-07). An I/O failure names no validation and yields `None`.
+    pub fn validation(&self) -> Option<&ValidationError> {
+        self.source.downcast_ref::<ValidationError>()
     }
 }
 
@@ -616,10 +630,12 @@ fn atomic_save_current(
     first_temp: Option<PathBuf>,
 ) -> std::result::Result<(), SaveError> {
     let state = state.clone();
-    state.state.validate().map_err(SaveError::not_committed)?;
+    if let Some(AtomicFailure::RefusedRow(row)) = failure {
+        return Err(SaveError::not_committed(row.contradiction()));
+    }
     state
         .state
-        .validate_lifecycle_views()
+        .validate_for_save()
         .map_err(SaveError::not_committed)?;
     let bytes = serde_json::to_vec_pretty(&state).map_err(SaveError::not_committed)?;
     let destination = root.join(file);

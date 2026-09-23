@@ -1014,6 +1014,35 @@ fn unavailable_cause(error: &ReconciliationUnavailable) -> UnavailableCause {
     }
 }
 
+/// BL-07 backstop: take one checkout out of the restored set after the durable
+/// write refused the state restore produced. The row is protected with that
+/// refusal as its cause and its runtime record is dropped, which is what makes
+/// the state the retry writes one the save will accept.
+///
+/// Returns false when the row is not there, or when protecting it still would
+/// not validate — a refusal this cannot repair — and the caller must fall back
+/// to stopping every restored session rather than releasing on a state that
+/// was never written.
+pub fn disown_refused_checkout(
+    state: &mut RepositoryState,
+    checkout: CheckoutKey,
+    detail: String,
+) -> bool {
+    let Some(index) = state.checkouts.iter().position(|row| row.key == checkout) else {
+        return false;
+    };
+    let mut next = state.clone();
+    next.checkouts[index].set_lifecycle(CheckoutLifecycle::Protected(UnavailableCause::Other(
+        detail,
+    )));
+    next.checkouts[index].set_owned_runtime(None);
+    if next.validate_for_save().is_err() {
+        return false;
+    }
+    *state = next;
+    true
+}
+
 /// Apply the shared reopen transition only after the caller supplies fresh Git
 /// reconciliation. Unavailable facts update health for presentation but never
 /// flip active intent or authorize a runtime effect.
@@ -1072,7 +1101,7 @@ pub fn plan_reopen(
         }
         // Both checks, as the save performs them: `validate` alone never
         // looks at a checkout's lifecycle against its runtime record.
-        if next.validate().is_ok() && next.validate_lifecycle_views().is_ok() {
+        if next.validate_for_save().is_ok() {
             *state = next;
         }
         return Err(ReopenBlocked {
@@ -1101,9 +1130,19 @@ pub fn plan_reopen(
     if let Some(index) = repository_index {
         next.repositories[index].health = RepositoryHealth::Available;
     }
-    // The existing state was validated at load/admission. Reopen changes only
-    // intent and health, so this cannot create a new aggregate invariant.
-    debug_assert!(next.validate().is_ok());
+    // The same gate the blocked path above uses, and for the same reason: a
+    // `debug_assert!(next.validate())` stood here, and `validate` never looks
+    // at a lifecycle against its runtime record. Under restore's deferred save
+    // nothing else checks this transition before Phase A's one write, where a
+    // contradiction stops every restored session rather than this row (#92,
+    // BL-07). A success that cannot be made valid is refused and NEVER
+    // dispatched: the caller sees a block, so no runtime effect is authorized.
+    if let Err(invalid) = next.validate_for_save() {
+        return Err(ReopenBlocked {
+            checkout: request.checkout,
+            cause: UnavailableCause::Other(format!("reopen would not persist: {invalid}")),
+        });
+    }
     *state = next;
 
     let dispatch = match request.runtime {
