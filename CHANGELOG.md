@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.0](https://github.com/poindexter12/baude/compare/v2.3.1...v2.4.0) (2026-09-23)
+
+
+### Features
+
+* **ci:** guard commit messages against the release-please parser trap ([#97](https://github.com/poindexter12/baude/issues/97)) ([00e885b](https://github.com/poindexter12/baude/commit/00e885becbda5d7f17a14520f8a2b4c77f529e20))
+
 ## [2.3.1](https://github.com/poindexter12/baude/compare/v2.3.0...v2.3.1) (2026-09-22)
 
 
