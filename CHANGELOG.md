@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.1](https://github.com/poindexter12/baude/compare/v2.4.0...v2.4.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **restore:** isolate one bad row instead of killing every restored session ([#99](https://github.com/poindexter12/baude/issues/99)) ([7106ea8](https://github.com/poindexter12/baude/commit/7106ea8b880ffdd487c08d36e43ae29abee5a214))
+
 ## [2.4.0](https://github.com/poindexter12/baude/compare/v2.3.1...v2.4.0) (2026-09-23)
 
 
