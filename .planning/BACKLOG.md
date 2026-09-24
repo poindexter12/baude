@@ -332,3 +332,72 @@ matching LINK-07 fail-closed.
    remote changes; a checkout that moves between repositories re-resolves.
 
 **Status:** open. Candidate for the next UX phase alongside link work.
+
+### BL-09 — A checkout whose recorded `resume_id` has no transcript can never be reopened from the TUI
+
+**Observation (2026-09-24, iarx-com / ai-scorecard, baude 2.4.0):** the row
+is listed closed; archive/unarchive work; Enter shows `No conversation found
+with session ID: 76eaf047-…` and `r` answers "this state has no
+lifecycle-authorized manual retry". Reproducible on 2.4.1 code.
+
+**Chain:**
+1. `meta.rs` `apply_session_file` learns `session_id` from Claude's
+   per-process `sessions/<pid>.json`, which Claude writes at startup, before
+   any transcript exists. `save_durable_status` persists it as
+   `session.resume_id`.
+2. Open a checkout, never send a prompt, quit: no
+   `projects/<cwd-dashed>/<id>.jsonl` is ever written. (Claude's transcript
+   cleanup deleting one later has the same effect.)
+3. Reopen (`app.rs` ~3138, and the standalone path ~1818) maps a present
+   `resume_id` to `SpawnMode::ResumeId`; `backend/claude.rs` `spawn_plan`
+   builds `exec claude --resume "$BAUDE_RESUME_ID"` with NO fallback, unlike
+   `ContinueLatest`'s `--continue 2>/dev/null || exec claude`. Claude exits
+   immediately. The pane keeps the dead screen.
+4. Nothing clears `resume_id` on that failure, so every Enter repeats it. The
+   row's lifecycle still reads `Running` with the dead child, which carries
+   no `Retry*` capability, so `r` is refused.
+
+**Fix (proposed):**
+- Before choosing `ResumeId`, check
+  `<CLAUDE_CONFIG_DIR>/projects/<cwd-dashed>/<id>.jsonl` exists; if not,
+  downgrade to `ContinueLatest`. Deterministic and testable without Claude.
+  Belt and braces: give the `ResumeId` shell the same `|| exec claude
+  --continue … || exec claude` fallback shape.
+- A child that exits within a few seconds of a targeted resume clears
+  `resume_id` and leaves the row in a state where `r` is authorized, so the
+  TUI cannot wedge on a bad id.
+
+**Tests:** fixture with a session-file id and no transcript reopens with
+`--continue`; a row whose child dies right after a targeted resume ends with
+`resume_id: None` and `r` allowed; a row with a real transcript still gets
+`--resume`.
+
+**Workaround:** quit the baude holding the workspace lock, set that row's
+`session.resume_id` to `null` in `~/.config/baude/state-<ws>.json`, relaunch.
+
+**Status:** open.
+
+### BL-10 — PTY children that exit on their own, or through `Pty::kill()`, are never reaped (permanent zombies)
+
+**Observation (2026-09-24):** 15 `<defunct>` processes on the machine, every
+one parented by a running baude 2.4.0 (10 under iarx-com, 3 under
+poindexter12, 2 under joese-iarx), the oldest 26 hours. One zombie per
+closed or failed session.
+
+**Where:** `pty.rs` reader thread sets `exited = true` on EOF and never
+waits; `is_exited()` then short-circuits on the flag and never reaches its
+`try_wait`. `Pty::kill()` calls `child.kill()` and sets the flag, no wait.
+`Session::kill()` uses it for agent and shell; app.rs calls that at 3586,
+3854 and the BL-07 isolate path. Only `kill_and_wait()` reaps.
+
+**Fix:** wait after EOF and after `kill()`; keep `is_exited` reaping when it
+is first to observe exit; idempotent after reaping. Tests assert via
+`ps -o stat= -p <pid>` that a self-exited child, a killed child, and a
+`Session::kill()` pair are not `Z`.
+
+**Also seen:** four `bash --noprofile --norc -i -c sh -c 'sleep 30'`
+test-fixture shells reparented to launchd since 2026-09-22 05:57, each with a
+defunct child. The suite leaked them when its harness died; separate from the
+runtime leak but the same reaping discipline applies to fixtures.
+
+**Status:** in progress (board SQ-3, dispatched 2026-09-24).
