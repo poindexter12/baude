@@ -214,7 +214,7 @@ green, the merge is green, the release-please run is green.
 | 10 | unbalanced `(` in the body | verdict taken from the oracle; recorded in the self-test, not assumed |
 | 11 | `--self-test` with `node` present | every case agrees with `@conventional-commits/parser` |
 
-**Status:** open. Background thread started 2026-09-22 from the #92 session.
+**Status:** ✅ RESOLVED 2026-09-23 via PR #97, released in v2.4.0. Background thread started 2026-09-22 from the #92 session.
 
 ---
 
@@ -265,5 +265,70 @@ lifecycle against runtime; `validate_lifecycle_views()` does).
    #93 becomes a shared helper so the above do not each rebuild it. This is
    the fixture-realism gap that let #92 through (`.planning` fixture note).
 
-**Status:** open. Needs the (a)/(b)/(c) decision; candidate for the next
+**Status:** ✅ RESOLVED 2026-09-23 as option (c) via PR #99, released in v2.4.1. Was: needs the (a)/(b)/(c) decision; candidate for the next
 milestone's reliability phase.
+
+## Captured 2026-09-24
+
+### BL-08 — Bare `#NN` issue/PR references in pane text are not activatable links
+
+**Observation (2026-09-24):** Claude's transcript inside a baude pane is full
+of bare references like `#21 comment`, `release-please (#21)`, `Refs #92,
+#93`. Today only OSC 8 hyperlinks and bare `http(s)://` URLs are collected by
+the link gesture (`baude/src/links.rs`, Phase 10), so a `#21` is plain text
+and the user has to work out which repo it belongs to and type the URL.
+
+**Ask:** make `#NN` activatable, resolved relative to what the pane is
+presenting: the checkout the session runs in, hence that repository's
+`origin`. `#21` in a baude pane opens `https://github.com/poindexter12/baude/issues/21`
+(GitHub redirects `/issues/NN` to `/pull/NN` when NN is a PR, so one URL form
+covers both). Do it without hurting rendering or CPU by scanning aggressively.
+
+**Why the cost concern is already answered by the Phase 10 design:** link
+collection is gesture-time only. `collect_links` runs when the user opens the
+hint overlay (`app.rs` around 5600), over the visible `vt100::Screen` under
+the parser lock, never per frame and never over scrollback beyond the
+`BARE_CONTINUATION_BOUND` join. Adding a third pass costs one more walk of
+rows × cols per gesture, same order as the bare-URL pass. Nothing is
+underlined or re-rendered; hints are labels in the overlay. So the guard rail
+is: keep the new pass inside `collect_links` and never move detection into
+the draw path.
+
+**Where the repo comes from:** repository rows in `RepositoryState` do not
+record a remote today (`repository.rs`; no remote/identity URL field), and
+`git::parse_clone_target` (`git.rs` ~1832) already turns any origin form into
+`(host, owner, repo)`. Resolve `origin` once per repository at reconcile time
+and cache it on the row or a side map; never shell out at gesture time or per
+frame. Panes without a resolvable GitHub-style origin (standalone sessions in
+a non-repo dir, a remote with an unknown host) simply do not collect `#NN`,
+matching LINK-07 fail-closed.
+
+**Detection rules (proposed):**
+- Token grammar: `#` followed by 1 to 7 digits, preceded by start-of-line,
+  whitespace or `(`/`[`, followed by end, whitespace or `)`/`]`/`,`/`.`/`:`/`;`.
+  Rejects `#1f2937` (hex color), `#!/bin/sh`, `C#`, `foo#3` (fragment-ish),
+  and `#` inside an OSC 8 run (explicit link wins, as the bare-URL pass does).
+- `owner/repo#NN` form resolves to that repo on the pane's origin host.
+- `GH-NN` is out of scope; so is Jira/ADO. If a second tracker ever
+  matters, this becomes a per-repository config knob, not a detector change.
+- Hint destination is the full URL, displayed in the overlay like any
+  other link (LINK-05/LINK-08 single source), so the user sees which repo
+  it resolved to before activating.
+
+**Tests (write-up):**
+1. `links.rs` unit tests over a synthetic screen: each grammar case above,
+   positive and negative, plus a wrapped row where `#12` is split across a
+   `row_wrapped` boundary (must not join into `#1` + `2`, must not miss it).
+2. A pane whose repository has no cached origin collects zero `#NN` links
+   while still collecting bare URLs.
+3. `owner/repo#NN` overrides the pane's own repo.
+4. Ordering: `#NN` hints sort into the same top-to-bottom, left-to-right
+   sequence as the other passes.
+5. Cost: a test that asserts `collect_links` is the only entry point that
+   calls the new pass (no call from `ui.rs`/draw), or a benchmark-ish test
+   bounding a full-screen walk of dense `#NN` text to the same order as the
+   bare-URL pass.
+6. Origin cache: reconciliation refresh updates the cached origin when the
+   remote changes; a checkout that moves between repositories re-resolves.
+
+**Status:** open. Candidate for the next UX phase alongside link work.
