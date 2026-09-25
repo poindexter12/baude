@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.2](https://github.com/poindexter12/baude/compare/v2.4.1...v2.4.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* **pty:** reap every PTY child, not just the ones kill_and_wait waited on ([#103](https://github.com/poindexter12/baude/issues/103)) ([eef2297](https://github.com/poindexter12/baude/commit/eef22972d93fb2afef06c13b769a13a1a25a08c9))
+
 ## [2.4.1](https://github.com/poindexter12/baude/compare/v2.4.0...v2.4.1) (2026-09-23)
 
 
