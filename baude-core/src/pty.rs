@@ -64,6 +64,7 @@ impl PausedPty {
         let exited = Arc::new(AtomicBool::new(false));
         let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
         let screen_generation = Arc::new(AtomicU64::new(0));
+        let child = parts.child;
 
         // Spawn the reader thread that will process output from the child
         {
@@ -72,6 +73,7 @@ impl PausedPty {
             let screen_gen = Arc::clone(&screen_generation);
             let exited = Arc::clone(&exited);
             let subscribers = Arc::clone(&subscribers);
+            let child = Arc::clone(&child);
             let mut reader = parts.reader;
 
             std::thread::spawn(move || {
@@ -79,6 +81,17 @@ impl PausedPty {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => {
+                            // The PTY side has closed: the child has exited or
+                            // is in the process of exiting. Reap it here,
+                            // promptly, rather than leaving that to whichever
+                            // caller happens to poll is_exited() or kill()
+                            // next — which may be never, and is the source of
+                            // the permanent zombies this guards against
+                            // (BL-10). The tty is already closed, so a
+                            // blocking wait on this thread is safe and short.
+                            if let Ok(mut child) = child.lock() {
+                                let _ = child.wait();
+                            }
                             exited.store(true, Ordering::Relaxed);
                             break;
                         }
@@ -101,7 +114,7 @@ impl PausedPty {
             parser,
             master: parts.master,
             writer,
-            child: parts.child,
+            child,
             identity: parts.identity,
             last_output_ms,
             screen_generation,
@@ -582,9 +595,21 @@ impl Pty {
             return true;
         }
         if let Ok(mut child) = self.child.lock() {
-            if let Ok(Some(_)) = child.try_wait() {
-                self.exited.store(true, Ordering::Relaxed);
-                return true;
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    // First observer: the reap happened right here.
+                    self.exited.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                Err(_) => {
+                    // Already reaped by someone else (the reader thread or
+                    // kill()) racing this call for the lock: portable_pty's
+                    // Child can surface a second wait as an error rather than
+                    // Ok(None). Idempotent either way — the child is gone.
+                    self.exited.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                Ok(None) => {}
             }
         }
         false
@@ -593,6 +618,9 @@ impl Pty {
     pub fn kill(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
+            // SIGKILL exit is prompt; reap it now instead of leaving a
+            // zombie for is_exited() to notice, which may never happen.
+            let _ = child.wait();
         }
         self.exited.store(true, Ordering::Relaxed);
     }
@@ -1291,6 +1319,80 @@ mod tests {
         }
         pty.kill_and_wait().unwrap();
         pty.kill_and_wait().unwrap();
+    }
+
+    /// `ps` process state for `pid`, or empty when the row is gone entirely
+    /// (a fully reaped process leaves no row at all, not a Z one).
+    fn ps_stat(pid: u32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn is_zombie(pid: u32) -> bool {
+        ps_stat(pid).starts_with('Z')
+    }
+
+    /// Wait briefly for a reap to land rather than spinning forever: BL-10's
+    /// failure mode is a zombie that never clears, so a real regression hangs
+    /// here until the deadline instead of silently passing.
+    fn assert_reaped_promptly(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} is still a zombie after 5s; BL-10 reap did not happen"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// BL-10 (a): a child that exits on its own must be reaped, not left a
+    /// permanent zombie, once `is_exited()` has observed the exit.
+    ///
+    /// On pre-fix code this hangs until the 5s deadline and fails: the reader
+    /// thread only ever sets the `exited` flag, `is_exited()`'s early return
+    /// on that flag means its `try_wait` is never reached, and nothing else
+    /// ever calls `wait()` on a naturally-exited child.
+    #[test]
+    fn is_exited_reaps_naturally_exited_child() {
+        let fixture = PtyFixture::new("reap-natural");
+        let pty = Pty::spawn(Some("exit 0"), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.pid().expect("pid before exit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pty.is_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never reported exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_reaped_promptly(pid);
+    }
+
+    /// BL-10 (b): `Pty::kill()` on a live child must reap it, not just signal
+    /// it. On pre-fix code `kill()` only sends the signal and flips `exited`,
+    /// so the SIGKILLed child stays a zombie forever — this hangs until the
+    /// 5s deadline and fails on that code.
+    ///
+    /// The child traps SIGHUP: `portable_pty`'s own `Child::kill()` sends
+    /// SIGHUP first and self-reaps via an internal `try_wait()` retry loop
+    /// when that alone kills the process, which would mask the bug this test
+    /// exists to catch. Trapping SIGHUP forces `portable_pty` through to its
+    /// real SIGKILL fallback, which does not wait — the exact path `kill()`
+    /// must reap itself. The short settle sleep matters too: killing before
+    /// the trap is armed lets SIGHUP through and re-masks the bug the same
+    /// way (verified while writing this test).
+    #[test]
+    fn kill_reaps_live_child() {
+        let fixture = PtyFixture::new("reap-kill");
+        let mut pty = Pty::spawn(Some("trap '' HUP; sleep 30"), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.pid().expect("pid while alive");
+        std::thread::sleep(Duration::from_millis(200));
+        pty.kill();
+        assert_reaped_promptly(pid);
     }
 
     #[test]

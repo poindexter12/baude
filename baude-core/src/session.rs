@@ -1378,4 +1378,96 @@ mod tests {
         );
         pty.kill();
     }
+
+    /// Like [`signal_fixture`], but the child traps SIGHUP.
+    ///
+    /// `portable_pty`'s own `Child::kill()` sends SIGHUP first and self-reaps
+    /// via an internal `try_wait()` retry loop when that alone kills the
+    /// process — `signal_fixture`'s plain `sleep 30` dies to that SIGHUP and
+    /// would mask BL-10's bug (no explicit wait after the eventual SIGKILL).
+    /// Trapping SIGHUP forces `portable_pty` through to its real SIGKILL
+    /// fallback, the exact path `Pty::kill()` must reap itself.
+    fn hup_trapping_fixture(label: &str) -> (crate::testing::TestRedirect, crate::pty::Pty) {
+        let root =
+            std::env::temp_dir().join(format!("baude-signal-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let redirect = crate::testing::TestRedirect::new(&root);
+        let pty = crate::pty::Pty::spawn_paused(Some("trap '' HUP; sleep 30"), &[], &root, 5, 40)
+            .expect("spawn")
+            .release()
+            .expect("release");
+        (redirect, pty)
+    }
+
+    fn assert_reaped(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = proc_state(pid);
+            if !state.starts_with('Z') {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} is still a zombie after 5s; BL-10 reap did not happen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// BL-10 (c): `Session::kill()` must reap both the agent and the shell,
+    /// not just signal them.
+    ///
+    /// On pre-fix code `Session::kill()` calls `Pty::kill()` for each, which
+    /// only called `child.kill()` and flipped the `exited` flag with no
+    /// `wait()` — both children would stay zombies forever. This hangs until
+    /// the 5s deadline and fails on that code.
+    #[test]
+    fn session_kill_reaps_both_children() {
+        let (_agent_redirect, agent) = hup_trapping_fixture("session-kill-agent");
+        let agent_pid = agent.process_identity().pid;
+        let (_shell_redirect, shell) = hup_trapping_fixture("session-kill-shell");
+        let shell_pid = shell.process_identity().pid;
+        wait_for(
+            agent_pid,
+            |s| !s.is_empty() && !s.starts_with('T'),
+            "agent running",
+        );
+        wait_for(
+            shell_pid,
+            |s| !s.is_empty() && !s.starts_with('T'),
+            "shell running",
+        );
+        // Let the trap actually land before signaling: killing mid-exec, before
+        // the shell has armed `trap '' HUP`, would let SIGHUP kill it anyway
+        // and mask BL-10's bug behind portable_pty's own self-reaping retry.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut session = Session {
+            id: 1,
+            name: "bl-10-test".to_string(),
+            cwd: std::env::temp_dir(),
+            repo_root: std::env::temp_dir(),
+            branch: None,
+            is_worktree: false,
+            claude: agent,
+            shell: Some(shell),
+            shell_open: true,
+            spawn_unix_ms: 0,
+            meta: ClaudeMeta::default(),
+            archived: false,
+            archived_by_user: false,
+            was_busy: false,
+            unarchived_at_ms: None,
+            pending_permission: None,
+            permission_decision: None,
+            child_suspended: false,
+            pane_focus_shell: false,
+            poll_meta_calls_for_test: std::cell::Cell::new(0),
+        };
+
+        session.kill();
+
+        assert_reaped(agent_pid);
+        assert_reaped(shell_pid);
+    }
 }
