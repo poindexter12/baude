@@ -400,4 +400,4 @@ test-fixture shells reparented to launchd since 2026-09-22 05:57, each with a
 defunct child. The suite leaked them when its harness died; separate from the
 runtime leak but the same reaping discipline applies to fixtures.
 
-**Status:** in progress (board SQ-3, dispatched 2026-09-24).
+**Status:** ✅ RESOLVED 2026-09-25 via PR #103, released in v2.4.2. Board SQ-3 closed with a verified delivery. The kill tests trap SIGHUP because portable-pty 0.8.1 `Child::kill()` sends SIGHUP first and self-reaps when that alone kills the child, which masked the bug on a plain `sleep` fixture. Running baudes keep their existing zombies until restarted on 2.4.2. The four orphaned fixture shells are still a separate cleanup.
