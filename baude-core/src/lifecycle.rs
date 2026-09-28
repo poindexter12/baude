@@ -1068,6 +1068,33 @@ pub fn resume_mode(
     }
 }
 
+/// Choose the spawn mode for restoring a retained checkout runtime from its
+/// saved session, through [`resume_mode`] against the saved cwd (where the
+/// runtime is spawned and so where the backend keeps the conversation).
+///
+/// A stale id is cleared from `saved` and, when the durable checkout row
+/// still carries that same id, from the row too, so the next state save does
+/// not write the dead id back and the next restore does not retry it.
+pub fn retained_resume_mode(
+    state: &mut RepositoryState,
+    checkout: CheckoutKey,
+    saved: &mut RetainedSessionState,
+) -> SpawnMode {
+    let stale = saved.resume_id.clone();
+    let cwd = saved.cwd.to_path_buf();
+    let mode = resume_mode(&mut saved.resume_id, |id| {
+        crate::backend::active().resume_target_exists(&cwd, id)
+    });
+    if let (Some(stale), None) = (stale, saved.resume_id.as_deref()) {
+        if let Some(row) = state.checkouts.iter_mut().find(|row| row.key == checkout) {
+            if row.session.resume_id.as_deref() == Some(stale.as_str()) {
+                row.session.resume_id = None;
+            }
+        }
+    }
+    mode
+}
+
 /// Apply the shared reopen transition only after the caller supplies fresh Git
 /// reconciliation. Unavailable facts update health for presentation but never
 /// flip active intent or authorize a runtime effect.
@@ -3934,6 +3961,39 @@ mod tests {
     /// project dir exists and holds OTHER conversations, as the real one did.
     /// Before the fix this planned `ResumeId`, the spawn ran
     /// `claude --resume <id>`, and the pane died with "No conversation found".
+    /// The retained-restore path (TUI and daemon `restore_removed_runtime`)
+    /// gets the same treatment as `plan_reopen`: a saved id with no
+    /// transcript under the saved cwd continues instead, and is cleared from
+    /// both the transient saved session and the durable checkout row. An id
+    /// whose transcript exists is resumed and left alone.
+    #[test]
+    fn retained_restore_of_resume_id_without_transcript_continues_and_clears_it() {
+        let _fixture = LifecycleFixture::new("retained-stale-resume");
+        let stale = "c2d67541-9731-4c72-aa5e-ef8b235ee06b";
+        let mut state = close_state();
+        let checkout = state.checkouts[0].key;
+        state.checkouts[0].session.resume_id = Some(stale.into());
+        let mut saved = state.checkouts[0].session.clone();
+        let cwd = saved.cwd.to_path_buf();
+        let other = crate::meta::transcript_file(&cwd, "0f1e2d3c-other-conversation");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"{\"type\":\"user\"}\n").unwrap();
+
+        let mode = super::retained_resume_mode(&mut state, checkout, &mut saved);
+        assert_eq!(mode, SpawnMode::ContinueLatest);
+        assert_eq!(saved.resume_id, None);
+        assert_eq!(state.checkouts[0].session.resume_id, None);
+
+        let live = "5b0c7e21-live-conversation";
+        std::fs::write(crate::meta::transcript_file(&cwd, live), b"{}\n").unwrap();
+        state.checkouts[0].session.resume_id = Some(live.into());
+        let mut saved = state.checkouts[0].session.clone();
+        let mode = super::retained_resume_mode(&mut state, checkout, &mut saved);
+        assert_eq!(mode, SpawnMode::ResumeId(live.into()));
+        assert_eq!(saved.resume_id.as_deref(), Some(live));
+        assert_eq!(state.checkouts[0].session.resume_id.as_deref(), Some(live));
+    }
+
     #[test]
     fn reopen_of_resume_id_without_transcript_continues_latest_and_clears_it() {
         use crate::backend::Backend;
