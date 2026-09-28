@@ -10311,6 +10311,12 @@ mod tests {
             app.session_mut(runtime).unwrap().meta.session_id = Some(resume_id.clone());
             let before = app.repository_state.clone();
             let path = before.checkouts[0].observed_path.to_path_buf();
+            // A real conversation has a transcript. Without one, the runtime
+            // restored after the failed removal would rightly drop the dead
+            // id instead of resuming it (SQ-4), which is not what this pins.
+            let transcript = baude_core::meta::transcript_file(&path, &resume_id);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
             let confirmation = app.prepare_remove_worktree(checkout).unwrap();
             app.atomic_failure_for_test = Some(failure);
 

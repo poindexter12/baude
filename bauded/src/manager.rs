@@ -3752,6 +3752,11 @@ mod tests {
         let path = manager.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
+        // A real conversation has a transcript; a restore must not drop it as
+        // a dead id (SQ-4).
+        let transcript = baude_core::meta::transcript_file(&path, "fresh-manager-removal-target");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
 
         manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
