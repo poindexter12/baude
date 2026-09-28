@@ -595,6 +595,10 @@ fn checkout_row(
         (_, Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery)) => "recovery",
         (CheckoutHealth::Unavailable(UnavailableCause::Missing), _) => "missing",
         (CheckoutHealth::Unavailable(UnavailableCause::IdentityChanged), _) => "changed",
+        (CheckoutHealth::Unavailable(UnavailableCause::BranchChanged { .. }), _) => "branch moved",
+        (CheckoutHealth::Unavailable(UnavailableCause::Detached), _) => "detached",
+        (CheckoutHealth::Unavailable(UnavailableCause::PathChanged), _) => "moved",
+        (CheckoutHealth::Unavailable(UnavailableCause::LockedOrPrunable), _) => "locked",
         (CheckoutHealth::Unavailable(_), _) => "unavailable",
         _ => default_state_text,
     };
