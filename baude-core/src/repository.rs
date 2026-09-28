@@ -107,7 +107,25 @@ pub struct OwnedRuntime {
 pub enum UnavailableCause {
     Missing,
     NotRepository,
+    /// The recorded path now belongs to a different repository (its Git
+    /// common directory changed). Before SQ-5 every reconcile refusal was
+    /// folded into this cause, so a row persisted by an older baude may carry
+    /// it for what was really a branch switch.
     IdentityChanged,
+    /// The path still resolves into the recorded repository, but Git reports
+    /// a different worktree for it.
+    PathChanged,
+    /// The checkout is the recorded worktree of the recorded repository, but
+    /// Git reports a different branch than the one this row is bound to. Only
+    /// branch-pinned roles record it; see `lifecycle::branch_binding`.
+    BranchChanged {
+        expected: Option<String>,
+        observed: Option<String>,
+    },
+    /// The checkout's HEAD is detached where this row is bound to a branch.
+    Detached,
+    /// Git reports the worktree locked or prunable.
+    LockedOrPrunable,
     /// Destructive authority was durably revoked before or during a removal
     /// attempt. Ordinary reconciliation must never adopt a replacement path.
     RemovalTombstone(String),

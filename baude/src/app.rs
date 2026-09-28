@@ -1120,6 +1120,10 @@ impl App {
             Some(UnavailableCause::Missing) => "missing",
             Some(UnavailableCause::NotRepository) => "not a repository",
             Some(UnavailableCause::IdentityChanged) => "identity changed",
+            Some(UnavailableCause::PathChanged) => "worktree path changed",
+            Some(UnavailableCause::BranchChanged { .. }) => "branch changed",
+            Some(UnavailableCause::Detached) => "detached HEAD",
+            Some(UnavailableCause::LockedOrPrunable) => "locked or prunable",
             Some(UnavailableCause::RemovalTombstone(_)) => "protected removal state",
             Some(UnavailableCause::PendingActivation { .. })
             | Some(UnavailableCause::ActivationRecovery { .. }) => "activation recovery",
@@ -2338,6 +2342,25 @@ impl App {
                 );
                 return Ok(None);
             }
+            // A user-owned primary FOLLOWS its branch (`lifecycle::branch_binding`),
+            // so after a `git switch` the row names the branch the user chose.
+            // It stays the primary: re-deriving the default below would add a
+            // managed default worktree the user never asked for and then refuse
+            // it for not being the recorded path.
+            if let Some(existing) = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == existing_key)
+            {
+                if lifecycle::branch_binding(existing) == lifecycle::BranchBinding::Follows
+                    && existing.observed_branch.as_deref() != Some(default.local_ref.as_str())
+                {
+                    self.admit_existing_worktrees(repository_key, &snapshot)?;
+                    self.repository_state.validate()?;
+                    return self.ensure_primary(existing_key);
+                }
+            }
         }
         let checkout_key = match existing_key {
             Some(key) => key,
@@ -2979,44 +3002,28 @@ impl App {
         let expected_common = self.repository_state.repositories[repository_index]
             .observed_common_dir
             .clone();
-        match git::reconcile_checkout(
+        let reconciliation = git::reconcile_checkout(
             &expected_common.to_path_buf(),
             &path,
             expected_branch.as_deref(),
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let cause = if matches!(error, git::ReconciliationUnavailable::Missing { .. }) {
-                    UnavailableCause::Missing
-                } else if matches!(
-                    error,
-                    git::ReconciliationUnavailable::IdentityChanged { .. }
-                        | git::ReconciliationUnavailable::PathChanged { .. }
-                        | git::ReconciliationUnavailable::BranchChanged { .. }
-                        | git::ReconciliationUnavailable::Detached
-                        | git::ReconciliationUnavailable::LockedOrPrunable
-                ) {
-                    UnavailableCause::IdentityChanged
-                } else {
-                    UnavailableCause::Other(error.to_string())
-                };
-                let _ = lifecycle::record_checkout_reconciliation(
-                    &mut self.repository_state,
-                    checkout_key,
-                    Some(cause.clone()),
-                );
-                self.repository_state.repositories[repository_index].health =
-                    RepositoryHealth::Unavailable(cause);
-                return false;
-            }
-        };
-        let _ = lifecycle::record_checkout_reconciliation(
+        )
+        .map(|_| ());
+        // The role decides whether branch drift is a fresh observation or a
+        // protecting refusal (`lifecycle::branch_binding`), and the cause is
+        // the one the refusal actually was.
+        let unavailable = match lifecycle::record_checkout_reconciliation(
             &mut self.repository_state,
             checkout_key,
-            None,
-        );
-        self.repository_state.repositories[repository_index].health = RepositoryHealth::Available;
-        true
+            &reconciliation,
+        ) {
+            Ok(unavailable) => unavailable,
+            Err(error) => Some(UnavailableCause::Other(error.to_string())),
+        };
+        self.repository_state.repositories[repository_index].health = match unavailable {
+            None => RepositoryHealth::Available,
+            Some(cause) => RepositoryHealth::Unavailable(cause),
+        };
+        self.repository_state.repositories[repository_index].health == RepositoryHealth::Available
     }
 
     // ---- session bookkeeping ----
@@ -9050,6 +9057,85 @@ mod tests {
             .checkouts
             .iter()
             .any(|checkout| checkout.key == row_key));
+        app.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// SQ-5, end to end: the user runs `git switch` in their own primary
+    /// checkout and reopens the repository. Before, re-admission marked the
+    /// repository "identity changed" and refused its topology; now the
+    /// primary follows the branch and nothing new is created under it.
+    #[test]
+    fn admit_repository_follows_a_git_switch_in_the_unmanaged_primary() {
+        let fixture = admission_repo("primary-follows-switch");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let linked = root.join("wt-kept");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/kept",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        let primary_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                assert!(!checkout.managed_by_baude, "the user's own main worktree");
+                assert_eq!(checkout.observed_branch.as_deref(), Some("refs/heads/main"));
+                checkout.key
+            })
+            .expect("primary default row");
+        let rows_before = app.repository_state.checkouts.len();
+
+        git(&repo, &["switch", "-q", "-c", "chore/other"]);
+        app.admit_repository(&repo)
+            .expect("re-admission after a git switch is not an error");
+
+        assert_eq!(
+            app.repository_state.repositories[0].health,
+            RepositoryHealth::Available,
+            "topology stays available"
+        );
+        let primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == primary_key)
+            .expect("the same primary row");
+        assert_eq!(
+            primary.observed_branch.as_deref(),
+            Some("refs/heads/chore/other")
+        );
+        assert_eq!(primary.session.branch.as_deref(), Some("chore/other"));
+        assert_eq!(primary.health(), &CheckoutHealth::Available);
+        assert_eq!(
+            app.repository_state.checkouts.len(),
+            rows_before,
+            "no managed default worktree is created under the user's primary"
+        );
+        assert!(app
+            .repository_state
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.health() == &CheckoutHealth::Available));
+        app.repository_state.validate_for_save().unwrap();
         app.kill_all();
         std::fs::remove_dir_all(root).unwrap();
     }
