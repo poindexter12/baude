@@ -104,6 +104,18 @@ pub trait Backend: Send + Sync {
     fn spawn_plan(&self, resolved_cmd: &str, event_url: Option<&str>, mode: SpawnMode)
         -> SpawnPlan;
 
+    /// Whether a stored conversation id still names something this backend
+    /// can resume from `cwd`. [`crate::lifecycle::resume_mode`] asks this
+    /// before choosing [`SpawnMode::ResumeId`], because a targeted resume of
+    /// a missing conversation does not fall back: the session dies at spawn.
+    ///
+    /// The default keeps the id: a backend that cannot tell must not have a
+    /// real conversation dropped on its behalf.
+    fn resume_target_exists(&self, cwd: &Path, id: &str) -> bool {
+        let _ = (cwd, id);
+        true
+    }
+
     /// Best-effort per-cwd wiring so a spawned session reports back to baude.
     /// Idempotent and non-clobbering — re-run on every restore-driven
     /// re-spawn — and a failure must NEVER abort a spawn.

@@ -65,6 +65,32 @@ impl Backend for ClaudeBackend {
         }
     }
 
+    /// `claude --resume <id>` has no fallback: with no transcript for `<id>`
+    /// it prints "No conversation found" and exits, and the pane is dead. A
+    /// shell `|| exec claude` would hide that, but it would also silently
+    /// restart a real conversation that merely exited non-zero, so the check
+    /// happens here, before the mode is chosen.
+    ///
+    /// The id is untrusted persisted data: anything that is not a single
+    /// plain file-name component cannot be a transcript and never reaches the
+    /// filesystem. Both the given and the canonical cwd are tried, because
+    /// Claude keys its project dir by the path it sees, and on macOS a
+    /// `/tmp`- or `/var`-rooted cwd resolves to `/private/...`.
+    fn resume_target_exists(&self, cwd: &Path, id: &str) -> bool {
+        let mut components = Path::new(id).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(name)), None) if name.to_str() == Some(id)
+        ) {
+            return false;
+        }
+        if crate::meta::transcript_file(cwd, id).is_file() {
+            return true;
+        }
+        std::fs::canonicalize(cwd)
+            .is_ok_and(|real| real != cwd && crate::meta::transcript_file(&real, id).is_file())
+    }
+
     /// Seed `.claude/settings.local.json` so the spawned Claude fires baude's
     /// lifecycle hooks, and — in `prompt` mode only — a non-clobbering
     /// `.mcp.json` registering the `permission-mcp` stdio server. Both seeds
@@ -218,6 +244,81 @@ mod tests {
         );
         assert!(!plan.cmd.contains(hostile));
         assert!(!plan.cmd.contains("--continue"));
+    }
+
+    // ---- resume_target_exists --------------------------------------------
+
+    /// A fixture root under the real temp dir, deliberately NOT canonical: on
+    /// macOS `temp_dir()` is `/var/...`, a symlink to `/private/var/...`, the
+    /// same shape as a `/tmp` session cwd in the field.
+    fn resume_fixture(label: &str) -> (std::path::PathBuf, crate::testing::TestRedirect) {
+        let root = std::env::temp_dir().join(format!(
+            "baude-claude-resume-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cwd")).unwrap();
+        let redirect = crate::testing::TestRedirect::new(&root);
+        (root, redirect)
+    }
+
+    fn write_transcript(cwd: &Path, id: &str) {
+        let file = crate::meta::transcript_file(cwd, id);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, b"{\"type\":\"user\"}\n").unwrap();
+    }
+
+    #[test]
+    fn resume_target_exists_only_with_a_transcript_for_that_id() {
+        let (root, _redirect) = resume_fixture("present");
+        let cwd = root.join("cwd");
+        let live = "0b1c7e7a-5a8f-4d2e-9a61-3f0f0c9d2b11";
+        let stale = "c2d67541-9731-4c72-aa5e-ef8b235ee06b";
+        write_transcript(&cwd, live);
+
+        assert!(ClaudeBackend.resume_target_exists(&cwd, live));
+        // Same project dir, other conversations present: still missing.
+        assert!(!ClaudeBackend.resume_target_exists(&cwd, stale));
+        // A transcript for the id under a DIFFERENT cwd does not count:
+        // `claude --resume` looks in the spawn cwd's project dir.
+        assert!(!ClaudeBackend.resume_target_exists(&root, live));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resume_target_exists_matches_the_canonical_cwd_claude_records() {
+        let (root, _redirect) = resume_fixture("canonical");
+        let cwd = root.join("cwd");
+        let real = std::fs::canonicalize(&cwd).unwrap();
+        let id = "5e2d9c1a-7b3f-4e8a-b0c4-9d1e2f3a4b5c";
+        write_transcript(&real, id);
+
+        assert!(ClaudeBackend.resume_target_exists(&real, id));
+        assert!(ClaudeBackend.resume_target_exists(&cwd, id));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resume_target_exists_rejects_ids_that_are_not_a_file_name() {
+        let (root, _redirect) = resume_fixture("hostile");
+        let cwd = root.join("cwd");
+        // Plant files a traversal id would otherwise find.
+        write_transcript(&cwd, "real");
+        let project = crate::meta::transcript_file(&cwd, "real");
+        let project = project.parent().unwrap();
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        std::fs::write(project.join("nested").join("x.jsonl"), b"").unwrap();
+
+        for hostile in [
+            "", ".", "..", "../real", "nested/x", "real/.", "/real", "./real",
+        ] {
+            assert!(
+                !ClaudeBackend.resume_target_exists(&cwd, hostile),
+                "accepted {hostile:?}"
+            );
+        }
+        assert!(ClaudeBackend.resume_target_exists(&cwd, "real"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

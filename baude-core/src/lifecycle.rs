@@ -1043,6 +1043,31 @@ pub fn disown_refused_checkout(
     true
 }
 
+/// Choose how to re-enter a retained conversation, given its stored
+/// backend id and a check that the backend still has it (normally
+/// `|id| backend::active().resume_target_exists(&cwd, id)` for the cwd the
+/// session will be spawned in).
+///
+/// A stored id only becomes [`SpawnMode::ResumeId`] when the check passes. An
+/// id with nothing behind it (a session closed before its first message, or
+/// a transcript the backend has since cleaned up) is cleared from
+/// `resume_id`, and the spawn continues the latest conversation exactly as if
+/// no id had been stored. A targeted resume never falls back on its own, so
+/// choosing it for a missing conversation kills the session at spawn. The
+/// check runs only when an id is stored.
+pub fn resume_mode(
+    resume_id: &mut Option<String>,
+    target_exists: impl FnOnce(&str) -> bool,
+) -> SpawnMode {
+    match resume_id.as_deref() {
+        Some(id) if target_exists(id) => SpawnMode::ResumeId(id.to_owned()),
+        _ => {
+            *resume_id = None;
+            SpawnMode::ContinueLatest
+        }
+    }
+}
+
 /// Apply the shared reopen transition only after the caller supplies fresh Git
 /// reconciliation. Unavailable facts update health for presentation but never
 /// flip active intent or authorize a runtime effect.
@@ -1110,13 +1135,19 @@ pub fn plan_reopen(
         });
     }
 
-    let mode = state.checkouts[checkout_index]
-        .session
-        .resume_id
-        .clone()
-        .map(SpawnMode::ResumeId)
-        .unwrap_or(SpawnMode::ContinueLatest);
     let mut next = state.clone();
+    // The runtime is spawned (or restarted) in the checkout's observed path,
+    // so that is where the backend keeps the conversation. A stale id is
+    // cleared on `next`, and so reaches disk in the same save that records
+    // the reopen. A live runtime is only focused, nothing spawns, and a
+    // running conversation may simply not have its first message yet, so its
+    // id is left alone.
+    let live = matches!(request.runtime, ReopenRuntime::Live { .. });
+    let cwd = next.checkouts[checkout_index].observed_path.to_path_buf();
+    let mode = resume_mode(
+        &mut next.checkouts[checkout_index].session.resume_id,
+        |id| live || crate::backend::active().resume_target_exists(&cwd, id),
+    );
     if matches!(request.runtime, ReopenRuntime::Live { .. }) {
         let lifecycle = next.checkouts[checkout_index]
             .owned_runtime()
@@ -2654,10 +2685,10 @@ mod tests {
     use super::{
         execute_activation_with_post_git_hook, mark_activation_recovery, plan_close, plan_reopen,
         prepare_activation, reconcile_activation_recovery, reconcile_teardown_recovery,
-        record_pending_activation, revoke_removal_authority, ActivationRecoveryResolution,
-        ActivationRequest, CloseEffect, CloseRequest, CollisionReason, CollisionReport,
-        LifecycleError, LifecycleOutcome, ReopenDispatch, ReopenRequest, ReopenRuntime,
-        RepositoryReservations, TeardownRecoveryResolution,
+        record_pending_activation, resume_mode, revoke_removal_authority,
+        ActivationRecoveryResolution, ActivationRequest, CloseEffect, CloseRequest,
+        CollisionReason, CollisionReport, LifecycleError, LifecycleOutcome, ReopenDispatch,
+        ReopenRequest, ReopenRuntime, RepositoryReservations, TeardownRecoveryResolution,
     };
     use crate::backend::SpawnMode;
     use crate::git::{self, ReconciliationUnavailable};
@@ -3849,6 +3880,14 @@ mod tests {
             (ReopenRuntime::Absent, ReopenDispatch::Spawn),
         ];
 
+        // A resumable id is one whose transcript really exists: the backend
+        // is asked before `ResumeId` is chosen.
+        let _fixture = LifecycleFixture::new("reopen-dispatch");
+        let transcript =
+            crate::meta::transcript_file(Path::new("/repo-feature"), "conversation-42");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
         for (runtime, expected) in vectors {
             let mut state = close_state();
             state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
@@ -3867,6 +3906,10 @@ mod tests {
             assert!(state.checkouts[0].active_intent);
             assert_eq!(plan.dispatch, expected);
             assert_eq!(plan.mode, SpawnMode::ResumeId("conversation-42".into()));
+            assert_eq!(
+                state.checkouts[0].session.resume_id.as_deref(),
+                Some("conversation-42")
+            );
             assert_eq!(plan.effects[0], super::ReopenEffect::SaveActiveIntent);
         }
 
@@ -3883,6 +3926,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.mode, SpawnMode::ContinueLatest);
+    }
+
+    /// The field report, reproduced: a closed, user-archived row carries a
+    /// resume_id recorded when the runtime registered, but the conversation
+    /// never got a first message, so Claude never wrote its transcript. The
+    /// project dir exists and holds OTHER conversations, as the real one did.
+    /// Before the fix this planned `ResumeId`, the spawn ran
+    /// `claude --resume <id>`, and the pane died with "No conversation found".
+    #[test]
+    fn reopen_of_resume_id_without_transcript_continues_latest_and_clears_it() {
+        use crate::backend::Backend;
+
+        let _fixture = LifecycleFixture::new("reopen-stale-resume");
+        let stale = "c2d67541-9731-4c72-aa5e-ef8b235ee06b";
+        let cwd = Path::new("/repo-feature");
+        let other = crate::meta::transcript_file(cwd, "0b1c7e7a-5a8f-4d2e-9a61-3f0f0c9d2b11");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"{\"type\":\"user\"}\n").unwrap();
+        assert!(!crate::meta::transcript_file(cwd, stale).exists());
+
+        for runtime in [ReopenRuntime::Absent, ReopenRuntime::Exited { id: 8 }] {
+            let mut state = close_state();
+            state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
+            state.checkouts[0].session.archived = true;
+            state.checkouts[0].session.archived_by_user = true;
+            state.checkouts[0].session.resume_id = Some(stale.into());
+            let checkout = state.checkouts[0].key;
+
+            let plan = plan_reopen(
+                &mut state,
+                ReopenRequest {
+                    checkout,
+                    reconciliation: Ok(()),
+                    runtime,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(plan.mode, SpawnMode::ContinueLatest);
+            assert_eq!(state.checkouts[0].session.resume_id, None);
+            let spawn = crate::backend::claude::ClaudeBackend.spawn_plan(
+                "claude",
+                Some("http://127.0.0.1:1/e"),
+                plan.mode,
+            );
+            assert!(!spawn.cmd.contains("--resume"), "got: {}", spawn.cmd);
+            assert!(spawn.cmd.contains("--continue"), "got: {}", spawn.cmd);
+            assert!(
+                spawn
+                    .env
+                    .iter()
+                    .all(|(key, _)| key != crate::backend::RESUME_ID_ENV),
+                "got: {:?}",
+                spawn.env
+            );
+        }
+
+        // A live runtime is only focused: nothing spawns, so its id stays.
+        let mut state = close_state();
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Inactive);
+        state.checkouts[0].session.resume_id = Some(stale.into());
+        let checkout = state.checkouts[0].key;
+        let plan = plan_reopen(
+            &mut state,
+            ReopenRequest {
+                checkout,
+                reconciliation: Ok(()),
+                runtime: ReopenRuntime::Live { id: 7 },
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.dispatch, ReopenDispatch::Focus { id: 7 });
+        assert_eq!(state.checkouts[0].session.resume_id.as_deref(), Some(stale));
+    }
+
+    #[test]
+    fn resume_mode_keeps_a_live_id_and_clears_only_a_missing_one() {
+        let mut none = None;
+        let mode = resume_mode(&mut none, |_| panic!("no id, so nothing to check"));
+        assert_eq!(mode, SpawnMode::ContinueLatest);
+
+        let mut live = Some("live".to_string());
+        let mode = resume_mode(&mut live, |id| {
+            assert_eq!(id, "live");
+            true
+        });
+        assert_eq!(mode, SpawnMode::ResumeId("live".into()));
+        assert_eq!(live.as_deref(), Some("live"));
+
+        let mut stale = Some("stale".to_string());
+        let mode = resume_mode(&mut stale, |_| false);
+        assert_eq!(mode, SpawnMode::ContinueLatest);
+        assert_eq!(stale, None);
     }
 
     #[test]
