@@ -36,6 +36,11 @@ pub enum StateSource {
 /// Overridable via config `auto_archive_minutes` / BAUDED_AUTO_ARCHIVE_MIN.
 pub const AUTO_ARCHIVE_IDLE_MS: u64 = 30 * 60 * 1000;
 
+/// A targeted resume that dies inside this window almost certainly rejected its
+/// saved conversation id. Three seconds leaves normal CLI startup alone while
+/// still catching the immediate transcript-cleanup/corruption failure.
+pub const EARLY_RESUME_ID_EXIT_WINDOW_MS: u64 = 3_000;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Status {
     /// Idle, blocked on the user — Claude asked a question or needs a
@@ -62,6 +67,10 @@ pub struct Session {
     pub shell: Option<Pty>,
     pub shell_open: bool,
     pub spawn_unix_ms: u64,
+    /// True only for the current spawn after it chose `claude --resume <id>`.
+    /// It is in-memory because it identifies a launch attempt, not a durable
+    /// conversation property.
+    pub targeted_resume: bool,
     pub meta: ClaudeMeta,
     /// Parked: sorts last, excluded from counters/notifications.
     /// Set manually or after the auto-archive idle window (config
@@ -102,6 +111,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// Detect the narrow failed-`--resume` signature before the runtime owner
+    /// tears the dead session down. Other spawn modes and later exits retain
+    /// their durable resume id unchanged.
+    pub fn early_targeted_resume_exit(&mut self) -> bool {
+        self.targeted_resume
+            && now_unix_ms().saturating_sub(self.spawn_unix_ms) <= EARLY_RESUME_ID_EXIT_WINDOW_MS
+            && self.claude.is_exited()
+    }
+
     /// Apply the auto-archive rules; returns true when the flag flipped.
     pub fn auto_archive_tick(&mut self, idle_ms: u64) -> bool {
         let status = self.status();
@@ -1453,6 +1471,7 @@ mod tests {
             shell: Some(shell),
             shell_open: true,
             spawn_unix_ms: 0,
+            targeted_resume: false,
             meta: ClaudeMeta::default(),
             archived: false,
             archived_by_user: false,

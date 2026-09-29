@@ -321,6 +321,16 @@ pub struct RetainedStandaloneSessionState {
     pub ever_launched: bool,
 }
 
+/// Browser issue-link destination derived from a repository's `origin` during
+/// reconciliation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryOrigin {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedRepository {

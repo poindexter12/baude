@@ -17,7 +17,7 @@ use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, State
 use baude_core::pty::{now_ms, Pty};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState,
+    RepositoryHealth, RepositoryKey, RepositoryOrigin, RepositoryState, RetainedSessionState,
     RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout, SavedRepository,
     SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
     ValidationRow,
@@ -569,6 +569,10 @@ pub struct App {
     /// `desktop_notifications`, then on.
     desktop_notify_enabled: bool,
     repository_state: RepositoryState,
+    /// Reconciliation-time origin cache keyed by stable repository identity.
+    /// Runtime-only by design: legacy state loads unchanged and an unknown
+    /// origin fails closed until its repository is admitted again.
+    repository_origins: HashMap<RepositoryKey, RepositoryOrigin>,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
@@ -861,6 +865,7 @@ impl App {
             desktop_notifier: DesktopNotifier::default(),
             desktop_notify_enabled,
             repository_state: RepositoryState::default(),
+            repository_origins: HashMap::new(),
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
@@ -2273,6 +2278,13 @@ impl App {
 
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
         let snapshot = git::discover_repository(path)?;
+        // Admission is the reconciliation seam: resolve origin once here and
+        // retain only its browser-addressable identity for gesture-time hints.
+        let origin = git::origin_target(&snapshot.main_worktree).map(|target| RepositoryOrigin {
+            host: target.host,
+            owner: target.owner,
+            repo: target.repo,
+        });
         let common = PersistedPath::from_path(&snapshot.common_dir);
         let repository_key = match self
             .repository_state
@@ -2296,6 +2308,11 @@ impl App {
                 key
             }
         };
+        if let Some(origin) = origin {
+            self.repository_origins.insert(repository_key, origin);
+        } else {
+            self.repository_origins.remove(&repository_key);
+        }
         if let Some(repository) = self
             .repository_state
             .repositories
@@ -3262,6 +3279,7 @@ impl App {
         // $BAUDE_EVENT_URL, which routes hook events to the /tmp append path
         // (only the daemon injects that var).
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&base, None, mode);
 
         // Wire the session cwd before the CLI starts (for Claude: the
@@ -3407,6 +3425,7 @@ impl App {
             shell: registered_shell,
             shell_open: shell_size.is_some(),
             spawn_unix_ms: now_unix_ms(),
+            targeted_resume,
             meta,
             archived: false,
             archived_by_user: false,
@@ -4158,7 +4177,43 @@ impl App {
         self.polled_meta_once
     }
 
+    /// Reconcile a targeted resume that died before Claude could establish the
+    /// retained conversation. This shares the normal retained close boundary,
+    /// so its runtime is reaped and the lifecycle reaches `Inactive`, where
+    /// manual reopen is authorized.
+    fn reconcile_early_targeted_resume_exits(&mut self) {
+        let exited: Vec<_> = self
+            .sessions
+            .iter_mut()
+            .filter_map(|session| {
+                session
+                    .early_targeted_resume_exit()
+                    .then(|| {
+                        checkout_for_runtime(&self.runtime_checkouts, session.id)
+                            .map(|key| (key, session.id))
+                    })
+                    .flatten()
+            })
+            .collect();
+        for (checkout, id) in exited {
+            if let Some(saved) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|saved| saved.key == checkout)
+            {
+                saved.session.resume_id = None;
+            }
+            if let Err(error) = self.close_retained_session(id) {
+                self.set_message(format!(
+                    "failed to reconcile early targeted resume: {error}"
+                ));
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
+        self.reconcile_early_targeted_resume_exits();
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
                 self.message = None;
@@ -5942,6 +5997,7 @@ impl App {
         // the prior behavior.
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&base, None, mode);
         // HREG-03/D-02: surface seed warnings exactly like the add-session
         // path — restart is a spawn path too.
@@ -5997,6 +6053,7 @@ impl App {
         if let Some(s) = self.session_mut(id) {
             std::mem::swap(&mut s.claude, &mut pty);
             s.spawn_unix_ms = now_unix_ms();
+            s.targeted_resume = targeted_resume;
             s.meta = ClaudeMeta::default();
             s.meta.backend_port = plan.server_port;
         }
@@ -6224,9 +6281,12 @@ impl App {
             ),
             Focus::Sidebar => (0, None),
         };
+        let origin = self
+            .selected_repository()
+            .and_then(|repository| self.repository_origins.get(&repository.key));
         let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
             p.set_scrollback(scroll);
-            let mut links = crate::links::collect_links(p.screen());
+            let mut links = crate::links::collect_links(p.screen(), origin);
             p.set_scrollback(0);
             // Top-to-bottom, left-to-right — hint letters label links in
             // visual order regardless of which pass found them.
@@ -7130,9 +7190,9 @@ mod tests {
     use baude_core::persist;
     use baude_core::repository::{
         CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
-        RepositoryHealth, RepositoryState, RetainedSessionState, RetainedStandaloneSessionState,
-        SavedCheckout, SavedRepository, SavedStandaloneSession, StandaloneKey, StandaloneLifecycle,
-        UnavailableCause, ValidationRow,
+        RepositoryHealth, RepositoryOrigin, RepositoryState, RetainedSessionState,
+        RetainedStandaloneSessionState, SavedCheckout, SavedRepository, SavedStandaloneSession,
+        StandaloneKey, StandaloneLifecycle, UnavailableCause, ValidationRow,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -7648,6 +7708,84 @@ mod tests {
         // Retain the pushed fixture's owner: only the selected checkout
         // changes, and dropping it here would un-redirect the clone.
         pushed.with_path(clone)
+    }
+
+    #[test]
+    fn admission_refreshes_cached_origin_after_remote_or_checkout_change() {
+        let fixture = admission_repo_cloned("origin-cache-refresh");
+        let repo = fixture.root().join("repo");
+        let clone = fixture.path().to_path_buf();
+        // The fixture first creates a real repository and `git remote add origin`
+        // to a real bare remote. Retarget only its URL after the tracking refs
+        // exist, preserving the normal admission topology while exercising the
+        // browser-addressable origin cache.
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:first/project.git",
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:second/other.git",
+            ],
+        );
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.admit_repository(&repo).expect("first admission");
+        app.admit_repository(&clone)
+            .expect("admission after checkout moves to another repository");
+        let origins: Vec<_> = app
+            .repository_state
+            .repositories
+            .iter()
+            .map(|repository| app.repository_origins.get(&repository.key).cloned())
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                Some(RepositoryOrigin {
+                    host: "github.com".into(),
+                    owner: "first".into(),
+                    repo: "project".into(),
+                }),
+                Some(RepositoryOrigin {
+                    host: "github.com".into(),
+                    owner: "second".into(),
+                    repo: "other".into(),
+                }),
+            ],
+            "repository rows retain their own origin when a pane moves between repositories"
+        );
+
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.example/team/next.git",
+            ],
+        );
+        app.admit_repository(&repo)
+            .expect("reconcile after remote change");
+        assert_eq!(
+            app.repository_origins
+                .get(&app.repository_state.repositories[0].key),
+            Some(&RepositoryOrigin {
+                host: "github.example".into(),
+                owner: "team".into(),
+                repo: "next".into(),
+            }),
+            "a repeated reconciliation refreshes rather than reuses the old repository origin"
+        );
     }
 
     /// Guards the fixture itself: `admission_repo` must keep the pushed shape. Repairing
@@ -12514,6 +12652,107 @@ mod tests {
 
         app.kill_all();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn early_targeted_resume_exit_clears_id_and_authorizes_reopen_but_late_exit_retains_it() {
+        for (label, late) in [("early-resume-exit", false), ("late-resume-exit", true)] {
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
+            let root = repo.parent().unwrap().to_path_buf();
+            let state_root = root.join("state");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let mut app = App::new(repo.clone());
+            app.remote = None;
+            app.config.claude_cmd = Some(
+                if late {
+                    "sh -c 'sleep 30'"
+                } else {
+                    "sh -c 'exit 1'"
+                }
+                .into(),
+            );
+            app.persistence_root_for_test = Some(state_root.clone());
+            let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+            let checkout = app.repository_state.checkouts[0].key;
+
+            if late {
+                app.session_mut(runtime).unwrap().claude.kill();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.session(runtime).unwrap().claude.is_exited() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "initial child never exited"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let resume_id = format!("resume-{label}");
+            let resume_cwd = app.repository_state.checkouts[0]
+                .observed_path
+                .to_path_buf();
+            let transcript = baude_core::meta::transcript_file(&resume_cwd, &resume_id);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+            assert!(
+                baude_core::backend::active().resume_target_exists(&resume_cwd, &resume_id),
+                "real transcript is visible to the backend"
+            );
+            app.repository_state.checkouts[0].session.resume_id = Some(resume_id.clone());
+            app.reopen_checkout(checkout).unwrap();
+            assert!(
+                app.session(runtime).unwrap().targeted_resume,
+                "real transcript uses --resume"
+            );
+
+            if late {
+                let session = app.session_mut(runtime).unwrap();
+                session.spawn_unix_ms = baude_core::meta::now_unix_ms()
+                    - baude_core::session::EARLY_RESUME_ID_EXIT_WINDOW_MS
+                    - 1;
+                session.claude.kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !app.session(runtime).unwrap().claude.is_exited() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "resumed child never exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            } else {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !app.session(runtime).unwrap().claude.is_exited() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "resumed child never exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+            app.tick();
+
+            let saved = baude_core::persist::load_current_at(
+                &state_root,
+                &baude_core::workspace::active().state_file("state"),
+            )
+            .unwrap()
+            .state;
+            if late {
+                assert_eq!(
+                    saved.checkouts[0].session.resume_id.as_deref(),
+                    Some(resume_id.as_str())
+                );
+            } else {
+                assert_eq!(saved.checkouts[0].session.resume_id, None);
+                assert_eq!(
+                    baude_core::lifecycle::lifecycle_capability(saved.checkouts[0].lifecycle()),
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
+                );
+                assert!(!app.runtime_checkouts.contains_key(&checkout));
+            }
+            app.kill_all();
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! [`validate_http_url`] are ever collected, so every `DetectedLink` is
 //! activatable by construction (LINK-07 fail-closed).
 
-use baude_core::vt100;
+use baude_core::{repository::RepositoryOrigin, vt100};
 
 /// Where a detected link came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +15,8 @@ pub enum LinkSource {
     Osc8,
     /// A bare `http(s)://` URL scanned out of rendered text (plan 10-03).
     Bare,
+    /// An issue or pull-request reference resolved from the pane repository.
+    Issue,
 }
 
 /// One activatable link visible on screen. `destination` is the parsed,
@@ -43,7 +45,10 @@ pub struct DetectedLink {
 /// `Screen::link_target(id)` — cell label text is never consulted — then
 /// gate every candidate through [`validate_http_url`]. Candidates that fail
 /// validation are simply not collected (they stay plain rendered text).
-pub fn collect_links(screen: &vt100::Screen) -> Vec<DetectedLink> {
+pub fn collect_links(
+    screen: &vt100::Screen,
+    origin: Option<&RepositoryOrigin>,
+) -> Vec<DetectedLink> {
     let (rows, cols) = screen.size();
     let mut out: Vec<DetectedLink> = Vec::new();
     let mut seen: Vec<u16> = Vec::new();
@@ -81,6 +86,9 @@ pub fn collect_links(screen: &vt100::Screen) -> Vec<DetectedLink> {
         }
     }
     out.extend(collect_bare_links(screen));
+    if let Some(origin) = origin {
+        out.extend(collect_issue_links(screen, origin));
+    }
     out
 }
 
@@ -173,6 +181,172 @@ fn push_row_text(
             }
         }
     }
+}
+
+/// Issue/PR reference pass. It uses the same bounded logical-line assembly as
+/// bare URLs, so an issue number split at a soft wrap is a single candidate.
+/// OSC 8 cells were replaced by spaces in `push_row_text`, so an explicit
+/// hyperlink always wins over synthetic issue detection.
+fn collect_issue_links(screen: &vt100::Screen, origin: &RepositoryOrigin) -> Vec<DetectedLink> {
+    let (rows, cols) = screen.size();
+    let mut out = Vec::new();
+    let mut chars = Vec::new();
+    let mut cells = Vec::new();
+    for row in 0..rows {
+        push_row_text(screen, row, Some(row), cols, &mut chars, &mut cells);
+        if !screen.row_wrapped(row) {
+            scan_line_for_issues(&chars, &cells, origin, &mut out);
+            chars.clear();
+            cells.clear();
+        }
+    }
+    if !chars.is_empty() {
+        let offset = screen.scrollback();
+        let reachable = offset.min(BARE_CONTINUATION_BOUND);
+        if reachable > 0 {
+            let mut peek = screen.clone();
+            for k in 1..=reachable {
+                peek.set_scrollback(offset - k);
+                push_row_text(&peek, rows - 1, None, cols, &mut chars, &mut cells);
+                if !peek.row_wrapped(rows - 1) {
+                    break;
+                }
+            }
+        }
+        scan_line_for_issues(&chars, &cells, origin, &mut out);
+    }
+    out
+}
+
+fn scan_line_for_issues(
+    chars: &[char],
+    cells: &[Option<(u16, u16)>],
+    origin: &RepositoryOrigin,
+    out: &mut Vec<DetectedLink>,
+) {
+    for hash in 0..chars.len() {
+        if chars[hash] != '#' {
+            continue;
+        }
+        let Some(end) = issue_number_end(chars, hash) else {
+            continue;
+        };
+        if let Some((owner, repo, start)) = issue_override(chars, hash) {
+            push_issue_link(
+                chars,
+                cells,
+                IssueSpan {
+                    start,
+                    number_start: hash + 1,
+                    end,
+                    owner: &owner,
+                    repo: &repo,
+                },
+                &origin.host,
+                out,
+            );
+        } else if hash == 0 || is_issue_prefix(chars[hash - 1]) {
+            push_issue_link(
+                chars,
+                cells,
+                IssueSpan {
+                    start: hash,
+                    number_start: hash + 1,
+                    end,
+                    owner: &origin.owner,
+                    repo: &origin.repo,
+                },
+                &origin.host,
+                out,
+            );
+        }
+    }
+}
+
+fn issue_number_end(chars: &[char], hash: usize) -> Option<usize> {
+    let mut end = hash + 1;
+    while end < chars.len() && chars[end].is_ascii_digit() && end - hash <= 7 {
+        end += 1;
+    }
+    let digits = end - hash - 1;
+    (digits > 0 && digits <= 7 && end_boundary(chars.get(end).copied())).then_some(end)
+}
+
+fn is_issue_prefix(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | '[')
+}
+
+fn end_boundary(c: Option<char>) -> bool {
+    c.is_none()
+        || c.is_some_and(|c| c.is_whitespace() || matches!(c, ')' | ']' | ',' | '.' | ':' | ';'))
+}
+
+/// Return an `owner/repo` override immediately preceding `#`, including its
+/// anchor index, only when the full token has a permitted left boundary.
+fn issue_override(chars: &[char], hash: usize) -> Option<(String, String, usize)> {
+    let slash = chars[..hash].iter().rposition(|&c| c == '/')?;
+    let owner_start = chars[..slash]
+        .iter()
+        .rposition(|&c| !is_repo_char(c))
+        .map_or(0, |index| index + 1);
+    if owner_start == slash
+        || slash + 1 == hash
+        || !chars[owner_start..slash].iter().all(|&c| is_repo_char(c))
+        || !chars[slash + 1..hash].iter().all(|&c| is_repo_char(c))
+        || (owner_start > 0 && !is_issue_prefix(chars[owner_start - 1]))
+    {
+        return None;
+    }
+    Some((
+        chars[owner_start..slash].iter().collect(),
+        chars[slash + 1..hash].iter().collect(),
+        owner_start,
+    ))
+}
+
+fn is_repo_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+struct IssueSpan<'a> {
+    start: usize,
+    number_start: usize,
+    end: usize,
+    owner: &'a str,
+    repo: &'a str,
+}
+
+fn push_issue_link(
+    chars: &[char],
+    cells: &[Option<(u16, u16)>],
+    span: IssueSpan<'_>,
+    host: &str,
+    out: &mut Vec<DetectedLink>,
+) {
+    let number: String = chars[span.number_start..span.end].iter().collect();
+    let raw = format!(
+        "https://{host}/{}/{}/issues/{number}",
+        span.owner, span.repo
+    );
+    let Some(destination) = validate_http_url(&raw) else {
+        return;
+    };
+    let Some((row, start_col)) = cells[span.start] else {
+        return;
+    };
+    let mut end_col = start_col;
+    for (r, c) in cells[span.start..span.end].iter().flatten() {
+        if *r == row {
+            end_col = *c;
+        }
+    }
+    out.push(DetectedLink {
+        destination,
+        row,
+        start_col,
+        end_col,
+        source: LinkSource::Issue,
+    });
 }
 
 /// Scan one logical line for scheme-anchored candidates and collect every
@@ -330,7 +504,7 @@ mod bare_url {
     fn links_on(input: &[u8], rows: u16, cols: u16) -> Vec<DetectedLink> {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(input);
-        collect_links(parser.screen())
+        collect_links(parser.screen(), None)
     }
 
     fn url(s: &str) -> url::Url {
@@ -360,7 +534,7 @@ mod bare_url {
         parser.process(b"https://ex.com/abc");
         assert!(parser.screen().row_wrapped(0), "precondition: row 0 wraps");
         assert!(parser.screen().row_wrapped(1), "precondition: row 1 wraps");
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "wrapped fragments join to one URL");
         assert_eq!(links[0].destination.as_str(), "https://ex.com/abc");
         // Anchor span: the first visible fragment (row 0, full width).
@@ -382,7 +556,7 @@ mod bare_url {
             !parser.screen().row_wrapped(0),
             "precondition: no wrap flag"
         );
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].destination.as_str(), "https://a.example/x");
     }
@@ -439,7 +613,7 @@ mod bare_url {
             parser.screen().row_wrapped(3),
             "precondition: bottom row wraps"
         );
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "off-screen tail joined into one URL");
         assert_eq!(links[0].destination.as_str(), "https://e.com/abcdefgh");
         assert_eq!(
@@ -470,7 +644,7 @@ mod bare_url {
             parser.screen().row_wrapped(3),
             "precondition: bottom row wraps"
         );
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "truncated candidate still validates");
         // Visible row + 4 continuation rows: "https://e.com/" + 26 a's.
         let expected = format!("https://e.com/{}", "a".repeat(26));
@@ -488,7 +662,7 @@ mod bare_url {
         let mut parser = vt100::Parser::new(2, 30, 0);
         parser
             .process(b"\x1b]8;;https://printed.example\x1b\\https://printed.example\x1b]8;;\x1b\\");
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "one link, not an OSC8 + bare duplicate");
         assert_eq!(links[0].source, LinkSource::Osc8, "the explicit link wins");
         assert_eq!(links[0].destination, url("https://printed.example"));
@@ -499,6 +673,121 @@ mod bare_url {
         assert!(
             links_on(b"plain text, no links here at all", 2, 40).is_empty(),
             "feeds 10-04's 'no links visible' state"
+        );
+    }
+}
+
+/// BL-08 issue references are synthetic links only when the focused pane has
+/// a reconciliation-time origin cache. The scanner remains pure and gesture-time.
+#[cfg(test)]
+mod issue_references {
+    use super::{collect_links, LinkSource};
+    use baude_core::{repository::RepositoryOrigin, vt100};
+
+    fn origin() -> RepositoryOrigin {
+        RepositoryOrigin {
+            host: "github.com".into(),
+            owner: "pane-owner".into(),
+            repo: "pane-repo".into(),
+        }
+    }
+
+    fn links_on(input: &[u8], rows: u16, cols: u16) -> Vec<super::DetectedLink> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(input);
+        collect_links(parser.screen(), Some(&origin()))
+    }
+
+    #[test]
+    fn grammar_accepts_bounded_issue_tokens_and_rejects_lookalikes() {
+        let links = links_on(
+            b"#1 (#12) [#123], #1234. #12345: #123456; #1234567 #1f2937 #!/bin/sh C# foo#3 #12345678",
+            3,
+            100,
+        );
+        let destinations: Vec<_> = links.iter().map(|link| link.destination.as_str()).collect();
+        assert_eq!(
+            destinations,
+            [
+                "https://github.com/pane-owner/pane-repo/issues/1",
+                "https://github.com/pane-owner/pane-repo/issues/12",
+                "https://github.com/pane-owner/pane-repo/issues/123",
+                "https://github.com/pane-owner/pane-repo/issues/1234",
+                "https://github.com/pane-owner/pane-repo/issues/12345",
+                "https://github.com/pane-owner/pane-repo/issues/123456",
+                "https://github.com/pane-owner/pane-repo/issues/1234567",
+            ],
+            "only complete, bounded issue tokens are links"
+        );
+        assert!(links.iter().all(|link| link.source == LinkSource::Issue));
+    }
+
+    #[test]
+    fn soft_wrapped_issue_number_is_one_link() {
+        let mut parser = vt100::Parser::new(3, 3, 0);
+        parser.process(b" #12");
+        assert!(
+            parser.screen().row_wrapped(0),
+            "precondition: #12 crosses a soft wrap"
+        );
+        let links = collect_links(parser.screen(), Some(&origin()));
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].destination.as_str(),
+            "https://github.com/pane-owner/pane-repo/issues/12"
+        );
+        assert_eq!(
+            (links[0].row, links[0].start_col, links[0].end_col),
+            (0, 1, 2)
+        );
+    }
+
+    #[test]
+    fn owner_repo_override_keeps_the_pane_origin_host() {
+        let links = links_on(b"see other-owner/other.repo#42", 2, 50);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].destination.as_str(),
+            "https://github.com/other-owner/other.repo/issues/42"
+        );
+        assert_eq!((links[0].row, links[0].start_col), (0, 4));
+    }
+
+    #[test]
+    fn absent_origin_collects_no_issues_but_keeps_bare_urls() {
+        let mut parser = vt100::Parser::new(2, 80, 0);
+        parser.process(b"#9 https://example.com/path");
+        let links = collect_links(parser.screen(), None);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source, LinkSource::Bare);
+        assert_eq!(links[0].destination.as_str(), "https://example.com/path");
+    }
+
+    #[test]
+    fn osc8_issue_label_is_not_synthesized() {
+        let mut parser = vt100::Parser::new(2, 30, 0);
+        parser.process(b"\x1b]8;;https://real.example/issue\x1b\\#12\x1b]8;;\x1b\\");
+        let links = collect_links(parser.screen(), Some(&origin()));
+        assert_eq!(links.len(), 1, "the explicit OSC 8 destination wins");
+        assert_eq!(links[0].source, LinkSource::Osc8);
+    }
+
+    #[test]
+    fn overlay_sort_key_orders_mixed_link_passes_visually() {
+        let links = links_on(b"#2 https://example.com/a\r\n#1", 3, 60);
+        let mut order: Vec<_> = links
+            .iter()
+            .map(|link| (link.row, link.start_col))
+            .collect();
+        order.sort_unstable();
+        assert_eq!(order, [(0, 0), (0, 3), (1, 0)]);
+    }
+
+    #[test]
+    fn draw_module_never_calls_link_collection() {
+        assert!(
+            !include_str!("ui.rs").contains("collect_links"),
+            "link collection must remain gesture-time, outside the draw path"
         );
     }
 }
@@ -612,7 +901,7 @@ mod tests {
     fn tracer_end_to_end() {
         let mut parser = vt100::Parser::new(4, 8, 50);
         parser.process(b"\x1b]8;;https://real.example/x\x1b\\click here\x1b]8;;\x1b\\");
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "exactly one OSC8 link collected");
         assert_eq!(links[0].destination.as_str(), "https://real.example/x");
         // Anchor span: the first visible fragment ("click he", row 0 of the
@@ -647,7 +936,7 @@ mod tests {
         let mut parser = vt100::Parser::new(4, 8, 50);
         parser.process(b"\x1b]8;;file:///etc/passwd\x1b\\pwd\x1b]8;;\x1b\\");
         assert!(
-            collect_links(parser.screen()).is_empty(),
+            collect_links(parser.screen(), None).is_empty(),
             "non-http OSC8 target is not collected"
         );
     }
@@ -659,7 +948,7 @@ mod tests {
     fn wide_char_label_records_full_span() {
         let mut parser = vt100::Parser::new(2, 20, 0);
         parser.process("\x1b]8;;https://wide.example/\x1b\\a中b\x1b]8;;\x1b\\".as_bytes());
-        let links = collect_links(parser.screen());
+        let links = collect_links(parser.screen(), None);
         assert_eq!(links.len(), 1, "one link — no split at the wide char");
         assert_eq!(links[0].destination.as_str(), "https://wide.example/");
         assert_eq!(

@@ -1236,6 +1236,7 @@ impl Manager {
             );
         }
 
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
         let generation = checkout
             .and_then(|key| {
@@ -1309,6 +1310,7 @@ impl Manager {
             shell: registered_shell,
             shell_open,
             spawn_unix_ms: now_unix_ms(),
+            targeted_resume,
             meta,
             archived: false,
             archived_by_user: false,
@@ -2194,6 +2196,7 @@ impl Manager {
     fn restart_with_mode(&mut self, id: u64, mode: backend::SpawnMode) -> MutationResult<()> {
         let be = backend::active();
         let resolved = be.resolve_cmd(&self.claude_cmd);
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
         let checkout = self
             .runtime_checkouts
@@ -2255,6 +2258,7 @@ impl Manager {
         let s = self.session_mut(id)?;
         std::mem::swap(&mut s.claude, &mut replacement);
         s.spawn_unix_ms = now_unix_ms();
+        s.targeted_resume = targeted_resume;
         s.meta = ClaudeMeta::default();
         s.meta.backend_port = plan.server_port;
         Ok(())
@@ -2394,7 +2398,41 @@ impl Manager {
         self.sessions.iter().find(|s| s.id == id).map(session_info)
     }
 
+    /// Reconcile an immediate `--resume` rejection through the ordinary
+    /// retained remove boundary so child reaping and retryable lifecycle state
+    /// stay identical to an explicit close.
+    fn reconcile_early_targeted_resume_exits(&mut self) {
+        let exited: Vec<_> = self
+            .sessions
+            .iter_mut()
+            .filter_map(|session| {
+                session
+                    .early_targeted_resume_exit()
+                    .then(|| {
+                        self.runtime_checkouts.iter().find_map(|(key, runtime)| {
+                            (*runtime == session.id).then_some((*key, session.id))
+                        })
+                    })
+                    .flatten()
+            })
+            .collect();
+        for (checkout, id) in exited {
+            if let Some(saved) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|saved| saved.key == checkout)
+            {
+                saved.session.resume_id = None;
+            }
+            if let Err(error) = self.remove(id) {
+                eprintln!("failed to reconcile early targeted resume: {error}");
+            }
+        }
+    }
+
     pub fn poll(&mut self) {
+        self.reconcile_early_targeted_resume_exits();
         let mut changed = false;
         let idle = self.auto_archive_ms;
         let policy = self.idle_child_policy;
@@ -3698,6 +3736,66 @@ mod tests {
             Some("opaque-daemon-before-poll")
         );
         assert_eq!(persisted_at(&root, workspace), manager.repository_state);
+    }
+
+    #[test]
+    fn poll_clears_an_immediately_dead_targeted_resume_and_authorizes_reopen() {
+        let fixture = persistence_fixture("early-targeted-resume");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(repo.to_str().unwrap(), None, Some("early targeted resume"))
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        let resume_id = "resume-daemon-early";
+        manager.session_id_for_test(runtime, resume_id);
+        manager.remove(runtime).unwrap();
+        let transcript_cwd = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = match manager.reopen_checkout(checkout).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        assert!(
+            manager.session(reopened).unwrap().targeted_resume,
+            "real transcript uses --resume"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        manager.poll();
+
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.checkouts[0].session.resume_id, None);
+        assert_eq!(
+            baude_core::lifecycle::lifecycle_capability(persisted.checkouts[0].lifecycle()),
+            Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
+        );
+        assert!(!manager.runtime_checkouts.contains_key(&checkout));
     }
 
     #[test]
