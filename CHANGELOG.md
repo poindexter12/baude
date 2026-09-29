@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.0](https://github.com/poindexter12/baude/compare/v2.4.4...v2.5.0) (2026-09-29)
+
+
+### Features
+
+* activate #NN issue references and recover from failed targeted resumes ([#111](https://github.com/poindexter12/baude/issues/111)) ([b80ee49](https://github.com/poindexter12/baude/commit/b80ee496bc2f7385e3c7bf693b73b75f38f6bfef))
+
 ## [2.4.4](https://github.com/poindexter12/baude/compare/v2.4.3...v2.4.4) (2026-09-29)
 
 
