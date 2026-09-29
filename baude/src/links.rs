@@ -235,24 +235,28 @@ fn scan_line_for_issues(
             push_issue_link(
                 chars,
                 cells,
-                start,
-                hash + 1,
-                end,
-                &owner,
-                &repo,
-                origin,
+                IssueSpan {
+                    start,
+                    number_start: hash + 1,
+                    end,
+                    owner: &owner,
+                    repo: &repo,
+                },
+                &origin.host,
                 out,
             );
         } else if hash == 0 || is_issue_prefix(chars[hash - 1]) {
             push_issue_link(
                 chars,
                 cells,
-                hash,
-                hash + 1,
-                end,
-                &origin.owner,
-                &origin.repo,
-                origin,
+                IssueSpan {
+                    start: hash,
+                    number_start: hash + 1,
+                    end,
+                    owner: &origin.owner,
+                    repo: &origin.repo,
+                },
+                &origin.host,
                 out,
             );
         }
@@ -304,27 +308,34 @@ fn is_repo_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 
-fn push_issue_link(
-    chars: &[char],
-    cells: &[Option<(u16, u16)>],
+struct IssueSpan<'a> {
     start: usize,
     number_start: usize,
     end: usize,
-    owner: &str,
-    repo: &str,
-    origin: &RepositoryOrigin,
+    owner: &'a str,
+    repo: &'a str,
+}
+
+fn push_issue_link(
+    chars: &[char],
+    cells: &[Option<(u16, u16)>],
+    span: IssueSpan<'_>,
+    host: &str,
     out: &mut Vec<DetectedLink>,
 ) {
-    let number: String = chars[number_start..end].iter().collect();
-    let raw = format!("https://{}/{}/{}/issues/{number}", origin.host, owner, repo);
+    let number: String = chars[span.number_start..span.end].iter().collect();
+    let raw = format!(
+        "https://{host}/{}/{}/issues/{number}",
+        span.owner, span.repo
+    );
     let Some(destination) = validate_http_url(&raw) else {
         return;
     };
-    let Some((row, start_col)) = cells[start] else {
+    let Some((row, start_col)) = cells[span.start] else {
         return;
     };
     let mut end_col = start_col;
-    for (r, c) in cells[start..end].iter().flatten() {
+    for (r, c) in cells[span.start..span.end].iter().flatten() {
         if *r == row {
             end_col = *c;
         }
