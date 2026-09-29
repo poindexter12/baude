@@ -357,25 +357,27 @@ lifecycle-authorized manual retry". Reproducible on 2.4.1 code.
    row's lifecycle still reads `Running` with the dead child, which carries
    no `Retry*` capability, so `r` is refused.
 
-**Fix (proposed):**
-- Before choosing `ResumeId`, check
-  `<CLAUDE_CONFIG_DIR>/projects/<cwd-dashed>/<id>.jsonl` exists; if not,
-  downgrade to `ContinueLatest`. Deterministic and testable without Claude.
-  Belt and braces: give the `ResumeId` shell the same `|| exec claude
-  --continue … || exec claude` fallback shape.
-- A child that exits within a few seconds of a targeted resume clears
-  `resume_id` and leaves the row in a state where `r` is authorized, so the
-  TUI cannot wedge on a bad id.
+**Fix (resolved):**
+- PR #107 checks `<CLAUDE_CONFIG_DIR>/projects/<cwd-dashed>/<id>.jsonl`
+  before selecting `ResumeId`; a missing transcript clears the id and uses
+  `ContinueLatest`. A targeted resume deliberately has no shell fallback:
+  retrying a real conversation after an unrelated non-zero exit would be
+  unsafe.
+- This residual fix clears `resume_id` and closes the retained runtime when a
+  real `ResumeId` child dies within three seconds. The ordinary close lifecycle
+  leaves the row `Inactive`, where `r` is authorized; later exits and other
+  spawn modes retain their ids.
 
 **Tests:** fixture with a session-file id and no transcript reopens with
-`--continue`; a row whose child dies right after a targeted resume ends with
-`resume_id: None` and `r` allowed; a row with a real transcript still gets
-`--resume`.
+`--continue`; TUI and daemon fixtures with a real transcript prove an
+immediately-dead targeted resume persists `resume_id: None` and authorizes
+`r`; a child that survives beyond the window retains its id.
 
 **Workaround:** quit the baude holding the workspace lock, set that row's
 `session.resume_id` to `null` in `~/.config/baude/state-<ws>.json`, relaunch.
 
-**Status:** open.
+**Status:** RESOLVED. PR #107 delivered the pre-spawn transcript check; this
+residual early-exit handling closes the cleanup/corruption race.
 
 ### BL-10 — PTY children that exit on their own, or through `Pty::kill()`, are never reaped (permanent zombies)
 

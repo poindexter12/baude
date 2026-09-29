@@ -3262,6 +3262,7 @@ impl App {
         // $BAUDE_EVENT_URL, which routes hook events to the /tmp append path
         // (only the daemon injects that var).
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&base, None, mode);
 
         // Wire the session cwd before the CLI starts (for Claude: the
@@ -3407,6 +3408,7 @@ impl App {
             shell: registered_shell,
             shell_open: shell_size.is_some(),
             spawn_unix_ms: now_unix_ms(),
+            targeted_resume,
             meta,
             archived: false,
             archived_by_user: false,
@@ -4158,7 +4160,43 @@ impl App {
         self.polled_meta_once
     }
 
+    /// Reconcile a targeted resume that died before Claude could establish the
+    /// retained conversation. This shares the normal retained close boundary,
+    /// so its runtime is reaped and the lifecycle reaches `Inactive`, where
+    /// manual reopen is authorized.
+    fn reconcile_early_targeted_resume_exits(&mut self) {
+        let exited: Vec<_> = self
+            .sessions
+            .iter_mut()
+            .filter_map(|session| {
+                session
+                    .early_targeted_resume_exit()
+                    .then(|| {
+                        checkout_for_runtime(&self.runtime_checkouts, session.id)
+                            .map(|key| (key, session.id))
+                    })
+                    .flatten()
+            })
+            .collect();
+        for (checkout, id) in exited {
+            if let Some(saved) = self
+                .repository_state
+                .checkouts
+                .iter_mut()
+                .find(|saved| saved.key == checkout)
+            {
+                saved.session.resume_id = None;
+            }
+            if let Err(error) = self.close_retained_session(id) {
+                self.set_message(format!(
+                    "failed to reconcile early targeted resume: {error}"
+                ));
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
+        self.reconcile_early_targeted_resume_exits();
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
                 self.message = None;
@@ -5942,6 +5980,7 @@ impl App {
         // the prior behavior.
         let be = backend::active();
         let base = be.resolve_cmd(&self.claude_cmd()).cmd;
+        let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&base, None, mode);
         // HREG-03/D-02: surface seed warnings exactly like the add-session
         // path — restart is a spawn path too.
@@ -5997,6 +6036,7 @@ impl App {
         if let Some(s) = self.session_mut(id) {
             std::mem::swap(&mut s.claude, &mut pty);
             s.spawn_unix_ms = now_unix_ms();
+            s.targeted_resume = targeted_resume;
             s.meta = ClaudeMeta::default();
             s.meta.backend_port = plan.server_port;
         }
@@ -12514,6 +12554,107 @@ mod tests {
 
         app.kill_all();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn early_targeted_resume_exit_clears_id_and_authorizes_reopen_but_late_exit_retains_it() {
+        for (label, late) in [("early-resume-exit", false), ("late-resume-exit", true)] {
+            let fixture = admission_repo(label);
+            let repo = fixture.path().to_path_buf();
+            let root = repo.parent().unwrap().to_path_buf();
+            let state_root = root.join("state");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let mut app = App::new(repo.clone());
+            app.remote = None;
+            app.config.claude_cmd = Some(
+                if late {
+                    "sh -c 'sleep 30'"
+                } else {
+                    "sh -c 'exit 1'"
+                }
+                .into(),
+            );
+            app.persistence_root_for_test = Some(state_root.clone());
+            let runtime = app.admit_repository(&repo).unwrap().expect("runtime");
+            let checkout = app.repository_state.checkouts[0].key;
+
+            if late {
+                app.session_mut(runtime).unwrap().claude.kill();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.session(runtime).unwrap().claude.is_exited() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "initial child never exited"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let resume_id = format!("resume-{label}");
+            let resume_cwd = app.repository_state.checkouts[0]
+                .observed_path
+                .to_path_buf();
+            let transcript = baude_core::meta::transcript_file(&resume_cwd, &resume_id);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+            assert!(
+                baude_core::backend::active().resume_target_exists(&resume_cwd, &resume_id),
+                "real transcript is visible to the backend"
+            );
+            app.repository_state.checkouts[0].session.resume_id = Some(resume_id.clone());
+            app.reopen_checkout(checkout).unwrap();
+            assert!(
+                app.session(runtime).unwrap().targeted_resume,
+                "real transcript uses --resume"
+            );
+
+            if late {
+                let session = app.session_mut(runtime).unwrap();
+                session.spawn_unix_ms = baude_core::meta::now_unix_ms()
+                    - baude_core::session::EARLY_RESUME_ID_EXIT_WINDOW_MS
+                    - 1;
+                session.claude.kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !app.session(runtime).unwrap().claude.is_exited() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "resumed child never exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            } else {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !app.session(runtime).unwrap().claude.is_exited() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "resumed child never exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+            app.tick();
+
+            let saved = baude_core::persist::load_current_at(
+                &state_root,
+                &baude_core::workspace::active().state_file("state"),
+            )
+            .unwrap()
+            .state;
+            if late {
+                assert_eq!(
+                    saved.checkouts[0].session.resume_id.as_deref(),
+                    Some(resume_id.as_str())
+                );
+            } else {
+                assert_eq!(saved.checkouts[0].session.resume_id, None);
+                assert_eq!(
+                    baude_core::lifecycle::lifecycle_capability(saved.checkouts[0].lifecycle()),
+                    Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
+                );
+                assert!(!app.runtime_checkouts.contains_key(&checkout));
+            }
+            app.kill_all();
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
