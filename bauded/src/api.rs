@@ -1100,6 +1100,27 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Assert a mutation's status and carry the response body into the
+    /// failure message. A bare status comparison hides which error the handler
+    /// mapped: `delete_session` turns every `MutationError::Domain` into 404,
+    /// so "404" alone cannot distinguish a missing session from a failed
+    /// runtime teardown.
+    async fn assert_status(
+        response: axum::response::Response,
+        expected: StatusCode,
+        leg: &str,
+        failure: &baude_core::persist::AtomicFailure,
+    ) {
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            expected,
+            "{leg} under {failure:?}: body={}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     #[tokio::test]
     async fn real_atomic_persistence_failures_are_503_for_every_mutation() {
         use baude_core::persist::{self, AtomicFailure};
@@ -1133,7 +1154,13 @@ mod tests {
                 .oneshot(post_json("/sessions", r#"{"repo":"/tmp"}"#))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_status(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "POST /sessions",
+                &failure,
+            )
+            .await;
             assert!(crate::manager::lock(&create_state).list().is_empty());
             let create_file = create_root.join(workspace.state_file("daemon-state"));
             assert_eq!(create_file.exists(), committed);
@@ -1167,7 +1194,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_status(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DELETE /sessions/{id}",
+                &failure,
+            )
+            .await;
             assert_eq!(
                 crate::manager::lock(&delete_state)
                     .info(delete_id)
@@ -1197,7 +1230,13 @@ mod tests {
                 .oneshot(post_json(&format!("/sessions/{archive_id}/archive"), ""))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_status(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "POST /sessions/{id}/archive",
+                &failure,
+            )
+            .await;
             assert_eq!(
                 crate::manager::lock(&archive_state)
                     .info(archive_id)
@@ -1248,7 +1287,13 @@ mod tests {
                 .oneshot(post_json(&format!("/sessions/{restart_id}/restart"), ""))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_status(
+                response,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "POST /sessions/{id}/restart",
+                &failure,
+            )
+            .await;
             assert_eq!(
                 crate::manager::lock(&restart_state)
                     .info(restart_id)
