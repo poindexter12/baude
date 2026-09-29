@@ -331,7 +331,7 @@ matching LINK-07 fail-closed.
 6. Origin cache: reconciliation refresh updates the cached origin when the
    remote changes; a checkout that moves between repositories re-resolves.
 
-**Status:** open. Candidate for the next UX phase alongside link work.
+**Status:** ✅ RESOLVED 2026-09-29 — cached-origin, gesture-time `#NN` and `owner/repo#NN` hints shipped with grammar, wrap, ordering, and refresh coverage.
 
 ### BL-09 — A checkout whose recorded `resume_id` has no transcript can never be reopened from the TUI
 

@@ -321,6 +321,17 @@ pub struct RetainedStandaloneSessionState {
     pub ever_launched: bool,
 }
 
+/// Browser issue-link destination derived from a repository's `origin` during
+/// reconciliation. It is optional for compatibility with persisted state from
+/// before link hints understood issue references.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryOrigin {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedRepository {
@@ -329,6 +340,9 @@ pub struct SavedRepository {
     pub observed_main_worktree: PersistedPath,
     pub first_seen_order: u64,
     pub health: RepositoryHealth,
+    /// Refreshed during repository admission; absent for legacy or unresolved origins.
+    #[serde(default)]
+    pub origin: Option<RepositoryOrigin>,
     #[serde(default)]
     pub physical_key: String,
 }
@@ -1129,6 +1143,7 @@ mod tests {
             observed_main_worktree: path("/repo"),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: String::new(),
         }
     }
@@ -1509,6 +1524,7 @@ mod tests {
             )),
             first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: physical_key_value.clone(),
         };
 

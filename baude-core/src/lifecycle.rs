@@ -1734,6 +1734,7 @@ pub fn ensure_repository(
         observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
         first_seen_order,
         health: RepositoryHealth::Available,
+        origin: None,
         physical_key: actual_physical_key,
     });
 
@@ -3167,6 +3168,7 @@ mod tests {
             observed_main_worktree: path("/repo"),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: String::new(),
         });
         state.checkouts.push(SavedCheckout {
@@ -3920,6 +3922,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: String::new(),
         });
         state.checkouts.push(SavedCheckout {
@@ -4581,6 +4584,7 @@ mod tests {
             observed_main_worktree: main_worktree,
             first_seen_order: state.allocate_first_seen_order().expect("allocate order"),
             health: crate::repository::RepositoryHealth::Available,
+            origin: None,
             physical_key: "legacy-counter".to_string(),
         };
 

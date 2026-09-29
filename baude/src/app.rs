@@ -17,7 +17,7 @@ use baude_core::persist::{self, Config, LegacyReconciliation, LoadOutcome, State
 use baude_core::pty::{now_ms, Pty};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState,
+    RepositoryHealth, RepositoryKey, RepositoryOrigin, RepositoryState, RetainedSessionState,
     RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout, SavedRepository,
     SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
     ValidationRow,
@@ -2273,6 +2273,13 @@ impl App {
 
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
         let snapshot = git::discover_repository(path)?;
+        // Admission is the reconciliation seam: resolve origin once here and
+        // retain only its browser-addressable identity for gesture-time hints.
+        let origin = git::origin_target(&snapshot.main_worktree).map(|target| RepositoryOrigin {
+            host: target.host,
+            owner: target.owner,
+            repo: target.repo,
+        });
         let common = PersistedPath::from_path(&snapshot.common_dir);
         let repository_key = match self
             .repository_state
@@ -2291,6 +2298,7 @@ impl App {
                     observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                     first_seen_order,
                     health: RepositoryHealth::Available,
+                    origin: origin.clone(),
                     physical_key: key.get().to_string(),
                 });
                 key
@@ -2305,6 +2313,7 @@ impl App {
             repository.observed_common_dir = common;
             repository.observed_main_worktree = PersistedPath::from_path(&snapshot.main_worktree);
             repository.health = RepositoryHealth::Available;
+            repository.origin = origin;
         }
 
         let default = match git::resolve_default_branch(&snapshot) {
@@ -6264,9 +6273,12 @@ impl App {
             ),
             Focus::Sidebar => (0, None),
         };
+        let origin = self
+            .selected_repository()
+            .and_then(|repository| repository.origin.as_ref());
         let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
             p.set_scrollback(scroll);
-            let mut links = crate::links::collect_links(p.screen());
+            let mut links = crate::links::collect_links(p.screen(), origin);
             p.set_scrollback(0);
             // Top-to-bottom, left-to-right — hint letters label links in
             // visual order regardless of which pass found them.
@@ -7170,9 +7182,9 @@ mod tests {
     use baude_core::persist;
     use baude_core::repository::{
         CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, PersistedPath,
-        RepositoryHealth, RepositoryState, RetainedSessionState, RetainedStandaloneSessionState,
-        SavedCheckout, SavedRepository, SavedStandaloneSession, StandaloneKey, StandaloneLifecycle,
-        UnavailableCause, ValidationRow,
+        RepositoryHealth, RepositoryOrigin, RepositoryState, RetainedSessionState,
+        RetainedStandaloneSessionState, SavedCheckout, SavedRepository, SavedStandaloneSession,
+        StandaloneKey, StandaloneLifecycle, UnavailableCause, ValidationRow,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{HashMap, HashSet};
@@ -7690,6 +7702,83 @@ mod tests {
         pushed.with_path(clone)
     }
 
+    #[test]
+    fn admission_refreshes_cached_origin_after_remote_or_checkout_change() {
+        let fixture = admission_repo_cloned("origin-cache-refresh");
+        let repo = fixture.root().join("repo");
+        let clone = fixture.path().to_path_buf();
+        // The fixture first creates a real repository and `git remote add origin`
+        // to a real bare remote. Retarget only its URL after the tracking refs
+        // exist, preserving the normal admission topology while exercising the
+        // browser-addressable origin cache.
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:first/project.git",
+            ],
+        );
+        git(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:second/other.git",
+            ],
+        );
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.admit_repository(&repo).expect("first admission");
+        app.admit_repository(&clone)
+            .expect("admission after checkout moves to another repository");
+        let origins: Vec<_> = app
+            .repository_state
+            .repositories
+            .iter()
+            .map(|repository| repository.origin.clone())
+            .collect();
+        assert_eq!(
+            origins,
+            [
+                Some(RepositoryOrigin {
+                    host: "github.com".into(),
+                    owner: "first".into(),
+                    repo: "project".into(),
+                }),
+                Some(RepositoryOrigin {
+                    host: "github.com".into(),
+                    owner: "second".into(),
+                    repo: "other".into(),
+                }),
+            ],
+            "repository rows retain their own origin when a pane moves between repositories"
+        );
+
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.example/team/next.git",
+            ],
+        );
+        app.admit_repository(&repo)
+            .expect("reconcile after remote change");
+        assert_eq!(
+            app.repository_state.repositories[0].origin,
+            Some(RepositoryOrigin {
+                host: "github.example".into(),
+                owner: "team".into(),
+                repo: "next".into(),
+            }),
+            "a repeated reconciliation refreshes rather than reuses the old repository origin"
+        );
+    }
+
     /// Guards the fixture itself: `admission_repo` must keep the pushed shape. Repairing
     /// `refs/remotes/origin/HEAD` here is what kept every admission test green while real
     /// `gh repo create` repositories were being refused.
@@ -7995,6 +8084,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -8018,6 +8108,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
@@ -8304,6 +8395,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo/project")),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
@@ -8734,6 +8826,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo")),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
@@ -8893,6 +8986,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -8922,6 +9016,7 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -9309,6 +9404,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository.get().to_string(),
         });
 
@@ -9474,6 +9570,7 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
+            origin: None,
             physical_key: repository.get().to_string(),
         });
         let before = app.repository_state.clone();
@@ -9622,6 +9719,7 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                origin: None,
                 physical_key: repository.get().to_string(),
             });
             let branch = format!("feature/{label}");
@@ -11051,6 +11149,7 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(Path::new(main)),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
+                origin: None,
                 physical_key: key.get().to_string(),
             });
             key

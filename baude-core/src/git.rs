@@ -1857,6 +1857,24 @@ pub struct CloneTarget {
 /// scheme-less `host/owner/repo`, or the `owner/repo` shorthand (assumes
 /// github.com). Everything except pasted https keeps ssh, so unattended
 /// pushes ride the usual ssh auth.
+/// Resolve the configured `origin` into a browser-addressable repository target.
+/// Admission/reconciliation calls this once per repository; callers treat missing,
+/// malformed, or non-Git origins as unavailable rather than guessing.
+pub fn origin_target(repo: &Path) -> Option<CloneTarget> {
+    let output = git_bytes(
+        repo,
+        &[
+            OsStr::new("remote"),
+            OsStr::new("get-url"),
+            OsStr::new("origin"),
+        ],
+        "read origin URL",
+    )
+    .ok()?;
+    let raw = std::str::from_utf8(&output.stdout).ok()?.trim();
+    parse_clone_target(raw)
+}
+
 pub fn parse_clone_target(input: &str) -> Option<CloneTarget> {
     let input = input.trim().split(['?', '#']).next()?.trim_end_matches('/');
     // Strip a trailing `.git` and reject empty/nested segments.

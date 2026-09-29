@@ -184,8 +184,11 @@ outer terminal — tmux passes Shift+Enter through only with its
 ### Link hints
 
 `ctrl+o` opens a hint overlay listing the links currently visible in the
-focused pane — OSC 8 hyperlinks and bare `http(s)://` urls alike. Each row is
-lettered and shows the link's **actual destination**, never its display label.
+focused pane — OSC 8 hyperlinks, bare `http(s)://` urls, and repository issue
+references alike. In a Git checkout with a resolvable `origin`, bare `#NN`
+opens that checkout's `https://<host>/<owner>/<repo>/issues/NN`, while
+`owner/repo#NN` selects that repository on the same host. Each row is lettered
+and shows the link's **actual destination**, never its display label.
 That is the whole point of the preview: a link rendered as `docs` shows you the
 url it would really send you to before you open it. Long destinations are
 middle-truncated to fit the pane width only, so the scheme and host stay
