@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.4](https://github.com/poindexter12/baude/compare/v2.4.3...v2.4.4) (2026-09-29)
+
+
+### Bug Fixes
+
+* **bauded:** report runtime teardown failure on DELETE as 500, not 404 ([#109](https://github.com/poindexter12/baude/issues/109)) ([c21172c](https://github.com/poindexter12/baude/commit/c21172cf89a17a5efed2712b726e5398ee69ec66))
+
 ## [2.4.3](https://github.com/poindexter12/baude/compare/v2.4.2...v2.4.3) (2026-09-29)
 
 
