@@ -67,6 +67,20 @@ fn encode_path(p: &Path) -> String {
         .collect()
 }
 
+/// Where Claude Code keeps the transcript of conversation `session_id` when
+/// it was started in `cwd`: `<config>/projects/<encoded cwd>/<id>.jsonl`.
+///
+/// Claude writes this file only once the conversation has a first message,
+/// so a session id can exist (announced in `sessions/<pid>.json`) with no
+/// transcript behind it — and `claude --resume <id>` then dies with "No
+/// conversation found".
+pub fn transcript_file(cwd: &Path, session_id: &str) -> PathBuf {
+    claude_config_dir()
+        .join("projects")
+        .join(encode_path(cwd))
+        .join(format!("{session_id}.jsonl"))
+}
+
 #[derive(Default, Clone)]
 pub struct Usage {
     pub input: u64,
@@ -333,7 +347,7 @@ impl ClaudeMeta {
     fn resolve_transcript(&mut self, cwd: &Path, spawn_unix_ms: u64) {
         let project_dir = claude_config_dir().join("projects").join(encode_path(cwd));
         let path = if let Some(sid) = &self.session_id {
-            let p = project_dir.join(format!("{sid}.jsonl"));
+            let p = transcript_file(cwd, sid);
             p.exists().then_some(p)
         } else {
             // No session file — fall back to the newest transcript started

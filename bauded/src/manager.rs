@@ -1461,7 +1461,7 @@ impl Manager {
     fn restore_removed_runtime(
         &mut self,
         checkout: CheckoutKey,
-        saved: RetainedSessionState,
+        mut saved: RetainedSessionState,
     ) -> Result<u64> {
         if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
             return Ok(id);
@@ -1496,11 +1496,8 @@ impl Manager {
             CheckoutLifecycle::Active => {}
             other => bail!("checkout cannot restore a runtime from {other:?}"),
         }
-        let mode = saved
-            .resume_id
-            .clone()
-            .map(backend::SpawnMode::ResumeId)
-            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        let mode =
+            lifecycle::retained_resume_mode(&mut self.repository_state, checkout, &mut saved);
         let id = self.spawn_retained_with_mode(
             checkout,
             saved.cwd.to_path_buf(),
@@ -2153,9 +2150,13 @@ impl Manager {
                     .ok()
                     .and_then(|session| session.meta.session_id.clone())
             });
-        let mode = targeted
-            .map(backend::SpawnMode::ResumeId)
-            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        // A targeted resume of a conversation with no transcript dies at
+        // spawn ("No conversation found"), so a dead id continues instead.
+        let mut targeted = targeted;
+        let cwd = self.session(id)?.cwd.clone();
+        let mode = lifecycle::resume_mode(&mut targeted, |resume| {
+            backend::active().resume_target_exists(&cwd, resume)
+        });
         self.restart_with_mode(id, mode)
     }
 
@@ -3751,6 +3752,11 @@ mod tests {
         let path = manager.repository_state.checkouts[0]
             .observed_path
             .to_path_buf();
+        // A real conversation has a transcript; a restore must not drop it as
+        // a dead id (SQ-4).
+        let transcript = baude_core::meta::transcript_file(&path, "fresh-manager-removal-target");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
 
         manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();

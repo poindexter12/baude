@@ -456,7 +456,30 @@ impl fmt::Display for ReconciliationUnavailable {
 
 impl std::error::Error for ReconciliationUnavailable {}
 
+impl ReconciliationUnavailable {
+    /// `Some(observed)` when the ONLY fact that failed is the checkout's
+    /// branch, with the full ref Git now reports (`None` when detached).
+    ///
+    /// Sound because [`reconcile_checkout`] compares branch facts last:
+    /// `Detached` and `BranchChanged` are returned only after the path was
+    /// found, discovered as the recorded repository's common directory, shown
+    /// to be the recorded worktree, and seen neither locked nor prunable. A
+    /// reorder of those checks would break this, which
+    /// `branch_drift_is_reported_only_after_every_identity_fact_verified`
+    /// pins.
+    pub fn branch_drift(&self) -> Option<Option<&str>> {
+        match self {
+            Self::BranchChanged { observed, .. } => Some(observed.as_deref()),
+            Self::Detached => Some(None),
+            _ => None,
+        }
+    }
+}
+
 /// Rediscover and compare every Git-owned fact that authorizes checkout reuse.
+///
+/// Branch facts are compared LAST, after identity, path and lock state; see
+/// [`ReconciliationUnavailable::branch_drift`], which depends on that order.
 pub fn reconcile_checkout(
     expected_common_dir: &Path,
     expected_path: &Path,
@@ -4553,6 +4576,64 @@ mod tests {
                 reconcile_checkout(&common, &missing, Some(&branch)),
                 Err(ReconciliationUnavailable::Missing { .. })
             ));
+        }
+
+        /// SQ-5: `branch_drift` lets a branch-following role adopt the new
+        /// branch without a second reconcile, which is only sound while a
+        /// branch refusal proves every identity fact held. A checkout whose
+        /// branch moved AND that is locked must report the lock, and a branch
+        /// move alone must carry the ref Git now reports.
+        #[test]
+        fn branch_drift_is_reported_only_after_every_identity_fact_verified() {
+            let fixture = GitFixture::new();
+            let repo = fixture.repo("drift order");
+            let linked = fixture.linked_worktree(&repo, "drift linked", "drift");
+            let expected = discover_repository(&linked).unwrap();
+            let common = expected.common_dir.clone();
+            let branch = expected.selected_worktree.branch.clone().unwrap();
+            let linked = expected.selected_worktree.path;
+
+            git_ok(
+                &linked,
+                &[
+                    OsStr::new("switch"),
+                    OsStr::new("-q"),
+                    OsStr::new("-c"),
+                    OsStr::new("drift-other"),
+                ],
+            );
+            let moved = reconcile_checkout(&common, &linked, Some(&branch)).unwrap_err();
+            assert_eq!(moved.branch_drift(), Some(Some("refs/heads/drift-other")));
+
+            git_ok(&linked, &[OsStr::new("switch"), OsStr::new("--detach")]);
+            let detached = reconcile_checkout(&common, &linked, Some(&branch)).unwrap_err();
+            assert_eq!(detached, ReconciliationUnavailable::Detached);
+            assert_eq!(detached.branch_drift(), Some(None));
+
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("lock"),
+                    linked.as_os_str(),
+                ],
+            );
+            let locked = reconcile_checkout(&common, &linked, Some(&branch)).unwrap_err();
+            assert_eq!(locked, ReconciliationUnavailable::LockedOrPrunable);
+            assert_eq!(locked.branch_drift(), None);
+
+            let other = fixture.repo("drift other identity");
+            let foreign = reconcile_checkout(
+                &discover_repository(&other).unwrap().common_dir,
+                &linked,
+                Some(&branch),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                foreign,
+                ReconciliationUnavailable::IdentityChanged { .. }
+            ));
+            assert_eq!(foreign.branch_drift(), None);
         }
     }
 

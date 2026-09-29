@@ -1120,6 +1120,10 @@ impl App {
             Some(UnavailableCause::Missing) => "missing",
             Some(UnavailableCause::NotRepository) => "not a repository",
             Some(UnavailableCause::IdentityChanged) => "identity changed",
+            Some(UnavailableCause::PathChanged) => "worktree path changed",
+            Some(UnavailableCause::BranchChanged { .. }) => "branch changed",
+            Some(UnavailableCause::Detached) => "detached HEAD",
+            Some(UnavailableCause::LockedOrPrunable) => "locked or prunable",
             Some(UnavailableCause::RemovalTombstone(_)) => "protected removal state",
             Some(UnavailableCause::PendingActivation { .. })
             | Some(UnavailableCause::ActivationRecovery { .. }) => "activation recovery",
@@ -2130,22 +2134,25 @@ impl App {
             }
         };
         let before = self.repository_state.clone();
-        self.repository_state
+        let row = self
+            .repository_state
             .standalone_session_mut(key)
-            .expect("standalone cloned above")
-            .set_runtime_state(StandaloneLifecycle::Active, None);
-        self.persist_standalone_change(before)?;
+            .expect("standalone cloned above");
+        row.set_runtime_state(StandaloneLifecycle::Active, None);
+        // The session spawns in the canonical folder, so that is where the
+        // backend keeps its conversation. A stored id with no transcript
+        // behind it (closed before its first message) would kill the pane at
+        // spawn with "No conversation found": it is cleared in the same save
+        // that marks the row active, and the spawn continues instead.
         let mode = requested_mode.unwrap_or_else(|| {
-            if !saved.session.ever_launched {
+            if !row.session.ever_launched {
                 return backend::SpawnMode::Fresh;
             }
-            saved
-                .session
-                .resume_id
-                .clone()
-                .map(backend::SpawnMode::ResumeId)
-                .unwrap_or(backend::SpawnMode::ContinueLatest)
+            lifecycle::resume_mode(&mut row.session.resume_id, |id| {
+                backend::active().resume_target_exists(&canonical, id)
+            })
         });
+        self.persist_standalone_change(before)?;
         let id =
             self.add_standalone_session_with_mode(key, canonical, mode, saved.session.shell_open)?;
         if let Some(runtime) = self.session_mut(id) {
@@ -2337,6 +2344,25 @@ impl App {
                         .into(),
                 );
                 return Ok(None);
+            }
+            // A user-owned primary FOLLOWS its branch (`lifecycle::branch_binding`),
+            // so after a `git switch` the row names the branch the user chose.
+            // It stays the primary: re-deriving the default below would add a
+            // managed default worktree the user never asked for and then refuse
+            // it for not being the recorded path.
+            if let Some(existing) = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == existing_key)
+            {
+                if lifecycle::branch_binding(existing) == lifecycle::BranchBinding::Follows
+                    && existing.observed_branch.as_deref() != Some(default.local_ref.as_str())
+                {
+                    self.admit_existing_worktrees(repository_key, &snapshot)?;
+                    self.repository_state.validate()?;
+                    return self.ensure_primary(existing_key);
+                }
             }
         }
         let checkout_key = match existing_key {
@@ -2979,44 +3005,28 @@ impl App {
         let expected_common = self.repository_state.repositories[repository_index]
             .observed_common_dir
             .clone();
-        match git::reconcile_checkout(
+        let reconciliation = git::reconcile_checkout(
             &expected_common.to_path_buf(),
             &path,
             expected_branch.as_deref(),
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let cause = if matches!(error, git::ReconciliationUnavailable::Missing { .. }) {
-                    UnavailableCause::Missing
-                } else if matches!(
-                    error,
-                    git::ReconciliationUnavailable::IdentityChanged { .. }
-                        | git::ReconciliationUnavailable::PathChanged { .. }
-                        | git::ReconciliationUnavailable::BranchChanged { .. }
-                        | git::ReconciliationUnavailable::Detached
-                        | git::ReconciliationUnavailable::LockedOrPrunable
-                ) {
-                    UnavailableCause::IdentityChanged
-                } else {
-                    UnavailableCause::Other(error.to_string())
-                };
-                let _ = lifecycle::record_checkout_reconciliation(
-                    &mut self.repository_state,
-                    checkout_key,
-                    Some(cause.clone()),
-                );
-                self.repository_state.repositories[repository_index].health =
-                    RepositoryHealth::Unavailable(cause);
-                return false;
-            }
-        };
-        let _ = lifecycle::record_checkout_reconciliation(
+        )
+        .map(|_| ());
+        // The role decides whether branch drift is a fresh observation or a
+        // protecting refusal (`lifecycle::branch_binding`), and the cause is
+        // the one the refusal actually was.
+        let unavailable = match lifecycle::record_checkout_reconciliation(
             &mut self.repository_state,
             checkout_key,
-            None,
-        );
-        self.repository_state.repositories[repository_index].health = RepositoryHealth::Available;
-        true
+            &reconciliation,
+        ) {
+            Ok(unavailable) => unavailable,
+            Err(error) => Some(UnavailableCause::Other(error.to_string())),
+        };
+        self.repository_state.repositories[repository_index].health = match unavailable {
+            None => RepositoryHealth::Available,
+            Some(cause) => RepositoryHealth::Unavailable(cause),
+        };
+        self.repository_state.repositories[repository_index].health == RepositoryHealth::Available
     }
 
     // ---- session bookkeeping ----
@@ -3544,7 +3554,7 @@ impl App {
     fn restore_removed_runtime(
         &mut self,
         checkout: CheckoutKey,
-        saved: RetainedSessionState,
+        mut saved: RetainedSessionState,
     ) -> Result<u64> {
         if let Some(id) = self.runtime_checkouts.get(&checkout).copied() {
             self.selected_id = Some(SelId::Checkout(checkout));
@@ -3582,11 +3592,8 @@ impl App {
             CheckoutLifecycle::Active => {}
             other => anyhow::bail!("checkout cannot restore a runtime from {other:?}"),
         }
-        let mode = saved
-            .resume_id
-            .clone()
-            .map(backend::SpawnMode::ResumeId)
-            .unwrap_or(backend::SpawnMode::ContinueLatest);
+        let mode =
+            lifecycle::retained_resume_mode(&mut self.repository_state, checkout, &mut saved);
         let id = self.add_retained_session_with_mode(
             checkout,
             saved.cwd.to_path_buf(),
@@ -9054,6 +9061,85 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// SQ-5, end to end: the user runs `git switch` in their own primary
+    /// checkout and reopens the repository. Before, re-admission marked the
+    /// repository "identity changed" and refused its topology; now the
+    /// primary follows the branch and nothing new is created under it.
+    #[test]
+    fn admit_repository_follows_a_git_switch_in_the_unmanaged_primary() {
+        let fixture = admission_repo("primary-follows-switch");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let linked = root.join("wt-kept");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/kept",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        app.admit_repository(&repo)
+            .unwrap()
+            .expect("initial runtime");
+        let primary_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                assert!(!checkout.managed_by_baude, "the user's own main worktree");
+                assert_eq!(checkout.observed_branch.as_deref(), Some("refs/heads/main"));
+                checkout.key
+            })
+            .expect("primary default row");
+        let rows_before = app.repository_state.checkouts.len();
+
+        git(&repo, &["switch", "-q", "-c", "chore/other"]);
+        app.admit_repository(&repo)
+            .expect("re-admission after a git switch is not an error");
+
+        assert_eq!(
+            app.repository_state.repositories[0].health,
+            RepositoryHealth::Available,
+            "topology stays available"
+        );
+        let primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == primary_key)
+            .expect("the same primary row");
+        assert_eq!(
+            primary.observed_branch.as_deref(),
+            Some("refs/heads/chore/other")
+        );
+        assert_eq!(primary.session.branch.as_deref(), Some("chore/other"));
+        assert_eq!(primary.health(), &CheckoutHealth::Available);
+        assert_eq!(
+            app.repository_state.checkouts.len(),
+            rows_before,
+            "no managed default worktree is created under the user's primary"
+        );
+        assert!(app
+            .repository_state
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.health() == &CheckoutHealth::Available));
+        app.repository_state.validate_for_save().unwrap();
+        app.kill_all();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn admit_repository_assigns_main_role_to_unselected_main_worktree() {
         // Pushed shape: the main worktree parks on a branch that tracks nothing and the
@@ -10311,6 +10397,12 @@ mod tests {
             app.session_mut(runtime).unwrap().meta.session_id = Some(resume_id.clone());
             let before = app.repository_state.clone();
             let path = before.checkouts[0].observed_path.to_path_buf();
+            // A real conversation has a transcript. Without one, the runtime
+            // restored after the failed removal would rightly drop the dead
+            // id instead of resuming it (SQ-4), which is not what this pins.
+            let transcript = baude_core::meta::transcript_file(&path, &resume_id);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
             let confirmation = app.prepare_remove_worktree(checkout).unwrap();
             app.atomic_failure_for_test = Some(failure);
 
@@ -10722,6 +10814,140 @@ mod tests {
         );
         app.close_standalone(key).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The field report (SQ-4), reproduced on the path it took: a non-repo
+    /// folder is a standalone session, closed and user-archived with a
+    /// resume_id whose conversation never got a first message, so Claude
+    /// never wrote its transcript. The project dir holds OTHER conversations,
+    /// as the real one did. Before the fix the reopen spawned
+    /// `claude --resume <id>` and the pane died with "No conversation found".
+    #[test]
+    fn standalone_reopen_of_resume_id_without_transcript_continues_and_clears_it() {
+        let _scope = isolation_scope("standalone-stale-resume");
+        let root = std::env::temp_dir().join(format!(
+            "baude-standalone-stale-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join("poindexter12");
+        let state_root = root.join("state");
+        let argv = root.join("argv.txt");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let mut app = App::new(folder.clone());
+        app.remote = None;
+        // The stand-in records the argv the spawn plan hands it, then stays
+        // alive like every other stand-in in this file.
+        app.config.claude_cmd = Some(format!(
+            "sh -c 'printf \"%s\\n\" \"$@\" > {}; exec sleep 30' baude-argv",
+            argv.display()
+        ));
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root.clone());
+        let recorded_argv = |argv: &Path| -> String {
+            for _ in 0..200 {
+                if let Ok(text) = std::fs::read_to_string(argv) {
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("the stand-in never recorded its argv at {}", argv.display());
+        };
+
+        app.open_repo_session_via(folder.clone(), LocalAdmissionRoute::Open);
+        let key = match app.selected_id {
+            Some(SelId::Standalone(key)) => key,
+            other => panic!("unexpected selection: {other:?}"),
+        };
+        let first = app.runtime_standalones[&key];
+        let stale = "c2d67541-9731-4c72-aa5e-ef8b235ee06b";
+        {
+            let runtime = app.session_mut(first).unwrap();
+            runtime.meta.session_id = Some(stale.into());
+            runtime.archived = true;
+            runtime.archived_by_user = true;
+        }
+        app.close_standalone(key).unwrap();
+
+        let canonical = app
+            .repository_state
+            .standalone_session(key)
+            .unwrap()
+            .canonical_path
+            .to_path_buf();
+        let other = baude_core::meta::transcript_file(&canonical, "0f1e2d3c-other-conversation");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"{\"type\":\"user\"}\n").unwrap();
+        assert!(!baude_core::meta::transcript_file(&canonical, stale).exists());
+        let saved = app.repository_state.standalone_session(key).unwrap();
+        assert_eq!(saved.session.resume_id.as_deref(), Some(stale));
+        assert!(saved.session.ever_launched);
+        assert!(saved.session.archived_by_user);
+
+        let _ = std::fs::remove_file(&argv);
+        let reopened = app.reopen_standalone(key).unwrap();
+        assert_ne!(reopened, first);
+        let args = recorded_argv(&argv);
+        assert!(
+            !args.lines().any(|arg| arg == "--resume") && !args.contains(stale),
+            "a dead resume_id must not be resumed: {args:?}"
+        );
+        assert!(
+            args.lines().any(|arg| arg == "--continue"),
+            "the reopen continues the latest conversation: {args:?}"
+        );
+        assert_eq!(
+            app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .session
+                .resume_id,
+            None
+        );
+        let state_file = baude_core::workspace::active().state_file("state");
+        let persisted = baude_core::persist::load_current_at(&state_root, &state_file).unwrap();
+        assert_eq!(
+            persisted
+                .state
+                .standalone_session(key)
+                .unwrap()
+                .session
+                .resume_id,
+            None,
+            "the stale id is cleared on disk, not only in memory"
+        );
+
+        // Control: an id whose transcript exists is still resumed exactly.
+        let live = "5b0c7e21-live-conversation";
+        app.session_mut(reopened).unwrap().meta.session_id = Some(live.into());
+        app.close_standalone(key).unwrap();
+        let transcript = baude_core::meta::transcript_file(&canonical, live);
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+        let _ = std::fs::remove_file(&argv);
+        app.reopen_standalone(key).unwrap();
+        let args = recorded_argv(&argv);
+        let resume_args: Vec<&str> = args.lines().collect();
+        assert!(
+            resume_args
+                .windows(2)
+                .any(|pair| pair == ["--resume", live]),
+            "a live resume_id is resumed: {args:?}"
+        );
+        assert_eq!(
+            app.repository_state
+                .standalone_session(key)
+                .unwrap()
+                .session
+                .resume_id
+                .as_deref(),
+            Some(live)
+        );
+        app.close_standalone(key).unwrap();
+        assert!(!app.runtime_standalones.contains_key(&key));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
