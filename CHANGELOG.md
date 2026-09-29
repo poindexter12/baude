@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.3](https://github.com/poindexter12/baude/compare/v2.4.2...v2.4.3) (2026-09-29)
+
+
+### Bug Fixes
+
+* recover from stale resume ids and follow branch switches in unmanaged checkouts ([#107](https://github.com/poindexter12/baude/issues/107)) ([99eae64](https://github.com/poindexter12/baude/commit/99eae6468f9118b70ee1deb3f775f19495fb0139))
+
 ## [2.4.2](https://github.com/poindexter12/baude/compare/v2.4.1...v2.4.2) (2026-09-25)
 
 
