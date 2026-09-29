@@ -2140,7 +2140,6 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(main_worktree),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
-                origin: None,
                 physical_key: String::new(),
             });
             self

@@ -790,7 +790,6 @@ fn migrate_legacy(
                 observed_main_worktree: main_worktree.clone(),
                 first_seen_order,
                 health: repository_health,
-                origin: None,
                 physical_key: String::new(),
             });
             repositories.insert(identity, key);
@@ -1302,7 +1301,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&main),
             first_seen_order: repository_order,
             health: RepositoryHealth::Unavailable(UnavailableCause::IdentityChanged),
-            origin: None,
             physical_key: String::new(),
         });
         state.checkouts.push(SavedCheckout::new(
@@ -1379,7 +1377,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&root),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: String::new(),
         };
         let identity = ProcessIdentity {

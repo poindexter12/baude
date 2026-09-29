@@ -569,6 +569,10 @@ pub struct App {
     /// `desktop_notifications`, then on.
     desktop_notify_enabled: bool,
     repository_state: RepositoryState,
+    /// Reconciliation-time origin cache keyed by stable repository identity.
+    /// Runtime-only by design: legacy state loads unchanged and an unknown
+    /// origin fails closed until its repository is admitted again.
+    repository_origins: HashMap<RepositoryKey, RepositoryOrigin>,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
@@ -861,6 +865,7 @@ impl App {
             desktop_notifier: DesktopNotifier::default(),
             desktop_notify_enabled,
             repository_state: RepositoryState::default(),
+            repository_origins: HashMap::new(),
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
@@ -2298,12 +2303,16 @@ impl App {
                     observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                     first_seen_order,
                     health: RepositoryHealth::Available,
-                    origin: origin.clone(),
                     physical_key: key.get().to_string(),
                 });
                 key
             }
         };
+        if let Some(origin) = origin {
+            self.repository_origins.insert(repository_key, origin);
+        } else {
+            self.repository_origins.remove(&repository_key);
+        }
         if let Some(repository) = self
             .repository_state
             .repositories
@@ -2313,7 +2322,6 @@ impl App {
             repository.observed_common_dir = common;
             repository.observed_main_worktree = PersistedPath::from_path(&snapshot.main_worktree);
             repository.health = RepositoryHealth::Available;
-            repository.origin = origin;
         }
 
         let default = match git::resolve_default_branch(&snapshot) {
@@ -6275,7 +6283,7 @@ impl App {
         };
         let origin = self
             .selected_repository()
-            .and_then(|repository| repository.origin.as_ref());
+            .and_then(|repository| self.repository_origins.get(&repository.key));
         let links = parser.and_then(|parser| parser.lock().ok()).map(|mut p| {
             p.set_scrollback(scroll);
             let mut links = crate::links::collect_links(p.screen(), origin);
@@ -7738,7 +7746,7 @@ mod tests {
             .repository_state
             .repositories
             .iter()
-            .map(|repository| repository.origin.clone())
+            .map(|repository| app.repository_origins.get(&repository.key).cloned())
             .collect();
         assert_eq!(
             origins,
@@ -7769,8 +7777,9 @@ mod tests {
         app.admit_repository(&repo)
             .expect("reconcile after remote change");
         assert_eq!(
-            app.repository_state.repositories[0].origin,
-            Some(RepositoryOrigin {
+            app.repository_origins
+                .get(&app.repository_state.repositories[0].key),
+            Some(&RepositoryOrigin {
                 host: "github.example".into(),
                 owner: "team".into(),
                 repo: "next".into(),
@@ -8084,7 +8093,6 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -8108,7 +8116,6 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::ManagedBranch, false);
@@ -8395,7 +8402,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo/project")),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
@@ -8826,7 +8832,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(Path::new("/repo")),
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::Main, false);
@@ -8986,7 +8991,6 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -9016,7 +9020,6 @@ mod tests {
             observed_main_worktree: path,
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository_key.get().to_string(),
         });
         add_checkout(&mut state, CheckoutRole::PrimaryDefault, true);
@@ -9404,7 +9407,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
 
@@ -9570,7 +9572,6 @@ mod tests {
             observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
         let before = app.repository_state.clone();
@@ -9719,7 +9720,6 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(&snapshot.main_worktree),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
-                origin: None,
                 physical_key: repository.get().to_string(),
             });
             let branch = format!("feature/{label}");
@@ -11149,7 +11149,6 @@ mod tests {
                 observed_main_worktree: PersistedPath::from_path(Path::new(main)),
                 first_seen_order: order,
                 health: RepositoryHealth::Available,
-                origin: None,
                 physical_key: key.get().to_string(),
             });
             key

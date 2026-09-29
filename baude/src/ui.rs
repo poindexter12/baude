@@ -2552,7 +2552,6 @@ mod tests {
             observed_main_worktree: persisted_path("/tmp/viewport/repository"),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
         for (index, (name, branch, role, managed, lifecycle, archived)) in [
@@ -2751,7 +2750,6 @@ mod tests {
             observed_main_worktree: persisted_path("/tmp/collapse/quiet"),
             first_seen_order: order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
         for branch in ["one", "two"] {
@@ -3182,7 +3180,6 @@ mod tests {
             observed_main_worktree: persisted_path("/tmp/tracer/repo"),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: repository.get().to_string(),
         });
         for (role, managed, checkout_path, branch) in [

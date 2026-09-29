@@ -338,7 +338,6 @@ mod tests {
             observed_main_worktree: path(checkout),
             first_seen_order: repository_order,
             health: RepositoryHealth::Available,
-            origin: None,
             physical_key: String::new(),
         });
         let key = state.allocate_checkout_key().unwrap();
