@@ -110,6 +110,9 @@ fn not_found(e: anyhow::Error) -> ApiError {
 fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
     match error {
         MutationError::Persistence(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        // The session exists but its runtime would not stop: a server-side
+        // failure, never the caller's "not found"/"bad request" fallback.
+        MutationError::Teardown(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         MutationError::Domain(error) => (fallback, error.to_string()),
     }
 }
@@ -269,6 +272,9 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
         match error {
             MutationError::Persistence(error) => {
                 (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
+            MutationError::Teardown(error) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             }
             MutationError::Domain(error) => {
                 let message = error.to_string();
@@ -1309,6 +1315,61 @@ mod tests {
                 std::fs::remove_dir_all(root).unwrap();
             }
         }
+    }
+
+    /// A runtime that will not stop is a server failure, not "no such
+    /// session". Before SQ-6 `remove` classified teardown errors as
+    /// `MutationError::Domain`, which `delete_session` reports as 404 — the
+    /// exact status of the macOS CI flake in the atomic-persistence test.
+    #[tokio::test]
+    async fn delete_teardown_failure_is_500_and_unknown_id_stays_404() {
+        use baude_core::persist;
+
+        let _scope = api_scope("delete-teardown-failure");
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &persist::Config::default(),
+            |_| {},
+        );
+        let root =
+            std::env::temp_dir().join(format!("bauded-api-delete-teardown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        let id = {
+            let mut manager = crate::manager::lock(&state);
+            manager.persist_at_for_test(&root, &workspace, None);
+            let id = manager.create("/tmp", None, None).unwrap().id;
+            manager.fail_next_agent_teardown_for_test(id, "agent stop refused once");
+            id
+        };
+        let delete = |id: u64| {
+            super::router(Arc::clone(&state)).oneshot(
+                Request::delete(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        let response = delete(id).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert!(body.contains("agent stop refused once"), "body={body}");
+        assert!(
+            crate::manager::lock(&state).info(id).is_some(),
+            "a failed teardown must keep the session"
+        );
+
+        // The failure is retryable: the next DELETE stops it for real.
+        assert_eq!(delete(id).await.unwrap().status(), StatusCode::NO_CONTENT);
+        // A genuinely unknown id is still 404.
+        assert_eq!(delete(id).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        crate::manager::lock(&state).kill_all();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

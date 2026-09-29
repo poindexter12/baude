@@ -41,6 +41,10 @@ pub type Shared = Arc<Mutex<Manager>>;
 pub enum MutationError {
     Domain(anyhow::Error),
     Persistence(persist::SaveError),
+    /// The session's runtime could not be confirmed stopped. A server-side
+    /// failure, never "no such session": the session still exists and its
+    /// checkout is left TeardownPending for a retry.
+    Teardown(anyhow::Error),
 }
 
 impl std::fmt::Display for MutationError {
@@ -48,6 +52,35 @@ impl std::fmt::Display for MutationError {
         match self {
             Self::Domain(error) => error.fmt(f),
             Self::Persistence(error) => error.fmt(f),
+            Self::Teardown(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Marks an error from [`Manager::teardown_retained_runtime`] so it survives
+/// the lifecycle engine as a typed error and can be classified as
+/// [`MutationError::Teardown`] instead of falling through to `Domain`.
+#[derive(Debug)]
+struct RuntimeTeardownError(anyhow::Error);
+
+impl std::fmt::Display for RuntimeTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for RuntimeTeardownError {}
+
+impl MutationError {
+    /// Classify an error that crossed the lifecycle engine: a persistence
+    /// failure, a runtime teardown failure, or a domain refusal.
+    fn from_lifecycle(error: anyhow::Error) -> Self {
+        match error.downcast::<persist::SaveError>() {
+            Ok(error) => Self::Persistence(error),
+            Err(error) => match error.downcast::<RuntimeTeardownError>() {
+                Ok(RuntimeTeardownError(error)) => Self::Teardown(error),
+                Err(error) => Self::Domain(error),
+            },
         }
     }
 }
@@ -1440,11 +1473,13 @@ impl Manager {
             &mut self.sessions[session_index],
         ) {
             if let Err(save_error) = self.save_checked() {
-                return Err(anyhow!(
+                return Err(anyhow::Error::new(RuntimeTeardownError(anyhow!(
                     "{error}; could not persist pending teardown recovery: {save_error}"
-                ));
+                ))));
             }
-            return Err(anyhow::Error::new(error));
+            return Err(anyhow::Error::new(RuntimeTeardownError(
+                anyhow::Error::new(error),
+            )));
         }
         Ok(())
     }
@@ -1788,7 +1823,8 @@ impl Manager {
                 UnavailableCause::TeardownPending { .. }
             ))
         ) {
-            self.teardown_retained_runtime(checkout_key, id)?;
+            self.teardown_retained_runtime(checkout_key, id)
+                .map_err(MutationError::from_lifecycle)?;
             self.drive_lifecycle_effect(
                 checkout_key,
                 lifecycle::LifecycleEvent::RuntimeExtinct,
@@ -1796,7 +1832,8 @@ impl Manager {
                     manager.forget_stopped_runtime(checkout_key, id);
                     Ok(())
                 },
-            )?;
+            )
+            .map_err(MutationError::from_lifecycle)?;
             return Ok(());
         }
         self.drive_lifecycle_effect(
@@ -1804,10 +1841,7 @@ impl Manager {
             lifecycle::LifecycleEvent::RequestClose,
             move |manager, _| manager.teardown_retained_runtime(checkout_key, id),
         )
-        .map_err(|error| match error.downcast::<persist::SaveError>() {
-            Ok(error) => MutationError::Persistence(error),
-            Err(error) => MutationError::Domain(error),
-        })?;
+        .map_err(MutationError::from_lifecycle)?;
         self.drive_lifecycle_effect(
             checkout_key,
             lifecycle::LifecycleEvent::RuntimeExtinct,
@@ -1816,10 +1850,7 @@ impl Manager {
                 Ok(())
             },
         )
-        .map_err(|error| match error.downcast::<persist::SaveError>() {
-            Ok(error) => MutationError::Persistence(error),
-            Err(error) => MutationError::Domain(error),
-        })?;
+        .map_err(MutationError::from_lifecycle)?;
         if self.persistence_dirty {
             return Err(MutationError::Persistence(
                 persist::SaveError::after_replacement(anyhow!(
@@ -2451,6 +2482,16 @@ impl Manager {
         self.persistence_target_for_test =
             Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
         self.atomic_failure_for_test = failure;
+    }
+
+    /// Test-only: make the next confirmed stop of session `id`'s agent PTY
+    /// fail, so API tests can drive the runtime-teardown failure path.
+    #[cfg(test)]
+    pub(crate) fn fail_next_agent_teardown_for_test(&self, id: u64, detail: &str) {
+        self.session(id)
+            .expect("session exists")
+            .claude
+            .fail_next_teardown_for_test(detail);
     }
 
     /// Test-only deterministic Claude metadata poll. The process running the
