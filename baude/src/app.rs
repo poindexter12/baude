@@ -34,7 +34,18 @@ use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
 const META_POLL_MS: u64 = 1000;
+/// Delay a sidebar action long enough to distinguish a deliberate key from a
+/// word typed while the sidebar has focus.
+const SIDEBAR_ACTION_SETTLE_MS: u64 = 150;
+const SIDEBAR_FOCUS_HINT: &str = "sidebar focused — press enter to type in the session";
 const PERSISTENCE_ACTION_REFUSAL: &str = "State is not safely saved. Repair the named state file, save, then retry; no lifecycle action was started.";
+
+#[derive(Debug)]
+enum SidebarKeyGate {
+    Idle,
+    Pending { key: KeyEvent, deadline_ms: u64 },
+    Swallowing { deadline_ms: u64 },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalAdmissionRoute {
@@ -510,6 +521,7 @@ pub struct App {
     pub sessions: Vec<Session>,
     pub selected_id: Option<SelId>,
     pub focus: Focus,
+    sidebar_key_gate: SidebarKeyGate,
     pub modal: Modal,
     pub message: Option<(String, u64)>,
     pub should_quit: bool,
@@ -833,6 +845,7 @@ impl App {
             sessions: Vec::new(),
             selected_id: None,
             focus: Focus::Sidebar,
+            sidebar_key_gate: SidebarKeyGate::Idle,
             modal: Modal::None,
             message: None,
             should_quit: false,
@@ -4072,6 +4085,74 @@ impl App {
         self.dirty = true;
     }
 
+    /// Returns the bounded wait needed to settle a sidebar key, if one is
+    /// pending. The main loop otherwise keeps its normal 50 ms idle poll.
+    pub fn sidebar_settle_timeout(&self) -> Option<std::time::Duration> {
+        let deadline_ms = match &self.sidebar_key_gate {
+            SidebarKeyGate::Idle => return None,
+            SidebarKeyGate::Pending { deadline_ms, .. }
+            | SidebarKeyGate::Swallowing { deadline_ms } => *deadline_ms,
+        };
+        let remaining_ms = deadline_ms.saturating_sub(now_ms()).max(1);
+        Some(std::time::Duration::from_millis(remaining_ms))
+    }
+
+    fn sidebar_key_is_guarded(&self, key: KeyEvent) -> bool {
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        match key.code {
+            // These controls deliberately remain instant even though Enter can
+            // resolve to SidebarAction::Open for a selected row.
+            KeyCode::Char('j' | 'k' | '?' | 'z' | 'f')
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Esc
+            | KeyCode::Enter
+            | KeyCode::Tab => false,
+            // Inline action arms are guarded even with no current selection.
+            KeyCode::Char('q' | 'n' | 'c') => true,
+            _ => self
+                .selected_action_view()
+                .is_some_and(|view| !matches!(sidebar_action(view, key), SidebarAction::None)),
+        }
+    }
+
+    /// Buffer sidebar actions briefly so ordinary text cannot trigger them.
+    /// `handle_sidebar_key` remains the immediate action executor, including
+    /// its persistence refusal, and is called only when a pending action fires.
+    fn handle_sidebar_focus_key(&mut self, key: KeyEvent) {
+        if !matches!(&self.sidebar_key_gate, SidebarKeyGate::Idle) {
+            self.sidebar_key_gate = SidebarKeyGate::Swallowing {
+                deadline_ms: now_ms() + SIDEBAR_ACTION_SETTLE_MS,
+            };
+            return;
+        }
+        if self.sidebar_key_is_guarded(key) {
+            self.sidebar_key_gate = SidebarKeyGate::Pending {
+                key,
+                deadline_ms: now_ms() + SIDEBAR_ACTION_SETTLE_MS,
+            };
+            return;
+        }
+        self.handle_sidebar_key(key);
+    }
+
+    fn flush_sidebar_key_gate_at(&mut self, now: u64) {
+        let gate = std::mem::replace(&mut self.sidebar_key_gate, SidebarKeyGate::Idle);
+        match gate {
+            SidebarKeyGate::Idle => {}
+            SidebarKeyGate::Pending { deadline_ms, .. }
+            | SidebarKeyGate::Swallowing { deadline_ms }
+                if now < deadline_ms =>
+            {
+                self.sidebar_key_gate = gate;
+            }
+            SidebarKeyGate::Pending { key, .. } => self.handle_sidebar_key(key),
+            SidebarKeyGate::Swallowing { .. } => self.set_message(SIDEBAR_FOCUS_HINT.into()),
+        }
+    }
+
     /// WR-01: warn — once per process to stderr, and visibly in the TUI — that
     /// `BAUDE_PERMISSION_MODE=prompt` cannot work under the bare TUI. Permission
     /// approval is daemon+PWA-mediated; a TUI-local session has no
@@ -4213,6 +4294,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.flush_sidebar_key_gate_at(now_ms());
         self.reconcile_early_targeted_resume_exits();
         if let Some((_, expiry)) = &self.message {
             if now_ms() > *expiry {
@@ -4506,7 +4588,7 @@ impl App {
             return;
         }
         match self.focus {
-            Focus::Sidebar => self.handle_sidebar_key(key),
+            Focus::Sidebar => self.handle_sidebar_focus_key(key),
             Focus::Claude => self.forward_key(key, false),
             Focus::Shell => self.forward_key(key, true),
         }
@@ -7231,6 +7313,147 @@ mod tests {
                 )
             );
         }
+    }
+
+    fn sidebar_gate_app() -> App {
+        let remote = |id: u64, name: &str| {
+            serde_json::from_value::<crate::remote::RemoteInfo>(serde_json::json!({
+                "id": id,
+                "name": name,
+                "title": null,
+                "status": "busy",
+                "waiting_for_ms": null,
+                "model": null,
+                "permission_mode": null,
+                "context_used_pct": null,
+                "branch": "main",
+                "session_cost_usd": null,
+                "archived": false
+            }))
+            .unwrap()
+        };
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote_snap = crate::remote::RemoteSnapshot {
+            sessions: vec![remote(1, "one"), remote(2, "two")],
+            fetched_ms: 1,
+            ok: true,
+            daemon_workspace: None,
+            daemon_workspace_source: None,
+            daemon_collision_count: 0,
+        };
+        app.selected_id = Some(SelId::Remote(1));
+        app
+    }
+
+    fn flush_sidebar_gate(app: &mut App) {
+        app.flush_sidebar_key_gate_at(baude_core::pty::now_ms() + super::SIDEBAR_ACTION_SETTLE_MS);
+    }
+
+    #[test]
+    fn sidebar_action_key_fires_only_after_its_settle_window() {
+        let _scope = isolation_scope("sidebar-settle-single");
+        let mut app = sidebar_gate_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit, "q must remain pending during the window");
+        assert!(app.sidebar_settle_timeout().is_some());
+
+        flush_sidebar_gate(&mut app);
+        assert!(app.should_quit, "the pending q fires after the window");
+    }
+
+    #[test]
+    fn deferred_sidebar_action_keeps_the_persistence_refusal() {
+        let _scope = isolation_scope("sidebar-settle-persistence");
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: PersistedPath::from_path(Path::new("/repo/project/.git")),
+            observed_main_worktree: PersistedPath::from_path(Path::new("/repo/project")),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
+        });
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Repository(repository));
+        app.persistence_dirty = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+        flush_sidebar_gate(&mut app);
+        assert_eq!(
+            app.message.as_ref().map(|(message, _)| message.as_str()),
+            Some(super::PERSISTENCE_ACTION_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn sidebar_key_bursts_are_swallowed_and_navigation_cancels_them() {
+        let _scope = isolation_scope("sidebar-settle-burst");
+        let mut app = sidebar_gate_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(matches!(app.modal, Modal::None), "c is swallowed too");
+        flush_sidebar_gate(&mut app);
+        assert_eq!(
+            app.message.as_ref().map(|(message, _)| message.as_str()),
+            Some(super::SIDEBAR_FOCUS_HINT)
+        );
+
+        let mut app = sidebar_gate_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.selected_id,
+            Some(SelId::Remote(1)),
+            "j is swallowed too"
+        );
+
+        flush_sidebar_gate(&mut app);
+        assert_eq!(
+            app.message.as_ref().map(|(message, _)| message.as_str()),
+            Some(super::SIDEBAR_FOCUS_HINT)
+        );
+    }
+
+    #[test]
+    fn typed_sidebar_word_performs_no_action() {
+        let _scope = isolation_scope("sidebar-settle-word");
+        let mut app = sidebar_gate_app();
+
+        for key in ['e', 'd', 'i', 't'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.selected_id, Some(SelId::Remote(1)));
+
+        flush_sidebar_gate(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            app.message.as_ref().map(|(message, _)| message.as_str()),
+            Some(super::SIDEBAR_FOCUS_HINT)
+        );
+    }
+
+    #[test]
+    fn sidebar_navigation_remains_immediate_during_a_settle_window() {
+        let _scope = isolation_scope("sidebar-settle-navigation");
+        let mut app = sidebar_gate_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected_id, Some(SelId::Remote(2)));
+        assert!(app.sidebar_settle_timeout().is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected_id, Some(SelId::Remote(1)));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected_id, Some(SelId::Remote(2)));
+        assert!(app.sidebar_settle_timeout().is_none());
     }
 
     /// The `test-support` cargo feature must reach THIS binary's test build.
