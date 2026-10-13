@@ -593,7 +593,7 @@ fn hold_state_lock(destination: &std::path::Path) -> std::result::Result<(), Sta
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(&io)?;
+        std::fs::create_dir_all(parent).map_err(io)?;
     }
     let mut lock = OpenOptions::new()
         .read(true)
@@ -601,7 +601,7 @@ fn hold_state_lock(destination: &std::path::Path) -> std::result::Result<(), Sta
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(&io)?;
+        .map_err(io)?;
     if let Err(source) = lock.try_lock() {
         return Err(match source {
             std::fs::TryLockError::WouldBlock => StateLockError::Held {
