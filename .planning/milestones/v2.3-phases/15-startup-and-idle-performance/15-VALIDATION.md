@@ -26,7 +26,7 @@ validated: "2026-10-13"
 | **Config file** | `Cargo.toml` |
 | **Quick run command** | `cargo test -p baude --bin baude idle_zero_draws_after_first_frame` |
 | **Full suite command** | `cargo test --workspace` |
-| **Measured runtime** | Focused idle-draw test: 39.55s compile + 1.65s test on 2026-10-12. Full workspace suite: 659s wall clock on 2026-10-13 at closeout (832 passed / 0 failed / 0 ignored across 10 binaries). The earlier 600s non-completion was a timeout, not a hang — the suite spawns a real `git` in a contained fixture root per test. |
+| **Measured runtime** | Focused idle-draw test: 39.55s compile + 1.65s test on 2026-10-12. Full workspace suite: 659s wall clock on 2026-10-13 at closeout (832 passed / 0 failed / 0 ignored across 10 binaries) on a loaded dev host with a cold compile. The same suite ran serially in 59s on a 3-core CI runner later that day (PR #117), so 659s measures host load, not the suite's intrinsic cost. The earlier 600s non-completion was a timeout, not a hang — the suite spawns a real `git` in a contained fixture root per test. |
 
 ---
 

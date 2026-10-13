@@ -116,7 +116,7 @@ state with standalone non-git sessions, and the v2.0.0-beta release channel
 - Phase 13 and Phase 14 never ran `validate-phase`, so their `VALIDATION.md` files are still the seeded template with `{pytest 7.x / jest 29.x}` placeholders. Nobody noticed for three weeks because nothing enforces it.
 - Phase 13's plans went through four Codex convergence cycles before executing, and the 13-02 TDD gate was accepted as debt with no `feat(13-02)` GREEN commit.
 - The whole milestone landed as one squash commit (#90) of 196 files and +27,188 lines. Nothing in the git history distinguishes Phase 13 from Phase 17.
-- An executor timed out the full suite at 600 s and reported it as a hang. The suite takes about 659 s; it was never hung, it was spawning real `git` per test in contained fixtures. The timeout was tuned to a guess rather than a measurement.
+- An executor timed out the full suite at 600 s and reported it as a hang. It was never hung — but the closeout's first correction was wrong too. Recording "the suite takes about 659 s" generalized a single wall clock taken on a heavily loaded dev host with a cold compile; CI ran the same suite serially, on three cores, in 59 s the same day. The timeout was tuned to a guess, and the number brought in to replace the guess was read off the worst host available.
 
 ### Patterns Established
 - Resolve launch-time state through one shared helper with a fixed write order (canonicalize, look up binding, derive, seed cache, claim lock, record binding), so TUI/daemon parity is a test rather than a convention.
@@ -127,7 +127,7 @@ state with standalone non-git sessions, and the v2.0.0-beta release channel
 ### Key Lessons
 - Close the milestone records when the milestone ships. Every day of delay converts passing verification into stale verification, and the only honest remedies are an override or a re-verification that checks old goals against new code.
 - A green unit test that proves a proxy is not evidence for the claim on the box. "Zero draws while idle" and "costs no CPU while idle" are different statements; only one of them was what the milestone promised.
-- Measure the suite before setting a timeout on it. A 600 s limit on a 659 s suite produces a convincing false "hang" report every single time.
+- A wall clock from one host is not the cost of the thing measured. This closeout replaced a guessed 600 s timeout with an observed 659 s, then watched CI run the same suite serially in 59 s — an order of magnitude apart, same commit, same day. Timeouts and "it hung" reports both need a figure from the host that will do the work, and a measurement taken under unknown load is a guess wearing a number.
 - A test that re-reads its own input and asserts on it passes forever and guards nothing. `timing_disabled_when_env_unset` survived a 9/9 verification score by being a tautology.
 - When a phase template ships with `{placeholder}` braces intact, no gate catches it. Three weeks of planning artifacts said `draft` and nothing escalated.
 
