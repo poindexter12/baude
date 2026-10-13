@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0](https://github.com/poindexter12/baude/compare/v2.6.0...v2.7.0) (2026-10-13)
+
+
+### Features
+
+* measure idle CPU in a contained PTY ([#115](https://github.com/poindexter12/baude/issues/115)) ([e1b9732](https://github.com/poindexter12/baude/commit/e1b9732b14370972a58e69c2b7be5085e57d4f17))
+
 ## [2.6.0](https://github.com/poindexter12/baude/compare/v2.5.0...v2.6.0) (2026-10-13)
 
 
