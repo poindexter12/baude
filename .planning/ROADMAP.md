@@ -5,9 +5,11 @@
 - ✅ **v0.7 Session Visibility** — Phases 1-4 (shipped 2026-07-02) ([archive](milestones/v0.7-ROADMAP.md))
 - ✅ **v2.0 Local TUI Dogfood Release** — Phases 5-7 (shipped 2026-09-03) ([archive](milestones/v2.0-ROADMAP.md))
 - ✅ **v2.2 Reliability and Terminal Usability** — Phases 8-12 (shipped 2026-09-19 as v2.2.0) ([archive](milestones/v2.2-ROADMAP.md))
-- 🚧 **v2.3 Launch Defaults and Startup Speed** — Phases 13-17 (in progress)
+- ✅ **v2.3 Launch Defaults and Startup Speed** — Phases 13-17 (shipped 2026-09-22 as v2.3.0) ([archive](milestones/v2.3-ROADMAP.md))
 
-v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases.
+v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases. The same holds after v2.3: v2.3.1 through v2.6.0 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them.
+
+No milestone is currently in progress.
 
 ## Phases
 
@@ -45,141 +47,22 @@ release-please at `v2.0.0-beta.1`. Full phase detail:
 
 </details>
 
-## v2.3 Launch Defaults and Startup Speed (Phases 13-17)
+<details>
+<summary>✅ v2.3 Launch Defaults and Startup Speed (Phases 13-17) — SHIPPED 2026-09-22</summary>
 
-- [x] **Phase 13: Workspace Derivation and New-Session/Open Defaults** - Opening baude from any folder uses the right workspace and repository (completed 2026-09-20)
-- [x] **Phase 14: Managed Worktree Identity** - Managed worktrees carry stable repository identity preventing cross-repo collisions (completed 2026-09-21)
-- [x] **Phase 15: Startup and Idle Performance** - Startup is measurable and fast, and an idle baude stops burning CPU and battery (completed 2026-09-22)
-- [x] **Phase 16: Pane Focus UX** - Pane focus is remembered across session switches (completed 2026-09-22)
-- [x] **Phase 17: Validation and v2.3.0 Release** - v2.3.0 is published after tests, CI, and smoke validation (completed 2026-09-22)
+- [x] Phase 13: Workspace Derivation and New-Session/Open Defaults (3/3 plans) — completed 2026-09-20
+- [x] Phase 14: Managed Worktree Identity (3/3 plans) — completed 2026-09-21
+- [x] Phase 15: Startup and Idle Performance (4/4 plans) — completed 2026-09-22
+- [x] Phase 16: Pane Focus UX (1/1 plans) — completed 2026-09-22
+- [x] Phase 17: Validation and v2.3.0 Release (1/1 plans) — completed 2026-09-22
 
-## Phase Details
+Published as `v2.3.0` via release-please (PR #91). Records closed out
+2026-10-13 as `override_closeout` — every phase had passed verification in
+September but read `stale` by then, main having advanced through v2.6.0.
+Full phase detail: [milestones/v2.3-ROADMAP.md](milestones/v2.3-ROADMAP.md).
+Known gaps: see MILESTONES.md.
 
-### Phase 13: Workspace Derivation and New-Session/Open Defaults
-
-**Goal**: Opening baude from any folder automatically uses the right workspace and repository, with recorded defaults and explicit config still winning.
-
-**Depends on**: Nothing (first phase of this milestone)
-
-**Requirements**: WSPC-01, WSPC-02, WSPC-03, WSPC-04, WSPC-05, OPEN-01, OPEN-02, OPEN-03, OPEN-04
-
-**Success Criteria** (what must be TRUE):
-
-  1. User launches baude from a subfolder of a repository and the correct workspace is used (either from a recorded folder binding or derived from the repo root folder name)
-  2. The new-session (`n`) prompt prefills the git toplevel when launched inside a repo, or the configured `new_session_dir` when launched outside any repository
-  3. Explicit `BAUDE_WORKSPACE`, config `workspace`, and `BAUDE_BACKEND` env/config still override derivation and recorded bindings
-  4. Launching baude from different subfolders of the same repository and from its root all admit the same repository row (no duplicates)
-  5. The README documents the full derivation rule, precedence chain, and examples for workspace and default-path selection
-  6. The top title of the TUI names the active workspace and how it was chosen, or shows a `(blank)` placeholder when none applies, so the landing workspace is visible at a glance
-
-**Plans**: 3/3 plans executed
-**Wave 1**
-
-- [x] 13-01-PLAN.md — Implement workspace derivation and TUI title end-to-end
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 13-02-PLAN.md — Comprehensive unit and integration tests for resolution, prefill, and deduplication
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 13-03-PLAN.md — Daemon parity and README documentation
-
-### Phase 14: Managed Worktree Identity
-
-**Goal**: Managed worktrees carry stable repository identity preventing cross-repo collisions and enabling safe in-place migration.
-
-**Depends on**: Phase 13
-
-**Requirements**: WTID-01, WTID-02, WTID-03, WTID-04
-
-**Success Criteria** (what must be TRUE):
-
-  1. Two repositories never resolve to the same managed worktree path, verified across TUI and daemon state files and after a state reset
-  2. Existing managed checkouts work unchanged under the new identity scheme (no deletions, no re-cloning, in-place migration)
-  3. When a collision is detected, baude names the repository that owns the path and offers non-destructive resolution instead of a hard error
-  4. `baude worktrees scan` reports the owning repository for each managed checkout and surface any collisions with ownership info
-
-**Plans**: 3/3 plans executed
-**Wave 1**
-
-- [x] 14-01-PLAN.md — Marker module and digest resolution (tracer: end-to-end proof of identity scheme)
-- [x] 14-02-PLAN.md — Path composition and collision detection integration
-
-**Wave 3** *(blocked on Wave 1 completion)*
-
-- [x] 14-03-PLAN.md — Admission flows, scan output, and documentation
-
-### Phase 15: Startup and Idle Performance
-
-**Goal**: Startup is measurable and reaches the first frame quickly without blocking on external services, and an idle baude with many sessions costs near-zero CPU: no unconditional or timer-driven redraws, no polling of dead rows, and an opt-in way to suspend idle Claude children.
-
-**Depends on**: Phase 14
-
-**Requirements**: PERF-01, PERF-02, PERF-03, PERF-04, PERF-05, PERF-06, PERF-07, PERF-08, UX-02
-
-**Success Criteria** (what must be TRUE):
-
-  1. A timing facility (env var or flag) logs each startup stage's duration so a slow launch can be diagnosed without a debugger
-  2. The first frame renders before session restore and the first metadata poll complete
-  3. The kitty keyboard probe never delays the first frame beyond a short bound and degrades to legacy encoding when the terminal does not answer
-  4. Session restore writes the durable state file once, batched, instead of several fsync'd full rewrites per restored session
-  5. With no input and no session activity, baude issues no terminal writes; working and waiting rows use static status glyphs (no wall-clock spinner or flash), so the only redraw triggers are input, child output, status transitions, and resize
-  6. Idle per-session polling touches only live, non-archived rows and skips unchanged files, so CPU no longer grows with the session count
-  7. An opt-in setting suspends or stops idle Claude children after the auto-archive timeout, and the user can see which children are suspended
-  8. The usage poller can be disabled or slowed from config
-  9. Every session and checkout row shows a static single-character status code (`?` waiting, `B` busy, `✓` completed, `✗` exited, `-` closed, `A` archived, `!` unavailable) in its existing per-state color, readable without a key, with an in-app legend; the old circle and spinner glyphs are gone
-
-**Plans**: TBD
-
-- [x] 15-01-PLAN.md
-- [x] 15-02-PLAN.md
-- [x] 15-03-PLAN.md
-- [x] 15-04-PLAN.md
-
-### Phase 16: Pane Focus UX
-
-**Goal**: Users can keep consistent pane focus (Claude or shell) across session switches.
-
-**Depends on**: Phase 15
-
-**Requirements**: UX-01
-
-**Success Criteria** (what must be TRUE):
-
-  1. Pane focus (Claude pane or expanded shell pane) is remembered when the user switches to a different session and back
-  2. A keyboard shortcut toggles focus between the Claude pane and shell pane while both are visible
-
-**Plans**: TBD
-
-- [x] 16-01-PLAN.md
-
-### Phase 17: Validation and v2.3.0 Release
-
-**Goal**: v2.3.0 is published after tests, CI, and smoke validation confirm stability and the new features work end-to-end.
-
-**Depends on**: Phase 16
-
-**Requirements**: SHIP-05
-
-**Success Criteria** (what must be TRUE):
-
-  1. All tests pass (`cargo test --workspace`)
-  2. Clippy reports no warnings (`cargo clippy -D warnings`)
-  3. Terminal smoke test confirms the new defaults, workspace derivation, and startup performance work end-to-end
-  4. Release notes and README reflect the new workspace derivation behavior, new-session defaults, worktree identity scheme, and startup improvements
-
-**Plans**: TBD
-
-## Progress Table
-
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 13. Workspace Derivation and New-Session/Open Defaults | 3/3 | Complete    | 2026-09-20 |
-| 14. Managed Worktree Identity | 3/3 | Complete    | 2026-09-21 |
-| 15. Startup and Idle Performance | 4/4 | Complete    | 2026-09-22 |
-| 16. Pane Focus UX | 1/1 | Complete    | 2026-09-22 |
-| 17. Validation and v2.3.0 Release | 1/1 | Complete    | 2026-09-22 |
+</details>
 
 ## Backlog
 
@@ -190,4 +73,4 @@ See `.planning/BACKLOG.md`:
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
 
 ---
-*Last updated: 2026-09-19. Roadmap created for v2.3 milestone.*
+*Last updated: 2026-10-13 after v2.3 milestone closeout.*
