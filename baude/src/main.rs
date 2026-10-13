@@ -754,6 +754,15 @@ impl LoopTiming {
     }
 }
 
+/// The regular event wait remains 50 ms. Only a live sidebar settle gate can
+/// shorten it, so idle CPU behavior stays unchanged.
+fn event_poll_timeout(app: &App) -> Duration {
+    let idle = Duration::from_millis(50);
+    app.sidebar_settle_timeout()
+        .map(|settle| settle.min(idle))
+        .unwrap_or(idle)
+}
+
 /// One iteration of the main loop.
 /// Returns information about what happened this iteration.
 fn step(
@@ -817,7 +826,7 @@ where
     }
     // Drain pending events, then sleep briefly (the draw loop doubles as
     // the refresh tick for streaming PTY output and status timers).
-    if drain_events && event::poll(Duration::from_millis(50))? {
+    if drain_events && !app.should_quit && event::poll(event_poll_timeout(app))? {
         loop {
             app.handle_event(event::read()?);
             if !event::poll(Duration::from_millis(0))? {
@@ -1485,6 +1494,27 @@ fn run_worktrees_prune(
             );
             WORKTREES_EXIT_FAILED
         }
+    }
+}
+
+#[cfg(test)]
+mod sidebar_poll_tests {
+    use super::*;
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    #[test]
+    fn idle_event_poll_keeps_the_existing_fifty_millisecond_wait() {
+        let root = PathBuf::from("/nonexistent/baude-sidebar-poll");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        assert_eq!(event_poll_timeout(&app), Duration::from_millis(50));
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(event_poll_timeout(&app) <= Duration::from_millis(50));
     }
 }
 
