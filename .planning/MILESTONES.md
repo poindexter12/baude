@@ -1,5 +1,33 @@
 # Milestones
 
+## v2.3 Launch Defaults and Startup Speed (Shipped: 2026-09-22)
+
+**Phases completed:** 5 phases (13-17), 12 plans, 21 tasks
+**Release:** v2.3.0 via release-please (PR #91); source range v2.2.0..v2.3.0 = 2 commits, 196 files, +27,188/-1,581. The whole milestone landed as one squash commit `ab72a36` ("feat: v2.3 launch defaults and startup speed", #90) plus the release commit.
+**Timeline:** 2026-09-19 (v2.2.0 baseline) -> 2026-09-22 (v2.3.0 published); GSD phases executed 2026-09-19 -> 2026-09-22; records closed out 2026-10-13
+**Closeout type:** override_closeout
+**Known verification overrides:** 0 newly acknowledged, 14 carried forward from a prior close (see STATE.md Deferred Items)
+
+**Delivered:** baude now starts in the right place and stops working when you are not. Launching from any folder derives the correct workspace and repository without configuration, managed worktrees carry a stable identity that survives being moved, startup is measurable stage by stage, an idle instance draws nothing and burns no measurable CPU, and pane focus survives session switches — published as v2.3.0.
+
+**Key accomplishments:**
+- Workspace derivation from repository root, ancestor walk for stable folder bindings, source-labeled TUI title, and shared startup helper for TUI/daemon parity
+- Comprehensive TDD test suite for ancestor walk, workspace derivation, precedence chain, new-session prefill, and repository deduplication
+- Daemon calls shared startup helper with lock_base="daemon-state", exposes workspace_source via /info endpoint, displays remote workspace with source label, and comprehensive README documents full precedence chain and derivation rule with examples
+- Atomic marker file ownership claim and stable repository identity via SHA256 digest of canonical common directory
+- Metadata polling optimization with archived/exited gating and mtime checks; idle child suspension via SIGSTOP/SIGCONT; configurable usage poller interval with disable option
+
+### Known Gaps
+
+- All five phases read `verification_status: stale` at closeout, so this closed as `override_closeout`. Each had passed on its own evidence at execution time — Phase 13 9/9 (2026-09-20), Phase 14 25/25 (2026-09-21), Phase 15 9/9 (2026-09-22), with 16 and 17 likewise `passed`. The staleness is digest drift, not a failure: records were closed on 2026-10-13, by which point main had advanced through v2.4, v2.5, and v2.6. Re-running the verifier would have checked v2.3 phase goals against three milestones of later rework.
+- Phase 13 and Phase 14 `VALIDATION.md` were never filled in by `validate-phase` — both remain the seeded template, with literal `{pytest 7.x / jest 29.x}` placeholders, and are left at `status: draft` rather than back-filled, since a contract invented at closeout never governed the execution it would claim to describe. Phase 15 is the only completed validation contract in this milestone (`validated`, `nyquist_compliant: true`, approved 2026-10-13). Phases 16 and 17 have no `VALIDATION.md` at all.
+- Phase 15's `timing_disabled_when_env_unset` (`baude/src/main.rs`) is a tautology — it re-reads `BAUDE_TIMING` and asserts it is unset rather than exercising the production gate. Recorded in `15-VALIDATION.md`, left unrepaired at closeout.
+- PERF-01 startup wall-clock timing and real-PTY idle CPU are Manual-Only by necessity; host-dependent figures cannot be asserted in CI. Measured evidence is recorded in `15-VALIDATION.md` (first frame 5,537 ms, total 6,859 ms, idle 0.000000 CPU-seconds per minute over a 61 s window against a 0.25 threshold).
+- `first_frame` at 5,537 ms is the weakest measured result in a milestone named "Launch Defaults and Startup Speed". The phase goal was that startup be *measurable* and idle be quiet, which it is and does; actually reducing first-frame latency was never in v2.3's scope and remains open.
+- No GSD `v2.3` tag was created; the release-please tag `v2.3.0` is the ship marker. `git.create_tag` is now `false` in `.planning/config.json` so GSD cannot mint a bare `vX.Y` tag into release-please's namespace.
+
+---
+
 ## v2.2 Reliability and Terminal Usability (Shipped: 2026-09-19)
 
 **Phases completed:** 5 phases (8-12), 25 plans, 49 tasks

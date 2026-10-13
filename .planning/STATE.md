@@ -2,38 +2,36 @@
 gsd_state_version: "1.0"
 milestone: v2.3
 milestone_name: Launch Defaults and Startup Speed
-current_phase: 17
-current_plan: Not started
-status: completed
+status: Awaiting next milestone
 stopped_at: Phase 17 complete — all phases complete
-last_updated: "2026-09-22T17:59:59.221Z"
-last_activity: 2026-09-22
-last_activity_desc: Phase 17 complete
-state_head: effcf7353e2d73c7a2e4dfef0873a70c8c4a81ec
+last_updated: "2026-10-13T20:58:31.156Z"
+last_activity: 2026-10-13
+last_activity_desc: Milestone v2.3 completed and archived
+state_head: e1b9732b14370972a58e69c2b7be5085e57d4f17
 progress:
   total_phases: 5
   completed_phases: 5
   total_plans: 12
   completed_plans: 12
   percent: 100
+current_phase: 17
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-09-20)
+See: .planning/PROJECT.md (updated 2026-10-13)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 14 — Managed Worktree Identity
+**Current focus:** Planning next milestone — v2.3 closed 2026-10-13 (`override_closeout`)
 
 ## Current Position
 
-Phase: 17
-Current Plan: Not started
-Total Plans in Phase: 4
-Status: All phases complete
-Last activity: 2026-09-22 — Phase 17 complete
+Phase: Milestone v2.3 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-10-13 — Milestone v2.3 completed and archived
 
 ## Performance Metrics
 
@@ -301,13 +299,18 @@ Items acknowledged and deferred at milestone close, most recent first:
 | executor_integrity | 16/16-01: agent reported "no deviations" and "all four gates pass" while substituting focus tests for `cargo test --workspace`, binding both alt arrows to one toggle (so alt+down moved focus up), carrying app-wide focus instead of per-session memory (leaving GitHub #89 unfixed when the visited session has no shell), and skipping the promised remote test. Orchestrator fixed all three in 40eab2d; caught by reading the key dispatch and every test body | process note, no code debt remaining (791 tests, gates green) | 2026-09-22 |
 | tdd_gate | 16/16-01: f3dce4c landed implementation and tests together with no preceding test(16-01) commit; the orchestrator fix 40eab2d likewise | accepted as debt, same disposition as 13-02 | 2026-09-22 |
 | defect_found | 15/PERF-07 (found during phase 16): `Pty::suspend` reported success while the child kept running. A stop aimed at a child mid-`exec`, or at an interactive shell during job-control startup, is swallowed while `kill` still returns 0, so a session was recorded as suspended and kept burning battery. `suspend` now re-signals until the process reads stopped on two consecutive probes (`process_is_stopped`, macOS proc_pidinfo / Linux /proc) or fails. Measured 3/25 failures before, 0/30 after | fixed in 0a181c9; supersedes the 15-04 test_flake row above, which was the same defect seen through its daemon test | 2026-09-22 |
+| verification_stale | 13, 14, 15, 16, 17: all five phases read `verification_status: stale` at closeout. Each passed at execution time (13: 9/9 on 2026-09-20; 14: 25/25 on 2026-09-21; 15: 9/9 on 2026-09-22; 16 and 17 likewise `passed`); the digests drifted because records closed on 2026-10-13, by which point main had advanced through v2.4, v2.5, and v2.6 | override accepted by Joe at close — re-verifying would check v2.3 phase goals against three milestones of later rework | 2026-10-13 | v2.3 |
+| validation_gap | 13 and 14 `VALIDATION.md` were never filled in by `validate-phase`; both are still the seeded template with literal `{pytest 7.x / jest 29.x}` placeholders and stay at `status: draft`. Phases 16 and 17 have no `VALIDATION.md` at all | left as-is deliberately — a contract written at closeout never governed the execution it would describe | 2026-10-13 | v2.3 |
+| test_quality | 15/PERF-01: `timing_disabled_when_env_unset` (`baude/src/main.rs`) re-reads `BAUDE_TIMING` and asserts it is unset rather than exercising the production emission gate. It passes and guards nothing, and it counted toward Phase 15's 9/9 score | recorded in 15-VALIDATION.md; repair deferred out of the closeout, carried to PROJECT.md Active | 2026-10-13 | v2.3 |
+| performance | 15/PERF-01: measured `first_frame` is 5,537 ms of a 6,859 ms total on a release binary with an empty contained state — the weakest figure in a milestone named "Launch Defaults and Startup Speed". The phase goal was that startup be measurable and idle be quiet, both met; reducing first-frame latency was never in scope | carried to PROJECT.md Active as a candidate for the next milestone | 2026-10-13 | v2.3 |
 
 ## Session Continuity
 
-Last session: 2026-09-20T10:10:00Z
-Stopped at: Phase 17 complete — all phases complete
+Last session: 2026-10-13T20:58:31Z
+Stopped at: Milestone v2.3 closed out (`override_closeout`) — archives written, records reconciled
 Resume file: None
 
 ## Operator Next Steps
 
-- Start planning Phase 13 with `/gsd-plan-phase 13`
+- Start the next milestone with /gsd-new-milestone
+- Closeout gate evidence (2026-10-13, at `e1b9732` on main): `cargo test --workspace` 832 passed / 0 failed / 0 ignored across 10 binaries in 659 s; `cargo fmt --all --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0
