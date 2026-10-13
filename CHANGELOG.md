@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.0](https://github.com/poindexter12/baude/compare/v2.5.0...v2.6.0) (2026-10-13)
+
+
+### Features
+
+* settle sidebar action keys ([#113](https://github.com/poindexter12/baude/issues/113)) ([2af57f6](https://github.com/poindexter12/baude/commit/2af57f6640c0642ad7d7af1015609ea068fdf64e))
+
 ## [2.5.0](https://github.com/poindexter12/baude/compare/v2.4.4...v2.5.0) (2026-09-29)
 
 
