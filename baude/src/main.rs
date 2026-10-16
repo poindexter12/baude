@@ -379,25 +379,37 @@ fn help_text() -> String {
     )
 }
 
+/// Whether startup timing should be reported, from the `BAUDE_TIMING` environment
+/// variable and the raw process arguments.
+///
+/// `main` decided this inline from `std::env::var` and `std::env::args`, which left the
+/// rule untestable: a test can only re-read the environment it is already running in, so
+/// the most it could assert was that timing happens to be off by default — true of an
+/// empty `main` too. Taking both inputs as parameters is what puts the `--timing` branch
+/// under test at all.
+fn timing_requested(env: Option<&str>, args: &[String]) -> bool {
+    env == Some("1") || args.iter().any(|a| a == "--timing")
+}
+
 fn main() -> Result<()> {
     use std::time::Instant;
 
+    let mut args: Vec<String> = std::env::args().collect();
+
     // Check if timing is enabled via BAUDE_TIMING env var or --timing flag (early, before parsing other args)
-    let timing_enabled = std::env::var("BAUDE_TIMING").ok().as_deref() == Some("1")
-        || std::env::args().any(|a| a == "--timing");
+    let timing_enabled = timing_requested(std::env::var("BAUDE_TIMING").ok().as_deref(), &args);
     let total_start = Instant::now();
     let mut timing = StartupTiming {
         stages: Vec::new(),
         total_ms: 0,
     };
 
-    // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
-    // Must be dispatched before anything touches the terminal: Claude Code
-    // invokes it headless on every statusline refresh.
-    let mut args: Vec<String> = std::env::args().collect();
     // Strip --timing flag from args so it's not mistaken for a launch dir
     args.retain(|a| a != "--timing");
 
+    // `baude statusline [--wrap <cmd>]` — statusline bridge mode, no TUI.
+    // Must be dispatched before anything touches the terminal: Claude Code
+    // invokes it headless on every statusline refresh.
     if args.get(1).map(String::as_str) == Some("statusline") {
         let wrap = args
             .iter()
@@ -2639,18 +2651,55 @@ mod keyboard_negotiation_tests {
         timing.print_to_stderr();
     }
 
-    #[test]
-    fn timing_disabled_when_env_unset() {
-        // Test: timing output respects BAUDE_TIMING env var.
-        let timing_enabled = std::env::var("BAUDE_TIMING").ok() == Some("1".to_string());
-        // By default in tests, BAUDE_TIMING should not be set
-        assert!(
-            !timing_enabled,
-            "BAUDE_TIMING should not be set in default test environment"
-        );
+    fn argv(extra: &[&str]) -> Vec<String> {
+        std::iter::once("baude")
+            .chain(extra.iter().copied())
+            .map(String::from)
+            .collect()
+    }
 
-        // Verify that when env var is not set, timing output would be skipped
-        // (in the actual main() code, it checks: if std::env::var("BAUDE_TIMING").ok() == Some("1".to_string()))
+    #[test]
+    fn timing_is_requested_by_either_the_env_var_or_the_flag() {
+        // Both inputs open the gate on their own, and neither closes it against the
+        // other: a user who exports BAUDE_TIMING=1 for a session still gets timing on
+        // the run where they also pass --timing.
+        assert!(!timing_requested(None, &argv(&[])), "neither input set");
+        assert!(timing_requested(Some("1"), &argv(&[])), "env var alone");
+        assert!(timing_requested(None, &argv(&["--timing"])), "flag alone");
+        assert!(timing_requested(Some("1"), &argv(&["--timing"])), "both");
+    }
+
+    #[test]
+    fn timing_env_var_is_only_honored_when_it_is_exactly_one() {
+        // BAUDE_TIMING is a literal "1", not a truthiness test. An exported-but-empty
+        // value is the one that matters in practice: `BAUDE_TIMING= baude` must not
+        // turn timing on.
+        for value in ["", "0", "2", "true", "yes", "on", " 1", "1 "] {
+            assert!(
+                !timing_requested(Some(value), &argv(&[])),
+                "BAUDE_TIMING={value:?} must not enable timing"
+            );
+        }
+    }
+
+    #[test]
+    fn timing_flag_is_matched_whole_and_never_mistaken_for_a_launch_dir() {
+        // The flag is compared whole, so near misses are launch-dir arguments rather
+        // than timing requests. `--timing=1` is the trap worth pinning: it reads like
+        // it should work, and silently does not.
+        for arg in ["--timing=1", "--timings", "-timing", "timing", "--time"] {
+            assert!(
+                !timing_requested(None, &argv(&[arg])),
+                "{arg} must not enable timing"
+            );
+        }
+
+        // And the real flag is stripped before argument parsing, so it cannot be read
+        // as the repo directory. This mirrors the retain() in main().
+        let mut args = argv(&["--timing", "/repo"]);
+        assert!(timing_requested(None, &args));
+        args.retain(|a| a != "--timing");
+        assert_eq!(args.get(1).map(String::as_str), Some("/repo"));
     }
 
     #[test]
