@@ -72,7 +72,7 @@ v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milesto
 No milestone is open. Candidates carried out of v2.3:
 
 - [ ] Reduce first-frame latency. v2.3 made startup *measurable* and idle *quiet*, which it set out to do, but the measured `first_frame` is 5,537 ms of a 6,859 ms total on a release binary with an empty state. Cutting that was never in v2.3's scope and is still open.
-- [ ] Replace `timing_disabled_when_env_unset` with a test that exercises the production `BAUDE_TIMING` gate rather than re-reading the environment variable.
+- [x] Replace `timing_disabled_when_env_unset` with a test that exercises the production `BAUDE_TIMING` gate rather than re-reading the environment variable. Done (SQ-12): the gate is now `timing_requested`, called by `main` and tested over env values crossed with the flag.
 
 ### Out of Scope
 
