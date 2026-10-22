@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.1](https://github.com/poindexter12/baude/compare/v2.7.0...v2.7.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* run the local gate's root check against a throwaway home ([#119](https://github.com/poindexter12/baude/issues/119)) ([6041f86](https://github.com/poindexter12/baude/commit/6041f86ed749c9d1b430196b629f03c521e57737))
+
 ## [2.7.0](https://github.com/poindexter12/baude/compare/v2.6.0...v2.7.0) (2026-10-13)
 
 
