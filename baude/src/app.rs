@@ -3171,6 +3171,26 @@ impl App {
         }
     }
 
+    /// Whether the agent pane of `id` has a live process to focus. The tick
+    /// drops agent-pane focus to the sidebar when this is false, and pane
+    /// cycling uses it to stop only where that focus would survive.
+    fn agent_pane_live(&self, id: SelId) -> bool {
+        let runtime = match id {
+            SelId::Checkout(key) => self.runtime_checkouts.get(&key),
+            SelId::Standalone(key) => self.runtime_standalones.get(&key),
+            SelId::Remote(id) => {
+                return self
+                    .attach
+                    .as_ref()
+                    .is_some_and(|a| a.remote_id == id && !a.is_closed());
+            }
+            SelId::Repository(_) => return false,
+        };
+        runtime
+            .and_then(|id| self.session(*id))
+            .is_some_and(|s| !s.claude.is_exited())
+    }
+
     fn selected_mut(&mut self) -> Option<&mut Session> {
         match self.selected_id {
             Some(SelId::Checkout(key)) => {
@@ -4421,19 +4441,7 @@ impl App {
         // If the focused pane's process died, fall back to the sidebar.
         match self.focus {
             Focus::Claude => {
-                let alive = match self.selected_id {
-                    Some(SelId::Checkout(_) | SelId::Standalone(_)) => self
-                        .selected()
-                        .map(|s| !s.claude.is_exited())
-                        .unwrap_or(false),
-                    Some(SelId::Remote(id)) => self
-                        .attach
-                        .as_ref()
-                        .map(|a| a.remote_id == id && !a.is_closed())
-                        .unwrap_or(false),
-                    Some(SelId::Repository(_)) => false,
-                    None => false,
-                };
+                let alive = self.selected_id.is_some_and(|id| self.agent_pane_live(id));
                 if !alive {
                     self.focus = Focus::Sidebar;
                 }
@@ -5853,11 +5861,16 @@ impl App {
                 _ => None,
             })
             .collect();
+        // From a pane, a row with no live agent would only hold focus until the
+        // next tick dropped it to the sidebar, so those rows are skipped too.
+        // The current row stays in the list so cycling has a place to start.
+        let from_pane = self.focus != Focus::Sidebar;
         let ids: Vec<_> = self
             .ordered_ids()
             .into_iter()
             .filter(|id| !matches!(id, SelId::Repository(_)))
             .filter(|id| !parked.contains(id) && !self.is_archived(*id))
+            .filter(|id| !from_pane || Some(*id) == self.selected_id || self.agent_pane_live(*id))
             .collect();
         if ids.is_empty() {
             return;
@@ -13312,6 +13325,78 @@ mod tests {
             Focus::Shell,
             "a restarted session lands on the pane it was left on"
         );
+        app.kill_all();
+    }
+
+    #[test]
+    fn alt_cycling_from_a_pane_skips_rows_whose_agent_exited() {
+        // Cycling from a pane used to stop on a row whose agent had exited.
+        // The next tick saw no live agent and dropped focus to the sidebar,
+        // and later cycling stayed there, because only pane focus restores a
+        // pane. From a pane, cycling now stops only where focus survives; from
+        // the sidebar it still reaches the exited row.
+        let _scope = isolation_scope("pane-focus-cycle-exited");
+        let fixture = admission_repo("pane-focus-cycle-exited");
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        for name in ["wt-a", "wt-b"] {
+            let path = root.join(name);
+            git(
+                &repo,
+                &["worktree", "add", "-b", name, path.to_str().unwrap()],
+            );
+        }
+        let mut app = App::new(repo.clone());
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(state_root);
+        app.admit_repository(&repo).unwrap().expect("runtime");
+        let keys: Vec<_> = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .collect();
+        assert_eq!(keys.len(), 3, "primary plus both worktrees");
+        for key in &keys {
+            if !app.runtime_checkouts.contains_key(key) {
+                app.reopen_checkout(*key).unwrap();
+            }
+        }
+        let order: Vec<_> = app
+            .ordered_ids()
+            .into_iter()
+            .filter(|id| matches!(id, SelId::Checkout(_)))
+            .collect();
+        assert_eq!(order.len(), 3);
+        let (first, middle, last) = (order[0], order[1], order[2]);
+
+        // The middle row's agent exits; its row stays in the sidebar.
+        app.selected_id = Some(middle);
+        app.selected_mut().unwrap().claude.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.selected().unwrap().claude.is_exited() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        app.selected_id = Some(first);
+        app.focus = Focus::Claude;
+        app.handle_key(alt(KeyCode::Right));
+        app.tick();
+        assert_eq!(app.selected_id, Some(last), "the exited row is skipped");
+        assert_eq!(app.focus, Focus::Claude, "focus stays on the agent pane");
+        app.handle_key(alt(KeyCode::Left));
+        app.tick();
+        assert_eq!(app.selected_id, Some(first), "and skipped going back");
+        assert_eq!(app.focus, Focus::Claude);
+
+        // The sidebar still cycles onto it, as j/k does.
+        app.focus = Focus::Sidebar;
+        app.handle_key(alt(KeyCode::Right));
+        assert_eq!(app.selected_id, Some(middle));
         app.kill_all();
     }
 
