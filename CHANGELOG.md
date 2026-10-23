@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.2](https://github.com/poindexter12/baude/compare/v2.7.1...v2.7.2) (2026-10-23)
+
+
+### Bug Fixes
+
+* keep pane focus when alt-arrows cycle past a row with no live agent ([#122](https://github.com/poindexter12/baude/issues/122)) ([87a0fb3](https://github.com/poindexter12/baude/commit/87a0fb322f798635197230028a418c91bd0cce87))
+
 ## [2.7.1](https://github.com/poindexter12/baude/compare/v2.7.0...v2.7.1) (2026-10-22)
 
 
