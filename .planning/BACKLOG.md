@@ -7,7 +7,12 @@ into ROADMAP phases when picked up.
 
 ## Captured 2026-06-15
 
-### BL-01 — Sidebar "idle"/status is inaccurate (silence-only, not real working/waiting)
+### BL-01 — Sidebar "idle"/status is inaccurate (silence-only, not real working/waiting) — ✅ RESOLVED 2026-10-24
+
+**Resolution (2026-10-24):** Hook-driven status shipped in v0.7 Phase 2, and the
+sidebar label for the not-working state now reads "waiting", not "idle"
+(`baude/src/ui.rs` `LocalStatus::Waiting => "waiting"` in both the sidebar and
+overlay renderers; no "idle" label remains). No follow-up relabel needed.
 
 **Observation (user):** The sidebar's "idle" indicator only reflects "we haven't
 typed anything" (the PTY-output-silence heuristic) — it does not show whether
@@ -28,7 +33,64 @@ follow-up to relabel.
 
 ---
 
-### BL-02 — Model / permission-mode (bypass) / planning mode not shown for every session — ⚠️ PARTIALLY RESOLVED 2026-06-24
+### BL-02 — Model / permission-mode (bypass) / planning mode not shown for every session — ✅ RESOLVED 2026-10-24
+
+**Resolution (2026-10-24, SQ-13):** Reproduced against fixtures in the shapes
+Claude Code 2.1.310 really writes (`sessions/<pid>.json` with `startedAt` per
+process, `projects/<encoded physical cwd>/<id>.jsonl`). Two causes confirmed and
+fixed in `baude-core/src/meta.rs`, each with a test that failed first and asserts
+the resolved model:
+- **Resumed/continued panes never resolved (the big one, newly found).** The
+  continue spawn `claude --continue 2>/dev/null || exec claude` has to FORK its
+  first claude to test the exit status, so that claude writes
+  `sessions/<child pid>.json` and the pane's own pid never gets a file. The
+  continued conversation's transcript predates the spawn, so the cwd fallback
+  missed it too: model, cost, context and hook status stayed empty for the life
+  of every reopened pane, TUI and daemon alike. Fix: when the pane pid has no
+  session file, adopt the newest file whose pid shares the pane's process
+  session (`getsid`; every PTY child is a `setsid` leader, so this cannot
+  cross-wire two panes in one repo), cached after the first match. Tests:
+  `continue_spawn_resolves_model_from_the_forked_claude_session_file` (meta),
+  `resumed_daemon_session_reports_model_from_forked_claude` (bauded, real PTY).
+- **Sub-cause 1, cwd encoding: confirmed in two forms.** (a) Claude keys the
+  project dir by the PHYSICAL cwd (symlinks resolved; every macOS `/tmp` or
+  `/var` path lands under `-private-...`), while baude encoded the cwd as given.
+  Lookups now try the as-given path and then its canonical form, for the
+  transcript, the cwd-fallback newest transcript, and the no-pid session-file
+  cwd match. (b) The sanitizer itself, lifted from the CLI binary, works on UTF-16
+  units and truncates past 200 chars with a base36 hash suffix; baude now matches
+  it exactly. Dots and underscores were already right (worktree paths like
+  `~/.local/share/baude/worktrees/...` encode identically). Tests:
+  `symlinked_cwd_resolves_model_from_the_physical_project_dir`,
+  `encode_path_matches_claude_code_sanitizer`. **The symlink form was confirmed
+  only in test temp dirs.** Real baude worktree cwds are plain dirs whose
+  realpath equals the path (`~/.local/share/baude/worktrees` checked), so it is
+  kept as a correctness fix but likely explains few production misses.
+- **Two-account config dir: confirmed, and the likely production cause.** baude
+  read `sessions/` and `projects/` only under its OWN `CLAUDE_CONFIG_DIR`, but the
+  pane runs claude under `$SHELL -il` in the session cwd, where per-directory env
+  can set a different one. Probed on this machine: with baude on the iarx dir (or
+  with it unset), a pane in the poindexter12 tree runs with
+  `CLAUDE_CONFIG_DIR=~/.poindexter/claude` (mise sources the account env there),
+  so its session never resolves. On a lookup miss, baude now reads
+  `CLAUDE_CONFIG_DIR` from the environment of the pane process and its direct
+  children (`/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS) and
+  searches those dirs, then caches the one that matched for the transcript too.
+  macOS hides the env of Apple platform binaries, which a pane's `/bin/zsh` is
+  but an installed claude is not. Tests:
+  `model_resolves_when_the_pane_claude_uses_another_config_dir`,
+  `model_resolves_when_only_the_forked_claude_uses_another_config_dir`. Not yet
+  covered: the resume-validity check in `backend/claude.rs` still asks baude's
+  own config dir.
+- **Sub-cause 2, the 20s age filter: does not reproduce.** The exact-pid path has
+  no age filter, and `startedAt` is stamped per process, so a `--resume` of an
+  old conversation still resolves. Guarded by
+  `resume_with_session_file_older_than_spawn_still_resolves_model`.
+- **Sub-cause 3, daemon panes without the statusline bridge: not a daemon gap.**
+  baude seeds only hooks, never a `statusLine`; the bridge comes from the user's
+  own settings, so TUI and daemon panes see it identically. The daemon's
+  missing model on reopened panes was the forked-claude cause above.
+
 
 **Triage (2026-06-24):** It's a CAPTURE gap, not a render gap — the sidebar/overlay
 already show each field when present (`Some`→show, `None`→omit). Root cause:

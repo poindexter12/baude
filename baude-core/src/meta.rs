@@ -58,13 +58,54 @@ pub fn claude_config_dir() -> PathBuf {
     real
 }
 
-/// Claude Code encodes a project cwd into a directory name by replacing
-/// every non-alphanumeric character with '-'.
+/// Longest encoded project-dir name Claude Code keeps verbatim; longer names
+/// are cut here and suffixed with a hash of the full path.
+const MAX_ENCODED_PATH: usize = 200;
+
+/// Claude Code's project-dir name for a cwd, matching its JavaScript
+/// sanitizer exactly (verified against the CLI v2.1.310 binary):
+/// `path.replace(/[^a-zA-Z0-9]/g, "-")`, and past 200 characters the first
+/// 200 plus `-` and `Math.abs(hash(path)).toString(36)`, where the hash is
+/// the `(h << 5) - h + code | 0` string hash.
+///
+/// Both steps run over UTF-16 code units, not chars, because that is what a
+/// JS regex and `charCodeAt` see: a character outside the BMP is two units,
+/// so it becomes TWO dashes and feeds the hash twice.
 fn encode_path(p: &Path) -> String {
-    p.to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let path = p.to_string_lossy();
+    let units: Vec<u16> = path.encode_utf16().collect();
+    let encoded: String = units
+        .iter()
+        .map(|&u| match u8::try_from(u) {
+            Ok(b) if b.is_ascii_alphanumeric() => b as char,
+            _ => '-',
+        })
+        .collect();
+    if encoded.len() <= MAX_ENCODED_PATH {
+        return encoded;
+    }
+    let hash = units.iter().fold(0i32, |h, &u| {
+        (h << 5).wrapping_sub(h).wrapping_add(i32::from(u))
+    });
+    format!(
+        "{}-{}",
+        &encoded[..MAX_ENCODED_PATH],
+        base36(i64::from(hash).unsigned_abs())
+    )
+}
+
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 digits are ASCII")
 }
 
 /// Where Claude Code keeps the transcript of conversation `session_id` when
@@ -74,11 +115,198 @@ fn encode_path(p: &Path) -> String {
 /// so a session id can exist (announced in `sessions/<pid>.json`) with no
 /// transcript behind it — and `claude --resume <id>` then dies with "No
 /// conversation found".
+///
+/// This encodes `cwd` as given. Claude itself keys the directory by the
+/// PHYSICAL cwd (symlinks resolved, so a macOS `/var/...` cwd lands under
+/// `-private-var-...`); [`resolve_transcript_file`] tries both.
 pub fn transcript_file(cwd: &Path, session_id: &str) -> PathBuf {
-    claude_config_dir()
+    transcript_file_in(&claude_config_dir(), cwd, session_id)
+}
+
+fn transcript_file_in(config: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    config
         .join("projects")
         .join(encode_path(cwd))
         .join(format!("{session_id}.jsonl"))
+}
+
+/// The existing transcript of `session_id` for `cwd`, trying the cwd as given
+/// and then its canonical path. Claude records the cwd `getcwd()` reports,
+/// which has every symlink resolved, so a session opened through a symlinked
+/// path (or anywhere under macOS `/tmp` or `/var`) keeps its transcript under
+/// the canonical encoding and the as-given lookup never finds it.
+pub fn resolve_transcript_file(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    resolve_transcript_file_in(&claude_config_dir(), cwd, session_id)
+}
+
+fn resolve_transcript_file_in(config: &Path, cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let given = transcript_file_in(config, cwd, session_id);
+    if given.is_file() {
+        return Some(given);
+    }
+    let real = fs::canonicalize(cwd).ok().filter(|real| real != cwd)?;
+    let canonical = transcript_file_in(config, &real, session_id);
+    canonical.is_file().then_some(canonical)
+}
+
+/// The session id that owns process `pid`, or `None` when the process is gone.
+fn process_session(pid: u32) -> Option<i32> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: getsid only reads kernel process metadata for the given pid.
+    let sid = unsafe { libc::getsid(pid) };
+    (sid >= 0).then_some(sid)
+}
+
+/// The value of `name` in an environment block of `NAME=value` entries.
+fn env_entry(entries: &[&[u8]], name: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let prefix = format!("{name}=");
+    entries.iter().find_map(|entry| {
+        entry
+            .strip_prefix(prefix.as_bytes())
+            .map(|value| std::ffi::OsStr::from_bytes(value).to_os_string())
+    })
+}
+
+/// The environment entries of a macOS `KERN_PROCARGS2` buffer: a native-endian
+/// `argc`, the NUL-terminated exec path, NUL padding, `argc` argument strings,
+/// then the environment strings up to the first empty one. Malformed input
+/// yields no entries rather than a guess.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn procargs2_env(buf: &[u8]) -> Vec<&[u8]> {
+    let Some(argc) = buf.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
+        return Vec::new();
+    };
+    let argc = i32::from_ne_bytes(argc).max(0) as usize;
+    let rest = &buf[4..];
+    let Some(path_end) = rest.iter().position(|b| *b == 0) else {
+        return Vec::new();
+    };
+    let rest = &rest[path_end..];
+    let rest = &rest[rest.iter().position(|b| *b != 0).unwrap_or(rest.len())..];
+    let mut fields = rest.split(|b| *b == 0);
+    for _ in 0..argc {
+        if fields.next().is_none() {
+            return Vec::new();
+        }
+    }
+    fields.take_while(|f| !f.is_empty()).collect()
+}
+
+/// `name` in process `pid`'s environment as of its last exec, or `None` when
+/// the process is gone, unreadable, or does not set it.
+#[cfg(target_os = "linux")]
+fn process_env_var(pid: u32, name: &str) -> Option<std::ffi::OsString> {
+    let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let entries: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    env_entry(&entries, name)
+}
+
+#[cfg(target_os = "macos")]
+fn process_env_var(pid: u32, name: &str) -> Option<std::ffi::OsString> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut argmax: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: reads one c_int into `argmax`, whose size `len` describes.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || argmax <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; argmax as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: the kernel writes at most `len` bytes into `buf` and updates `len`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    env_entry(&procargs2_env(&buf), name)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_env_var(_pid: u32, _name: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// The direct children of process `pid`.
+#[cfg(target_os = "linux")]
+fn child_pids(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(list) = fs::read_to_string(task.path().join("children")) {
+            out.extend(
+                list.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn child_pids(pid: u32) -> Vec<u32> {
+    const PROC_PPID_ONLY: u32 = 6;
+    let mut buf = vec![0 as libc::pid_t; 256];
+    let bytes = libc::c_int::try_from(buf.len() * std::mem::size_of::<libc::pid_t>())
+        .unwrap_or(libc::c_int::MAX);
+    // SAFETY: the kernel fills at most `bytes` bytes of `buf` and returns the
+    // number of bytes written.
+    let written =
+        unsafe { libc::proc_listpids(PROC_PPID_ONLY, pid, buf.as_mut_ptr().cast(), bytes) };
+    if written <= 0 {
+        return Vec::new();
+    }
+    let n = (written as usize / std::mem::size_of::<libc::pid_t>()).min(buf.len());
+    buf[..n]
+        .iter()
+        .filter(|p| **p > 0)
+        .map(|p| *p as u32)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn child_pids(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Whether a config dir read from a child process's environment may be
+/// consulted. Production reads whatever the child uses; a test build only
+/// admits dirs under the active redirect's fixture root, so an ambient
+/// `CLAUDE_CONFIG_DIR` inherited by a test child never reaches the real tree.
+fn admissible_child_config_dir(dir: &Path) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        crate::testing::claude_config_dir_override()
+            .and_then(|own| own.parent().map(Path::to_path_buf))
+            .is_some_and(|root| dir.starts_with(root))
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        dir.is_absolute()
+    }
 }
 
 #[derive(Default, Clone)]
@@ -246,6 +474,16 @@ pub struct ClaudeMeta {
     /// move the mtime. Both sizes must match too before a read is skipped.
     pub last_session_len: Option<u64>,
     pub last_events_len: Option<u64>,
+    /// Pid whose `sessions/<pid>.json` belongs to this pane when it is NOT the
+    /// pane's own pid (see [`Self::session_member_file`]), cached so later
+    /// polls read that one file instead of rescanning the directory.
+    session_file_pid: Option<u32>,
+    /// The Claude config dir this pane's claude actually writes to, once its
+    /// session file has been found there. It can differ from baude's own: the
+    /// child runs under the user's login shell in the session cwd, and a
+    /// per-directory env (mise, an account launcher) may set its own
+    /// `CLAUDE_CONFIG_DIR`. `None` means baude's own config dir.
+    config_dir: Option<PathBuf>,
 }
 
 impl ClaudeMeta {
@@ -270,16 +508,25 @@ impl ClaudeMeta {
     }
 
     /// Find this session's `sessions/<pid>.json`. Exact pid match wins
-    /// (sessions spawned with `exec claude` — the child IS claude); otherwise
-    /// match by cwd and pick the file whose start time is closest to ours.
+    /// (sessions spawned with `exec claude` — the child IS claude). When the
+    /// pane's pid has no file, claude may still be running as a CHILD of the
+    /// pane shell: the continue spawn `claude --continue || exec claude` has
+    /// to fork its first command to test the exit status, so that claude
+    /// writes its file under its own pid and the exact match never fires.
+    /// [`Self::session_member_file`] finds it by process session. With no pid
+    /// at all, match by cwd and pick the file whose start time is closest.
     ///
     /// Gate on mtime: if mtime unchanged since last poll, skip read (cost: one stat call).
     fn poll_session_file(&mut self, cwd: &Path, pid: Option<u32>, spawn_unix_ms: u64) {
-        let dir = claude_config_dir().join("sessions");
+        let base = claude_config_dir();
+        let dir = base.join("sessions");
 
         // Check mtime before reading (low-cost stat call)
         let session_file = if let Some(pid) = pid {
-            dir.join(format!("{pid}.json"))
+            let Some(file) = self.find_pid_session_file(&base, pid, spawn_unix_ms) else {
+                return;
+            };
+            file
         } else {
             // Fallback path: we'll need to scan, so mtime gate doesn't apply
             let session_mtime = fs::metadata(&dir).and_then(|m| m.modified()).ok();
@@ -288,7 +535,10 @@ impl ClaudeMeta {
             }
             self.last_session_mtime = session_mtime;
 
+            // Claude records the physical cwd, so accept the canonical form too.
             let cwd_str = cwd.to_string_lossy();
+            let real = fs::canonicalize(cwd).ok();
+            let real_str = real.as_ref().map(|r| r.to_string_lossy());
             let Ok(entries) = fs::read_dir(&dir) else {
                 return;
             };
@@ -297,7 +547,8 @@ impl ClaudeMeta {
                 let Some(v) = read_json(&entry.path()) else {
                     continue;
                 };
-                if v["cwd"].as_str() != Some(cwd_str.as_ref()) {
+                let recorded = v["cwd"].as_str();
+                if recorded != Some(cwd_str.as_ref()) && recorded != real_str.as_deref() {
                     continue;
                 }
                 let started = v["startedAt"].as_u64().unwrap_or(0);
@@ -335,6 +586,112 @@ impl ClaudeMeta {
         }
     }
 
+    /// The session file of a claude running INSIDE this pane's process
+    /// session when it is not the pane's own pid.
+    ///
+    /// Every PTY child is a session leader (`setsid` at spawn), so anything
+    /// the pane shell forks shares its session id, and no other pane's or
+    /// terminal's process does. That makes the session id an exact owner
+    /// test, where matching by cwd would cross-wire two panes in one repo.
+    /// A file whose `startedAt` predates the pane is a stale file for a
+    /// recycled pid: nothing in the pane can have started before the pane.
+    /// The session file for pane `pid`, looked up first in the config dir that
+    /// matched last time (baude's own until something else has), then in every
+    /// `CLAUDE_CONFIG_DIR` set in the environment of the pane process or its
+    /// direct children, then in baude's own. Only the miss path reads process
+    /// environments, so a resolved session costs one stat per poll as before.
+    fn find_pid_session_file(
+        &mut self,
+        base: &Path,
+        pid: u32,
+        spawn_unix_ms: u64,
+    ) -> Option<PathBuf> {
+        let current = self
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| base.to_path_buf());
+        if let Some(file) = self.pid_session_file_in(&current, pid, spawn_unix_ms) {
+            return Some(file);
+        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for p in std::iter::once(pid).chain(child_pids(pid)) {
+            let Some(value) = process_env_var(p, "CLAUDE_CONFIG_DIR") else {
+                continue;
+            };
+            let dir = PathBuf::from(value);
+            if dir != current && admissible_child_config_dir(&dir) && !candidates.contains(&dir) {
+                candidates.push(dir);
+            }
+        }
+        if current != base && !candidates.iter().any(|d| d == base) {
+            candidates.push(base.to_path_buf());
+        }
+        for dir in candidates {
+            if let Some(file) = self.pid_session_file_in(&dir, pid, spawn_unix_ms) {
+                self.config_dir = (dir != base).then_some(dir);
+                return Some(file);
+            }
+        }
+        None
+    }
+
+    fn pid_session_file_in(
+        &mut self,
+        config: &Path,
+        pid: u32,
+        spawn_unix_ms: u64,
+    ) -> Option<PathBuf> {
+        let dir = config.join("sessions");
+        let own = dir.join(format!("{pid}.json"));
+        if own.is_file() {
+            self.session_file_pid = None;
+            return Some(own);
+        }
+        self.session_member_file(&dir, pid, spawn_unix_ms)
+    }
+
+    fn session_member_file(&mut self, dir: &Path, pid: u32, spawn_unix_ms: u64) -> Option<PathBuf> {
+        let owner = process_session(pid)?;
+        if let Some(cached) = self.session_file_pid {
+            let file = dir.join(format!("{cached}.json"));
+            if process_session(cached) == Some(owner) && file.is_file() {
+                return Some(file);
+            }
+            self.session_file_pid = None;
+        }
+        let mut best: Option<(u64, u32, PathBuf)> = None;
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Some(candidate) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if candidate == pid || process_session(candidate) != Some(owner) {
+                continue;
+            }
+            let Some(v) = read_json(&path) else {
+                continue;
+            };
+            let started = v["startedAt"].as_u64().unwrap_or(0);
+            if started + 20_000 < spawn_unix_ms {
+                continue;
+            }
+            // Newest wins: a nested claude started later is the live one.
+            if best.as_ref().is_none_or(|(s, _, _)| started > *s) {
+                best = Some((started, candidate, path));
+            }
+        }
+        let (_, candidate, path) = best?;
+        self.session_file_pid = Some(candidate);
+        Some(path)
+    }
+
     fn apply_session_file(&mut self, v: &Value) {
         if let Some(sid) = v["sessionId"].as_str() {
             self.session_id = Some(sid.to_string());
@@ -345,14 +702,18 @@ impl ClaudeMeta {
     }
 
     fn resolve_transcript(&mut self, cwd: &Path, spawn_unix_ms: u64) {
-        let project_dir = claude_config_dir().join("projects").join(encode_path(cwd));
+        let config = self.config_dir.clone().unwrap_or_else(claude_config_dir);
         let path = if let Some(sid) = &self.session_id {
-            let p = transcript_file(cwd, sid);
-            p.exists().then_some(p)
+            resolve_transcript_file_in(&config, cwd, sid)
         } else {
             // No session file — fall back to the newest transcript started
-            // after this session spawned.
-            newest_jsonl(&project_dir, spawn_unix_ms)
+            // after this session spawned, under the as-given and then the
+            // canonical encoding (Claude writes the canonical one).
+            let projects = config.join("projects");
+            newest_jsonl(&projects.join(encode_path(cwd)), spawn_unix_ms).or_else(|| {
+                let real = fs::canonicalize(cwd).ok().filter(|real| real != cwd)?;
+                newest_jsonl(&projects.join(encode_path(&real)), spawn_unix_ms)
+            })
         };
         if path != self.transcript {
             self.transcript = path;
@@ -1606,5 +1967,397 @@ mod tests {
             "an mtime-only gate would skip this read and lose the second Stop event"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- BL-02: the claude session id must resolve for every real spawn ----
+    //
+    // Fixtures here use the shapes current Claude Code (v2.1.310) writes:
+    // `sessions/<pid>.json` carries the PHYSICAL cwd and a per-process
+    // `startedAt`, and the transcript sits under the encoding of that physical
+    // cwd. A friendlier fixture that reuses the as-given cwd everywhere is
+    // exactly what let these defects ship.
+
+    /// A `sessions/<pid>.json` in the shape the real CLI writes.
+    fn write_real_session_file(claude: &Path, pid: u32, sid: &str, cwd: &Path, started: u64) {
+        fs::create_dir_all(claude.join("sessions")).unwrap();
+        fs::write(
+            claude.join("sessions").join(format!("{pid}.json")),
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": sid,
+                "cwd": cwd.to_string_lossy(),
+                "startedAt": started,
+                "procStart": "Sat Oct 24 15:19:12 2026",
+                "version": "2.1.310",
+                "kind": "interactive",
+                "entrypoint": "cli",
+                "status": "idle",
+                "updatedAt": started + 5,
+                "statusUpdatedAt": started + 5,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A transcript with one assistant turn on `model`, under Claude's own
+    /// encoding of `physical_cwd`, last written `age` ago.
+    fn write_real_transcript(
+        claude: &Path,
+        physical_cwd: &Path,
+        sid: &str,
+        model: &str,
+        age: std::time::Duration,
+    ) -> PathBuf {
+        let dir = claude.join("projects").join(encode_path(physical_cwd));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{sid}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"user\",\"cwd\":{cwd:?},\"sessionId\":\"{sid}\"}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\"}}}}\n",
+                cwd = physical_cwd.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+        path
+    }
+
+    /// Vectors computed by running the sanitizer lifted verbatim from the
+    /// Claude Code 2.1.310 binary under node.
+    #[test]
+    fn encode_path_matches_claude_code_sanitizer() {
+        let cases = [
+            (
+                "/Users/joese/.local/share/baude/worktrees/claude/repository-14/primary-14",
+                "-Users-joese--local-share-baude-worktrees-claude-repository-14-primary-14",
+            ),
+            ("/tmp/caf\u{e9} repo/x_y", "-tmp-caf--repo-x-y"),
+            // Outside the BMP: two UTF-16 units, so two dashes.
+            ("/tmp/rocket-\u{1F680}/r", "-tmp-rocket----r"),
+        ];
+        for (cwd, want) in cases {
+            assert_eq!(encode_path(Path::new(cwd)), want, "encoding of {cwd}");
+        }
+        let long = format!("/Users/dev/{}repo", "deeply_nested.dir/".repeat(12));
+        assert_eq!(
+            encode_path(Path::new(&long)),
+            "-Users-dev-deeply-nested-dir-deeply-nested-dir-deeply-nested-dir-\
+             deeply-nested-dir-deeply-nested-dir-deeply-nested-dir-deeply-nested-dir-\
+             deeply-nested-dir-deeply-nested-dir-deeply-nested-dir-deeply-ne-cf4m9y",
+            "past 200 chars Claude truncates and appends a base36 hash"
+        );
+    }
+
+    /// Sub-cause 1: a pane opened through a symlinked path. Claude records
+    /// and keys everything by the resolved path, so encoding the as-given cwd
+    /// looks in a project dir that does not exist and the model never shows.
+    #[test]
+    fn symlinked_cwd_resolves_model_from_the_physical_project_dir() {
+        let root = isolated_claude_root("symlink-cwd");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let claude = root.join("claude");
+        let real = root.join("real-repo");
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("linked-repo");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let physical = fs::canonicalize(&link).unwrap();
+
+        let pid = std::process::id();
+        let spawn = now_unix_ms();
+        let sid = format!("symlink-{pid}");
+        write_real_session_file(&claude, pid, &sid, &physical, spawn + 300);
+        write_real_transcript(
+            &claude,
+            &physical,
+            &sid,
+            "claude-opus-4-8",
+            std::time::Duration::ZERO,
+        );
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&link, Some(pid), spawn, &link);
+
+        assert_eq!(meta.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(meta.model.as_deref(), Some("claude-opus-4-8"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Sub-cause 2, as suspected, does not reproduce: Claude stamps
+    /// `startedAt` per PROCESS, and the exact-pid path applies no age filter,
+    /// so a `--resume` of an old conversation whose session file is far older
+    /// than the pane's spawn time still resolves. (On macOS this test also
+    /// failed before the fix, but only because `temp_dir()` sits under the
+    /// `/var` symlink, which is sub-cause 1; on Linux it guards sub-cause 2.)
+    #[test]
+    fn resume_with_session_file_older_than_spawn_still_resolves_model() {
+        let root = isolated_claude_root("resume-old");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let claude = root.join("claude");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let physical = fs::canonicalize(&cwd).unwrap();
+
+        let pid = std::process::id();
+        let spawn = now_unix_ms();
+        let sid = format!("resume-old-{pid}");
+        write_real_session_file(&claude, pid, &sid, &physical, spawn - 60_000);
+        write_real_transcript(
+            &claude,
+            &physical,
+            &sid,
+            "claude-sonnet-4-6",
+            std::time::Duration::from_secs(3600),
+        );
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&cwd, Some(pid), spawn, &cwd);
+
+        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4-6"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A session-leader shell that forks one child, the shape of the pane
+    /// running `claude --continue || exec claude`. Returns the shell and the
+    /// forked child's pid.
+    fn spawn_pane_shell_with_forked_child() -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 20 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe; it makes the shell a session
+        // leader exactly as portable-pty does for every pane.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let child = line.trim().parse().unwrap();
+        (shell, child)
+    }
+
+    fn reap(mut shell: std::process::Child, child: u32) {
+        // SAFETY: `child` is the sleep this test's own shell forked.
+        unsafe {
+            libc::kill(child as i32, libc::SIGKILL);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+    }
+
+    /// Sub-cause found while reproducing: the continue spawn
+    /// `claude --continue 2>/dev/null || exec claude` FORKS its first claude,
+    /// so that claude writes `sessions/<its pid>.json` and the pane's own pid
+    /// never gets a file. The continued conversation's transcript is older
+    /// than the spawn, so the cwd fallback cannot find it either, and model,
+    /// cost, context and hook status all stay empty for the life of the pane.
+    /// A same-cwd claude in ANOTHER process session must not be adopted.
+    #[test]
+    fn continue_spawn_resolves_model_from_the_forked_claude_session_file() {
+        let root = isolated_claude_root("continue-fork");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let claude = root.join("claude");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let physical = fs::canonicalize(&cwd).unwrap();
+
+        let spawn = now_unix_ms();
+        let (pane, forked) = spawn_pane_shell_with_forked_child();
+        let (other_pane, other_forked) = spawn_pane_shell_with_forked_child();
+
+        let sid = format!("continued-{}", std::process::id());
+        write_real_session_file(&claude, forked, &sid, &physical, spawn + 200);
+        write_real_transcript(
+            &claude,
+            &physical,
+            &sid,
+            "claude-opus-4-8",
+            std::time::Duration::from_secs(3600),
+        );
+        let foreign = format!("foreign-{}", std::process::id());
+        write_real_session_file(&claude, other_forked, &foreign, &physical, spawn + 900);
+        write_real_transcript(
+            &claude,
+            &physical,
+            &foreign,
+            "claude-haiku-4-5",
+            std::time::Duration::ZERO,
+        );
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&cwd, Some(pane.id()), spawn, &cwd);
+        let first = (meta.session_id.clone(), meta.model.clone());
+        // A second poll reads the cached member file, not a rescan.
+        meta.poll(&cwd, Some(pane.id()), spawn, &cwd);
+        let second = meta.model.clone();
+
+        reap(pane, forked);
+        reap(other_pane, other_forked);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(first.0.as_deref(), Some(sid.as_str()));
+        assert_eq!(first.1.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(second.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    // ---- BL-02: the child's CLAUDE_CONFIG_DIR differs from baude's ----
+
+    /// Stand-in claude for the two-account tests: an ordinary (non-platform)
+    /// binary, because macOS hides the environment of Apple platform binaries
+    /// such as `/bin/sleep` while exposing that of user-installed ones like
+    /// claude. Runs only when a test launches it by name.
+    #[test]
+    #[ignore = "stand-in process launched by the two-account tests"]
+    fn pane_claude_stand_in() {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+    }
+
+    /// Shell text that runs [`pane_claude_stand_in`] from this test binary.
+    fn stand_in_claude() -> String {
+        format!(
+            "'{}' --exact meta::tests::pane_claude_stand_in --ignored >/dev/null 2>&1",
+            std::env::current_exe().unwrap().display()
+        )
+    }
+
+    /// A process standing in for a pane, launched with `CLAUDE_CONFIG_DIR`
+    /// set to `own` and running `script`. Returns the process and the pid the
+    /// script echoes first (the forked child, or the shell itself).
+    fn spawn_pane(own: &Path, script: &str) -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script])
+            .env("CLAUDE_CONFIG_DIR", own)
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe; portable-pty does the same.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid = line.trim().parse().unwrap();
+        (shell, pid)
+    }
+
+    /// Two-account shape seen on the operator's machine: baude runs with one
+    /// `CLAUDE_CONFIG_DIR` while the pane's claude runs with another (an
+    /// account launcher, or a per-directory env the login shell applies in
+    /// the session cwd). Claude writes `sessions/<pid>.json` and the transcript
+    /// under ITS dir, so a lookup in baude's dir never resolves the session.
+    /// Exec shape: the pane process itself carries the account's dir.
+    #[test]
+    fn model_resolves_when_the_pane_claude_uses_another_config_dir() {
+        let root = isolated_claude_root("two-accounts-exec");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let own = root.join("claude");
+        let account = root.join("claude-account");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(own.join("sessions")).unwrap();
+        let physical = fs::canonicalize(&cwd).unwrap();
+
+        let spawn = now_unix_ms();
+        let (pane, pid) = spawn_pane(&account, &format!("echo $$; exec {}", stand_in_claude()));
+        let sid = format!("account-{}", std::process::id());
+        write_real_session_file(&account, pid, &sid, &physical, spawn + 300);
+        write_real_transcript(
+            &account,
+            &physical,
+            &sid,
+            "claude-opus-4-8",
+            std::time::Duration::ZERO,
+        );
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&cwd, Some(pid), spawn, &cwd);
+        let resolved = (meta.session_id.clone(), meta.model.clone());
+        let mut pane = pane;
+        let _ = pane.kill();
+        let _ = pane.wait();
+
+        assert_eq!(resolved, (Some(sid), Some("claude-opus-4-8".to_string())));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Per-directory env shape: the pane shell starts with baude's dir, and
+    /// only after its startup files run (mise in the session cwd) does the
+    /// claude it forks get the account's dir. The pane's own exec-time env
+    /// never names the account dir, so the lookup has to read the child's.
+    #[test]
+    fn model_resolves_when_only_the_forked_claude_uses_another_config_dir() {
+        let root = isolated_claude_root("two-accounts-fork");
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let own = root.join("claude");
+        let account = root.join("claude-account");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(own.join("sessions")).unwrap();
+        let physical = fs::canonicalize(&cwd).unwrap();
+
+        let spawn = now_unix_ms();
+        let script = format!(
+            "export CLAUDE_CONFIG_DIR='{}'; {} & echo $!; wait",
+            account.display(),
+            stand_in_claude()
+        );
+        let (pane, forked) = spawn_pane(&own, &script);
+        let sid = format!("account-fork-{}", std::process::id());
+        write_real_session_file(&account, forked, &sid, &physical, spawn + 300);
+        write_real_transcript(
+            &account,
+            &physical,
+            &sid,
+            "claude-sonnet-4-6",
+            std::time::Duration::ZERO,
+        );
+
+        let mut meta = ClaudeMeta::default();
+        meta.poll(&cwd, Some(pane.id()), spawn, &cwd);
+        let first = meta.model.clone();
+        meta.poll(&cwd, Some(pane.id()), spawn, &cwd);
+        let second = meta.model.clone();
+        reap(pane, forked);
+
+        assert_eq!(first.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(second.as_deref(), Some("claude-sonnet-4-6"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The macOS `KERN_PROCARGS2` layout: argc, exec path, NUL padding, argv,
+    /// then env strings up to the first empty one.
+    #[test]
+    fn procargs2_env_skips_path_padding_and_argv() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(
+            b"/bin/sleep\0\0\0\0sleep\x0020\0A=1\0CLAUDE_CONFIG_DIR=/x/y\0\0junk=1\0",
+        );
+        let env = procargs2_env(&buf);
+        assert_eq!(env, vec![&b"A=1"[..], &b"CLAUDE_CONFIG_DIR=/x/y"[..]]);
+        assert_eq!(
+            env_entry(&env, "CLAUDE_CONFIG_DIR"),
+            Some(std::ffi::OsString::from("/x/y"))
+        );
+        assert!(procargs2_env(&buf[..2]).is_empty());
     }
 }
