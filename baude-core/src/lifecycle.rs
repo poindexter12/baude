@@ -474,23 +474,29 @@ pub fn mark_checkout_active(
 
 /// Whether a checkout row's recorded branch is part of its identity.
 ///
-/// SQ-5 decision, per role:
+/// Decision per role (SQ-5, revised by SQ-14):
 ///
-/// - `Main`, and a `PrimaryDefault` baude did not create, are the user's own
-///   checkouts. Running `git switch` (or detaching HEAD) in them is ordinary
-///   use, not evidence that the checkout was replaced, so the row FOLLOWS the
-///   branch: reconciliation re-observes whatever Git reports and the row stays
-///   available. This holds with a runtime attached, because a runtime is bound
-///   to the checkout's path (its cwd), never to a branch; the agent inside it
-///   switching branches is the most common way the branch moves at all.
+/// - `Main` and every `PrimaryDefault`, whether baude created its worktree or
+///   not, FOLLOW the branch. Running `git switch` (or detaching HEAD) in them
+///   is ordinary use, not evidence that the checkout was replaced, so
+///   reconciliation re-observes whatever Git reports and the row stays
+///   available. The default tab is where the user and their agents work. A
+///   runtime is bound to the checkout's path (its cwd), never to a branch,
+///   and the agent inside it switching branches is the most common way the
+///   branch moves at all. The app finds a default row by its role, and
+///   activation finds a row by the path Git reports for the requested branch,
+///   so nothing looks a default row up by its recorded branch and following
+///   cannot hand a branch request the wrong checkout. And pinning a baude-made default to the default branch
+///   can be unreachable: when the main clone already holds that branch, Git
+///   refuses to check it out a second time, so a pinned row could never be
+///   switched back to the branch it was bound to.
 /// - `ManagedBranch` rows exist to hold one branch (activation finds and
-///   reuses them by that branch, removal confirms it), and a `PrimaryDefault`
-///   baude created holds the default branch in a worktree baude owns. For
-///   those the branch IS the identity, so drift stays a protecting refusal
-///   with its own cause. That includes `ManagedBranch` rows admitted from a
-///   user's existing worktrees (`managed_by_baude: false`): activation still
-///   finds them by branch, so a row that silently followed would hand one
-///   branch's request a checkout on another.
+///   reuses them by that branch, removal confirms it), so for them the branch
+///   IS the identity and drift stays a protecting refusal with its own cause.
+///   That includes rows admitted from a user's existing worktrees
+///   (`managed_by_baude: false`): activation still finds them by branch, so a
+///   row that silently followed would hand one branch's request a checkout on
+///   another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BranchBinding {
     Follows,
@@ -498,11 +504,9 @@ pub enum BranchBinding {
 }
 
 pub fn branch_binding(checkout: &SavedCheckout) -> BranchBinding {
-    match (checkout.role, checkout.managed_by_baude) {
-        (CheckoutRole::Main, _) | (CheckoutRole::PrimaryDefault, false) => BranchBinding::Follows,
-        (CheckoutRole::PrimaryDefault, true) | (CheckoutRole::ManagedBranch, _) => {
-            BranchBinding::Pinned
-        }
+    match checkout.role {
+        CheckoutRole::Main | CheckoutRole::PrimaryDefault => BranchBinding::Follows,
+        CheckoutRole::ManagedBranch => BranchBinding::Pinned,
     }
 }
 
@@ -529,23 +533,45 @@ fn reobserve_branch(checkout: &mut SavedCheckout, observed: Option<String>) {
     checkout.observed_branch = observed;
 }
 
-/// Protection a fresh, successful reconciliation of a FOLLOWING row lifts.
+/// Protection a fresh, successful reconciliation lifts, on either binding.
 /// These are exactly the causes branch drift can have produced: the explicit
 /// branch causes, and `IdentityChanged`, which baude before SQ-5 wrote for
-/// every reconcile refusal including a plain `git switch`. A reconcile that
-/// verified the recorded common directory, path and lock state has disproved
-/// all of them for a row that follows its branch. Every other protection
-/// (recovery, teardown, removal, missing) keeps its own authority.
+/// every reconcile refusal including a plain `git switch`.
+///
+/// Callers ask only after a reconcile that verified the recorded common
+/// directory, path and lock state AND found the branch the row records: for
+/// a pinned row that is a plain `Ok`, so its branch is back where it is
+/// bound; for a following row it includes a branch-only refusal the row just
+/// adopted. Either way the fresh facts disprove all three causes (SQ-14: a
+/// pinned row switched back to its branch was otherwise protected forever).
+/// Every other protection (recovery, teardown, removal, missing) keeps its
+/// own authority.
 fn lifts_on_reconcile(checkout: &SavedCheckout) -> bool {
-    branch_binding(checkout) == BranchBinding::Follows
-        && matches!(
-            checkout.lifecycle(),
-            CheckoutLifecycle::Protected(
-                UnavailableCause::IdentityChanged
-                    | UnavailableCause::BranchChanged { .. }
-                    | UnavailableCause::Detached
-            )
+    matches!(
+        checkout.lifecycle(),
+        CheckoutLifecycle::Protected(
+            UnavailableCause::IdentityChanged
+                | UnavailableCause::BranchChanged { .. }
+                | UnavailableCause::Detached
         )
+    )
+}
+
+/// Whether a still-refusing reconcile replaces the cause a row is protected
+/// for. A row baude before SQ-5 stored at `IdentityChanged` whose fresh
+/// refusal is `BranchChanged` or `Detached` has had its common directory,
+/// path and lock state verified (branch facts are compared last; see
+/// [`ReconciliationUnavailable::branch_drift`]), so the identity claim is
+/// false and the branch cause is the truth. The row stays protected; only
+/// its label changes. Every other stored cause keeps its own authority.
+fn relabels_protection(checkout: &SavedCheckout, fresh: &UnavailableCause) -> bool {
+    matches!(
+        checkout.lifecycle(),
+        CheckoutLifecycle::Protected(UnavailableCause::IdentityChanged)
+    ) && matches!(
+        fresh,
+        UnavailableCause::BranchChanged { .. } | UnavailableCause::Detached
+    )
 }
 
 /// Update topology availability through core lifecycle authority, applying
@@ -555,7 +581,8 @@ fn lifts_on_reconcile(checkout: &SavedCheckout) -> bool {
 /// Successful reconciliation clears protection only where
 /// [`lifts_on_reconcile`] says the fresh facts disprove it; failed
 /// reconciliation records protection once and preserves any stronger
-/// existing evidence.
+/// existing evidence, except a stale `IdentityChanged` that
+/// [`relabels_protection`] replaces with the branch cause Git now shows.
 pub fn record_checkout_reconciliation(
     state: &mut RepositoryState,
     checkout: CheckoutKey,
@@ -599,7 +626,7 @@ pub fn record_checkout_reconciliation(
                 CheckoutLifecycle::Inactive
             });
         }
-        Some(cause) if !saved.lifecycle().is_protected() => {
+        Some(cause) if !saved.lifecycle().is_protected() || relabels_protection(saved, cause) => {
             saved.set_lifecycle(CheckoutLifecycle::Protected(cause.clone()));
         }
         _ => {}
@@ -1233,8 +1260,9 @@ pub fn plan_reopen(
 
     // A row that follows its branch adopts a branch-only refusal as a fresh
     // observation (see `branch_binding`), and a verified reconcile lifts the
-    // drift protection an earlier refusal left on it, so a user's `git
-    // switch` never strands the checkout.
+    // drift protection an earlier refusal left on it, on either binding, so
+    // neither a user's `git switch` nor a pinned row's switch back to its
+    // branch strands the checkout.
     let mut reconciliation = request.reconciliation;
     let mut adopted = None;
     if let Err(error) = &reconciliation {
@@ -1244,6 +1272,29 @@ pub fn plan_reopen(
         }
     }
     let lifted = reconciliation.is_ok() && lifts_on_reconcile(&state.checkouts[checkout_index]);
+
+    // A pinned row protected at a stale `IdentityChanged` stays blocked, but
+    // under the branch cause the fresh refusal proves, so the label tells the
+    // truth. Committed only when the relabelled state validates, like every
+    // other protection written here.
+    if let Err(error) = &reconciliation {
+        let fresh = unavailable_cause(error);
+        if relabels_protection(&state.checkouts[checkout_index], &fresh) {
+            let mut next = state.clone();
+            next.checkouts[checkout_index]
+                .set_lifecycle(CheckoutLifecycle::Protected(fresh.clone()));
+            if let Some(index) = repository_index {
+                next.repositories[index].health = RepositoryHealth::Unavailable(fresh.clone());
+            }
+            if next.validate_for_save().is_ok() {
+                *state = next;
+            }
+            return Err(ReopenBlocked {
+                checkout: request.checkout,
+                cause: fresh,
+            });
+        }
+    }
 
     if let Some(cause) = match state.checkouts[checkout_index].lifecycle() {
         _ if lifted => None,
@@ -4083,21 +4134,30 @@ mod tests {
             Some(UnavailableCause::Detached)
         );
 
-        // A default worktree baude created holds the default branch; it is
-        // pinned too.
+        // SQ-14: a default worktree baude created is NOT pinned; it follows
+        // its branch like the user's own default.
         let mut state = drift_state(&repo, CheckoutRole::PrimaryDefault, true, &repo, "main");
         git_in(&repo, &["switch", "-q", "-c", "baude-owned-moved"]);
         let reconciliation = reconcile_row(&state);
         assert!(matches!(
-            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
-            Some(UnavailableCause::BranchChanged { .. })
+            reconciliation,
+            Err(ReconciliationUnavailable::BranchChanged { .. })
         ));
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            None
+        );
+        assert_eq!(
+            state.checkouts[0].observed_branch.as_deref(),
+            Some("refs/heads/baude-owned-moved")
+        );
     }
 
     /// SQ-5 recovery: rows an older baude persisted at `identity_changed` for
     /// what was really a `git switch` come back on the next reconcile, with
-    /// no hand edit, through both the admission and the reopen paths. A
-    /// pinned row at the same cause stays protected.
+    /// no hand edit, through both the admission and the reopen paths. Since
+    /// SQ-14 a pinned row at the same cause recovers too once its own branch
+    /// verifies; only a real identity change keeps it protected.
     #[test]
     fn rows_stuck_at_identity_changed_by_a_branch_switch_recover_on_reconcile() {
         use super::record_checkout_reconciliation;
@@ -4151,8 +4211,10 @@ mod tests {
             Some("refs/heads/chore/workspace")
         );
 
-        // A pinned row stuck at the same cause keeps its protection: for it
-        // the old fold may have hidden a real branch move.
+        // SQ-14: a pinned row stuck at the same cause whose reconcile now
+        // verifies everything, its own branch included, lifts too. The old
+        // fold may have hidden a real branch move, but the branch is where
+        // the row is bound right now, so nothing protects it any more.
         let mut state = drift_state(
             &repo,
             CheckoutRole::ManagedBranch,
@@ -4163,13 +4225,24 @@ mod tests {
         stuck(&mut state);
         let reconciliation = reconcile_row(&state);
         assert_eq!(reconciliation, Ok(()));
-        record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap();
         assert_eq!(
-            state.checkouts[0].lifecycle(),
-            &CheckoutLifecycle::Protected(UnavailableCause::IdentityChanged)
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            None
         );
+        assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Inactive);
+        assert_eq!(state.checkouts[0].health(), &CheckoutHealth::Available);
+        assert!(state.validate_for_save().is_ok());
+
+        let mut state = drift_state(
+            &repo,
+            CheckoutRole::ManagedBranch,
+            true,
+            &linked,
+            "feature/kept",
+        );
+        stuck(&mut state);
         let reconciliation = reconcile_row(&state);
-        assert!(plan_reopen(
+        plan_reopen(
             &mut state,
             ReopenRequest {
                 checkout,
@@ -4177,7 +4250,338 @@ mod tests {
                 runtime: ReopenRuntime::Absent,
             },
         )
-        .is_err());
+        .expect("a pinned row whose branch verifies reopens");
+        assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Active);
+        assert_eq!(state.repositories[0].health, RepositoryHealth::Available);
+
+        // A real identity change still protects a pinned row: the stored
+        // cause is not branch-shaped, so neither lift nor relabel applies.
+        let mut state = drift_state(
+            &repo,
+            CheckoutRole::ManagedBranch,
+            true,
+            &linked,
+            "feature/kept",
+        );
+        stuck(&mut state);
+        state.repositories[0].observed_common_dir =
+            PersistedPath::from_path(&fixture.root().join("elsewhere.git"));
+        let reconciliation = reconcile_row(&state);
+        assert!(matches!(
+            reconciliation,
+            Err(ReconciliationUnavailable::IdentityChanged { .. })
+        ));
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            Some(UnavailableCause::IdentityChanged)
+        );
+        assert_eq!(
+            state.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(UnavailableCause::IdentityChanged)
+        );
+    }
+
+    /// The topology the live iarx-com rows have: a CLONED repository whose
+    /// main checkout holds a working branch, a default worktree on `main`
+    /// made the way baude makes one (`git worktree add <path> main`), and a
+    /// managed branch worktree (`git worktree add -b feature/kept <path>`).
+    /// Returns (clone main worktree, default worktree, managed worktree), each
+    /// as Git reports it.
+    fn cloned_topology(fixture: &LifecycleFixture) -> (PathBuf, PathBuf, PathBuf) {
+        let upstream = fixture.subdir("upstream");
+        git_in(&upstream, &["init", "-q", "-b", "main"]);
+        git_in(&upstream, &["config", "user.email", "test@example.com"]);
+        git_in(&upstream, &["config", "user.name", "Test"]);
+        std::fs::write(upstream.join("tracked"), b"one\n").unwrap();
+        git_in(&upstream, &["add", "tracked"]);
+        git_in(&upstream, &["commit", "-q", "-m", "initial"]);
+        let clone = fixture.root().join("clone");
+        git_in(
+            fixture.root(),
+            &[
+                "clone",
+                "-q",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        git_in(&clone, &["switch", "-q", "-c", "chore/workspace"]);
+        let default = fixture.root().join("default");
+        git_in(
+            &clone,
+            &["worktree", "add", "-q", default.to_str().unwrap(), "main"],
+        );
+        let managed = fixture.root().join("managed");
+        git_in(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/kept",
+                managed.to_str().unwrap(),
+            ],
+        );
+        let reported = |path: &Path| {
+            git::discover_repository(path)
+                .unwrap()
+                .selected_worktree
+                .path
+        };
+        let main = git::discover_repository(&clone).unwrap().main_worktree;
+        (main, reported(&default), reported(&managed))
+    }
+
+    /// The persisted shape an older baude, or an earlier refusal, left: the
+    /// row protected at `cause` and the repository unavailable for it.
+    fn persisted_protection(
+        state: &mut RepositoryState,
+        cause: crate::repository::UnavailableCause,
+    ) {
+        state.checkouts[0].set_lifecycle(CheckoutLifecycle::Protected(cause.clone()));
+        state.repositories[0].health = RepositoryHealth::Unavailable(cause);
+        assert!(state.validate_for_save().is_ok(), "the persisted shape");
+    }
+
+    fn reopen_row(state: &mut RepositoryState) -> Result<super::ReopenPlan, super::ReopenBlocked> {
+        let checkout = state.checkouts[0].key;
+        let reconciliation = reconcile_row(state);
+        plan_reopen(
+            state,
+            ReopenRequest {
+                checkout,
+                reconciliation,
+                runtime: ReopenRuntime::Absent,
+            },
+        )
+    }
+
+    /// SQ-14: a default worktree baude created FOLLOWS its branch. Switched
+    /// away it stays available and shows the new branch, and a row of that
+    /// kind persisted at any branch-shaped protection, the four live
+    /// iarx-com rows included, lifts on the next clean reconcile with no
+    /// hand edit, through both the admission and the reopen paths.
+    #[test]
+    fn baude_made_default_worktree_follows_and_stale_protection_lifts() {
+        use super::record_checkout_reconciliation;
+        use super::{branch_binding, BranchBinding};
+        use crate::repository::UnavailableCause;
+        let fixture = LifecycleFixture::new("sq14-default");
+        let (main, default, _managed) = cloned_topology(&fixture);
+        let row = || drift_state(&main, CheckoutRole::PrimaryDefault, true, &default, "main");
+        assert_eq!(branch_binding(&row().checkouts[0]), BranchBinding::Follows);
+
+        // Switched away: available, showing the new branch.
+        git_in(&default, &["switch", "-q", "-c", "chore/default-moved"]);
+        let mut state = row();
+        let checkout = state.checkouts[0].key;
+        let reconciliation = reconcile_row(&state);
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            None
+        );
+        assert_eq!(state.checkouts[0].health(), &CheckoutHealth::Available);
+        assert_eq!(
+            state.checkouts[0].observed_branch.as_deref(),
+            Some("refs/heads/chore/default-moved")
+        );
+        assert_eq!(
+            state.checkouts[0].session.branch.as_deref(),
+            Some("chore/default-moved")
+        );
+
+        let stale_causes = [
+            UnavailableCause::IdentityChanged,
+            UnavailableCause::BranchChanged {
+                expected: Some("refs/heads/main".into()),
+                observed: Some("refs/heads/chore/default-moved".into()),
+            },
+            UnavailableCause::Detached,
+        ];
+
+        // Every stale cause lifts while the worktree is still switched away
+        // (the row adopts the branch) ...
+        for cause in stale_causes.clone() {
+            let mut state = row();
+            persisted_protection(&mut state, cause.clone());
+            let reconciliation = reconcile_row(&state);
+            assert_eq!(
+                record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+                None,
+                "{cause:?} lifts on admission"
+            );
+            assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Inactive);
+            assert!(state.validate_for_save().is_ok());
+
+            let mut state = row();
+            persisted_protection(&mut state, cause.clone());
+            reopen_row(&mut state).unwrap_or_else(|blocked| {
+                panic!("{cause:?} lifts on reopen, blocked: {blocked:?}")
+            });
+            assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Active);
+            assert_eq!(state.repositories[0].health, RepositoryHealth::Available);
+            assert_eq!(
+                state.checkouts[0].observed_branch.as_deref(),
+                Some("refs/heads/chore/default-moved")
+            );
+        }
+
+        // ... and after it is switched back to the recorded branch.
+        git_in(&default, &["switch", "-q", "main"]);
+        for cause in stale_causes.clone() {
+            let mut state = row();
+            persisted_protection(&mut state, cause.clone());
+            let reconciliation = reconcile_row(&state);
+            assert_eq!(reconciliation, Ok(()));
+            assert_eq!(
+                record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+                None,
+                "{cause:?} lifts once the default is back on main"
+            );
+            assert_eq!(state.checkouts[0].health(), &CheckoutHealth::Available);
+        }
+
+        // Detached HEAD in the default worktree is followed too.
+        git_in(&default, &["switch", "-q", "--detach"]);
+        let mut state = row();
+        persisted_protection(&mut state, UnavailableCause::IdentityChanged);
+        reopen_row(&mut state).expect("a detached default reopens");
+        assert_eq!(state.checkouts[0].observed_branch, None);
+        assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Active);
+    }
+
+    /// SQ-14 on a pinned row: a `ManagedBranch` worktree switched away is
+    /// protected for the branch, and switched back to its own branch the
+    /// next clean reconcile lifts that protection. A row persisted at
+    /// `IdentityChanged` whose common directory still matches stays
+    /// protected while Git refuses, but relabelled with the cause the fresh
+    /// facts show.
+    #[test]
+    fn managed_branch_worktree_recovers_on_switch_back_and_relabels_stale_identity() {
+        use super::record_checkout_reconciliation;
+        use super::{branch_binding, BranchBinding};
+        use crate::repository::UnavailableCause;
+        let fixture = LifecycleFixture::new("sq14-managed");
+        let (main, _default, managed) = cloned_topology(&fixture);
+        let row = || {
+            drift_state(
+                &main,
+                CheckoutRole::ManagedBranch,
+                true,
+                &managed,
+                "feature/kept",
+            )
+        };
+        assert_eq!(branch_binding(&row().checkouts[0]), BranchBinding::Pinned);
+
+        // Switched away: protected for the branch.
+        git_in(&managed, &["switch", "-q", "-c", "chore/managed-moved"]);
+        let moved = UnavailableCause::BranchChanged {
+            expected: Some("refs/heads/feature/kept".into()),
+            observed: Some("refs/heads/chore/managed-moved".into()),
+        };
+        let mut state = row();
+        let checkout = state.checkouts[0].key;
+        let reconciliation = reconcile_row(&state);
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            Some(moved.clone())
+        );
+        assert_eq!(
+            state.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(moved.clone())
+        );
+
+        // Relabel while still switched away: stored identity, fresh branch.
+        let mut relabelled = row();
+        persisted_protection(&mut relabelled, UnavailableCause::IdentityChanged);
+        let reconciliation = reconcile_row(&relabelled);
+        assert_eq!(
+            record_checkout_reconciliation(&mut relabelled, checkout, &reconciliation).unwrap(),
+            Some(moved.clone())
+        );
+        assert_eq!(
+            relabelled.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(moved.clone()),
+            "the label tells the truth while the row stays protected"
+        );
+        assert_eq!(
+            relabelled.checkouts[0].observed_branch.as_deref(),
+            Some("refs/heads/feature/kept"),
+            "a pinned row keeps the branch it is bound to"
+        );
+
+        // Switched back: the same rows recover, admission and reopen.
+        git_in(&managed, &["switch", "-q", "feature/kept"]);
+        let reconciliation = reconcile_row(&state);
+        assert_eq!(reconciliation, Ok(()));
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            None
+        );
+        assert_eq!(state.checkouts[0].lifecycle(), &CheckoutLifecycle::Inactive);
+        assert_eq!(state.checkouts[0].health(), &CheckoutHealth::Available);
+        assert!(state.validate_for_save().is_ok());
+        reopen_row(&mut relabelled).expect("a pinned row switched back reopens");
+        assert_eq!(
+            relabelled.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Active
+        );
+        assert_eq!(
+            relabelled.repositories[0].health,
+            RepositoryHealth::Available
+        );
+
+        // Detached with the pre-SQ-5 identity cause: stays protected, but as
+        // Detached, through admission and through reopen.
+        git_in(&managed, &["switch", "-q", "--detach"]);
+        let mut state = row();
+        persisted_protection(&mut state, UnavailableCause::IdentityChanged);
+        let reconciliation = reconcile_row(&state);
+        assert_eq!(reconciliation, Err(ReconciliationUnavailable::Detached));
+        assert_eq!(
+            record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap(),
+            Some(UnavailableCause::Detached)
+        );
+        assert_eq!(
+            state.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(UnavailableCause::Detached)
+        );
+        assert_eq!(
+            state.checkouts[0].health(),
+            &CheckoutHealth::Unavailable(UnavailableCause::Detached)
+        );
+
+        let mut state = row();
+        persisted_protection(&mut state, UnavailableCause::IdentityChanged);
+        let blocked = reopen_row(&mut state).expect_err("a detached pinned row stays blocked");
+        assert_eq!(blocked.cause, UnavailableCause::Detached);
+        assert_eq!(
+            state.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(UnavailableCause::Detached)
+        );
+        assert_eq!(
+            state.repositories[0].health,
+            RepositoryHealth::Unavailable(UnavailableCause::Detached)
+        );
+        assert!(state.validate_for_save().is_ok());
+        let round_trip: RepositoryState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(
+            round_trip, state,
+            "the relabelled cause persists and reloads"
+        );
+
+        // A stored branch cause is not rewritten by a different branch fact.
+        let mut state = row();
+        persisted_protection(&mut state, moved.clone());
+        let reconciliation = reconcile_row(&state);
+        record_checkout_reconciliation(&mut state, checkout, &reconciliation).unwrap();
+        assert_eq!(
+            state.checkouts[0].lifecycle(),
+            &CheckoutLifecycle::Protected(moved)
+        );
     }
 
     /// The runtime record a baude that exited without teardown leaves on a

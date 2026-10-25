@@ -2375,8 +2375,9 @@ impl App {
                 );
                 return Ok(None);
             }
-            // A user-owned primary FOLLOWS its branch (`lifecycle::branch_binding`),
-            // so after a `git switch` the row names the branch the user chose.
+            // Every primary FOLLOWS its branch (`lifecycle::branch_binding`),
+            // the default worktree baude made included, so after a `git switch`
+            // the row names the branch the user chose.
             // It stays the primary: re-deriving the default below would add a
             // managed default worktree the user never asked for and then refuse
             // it for not being the recorded path.
