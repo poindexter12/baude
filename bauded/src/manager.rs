@@ -4743,4 +4743,78 @@ mod tests {
         m.kill_all();
         drop(fixture);
     }
+
+    /// BL-02, daemon side: a resumed daemon pane runs
+    /// `claude --continue 2>/dev/null || exec claude`, so its claude is a
+    /// FORKED child that writes `sessions/<child pid>.json`, never the pane
+    /// pid's file. The stand-in below behaves that way through a real PTY, and
+    /// the continued conversation's transcript predates the spawn by an hour,
+    /// so only the session-member lookup can find the model.
+    #[test]
+    fn resumed_daemon_session_reports_model_from_forked_claude() {
+        let fixture = ManagerFixture::new("resumed-daemon-session-reports-model");
+        let claude = fixture.root().join("claude");
+        let repo = fixture.subdir("repo");
+        let physical = repo.canonicalize().unwrap();
+        let sid = format!("daemon-continued-{}", std::process::id());
+
+        let transcript = baude_core::meta::transcript_file(&physical, &sid);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{sid}\"}}\n\
+                 {{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-opus-4-8\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+
+        let fake = fixture.root().join("fake-claude.sh");
+        std::fs::write(
+            &fake,
+            format!(
+                "mkdir -p '{sessions}'\n\
+                 now=$(( $(date +%s) * 1000 ))\n\
+                 printf '{{\"pid\":%s,\"sessionId\":\"{sid}\",\"cwd\":\"{cwd}\",\"startedAt\":%s,\
+                 \"version\":\"2.1.310\",\"kind\":\"interactive\",\"entrypoint\":\"cli\",\
+                 \"status\":\"idle\"}}' $$ \"$now\" > '{sessions}'/$$.json\n\
+                 exec sleep 30\n",
+                sessions = claude.join("sessions").display(),
+                cwd = physical.display(),
+            ),
+        )
+        .unwrap();
+
+        let mut m = Manager::new(format!("sh {}", fake.display()), false);
+        let id = m
+            .spawn(repo.clone(), repo.clone(), None, false, None, true)
+            .unwrap();
+        let pane_pid = m.session(id).unwrap().claude.pid();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let model = loop {
+            m.poll_claude_meta_for_test(id);
+            let info = m.info(id).unwrap();
+            if info.model.is_some() || Instant::now() > deadline {
+                break info.model;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let own_file = pane_pid.map(|p| claude.join("sessions").join(format!("{p}.json")));
+
+        m.kill_all();
+        drop(fixture);
+
+        assert!(
+            own_file.is_some_and(|f| !f.exists()),
+            "the forked claude must not have written the pane pid's file"
+        );
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+    }
 }

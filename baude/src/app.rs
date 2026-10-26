@@ -2375,8 +2375,9 @@ impl App {
                 );
                 return Ok(None);
             }
-            // A user-owned primary FOLLOWS its branch (`lifecycle::branch_binding`),
-            // so after a `git switch` the row names the branch the user chose.
+            // Every primary FOLLOWS its branch (`lifecycle::branch_binding`),
+            // the default worktree baude made included, so after a `git switch`
+            // the row names the branch the user chose.
             // It stays the primary: re-deriving the default below would add a
             // managed default worktree the user never asked for and then refuse
             // it for not being the recorded path.
@@ -11212,9 +11213,13 @@ mod tests {
         let mut app = App::new(folder.clone());
         app.remote = None;
         // The stand-in records the argv the spawn plan hands it, then stays
-        // alive like every other stand-in in this file.
+        // alive like every other stand-in in this file. It writes a staged
+        // file and renames it into place: macOS `/bin/sh` is bash, whose
+        // line-buffered `printf` issues one write per argument, so a reader
+        // could otherwise see only `--dangerously-skip-permissions` before
+        // `--continue` lands (macOS CI, run 40218431604).
         app.config.claude_cmd = Some(format!(
-            "sh -c 'printf \"%s\\n\" \"$@\" > {}; exec sleep 30' baude-argv",
+            "sh -c 'printf \"%s\\n\" \"$@\" > {0}.$$ && mv {0}.$$ {0}; exec sleep 30' baude-argv",
             argv.display()
         ));
         app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
