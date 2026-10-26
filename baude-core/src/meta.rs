@@ -2217,12 +2217,24 @@ mod tests {
     /// Stand-in claude for the two-account tests: an ordinary (non-platform)
     /// binary, because macOS hides the environment of Apple platform binaries
     /// such as `/bin/sleep` while exposing that of user-installed ones like
-    /// claude. Runs only when a test launches it by name.
+    /// claude. Runs only when a test launches it by name. Once running it
+    /// announces its pid at [`STAND_IN_READY_ENV`] (write, then rename, so
+    /// the file never appears half-written), which is the earliest point a
+    /// real claude could write its session file.
     #[test]
     #[ignore = "stand-in process launched by the two-account tests"]
     fn pane_claude_stand_in() {
+        if let Some(ready) = std::env::var_os(STAND_IN_READY_ENV) {
+            let ready = PathBuf::from(ready);
+            let staged = ready.with_extension(format!("{}.tmp", std::process::id()));
+            fs::write(&staged, std::process::id().to_string()).unwrap();
+            fs::rename(&staged, &ready).unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_secs(20));
     }
+
+    /// Where [`pane_claude_stand_in`] announces that it is running.
+    const STAND_IN_READY_ENV: &str = "BAUDE_TEST_STAND_IN_READY";
 
     /// Shell text that runs [`pane_claude_stand_in`] from this test binary.
     fn stand_in_claude() -> String {
@@ -2234,13 +2246,24 @@ mod tests {
 
     /// A process standing in for a pane, launched with `CLAUDE_CONFIG_DIR`
     /// set to `own` and running `script`. Returns the process and the pid the
-    /// script echoes first (the forked child, or the shell itself).
-    fn spawn_pane(own: &Path, script: &str) -> (std::process::Child, u32) {
+    /// script echoes first (the forked child, or the shell itself), once the
+    /// stand-in claude at that pid is running.
+    ///
+    /// The script echoes the pid before the stand-in's exec, and until that
+    /// exec the pid is still `/bin/sh`, a platform binary whose environment
+    /// macOS hides, so its `CLAUDE_CONFIG_DIR` cannot be read yet. A real
+    /// claude writes `sessions/<pid>.json` only after it starts, so a fixture
+    /// that writes the file first models a pane that cannot exist, and a
+    /// poll that lands before the exec misses (macOS CI, run 40218431604).
+    /// Waiting for the stand-in's own announcement, at `ready`, restores the
+    /// production order.
+    fn spawn_pane(own: &Path, script: &str, ready: &Path) -> (std::process::Child, u32) {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.args(["-c", script])
             .env("CLAUDE_CONFIG_DIR", own)
+            .env(STAND_IN_READY_ENV, ready)
             .stdout(std::process::Stdio::piped());
         // SAFETY: setsid is async-signal-safe; portable-pty does the same.
         unsafe {
@@ -2257,6 +2280,19 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let pid = line.trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let announced: u32 = loop {
+            if let Ok(text) = fs::read_to_string(ready) {
+                break text.parse().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in claude never started: {}",
+                ready.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(announced, pid, "the echoed pid is the stand-in claude");
         (shell, pid)
     }
 
@@ -2278,7 +2314,11 @@ mod tests {
         let physical = fs::canonicalize(&cwd).unwrap();
 
         let spawn = now_unix_ms();
-        let (pane, pid) = spawn_pane(&account, &format!("echo $$; exec {}", stand_in_claude()));
+        let (pane, pid) = spawn_pane(
+            &account,
+            &format!("echo $$; exec {}", stand_in_claude()),
+            &root.join("stand-in.ready"),
+        );
         let sid = format!("account-{}", std::process::id());
         write_real_session_file(&account, pid, &sid, &physical, spawn + 300);
         write_real_transcript(
@@ -2321,7 +2361,7 @@ mod tests {
             account.display(),
             stand_in_claude()
         );
-        let (pane, forked) = spawn_pane(&own, &script);
+        let (pane, forked) = spawn_pane(&own, &script, &root.join("stand-in.ready"));
         let sid = format!("account-fork-{}", std::process::id());
         write_real_session_file(&account, forked, &sid, &physical, spawn + 300);
         write_real_transcript(
