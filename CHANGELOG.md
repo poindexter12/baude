@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.3](https://github.com/poindexter12/baude/compare/v2.7.2...v2.7.3) (2026-10-26)
+
+
+### Bug Fixes
+
+* resolve session model across config dirs and recover pinned checkout rows ([bf7e9a4](https://github.com/poindexter12/baude/commit/bf7e9a4c4dc997d71a567f13b4d9898ee21fe1e2))
+
 ## [2.7.2](https://github.com/poindexter12/baude/compare/v2.7.1...v2.7.2) (2026-10-23)
 
 
