@@ -23,13 +23,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
 
       - id: rp
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
@@ -37,7 +37,7 @@ jobs:
 
       # We need the CURRENT (pre-bump) version to classify the bump size.
       - if: ${{ steps.rp.outputs.pr }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The generic toml updaters cannot target Cargo.lock's [[package]]
       # entries, so refresh the lock on the release branch. The release-as

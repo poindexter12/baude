@@ -18,7 +18,7 @@ jobs:
     steps:
       # PR commit checks compare against origin/main, so checkout needs the
       # base history rather than Actions' default depth-one checkout.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: Swatinem/rust-cache@v2
@@ -62,11 +62,11 @@ jobs:
   docker:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: validate compose config
         run: TS_AUTHKEY=tskey-dummy docker compose config -q
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           tags: bauded:ci
@@ -113,7 +113,7 @@ jobs:
             os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: artifact-readiness-${{ matrix.target }}
