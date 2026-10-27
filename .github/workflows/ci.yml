@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege for every job; a job needing more widens it on its own.
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
