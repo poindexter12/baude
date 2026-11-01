@@ -14,14 +14,19 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current State (v2.6.0; last GSD milestone v2.3 shipped 2026-09-22)
+## Current State (v2.7.3; last GSD milestone v2.3 shipped 2026-09-22)
 
-v2.6.0 is the current release. The latest GSD-completed milestone is v2.3 through Phase 17 (phases 13-17, archived under `milestones/v2.3-*`, closed out 2026-10-13). v2.3.1 through v2.6.0 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them. The codebase is about 62.3k lines of Rust across `baude-core`, `baude`, and `bauded`.
+v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 through Phase 17 (phases 13-17, archived under `milestones/v2.3-*`, closed out 2026-10-13). v2.3.1 through v2.7.3 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them. The codebase is about 62.3k lines of Rust across `baude-core`, `baude`, and `bauded`.
 
-## Current Milestone: none
+## Current Milestone: v2.8 Project Removal
 
-v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milestone` to open one.
+**Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path.
 
+**Target features:**
+- A remove action that works on repository parents (with all children), single checkout or worktree children, and standalone folder rows, including rows with a live runtime
+- Owned runtime is killed before the rows drop; baude-managed worktrees are removed from disk; main checkouts, standalone folders and local branches are never deleted
+- Removal clears the folder-workspace binding and marker ownership so the startup sweep and reconcile do not re-admit the project; it comes back only through `n`, `c`, or launching baude inside the folder
+- Daemon parity: the same removal over the REST API and from the PWA
 ## Requirements
 
 ### Validated
@@ -69,7 +74,15 @@ v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milesto
 
 <!-- Current milestone scope. -->
 
-No milestone is open. Candidates carried out of v2.3:
+v2.8 Project Removal:
+
+- [ ] User can remove a repository parent with every child, a single checkout or worktree child, or a standalone row from the sidebar in one confirmed action, even while a runtime is live
+- [ ] Removal kills the owned runtime first and never leaves an orphaned process
+- [ ] Removal deletes baude-managed worktrees from disk and never deletes a main checkout, a standalone folder or a local branch
+- [ ] Removed projects stay gone across reconcile and relaunch until re-added by `n`, `c`, or launching inside the folder
+- [ ] The daemon exposes the same removal over REST and the PWA offers it
+
+Carried out of v2.3, not in this milestone:
 
 - [ ] Reduce first-frame latency. v2.3 made startup *measurable* and idle *quiet*, which it set out to do, but the measured `first_frame` is 5,537 ms of a 6,859 ms total on a release binary with an empty state. Cutting that was never in v2.3's scope and is still open.
 - [x] Replace `timing_disabled_when_env_unset` with a test that exercises the production `BAUDE_TIMING` gate rather than re-reading the environment variable. Done (SQ-12): the gate is now `timing_requested`, called by `main` and tested over env values crossed with the flag.
@@ -158,4 +171,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-13 after v2.3 milestone closeout*
+*Last updated: 2026-11-01 after starting milestone v2.8*
