@@ -1,5 +1,5 @@
 {
-  "model_profile": "balanced",
+  "model_profile": "quality",
   "commit_docs": true,
   "parallelization": true,
   "search_gitignored": false,
@@ -49,7 +49,8 @@
     "ui_review": false,
     "use_worktrees": true,
     "_auto_chain_active": false,
-    "plan_review_convergence": true
+    "plan_review_convergence": true,
+    "compact_content": true
   },
   "ship": {
     "pr_body_sections": []
