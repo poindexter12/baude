@@ -69,7 +69,7 @@ Known gaps: see MILESTONES.md.
 
 **Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
 
-- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (0/? plans)
+- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (0/7 plans)
 - [ ] Phase 19: Re-admission Suppression (0/? plans)
 - [ ] Phase 20: TUI Remove Action (0/? plans)
 - [ ] Phase 21: Daemon and PWA Parity (0/? plans)
@@ -91,7 +91,16 @@ Known gaps: see MILESTONES.md.
   4. Removing a repository parent removes each child by the per-child rules and then the parent, in one lifecycle operation composed from the existing kill, close and managed-worktree removal stages
   5. A crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
 
-**Plans**: TBD
+**Plans**: 7 plans
+
+Plans:
+- [ ] 18-01-PLAN.md — `removal.rs` vocabulary, `select_rows` and side-effect-free `preview_removal` for every row kind (TDD)
+- [ ] 18-02-PLAN.md — `git::remove_managed_worktree_forced` with managed-root containment, prune fallback and postcondition proof (TDD)
+- [ ] 18-03-PLAN.md — `RepositoryState::remove_rows` batch aggregate mutation (TDD)
+- [ ] 18-04-PLAN.md — `removal::remove` kill-then-disk-then-single-save orchestration with live process doubles (TDD)
+- [ ] 18-05-PLAN.md — persistence failure modes and crash-before-save reconcile proof
+- [ ] 18-06-PLAN.md — keep rules, already-removed rows and parent fan-out on cloned and `git init` fixtures
+- [ ] 18-07-PLAN.md — `scripts/gate.sh` on macOS and `--linux`, gate-driven fixes only
 
 ### Phase 19: Re-admission Suppression
 
