@@ -6,10 +6,11 @@
 - ✅ **v2.0 Local TUI Dogfood Release** — Phases 5-7 (shipped 2026-09-03) ([archive](milestones/v2.0-ROADMAP.md))
 - ✅ **v2.2 Reliability and Terminal Usability** — Phases 8-12 (shipped 2026-09-19 as v2.2.0) ([archive](milestones/v2.2-ROADMAP.md))
 - ✅ **v2.3 Launch Defaults and Startup Speed** — Phases 13-17 (shipped 2026-09-22 as v2.3.0) ([archive](milestones/v2.3-ROADMAP.md))
+- 🚧 **v2.8 Project Removal** — Phases 18-22 (in progress, started 2026-11-01)
 
 v2.1.0 through v2.1.5 were release-please point releases between v2.0 and v2.2 and do not add roadmap phases. The same holds after v2.3: v2.3.1 through v2.6.0 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them.
 
-No milestone is currently in progress.
+**Current milestone:** v2.8 Project Removal — Phases 18-22. Requirements in `.planning/REQUIREMENTS.md`; research brief in `.planning/research/v2.8-research-brief.md`.
 
 ## Phases
 
@@ -64,6 +65,100 @@ Known gaps: see MILESTONES.md.
 
 </details>
 
+### 🚧 v2.8 Project Removal (Phases 18-22) — IN PROGRESS
+
+**Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
+
+- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (0/? plans)
+- [ ] Phase 19: Re-admission Suppression (0/? plans)
+- [ ] Phase 20: TUI Remove Action (0/? plans)
+- [ ] Phase 21: Daemon and PWA Parity (0/? plans)
+- [ ] Phase 22: Validation and v2.8.0 Release (0/? plans)
+
+### Phase 18: Shared Kill-Then-Remove Lifecycle
+
+**Goal**: `baude-core` can remove any row kind in one operation that kills the owned runtime first, removes managed worktrees from disk, never deletes a main checkout, standalone folder or local branch, and persists atomically, so the TUI and daemon share one removal path.
+
+**Depends on**: Nothing (first phase of this milestone)
+
+**Requirements**: KILL-01, KILL-02, KILL-03, RMV-01, RMV-02, RMV-03, RMV-04, RMV-05, RMV-06, RMV-07
+
+**Success Criteria** (what must be TRUE):
+
+  1. Removing a row with a live runtime terminates the owned process group with SIGTERM then SIGKILL on macOS and Linux, and no zombie or orphan attributable to that row remains
+  2. A runtime that survives escalation leaves the row in place with an error instead of dropping the row and leaking the process
+  3. Removing a managed worktree child deletes its worktree directory even when the tree is unclean or a runtime held it as cwd; removing a main checkout or standalone row leaves the directory and every local branch untouched, and tests on cloned and `git init` fixtures assert each of these
+  4. Removing a repository parent removes each child by the per-child rules and then the parent, in one lifecycle operation composed from the existing kill, close and managed-worktree removal stages
+  5. A crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
+
+**Plans**: TBD
+
+### Phase 19: Re-admission Suppression
+
+**Goal**: A removed project stays gone across reconcile and relaunch because removal clears its folder-workspace binding and marker ownership, and every rediscovery path respects that, while `n`, `c` and launching inside the folder still admit it fresh.
+
+**Depends on**: Phase 18
+
+**Requirements**: READM-01, READM-02, READM-03, READM-04, READM-05
+
+**Success Criteria** (what must be TRUE):
+
+  1. After removal, the launch-dir binding walk no longer resolves the removed folder to a workspace and marker recovery does not restore the row
+  2. The session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row across a TUI relaunch
+  3. `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity
+  4. Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace
+
+**Plans**: TBD
+
+### Phase 20: TUI Remove Action
+
+**Goal**: The user can remove any row kind from the sidebar through a confirmation that names exactly what will be killed, dropped and deleted, and a failure leaves a visible, retryable state.
+
+**Depends on**: Phase 19
+
+**Requirements**: TUI-01, TUI-02, TUI-03, TUI-04
+
+**Success Criteria** (what must be TRUE):
+
+  1. The remove action is reachable on repository, main checkout, managed worktree, unmanaged checkout and standalone rows, and the footer or help lists it beside `x`, `w` and `X`
+  2. The confirmation names the row kind, the rows to be dropped, whether a live runtime will be killed, and which paths are deleted versus left in place; for a repository parent it lists every child
+  3. On confirm the rows disappear from the sidebar and the state file in one step
+  4. A failure at any stage leaves the affected rows visible with an error notice and the user can retry
+
+**Plans**: TBD
+
+### Phase 21: Daemon and PWA Parity
+
+**Goal**: The same removal is available over the daemon REST API with SSE updates and from the PWA with an equivalent confirmation, through the shared `baude-core` operation.
+
+**Depends on**: Phase 20
+
+**Requirements**: API-01, API-02, API-03
+
+**Success Criteria** (what must be TRUE):
+
+  1. A REST removal endpoint accepts repository, checkout, worktree and standalone rows, calls the Phase 18 operation, and returns the rows removed, runtimes killed and paths deleted
+  2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
+  3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
+
+**Plans**: TBD
+
+### Phase 22: Validation and v2.8.0 Release
+
+**Goal**: Removal is proven end to end on realistic fixtures for every row kind with and without a live runtime, documented, and shipped as v2.8.0 through release-please.
+
+**Depends on**: Phase 21
+
+**Requirements**: REL-01, REL-02
+
+**Success Criteria** (what must be TRUE):
+
+  1. Integration tests cover each row kind with a live runtime and without, on cloned and `git init` fixtures, and assert on fixture output that process, worktree, binding and marker state are gone
+  2. README and PWA docs describe the remove action, its confirmation, and what is and is not deleted
+  3. `scripts/gate.sh` and `scripts/gate.sh --linux` pass and v2.8.0 is released through release-please
+
+**Plans**: TBD
+
 ## Backlog
 
 See `.planning/BACKLOG.md`:
@@ -73,4 +168,4 @@ See `.planning/BACKLOG.md`:
 - **BL-03** — wire GSD phase/state into the sidebar (new feature idea)
 
 ---
-*Last updated: 2026-10-13 after v2.3 milestone closeout.*
+*Last updated: 2026-11-02 after v2.8 roadmap creation.*

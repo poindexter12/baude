@@ -2,11 +2,15 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-status: planning
-last_updated: "2026-11-01T16:54:02.925Z"
-last_activity: 2026-11-01
+current_phase_name: defining requirements
+status: ready_to_plan
+stopped_at: context exhaustion at 76% (2026-11-02)
+last_updated: "2026-11-02T14:10:00.000Z"
+last_activity: 2026-11-02
+last_activity_desc: Milestone v2.8 started
+state_head: ae9eeeff1bc45b24933aa3fb7ed95d6048bd0e03
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-13)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Planning next milestone — v2.3 closed 2026-10-13 (`override_closeout`)
+**Current focus:** v2.8 Project Removal — Phase 18 ready to plan
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 18 of 22 (Shared Kill-Then-Remove Lifecycle) — not started
 Plan: —
-Status: Defining requirements
-Last activity: 2026-11-01 — Milestone v2.8 started
+Status: Ready to plan
+Last activity: 2026-11-02 — v2.8 requirements and roadmap written (5 phases, 24 requirements)
 
 
 ## Performance Metrics
@@ -303,8 +307,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-01T16:14:49.274Z
-Stopped at: context exhaustion at 76% (2026-11-01)
+Last session: 2026-11-02T14:06:06.608Z
+Stopped at: context exhaustion at 76% (2026-11-02)
 Resume file: None
 
 ## Operator Next Steps
