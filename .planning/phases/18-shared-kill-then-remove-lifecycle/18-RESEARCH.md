@@ -430,20 +430,23 @@ assert!(managed.exists());                                   // disk untouched
 | A3 | `git worktree prune` with no `--expire` prunes a missing-directory entry immediately (default `gc.worktreePruneExpire` only governs automatic gc, not explicit prune) | Pattern 3 step 3 | Medium: if prune leaves the entry, the postcondition check fails and the op reports `DiskRemoval` while the dir is gone. Verify in the fallback test by asserting `worktree list --porcelain` no longer lists the path. [ASSUMED] |
 | A4 | `verify_removal_postconditions` can be reused by constructing a `VerifiedRemovalTarget` from `discover_repository` facts for the forced path | Pattern 3 step 4 | Low: fallback is a forced-variant postcondition in the same file. [ASSUMED] |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Locked worktrees: `--force` once or twice?**
    - What we know: CONTEXT says `--force`; git refuses locked trees without a second `--force` and `prune` skips locked entries [CITED: git-scm.com/docs/git-worktree]. Reconcile already classifies such rows `LockedOrPrunable` (git.rs:509-511).
    - What's unclear: whether the user's "explicit removal" intent extends to a lock the user (or a network-mount guard) placed.
    - Recommendation: for paths inside the managed root, pass `--force --force`; outside the managed root nothing is deleted anyway. Record as a decision in the plan.
+   - RESOLVED: plan 18-02 passes `--force --force` inside the managed root and refuses any path outside it with `OutsideManagedRoot`.
 
 2. **Where does `RepositoryReservations` get taken?**
    - What we know: the TUI reserves the repository around prepare/confirm (app.rs:3704-3708, 3716-3719); the daemon imports `RepositoryReservations` (manager.rs:16).
    - Recommendation: keep reservation at the caller (Phases 20/21) and document in the new module's doc comment that callers must hold one for every repository in the `RemovalSet`.
+   - RESOLVED: plan 18-04 keeps `RepositoryReservations` at the TUI and daemon callers and documents the requirement in the `removal` module doc comment.
 
 3. **Should the kill stage mark anything in memory when a runtime survives?**
    - What we know: locked decision says row and state file untouched; `mark_teardown_pending` exists for close.
    - Recommendation: return the error only; the caller may choose to run the existing close-recovery path afterward. Do not couple.
+   - RESOLVED: plan 18-04 returns a structured survivor error with pids and leaves the row, in-memory state and state file untouched; no `mark_teardown_pending` coupling.
 
 ## Environment Availability
 
