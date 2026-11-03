@@ -91,10 +91,10 @@ Known gaps: see MILESTONES.md.
   4. Removing a repository parent removes each child by the per-child rules and then the parent, in one lifecycle operation composed from the existing kill, close and managed-worktree removal stages
   5. A crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
 
-**Plans**: 8 plans
+**Plans**: 1/8 plans executed
 
 Plans:
-- [ ] 18-01-PLAN.md — `removal.rs` vocabulary, `select_rows` and side-effect-free `preview_removal` for every row kind (TDD)
+- [x] 18-01-PLAN.md — `removal.rs` vocabulary, `select_rows` and side-effect-free `preview_removal` for every row kind (TDD)
 - [ ] 18-02-PLAN.md — `git::remove_managed_worktree_forced` with managed-root containment, prune fallback and postcondition proof (TDD)
 - [ ] 18-03-PLAN.md — `RepositoryState::remove_rows` batch aggregate mutation (TDD)
 - [ ] 18-04-PLAN.md — `removal::remove` preflight, validate, kill, disk, single-save orchestration with owning handles and live process doubles (TDD)

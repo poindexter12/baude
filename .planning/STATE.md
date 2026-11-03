@@ -2,18 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase_name: defining requirements
-status: ready_to_plan
-stopped_at: context exhaustion at 76% (2026-11-02)
-last_updated: "2026-11-02T14:10:00.000Z"
-last_activity: 2026-11-02
-last_activity_desc: Milestone v2.8 started
-state_head: ae9eeeff1bc45b24933aa3fb7ed95d6048bd0e03
+current_phase: 18
+current_phase_name: Shared Kill-Then-Remove Lifecycle
+status: executing
+stopped_at: Completed 18-01-PLAN.md
+last_updated: "2026-11-03T22:15:07.413Z"
+last_activity: 2026-11-03
+last_activity_desc: Phase 18 execution started
+state_head: 506ee3758d443145e0b57741daf6910934d7bd2f
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 8
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-10-13)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** v2.8 Project Removal — Phase 18 ready to plan
+**Current focus:** Phase 18 — Shared Kill-Then-Remove Lifecycle
 
 ## Current Position
 
-Phase: 18 of 22 (Shared Kill-Then-Remove Lifecycle) — not started
-Plan: —
-Status: Ready to plan
-Last activity: 2026-11-02 — v2.8 requirements and roadmap written (5 phases, 24 requirements)
+Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
+Plan: 2 of 8
+Status: Ready to execute
+Last activity: 2026-11-03 — Phase 18 execution started
 
 
 ## Performance Metrics
@@ -100,6 +101,7 @@ Last activity: 2026-11-02 — v2.8 requirements and roadmap written (5 phases, 2
 | Phase 12 P01 | 21 min | 3 tasks | 4 files |
 | Phase 12 P02 | 7 min | 3 tasks | 1 files |
 | Phase 12 P04 | 45 min | 3 tasks | 1 files |
+| Phase 18 P01 | 7 min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -228,6 +230,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 12]: README never advises deleting the workspace lock file; recovery is quit the holder, signal it, or switch workspace — It is an OS advisory lock on an open fd released by the kernel on exit; deleting it while a holder lives yields two writers on one state file (T-12-04)
 - [Phase 12]: Rebased with git rebase --onto origin/main 985f543 because origin/main's 30ce007 is a squash of this chain's own first seven planning commits — A plain rebase conflicted on already-applied content at commit 1 of 181; the --onto form starts from a byte-identical tree and replayed all 174 commits with zero conflicts
 - [Phase 12]: Pushed with the local real-roots gate red after proving by null bracket that the delta came from concurrent host processes, not the test suite — A 45s before/after bracket with no suite also failed; pids 8413 (live baude) and 21951 (FHIR IG publisher under the managed-worktrees root) were identified. check (macos-14) and check (ubuntu-22.04) run the same bracket in a clean room and both passed
+- [Phase 18]: RemovalError::RuntimeSurvived boxes SessionTeardownError for clippy result_large_err; plan 04 wraps with Box::new
+- [Phase 18]: Repository parent PlannedRow carries main_worktree and common_dir from its SavedRepository for plan 04 pruning
 
 ### Pending Todos
 
@@ -307,8 +311,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-02T14:06:06.608Z
-Stopped at: context exhaustion at 76% (2026-11-02)
+Last session: 2026-11-03T22:15:07.380Z
+Stopped at: Completed 18-01-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
