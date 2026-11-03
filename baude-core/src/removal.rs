@@ -1641,14 +1641,7 @@ mod tests {
         impl FnOnce(&StateFile) -> Result<(), SaveError>,
         Rc<Cell<u32>>,
     ) {
-        let calls = Rc::new(Cell::new(0));
-        let counter = Rc::clone(&calls);
-        let root = state_root.to_path_buf();
-        let save = move |file: &StateFile| {
-            counter.set(counter.get() + 1);
-            persist::save_current_at_test(&root, "state.json", file, None, None)
-        };
-        (save, calls)
+        counting_save_with(state_root, None)
     }
 
     fn mismatch_row(error: RemovalError, needle: &str) -> RowKey {
@@ -2182,5 +2175,264 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    // ---- persistence failure modes (plan 05) ----
+
+    use crate::persist::AtomicFailure;
+    use crate::repository::ValidationRow;
+
+    /// `counting_save` with one `AtomicFailure` injected into every call, so
+    /// a test can prove how `remove` treats each branch of the atomic save.
+    fn counting_save_with(
+        state_root: &Path,
+        failure: Option<AtomicFailure>,
+    ) -> (
+        impl FnOnce(&StateFile) -> Result<(), SaveError>,
+        Rc<Cell<u32>>,
+    ) {
+        let calls = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&calls);
+        let root = state_root.to_path_buf();
+        let save = move |file: &StateFile| {
+            counter.set(counter.get() + 1);
+            persist::save_current_at_test(&root, "state.json", file, failure, None)
+        };
+        (save, calls)
+    }
+
+    /// Repository k with its main checkout and one managed child at `name`
+    /// seeded `Inactive` with no runtime: the save-valid shape of a row that
+    /// has never launched.
+    fn inactive_row(
+        f: &RemovalFixture,
+        name: &str,
+    ) -> (RepositoryState, RepositoryKey, CheckoutKey, PathBuf) {
+        let managed = f.managed_worktree(name, &format!("feature/{name}"));
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        let key = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
+        state.validate_for_save().expect("seed is save-valid");
+        (state, k, key, managed)
+    }
+
+    /// Repository k with its main checkout and two managed children, c1
+    /// pushed before c2 so `set.rows` walks c1 first.
+    fn inactive_pair(
+        f: &RemovalFixture,
+    ) -> (
+        RepositoryState,
+        RepositoryKey,
+        CheckoutKey,
+        CheckoutKey,
+        PathBuf,
+        PathBuf,
+    ) {
+        let c1_dir = f.managed_worktree("wt-c1", "feature/one");
+        let c2_dir = f.managed_worktree("wt-c2", "feature/two");
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        let c1 = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &c1_dir);
+        let c2 = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &c2_dir);
+        state.validate_for_save().expect("seed is save-valid");
+        (state, k, c1, c2, c1_dir, c2_dir)
+    }
+
+    fn persist_error(error: RemovalError) -> SaveError {
+        match error {
+            RemovalError::Persist { error } => error,
+            other => panic!("expected Persist, got {other:?}"),
+        }
+    }
+
+    /// The retry can report `already_removed` at all because the first
+    /// attempt's disk stage completed before the save failed: either
+    /// `git worktree remove --force --force` dropped the administrative entry
+    /// together with the directory, or plan 02's fallback deleted the
+    /// directory and pruned the entry; on the retry the forced helper finds
+    /// no record and no directory and only prunes. A marker-write failure is
+    /// not a third case: it returns `Marker` before git runs, the row stays
+    /// registered with its directory intact and the first `remove` fails at
+    /// the disk stage, so this fixture would never reach its save failure.
+    #[test]
+    fn rename_failure_keeps_prior_state_then_retry_reports_already_removed() {
+        let f = RemovalFixture::new("rename-failure");
+        let (mut state, _k, key, managed) = inactive_row(&f, "wt-rename");
+        let before_bytes = write_seed(&f, &state);
+        let before = state.clone();
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save_with(&f.state_root(), Some(AtomicFailure::Rename));
+
+        let error = remove(&mut state, RemovalTarget::Checkout(key), &mut handles, save)
+            .expect_err("the injected rename failure must surface");
+
+        assert!(!persist_error(error).replacement_committed());
+        assert_eq!(state, before);
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
+        assert!(
+            !managed.exists(),
+            "the disk stage completed before the save failed"
+        );
+        assert_eq!(calls.get(), 1, "one attempt, no internal retry");
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(&mut state, RemovalTarget::Checkout(key), &mut handles, save)
+            .expect("retry with a working save");
+
+        assert_eq!(report.already_removed, vec![managed.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!has_checkout(&state, key));
+        assert!(!has_checkout(&load_state(&f.state_root()), key));
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// The one pre-rename failure with a live runtime: the kill stage has
+    /// run to completion when the save fails, so the restored row still says
+    /// Running while its process is gone. The handle stays owned by the
+    /// caller and the retry completes through plan 08's `Extinct`
+    /// disposition without a second signal.
+    #[test]
+    fn sync_failure_keeps_prior_state_and_file_bytes() {
+        let f = RemovalFixture::new("sync-failure");
+        let (mut state, key, managed, pty) = live_row(&f, "wt-sync");
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        state.validate_for_save().expect("seed is save-valid");
+        let before_bytes = write_seed(&f, &state);
+        let before = state.clone();
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(key),
+            pty,
+            None,
+            &managed,
+            &f.repo(),
+        )]);
+        let (save, calls) = counting_save_with(&f.state_root(), Some(AtomicFailure::Sync));
+
+        let error = remove(
+            &mut state,
+            RemovalTarget::Checkout(key),
+            &mut handles.0,
+            save,
+        )
+        .expect_err("the injected sync failure must surface");
+
+        assert!(!persist_error(error).replacement_committed());
+        assert!(
+            group_is_extinct(pgid),
+            "the kill stage ran to completion before the save failed"
+        );
+        assert_reaped_promptly(pid);
+        assert_eq!(
+            handles.0.len(),
+            1,
+            "an error never drains the caller's handles"
+        );
+        assert_eq!(handles.0[0].row, RowKey::Checkout(key));
+        assert!(
+            handles.0[0].session.claude.reader_finished(),
+            "nothing outside the group held the terminal, so the reader was joined"
+        );
+        assert_eq!(state, before);
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
+        assert!(!managed.exists());
+        assert_eq!(calls.get(), 1);
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(key),
+            &mut handles.0,
+            save,
+        )
+        .expect("retry with a working save");
+
+        assert_eq!(report.already_removed, vec![managed.clone()]);
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert_eq!(report.runtimes_killed[0].agent_pid, pid);
+        assert!(report.readers_parked.is_empty());
+        assert!(handles.0.is_empty(), "the retry consumes the handle");
+        assert!(!has_checkout(&state, key));
+        assert!(!has_checkout(&load_state(&f.state_root()), key));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn directory_sync_failure_commits_state_and_reports_degraded() {
+        let f = RemovalFixture::new("dirsync-failure");
+        let (mut state, _k, key, managed) = inactive_row(&f, "wt-dirsync");
+        write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save_with(&f.state_root(), Some(AtomicFailure::DirectorySync));
+
+        let report = remove(&mut state, RemovalTarget::Checkout(key), &mut handles, save)
+            .expect("a committed replacement is a degraded success");
+
+        assert!(matches!(
+            report.persistence,
+            PersistenceOutcome::SavedDegraded { .. }
+        ));
+        assert!(!has_checkout(&state, key));
+        assert_eq!(load_state(&f.state_root()), state);
+        assert!(!managed.exists());
+        assert_eq!(report.paths_deleted, vec![managed.clone()]);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn refused_row_failure_names_row_and_keeps_prior_state() {
+        let f = RemovalFixture::new("refused-row");
+        let (mut state, _k, c1, c2, c1_dir, c2_dir) = inactive_pair(&f);
+        let before_bytes = write_seed(&f, &state);
+        let before = state.clone();
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let refused = ValidationRow::Checkout(c2);
+        let (save, calls) =
+            counting_save_with(&f.state_root(), Some(AtomicFailure::RefusedRow(refused)));
+
+        let error = remove(&mut state, RemovalTarget::Checkout(c1), &mut handles, save)
+            .expect_err("the refused row must surface");
+
+        let error = persist_error(error);
+        assert!(!error.replacement_committed());
+        assert_eq!(
+            error.validation().and_then(ValidationError::row),
+            Some(refused),
+            "the refusal names the survivor, not the target"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{c2:?}")),
+            "message {message:?} must name the refused row"
+        );
+        assert_eq!(state, before);
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
+        assert!(!c1_dir.exists());
+        assert!(c2_dir.exists());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn save_closure_is_called_exactly_once_for_parent_with_children() {
+        let f = RemovalFixture::new("single-save");
+        let (mut state, k, _c1, _c2, c1_dir, c2_dir) = inactive_pair(&f);
+        write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository");
+
+        assert_eq!(calls.get(), 1, "one save for the parent and both children");
+        assert!(!state.repositories.iter().any(|r| r.key == k));
+        assert!(!state.checkouts.iter().any(|c| c.repository_key == k));
+        assert!(!c1_dir.exists());
+        assert!(!c2_dir.exists());
+        assert!(f.repo().exists(), "the main worktree is kept");
+        assert_eq!(report.paths_kept, vec![f.repo()]);
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(load_state(&f.state_root()), state);
     }
 }
