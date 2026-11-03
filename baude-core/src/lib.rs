@@ -18,6 +18,7 @@ pub mod meta;
 pub mod permission;
 pub mod persist;
 pub mod pty;
+pub mod removal;
 pub mod repository;
 pub mod session;
 #[cfg(any(test, feature = "test-support"))]
