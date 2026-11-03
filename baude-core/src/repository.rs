@@ -880,11 +880,7 @@ impl RepositoryState {
         &mut self,
         key: StandaloneKey,
     ) -> Option<SavedStandaloneSession> {
-        let index = self
-            .standalone_sessions
-            .iter()
-            .position(|session| session.key == key)?;
-        Some(self.standalone_sessions.remove(index))
+        self.remove_rows(&[], &[], &[key]).standalone_sessions.pop()
     }
 
     /// Removes any combination of repository, checkout and standalone rows by
