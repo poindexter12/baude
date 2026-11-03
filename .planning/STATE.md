@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 18
 current_phase_name: Shared Kill-Then-Remove Lifecycle
 status: executing
-stopped_at: Completed 18-08-PLAN.md
-last_updated: "2026-11-03T23:14:43.408Z"
+stopped_at: Completed 18-04-PLAN.md
+last_updated: "2026-11-03T23:44:30.441Z"
 last_activity: 2026-11-03
 last_activity_desc: Phase 18 execution started
-state_head: 213e26e2423b8970edc8f28d9e28dcd520c0aa89
+state_head: 32a777083ee366acf45ebec1559e46581744216a
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 4
+  completed_plans: 5
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
-Plan: 5 of 8
+Plan: 6 of 8
 Status: Ready to execute
 Last activity: 2026-11-03 — Phase 18 execution started
 
@@ -105,6 +105,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | Phase 18 P02 | 35m | 3 tasks | 1 files |
 | Phase 18 P03 | 4 min | 3 tasks | 1 files |
 | Phase 18 P08 | 28 min | 3 tasks | 2 files |
+| Phase 18 P04 | 31 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -241,6 +242,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: Removal test seeds allocate keys and orders through the aggregate allocators and assert validate Ok before remove_rows
 - [Phase 18]: Pty::kill_and_wait signals the recorded group before any child-mutex lock and decides from a four-way GroupDisposition; the reader JoinHandle stays owned and is reported through reader_finished rather than detached
 - [Phase 18]: macOS parked-reader fixture uses a test-only revoke on the slave because the session keeps the controlling tty open until the leader exits
+- [Phase 18]: removal::remove matches ForcedRemovalError::NotRegistered at the disk_stage call site for AlreadyRemoved rows so the tolerated case is named where it originates
+- [Phase 18]: Parked-reader fixture copies the 18-08 holder command verbatim including trap '' HUP so the holder survives the leader-exit SIGHUP until setsid
+- [Phase 18]: report_from_set takes Option<StageResults> so preview and remove share one report assembly path
 
 ### Pending Todos
 
@@ -320,8 +324,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T23:14:43.376Z
-Stopped at: Completed 18-08-PLAN.md
+Last session: 2026-11-03T23:44:30.361Z
+Stopped at: Completed 18-04-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
