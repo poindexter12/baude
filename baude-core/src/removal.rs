@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pty::Pty;
 use crate::repository::{
     CheckoutKey, CheckoutRole, OwnedRuntime, RepositoryKey, RepositoryState, SavedCheckout,
     SavedRepository, ShellOwnership, StandaloneKey, ValidationError,
@@ -354,15 +355,290 @@ impl From<crate::git::ForcedRemovalError> for DiskRemovalFailure {
     }
 }
 
-/// Remove `target`: kill its runtimes, remove managed directories, save once.
+/// Remove `target` from the saved state: stop its runtimes, remove the
+/// managed worktree directories it owns, then save the whole removed row set
+/// once.
+///
+/// Stages, in this order: `select_rows`, `preflight` (every supplied handle
+/// must match the persisted runtime of its row in full, one handle per row,
+/// no handle for a row without a persisted runtime), candidate construction
+/// with `validate_for_save` so a validation refusal never follows an
+/// irreversible effect, the kill stage (one `Session::kill_and_wait` per live
+/// row in `set.rows` order, aborting on the first survivor), the disk stage
+/// (forced removal of every managed worktree directory, pruning the git
+/// administrative entry of one that is already gone), and one `save` of the
+/// candidate. The in-memory state is replaced and the handles for removed
+/// rows are consumed only after that save returns `Ok` or reports that the
+/// replacement file was committed.
+///
+/// The kill unit is the whole `Session`: the agent and, when the persisted
+/// ownership says so, the shell. Callers hold `lifecycle::RepositoryReservations`
+/// for every repository in the set from before `select_rows` until this
+/// function has returned, including after the save, so a concurrent reopen
+/// cannot observe the half-committed window between the disk stage and the
+/// save; a crash in that window is covered by the startup reconcile, which
+/// re-selects a deleted directory as `DiskAction::AlreadyRemoved`.
+///
+/// On `Ok` the handles whose rows were removed have been drained from
+/// `runtimes` and dropped here, so the caller must drop its own registry
+/// entries for those rows. `RemovalReport::readers_parked` names the rows
+/// whose PTY reader thread was still blocked behind a process outside the
+/// recorded group when the handle dropped; that thread exits when the holder
+/// closes the terminal. On `Err` the caller keeps every handle and `*state`
+/// is untouched; after a parent all-or-nothing abort some of those handles
+/// may already be dead, which the existing exit detection reconciles.
+///
+/// This is deliberately not the close protocol or the tombstoned-removal
+/// protocol the TUI uses: a kill failure leaves the row exactly as it was,
+/// with no pending lifecycle written.
 pub fn remove(
     state: &mut RepositoryState,
     target: RemovalTarget,
     runtimes: &mut Vec<RowRuntime>,
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
-    let _ = (&*state, &*runtimes, save);
-    Err(RemovalError::UnknownTarget(target))
+    let set = select_rows(state, target)?;
+    preflight(&set, runtimes)?;
+    let mut candidate = state.clone();
+    candidate.remove_rows(
+        &set.repository_keys(),
+        &set.checkout_keys(),
+        &set.standalone_keys(),
+    );
+    candidate
+        .validate_for_save()
+        .map_err(RemovalError::Validation)?;
+    let killed = kill_stage(&set, runtimes)?;
+    let disk = disk_stage(&set)?;
+    let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
+    let mut report = report_from_set(&set, false);
+    report.runtimes_killed = killed;
+    report.paths_deleted = disk.deleted;
+    report.paths_kept = disk.kept;
+    report.already_removed = disk.already_removed;
+    report.readers_parked = readers_parked;
+    report.persistence = persistence;
+    Ok(report)
+}
+
+/// Verify every handle against the persisted runtime of its row before any
+/// signal is sent: exactly one handle per live row, full `ProcessIdentity`
+/// equality for the agent, exact `ShellOwnership` agreement, and no handle
+/// at all for a row without a persisted runtime.
+fn preflight(set: &RemovalSet, runtimes: &[RowRuntime]) -> Result<(), RemovalError> {
+    for row in &set.rows {
+        let handles: Vec<&RowRuntime> = runtimes
+            .iter()
+            .filter(|handle| handle.row == row.row)
+            .collect();
+        if handles.len() > 1 {
+            return Err(RemovalError::RuntimeIdentityMismatch {
+                row: row.row,
+                detail: format!("duplicate handles supplied: {} for one row", handles.len()),
+            });
+        }
+        let Some(runtime) = &row.runtime else {
+            if !handles.is_empty() {
+                return Err(RemovalError::RuntimeIdentityMismatch {
+                    row: row.row,
+                    detail: "a handle was supplied for a row with no persisted runtime".to_string(),
+                });
+            }
+            continue;
+        };
+        let Some(handle) = handles.first() else {
+            return Err(RemovalError::RuntimeHandleMissing(row.row));
+        };
+        let found = handle.session.claude.process_identity();
+        if found != &runtime.agent {
+            return Err(RemovalError::RuntimeIdentityMismatch {
+                row: row.row,
+                detail: format!(
+                    "agent identity differs: expected pid {} start_time {} pgid {} sid {}, found pid {} start_time {} pgid {} sid {}",
+                    runtime.agent.pid,
+                    runtime.agent.start_time,
+                    runtime.agent.process_group,
+                    runtime.agent.session,
+                    found.pid,
+                    found.start_time,
+                    found.process_group,
+                    found.session,
+                ),
+            });
+        }
+        let live_shell = handle.session.shell.as_ref().map(Pty::process_identity);
+        match (&runtime.shell, live_shell) {
+            (ShellOwnership::Closed, None) => {}
+            (ShellOwnership::Closed, Some(found)) => {
+                return Err(RemovalError::RuntimeIdentityMismatch {
+                    row: row.row,
+                    detail: format!(
+                        "persisted shell ownership is closed but the handle carries a live shell pid {}",
+                        found.pid
+                    ),
+                });
+            }
+            (ShellOwnership::Owned(expected), Some(found)) if found == expected => {}
+            (ShellOwnership::Owned(expected), found) => {
+                return Err(RemovalError::RuntimeIdentityMismatch {
+                    row: row.row,
+                    detail: format!(
+                        "shell identity differs: expected pid {} start_time {}, found {}",
+                        expected.pid,
+                        expected.start_time,
+                        found.map_or_else(
+                            || "no shell".to_string(),
+                            |f| format!("pid {} start_time {}", f.pid, f.start_time)
+                        ),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stop every live row in `set.rows` order through its verified handle,
+/// aborting on the first survivor so disk and state stay untouched.
+fn kill_stage(
+    set: &RemovalSet,
+    runtimes: &mut [RowRuntime],
+) -> Result<Vec<KilledRuntime>, RemovalError> {
+    let mut killed = Vec::new();
+    for row in &set.rows {
+        if row.runtime.is_none() {
+            continue;
+        }
+        let handle = runtimes
+            .iter_mut()
+            .find(|handle| handle.row == row.row)
+            .ok_or(RemovalError::RuntimeHandleMissing(row.row))?;
+        handle
+            .session
+            .kill_and_wait()
+            .map_err(|error| RemovalError::RuntimeSurvived {
+                row: row.row,
+                error: Box::new(error),
+            })?;
+        killed.push(KilledRuntime {
+            row: row.row,
+            agent_pid: handle.session.claude.process_identity().pid,
+            shell_pid: handle
+                .session
+                .shell
+                .as_ref()
+                .map(|shell| shell.process_identity().pid),
+        });
+    }
+    Ok(killed)
+}
+
+/// Paths the disk stage deleted, kept and found already gone.
+struct DiskResults {
+    deleted: Vec<PathBuf>,
+    kept: Vec<PathBuf>,
+    already_removed: Vec<PathBuf>,
+}
+
+/// Apply each row's `DiskAction`. A managed directory that is already gone
+/// still goes through the forced helper so its administrative entry is
+/// pruned; `NotRegistered` there means there was nothing left to clean.
+fn disk_stage(set: &RemovalSet) -> Result<DiskResults, RemovalError> {
+    let mut results = DiskResults {
+        deleted: Vec::new(),
+        kept: Vec::new(),
+        already_removed: Vec::new(),
+    };
+    for row in &set.rows {
+        let Some(path) = &row.path else {
+            continue;
+        };
+        match row.disk {
+            DiskAction::KeepDirectory => results.kept.push(path.clone()),
+            DiskAction::RemoveManagedWorktree => {
+                let (main_worktree, common_dir) = owner_paths(row, path)?;
+                crate::git::remove_managed_worktree_forced(main_worktree, common_dir, path)
+                    .map_err(|error| disk_error(row, path, error.into()))?;
+                results.deleted.push(path.clone());
+            }
+            DiskAction::AlreadyRemoved => {
+                let (main_worktree, common_dir) = owner_paths(row, path)?;
+                match crate::git::remove_managed_worktree_forced(main_worktree, common_dir, path) {
+                    Ok(_) | Err(crate::git::ForcedRemovalError::NotRegistered { .. }) => {}
+                    Err(error) => return Err(disk_error(row, path, error.into())),
+                }
+                results.already_removed.push(path.clone());
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// The owning repository's main worktree and common directory, which
+/// `select_rows` records on every checkout row.
+fn owner_paths<'a>(row: &'a PlannedRow, path: &Path) -> Result<(&'a Path, &'a Path), RemovalError> {
+    match (&row.main_worktree, &row.common_dir) {
+        (Some(main_worktree), Some(common_dir)) => Ok((main_worktree, common_dir)),
+        _ => Err(disk_error(
+            row,
+            path,
+            DiskRemovalFailure {
+                kind: DiskRemovalFailureKind::NotRegistered,
+                detail: "managed row carries no owning repository".to_string(),
+            },
+        )),
+    }
+}
+
+fn disk_error(row: &PlannedRow, path: &Path, error: DiskRemovalFailure) -> RemovalError {
+    RemovalError::DiskRemoval {
+        row: row.row,
+        path: path.to_path_buf(),
+        error,
+    }
+}
+
+/// Save the candidate once. Commits `*state` and consumes the removed rows'
+/// handles on `Ok` or on a committed replacement; otherwise leaves both
+/// untouched. The parked-reader sweep runs while the handles are still
+/// owned, so a reader left behind an out-of-group slave holder is reported
+/// rather than detached silently.
+fn persist_stage(
+    state: &mut RepositoryState,
+    candidate: RepositoryState,
+    set: &RemovalSet,
+    runtimes: &mut Vec<RowRuntime>,
+    save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
+) -> Result<(PersistenceOutcome, Vec<RowKey>), RemovalError> {
+    let file = crate::persist::StateFile {
+        schema_version: crate::persist::SCHEMA_VERSION,
+        state: candidate,
+    };
+    let persistence = match save(&file) {
+        Ok(()) => PersistenceOutcome::Saved,
+        Err(error) if error.replacement_committed() => PersistenceOutcome::SavedDegraded {
+            detail: error.to_string(),
+        },
+        Err(error) => return Err(RemovalError::Persist { error }),
+    };
+    *state = file.state;
+    let removed_rows: Vec<RowKey> = set.rows.iter().map(|row| row.row).collect();
+    let readers_parked: Vec<RowKey> = runtimes
+        .iter()
+        .filter(|handle| removed_rows.contains(&handle.row))
+        .filter(|handle| {
+            let joined = handle.session.claude.reader_finished()
+                && handle
+                    .session
+                    .shell
+                    .as_ref()
+                    .is_none_or(Pty::reader_finished);
+            !joined
+        })
+        .map(|handle| handle.row)
+        .collect();
+    runtimes.retain(|handle| !removed_rows.contains(&handle.row));
+    Ok((persistence, readers_parked))
 }
 
 fn find_repository(state: &RepositoryState, key: RepositoryKey) -> Option<&SavedRepository> {
@@ -958,7 +1234,6 @@ mod tests {
 
     use crate::meta::ClaudeMeta;
     use crate::persist::{self, SaveError, StateFile};
-    use crate::pty::Pty;
     use crate::session::Session;
     use std::cell::Cell;
     use std::process::Command;
@@ -999,10 +1274,8 @@ mod tests {
 
     impl RemovalFixture {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "baude-removal-live-{label}-{}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("baude-removal-live-{label}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create fixture root");
             let root = fs::canonicalize(&root).expect("canonicalize fixture root");
@@ -1244,7 +1517,7 @@ mod tests {
     fn spawn_parked_reader_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, HolderGuard) {
         let _ = fs::remove_file(holder_pid_path);
         let cmd = format!(
-            "set +m; perl -MPOSIX -e 'my $sid = POSIX::setsid(); \
+            "set +m; trap '' HUP; perl -MPOSIX -e 'my $sid = POSIX::setsid(); \
              exit 3 unless defined $sid && $sid != -1; \
              open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' & exit 0",
             holder_pid_path.display()
@@ -1318,7 +1591,13 @@ mod tests {
         }
     }
 
-    fn handle_for(row: RowKey, pty: Pty, shell: Option<Pty>, cwd: &Path, repo: &Path) -> RowRuntime {
+    fn handle_for(
+        row: RowKey,
+        pty: Pty,
+        shell: Option<Pty>,
+        cwd: &Path,
+        repo: &Path,
+    ) -> RowRuntime {
         RowRuntime {
             row,
             session: session_for(pty, shell, cwd, repo),
@@ -1697,7 +1976,10 @@ mod tests {
                 mismatch_row(error, "no persisted runtime"),
                 RowKey::Checkout(key)
             );
-            assert!(group_is_alive(pgid), "an unrecorded runtime is never killed");
+            assert!(
+                group_is_alive(pgid),
+                "an unrecorded runtime is never killed"
+            );
             assert_eq!(state, before);
             assert_eq!(calls.get(), 0);
             assert_eq!(handles.0.len(), 1);
@@ -1763,7 +2045,10 @@ mod tests {
             !worktree_list(&f.repo()).contains(wt_text),
             "the administrative entry must be pruned"
         );
-        assert_eq!(git_ok(&f.repo(), &["rev-parse", "feature/gone"]), oid_before);
+        assert_eq!(
+            git_ok(&f.repo(), &["rev-parse", "feature/gone"]),
+            oid_before
+        );
         assert!(!has_checkout(&state, key));
         assert!(!has_checkout(&load_state(&f.state_root()), key));
         assert_eq!(calls.get(), 1);
