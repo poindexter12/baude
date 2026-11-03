@@ -321,7 +321,7 @@ pub fn preview_removal(
     target: RemovalTarget,
 ) -> Result<RemovalReport, RemovalError> {
     let set = select_rows(state, target)?;
-    Ok(report_from_set(&set, true))
+    Ok(report_from_set(&set, None))
 }
 
 /// One live runtime handed to `remove`, owned for the call. The caller moves
@@ -411,14 +411,24 @@ pub fn remove(
     let killed = kill_stage(&set, runtimes)?;
     let disk = disk_stage(&set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
-    let mut report = report_from_set(&set, false);
-    report.runtimes_killed = killed;
-    report.paths_deleted = disk.deleted;
-    report.paths_kept = disk.kept;
-    report.already_removed = disk.already_removed;
-    report.readers_parked = readers_parked;
-    report.persistence = persistence;
-    Ok(report)
+    Ok(report_from_set(
+        &set,
+        Some(StageResults {
+            killed,
+            disk,
+            readers_parked,
+            persistence,
+        }),
+    ))
+}
+
+/// What the real run's stages produced, handed to `report_from_set` in place
+/// of the preview's derivation from the planned set.
+struct StageResults {
+    killed: Vec<KilledRuntime>,
+    disk: DiskResults,
+    readers_parked: Vec<RowKey>,
+    persistence: PersistenceOutcome,
 }
 
 /// Verify every handle against the persisted runtime of its row before any
@@ -683,11 +693,29 @@ fn probe_disk(action: DiskAction, path: &Path) -> DiskAction {
     }
 }
 
-fn report_from_set(set: &RemovalSet, planned: bool) -> RemovalReport {
+/// One assembly path for both the preview and the real run. With `stages`
+/// absent the report is a plan derived from the selected rows; with them
+/// present the runtime, path and persistence fields are what the stages
+/// actually did.
+fn report_from_set(set: &RemovalSet, stages: Option<StageResults>) -> RemovalReport {
+    let rows_removed = set.rows.iter().map(|row| row.row).collect();
+    if let Some(stages) = stages {
+        return RemovalReport {
+            target: set.target,
+            planned: false,
+            rows_removed,
+            runtimes_killed: stages.killed,
+            paths_deleted: stages.disk.deleted,
+            paths_kept: stages.disk.kept,
+            already_removed: stages.disk.already_removed,
+            readers_parked: stages.readers_parked,
+            persistence: stages.persistence,
+        };
+    }
     let mut report = RemovalReport {
         target: set.target,
-        planned,
-        rows_removed: Vec::with_capacity(set.rows.len()),
+        planned: true,
+        rows_removed,
         runtimes_killed: Vec::new(),
         paths_deleted: Vec::new(),
         paths_kept: Vec::new(),
@@ -696,7 +724,6 @@ fn report_from_set(set: &RemovalSet, planned: bool) -> RemovalReport {
         persistence: PersistenceOutcome::Planned,
     };
     for row in &set.rows {
-        report.rows_removed.push(row.row);
         if let Some(runtime) = &row.runtime {
             report.runtimes_killed.push(KilledRuntime {
                 row: row.row,
