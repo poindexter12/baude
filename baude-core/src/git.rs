@@ -2688,13 +2688,11 @@ fn remove_verified_worktree_with_post_remove_hook(
     // non-force removal below stays the fail-closed authority for the rest.
     remove_seed_artifacts(&target.path);
     let arguments = verified_remove_arguments();
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&target.main_worktree)
-        .args(arguments)
-        .arg(&target.path)
-        .output()
-        .map_err(RemoveVerifiedError::CommandStart)?;
+    let output = run_worktree_command(
+        &target.main_worktree,
+        arguments.into_iter().chain([target.path.as_os_str()]),
+    )
+    .map_err(RemoveVerifiedError::CommandStart)?;
     if !output.status.success() {
         return Err(RemoveVerifiedError::GitRefused {
             status: output.status.code(),
@@ -3222,12 +3220,21 @@ fn removal_marker_matches(canonical: &Path, expected_common_dir: &Path) -> bool 
         && lines.next() == Some(format!("common_dir={}", expected_common_dir.display()).as_str())
 }
 
-fn prune_worktrees(main_worktree: &Path) -> std::result::Result<Output, ForcedRemovalError> {
+/// Run `git -C <main_worktree> <args>` and capture its output. Shared by the
+/// verified and forced removal paths so neither builds its own `Command`.
+fn run_worktree_command(
+    main_worktree: &Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> std::io::Result<Output> {
     Command::new("git")
         .arg("-C")
         .arg(main_worktree)
-        .args([OsStr::new("worktree"), OsStr::new("prune")])
+        .args(args)
         .output()
+}
+
+fn prune_worktrees(main_worktree: &Path) -> std::result::Result<Output, ForcedRemovalError> {
+    run_worktree_command(main_worktree, ["worktree", "prune"])
         .map_err(ForcedRemovalError::CommandStart)
 }
 
@@ -3287,13 +3294,13 @@ pub fn remove_managed_worktree_forced(
         (Some(_), true) => {
             foreign_repository_guard(&canonical, &expected_common_dir)?;
             write_removal_marker(&canonical, &expected_common_dir)?;
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(main_worktree)
-                .args(forced_remove_arguments())
-                .arg(&canonical)
-                .output()
-                .map_err(ForcedRemovalError::CommandStart)?;
+            let output = run_worktree_command(
+                main_worktree,
+                forced_remove_arguments()
+                    .into_iter()
+                    .chain([canonical.as_os_str()]),
+            )
+            .map_err(ForcedRemovalError::CommandStart)?;
             if output.status.success() {
                 ForcedStep::GitRemoved
             } else {
@@ -3323,16 +3330,16 @@ pub fn remove_managed_worktree_forced(
                 }
             }
             // Best effort: a lock would otherwise shield the stale entry from prune.
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(main_worktree)
-                .args([
+            let _ = run_worktree_command(
+                main_worktree,
+                [
                     OsStr::new("worktree"),
                     OsStr::new("unlock"),
                     OsStr::new("--"),
-                ])
-                .arg(&canonical)
-                .output();
+                ]
+                .into_iter()
+                .chain([canonical.as_os_str()]),
+            );
             prune_worktrees(main_worktree)?;
             ForcedRemovalMethod::PruneFallback
         }
