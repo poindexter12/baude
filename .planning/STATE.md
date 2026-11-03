@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 18
 current_phase_name: Shared Kill-Then-Remove Lifecycle
 status: executing
-stopped_at: Completed 18-01-PLAN.md
-last_updated: "2026-11-03T22:15:07.413Z"
+stopped_at: Completed 18-02-PLAN.md
+last_updated: "2026-11-03T22:35:03.528Z"
 last_activity: 2026-11-03
 last_activity_desc: Phase 18 execution started
-state_head: 506ee3758d443145e0b57741daf6910934d7bd2f
+state_head: b2e52033845addbde02b07bbc93d6db2f5ef1b59
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
-Plan: 2 of 8
+Plan: 3 of 8
 Status: Ready to execute
 Last activity: 2026-11-03 — Phase 18 execution started
 
@@ -102,6 +102,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | Phase 12 P02 | 7 min | 3 tasks | 1 files |
 | Phase 12 P04 | 45 min | 3 tasks | 1 files |
 | Phase 18 P01 | 7 min | 3 tasks | 2 files |
+| Phase 18 P02 | 35m | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -232,6 +233,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 12]: Pushed with the local real-roots gate red after proving by null bracket that the delta came from concurrent host processes, not the test suite — A 45s before/after bracket with no suite also failed; pids 8413 (live baude) and 21951 (FHIR IG publisher under the managed-worktrees root) were identified. check (macos-14) and check (ubuntu-22.04) run the same bracket in a clean room and both passed
 - [Phase 18]: RemovalError::RuntimeSurvived boxes SessionTeardownError for clippy result_large_err; plan 04 wraps with Box::new
 - [Phase 18]: Repository parent PlannedRow carries main_worktree and common_dir from its SavedRepository for plan 04 pruning
+- [Phase 18]: Forced removal .git shape guard runs before git worktree remove is spawned because git follows a symlinked gitfile
+- [Phase 18]: Bare repository at a registered managed path is refused with ForeignRepository; partial signatures are no repository and the registration proof carries the deletion
 
 ### Pending Todos
 
@@ -311,8 +314,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T22:15:07.380Z
-Stopped at: Completed 18-01-PLAN.md
+Last session: 2026-11-03T22:35:03.505Z
+Stopped at: Completed 18-02-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
