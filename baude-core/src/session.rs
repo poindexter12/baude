@@ -1489,4 +1489,257 @@ mod tests {
         assert_reaped(agent_pid);
         assert_reaped(shell_pid);
     }
+
+    /// One `ps -eo pid=,pgid=,comm=` listing has a row carrying `pgid` and the
+    /// command name `name`. A private copy of the `pty::tests` helper: test
+    /// modules are private and this plan adds no production-visible helper.
+    fn descendant_in_group(pgid: i32, name: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,pgid=,comm="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next();
+            let row_pgid = fields.next().and_then(|p| p.parse::<i32>().ok());
+            let comm = fields.next().unwrap_or("");
+            row_pgid == Some(pgid) && (comm == name || comm.ends_with(&format!("/{name}")))
+        })
+    }
+
+    fn wait_for_descendant(pgid: i32, name: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !descendant_in_group(pgid, name) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {name} inside recorded group {pgid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn group_alive(pgid: i32) -> bool {
+        // SAFETY: signal zero is a liveness probe only.
+        unsafe { libc::kill(-pgid, 0) == 0 }
+    }
+
+    /// `None` while the group has members, else the errno of the probe.
+    fn group_errno(pgid: i32) -> Option<i32> {
+        // SAFETY: signal zero is a liveness probe only.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            None
+        } else {
+            std::io::Error::last_os_error().raw_os_error()
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal zero is a liveness probe only.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// One `ps -o comm=` row for `pid` names `name` (macOS may print the
+    /// executable's full path).
+    fn leader_runs(pid: u32, name: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        comm == name || comm.ends_with(&format!("/{name}"))
+    }
+
+    fn wait_until_leader_runs(pid: u32, name: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !leader_runs(pid, name) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader {pid} never became {name}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Unwinding guard: SIGKILL every recorded group directly and wait for the
+    /// reader threads to reap. It never calls `kill_and_wait`.
+    struct GroupGuard {
+        pgids: Vec<i32>,
+        pids: Vec<u32>,
+    }
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            for pgid in &self.pgids {
+                // SAFETY: the group ids were recorded from this test's own leaders.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline
+                && self
+                    .pids
+                    .iter()
+                    .any(|pid| proc_state(*pid).starts_with('Z'))
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    fn session_with(agent: Pty, shell: Pty) -> Session {
+        Session {
+            id: 1,
+            name: "group-extinction-test".to_string(),
+            cwd: std::env::temp_dir(),
+            repo_root: std::env::temp_dir(),
+            branch: None,
+            is_worktree: false,
+            claude: agent,
+            shell: Some(shell),
+            shell_open: true,
+            spawn_unix_ms: 0,
+            targeted_resume: false,
+            meta: ClaudeMeta::default(),
+            archived: false,
+            archived_by_user: false,
+            was_busy: false,
+            unarchived_at_ms: None,
+            pending_permission: None,
+            permission_decision: None,
+            child_suspended: false,
+            pane_focus_shell: false,
+            poll_meta_calls_for_test: std::cell::Cell::new(0),
+        }
+    }
+
+    fn group_extinction_root(label: &str) -> (PathBuf, crate::testing::TestRedirect) {
+        let root = std::env::temp_dir().join(format!("baude-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let redirect = crate::testing::TestRedirect::new(&root);
+        (root, redirect)
+    }
+
+    /// KILL-01 and KILL-02 at the session level: both groups extinct, both
+    /// leaders reaped, both readers joined.
+    #[test]
+    fn group_extinction_drains_agent_and_shell_readers() {
+        let (root, _redirect) = group_extinction_root("group-drain");
+        // `set +m` keeps the sleeper in the leader's group under `bash -i`.
+        let cmd = "set +m; trap '' TERM HUP; sleep 30";
+        let agent = Pty::spawn(Some(cmd), &root, 5, 40).expect("spawn agent");
+        let shell = Pty::spawn(Some(cmd), &root, 5, 40).expect("spawn shell");
+        let agent_pid = agent.process_identity().pid;
+        let agent_pgid = agent.process_identity().process_group;
+        let shell_pid = shell.process_identity().pid;
+        let shell_pgid = shell.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgids: vec![agent_pgid, shell_pgid],
+            pids: vec![agent_pid, shell_pid],
+        };
+        // Let the traps arm before signalling (RESEARCH Pitfall 1).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_descendant(agent_pgid, "sleep");
+        wait_for_descendant(shell_pgid, "sleep");
+
+        let mut session = session_with(agent, shell);
+        session.kill_and_wait().expect("kill_and_wait");
+
+        assert_eq!(
+            group_errno(agent_pgid),
+            Some(libc::ESRCH),
+            "agent group survived"
+        );
+        assert_eq!(
+            group_errno(shell_pgid),
+            Some(libc::ESRCH),
+            "shell group survived"
+        );
+        assert!(session.claude.reader_finished(), "agent reader not joined");
+        assert!(
+            session.shell.as_ref().unwrap().reader_finished(),
+            "shell reader not joined"
+        );
+        assert_reaped(agent_pid);
+        assert_reaped(shell_pid);
+    }
+
+    /// KILL-03's reporting path: a Pty error that returns with the leader
+    /// alive must surface promptly from the wrapper even while both readers
+    /// are parked in `child.wait()` holding their child mutexes (the shape of
+    /// `pty::tests::group_extinction_signals_before_taking_child_lock`).
+    #[test]
+    fn group_extinction_error_path_does_not_take_child_lock() {
+        let (root, _redirect) = group_extinction_root("group-error-path");
+        let cmd = "trap '' HUP; exec sleep 8 </dev/null >/dev/null 2>&1";
+        let agent = Pty::spawn(Some(cmd), &root, 5, 40).expect("spawn agent");
+        let shell = Pty::spawn(Some(cmd), &root, 5, 40).expect("spawn shell");
+        // `Pty::pid()` and `is_exited()` would block here: read lock-free.
+        let agent_pid = agent.process_identity().pid;
+        let agent_pgid = agent.process_identity().process_group;
+        let shell_pid = shell.process_identity().pid;
+        let shell_pgid = shell.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgids: vec![agent_pgid, shell_pgid],
+            pids: vec![agent_pid, shell_pid],
+        };
+        wait_until_leader_runs(agent_pid, "sleep");
+        wait_until_leader_runs(shell_pid, "sleep");
+        agent.hang_up_slave_for_test();
+        shell.hang_up_slave_for_test();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut consecutive = 0;
+        while consecutive < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "readers never parked in child.wait()"
+            );
+            assert!(
+                pid_alive(agent_pid) && pid_alive(shell_pid),
+                "a leader exited before its reader parked"
+            );
+            if agent.reader_holds_child_lock_for_test() && shell.reader_holds_child_lock_for_test()
+            {
+                consecutive += 1;
+            } else {
+                consecutive = 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut session = session_with(agent, shell);
+        let started = std::time::Instant::now();
+        session.claude.fail_next_teardown_for_test("injected");
+        session
+            .shell
+            .as_ref()
+            .unwrap()
+            .fail_next_teardown_for_test("injected");
+        let error = session
+            .kill_and_wait()
+            .expect_err("injected teardown failure must surface");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "error path blocked behind the parked readers for {elapsed:?}"
+        );
+        assert_eq!(error.agent_pid, Some(agent_pid));
+        assert_eq!(error.shell_pid, Some(shell_pid));
+        assert!(!error.agent_stopped);
+        assert!(!error.shell_stopped);
+        assert_eq!(
+            error.detail.matches("injected").count(),
+            2,
+            "detail: {}",
+            error.detail
+        );
+        assert!(pid_alive(agent_pid), "agent leader was signalled");
+        assert!(pid_alive(shell_pid), "shell leader was signalled");
+        assert!(group_alive(agent_pgid), "agent group was signalled");
+        assert!(group_alive(shell_pgid), "shell group was signalled");
+        assert!(!session.claude.reader_finished());
+        assert!(!session.shell.as_ref().unwrap().reader_finished());
+    }
 }

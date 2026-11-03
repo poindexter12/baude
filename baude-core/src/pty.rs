@@ -122,6 +122,7 @@ impl PausedPty {
             size: (parts.rows, parts.cols),
             subscribers,
             gated: true,
+            reader: None,
         })
     }
 
@@ -153,6 +154,9 @@ pub struct Pty {
     /// Pty is live (reader thread running, writer held) but the command has
     /// not started; `release_gate` writes the token that starts it.
     gated: bool,
+    /// The reader thread, owned so teardown can join it (or report that it
+    /// is still parked behind a slave holder outside the recorded group).
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Written to the paused child's stdin once its identity is durably recorded.
@@ -590,6 +594,48 @@ impl Pty {
         &self.identity
     }
 
+    /// True once the reader thread has been joined or has run to completion.
+    pub fn reader_finished(&self) -> bool {
+        false
+    }
+
+    /// Observes the parked-reader shape from another module's tests: the
+    /// reader holds the child mutex only inside `child.wait()`.
+    #[cfg(test)]
+    pub(crate) fn reader_holds_child_lock_for_test(&self) -> bool {
+        matches!(
+            self.child.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    /// Hangs the slave terminal up from outside the session, the way the
+    /// kernel does when a session leader exits, so a leader that ignores HUP
+    /// keeps running while the master reads EOF and the reader thread parks
+    /// in `child.wait()`. On Linux the leader's own last slave close already
+    /// does this, so nothing is needed; on macOS the session keeps the
+    /// controlling tty open until the leader exits, so only revoke(2) on the
+    /// slave reaches that state. Test shape only: no production caller.
+    #[cfg(test)]
+    pub(crate) fn hang_up_slave_for_test(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn revoke(path: *const libc::c_char) -> libc::c_int;
+            }
+            let fd = self.master.as_raw_fd().expect("master fd");
+            // SAFETY: ptsname reads the master fd this Pty owns; the returned
+            // static buffer is copied before any other call can overwrite it.
+            let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(fd)) }
+                .to_string_lossy()
+                .into_owned();
+            let path = std::ffi::CString::new(name).expect("slave path");
+            // SAFETY: revoke takes a NUL-terminated path and touches nothing else.
+            let rc = unsafe { revoke(path.as_ptr()) };
+            assert_eq!(rc, 0, "revoke failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
     pub fn is_exited(&self) -> bool {
         if self.exited.load(Ordering::Relaxed) {
             return true;
@@ -803,6 +849,30 @@ impl Pty {
                 .insert(pid, detail.into());
         }
     }
+}
+
+/// What [`Pty::kill_and_wait`] may do to the recorded process group, decided
+/// from the recorded identity, what the kernel reports for the leader pid, and
+/// whether the group still has members.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupDisposition {
+    /// The group is alive and its leader is ours or already gone: signal it.
+    Signal,
+    /// Nothing is left in the group, so there is nothing to signal or verify.
+    Extinct,
+    /// A different process now sits inside the recorded group: never signal.
+    ForeignOwner,
+    /// The leader could not be inspected: refuse before any signal.
+    Unverifiable,
+}
+
+pub(crate) fn group_disposition(
+    recorded: &ProcessIdentity,
+    observed_leader: std::result::Result<Option<&ProcessIdentity>, &str>,
+    group_alive: bool,
+) -> GroupDisposition {
+    let _ = (recorded, observed_leader, group_alive);
+    GroupDisposition::Signal
 }
 
 fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
@@ -1673,5 +1743,397 @@ mod tests {
 
         assert!(registered, "register callback must be called");
         assert!(!pty.is_exited(), "child should be running after register");
+    }
+
+    /// One `ps -eo pid=,pgid=,comm=` listing has a row carrying `pgid` and the
+    /// command name `name` (macOS prints `comm` as a full path, so the last
+    /// path component is compared too).
+    fn descendant_in_group(pgid: i32, name: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,pgid=,comm="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next();
+            let row_pgid = fields.next().and_then(|p| p.parse::<i32>().ok());
+            let comm = fields.next().unwrap_or("");
+            row_pgid == Some(pgid) && (comm == name || comm.ends_with(&format!("/{name}")))
+        })
+    }
+
+    fn group_alive(pgid: i32) -> bool {
+        // SAFETY: signal zero is a liveness probe only.
+        unsafe { libc::kill(-pgid, 0) == 0 }
+    }
+
+    /// `None` while the group has members, else the errno of the probe.
+    fn group_errno(pgid: i32) -> Option<i32> {
+        // SAFETY: signal zero is a liveness probe only.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            None
+        } else {
+            std::io::Error::last_os_error().raw_os_error()
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal zero is a liveness probe only.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// Unwinding guard for the group-extinction fixtures: SIGKILL the recorded
+    /// group (and the holder pid a fixture wrote) directly, then reap through
+    /// `try_wait`. It never calls `kill_and_wait`, which at RED returns early
+    /// for an exited leader and would leak the descendants these tests create.
+    struct GroupGuard {
+        pgid: i32,
+        child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+        holder_pid_file: Option<PathBuf>,
+    }
+
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            // SAFETY: the group id was recorded from this fixture's own leader.
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+            }
+            if let Some(pid) = self
+                .holder_pid_file
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                // SAFETY: the pid was written by the fixture's own holder.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            for _ in 0..40 {
+                if let Ok(mut child) = self.child.try_lock() {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// The reader parks in `child.wait()` holding the child mutex once the
+    /// master reads EOF while the leader is still alive. Three consecutive
+    /// `WouldBlock` polls separate that from a reader briefly reaping.
+    fn wait_until_reader_parked(child: &Mutex<Box<dyn Child + Send + Sync>>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut consecutive = 0;
+        while consecutive < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "reader never parked in child.wait()"
+            );
+            match child.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => consecutive += 1,
+                _ => consecutive = 0,
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// KILL-01: a TERM- and HUP-ignoring descendant that outlived its PTY
+    /// leader is still inside the kill unit, and `kill_and_wait` must reach
+    /// group extinction instead of returning early on the exited leader.
+    #[test]
+    fn group_extinction_after_leader_exit() {
+        let fixture = PtyFixture::new("group-leader-exit");
+        // `set +m` is load-bearing: the gate runs `bash -i`, and job control
+        // would give the background subshell its own process group. The leader
+        // ignores TERM and HUP before forking so the subshell and its sleep
+        // inherit those dispositions at fork time, ahead of the SIGHUP the
+        // kernel sends to the foreground group when the leader exits.
+        let cmd = "set +m; trap '' TERM HUP; (trap '' TERM HUP; sleep 30) & exit 0";
+        let mut pty = Pty::spawn(Some(cmd), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgid,
+            child: Arc::clone(&pty.child),
+            holder_pid_file: None,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pty.is_exited() {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            group_alive(pgid),
+            "group {pgid} should still hold the sleeper after the leader exited"
+        );
+        assert!(
+            descendant_in_group(pgid, "sleep"),
+            "sleeper is not inside the recorded group {pgid}"
+        );
+
+        pty.kill_and_wait().unwrap();
+
+        assert_eq!(
+            group_errno(pgid),
+            Some(libc::ESRCH),
+            "group {pgid} survived kill_and_wait"
+        );
+        assert_reaped_promptly(pid);
+    }
+
+    /// The pure decision table behind `kill_and_wait`: the group id is
+    /// compared explicitly, an inspection error is a refusal, and a foreign
+    /// process inside the recorded group is never signalled.
+    #[test]
+    fn group_extinction_disposition_never_signals_foreign_owner() {
+        let recorded = ProcessIdentity {
+            pid: 4242,
+            start_time: 1000,
+            process_group: 4242,
+            session: 4242,
+        };
+        let same_group = ProcessIdentity {
+            start_time: 2000,
+            ..recorded.clone()
+        };
+        let other_group = ProcessIdentity {
+            start_time: 2000,
+            process_group: 5151,
+            session: 5151,
+            ..recorded.clone()
+        };
+        type Observed<'a> = std::result::Result<Option<&'a ProcessIdentity>, &'a str>;
+        let failed: Observed<'_> = Err("could not inspect");
+        let rows: Vec<(Observed<'_>, bool, GroupDisposition, &str)> = vec![
+            (
+                Ok(Some(&recorded)),
+                true,
+                GroupDisposition::Signal,
+                "live matching leader",
+            ),
+            (
+                Ok(None),
+                true,
+                GroupDisposition::Signal,
+                "leader gone, members remain",
+            ),
+            (
+                Ok(Some(&same_group)),
+                true,
+                GroupDisposition::ForeignOwner,
+                "stranger inside the group",
+            ),
+            (
+                Ok(Some(&other_group)),
+                true,
+                GroupDisposition::Signal,
+                "pid reuser in another group",
+            ),
+            (
+                failed,
+                true,
+                GroupDisposition::Unverifiable,
+                "inspection failed, group alive",
+            ),
+            (
+                failed,
+                false,
+                GroupDisposition::Extinct,
+                "inspection failed, group gone",
+            ),
+            (
+                Ok(Some(&same_group)),
+                false,
+                GroupDisposition::Extinct,
+                "stranger, group gone",
+            ),
+            (
+                Ok(None),
+                false,
+                GroupDisposition::Extinct,
+                "leader gone, group gone",
+            ),
+            (
+                Ok(Some(&recorded)),
+                false,
+                GroupDisposition::Extinct,
+                "matching leader, group gone",
+            ),
+        ];
+        for (observed, group_alive, expected, label) in rows {
+            assert_eq!(
+                group_disposition(&recorded, observed, group_alive),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// KILL-02: after a successful kill the reader thread has been joined.
+    #[test]
+    fn group_extinction_joins_reader() {
+        let fixture = PtyFixture::new("group-joins-reader");
+        let mut pty = Pty::spawn(Some("sleep 30"), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgid,
+            child: Arc::clone(&pty.child),
+            holder_pid_file: None,
+        };
+
+        pty.kill_and_wait().unwrap();
+
+        assert!(
+            pty.reader_finished(),
+            "reader thread was not joined after kill_and_wait"
+        );
+        assert!(pty.is_exited());
+        assert_reaped_promptly(pid);
+    }
+
+    /// One `ps -o comm=` row for `pid` names `name` (macOS may print the
+    /// executable's full path).
+    fn leader_runs(pid: u32, name: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        comm == name || comm.ends_with(&format!("/{name}"))
+    }
+
+    fn wait_until_leader_runs(pid: u32, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !leader_runs(pid, name) {
+            assert!(
+                Instant::now() < deadline,
+                "leader {pid} never became {name}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A leader that keeps running after the master has read EOF parks the
+    /// reader in `child.wait()` holding the child mutex: on Linux redirecting
+    /// its stdio away from the terminal is enough, on macOS the fixture hangs
+    /// the slave up once the leader is in place. SIGTERM must go out before
+    /// anything in `kill_and_wait` waits on that mutex.
+    #[test]
+    fn group_extinction_signals_before_taking_child_lock() {
+        let fixture = PtyFixture::new("group-before-lock");
+        let cmd = "trap '' HUP; exec sleep 8 </dev/null >/dev/null 2>&1";
+        let mut pty = Pty::spawn(Some(cmd), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgid,
+            child: Arc::clone(&pty.child),
+            holder_pid_file: None,
+        };
+        wait_until_leader_runs(pid, "sleep");
+        pty.hang_up_slave_for_test();
+        wait_until_reader_parked(&pty.child);
+        assert!(pid_alive(pid), "leader exited before the reader parked");
+
+        let started = Instant::now();
+        pty.kill_and_wait().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "kill_and_wait blocked behind the parked reader for {elapsed:?}"
+        );
+        assert_eq!(group_errno(pgid), Some(libc::ESRCH));
+        assert_reaped_promptly(pid);
+        assert!(pty.reader_finished());
+    }
+
+    /// A process that left the session with setsid but kept the slave terminal
+    /// open is outside the kill unit: the group is extinct and the leader
+    /// reaped, but the reader stays parked in `read()`, its handle owned by
+    /// the Pty, and `reader_finished()` says so.
+    #[test]
+    fn group_extinction_leaves_reader_parked_for_out_of_group_slave_holder() {
+        let fixture = PtyFixture::new("group-slave-holder");
+        let holder_pid_file = fixture.cwd().join("holder.pid");
+        // The holder exits 3 without writing holder.pid when setsid fails, so a
+        // holder that stayed inside the group can never pass as this case.
+        let cmd = format!(
+            "set +m; trap '' HUP; perl -MPOSIX -e 'my $sid = POSIX::setsid(); \
+             exit 3 unless defined $sid && $sid != -1; \
+             open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' & exit 0",
+            holder_pid_file.display()
+        );
+        let mut pty = Pty::spawn(Some(&cmd), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgid,
+            child: Arc::clone(&pty.child),
+            holder_pid_file: Some(holder_pid_file.clone()),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let holder: i32 = loop {
+            let written = std::fs::read_to_string(&holder_pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            if let Some(holder) = written {
+                if pty.is_exited() {
+                    break holder;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder.pid was not written or the leader did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &holder.to_string()])
+            .output()
+            .expect("ps");
+        let holder_pgid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_ne!(
+            holder_pgid, pgid,
+            "setsid did not move the holder out of the recorded group"
+        );
+
+        let started = Instant::now();
+        pty.kill_and_wait().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "kill_and_wait took {elapsed:?}"
+        );
+        assert_eq!(group_errno(pgid), Some(libc::ESRCH));
+        assert_reaped_promptly(pid);
+        assert!(
+            !pty.reader_finished(),
+            "reader should still be parked behind the out-of-group slave holder"
+        );
+        assert!(
+            pty.reader.is_some(),
+            "reader handle must stay owned by the Pty, not detached"
+        );
+
+        // SAFETY: the pid was written by this fixture's own holder.
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pty.reader_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not finish after the holder died"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pty.reader.take().unwrap().join().is_ok());
     }
 }
