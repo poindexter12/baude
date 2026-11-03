@@ -903,8 +903,26 @@ impl RepositoryState {
         checkouts: &[CheckoutKey],
         standalone: &[StandaloneKey],
     ) -> RemovedRows {
-        let _ = (repositories, checkouts, standalone);
-        RemovedRows::default()
+        let (removed_repositories, kept_repositories): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.repositories)
+                .into_iter()
+                .partition(|row| repositories.contains(&row.key));
+        self.repositories = kept_repositories;
+        let (removed_checkouts, kept_checkouts): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.checkouts)
+                .into_iter()
+                .partition(|row| checkouts.contains(&row.key));
+        self.checkouts = kept_checkouts;
+        let (removed_standalone, kept_standalone): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.standalone_sessions)
+                .into_iter()
+                .partition(|row| standalone.contains(&row.key));
+        self.standalone_sessions = kept_standalone;
+        RemovedRows {
+            repositories: removed_repositories,
+            checkouts: removed_checkouts,
+            standalone_sessions: removed_standalone,
+        }
     }
 
     pub fn allocate_first_seen_order(&mut self) -> Result<u64, AllocationError> {
