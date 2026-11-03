@@ -1,11 +1,12 @@
 ---
 phase: 18
 reviewers: [codex, opencode, qwen, cursor, antigravity, ollama]
-convergence_cycle: 3
+convergence_cycle: 4
 cycle_1_commit: 0070c74
 cycle_2_commit: 11b0413
-plans_commit: cadcf1a
-reviewed_at: 2026-11-02T19:10:07Z
+cycle_3_commit: 574eca5
+plans_commit: b28c4d0
+reviewed_at: 2026-11-03T16:03:36Z
 plans_reviewed: [18-01-PLAN.md, 18-02-PLAN.md, 18-03-PLAN.md, 18-04-PLAN.md, 18-05-PLAN.md, 18-06-PLAN.md, 18-07-PLAN.md, 18-08-PLAN.md]
 models:
   codex: "gpt-6.1-sol (reasoning=high)"
@@ -1649,3 +1650,601 @@ Folded into HIGHs above, not counted separately: Cursor's 18-04 MEDIUM on step 6
 ### Overall
 
 Codex: HIGH, "fix the bare-repository deletion case, remove the indirect pre-TERM child lock, and reconcile unfinished-reader ownership with KILL-02" before autonomous execution. Cursor: MEDIUM, "cycle 2 HIGHs are genuinely closed in plan text... fix the 18-04 reader-join wording, then execute". Consensus: the phase is close but not executable as written. Five of the seven cycle 2 HIGHs are closed, the ledgers are honest, and the architecture has held through three cycles. What remains is narrow: one new deletion-authority hole in 18-02's filesystem guard, and two 18-08 fixes that are correct inside `pty.rs` but undone by text outside the sequence they govern (the untouched debug check above it, the 18-04 drop below it). All three are plan-text edits of a few lines each plus one fixture apiece; none reopens a design decision. This is the final convergence cycle, so these three go to the planner as blocking revisions and the ten non-HIGH items ride along.
+
+---
+
+# Cross-AI Plan Review — Phase 18, Convergence Cycle 4
+
+Reviewed 2026-11-03T16:03:36Z against the eight plans at `b28c4d0` (18-01 through 18-08, each carrying a Review Dispositions Ledger with Round 1, Round 2 and Round 3 blocks). Cycle 1 (above) was committed at `0070c74`, cycle 2 at `11b0413`, cycle 3 at `574eca5`. The lane runner was launched exactly once and ran the six lanes sequentially: Codex in 7 min and Cursor in 11 min produced full source-grounded reviews of all eight plans; OpenCode, Antigravity and Ollama produced nothing; Qwen emitted only its discount marker. Reviewers were asked to check whether the three cycle 3 HIGHs and ten non-HIGH items are genuinely closed in plan text and to surface residual defects in the revised text.
+
+## Plan-Revision Conflicts (Cycle 4)
+
+None. Both grounded lanes reviewed all eight plans at `b28c4d0`; `git log` over the PLAN files still resolves to `b28c4d0` after the run.
+
+## Codex Review (Cycle 4)
+
+Reviewed repository HEAD `b28c4d0` against the five requested source modules and supporting lifecycle, fixture, marker and gate code. These are assessments of the proposed changes; implementation tests and gates were not run. No files were modified.
+
+## 18-01
+
+**Summary:** A well-scoped foundation. Selection, disk classification and preview share one model, and the vocabulary matches the existing durable ownership types.
+
+**Strengths**
+
+- Carrying the complete `OwnedRuntime` preserves agent identity, shell ownership and generation. Those fields exist in [repository.rs:98](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:98), so preview can describe both PTYs without inventing a separate ownership model.
+- The `NotFound`-only downgrade preserves inspection failures for execution to refuse. The contract is explicit in [18-01:96](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-01-PLAN.md:96).
+
+**Cycle 3 dispositions**
+
+- **RESOLVED — Test-count drift:** RED now requires six failures and one pass; final verification requires seven passes. See [18-01:130](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-01-PLAN.md:130) and [18-01:275](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-01-PLAN.md:275). The unconditional unknown-target stub explains the passing test.
+- **RESOLVED — Preview I/O wording:** The production algorithm permits metadata reads while forbidding mutation, commands and signals. Calling that side-effect-free is appropriate.
+- The new `readers_parked` field is present in [18-01:93](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-01-PLAN.md:93); whether it satisfies KILL-02 is addressed under 18-04.
+
+**Concerns**
+
+- No new substantive source-backed concern.
+
+**Suggestions**
+
+- Retain the behavioral classification tests as the primary acceptance evidence; textual counts should remain supplementary.
+
+**Risk Assessment:** **LOW.** The work is predominantly data modeling and read-only selection.
+
+## 18-02
+
+**Summary:** The plan now has substantial protection against stale or foreign paths. Three remaining gaps concern the new guard’s decision table, missing-root recovery and marker creation.
+
+**Strengths**
+
+- Fresh common-directory verification and exact inventory matching build on the existing canonical inventory mechanism in [git.rs:299](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/git.rs:299).
+- The retry marker addresses a real Git behavior: Git deletes worktree administration even after directory removal fails. That behavior is visible in the official [Git removal implementation](https://github.com/git/git/blob/v2.54.0/builtin/worktree.c#L1328-L1335).
+
+**Cycle 3 dispositions**
+
+- **RESOLVED — Replacement bare repository:** [18-02:110](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:110) explicitly checks the bare-repository shape before authorizing deletion; [18-02:95](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:95) supplies a real `git init --bare` fixture. This closes the specific `.git`-absent authorization hole.
+- **RESOLVED — Shape check after Git removal:** [18-02:112](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:112) moves the guard ahead of marker creation and the remove command, and repeats it before fallback. The symlinked-gitfile fixture exercises that ordering.
+
+**Concerns**
+
+- **MEDIUM — NEW: The bare guard lacks an outcome for ordinary project files.** [18-02:110](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:110) permits success only when *every* bare-signature probe returns `NotFound`. A partially removed worktree can legitimately retain a regular `config` or `HEAD` file without being a bare repository. Successful inspection of such a file matches neither the bare signature nor the all-absent success branch. The existing removal model accepts arbitrary modified and untracked paths—see [git.rs:1969](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/git.rs:1969)—so this cannot be excluded by upstream classification.
+- **MEDIUM — NEW: Missing-root recovery stops before the ancestor walk.** [18-02:108](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:108) first canonicalizes `worktrees_base()`. If the entire managed root was deleted, that fails before the missing-target recovery logic runs. The resolver merely returns a path; it does not create the directory, as [git.rs:1788](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/git.rs:1788) confirms.
+- **MEDIUM — NEW: Retry-marker creation is underspecified at a destructive trust boundary.** [18-02:111](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:111) specifies writing and reading a predictable sibling filename, but no symlink rejection or collision policy. An ordinary overwrite implementation could follow a pre-existing symlink or truncate an unrelated file. The existing marker module already establishes a stronger pattern: exclusive creation at [marker.rs:91](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/marker.rs:91), and symlink rejection at [marker.rs:188](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/marker.rs:188).
+
+**Suggestions**
+
+- Define all bare-probe outcomes: positive signature, successfully inspected non-signature entries, and inspection failure. Add missing-`.git` fixtures retaining ordinary `config` and `HEAD` files.
+- Handle an absent managed root without creating it or weakening containment; add a fixture deleting the whole root.
+- Specify exclusive marker creation, rejection of symlink/nonmatching existing markers, and reuse of a verified matching marker. Add collision and symlink tests.
+
+**Risk Assessment:** **MEDIUM.** The main ownership checks are much stronger, but these gaps affect destructive fallback and retry behavior.
+
+## 18-03
+
+**Summary:** The batch mutation is appropriately small and keeps persistence and validation responsibilities explicit.
+
+**Strengths**
+
+- Removing children and their parent together addresses the actual invariant enforced at [repository.rs:941](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:941).
+- Preserving allocation counters matches their independent role in [repository.rs:510](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:510); removal should not recycle durable identities.
+
+**Cycle 3 disposition**
+
+- **RESOLVED — `validate_for_save()` documentation:** [18-03:73](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-03-PLAN.md:73) now distinguishes aggregate validation from save validation. That distinction is real: [repository.rs:669](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:669) additionally checks lifecycle/runtime consistency.
+
+**Concerns**
+
+- No new substantive source-backed concern.
+
+**Suggestions**
+
+- Keep validation outside the mutation helper, as planned, and preserve the existing standalone-removal signature.
+
+**Risk Assessment:** **LOW.** The transformation and its caller obligations are clear.
+
+## 18-04
+
+**Summary:** Ownership preflight, validation before irreversible effects, and commit-aware persistence are sound. The parked-reader amendment improves reporting but does not fully satisfy the stated shutdown requirement.
+
+**Strengths**
+
+- Full identity and exact shell-ownership preflight match the actual durable structures in [repository.rs:62](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:62) and [repository.rs:91](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/repository.rs:91).
+- Committing memory after a save reports replacement committed correctly follows the persistence boundary: rename occurs before directory synchronization in [persist.rs:681](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/persist.rs:681).
+
+**Cycle 3 dispositions**
+
+- **PARTIALLY RESOLVED — Dropping parked readers:** [18-04:112](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-04-PLAN.md:112) now reports unfinished readers before dropping their Sessions. It still drops the last `JoinHandle`, detaching the thread; that is the documented [Rust behavior](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html). The reader itself owns its terminal reader and remains blocked in the loop at [pty.rs:77](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:77). Reporting the resource does not close it.
+- **RESOLVED — Job-control fixtures:** [18-04:91](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-04-PLAN.md:91) disables job control and requires observed sleeper membership. This addresses the interactive Bash gate actually used at [pty.rs:177](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:177).
+- **RESOLVED — Test-count drift:** The acceptance criteria now consistently require sixteen tests, including nine orchestration tests, at [18-04:187](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-04-PLAN.md:187).
+
+**Concerns**
+
+- **HIGH — Existing concern remains partially resolved:** KILL-02 explicitly requires baude-owned PTYs and reader threads to be closed, at [REQUIREMENTS.md:24](/Users/joese/Code/github.com/poindexter12/baude/.planning/REQUIREMENTS.md:24). Avoiding signals to an out-of-group process is reasonable; it does not exempt baude’s own reader thread. The new test explicitly permits successful removal before the test subsequently kills the holder, at [18-04:100](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-04-PLAN.md:100).
+
+**Suggestions**
+
+- Define an actual reader-cleanup ownership policy: bounded cancellation, or retained cleanup ownership with a completion contract that satisfies KILL-02.
+- If the intended acceptance criterion is instead “report a detached reader,” explicitly revise KILL-02 rather than marking it achieved.
+
+**Risk Assessment:** **HIGH.** The operation can report success while a required resource-cleanup condition remains false.
+
+## 18-05
+
+**Summary:** Persistence and retry coverage is now strong, including the previously missing live-runtime case. One newly added explanation contradicts the specified control flow.
+
+**Strengths**
+
+- The injection matrix corresponds to real failure boundaries in [persist.rs:633](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/persist.rs:633), [persist.rs:667](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/persist.rs:667) and [persist.rs:683](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/persist.rs:683).
+- Crash recovery tests use the actual missing-checkout path at [git.rs:488](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/git.rs:488) and protection transition at [lifecycle.rs:629](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/lifecycle.rs:629).
+
+**Cycle 3 dispositions**
+
+- **RESOLVED — Live-runtime persistence failure:** [18-05:90](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-05-PLAN.md:90) now asserts extinction, reaping, retained handle ownership and retry using the same handle after a pre-rename failure. This matches the real `Sync` injection occurring before replacement.
+- **UNRESOLVED — `NotRegistered` retry explanation:** The sentence was added at [18-05:89](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-05-PLAN.md:89), but its mechanism is incorrect. Under [18-02:112](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-02-PLAN.md:112), marker-write failure occurs before Git removal, so that failure does not itself remove registration or the directory. Furthermore, [18-04:111](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-04-PLAN.md:111) explicitly tolerates `NotRegistered` for `AlreadyRemoved` rows.
+
+**Concerns**
+
+- **LOW — Incorrect retry invariant:** The requested test comment would teach maintainers the wrong relationship between marker failure, registration and retry. The tests can otherwise remain useful.
+
+**Suggestions**
+
+- Explain the two cases accurately: an absent path can complete without a marker; an existing unregistered orphan needs matching marker proof.
+- Test marker-write failure separately and assert that Git registration and the target directory remain unchanged.
+
+**Risk Assessment:** **LOW**, subject to the underlying shutdown and disk-helper fixes.
+
+## 18-06
+
+**Summary:** The integration matrix covers the important row kinds, live-runtime variants and cloned-repository topology without unnecessarily duplicating every primitive test.
+
+**Strengths**
+
+- The cloned fixture follows the existing realistic topology at [lifecycle.rs:4290](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/lifecycle.rs:4290).
+- Redirecting allocations through the shared test infrastructure matches [testing.rs:128](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/testing.rs:128), which is specifically designed to prevent fixture leakage.
+- Assertions about unmanaged directory and registration preservation exercise a different rule from managed-worktree deletion, as specified at [18-06:115](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-06-PLAN.md:115).
+
+**Cycle 3 dispositions**
+
+- **RESOLVED — Objective wording:** [18-06:53](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-06-PLAN.md:53) now states precisely which rules run on both fixture kinds.
+- **RESOLVED — Inherited job-control correction:** The live tests reuse the corrected helper, addressing the interactive-shell behavior at [pty.rs:177](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:177).
+
+**Concerns**
+
+- No new substantive source-backed concern.
+
+**Suggestions**
+
+- Preserve the distinction between branch-ref snapshots and decorated branch-list output.
+
+**Risk Assessment:** **LOW** for this plan itself. Its results depend on corrected shutdown and disk primitives.
+
+## 18-07
+
+**Summary:** The gate plan accurately reflects the repository’s validation workflow and appropriately requires both platforms to validate the final revision.
+
+**Strengths**
+
+- The Linux gate actually runs as UID 1000, at [gate.sh:38](/Users/joese/Code/github.com/poindexter12/baude/scripts/gate.sh:38), supporting the permission-based failure fixtures.
+- The authoritative script checks formatting, clippy, commit messages and isolated tests, starting at [gate.sh:63](/Users/joese/Code/github.com/poindexter12/baude/scripts/gate.sh:63).
+- Requiring the host gate after Linux-driven fixes at [18-07:108](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-07-PLAN.md:108) prevents validation of different source revisions.
+
+**Cycle 3 dispositions**
+
+- No cycle 3 finding was assigned directly to this plan.
+
+**Concerns**
+
+- No new substantive source-backed concern.
+
+**Suggestions**
+
+- Record the tested commit hash alongside each gate’s exit status in the summary.
+
+**Risk Assessment:** **LOW.** This is a suitable final verification stage; it cannot replace missing behavioral assertions.
+
+## 18-08
+
+**Summary:** The primitive changes address genuine early-return and mutex-ordering defects. One additional mutex-taking path remains in the Session wrapper’s error construction.
+
+**Strengths**
+
+- Group cleanup after leader exit addresses the premature return at [pty.rs:759](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:759).
+- Signalling before acquiring the child mutex addresses a real blocking interaction: the reader holds that mutex across `child.wait()` at [pty.rs:92](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:92).
+- Preserving inspection errors is appropriate: Linux identity inspection genuinely distinguishes absence from failure at [session.rs:651](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/session.rs:651).
+
+**Cycle 3 dispositions**
+
+- **RESOLVED — Debug injection accessor:** [18-08:89](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-08-PLAN.md:89) replaces `self.pid()` with `self.identity.pid` for both lookup and registration. This avoids the lock taken by [pty.rs:585](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:585).
+- **RESOLVED — Job control and `setsid` verification:** [18-08:78](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-08-PLAN.md:78) and [18-08:82](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-08-PLAN.md:82) now require observable membership rather than assuming it.
+- **RESOLVED — Extraction versus ordering check:** [18-08:184](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-08-PLAN.md:184) explicitly preserves signal-before-lock ordering when extracting the helper.
+- **RESOLVED — Shared-reaping comment:** The revised explanation distinguishes the reader’s blocking `read()` from its subsequent mutex-protected wait, matching [pty.rs:82](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/pty.rs:82).
+- **PARTIALLY RESOLVED — Parked-reader ownership:** Retention inside `Pty` is explicit, but removal subsequently drops it. The outstanding KILL-02 issue is described under 18-04.
+
+**Concerns**
+
+- **HIGH — NEW: Session error construction can still block indefinitely.** After either PTY teardown fails, `Session::kill_and_wait` constructs its error using `self.claude.pid()` and `Pty::pid` at [session.rs:498](/Users/joese/Code/github.com/poindexter12/baude/baude-core/src/session.rs:498). Those accessors acquire the same child mutex. If the reader is waiting on a still-running child, a prompt PTY error—such as the injection or an inspection refusal—turns into a blocked Session call. The proposed Session changes at [18-08:94](/Users/joese/Code/github.com/poindexter12/baude/.planning/phases/18-shared-kill-then-remove-lifecycle/18-08-PLAN.md:94) only update documentation and tests; they leave this route intact.
+
+**Suggestions**
+
+- Populate error PIDs from the immutable recorded identities, without taking the child mutex.
+- Add a Session-level test combining the redirected-stdio fixture with an injected teardown failure. Assert prompt error return, unchanged ownership and no signal before the injected refusal. The existing direct-`Pty` timing test does not exercise Session error formatting.
+
+**Risk Assessment:** **HIGH.** The remaining wrapper hang undermines bounded failure reporting and KILL-03.
+
+## Overall assessment
+
+**Request changes before execution.** The dependency ordering and persistence strategy are coherent, and most cycle 3 amendments resolve their specific concerns.
+
+The remaining blockers are the **Session error-path mutex hang** and the **partially resolved reader-cleanup requirement**. The disk-helper gaps should also receive explicit behavior and fixtures before implementation. The accepted disk-delete/state-save gap and deferred UI, API and re-admission work do not need reopening.
+
+## OpenCode Review (Cycle 4)
+
+_Lane skipped: no review was produced. Diagnostic output preserved verbatim below; this is not a review._
+
+opencode review failed or returned empty output. stderr:
+
+Raw response body:
+OpenCode review returned no assistant text (#1936: agent ended its turn with no final message).
+Diagnostic: stop reason=?, output tokens=?
+Diagnosis: opencode ran with no effort argument, so the reviewer CLI's own configuration applied and exited with status 1.
+
+## Qwen Review (Cycle 4)
+
+_Lane skipped: the lane ran but emitted only the discount marker and a reviewer tag, no review body (Copilot rejects model claude-sonnet-4.6 for the opencode integrator). Output preserved verbatim below; this is not a review._
+
+> [reviewed-without-source-citations] This reviewer declared source-grounded evidence but cited no file:line source evidence, so it reviewed the pasted plan text only — down-weight its verdict in the Consensus Summary.
+
+[reviewer: github-copilot/claude-sonnet-4.6 via opencode (invoked as 'qwen')]
+
+## Cursor Review (Cycle 4)
+
+# Phase 18 Cross-AI Plan Review (Cycle 4)
+
+Source-grounded against repository plans under `.planning/phases/18-shared-kill-then-remove-lifecycle/` and live code in `baude-core/src/{pty,session,git,repository,persist}.rs`. Cycle-3 HIGHs are dispositioned first per plan, then a fresh pass for new defects.
+
+## Cycle 3 HIGH rollup
+
+| # | Concern | Disposition |
+|---|---------|-------------|
+| 1 | Bare repo at vacated managed path passes guard and is `remove_dir_all`'d | **RESOLVED** in 18-02 (`foreign_repository_guard` bare signature + `replacement_bare_repository_at_registered_path_is_refused`) |
+| 2 | Successful removal drops parked reader `JoinHandle` while 08 returns `Ok` | **RESOLVED** across 18-01 (`readers_parked`), 18-04 (`persist_stage` sweep), 18-08 (`reader_finished` + retained handle) |
+| 3 | Debug injection / `fail_next_teardown_for_test` call `self.pid()` before SIGTERM | **RESOLVED** in 18-08 (`identity.pid` keying + region greps forbidding `self.pid()` in `kill_and_wait`) |
+
+Live evidence for why (1)–(3) were real: `Pty::kill_and_wait` early-returns on exited leader without signalling (`pty.rs:759-765`), injection calls `self.pid()` which locks `child` (`pty.rs:745-754`, `585-587`, `798-804`), and the reader `JoinHandle` is dropped at spawn (`pty.rs:79-110`) with no `reader_finished` on `Pty` (`pty.rs:140-156`).
+
+---
+
+## 18-01
+
+### Cycle 3 disposition
+**RESOLVED** for the report field half of parked-reader honesty: `RemovalReport.readers_parked` is declared, empty in preview, and asserted in the serde round-trip (`18-01-PLAN.md` feature ~L93, Round 3 ledger). Composition with 04/08 is intentional; this plan does not implement join semantics.
+
+### Summary
+Wave-1 TDD vocabulary plan for pure `select_rows` / `preview_removal`, disk classification, full `OwnedRuntime` on `PlannedRow`, and a removal-owned `DiskRemovalFailure` so the crate compiles without plan 02. Classification and clone rules match the aggregate types that exist today.
+
+### Strengths
+- `ProcessIdentity` / `ShellOwnership` / `OwnedRuntime` are `Clone` and not `Copy` (`repository.rs:60-102`); `.cloned()` matches that.
+- Disk table keys off real fields: `CheckoutRole`, `managed_by_baude`, `owned_runtime()` (`repository.rs` role/management/runtime accessors).
+- `DiskRemoval` wrapping local `DiskRemovalFailure` (not `ForcedRemovalError`) matches `depends_on: []` and current `lib.rs` (no `removal` module yet).
+- Probe-only `symlink_metadata` with `NotFound`-only downgrade keeps preview side-effect-free; non-`NotFound` leave `RemoveManagedWorktree` for plan 02.
+- Module insertion between `pty` and `repository` matches `lib.rs` alphabetical layout.
+
+### Concerns
+- None new that contradict the ledger. Residual executor discipline only: production region must stay free of kill/git/write (already gated by region-scoped greps).
+
+### Suggestions
+- Keep asserting `readers_parked` empty on the serde round-trip so Phase 21 cannot invent preview-side parking.
+
+### Risk Assessment
+**LOW** — pure data + preview; dependencies and compile boundary are correctly drawn.
+
+---
+
+## 18-02
+
+### Cycle 3 disposition
+**RESOLVED.** When `.git` is absent, `foreign_repository_guard` probes `HEAD` + `objects/` + `refs/` and/or a config line `bare = true`, refuses as `ForeignRepository`, and runs before both `git worktree remove` and `remove_dir_all` (`18-02-PLAN.md` implementation ~L110–L113, test `replacement_bare_repository_at_registered_path_is_refused`, Round 3 ledger, T-18-37). Symlinked-`.git` pre-git check is likewise ordered ahead of spawn.
+
+Today there is no force helper: `remove_verified_worktree` is non-force only (`git.rs:2681-2714`) and never recursive-deletes. The planned defect was in the new fallback path; the plan text now closes it.
+
+### Summary
+Force-removal primitive beside `remove_verified_worktree`: managed-root containment, registration/identity re-proof, `.git`/bare shape guard, double `--force`, orphan marker, guarded fallback + postcondition. Correctly separates clean-tree/lock (still owned by `inspect_removal` / `topology_blockers`) from ownership checks this helper re-runs.
+
+### Strengths
+- Placement after `remove_verified_worktree` matches source (`git.rs:2710`).
+- `worktrees_base()` appends `baude/worktrees` under a redirect (`git.rs:1788-1792`); fixtures under `data/baude/worktrees/...` are the right shape.
+- `verified_remove_arguments` stays non-force; forced path gets its own five-arg vector with `--` (injection hygiene mirrors existing pattern).
+- Containment refuses root equality, symlinks, and non-`Normal` residual components; marker + `NotRegistered` retry matches git’s admin-entry-gone / tree-left behaviour the plan cites.
+- Guard is filesystem-only (no `rev-parse`); Task 2 greps pin that.
+
+### Concerns
+- **LOW — wording drift on bare config.** must_haves / T-18-37 say `core.bare = true`; the implementation bullet requires a trimmed line equal to `bare = true` (correct for a normal `[core]` stanza from `git init --bare`). An executor following only the threat row could implement the wrong matcher. Body + bare fixture remain sound because the three-entry signature alone refuses the planned fixture.
+
+### Suggestions
+- Normalize must_haves / T-18-37 wording to `bare = true` (optionally also accept `bare=true`) to match the implementation bullet and region grep.
+
+### Risk Assessment
+**MEDIUM** — recursive delete under the managed root is inherently high blast-radius; mitigations in-plan are strong if implemented as written.
+
+---
+
+## 18-03
+
+### Cycle 3 disposition
+**N/A / RESOLVED** for the three cycle-3 HIGHs (none originate here). Round 3 only tightened docs to name `validate_for_save` beside `validate`.
+
+### Summary
+Batch `RepositoryState::remove_rows` generalizing `remove_standalone_session`. Honest about validation: dangling child is caught; childless parent is not — hence repository targets must remove parent+children together.
+
+### Strengths
+- `DanglingRepositoryKey` on missing parent is real (`repository.rs:941-944`).
+- Parent-without-children is **not** rejected by `validate` / `validate_for_save` (`repository.rs:669-672`, validate body through ~1061) — the plan states this correctly.
+- `validate_for_save` = `validate` + `validate_lifecycle_views` (`repository.rs:669-672`); plan 04’s pre-kill save-validity check is the right layer.
+- Unknown keys no-op; counters untouched; insertion neighbor `remove_standalone_session` exists (`repository.rs:870`).
+- `repository_at` / `checkout_at` helpers fix shared-builder collisions (`DuplicateRepositoryIdentity` / `DuplicateRole`).
+
+### Concerns
+- None new.
+
+### Suggestions
+- None.
+
+### Risk Assessment
+**LOW** — small aggregate API with accurate validation claims.
+
+---
+
+## 18-04
+
+### Cycle 3 disposition
+**RESOLVED** for parked-reader drop (depends on 18-08): `persist_stage` sweeps `reader_finished()` on agent and shell before `runtimes.retain`, fills `readers_parked`, then drops Sessions (`18-04-PLAN.md` ~L112, test `reader_parked_on_out_of_group_slave_holder_is_reported`, T-18-39). Detach-on-drop remains a report, not an error — deferred with sound rationale (out-of-group slave holder outside D-KILL-01).
+
+**N/A** for bare-repo (02) and **delegated RESOLVED** for `pid()`-before-SIGTERM (08). `depends_on` includes `18-08`.
+
+### Summary
+Orchestration spine: preflight → `validate_for_save` on candidate → kill → disk → one save → reader sweep → drain owned `Session`s. Live fixtures address job-control vacuity (`set +m` + `descendant_in_group`) against the real interactive gate (`pty.rs:177`, `TEST_GATE_SHELL` `/bin/bash` at `pty.rs:182`).
+
+### Strengths
+- Preflight full `ProcessIdentity` equality matches struct fields (`repository.rs:62-68`).
+- Seeds as `Running` + `OwnedRuntime` match `validate_lifecycle_views` (`repository.rs:745-766`); `Inactive`+`Some(runtime)` would fail — correctly avoided.
+- `SaveError::replacement_committed` and atomic save’s `validate_for_save` exist (`persist.rs:254-280`, `636-639`).
+- `Session::kill_and_wait` wraps both PTYs; `SessionTeardownError.agent_pid` exists for `RuntimeSurvived` (`session.rs:478-524`).
+- Stage order (validate before kill/disk) and handle ownership (drain only after save) close prior HIGHs.
+- `AlreadyRemoved` still calls `remove_managed_worktree_forced` so stale git admin is pruned; `NotRegistered` treated as success.
+
+### Concerns
+- **LOW — Round 2 ledger test counts stale vs body.** Round 2 still says “RED expects 8 failed / 7 passed; GREEN … 15 passed” while Task 1/2/verification and Round 3 require **9 failed / 16 passed**. Body is authoritative; ledger row can mislead an executor/validator.
+
+No new HIGH/MEDIUM. Parked-reader detach-after-report is explicitly deferred; not re-raised.
+
+### Suggestions
+- Correct the Round 2 ledger row in place (as 18-01 did for its count drift).
+- Keep 18-08 landing before GREEN of 04 (`depends_on` already requires it).
+
+### Risk Assessment
+**MEDIUM** when 08 is complete as written; **HIGH** if 08 slips or is partial (early-exit kill, no `reader_finished`, `pid()` lock). Residual risk is live-signal + disk + save orchestration, not missing design.
+
+---
+
+## 18-05
+
+### Cycle 3 disposition
+| Item | Status |
+|------|--------|
+| Live-runtime pre-rename `AtomicFailure` (cycle 3 MEDIUM) | **RESOLVED** — `sync_failure_keeps_prior_state_and_file_bytes` with trapping runtime; injection points match `persist.rs:667-685` (`DirectorySync` after `replacement_committed = true` at `:682`) |
+| NotRegistered-on-retry doc sentence | **RESOLVED** |
+| Test-count drift | **RESOLVED** (thresholds 21/24/25) |
+| Bare-repo | **N/A** (upstream 02) |
+
+### Summary
+Persistence/ordering contract plan: every `AtomicFailure` branch, single-save, crash mid-fan-out, per-child disk fault, validation-before-irreversible. Round 3 correctly adds the kill-then-failed-save live-runtime case.
+
+### Strengths
+- Five inject points match `AtomicFailure` (`persist.rs:242-250`) and commit semantics (`:665-706`).
+- Crash-before-save claims match real atomicity: `Write` bails before `write_all` (`persist.rs:667-669`); temp cleaned on error (`:699-701`).
+- Per-child `0o555` on `<c2>/pin` avoids shared-parent chmod; mirrors plan 02 orphan shape.
+- Validation fixture is real: `set_owned_runtime` does not fix lifecycle; `validate_for_save` → `validate_lifecycle_views` rejects (`repository.rs:762-764`).
+
+### Concerns
+- **LOW — seed ambiguity.** `directory_sync_failure…: same seed` now sits after the live-runtime sync bullet; unclear whether seed is Inactive (rename) or live. Both can satisfy DirectorySync assertions; clarify Inactive no-runtime seed.
+
+### Suggestions
+- Say explicitly that DirectorySync uses the Inactive seed.
+- Keep asserting `worktree_list` + marker on the mid-fan-out disk-failure path.
+
+### Risk Assessment
+**LOW–MEDIUM** — SC5 gap is pinned; depends on 04 persist_stage + 02 marker + 08 Extinct/`reader_finished` for the sync-failure retry.
+
+---
+
+## 18-06
+
+### Cycle 3 disposition
+| Item | Status |
+|------|--------|
+| Objective vs SC3 scope | **RESOLVED** |
+| Job control / trapping via `spawn_trapping_runtime` | **RESOLVED** (inherits plan 04 helper; gate is interactive bash at `pty.rs:177`) |
+| Test-count drift | **RESOLVED** |
+| Bare-repo | **N/A** (managed deletes go through 02’s guard) |
+
+### Summary
+End-to-end keep/delete matrix on cloned topology under redirected `worktrees_base`, plus worktree-mechanics rules on `git init`. Objective/truth aligned with SC3.
+
+### Strengths
+- Worktrees placed at `worktrees_base().join(...)` so forced-removal containment accepts them.
+- `branch_snapshot` via `for-each-ref` only — avoids `git branch` decoration churn.
+- Live unmanaged + unmanaged fan-out child pins KeepDirectory vs forced path.
+- Both fixture kinds scoped honestly (cloned vs `git init`).
+
+### Concerns
+- **LOW — `paths_kept` order equality.** `repository_removes_children_then_parent` asserts `paths_kept == vec![clone, outside_wt]` “set order”. If report order differs from that vector, the equality flakes. Residual, not ledgered in Round 3.
+
+### Suggestions
+- Assert `paths_kept` as a set, or pin expected order to `set.rows` / disk-stage order explicitly in the behavior text.
+
+### Risk Assessment
+**LOW–MEDIUM** — broad integration; correctness rides on 02/04/08 primitives already under test elsewhere.
+
+---
+
+## 18-07
+
+### Cycle 3 disposition
+**N/A** for the three HIGHs. Allowlist including `pty.rs` / `session.rs` and `depends_on: [18-06, 18-08]` were closed in earlier rounds and remain present (`files_modified`, Task `<files>`, `#[ignore]` greps).
+
+### Summary
+Close-out plan: run authoritative gate on macOS and Linux, fix only what it surfaces, same final SHA. No new feature work.
+
+### Strengths
+- Matches real `scripts/gate.sh`: fmt, clippy `-D warnings`, commit-message self-test + range, real-roots self-test, isolated `cargo test -- --test-threads=1`, leak check.
+- `--linux` uses `rust:1-bookworm` as uid 1000 with `HOME` under `target/linux-gate` — matches CLAUDE.md platform-gate guidance.
+- Fix allowlist includes shutdown primitives; no `#[ignore]` escape hatch.
+- Re-run macOS gate after last Linux fix so both results name the same commit.
+
+### Concerns
+- **LOW — brittle named-test greps in acceptance.** Acceptance looks for specific 04/08 test names; a rename in 08 breaks 07 acceptance without a code bug. Acceptable given `depends_on`.
+
+### Suggestions
+- Keep re-running host `gate.sh` after the last Linux fix (already required).
+
+### Risk Assessment
+**LOW** — process/gate plan; residual flake risk is environmental (Docker, signal timing), not design.
+
+---
+
+## 18-08
+
+### Cycle 3 disposition
+| Item | Status |
+|------|--------|
+| Parked reader / drop on successful removal | **RESOLVED** — retain handle + `reader_finished`; Session doc names `readers_parked` (04 fills it) |
+| `fail_next` / `kill_and_wait` → `self.pid()` before SIGTERM | **RESOLVED** — lookup by `self.identity.pid`; Task 2 greps forbid `self.pid()` and order `signal_group(` before `self.child` / `self.pid()`; T-18-40 |
+| Job control in trapping fixtures | **RESOLVED** — `set +m` + `descendant_in_group`; holder proves setsid |
+| `extinguish_group` vs order grep | **RESOLVED** (Task 3) |
+| Shared-reaping comment | **RESOLVED** |
+
+### Summary
+Necessary rewrite of `Pty::kill_and_wait`: group extinction after leader exit, disposition table with explicit pgid compare, lock-free TERM, bounded reader join with honest parked contract. Round 3 closes the debug `pid()` lock hole that cycle 3 found.
+
+### Current source vs proposed change (verified)
+- Exited leader early-return without signal: `pty.rs:759-765`.
+- Mismatched/absent leader early-return `Ok` without signal: `pty.rs:767-772`.
+- Injection/`fail_next` call `self.pid()` → locks `child`: `pty.rs:745-754`, `798-804`, `585-587`; body also locks before TERM at `755-758`.
+- Reader `JoinHandle` not retained: `pty.rs:79-110`, `Pty` fields `140-156`.
+- `inspect_process_identity` already returns `Result<Option<_>, String>`; current code refuses on `Err` via `.map_err(...)?` — collapse risk was treating `Ok(None)`/mismatch as “done,” which the disposition table fixes. Region grep forbidding `unwrap_or(None)` / `ok().flatten()` is still warranted.
+
+### Strengths
+- Disposition order and pgid compare match the real inspection API.
+- RED guards must not call today’s early-return `kill_and_wait` — correct given `pty.rs:759-765`.
+- Acceptance orders SIGTERM before any child lock, including rustfmt-split `.child` and `self.pid()`.
+- Parked-reader contract + 04 `readers_parked` closes KILL-02 honesty without unbounded join; deferral of reader cancellation (macOS `POLLNVAL` on terminal `poll`) remains sound.
+
+### Concerns
+- **HIGH / MEDIUM** — none new.
+- **LOW — `perl -MPOSIX` availability.** Fixtures assume perl under the stripped test PATH (`/usr/bin:/bin:...` at `pty.rs:279`). Plan already says confirm on host and bookworm; 07 is the backstop.
+
+### Suggestions
+- Keep the region greps forbidding Result collapse and `self.pid()` inside `kill_and_wait`.
+- Do not reopen unconditional join.
+
+### Risk Assessment
+**MEDIUM** — highest process-correctness surface in the phase; design matches the live bugs at `pty.rs:759-772` and `585`+`745`. Residual risk is fixture/flake (job control already mitigated; setsid/perl; Linux gate).
+
+---
+
+## Cross-plan comparison
+
+- **Dependency graph is sound:** wave 1 = 01/02/03/08; wave 2 = 04 (`depends_on` all four); 05→06→07 with 07 also naming 08. Compile boundary (01 without 02) and kill-primitive ownership (08 before 04) are correct.
+- **Phase success criteria coverage:** SC1–SC2 via 08+04; SC3 via 02+06; SC4 via 01+03+04+06; SC5 via candidate `validate_for_save` + single save in 04/05. READM/TUI/API stay out of phase 18 as intended.
+- **No new HIGH** across the eight plans. Cycle-3 HIGHs are genuinely closed in plan text with matching source anchors for the defects being fixed.
+- **Residual LOW noise** is ledger/wording drift (02 bare config string, 04 Round 2 counts, 05 DirectorySync seed, 06 `paths_kept` order) — fix before execute if cheap; none block the phase.
+
+## Overall risk assessment
+
+**MEDIUM.** The plans are executable and source-grounded after three revision cycles. Remaining risk is implementation and fixture fidelity on the kill/disk path (08+02+04), not missing architecture. Gate plan 07 is the right hard stop for platform defects. No blocking NEW HIGH; proceed to execute with the LOW wording cleanups preferred but not required for correctness if executors follow feature-implementation bullets over threat-row prose.
+
+## Antigravity Review (Cycle 4)
+
+_Lane skipped: no review was produced. Diagnostic output preserved verbatim below; this is not a review._
+
+Antigravity review failed or returned empty output.
+stderr:
+jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. read_file(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.
+An agy session started this run but no review was recovered, so a pre-launch stall is ruled out. See stderr above; a headless run that was auto-denied a tool permission reports the cause and its fix there.
+
+## Ollama Review (Cycle 4)
+
+_Lane skipped: no review was produced. Diagnostic output preserved verbatim below; this is not a review._
+
+ollama review failed or returned empty output. stderr:
+
+Raw response body:
+The operation was aborted due to timeout
+Diagnosis: ollama is an HTTP lane and carries no reasoning-effort setting.
+
+## Consensus Summary (Cycle 4)
+
+Two grounded reviews ran for the fourth time: Codex (gpt-6.1-sol, reasoning=high) and Cursor. Both cite `file:line` evidence from the live tree at `b28c4d0` and neither opens with a `[reviewed-without-source-citations]` or `[reviewed-without-repo-access]` marker, so both count at full weight and the consensus gate engages. OpenCode (no assistant text, #1936), Antigravity (headless `read_file` auto-denied) and Ollama (HTTP timeout) produced nothing; Qwen ran but emitted only the discount marker and a reviewer tag because Copilot again rejected model `claude-sonnet-4.6` for the `opencode` integrator. Those four are stubs, not reviews, and carry no weight.
+
+Both reviewers re-verified the eight Round 3 ledger blocks and agree they are honest: every row points at text in the plan body. Cursor marks all three cycle 3 HIGHs RESOLVED, finds no new HIGH or MEDIUM, and rates the phase MEDIUM, "proceed to execute with the LOW wording cleanups preferred but not required". Codex marks two RESOLVED and one PARTIALLY RESOLVED (reader cleanup versus the KILL-02 wording), adds one new HIGH on 18-08 (the `Session` wrapper's error construction still takes the child mutex) and three MEDIUMs on 18-02's new guard text, and rates the phase HIGH. The orchestrator's source-grounding below sides with Codex on the new 18-08 HIGH and the first 18-02 MEDIUM, and with Cursor on the reader-cleanup disposition: that one is a design decision the plans record with rationale, and what remains of it is a one-line requirements note.
+
+### Cycle 3 HIGH retrospective
+
+| Cycle 3 HIGH | Plan | Status at b28c4d0 | Evidence |
+|---|---|---|---|
+| Replacement bare repository is recursively deleted by the fallback (Codex) | 18-02 | RESOLVED | `foreign_repository_guard` probes `HEAD`, `objects/`, `refs/` and a `config` line `bare = true` when `.git` is absent and refuses `ForeignRepository`; the guard runs before the marker and the git command and again before fallback (`18-02-PLAN.md:110, :112`); `replacement_bare_repository_at_registered_path_is_refused` with a real `git init --bare` fixture (`:95`); T-18-37 (both confirm) |
+| Successful removal drops an unfinished reader's last owner (Codex HIGH, Cursor MEDIUM) | 18-04 / 18-08 | RESOLVED as a reporting contract | `persist_stage` sweeps `reader_finished()` on agent and shell before `runtimes.retain` and lists the rows in `RemovalReport.readers_parked` (`18-04-PLAN.md:29, :112`; `18-01-PLAN.md:93, :248`); `reader_parked_on_out_of_group_slave_holder_is_reported`; 18-08 keeps the `JoinHandle` on the `Pty` (`18-08-PLAN.md:24, :94`). Cursor RESOLVED; Codex PARTIALLY RESOLVED because KILL-02 says "closed" and a parked reader is reported, not closed. See the divergent view below |
+| Debug-only injection check locks the child mutex before TERM (Codex) | 18-08 | RESOLVED | Injection lookup and registration keyed by `self.identity.pid`, never `self.pid()` (`18-08-PLAN.md:89, :92`); the acceptance grep forbids both `self.child` and `self.pid()` before the first `signal_group(` and survives rustfmt line splits (`:165-166`); T-18-40 (both confirm) |
+
+All three cycle 3 HIGHs are closed in plan text. The ten cycle 3 non-HIGH items are all incorporated: 18-02 symlinked-gitfile pre-spawn guard (`:112`, item 1); 18-08 `set +m` plus `descendant_in_group` and asserted `POSIX::setsid()` in the trapping fixtures, reused by 18-04 and 18-06 (`18-08:78, :82`; `18-04:91`, item 2); 18-05 live-runtime pre-rename `Sync` fixture `sync_failure_keeps_prior_state_and_file_bytes` (`:90`, item 3); 18-01 counts 7 and "6 failed, 1 passed" (`:130, :275`, item 4); 18-04 "16 tests" with nine orchestration tests (`:187`, item 5); 18-03 doc comment names `validate_for_save()` (`:73`, item 6); 18-06 objective scoped to the two fixture kinds (`:53`, item 7); 18-08 extraction preserves signal-before-lock (`:184`, item 8); 18-08 shared-reaping comment distinguishes `read()` from `child.wait()` parking (item 9); 18-05 retry sentence added (`:89`, item 10). Item 10 landed with the wrong mechanism and is re-raised below at LOW.
+
+### Orchestrator source-grounding of the cycle 4 HIGH
+
+- **18-08 `Session::kill_and_wait` error construction still takes the child mutex (Codex, new).** `session.rs:499-500`: `agent_pid: self.claude.pid(), shell_pid: self.shell.as_ref().and_then(Pty::pid)`; `pty.rs:585-587`: `pub fn pid(&self) -> Option<u32> { self.child.lock().ok().and_then(|c| c.process_id()) }`. The reader holds that lock inside `child.wait()` (`pty.rs:92-94`) whenever the master has reached EOF while the leader is still alive, which is exactly the redirected-stdio holder shape 18-08's own fixtures build. On every `Pty::kill_and_wait` error path that returns with the leader still running, the `Session` wrapper then blocks on the lock while formatting the error: `Unverifiable` and `ForeignOwner` (no signal sent by design), the debug injection, and `RuntimeSurvived` after SIGKILL, which is KILL-03's own scenario. 18-08 rewrites `Pty::kill_and_wait` to signal before touching `self.child` and keys the injection by `self.identity.pid`, but its only `session.rs` change is the doc comment and tests at `18-08-PLAN.md:94`; nothing routes the error fields around the lock, and the `:165-166` grep is scoped to `pty.rs`. `ProcessIdentity.pid` (`repository.rs:63`) is already immutable and lock-free on both PTYs. Judgment-class, single reviewer, no marker: counts. Cursor's 18-08 "no new HIGH/MEDIUM" did not examine the wrapper's error arm.
+
+### Agreed Strengths
+
+- Ledgers are faithful for the third cycle running: every Round 3 row points at text in the plan body (both).
+- 18-02 now orders contain -> register/identity -> `.git` shape guard -> marker -> git -> guard again -> fallback -> postcondition, and the bare signature closes the vacated-path hole (both).
+- 18-04 validates the candidate before any signal, kills in `set.rows` order, saves once, sweeps `reader_finished()` before dropping Sessions, and its live fixtures disable job control and prove sleeper membership in the recorded group (both).
+- 18-05's injection matrix matches the real `AtomicFailure` boundaries in `persist.rs:633-685`, and the live-runtime `Sync` case now asserts extinction, reaping, retained handle ownership and retry on the same handle (both).
+- 18-06's cloned topology and redirected `worktrees_base` match the shared test infrastructure; the unmanaged keep rules are pinned with and without live runtimes (both).
+- 18-07 runs the authoritative gate on both platforms and requires one SHA (both).
+- 18-08's disposition table, `Unverifiable` bail, explicit pgid compare, lock-free TERM and bounded reader join are all present and anchored to the live defects at `pty.rs:759-772` and `:585` (both).
+
+### Agreed Concerns
+
+- **No concern is raised by both lanes at the same severity this cycle.** The overlap is on wording: Codex re-raises the 18-05 retry sentence it asked for in cycle 3 (now LOW, wrong mechanism) and Cursor finds four ledger and wording drifts (18-02, 18-04, 18-05, 18-06), all LOW.
+
+### Divergent Views
+
+- **18-08 Session error-path lock.** Codex HIGH; Cursor did not look at it. Source confirms Codex (above).
+- **KILL-02 and the parked reader.** Codex HIGH "partially resolved": `REQUIREMENTS.md:24` says reader threads are closed, 18-04 `:100` lets removal succeed before the test kills the holder, so success is reported while a thread is detached. Cursor RESOLVED: detach is reported in `readers_parked`, never hidden, and the out-of-group slave holder sits outside the kill unit by D-KILL-01. The orchestrator sides with Cursor on the plan text: 18-08 `:24` and `:91` state the contract, 18-04 `:29` and `:317` scope the KILL-02 claim to it, the cycle 2 and cycle 3 ledgers record why an unconditional join or a portable cancellation is out of reach (macOS `POLLNVAL` on terminal `poll`), and cycle 3 accepted the reporting form as the resolution. What the plans do not do is carry that scope into the requirement itself, so a verifier reading `REQUIREMENTS.md:24` alone would mark KILL-02 satisfied without the caveat. Counted below at LOW as a requirements note, not as a design change.
+- **18-02 bare-guard decision table.** Codex MEDIUM: `18-02-PLAN.md:110` defines three outcomes for the bare probes (all three entries or the config line is `ForeignRepository`; any probe error other than `NotFound` is `Uninspectable`; every probe `NotFound` passes) and none covers a successfully inspected entry that is not the signature, such as a lone regular `HEAD` or a `config` without `bare = true`. A worktree whose tree carries files of those names, half-deleted by a failed `git worktree remove`, lands in no branch. Cursor did not consider it. Plan text confirms the gap: counts at MEDIUM.
+- **18-02 missing managed root.** Codex MEDIUM: `managed_root_contains` canonicalizes `worktrees_base()` first (`:108`) and `git.rs:1788` only resolves the path, so a wiped managed root fails containment before the vanished-target walk runs; the error is unspecified. Since 18-04 `:111` sends `AlreadyRemoved` rows through the forced helper and treats only `NotRegistered` as success, such rows cannot be removed until the root exists again. Fail-closed and recoverable by `mkdir`, so counted at LOW.
+- **18-02 marker write hygiene.** Codex MEDIUM: `write_removal_marker` (`:111`) specifies neither symlink rejection nor collision behaviour, while `marker.rs:91` uses `File::create_new` and `marker.rs:188` rejects a symlink at the path. The marker lives beside the target under the managed root, which baude owns, and its content is two lines, so the blast radius is bounded; counted at LOW as a pattern-conformance note.
+
+### Current HIGH Concerns
+
+One HIGH, counted (gate engaged; two reviewers; no markers). It is new against the b28c4d0 text and is the same mutex-ordering class as cycle 3 HIGH 3, one layer up.
+
+1. **18-08: `Session::kill_and_wait` builds `SessionTeardownError` through `Pty::pid()`, which locks the child mutex (Codex).** `session.rs:499-500` with `pty.rs:585`. Needed: populate `agent_pid` and `shell_pid` from `process_identity().pid` (or drop the two fields in favour of the identity fields already present) so the error arm never touches `self.child`; extend the Task 2 acceptance so `.pid()` does not appear inside `Session::kill_and_wait` in `session.rs`; add one Session-level test that pairs the redirected-stdio holder fixture with `fail_next_teardown_for_test` and asserts the `Err` returns within the bound with ownership unchanged and no signal sent. Without it, KILL-03's "visible error instead of a leaked process" becomes a hang in the exact case it exists for.
+
+### Current Actionable Non-HIGH Concerns
+
+Nine items that `/gsd-execute-phase` would not see unless they land in a PLAN.md or its ledger.
+
+1. **18-02 (MEDIUM):** complete the bare-probe decision table at `:110`: state what a successfully inspected non-signature entry does (pass, because no repository claims the directory, keeping `Uninspectable` for probe errors and `ForeignRepository` for the signature), and add a fixture with `.git` absent and a lone regular `HEAD` or non-bare `config` left behind (Codex MEDIUM).
+2. **18-02 (LOW):** specify `managed_root_contains` when `worktrees_base()` itself does not exist: either walk the root through the same nearest-existing-ancestor logic and let an absent target reach the `None` + absent-directory prune branch, or name the typed error; add a whole-root-deleted fixture (Codex MEDIUM, graded LOW: fail-closed, recoverable).
+3. **18-02 (LOW):** `write_removal_marker` should reject a symlink at the marker path via `symlink_metadata` and state its overwrite policy for a marker left by a prior failed attempt (overwrite, or `create_new` with `AlreadyExists` verified through `removal_marker_matches`), following `marker.rs:91` and `:188` (Codex MEDIUM, graded LOW).
+4. **18-02 (LOW):** align the must_haves truth at `:27` and T-18-37 at `:298`, which say `core.bare = true`, with the implementation bullet and grep at `:110`, which match a trimmed line `bare = true` (Cursor LOW).
+5. **18-04 (LOW):** the Round 2 ledger row at `:265` still says "RED expects 8 failed / 7 passed; GREEN and REFACTOR expect 15 passed" while the body and Round 3 require 9 failed, 7 passed and 16 passed; correct the row in place (Cursor LOW).
+6. **18-05 (LOW):** the retry sentence at `:89` names the wrong mechanism: under `18-02:112` a marker write failure returns `Marker` before the git command runs, so registration and the directory survive and the retry takes the normal registered path, and 18-04 `:111` accepts `NotRegistered` for an absent directory. Reword to the two real cases: an absent path completes without a marker; a present unregistered orphan needs a matching marker or fails closed as `NotRegistered` (Codex LOW; cycle 3 item 10 landed incorrectly).
+7. **18-05 (LOW):** `directory_sync_failure_commits_state_and_reports_degraded` at `:91` says "same seed" directly after the live-runtime `Sync` bullet; say it uses the `Inactive` no-runtime seed from `:89` (Cursor LOW).
+8. **18-06 (LOW):** `repository_removes_children_then_parent` at `:154` asserts `paths_kept == vec![clone, outside_wt]` with the note "set order"; either assert set equality or pin the order to `set.rows` in the behaviour text so the test cannot flake on ordering (Cursor LOW).
+9. **Requirements (LOW):** record on KILL-02 (REQUIREMENTS.md or the phase VERIFICATION) that a reader parked behind an out-of-group slave holder is reported in `readers_parked` rather than joined, per D-KILL-01, so the requirement is not marked satisfied without the caveat the plans already carry (Codex HIGH, graded LOW: design decision already recorded; only the requirement text is silent).
+
+Dispositioned already in plan text and not counted: Cursor's 18-07 LOW on named-test greps (accepted by Cursor itself given `depends_on`), Cursor's 18-08 LOW on `perl -MPOSIX` under the stripped PATH (18-08 requires host and bookworm confirmation; 18-07 is the backstop), Codex's 18-07 suggestion to record the tested SHA (`18-07:108` already requires both gates on one commit), and Codex's 18-01 and 18-03 suggestions, which restate what the plans do.
+
+### Overall
+
+Codex: HIGH, "request changes before execution": the Session error-path hang and the KILL-02 reader question, with the three 18-02 guard gaps to specify first. Cursor: MEDIUM, "no blocking NEW HIGH; proceed to execute with the LOW wording cleanups". Consensus: the three cycle 3 HIGHs are genuinely closed and the ten non-HIGH items all landed, one of them with a wrong explanation. The architecture has held through four cycles and both lanes now agree the dependency graph, persistence contract and kill primitive match the live defects they fix. One new HIGH remains, a two-line change in `session.rs` plus a test and a grep, found one layer above the cycle 3 fix of the same class; one MEDIUM completes a decision table 18-02 introduced in response to cycle 3; the rest is wording. These go to the planner as a short revision; nothing reopens a design decision.
