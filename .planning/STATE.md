@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 18
 current_phase_name: Shared Kill-Then-Remove Lifecycle
 status: executing
-stopped_at: Completed 18-02-PLAN.md
-last_updated: "2026-11-03T22:35:03.528Z"
+stopped_at: Completed 18-03-PLAN.md
+last_updated: "2026-11-03T22:43:04.610Z"
 last_activity: 2026-11-03
 last_activity_desc: Phase 18 execution started
-state_head: b2e52033845addbde02b07bbc93d6db2f5ef1b59
+state_head: 5e1e157e7558b490ba106183d9e273e6077aaeac
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
-Plan: 3 of 8
+Plan: 4 of 8
 Status: Ready to execute
 Last activity: 2026-11-03 — Phase 18 execution started
 
@@ -103,6 +103,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | Phase 12 P04 | 45 min | 3 tasks | 1 files |
 | Phase 18 P01 | 7 min | 3 tasks | 2 files |
 | Phase 18 P02 | 35m | 3 tasks | 1 files |
+| Phase 18 P03 | 4 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -235,6 +236,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: Repository parent PlannedRow carries main_worktree and common_dir from its SavedRepository for plan 04 pruning
 - [Phase 18]: Forced removal .git shape guard runs before git worktree remove is spawned because git follows a symlinked gitfile
 - [Phase 18]: Bare repository at a registered managed path is refused with ForeignRepository; partial signatures are no repository and the registration proof carries the deletion
+- [Phase 18]: remove_standalone_session delegates to remove_rows so one mutation path serves every row kind
+- [Phase 18]: Removal test seeds allocate keys and orders through the aggregate allocators and assert validate Ok before remove_rows
 
 ### Pending Todos
 
@@ -314,8 +317,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T22:35:03.505Z
-Stopped at: Completed 18-02-PLAN.md
+Last session: 2026-11-03T22:43:04.590Z
+Stopped at: Completed 18-03-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
