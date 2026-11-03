@@ -28,12 +28,14 @@
 //! while this path persists the whole removed set once.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::repository::{
-    CheckoutKey, OwnedRuntime, RepositoryKey, RepositoryState, StandaloneKey, ValidationError,
+    CheckoutKey, CheckoutRole, OwnedRuntime, RepositoryKey, RepositoryState, SavedCheckout,
+    SavedRepository, ShellOwnership, StandaloneKey, ValidationError,
 };
 
 /// What the caller asked to remove.
@@ -198,7 +200,7 @@ pub enum RemovalError {
     },
     RuntimeSurvived {
         row: RowKey,
-        error: crate::session::SessionTeardownError,
+        error: Box<crate::session::SessionTeardownError>,
     },
     DiskRemoval {
         row: RowKey,
@@ -245,7 +247,7 @@ impl fmt::Display for RemovalError {
 impl std::error::Error for RemovalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::RuntimeSurvived { error, .. } => Some(error),
+            Self::RuntimeSurvived { error, .. } => Some(error.as_ref()),
             Self::Persist { error } => Some(error),
             Self::Validation(error) => Some(error),
             _ => None,
@@ -264,8 +266,52 @@ pub fn select_rows(
     state: &RepositoryState,
     target: RemovalTarget,
 ) -> Result<RemovalSet, RemovalError> {
-    let _ = state;
-    Err(RemovalError::UnknownTarget(target))
+    let rows = match target {
+        RemovalTarget::Repository(key) => {
+            let parent = find_repository(state, key).ok_or(RemovalError::UnknownTarget(target))?;
+            let mut rows: Vec<PlannedRow> = state
+                .checkouts
+                .iter()
+                .filter(|checkout| checkout.repository_key == key)
+                .map(|checkout| checkout_row(checkout, parent))
+                .collect();
+            rows.push(PlannedRow {
+                row: RowKey::Repository(key),
+                path: None,
+                disk: DiskAction::KeepDirectory,
+                runtime: None,
+                main_worktree: Some(parent.observed_main_worktree.to_path_buf()),
+                common_dir: Some(parent.observed_common_dir.to_path_buf()),
+            });
+            rows
+        }
+        RemovalTarget::Checkout(key) => {
+            let checkout = state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .ok_or(RemovalError::UnknownTarget(target))?;
+            let parent = find_repository(state, checkout.repository_key)
+                .ok_or(RemovalError::UnknownTarget(target))?;
+            vec![checkout_row(checkout, parent)]
+        }
+        RemovalTarget::Standalone(key) => {
+            let standalone = state
+                .standalone_sessions
+                .iter()
+                .find(|standalone| standalone.key == key)
+                .ok_or(RemovalError::UnknownTarget(target))?;
+            vec![PlannedRow {
+                row: RowKey::Standalone(key),
+                path: Some(standalone.canonical_path.to_path_buf()),
+                disk: DiskAction::KeepDirectory,
+                runtime: standalone.owned_runtime().cloned(),
+                main_worktree: None,
+                common_dir: None,
+            }]
+        }
+    };
+    Ok(RemovalSet { target, rows })
 }
 
 /// Describe what removing `target` would do without doing any of it.
@@ -273,22 +319,96 @@ pub fn preview_removal(
     state: &RepositoryState,
     target: RemovalTarget,
 ) -> Result<RemovalReport, RemovalError> {
-    let _ = state;
-    Err(RemovalError::UnknownTarget(target))
+    let set = select_rows(state, target)?;
+    Ok(report_from_set(&set, true))
+}
+
+fn find_repository(state: &RepositoryState, key: RepositoryKey) -> Option<&SavedRepository> {
+    state
+        .repositories
+        .iter()
+        .find(|repository| repository.key == key)
+}
+
+fn checkout_row(checkout: &SavedCheckout, parent: &SavedRepository) -> PlannedRow {
+    let path = checkout.observed_path.to_path_buf();
+    let disk = probe_disk(disk_action_for(checkout), &path);
+    PlannedRow {
+        row: RowKey::Checkout(checkout.key),
+        path: Some(path),
+        disk,
+        runtime: checkout.owned_runtime().cloned(),
+        main_worktree: Some(parent.observed_main_worktree.to_path_buf()),
+        common_dir: Some(parent.observed_common_dir.to_path_buf()),
+    }
+}
+
+/// The per-kind disk rule from the persisted row alone: a main checkout and
+/// an unmanaged checkout are kept; a managed non-main checkout is removed.
+fn disk_action_for(checkout: &SavedCheckout) -> DiskAction {
+    match (checkout.role, checkout.managed_by_baude) {
+        (CheckoutRole::Main, _) | (_, false) => DiskAction::KeepDirectory,
+        (_, true) => DiskAction::RemoveManagedWorktree,
+    }
+}
+
+/// Downgrade a managed removal to `AlreadyRemoved` only when the directory
+/// is `NotFound`. Any other inspection error keeps the row so the disk stage
+/// reports it as a typed failure instead of silently dropping the row.
+fn probe_disk(action: DiskAction, path: &Path) -> DiskAction {
+    if action != DiskAction::RemoveManagedWorktree {
+        return action;
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => DiskAction::AlreadyRemoved,
+        _ => DiskAction::RemoveManagedWorktree,
+    }
+}
+
+fn report_from_set(set: &RemovalSet, planned: bool) -> RemovalReport {
+    let mut report = RemovalReport {
+        target: set.target,
+        planned,
+        rows_removed: Vec::with_capacity(set.rows.len()),
+        runtimes_killed: Vec::new(),
+        paths_deleted: Vec::new(),
+        paths_kept: Vec::new(),
+        already_removed: Vec::new(),
+        readers_parked: Vec::new(),
+        persistence: PersistenceOutcome::Planned,
+    };
+    for row in &set.rows {
+        report.rows_removed.push(row.row);
+        if let Some(runtime) = &row.runtime {
+            report.runtimes_killed.push(KilledRuntime {
+                row: row.row,
+                agent_pid: runtime.agent.pid,
+                shell_pid: match &runtime.shell {
+                    ShellOwnership::Owned(identity) => Some(identity.pid),
+                    ShellOwnership::Closed => None,
+                },
+            });
+        }
+        if let Some(path) = &row.path {
+            match row.disk {
+                DiskAction::KeepDirectory => report.paths_kept.push(path.clone()),
+                DiskAction::RemoveManagedWorktree => report.paths_deleted.push(path.clone()),
+                DiskAction::AlreadyRemoved => report.already_removed.push(path.clone()),
+            }
+        }
+    }
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::repository::{
-        CheckoutLifecycle, CheckoutRole, PersistedPath, ProcessIdentity, RepositoryHealth,
-        RetainedSessionState, RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout,
-        SavedRepository, SavedStandaloneSession, ShellOwnership, StandaloneLifecycle,
-        UnavailableCause,
+        CheckoutLifecycle, PersistedPath, ProcessIdentity, RepositoryHealth, RetainedSessionState,
+        RetainedStandaloneSessionState, RuntimeGeneration, SavedStandaloneSession,
+        StandaloneLifecycle, UnavailableCause,
     };
     use std::fs;
-    use std::io::ErrorKind;
-    use std::path::Path;
 
     /// Per-test fixture root under the temp dir, removed on drop so a failing
     /// assertion still cleans up.
@@ -485,7 +605,7 @@ mod tests {
         }
     }
 
-    fn row<'a>(set: &'a RemovalSet, key: RowKey) -> &'a PlannedRow {
+    fn row(set: &RemovalSet, key: RowKey) -> &PlannedRow {
         set.rows
             .iter()
             .find(|row| row.row == key)
