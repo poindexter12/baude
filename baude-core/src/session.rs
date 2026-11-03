@@ -475,6 +475,23 @@ impl Session {
     /// Stop and reap every process owned by this session. The agent is waited
     /// first so callers never begin destructive worktree inspection while it
     /// may still be writing into the checkout.
+    ///
+    /// On `Ok` both recorded process groups are extinct, both leaders are
+    /// reaped, and both reader threads have been joined, unless a process
+    /// outside a recorded group still holds that slave terminal open: then
+    /// that Pty's `reader_finished()` is false and its handle stays owned by
+    /// the Pty. The master and writer handles stay open until this `Session`
+    /// is dropped, so its owner (the registry, or `removal::remove`, which
+    /// takes ownership of the handles for the rows it removes) must drop it
+    /// promptly after `Ok`; `removal::remove` also checks `reader_finished()`
+    /// on every consumed Pty and lists rows still parked in
+    /// `RemovalReport.readers_parked`, so a thread that outlives the handle
+    /// is reported, never hidden.
+    ///
+    /// The error arm never touches either child mutex: a Pty error that
+    /// returns with its leader alive leaves that reader parked in
+    /// `child.wait()` under the mutex, so the pids come from the immutable
+    /// recorded identities rather than `Pty::pid`.
     pub fn kill_and_wait(&mut self) -> std::result::Result<(), SessionTeardownError> {
         // Attempt each owned process independently. A partially successful
         // stop remains retryable because Pty::kill_and_wait is idempotent.
@@ -496,8 +513,11 @@ impl Session {
                     failures.push(format!("shell: {error}"));
                 }
                 Err(SessionTeardownError {
-                    agent_pid: self.claude.pid(),
-                    shell_pid: self.shell.as_ref().and_then(Pty::pid),
+                    agent_pid: Some(self.claude.process_identity().pid),
+                    shell_pid: self
+                        .shell
+                        .as_ref()
+                        .map(|shell| shell.process_identity().pid),
                     agent_identity: Some(self.claude.process_identity().clone()),
                     shell_identity: self
                         .shell
@@ -1730,8 +1750,18 @@ mod tests {
         assert!(!error.agent_stopped);
         assert!(!error.shell_stopped);
         assert_eq!(
-            error.detail.matches("injected").count(),
+            error.detail.matches("teardown failure: injected").count(),
             2,
+            "detail: {}",
+            error.detail
+        );
+        assert!(
+            error.detail.starts_with("agent: "),
+            "detail: {}",
+            error.detail
+        );
+        assert!(
+            error.detail.contains("; shell: "),
             "detail: {}",
             error.detail
         );

@@ -67,7 +67,7 @@ impl PausedPty {
         let child = parts.child;
 
         // Spawn the reader thread that will process output from the child
-        {
+        let handle = {
             let parser = Arc::clone(&parser);
             let last_output_ms = Arc::clone(&last_output_ms);
             let screen_gen = Arc::clone(&screen_generation);
@@ -76,7 +76,7 @@ impl PausedPty {
             let child = Arc::clone(&child);
             let mut reader = parts.reader;
 
-            std::thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
@@ -108,7 +108,8 @@ impl PausedPty {
                     }
                 }
             });
-        }
+            handle
+        };
 
         Ok(Pty {
             parser,
@@ -122,7 +123,7 @@ impl PausedPty {
             size: (parts.rows, parts.cols),
             subscribers,
             gated: true,
-            reader: None,
+            reader: Some(handle),
         })
     }
 
@@ -595,8 +596,12 @@ impl Pty {
     }
 
     /// True once the reader thread has been joined or has run to completion.
+    /// False only after a `kill_and_wait` that left the reader parked behind a
+    /// process outside the recorded group holding the slave terminal open.
     pub fn reader_finished(&self) -> bool {
-        false
+        self.reader
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
     }
 
     /// Observes the parked-reader shape from another module's tests: the
@@ -784,70 +789,132 @@ impl Pty {
         Ok(())
     }
 
-    /// Stop the child and confirm that it has exited before reporting success.
-    /// Safety-sensitive callers must use this instead of the best-effort
-    /// `kill`, because a signal attempt alone is not a process-stop boundary.
+    /// Stop the whole recorded process group and confirm it is extinct before
+    /// reporting success. Safety-sensitive callers must use this instead of
+    /// the best-effort `kill`, because a signal attempt alone is not a
+    /// process-stop boundary.
+    ///
+    /// On `Ok` the recorded group has no members, the leader is reaped, and
+    /// the reader thread has been joined unless a process outside the
+    /// recorded group still holds the slave terminal open: that process is
+    /// outside the kill unit, so the reader stays parked in `read()`, its
+    /// handle stays owned by this `Pty` rather than being detached, and
+    /// [`Pty::reader_finished`] reports `false`. The master and writer
+    /// handles close when the `Pty` is dropped.
+    ///
+    /// Inspection, the group decision and SIGTERM all happen before anything
+    /// here waits on the child mutex: a reader that saw EOF while the leader
+    /// was still running is parked in `child.wait()` holding that mutex, and
+    /// only the signal releases it. Idempotent: an extinct group reaps and
+    /// returns `Ok` again.
     pub fn kill_and_wait(&mut self) -> Result<()> {
         #[cfg(debug_assertions)]
-        if let Some(pid) = self.pid() {
-            if let Some(detail) = teardown_failures_for_test()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&pid)
-            {
-                anyhow::bail!("injected PTY teardown failure: {detail}");
-            }
-        }
-        let mut child = self
-            .child
+        if let Some(detail) = teardown_failures_for_test()
             .lock()
-            .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
-        if child
-            .try_wait()
-            .context("failed to inspect PTY child before stop")?
-            .is_some()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.identity.pid)
         {
-            self.exited.store(true, Ordering::Release);
-            return Ok(());
+            anyhow::bail!("injected PTY teardown failure: {detail}");
         }
-        let observed = crate::session::inspect_process_identity(self.identity.pid)
-            .map_err(anyhow::Error::msg)?;
-        if observed.as_ref() != Some(&self.identity) {
-            self.exited.store(true, Ordering::Release);
-            return Ok(());
-        }
-        signal_group(self.identity.process_group, libc::SIGTERM)
-            .context("failed to terminate exact PTY process group")?;
-        if !wait_for_group_extinction(self.identity.process_group, child.as_mut()) {
-            signal_group(self.identity.process_group, libc::SIGKILL)
-                .context("failed to force exact PTY process group")?;
-            if !wait_for_group_extinction(self.identity.process_group, child.as_mut()) {
+        let observed = crate::session::inspect_process_identity(self.identity.pid);
+        let group_alive = process_group_exists(self.identity.process_group);
+        match group_disposition(
+            &self.identity,
+            observed
+                .as_ref()
+                .map(Option::as_ref)
+                .map_err(String::as_str),
+            group_alive,
+        ) {
+            GroupDisposition::Unverifiable => {
+                let Err(error) = observed else {
+                    unreachable!("Unverifiable only arises from an inspection error")
+                };
                 anyhow::bail!(
-                    "PTY process group {} remained live after forced termination",
+                    "cannot inspect PTY child {}: {error}; refusing to signal process group {}",
+                    self.identity.pid,
                     self.identity.process_group
                 );
             }
+            GroupDisposition::Signal => self.extinguish_group()?,
+            GroupDisposition::Extinct | GroupDisposition::ForeignOwner => {}
         }
-        if child
-            .try_wait()
-            .context("failed to inspect PTY child after group extinction")?
-            .is_none()
+        // The leader is dead or was never ours, so a reader parked in
+        // `child.wait()` has returned and released the mutex, and a reader
+        // parked in `read()` behind an out-of-group slave holder never took
+        // it: the lock is free either way, and the bounded join below is
+        // what deals with that second thread.
         {
-            child.wait().context("failed to wait for PTY child")?;
+            let mut child = self
+                .child
+                .lock()
+                .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
+            let running = match child.try_wait() {
+                Ok(status) => status.is_none(),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => false,
+                Err(error) => {
+                    return Err(error).context("failed to inspect PTY child after group extinction")
+                }
+            };
+            if running {
+                match child.wait() {
+                    Ok(_) => {}
+                    // The reader may have reaped first.
+                    Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+                    Err(error) => return Err(error).context("failed to wait for PTY child"),
+                }
+            }
         }
         self.exited.store(true, Ordering::Release);
+        self.join_reader();
         Ok(())
+    }
+
+    /// SIGTERM the recorded group, escalate to SIGKILL when members survive
+    /// the 500 ms poll, and fail when the group is still alive after that.
+    /// Never touches the child mutex.
+    fn extinguish_group(&self) -> Result<()> {
+        let process_group = self.identity.process_group;
+        signal_group(process_group, libc::SIGTERM)
+            .context("failed to terminate exact PTY process group")?;
+        if wait_for_group_extinction(process_group, &self.child) {
+            return Ok(());
+        }
+        signal_group(process_group, libc::SIGKILL)
+            .context("failed to force exact PTY process group")?;
+        if wait_for_group_extinction(process_group, &self.child) {
+            return Ok(());
+        }
+        anyhow::bail!("PTY process group {process_group} remained live after forced termination")
+    }
+
+    /// Join the reader thread within a bound. The group is extinct and the
+    /// leader reaped by now, so the only thing that can keep the reader
+    /// blocked is a process outside the recorded group holding the slave
+    /// terminal open; in that case the handle goes back into `self.reader`,
+    /// owned rather than detached, and `reader_finished` reports it.
+    fn join_reader(&mut self) {
+        let Some(handle) = self.reader.take() else {
+            return;
+        };
+        let deadline = Instant::now() + std::time::Duration::from_millis(2000);
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                self.reader = Some(handle);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = handle.join();
     }
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn fail_next_teardown_for_test(&self, detail: impl Into<String>) {
-        if let Some(pid) = self.pid() {
-            teardown_failures_for_test()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(pid, detail.into());
-        }
+        teardown_failures_for_test()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(self.identity.pid, detail.into());
     }
 }
 
@@ -866,13 +933,37 @@ pub enum GroupDisposition {
     Unverifiable,
 }
 
+/// The pid-reuse rule, kept pure so it can be table-tested. `observed_leader`
+/// is what the kernel reports for the recorded pid right now (`Err` when it
+/// could not be inspected), `group_alive` whether the recorded group still
+/// has members.
+///
+/// The group is the kill unit because POSIX fork() gives a child its parent's
+/// process group id: every descendant the leader spawned without setsid or
+/// setpgid is still inside the recorded group after the leader exits, so an
+/// exited leader is a reason to inspect the group, not to stop.
 pub(crate) fn group_disposition(
     recorded: &ProcessIdentity,
     observed_leader: std::result::Result<Option<&ProcessIdentity>, &str>,
     group_alive: bool,
 ) -> GroupDisposition {
-    let _ = (recorded, observed_leader, group_alive);
-    GroupDisposition::Signal
+    if !group_alive {
+        return GroupDisposition::Extinct;
+    }
+    match observed_leader {
+        Err(_) => GroupDisposition::Unverifiable,
+        // The leader exited but descendants remain: they are the kill unit.
+        Ok(None) => GroupDisposition::Signal,
+        Ok(Some(live)) if live == recorded => GroupDisposition::Signal,
+        // The pid was reused by a process that now sits inside the recorded
+        // group: signalling the group would hit a stranger.
+        Ok(Some(live)) if live.process_group == recorded.process_group => {
+            GroupDisposition::ForeignOwner
+        }
+        // The pid was reused elsewhere; the live members of the recorded
+        // group are still our descendants.
+        Ok(Some(_)) => GroupDisposition::Signal,
+    }
 }
 
 fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
@@ -897,9 +988,17 @@ fn process_group_exists(process_group: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn wait_for_group_extinction(process_group: i32, child: &mut dyn Child) -> bool {
+/// Poll the recorded group for up to 500 ms. A zombie leader still counts as
+/// a member, so each round reaps through `try_lock`; when the reader holds
+/// the mutex it is inside its own `child.wait()` and reaps for us.
+fn wait_for_group_extinction(
+    process_group: i32,
+    child: &Mutex<Box<dyn Child + Send + Sync>>,
+) -> bool {
     for _ in 0..50 {
-        let _ = child.try_wait();
+        if let Ok(mut child) = child.try_lock() {
+            let _ = child.try_wait();
+        }
         if !process_group_exists(process_group) {
             return true;
         }
@@ -2053,9 +2152,14 @@ mod tests {
     }
 
     /// A process that left the session with setsid but kept the slave terminal
-    /// open is outside the kill unit: the group is extinct and the leader
-    /// reaped, but the reader stays parked in `read()`, its handle owned by
-    /// the Pty, and `reader_finished()` says so.
+    /// open is outside the kill unit: the group is extinct, the leader reaped,
+    /// and the holder is never signalled. What the reader does then is the
+    /// kernel's call. Linux skips the hangup for PTYs when a session leader
+    /// exits, so the holder keeps the slave open, the reader stays parked in
+    /// `read()`, its handle stays owned by the Pty and `reader_finished()`
+    /// says so. macOS revokes the controlling tty at leader exit, which
+    /// closes the holder's descriptors too, so the master reads EOF and the
+    /// reader is joined.
     #[test]
     fn group_extinction_leaves_reader_parked_for_out_of_group_slave_holder() {
         let fixture = PtyFixture::new("group-slave-holder");
@@ -2113,6 +2217,21 @@ mod tests {
         );
         assert_eq!(group_errno(pgid), Some(libc::ESRCH));
         assert_reaped_promptly(pid);
+        assert!(
+            pid_alive(holder as u32),
+            "holder is outside the kill unit and must not be signalled"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                pty.reader_finished(),
+                "macOS revokes the tty at leader exit, so the reader must have finished"
+            );
+            assert!(
+                pty.reader.is_none(),
+                "a finished reader is joined, not retained"
+            );
+            return;
+        }
         assert!(
             !pty.reader_finished(),
             "reader should still be parked behind the out-of-group slave holder"
