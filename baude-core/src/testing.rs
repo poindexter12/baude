@@ -305,6 +305,117 @@ pub(crate) fn assert_contained(resolved: &Path, what: &str) {
     }
 }
 
+/// Run `git` with `args` in `dir`. Panics with git's stderr on a non-zero
+/// status and returns trimmed stdout, so a fixture step that fails names the
+/// command and the directory instead of leaving a half-built topology.
+pub fn git_in(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?} in {}: {error}", dir.display()));
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The topology real users have: an upstream, a clone whose main checkout
+/// sits on a working branch, a managed default worktree on `main` and a
+/// managed branch worktree, the two managed worktrees allocated under the
+/// redirected managed root so the forced removal path accepts them.
+///
+/// Every path is the one [`crate::git::discover_repository`] reports, so a
+/// test can compare it with what removal records without canonicalizing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClonedTopology {
+    /// The repository the clone was made from.
+    pub upstream: PathBuf,
+    /// The clone's main checkout, switched to `chore/workspace`.
+    pub clone: PathBuf,
+    /// `<managed root>/default`, a linked worktree on `main`.
+    pub default_worktree: PathBuf,
+    /// `<managed root>/managed`, a linked worktree on `feature/kept`.
+    pub managed_worktree: PathBuf,
+    /// The clone's common dir, as discovery reports it.
+    pub common_dir: PathBuf,
+}
+
+/// Build a [`ClonedTopology`] under `root`.
+///
+/// Requires an active [`TestRedirect`] on this thread and panics otherwise:
+/// the managed worktrees are created under [`crate::git::worktrees_base`],
+/// and without a redirect that would be the developer's real managed root,
+/// which is the leak this module exists to prevent.
+pub fn cloned_topology(root: &Path) -> ClonedTopology {
+    assert!(
+        worktrees_base_override().is_some(),
+        "cloned_topology requires an active TestRedirect on this thread; without one the \
+         managed worktrees would be created under the real managed root"
+    );
+    let upstream = root.join("upstream");
+    std::fs::create_dir_all(&upstream).expect("create upstream");
+    git_in(&upstream, &["init", "-q", "-b", "main"]);
+    git_in(&upstream, &["config", "user.email", "test@example.com"]);
+    git_in(&upstream, &["config", "user.name", "Test"]);
+    std::fs::write(upstream.join("tracked"), b"one\n").expect("write tracked file");
+    git_in(&upstream, &["add", "tracked"]);
+    git_in(&upstream, &["commit", "-q", "-m", "initial"]);
+    let clone = root.join("clone");
+    git_in(
+        root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf-8 upstream path"),
+            clone.to_str().expect("utf-8 clone path"),
+        ],
+    );
+    git_in(&clone, &["switch", "-q", "-c", "chore/workspace"]);
+    let base = crate::git::worktrees_base();
+    std::fs::create_dir_all(&base).expect("create managed root");
+    let default = base.join("default");
+    git_in(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            default.to_str().expect("utf-8 default path"),
+            "main",
+        ],
+    );
+    let managed = base.join("managed");
+    git_in(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/kept",
+            managed.to_str().expect("utf-8 managed path"),
+        ],
+    );
+    let reported = |path: &Path| {
+        crate::git::discover_repository(path)
+            .expect("discover worktree")
+            .selected_worktree
+            .path
+    };
+    let snapshot = crate::git::discover_repository(&clone).expect("discover clone");
+    ClonedTopology {
+        upstream,
+        clone: snapshot.main_worktree,
+        default_worktree: reported(&default),
+        managed_worktree: reported(&managed),
+        common_dir: snapshot.common_dir,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

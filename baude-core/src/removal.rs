@@ -2708,4 +2708,51 @@ mod tests {
         assert_eq!(calls.get(), 0);
         assert_eq!(handles.0.len(), 1);
     }
+
+    // ---- integration matrix over the cloned fixture (plan 06) ----
+
+    use crate::testing::{cloned_topology, git_in};
+
+    #[test]
+    fn cloned_topology_places_worktrees_under_managed_root() {
+        let f = RemovalFixture::new("cloned-placement");
+        let t = cloned_topology(&f.root);
+        let base = fs::canonicalize(crate::git::worktrees_base()).expect("canonical managed root");
+        assert!(
+            t.default_worktree.starts_with(&base),
+            "{} must sit under {}",
+            t.default_worktree.display(),
+            base.display()
+        );
+        assert!(
+            t.managed_worktree.starts_with(&base),
+            "{} must sit under {}",
+            t.managed_worktree.display(),
+            base.display()
+        );
+        assert!(
+            !t.clone.starts_with(&base),
+            "the clone {} must stay outside the managed root",
+            t.clone.display()
+        );
+        let refs = git_in(
+            &t.clone,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        for branch in [
+            "refs/heads/main",
+            "refs/heads/chore/workspace",
+            "refs/heads/feature/kept",
+        ] {
+            assert!(refs.contains(branch), "{branch} missing from {refs:?}");
+        }
+        let listed = git_in(&t.clone, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        assert_eq!(
+            listed, 3,
+            "clone, default and managed worktrees must be listed"
+        );
+    }
 }
