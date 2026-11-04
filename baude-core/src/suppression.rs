@@ -6,23 +6,140 @@
 //! schema; a corrupt or absent file reads as empty and never fails a launch.
 //! Entries are kept until lifted by an explicit admission of that exact path
 //! or garbage-collected when the parent repository row is removed.
+//!
+//! The store lives beside the breadcrumbs file under the config dir as
+//! `suppressed-admissions-<workspace>.json`, keyed by
+//! [`folder_key`] of the canonical checkout path. It never reads or writes
+//! the schema-locked state file; every write goes through the shared
+//! advisory-lock merge path so parallel TUIs never clobber each other. The
+//! store can only suppress, never admit: a tampered entry hides a worktree
+//! until the next explicit admission of that exact path lifts it.
+//!
+//! All helpers take the config root explicitly so callers pass
+//! `persist::config_dir()` and tests pass a scratch dir.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::breadcrumbs::{folder_key, load_json, locked_merge_write};
+
+pub const SCHEMA_VERSION: u32 = 1;
+/// Base name; the on-disk file is `suppressed-admissions-<workspace>.json`.
+pub const FILE_BASE: &str = "suppressed-admissions";
+
+fn schema_version_default() -> u32 {
+    SCHEMA_VERSION
+}
+
+/// Whole-file shape. No `deny_unknown_fields`: additive evolution is expected
+/// and an older baude reading a newer file must not treat it as corrupt.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SuppressionFile {
+    #[serde(default = "schema_version_default")]
+    pub schema_version: u32,
+    /// Keyed by the canonical checkout path (lossy UTF-8).
+    #[serde(default)]
+    pub entries: BTreeMap<String, SuppressionEntry>,
+}
+
+/// One suppressed checkout path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SuppressionEntry {
+    /// `folder_key` of the surviving repository's common dir, so the entry
+    /// can be garbage-collected when that repository row is removed.
+    pub repository_common_dir: String,
+    #[serde(default)]
+    pub suppressed_ms: u64,
+}
+
+/// The per-workspace file name, like the breadcrumbs file.
+fn file_name() -> String {
+    crate::workspace::active().state_file(FILE_BASE)
+}
+
+/// Where the store lives under `root` for the active workspace.
+pub fn file_path(root: &Path) -> PathBuf {
+    root.join(file_name())
+}
+
+/// The store as it is on disk right now; absent or corrupt reads as empty.
+fn current(root: &Path) -> SuppressionFile {
+    load_json::<SuppressionFile>(&file_path(root)).0
+}
+
+/// Whether `path` is currently suppressed. Exact `folder_key` match only; a
+/// parent or sibling entry does not suppress it. Never errors: an absent or
+/// corrupt file reads as empty so a bad store cannot fail a launch.
+pub fn is_suppressed(root: &Path, path: &Path) -> bool {
+    current(root).entries.contains_key(&folder_key(path))
+}
+
+/// Forget the entry for exactly `path`. Returns `Ok(true)` when an entry was
+/// removed and `Ok(false)` without writing when the key or the file is
+/// absent, so an untouched file stays byte-identical and an absent file
+/// stays absent. Other entries are left intact.
+pub fn lift(root: &Path, path: &Path) -> io::Result<bool> {
+    let key = folder_key(path);
+    if !current(root).entries.contains_key(&key) {
+        return Ok(false);
+    }
+    locked_merge_write(root, &file_name(), |merged: &mut SuppressionFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged.entries.remove(&key);
+    })?;
+    Ok(true)
+}
+
+/// Record that `path` was removed while the repository at `common_dir`
+/// survived. A later entry for the same path replaces the earlier one.
+pub fn suppress(root: &Path, path: &Path, common_dir: &Path, now_ms: u64) -> io::Result<()> {
+    let key = folder_key(path);
+    let entry = SuppressionEntry {
+        repository_common_dir: folder_key(common_dir),
+        suppressed_ms: now_ms,
+    };
+    locked_merge_write(root, &file_name(), |merged: &mut SuppressionFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged.entries.insert(key, entry);
+    })
+}
+
+/// Garbage-collect every entry whose `repository_common_dir` is
+/// `folder_key(common_dir)`, returning how many were dropped. Writes nothing
+/// when there are none.
+pub fn drop_children(root: &Path, common_dir: &Path) -> io::Result<usize> {
+    let common = folder_key(common_dir);
+    let count = current(root)
+        .entries
+        .values()
+        .filter(|entry| entry.repository_common_dir == common)
+        .count();
+    if count == 0 {
+        return Ok(0);
+    }
+    locked_merge_write(root, &file_name(), |merged: &mut SuppressionFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged
+            .entries
+            .retain(|_, entry| entry.repository_common_dir != common);
+    })?;
+    Ok(count)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::breadcrumbs::folder_key;
     use crate::persist::Config;
     use crate::testing::TestRedirect;
-    use std::path::{Path, PathBuf};
-
     const WORKSPACE: &str = "suppression-ws";
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
     fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "baude-suppression-{name}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("baude-suppression-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
