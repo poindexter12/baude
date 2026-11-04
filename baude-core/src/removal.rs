@@ -2711,7 +2711,7 @@ mod tests {
 
     // ---- integration matrix over the cloned fixture (plan 06) ----
 
-    use crate::testing::{cloned_topology, git_in};
+    use crate::testing::{cloned_topology, git_in, ClonedTopology};
 
     #[test]
     fn cloned_topology_places_worktrees_under_managed_root() {
@@ -2754,5 +2754,285 @@ mod tests {
             listed, 3,
             "clone, default and managed worktrees must be listed"
         );
+    }
+
+    use crate::repository::CheckoutHealth;
+
+    /// Sorted `refname objectname` lines for every local branch. Never `git
+    /// branch --list`: its `+` and `*` decorations legitimately change when a
+    /// linked worktree disappears, which is exactly what these tests do.
+    fn branch_snapshot(repo: &Path) -> Vec<String> {
+        let mut lines: Vec<String> = git_in(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect();
+        lines.sort();
+        lines
+    }
+
+    /// The rows the cloned topology seeds: repository `k`, Main `m` at the
+    /// clone, managed PrimaryDefault `d` and managed ManagedBranch `b`.
+    struct ClonedRows {
+        k: RepositoryKey,
+        m: CheckoutKey,
+        d: CheckoutKey,
+        b: CheckoutKey,
+    }
+
+    /// Seed the topology through plan 01's builders: one role of each kind,
+    /// distinct paths, the common dir discovery reported for the clone.
+    fn seed_cloned(state: &mut RepositoryState, t: &ClonedTopology) -> ClonedRows {
+        let k = state.allocate_repository_key().expect("repository key");
+        let order = state.allocate_first_seen_order().expect("order");
+        state.repositories.push(SavedRepository {
+            key: k,
+            observed_common_dir: persisted(&t.common_dir),
+            observed_main_worktree: persisted(&t.clone),
+            first_seen_order: order,
+            health: RepositoryHealth::Available,
+            physical_key: String::new(),
+        });
+        let m = checkout(state, k, CheckoutRole::Main, false, &t.clone);
+        let d = checkout(
+            state,
+            k,
+            CheckoutRole::PrimaryDefault,
+            true,
+            &t.default_worktree,
+        );
+        let b = checkout(
+            state,
+            k,
+            CheckoutRole::ManagedBranch,
+            true,
+            &t.managed_worktree,
+        );
+        ClonedRows { k, m, d, b }
+    }
+
+    /// A second linked worktree of the clone, outside the managed root, on
+    /// `feature/outside`: the shape of a checkout baude did not create.
+    fn outside_worktree(f: &RemovalFixture, t: &ClonedTopology) -> PathBuf {
+        let path = f.root.join("outside-wt");
+        git_in(
+            &t.clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/outside",
+                path.to_str().expect("utf-8 outside path"),
+            ],
+        );
+        fs::canonicalize(&path).expect("canonicalize outside worktree")
+    }
+
+    /// A standalone folder with one file, and its row in `state`.
+    fn notes_folder(f: &RemovalFixture) -> PathBuf {
+        let notes = f.root.join("notes");
+        fs::create_dir_all(&notes).expect("create notes folder");
+        fs::write(notes.join("todo.md"), b"- keep me\n").expect("write notes file");
+        notes
+    }
+
+    fn seed_notes(
+        state: &mut RepositoryState,
+        notes: &Path,
+        lifecycle: StandaloneLifecycle,
+        runtime: Option<OwnedRuntime>,
+    ) -> StandaloneKey {
+        let key = state.allocate_standalone_key().expect("standalone key");
+        let order = state.allocate_first_seen_order().expect("order");
+        state.standalone_sessions.push(SavedStandaloneSession::new(
+            key,
+            persisted(notes),
+            order,
+            lifecycle,
+            runtime,
+            RetainedStandaloneSessionState {
+                name: "notes".into(),
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+                ever_launched: false,
+            },
+        ));
+        key
+    }
+
+    fn no_handles() -> Vec<RowRuntime> {
+        Vec::new()
+    }
+
+    #[test]
+    fn main_checkout_keeps_directory_and_branches() {
+        let f = RemovalFixture::new("cloned-main-kept");
+        let t = cloned_topology(&f.root);
+        let before = branch_snapshot(&t.clone);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(rows.m),
+            &mut handles,
+            save,
+        )
+        .expect("remove main checkout");
+
+        assert!(t.clone.exists(), "the main checkout must stay on disk");
+        assert!(t.clone.join("tracked").exists());
+        assert_eq!(report.paths_kept, vec![t.clone.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!has_checkout(&state, rows.m));
+        assert!(has_checkout(&state, rows.d));
+        assert!(has_checkout(&state, rows.b));
+        assert!(state.repositories.iter().any(|r| r.key == rows.k));
+        state.validate().expect("state validates after removal");
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn standalone_keeps_folder() {
+        let f = RemovalFixture::new("standalone-kept");
+        let notes = notes_folder(&f);
+        let mut state = RepositoryState::default();
+        let key = seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles,
+            save,
+        )
+        .expect("remove standalone");
+
+        assert!(notes.exists(), "the standalone folder must stay on disk");
+        assert!(notes.join("todo.md").exists());
+        assert_eq!(report.paths_kept, vec![notes.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(state.standalone_sessions.is_empty());
+        assert!(load_state(&f.state_root()).standalone_sessions.is_empty());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn already_removed_managed_directory_drops_row() {
+        let f = RemovalFixture::new("cloned-already-removed");
+        let t = cloned_topology(&f.root);
+        let oid_before = git_in(&t.clone, &["rev-parse", "feature/kept"]);
+        fs::remove_dir_all(&t.managed_worktree).expect("remove managed directory without prune");
+        let wt_text = t.managed_worktree.to_str().expect("utf-8");
+
+        // Part A: an Inactive row whose directory is gone.
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(rows.b),
+            &mut handles,
+            save,
+        )
+        .expect("already-removed inactive row");
+        assert_eq!(report.already_removed, vec![t.managed_worktree.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!has_checkout(&state, rows.b));
+        assert!(!has_checkout(&load_state(&f.state_root()), rows.b));
+        assert!(
+            !worktree_list(&t.clone).contains(wt_text),
+            "the administrative entry must be pruned"
+        );
+        assert_eq!(git_in(&t.clone, &["rev-parse", "feature/kept"]), oid_before);
+        assert_eq!(calls.get(), 1);
+
+        // Part B: the same row already Protected(Missing), on a fresh state.
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        checkout_mut(&mut state, rows.b)
+            .set_lifecycle(CheckoutLifecycle::Protected(UnavailableCause::Missing));
+        assert_eq!(
+            checkout_mut(&mut state, rows.b).health(),
+            &CheckoutHealth::Unavailable(UnavailableCause::Missing)
+        );
+        state
+            .validate_for_save()
+            .expect("protected seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(rows.b),
+            &mut handles,
+            save,
+        )
+        .expect("already-removed protected row");
+        assert_eq!(report.already_removed, vec![t.managed_worktree.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!has_checkout(&state, rows.b));
+        assert!(!has_checkout(&load_state(&f.state_root()), rows.b));
+        assert!(!worktree_list(&t.clone).contains(wt_text));
+        assert_eq!(git_in(&t.clone, &["rev-parse", "feature/kept"]), oid_before);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unmanaged_checkout_keeps_directory() {
+        let f = RemovalFixture::new("cloned-unmanaged-kept");
+        let t = cloned_topology(&f.root);
+        let outside = outside_worktree(&f, &t);
+        let outside_text = outside.to_str().expect("utf-8");
+        let before = branch_snapshot(&t.clone);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let x = checkout(
+            &mut state,
+            rows.k,
+            CheckoutRole::ManagedBranch,
+            false,
+            &outside,
+        );
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Checkout(x), &mut handles, save)
+            .expect("remove unmanaged checkout");
+
+        assert!(outside.exists(), "the unmanaged checkout must stay on disk");
+        assert!(outside.join("tracked").exists());
+        assert_eq!(report.paths_kept, vec![outside.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(
+            worktree_list(&t.clone).contains(outside_text),
+            "nothing may be pruned for an unmanaged checkout"
+        );
+        assert!(!has_checkout(&state, x));
+        assert!(has_checkout(&state, rows.m));
+        assert!(has_checkout(&state, rows.d));
+        assert!(has_checkout(&state, rows.b));
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert!(before
+            .iter()
+            .any(|line| line.starts_with("refs/heads/feature/outside ")));
+        assert_eq!(calls.get(), 1);
     }
 }
