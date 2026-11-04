@@ -3035,4 +3035,384 @@ mod tests {
             .any(|line| line.starts_with("refs/heads/feature/outside ")));
         assert_eq!(calls.get(), 1);
     }
+
+    // ---- live keep rows, unclean cwd-held deletion, parent fan-out (plan 06) ----
+
+    /// Make a worktree unclean the way a working session leaves it: one
+    /// untracked file and one modified tracked file.
+    fn make_unclean(worktree: &Path, tracked: &str) {
+        fs::write(worktree.join("scratch.txt"), b"untracked\n").expect("write untracked file");
+        fs::write(worktree.join(tracked), b"modified\n").expect("modify tracked file");
+        assert!(
+            !git_in(worktree, &["status", "--porcelain"]).is_empty(),
+            "worktree must report as unclean"
+        );
+    }
+
+    #[test]
+    fn live_main_checkout_runtime_is_killed_and_directory_kept() {
+        let f = RemovalFixture::new("cloned-live-main");
+        let t = cloned_topology(&f.root);
+        let before = branch_snapshot(&t.clone);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let pty = spawn_trapping_runtime(&t.clone);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        seed_live(&mut state, rows.m, &pty, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(rows.m),
+            pty,
+            None,
+            &t.clone,
+            &t.clone,
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(rows.m),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove live main checkout");
+
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert!(t.clone.exists(), "the main checkout must stay on disk");
+        assert!(t.clone.join("tracked").exists());
+        assert_eq!(report.paths_kept, vec![t.clone.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert_eq!(report.runtimes_killed[0].agent_pid, pid);
+        assert!(handles.0.is_empty(), "the consumed handle must be gone");
+        assert!(!has_checkout(&state, rows.m));
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn live_standalone_runtime_is_killed_and_folder_kept() {
+        let f = RemovalFixture::new("standalone-live");
+        let notes = notes_folder(&f);
+        let pty = spawn_trapping_runtime(&notes);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let runtime = OwnedRuntime {
+            generation: RuntimeGeneration::initial(),
+            agent: pty.process_identity().clone(),
+            shell: ShellOwnership::Closed,
+        };
+        let mut state = RepositoryState::default();
+        let key = seed_notes(
+            &mut state,
+            &notes,
+            StandaloneLifecycle::Running(RuntimeGeneration::initial()),
+            Some(runtime),
+        );
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Standalone(key),
+            pty,
+            None,
+            &notes,
+            &notes,
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove live standalone");
+
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert!(notes.exists(), "the standalone folder must stay on disk");
+        assert!(notes.join("todo.md").exists());
+        assert_eq!(report.paths_kept, vec![notes.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert!(handles.0.is_empty(), "the consumed handle must be gone");
+        assert!(state.standalone_sessions.is_empty());
+        assert!(load_state(&f.state_root()).standalone_sessions.is_empty());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn live_unmanaged_checkout_runtime_is_killed_and_directory_kept() {
+        let f = RemovalFixture::new("cloned-live-unmanaged");
+        let t = cloned_topology(&f.root);
+        let outside = outside_worktree(&f, &t);
+        let outside_text = outside.to_str().expect("utf-8");
+        let before = branch_snapshot(&t.clone);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let x = checkout(
+            &mut state,
+            rows.k,
+            CheckoutRole::ManagedBranch,
+            false,
+            &outside,
+        );
+        let pty = spawn_trapping_runtime(&outside);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        seed_live(&mut state, x, &pty, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(x),
+            pty,
+            None,
+            &outside,
+            &t.clone,
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Checkout(x), &mut handles.0, save)
+            .expect("remove live unmanaged checkout");
+
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert!(outside.exists(), "the unmanaged checkout must stay on disk");
+        assert!(outside.join("tracked").exists());
+        assert_eq!(report.paths_kept, vec![outside.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert_eq!(report.runtimes_killed[0].agent_pid, pid);
+        assert!(
+            worktree_list(&t.clone).contains(outside_text),
+            "the unmanaged registration must survive"
+        );
+        assert!(handles.0.is_empty(), "the consumed handle must be gone");
+        assert!(!has_checkout(&state, x));
+        assert!(has_checkout(&state, rows.m));
+        assert!(has_checkout(&state, rows.d));
+        assert!(has_checkout(&state, rows.b));
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn git_init_unclean_cwd_held_managed_is_deleted_and_main_kept() {
+        let f = RemovalFixture::new("init-unclean-held");
+        let wt_a = f.managed_worktree("wt-a", "feature/a");
+        let wt_text = wt_a.to_str().expect("utf-8");
+        make_unclean(&wt_a, "tracked.txt");
+        let oid_before = git_ok(&f.repo(), &["rev-parse", "feature/a"]);
+        let before = branch_snapshot(&f.repo());
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        let main = checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        let managed = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &wt_a);
+        let pty = spawn_trapping_runtime(&wt_a);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        seed_live(&mut state, managed, &pty, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(managed),
+            pty,
+            None,
+            &wt_a,
+            &f.repo(),
+        )]);
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(main),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove main checkout");
+        assert!(f.repo().exists(), "the main checkout must stay on disk");
+        assert!(f.repo().join("tracked.txt").exists());
+        assert_eq!(report.paths_kept, vec![f.repo()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(report.runtimes_killed.is_empty());
+        assert!(
+            group_is_alive(pgid),
+            "the managed runtime must survive the main removal"
+        );
+        assert_eq!(
+            handles.0.len(),
+            1,
+            "the managed handle must not be consumed"
+        );
+        assert_eq!(branch_snapshot(&f.repo()), before);
+        assert_eq!(calls.get(), 1);
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(managed),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove unclean cwd-held managed checkout");
+        assert!(!wt_a.exists(), "the managed directory must be deleted");
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert_eq!(report.paths_deleted, vec![wt_a.clone()]);
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert_eq!(git_ok(&f.repo(), &["rev-parse", "feature/a"]), oid_before);
+        assert!(
+            !worktree_list(&f.repo()).contains(wt_text),
+            "the managed registration must be gone"
+        );
+        assert!(handles.0.is_empty());
+        assert!(!has_checkout(&state, managed));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn managed_worktree_unclean_and_cwd_held_is_deleted() {
+        let f = RemovalFixture::new("cloned-unclean-held");
+        let t = cloned_topology(&f.root);
+        let wt_text = t.managed_worktree.to_str().expect("utf-8");
+        make_unclean(&t.managed_worktree, "tracked");
+        let before = branch_snapshot(&t.clone);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let pty = spawn_trapping_runtime(&t.managed_worktree);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        seed_live(&mut state, rows.b, &pty, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(rows.b),
+            pty,
+            None,
+            &t.managed_worktree,
+            &t.clone,
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Checkout(rows.b),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove unclean cwd-held managed checkout");
+
+        assert!(
+            !t.managed_worktree.exists(),
+            "the managed directory must be deleted"
+        );
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert_eq!(report.paths_deleted, vec![t.managed_worktree.clone()]);
+        assert!(report.paths_kept.is_empty());
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert!(
+            !worktree_list(&t.clone).contains(wt_text),
+            "the managed registration must be gone"
+        );
+        assert!(handles.0.is_empty());
+        assert!(!has_checkout(&state, rows.b));
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn repository_removes_children_then_parent() {
+        let f = RemovalFixture::new("cloned-fan-out");
+        let t = cloned_topology(&f.root);
+        let outside = outside_worktree(&f, &t);
+        let outside_text = outside.to_str().expect("utf-8");
+        let default_text = t.default_worktree.to_str().expect("utf-8");
+        let managed_text = t.managed_worktree.to_str().expect("utf-8");
+        let before = branch_snapshot(&t.clone);
+        assert_eq!(
+            before.len(),
+            4,
+            "main, chore/workspace, feature/kept, feature/outside"
+        );
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let x = checkout(
+            &mut state,
+            rows.k,
+            CheckoutRole::ManagedBranch,
+            false,
+            &outside,
+        );
+        let pty = spawn_trapping_runtime(&t.default_worktree);
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        seed_live(&mut state, rows.d, &pty, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(rows.d),
+            pty,
+            None,
+            &t.default_worktree,
+            &t.clone,
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Repository(rows.k),
+            &mut handles.0,
+            save,
+        )
+        .expect("remove repository");
+
+        assert_eq!(
+            report.rows_removed.last(),
+            Some(&RowKey::Repository(rows.k))
+        );
+        let children = &report.rows_removed[..report.rows_removed.len() - 1];
+        for child in [rows.m, rows.d, rows.b, x] {
+            assert!(
+                children.contains(&RowKey::Checkout(child)),
+                "{child:?} must be removed before the parent"
+            );
+        }
+        assert!(t.clone.exists(), "the main checkout must stay on disk");
+        assert!(outside.exists(), "the unmanaged checkout must stay on disk");
+        assert!(outside.join("tracked").exists());
+        assert!(
+            !t.default_worktree.exists(),
+            "the default worktree must be deleted"
+        );
+        assert!(
+            !t.managed_worktree.exists(),
+            "the managed worktree must be deleted"
+        );
+        assert_eq!(report.paths_kept, vec![t.clone.clone(), outside.clone()]);
+        assert_eq!(
+            report.paths_deleted,
+            vec![t.default_worktree.clone(), t.managed_worktree.clone()]
+        );
+        let list = worktree_list(&t.clone);
+        assert!(
+            list.contains(outside_text),
+            "the unmanaged registration must survive"
+        );
+        assert!(
+            !list.contains(default_text),
+            "the default registration must be gone"
+        );
+        assert!(
+            !list.contains(managed_text),
+            "the managed registration must be gone"
+        );
+        assert!(group_is_extinct(pgid), "group {pgid} must be extinct");
+        assert_reaped_promptly(pid);
+        assert_eq!(report.runtimes_killed.len(), 1);
+        assert!(handles.0.is_empty());
+        assert!(!state.repositories.iter().any(|r| r.key == rows.k));
+        assert!(!state.checkouts.iter().any(|c| c.repository_key == rows.k));
+        state.validate().expect("state validates after fan-out");
+        assert_eq!(load_state(&f.state_root()), state);
+        assert_eq!(branch_snapshot(&t.clone), before);
+        assert_eq!(calls.get(), 1);
+    }
 }
