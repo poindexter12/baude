@@ -912,9 +912,31 @@ mod tests {
     };
     use std::fs;
 
+    /// The workspace identity every fixture here pins, so the stage's
+    /// per-workspace artefacts (`repository-<key>` directories, the
+    /// suppression store) resolve under the fixture's redirect instead of
+    /// aborting the test.
+    const WORKSPACE: &str = "removal-ws";
+
+    /// Acquired AFTER the fixture's `TestRedirect` and declared BEFORE it in
+    /// every fixture struct, so identity is restored before the root it was
+    /// resolved against.
+    fn fixture_identity() -> crate::testing::TestRedirect {
+        crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some(WORKSPACE.to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        )
+    }
+
     /// Per-test fixture root under the temp dir, removed on drop so a failing
-    /// assertion still cleans up.
+    /// assertion still cleans up. Redirected and given an identity because
+    /// `preview_removal` reads the suppression store under the config dir.
     struct TempTree {
+        _identity: crate::testing::TestRedirect,
+        _redirect: crate::testing::TestRedirect,
         root: PathBuf,
     }
 
@@ -924,7 +946,13 @@ mod tests {
                 std::env::temp_dir().join(format!("baude-removal-{}-{label}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create fixture root");
-            Self { root }
+            let redirect = crate::testing::TestRedirect::new(&root);
+            let identity = fixture_identity();
+            Self {
+                _identity: identity,
+                _redirect: redirect,
+                root,
+            }
         }
 
         /// A directory that exists on disk.
@@ -1452,6 +1480,7 @@ mod tests {
     /// declared before `root` so it is still installed while the root is
     /// torn down.
     struct RemovalFixture {
+        _identity: crate::testing::TestRedirect,
         _redirect: crate::testing::TestRedirect,
         root: PathBuf,
     }
@@ -1464,7 +1493,9 @@ mod tests {
             fs::create_dir_all(&root).expect("create fixture root");
             let root = fs::canonicalize(&root).expect("canonicalize fixture root");
             let redirect = crate::testing::TestRedirect::new(&root);
+            let identity = fixture_identity();
             let fixture = Self {
+                _identity: identity,
                 _redirect: redirect,
                 root,
             };
@@ -3854,10 +3885,16 @@ mod tests {
         assert_eq!(after.folders.get(&main_key), Some(&main_before));
         assert_eq!(
             report.cleared,
-            vec![ClearedItem {
-                kind: ClearingKind::Binding,
-                path: outside.clone(),
-            }]
+            vec![
+                ClearedItem {
+                    kind: ClearingKind::Binding,
+                    path: outside.clone(),
+                },
+                ClearedItem {
+                    kind: ClearingKind::SuppressionAdded,
+                    path: outside.clone(),
+                },
+            ]
         );
         assert!(report.clearing_failures.is_empty());
         assert!(has_checkout(&state, rows.m));
@@ -4003,6 +4040,595 @@ mod tests {
             .repositories
             .iter()
             .any(|r| r.key == k));
+        assert_eq!(calls.get(), 1);
+    }
+
+    // ---- markers, managed directories and suppression (phase 19 plan 04) ----
+
+    use crate::marker::{self, MarkerMetadata, MarkerRead};
+    use crate::suppression::{self, SuppressionFile};
+    use std::os::unix::ffi::OsStrExt;
+
+    /// The marker file name `marker.rs` writes; private there, spelled out
+    /// here so a test can read the raw bytes the way a byte-identity check
+    /// must.
+    const MARKER_FILE_NAME: &str = ".baude-marker.json";
+
+    /// Where the stage expects a repository row's managed directory:
+    /// `worktrees_base()/<workspace>/repository-<key>`.
+    fn repository_dir_for(key: &str) -> PathBuf {
+        crate::git::worktrees_base()
+            .join(WORKSPACE)
+            .join(format!("repository-{key}"))
+    }
+
+    /// A managed repository directory whose marker names `owner` as its
+    /// common dir, the way `ensure_repository` leaves one behind.
+    fn owned_repository_dir(key: &str, owner: &Path) -> PathBuf {
+        let dir = repository_dir_for(key);
+        fs::create_dir_all(&dir).expect("create repository dir");
+        marker::write_marker(
+            &dir,
+            &MarkerMetadata {
+                canonical_common_dir: PersistedPath::from_path(owner).as_bytes().to_vec(),
+                scheme_version: 1,
+                recorded_at_ms: 1,
+            },
+        )
+        .expect("write marker");
+        dir
+    }
+
+    fn marker_bytes(dir: &Path) -> Vec<u8> {
+        fs::read(dir.join(MARKER_FILE_NAME)).expect("read marker bytes")
+    }
+
+    fn set_physical_key(state: &mut RepositoryState, key: RepositoryKey, physical_key: &str) {
+        state
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.key == key)
+            .expect("repository row")
+            .physical_key = physical_key.to_string();
+    }
+
+    /// The digest `ensure_repository` recomputes for a common dir.
+    fn digest_of(common_dir: &Path) -> String {
+        crate::repository::compute_repository_digest(common_dir.as_os_str().as_bytes())
+    }
+
+    /// A second real repository under `root` with its own common dir and a
+    /// commit, so a neighbour row has the same shape as the fixture's.
+    fn init_repo(root: &Path, name: &str) -> PathBuf {
+        git_ok(root, &["init", "-q", "-b", "main", name]);
+        let repo = root.join(name);
+        git_ok(&repo, &["config", "user.name", "Baude Test"]);
+        git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+        fs::write(repo.join("tracked.txt"), b"neighbour\n").expect("write tracked file");
+        git_ok(&repo, &["add", "tracked.txt"]);
+        git_ok(&repo, &["commit", "-q", "-m", "neighbour"]);
+        repo
+    }
+
+    /// The suppression store under the redirected config dir, read the way
+    /// `is_suppressed` reads it.
+    fn suppressions_on_disk() -> SuppressionFile {
+        load_json::<SuppressionFile>(&suppression::file_path(&crate::persist::config_dir())).0
+    }
+
+    /// Sorted entry names of a directory, for before/after identity checks.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn cleared_of(report: &RemovalReport, kind: ClearingKind) -> Vec<PathBuf> {
+        report
+            .cleared
+            .iter()
+            .filter(|item| item.kind == kind)
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
+    fn failures_of(report: &RemovalReport, kind: ClearingKind) -> Vec<&ClearingFailure> {
+        report
+            .clearing_failures
+            .iter()
+            .filter(|failure| failure.kind == kind)
+            .collect()
+    }
+
+    /// D-14: every kind/path the real run cleared or failed to clear was
+    /// named by the preview, so Phase 20 can show the user what will go.
+    fn assert_preview_covers(preview: &RemovalReport, report: &RemovalReport) {
+        for (kind, path) in report
+            .cleared
+            .iter()
+            .map(|item| (item.kind, &item.path))
+            .chain(
+                report
+                    .clearing_failures
+                    .iter()
+                    .map(|failure| (failure.kind, &failure.path)),
+            )
+        {
+            assert!(
+                preview
+                    .cleared
+                    .iter()
+                    .any(|item| item.kind == kind && &item.path == path),
+                "real run touched {kind:?} {} that the preview did not name",
+                path.display()
+            );
+        }
+    }
+
+    /// READM-02: the removed repository's owned marker and directory go, and
+    /// the next admission of the same repository sees no owner there, reports
+    /// no collision and allocates the un-suffixed digest with a fresh marker.
+    #[test]
+    fn repository_removal_clears_owned_marker_and_directory() {
+        let f = RemovalFixture::new("marker-owned");
+        let common = f.common_dir();
+        let digest = digest_of(&common);
+        let dir = owned_repository_dir(&digest, &common);
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, &digest);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository");
+
+        assert_eq!(cleared_of(&report, ClearingKind::Marker), vec![dir.clone()]);
+        assert_eq!(
+            cleared_of(&report, ClearingKind::RepositoryDir),
+            vec![dir.clone()]
+        );
+        assert!(report.clearing_failures.is_empty());
+        assert!(!dir.exists(), "the owned repository directory is gone");
+        assert_eq!(
+            marker::read_marker(&dir).expect("read cleared marker"),
+            MarkerRead::Missing
+        );
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+
+        let snapshot = crate::git::discover_repository(&f.repo()).expect("discover");
+        let (new_key, collision) =
+            crate::lifecycle::ensure_repository(&mut state, &snapshot).expect("re-admit");
+        assert_eq!(collision, None, "the cleared directory has no owner to collide with");
+        assert_ne!(new_key, k);
+        let row = state
+            .repositories
+            .iter()
+            .find(|repository| repository.key == new_key)
+            .expect("re-admitted row");
+        assert_eq!(row.physical_key, digest);
+        match marker::read_marker(&dir).expect("read fresh marker") {
+            MarkerRead::Valid(meta) => assert_eq!(
+                meta.canonical_common_dir,
+                PersistedPath::from_path(&common).as_bytes()
+            ),
+            other => panic!("expected a fresh valid marker, got {other:?}"),
+        }
+    }
+
+    /// D-04 and READM-03: removing one child under a surviving parent leaves
+    /// the parent's marker and directory alone and records the child path for
+    /// suppression, keyed to the parent's common dir.
+    #[test]
+    fn child_removal_keeps_parent_marker_and_writes_suppression() {
+        let f = RemovalFixture::new("child-suppressed");
+        let common = f.common_dir();
+        let dir = owned_repository_dir("parent-key", &common);
+        let managed = f.managed_worktree("wt-child", "feature/child");
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, "parent-key");
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        let c = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
+        state.validate_for_save().expect("seed is save-valid");
+        let config = crate::persist::config_dir();
+        let marker_before = marker_bytes(&dir);
+        assert!(!suppression::file_path(&config).exists());
+        let preview = preview_removal(&state, RemovalTarget::Checkout(c)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Checkout(c), &mut handles, save)
+            .expect("remove child");
+
+        assert!(cleared_of(&report, ClearingKind::Marker).is_empty());
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert_eq!(marker_bytes(&dir), marker_before);
+        assert!(dir.is_dir(), "the parent's directory stays");
+        assert!(suppression::is_suppressed(&config, &managed));
+        let file = suppressions_on_disk();
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(
+            file.entries[&folder_key(&managed)].repository_common_dir,
+            folder_key(&common)
+        );
+        assert_eq!(
+            cleared_of(&report, ClearingKind::SuppressionAdded),
+            vec![managed.clone()]
+        );
+        assert!(cleared_of(&report, ClearingKind::SuppressionDropped).is_empty());
+        assert!(!managed.exists());
+        assert!(state.repositories.iter().any(|r| r.key == k));
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+    }
+
+    /// D-10: a parent removal garbage-collects its children's entries and
+    /// writes none of its own; a standalone removal never touches the store.
+    #[test]
+    fn repository_removal_drops_child_suppression_and_standalone_writes_none() {
+        // Part A: a legacy row with an empty physical_key; its children's
+        // entries go, a neighbour's entry stays, no marker work is planned.
+        let f = RemovalFixture::new("drop-children");
+        let config = crate::persist::config_dir();
+        let common = f.common_dir();
+        let managed = f.managed_worktree("wt-child", "feature/child");
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
+        state.validate_for_save().expect("seed is save-valid");
+        let old_child = f.root.join("old-child");
+        let other_common = f.root.join("other").join(".git");
+        let other_child = f.root.join("other-child");
+        suppression::suppress(&config, &old_child, &common, 1).expect("seed child entry");
+        suppression::suppress(&config, &other_child, &other_common, 2)
+            .expect("seed neighbour entry");
+        let other_before = suppressions_on_disk().entries[&folder_key(&other_child)].clone();
+        let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository");
+
+        assert_eq!(
+            cleared_of(&report, ClearingKind::SuppressionDropped),
+            vec![common.clone()]
+        );
+        assert!(cleared_of(&report, ClearingKind::SuppressionAdded).is_empty());
+        assert!(cleared_of(&report, ClearingKind::Marker).is_empty());
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        assert!(report.clearing_failures.is_empty());
+        let after = suppressions_on_disk();
+        assert!(!after.entries.contains_key(&folder_key(&old_child)));
+        assert_eq!(
+            after.entries.get(&folder_key(&other_child)),
+            Some(&other_before)
+        );
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+        drop(f);
+
+        // Part B: a standalone removal writes no entry, so an absent store
+        // stays absent.
+        let f = RemovalFixture::new("standalone-no-entry");
+        let config = crate::persist::config_dir();
+        let notes = notes_folder(&f);
+        let mut state = RepositoryState::default();
+        let s = seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None);
+        state.validate_for_save().expect("seed is save-valid");
+        assert!(!suppression::file_path(&config).exists());
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Standalone(s), &mut handles, save)
+            .expect("remove standalone");
+
+        assert!(
+            !suppression::file_path(&config).exists(),
+            "an absent suppression store must stay absent"
+        );
+        assert!(report.cleared.is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert!(notes.exists());
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// D-06, D-07, D-14: a refusal and a non-empty directory are reported,
+    /// the directory stays, nothing recurses, and the removal is still Ok
+    /// with the state saved.
+    #[test]
+    fn marker_refusal_and_non_empty_dir_are_reported_not_raised() {
+        // Part A: the marker names another repository.
+        let f = RemovalFixture::new("marker-foreign");
+        let foreign_owner = f.root.join("elsewhere").join(".git");
+        let dir = owned_repository_dir("foreign-key", &foreign_owner);
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, "foreign-key");
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let before = marker_bytes(&dir);
+        let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository with a foreign marker");
+
+        let failures = failures_of(&report, ClearingKind::Marker);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, dir);
+        assert!(
+            failures[0].error.contains("ForeignOwner"),
+            "reason names the refusal: {}",
+            failures[0].error
+        );
+        assert_eq!(report.clearing_failures.len(), 1);
+        assert!(cleared_of(&report, ClearingKind::Marker).is_empty());
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        assert_eq!(marker_bytes(&dir), before);
+        assert!(dir.is_dir());
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert!(!state.repositories.iter().any(|r| r.key == k));
+        assert!(!load_state(&f.state_root())
+            .repositories
+            .iter()
+            .any(|r| r.key == k));
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+        drop(f);
+
+        // Part B: our marker next to a stray subdirectory.
+        let f = RemovalFixture::new("marker-stray");
+        let common = f.common_dir();
+        let dir = owned_repository_dir("stray-key", &common);
+        let stray = dir.join("stray");
+        fs::create_dir_all(&stray).expect("create stray dir");
+        fs::write(stray.join("keep.txt"), b"keep\n").expect("write stray file");
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, "stray-key");
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository with a stray subdirectory");
+
+        assert_eq!(cleared_of(&report, ClearingKind::Marker), vec![dir.clone()]);
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        let failures = failures_of(&report, ClearingKind::RepositoryDir);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, dir);
+        assert!(
+            failures[0].error.contains("not empty"),
+            "reason says why the directory stayed: {}",
+            failures[0].error
+        );
+        assert_eq!(report.clearing_failures.len(), 1);
+        assert!(stray.join("keep.txt").is_file(), "nothing recursed");
+        assert_eq!(
+            marker::read_marker(&dir).expect("read cleared marker"),
+            MarkerRead::Missing
+        );
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+    }
+
+    /// D-05 and T-19-10: the directory comes from the stored `physical_key`,
+    /// never a recomputed digest; an empty key is a legacy no-op and a key
+    /// that is not one path component is refused before any path exists.
+    #[test]
+    fn repository_dir_comes_from_stored_physical_key() {
+        // Part A: the row owns the suffixed collision directory while the
+        // un-suffixed sibling carries the same owner bytes, the trap a
+        // recomputed digest would fall into.
+        let f = RemovalFixture::new("key-suffixed");
+        let common = f.common_dir();
+        let digest = digest_of(&common);
+        let sibling = owned_repository_dir(&digest, &common);
+        let suffixed = owned_repository_dir(&format!("{digest}-2"), &common);
+        let sibling_before = marker_bytes(&sibling);
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, &format!("{digest}-2"));
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, _) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove suffixed repository");
+
+        assert_eq!(
+            cleared_of(&report, ClearingKind::Marker),
+            vec![suffixed.clone()]
+        );
+        assert_eq!(
+            cleared_of(&report, ClearingKind::RepositoryDir),
+            vec![suffixed.clone()]
+        );
+        assert!(report.clearing_failures.is_empty());
+        assert!(!suffixed.exists());
+        assert!(sibling.is_dir(), "the un-suffixed sibling survives");
+        assert_eq!(marker_bytes(&sibling), sibling_before);
+        drop(f);
+
+        // Part B: a legacy bare-counter row has no directory to clear, even
+        // when a bare `repository-` directory happens to exist.
+        let f = RemovalFixture::new("key-legacy");
+        let common = f.common_dir();
+        let bare = owned_repository_dir("", &common);
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, _) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove legacy repository");
+
+        assert!(cleared_of(&report, ClearingKind::Marker).is_empty());
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert!(bare.is_dir());
+        drop(f);
+
+        // Part C: a key that would escape the workspace directory is one
+        // failure and no filesystem change, with an owned marker planted at
+        // the path a naive join would reach.
+        let f = RemovalFixture::new("key-escape");
+        let common = f.common_dir();
+        let base = crate::git::worktrees_base();
+        let escape = base.join("escape");
+        fs::create_dir_all(&escape).expect("create escape dir");
+        marker::write_marker(
+            &escape,
+            &MarkerMetadata {
+                canonical_common_dir: PersistedPath::from_path(&common).as_bytes().to_vec(),
+                scheme_version: 1,
+                recorded_at_ms: 1,
+            },
+        )
+        .expect("write escape marker");
+        let ws_dir = base.join(WORKSPACE);
+        fs::create_dir_all(&ws_dir).expect("create workspace dir");
+        let base_before = listing(&base);
+        let ws_before = listing(&ws_dir);
+        let escape_before = marker_bytes(&escape);
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, k, "../escape");
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository with an unsafe key");
+
+        assert_eq!(report.clearing_failures.len(), 1);
+        assert_eq!(report.clearing_failures[0].kind, ClearingKind::Marker);
+        assert!(cleared_of(&report, ClearingKind::Marker).is_empty());
+        assert!(cleared_of(&report, ClearingKind::RepositoryDir).is_empty());
+        assert_eq!(listing(&base), base_before);
+        assert_eq!(listing(&ws_dir), ws_before);
+        assert_eq!(marker_bytes(&escape), escape_before);
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+        assert_preview_covers(&preview, &report);
+    }
+
+    /// READM-05 and D-15: two repositories bound to one workspace plus a
+    /// third with a managed worktree; removing one leaves every neighbour
+    /// artefact byte-identical and the preview names everything cleared.
+    #[test]
+    fn removal_leaves_neighbour_bindings_markers_worktrees_and_suppressions_byte_identical() {
+        let f = RemovalFixture::new("neighbours");
+        let config = crate::persist::config_dir();
+        let x = f.repo();
+        let x_common = f.common_dir();
+        let kept = f.managed_worktree("kept", "feature/kept");
+        let x_dir = owned_repository_dir("x-key", &x_common);
+        let a = init_repo(&f.root, "a");
+        let a_common = a.join(".git");
+        let b = init_repo(&f.root, "b");
+        let b_common = b.join(".git");
+        let a_dir = owned_repository_dir("a-key", &a_common);
+        let b_dir = owned_repository_dir("b-key", &b_common);
+        let mut state = RepositoryState::default();
+        let kx = seed_repository(&mut state, &f);
+        set_physical_key(&mut state, kx, "x-key");
+        checkout(&mut state, kx, CheckoutRole::Main, false, &x);
+        checkout(&mut state, kx, CheckoutRole::ManagedBranch, true, &kept);
+        let ka = repository(&mut state, &a);
+        set_physical_key(&mut state, ka, "a-key");
+        checkout(&mut state, ka, CheckoutRole::Main, false, &a);
+        let kb = repository(&mut state, &b);
+        set_physical_key(&mut state, kb, "b-key");
+        checkout(&mut state, kb, CheckoutRole::Main, false, &b);
+        state.validate_for_save().expect("seed is save-valid");
+        folder_workspace::record(Some(&config), &a, "shared", 10);
+        folder_workspace::record(Some(&config), &b, "shared", 20);
+        folder_workspace::record(Some(&config), &x, "x-ws", 30);
+        let a_child = f.root.join("a-child");
+        let b_child = f.root.join("b-child");
+        suppression::suppress(&config, &a_child, &a_common, 1).expect("seed a entry");
+        suppression::suppress(&config, &b_child, &b_common, 2).expect("seed b entry");
+
+        let bindings_before = bindings_on_disk();
+        let b_binding = bindings_before.folders[&folder_key(&b)].clone();
+        let x_binding = bindings_before.folders[&folder_key(&x)].clone();
+        let b_marker = marker_bytes(&b_dir);
+        let x_marker = marker_bytes(&x_dir);
+        let kept_listing = listing(&kept);
+        let managed_listing = listing(&f.managed_root());
+        let b_entry = suppressions_on_disk().entries[&folder_key(&b_child)].clone();
+        let preview = preview_removal(&state, RemovalTarget::Repository(ka)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(ka), &mut handles, save)
+            .expect("remove repository a");
+
+        // A is gone from every store, and its main worktree is kept on disk.
+        let bindings = bindings_on_disk();
+        assert!(!bindings.folders.contains_key(&folder_key(&a)));
+        assert!(!a_dir.exists());
+        let suppressions = suppressions_on_disk();
+        assert!(!suppressions.entries.contains_key(&folder_key(&a_child)));
+        assert!(a.join("tracked.txt").is_file());
+        assert!(!state.repositories.iter().any(|r| r.key == ka));
+        // B and X are byte-identical.
+        assert_eq!(bindings.folders.get(&folder_key(&b)), Some(&b_binding));
+        assert_eq!(bindings.folders.get(&folder_key(&x)), Some(&x_binding));
+        assert_eq!(bindings.folders.len(), 2);
+        assert_eq!(marker_bytes(&b_dir), b_marker);
+        assert_eq!(marker_bytes(&x_dir), x_marker);
+        assert_eq!(
+            listing(&a_dir.parent().expect("workspace dir")),
+            vec!["repository-b-key".to_string(), "repository-x-key".to_string()]
+        );
+        assert_eq!(listing(&kept), kept_listing);
+        assert_eq!(listing(&f.managed_root()), managed_listing);
+        assert_eq!(suppressions.entries.get(&folder_key(&b_child)), Some(&b_entry));
+        assert_eq!(suppressions.entries.len(), 1);
+        assert!(state.repositories.iter().any(|r| r.key == kb));
+        assert!(state.repositories.iter().any(|r| r.key == kx));
+        // The report names exactly A's artefacts, and the preview named them.
+        assert_eq!(cleared_of(&report, ClearingKind::Binding), vec![a.clone()]);
+        assert_eq!(cleared_of(&report, ClearingKind::Marker), vec![a_dir.clone()]);
+        assert_eq!(
+            cleared_of(&report, ClearingKind::RepositoryDir),
+            vec![a_dir.clone()]
+        );
+        assert_eq!(
+            cleared_of(&report, ClearingKind::SuppressionDropped),
+            vec![a_common.clone()]
+        );
+        assert!(cleared_of(&report, ClearingKind::SuppressionAdded).is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert_preview_covers(&preview, &report);
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
         assert_eq!(calls.get(), 1);
     }
 }
