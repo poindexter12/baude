@@ -276,7 +276,7 @@ mod tests {
             .folders[&folder_key(Path::new("/mem/web"))]
             .clone();
 
-        assert_eq!(clear(Some(&dir), Path::new("/mem/api")).unwrap(), true);
+        assert!(clear(Some(&dir), Path::new("/mem/api")).unwrap());
 
         let (on_disk, corrupted) = load_json::<FolderWorkspaceFile>(&dir.join(FILE_NAME));
         assert!(!corrupted);
@@ -294,14 +294,14 @@ mod tests {
 
         // A second clear of the same folder finds nothing and writes nothing.
         let bytes_before = std::fs::read(dir.join(FILE_NAME)).unwrap();
-        assert_eq!(clear(Some(&dir), Path::new("/mem/api")).unwrap(), false);
+        assert!(!clear(Some(&dir), Path::new("/mem/api")).unwrap());
         assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap(), bytes_before);
 
         // An absent file stays absent, and in-memory mode clears nothing.
         let empty = scratch("clear-empty");
-        assert_eq!(clear(Some(&empty), Path::new("/mem/api")).unwrap(), false);
+        assert!(!clear(Some(&empty), Path::new("/mem/api")).unwrap());
         assert!(!empty.join(FILE_NAME).exists());
-        assert_eq!(clear(None, Path::new("/mem/web")).unwrap(), false);
+        assert!(!clear(None, Path::new("/mem/web")).unwrap());
     }
 
     #[test]

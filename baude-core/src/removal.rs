@@ -2362,6 +2362,15 @@ mod tests {
         checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
         let s = standalone(&mut state, &folder);
         state.validate_for_save().expect("seed is save-valid");
+        // Only the main worktree has a binding, so the real run clears a
+        // strict subset of what the preview names. Rows run children first,
+        // so the main checkout's folder leads and the managed child follows.
+        folder_workspace::record(
+            Some(&crate::persist::config_dir()),
+            &f.repo(),
+            "repo-ws",
+            10,
+        );
         let preview = preview_removal(&state, RemovalTarget::Repository(k)).expect("preview");
         let mut handles: Vec<RowRuntime> = Vec::new();
         let (save, calls) = counting_save(&f.state_root());
@@ -2370,6 +2379,48 @@ mod tests {
             .expect("remove repository");
 
         assert_eq!(preview.rows_removed, report.rows_removed);
+        assert!(preview.clearing_failures.is_empty());
+        assert_eq!(
+            preview.cleared,
+            vec![
+                ClearedItem {
+                    kind: ClearingKind::Binding,
+                    path: f.repo(),
+                },
+                ClearedItem {
+                    kind: ClearingKind::Binding,
+                    path: managed.clone(),
+                },
+            ]
+        );
+        assert_eq!(
+            report.cleared,
+            vec![ClearedItem {
+                kind: ClearingKind::Binding,
+                path: f.repo(),
+            }]
+        );
+        assert!(report.clearing_failures.is_empty());
+        for (kind, path) in report
+            .cleared
+            .iter()
+            .map(|item| (item.kind, &item.path))
+            .chain(
+                report
+                    .clearing_failures
+                    .iter()
+                    .map(|failure| (failure.kind, &failure.path)),
+            )
+        {
+            assert!(
+                preview
+                    .cleared
+                    .iter()
+                    .any(|item| item.kind == kind && &item.path == path),
+                "real run cleared {kind:?} {} that the preview did not name",
+                path.display()
+            );
+        }
         assert!(!state.repositories.iter().any(|r| r.key == k));
         assert!(!state.checkouts.iter().any(|c| c.repository_key == k));
         assert_eq!(state.standalone_sessions.len(), 1);
