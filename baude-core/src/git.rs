@@ -2717,17 +2717,25 @@ pub fn remove_verified_worktree(
 pub enum ForcedRemovalMethod {
     /// `git worktree remove --force --force` succeeded.
     GitRemove,
-    /// Git refused or had already dropped the entry; the directory was deleted
-    /// directly and the administrative entry pruned.
-    PruneFallback,
+    /// Git refused or the directory was already gone; the directory was
+    /// deleted directly and the administrative entry removed per entry. No
+    /// repository-wide `git worktree prune` ever runs: other registered
+    /// worktrees whose directories are temporarily absent keep their entries.
+    DeleteFallback,
+    /// Nothing was registered and nothing was on disk: no command ran and
+    /// nothing was deleted.
+    AlreadyAbsent,
 }
 
 /// A proven forced removal: the canonical path is gone from disk and from the
-/// inventory.
+/// inventory. `deleted_directory` is whether a directory existed at the path
+/// when the call began and was deleted by it, so the caller's report can
+/// tell a deletion from a path that was already gone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForcedRemoval {
     pub path: PathBuf,
     pub method: ForcedRemovalMethod,
+    pub deleted_directory: bool,
 }
 
 /// Typed refusals and failures of [`remove_managed_worktree_forced`]. Every
@@ -3233,14 +3241,31 @@ fn run_worktree_command(
         .output()
 }
 
-fn prune_worktrees(main_worktree: &Path) -> std::result::Result<Output, ForcedRemovalError> {
-    run_worktree_command(main_worktree, ["worktree", "prune"])
-        .map_err(ForcedRemovalError::CommandStart)
+/// `git worktree remove --force --force -- <canonical>`: the one command that
+/// drops a single administrative entry, whether or not the directory is still
+/// on disk. Never `git worktree prune`, which is repository-wide and would
+/// also drop every other registered worktree whose directory is temporarily
+/// absent (an unmounted volume the startup reconcile keeps as unavailable).
+fn remove_worktree_entry(
+    main_worktree: &Path,
+    canonical: &Path,
+) -> std::result::Result<Output, ForcedRemovalError> {
+    run_worktree_command(
+        main_worktree,
+        forced_remove_arguments()
+            .into_iter()
+            .chain([canonical.as_os_str()]),
+    )
+    .map_err(ForcedRemovalError::CommandStart)
+}
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
 }
 
 enum ForcedStep {
     GitRemoved,
-    PruneOnly,
+    Nothing,
     Fallback(String),
 }
 
@@ -3253,7 +3278,7 @@ enum ForcedStep {
 /// and registration are re-proven here on the live tree. Containment in the
 /// managed root is checked before any effect. No branch command is ever
 /// issued. A registered path whose directory is already gone is accepted so
-/// stale administration is pruned; a directory that Git half-removed is
+/// its own administrative entry is dropped; a directory that Git half-removed is
 /// reclaimed only through the removal marker written before the Git command;
 /// a target whose Git identity cannot be inspected is refused; the `.git`
 /// shape is inspected before the Git command is spawned as well as before the
@@ -3278,7 +3303,7 @@ pub fn remove_managed_worktree_forced(
     };
 
     let step = match (record, present) {
-        (None, false) => ForcedStep::PruneOnly,
+        (None, false) => ForcedStep::Nothing,
         (None, true) => {
             let claimed_beneath = worktree_inventory(main_worktree)
                 .map_err(|error| discovery_to_forced(&canonical, error))?
@@ -3290,21 +3315,23 @@ pub fn remove_managed_worktree_forced(
             foreign_repository_guard(&canonical, &expected_common_dir)?;
             ForcedStep::Fallback(String::new())
         }
-        (Some(_), false) => ForcedStep::Fallback(String::new()),
-        (Some(_), true) => {
-            foreign_repository_guard(&canonical, &expected_common_dir)?;
-            write_removal_marker(&canonical, &expected_common_dir)?;
-            let output = run_worktree_command(
-                main_worktree,
-                forced_remove_arguments()
-                    .into_iter()
-                    .chain([canonical.as_os_str()]),
-            )
-            .map_err(ForcedRemovalError::CommandStart)?;
+        // Registered, directory gone: git drops a missing worktree per entry.
+        (Some(_), false) => {
+            let output = remove_worktree_entry(main_worktree, &canonical)?;
             if output.status.success() {
                 ForcedStep::GitRemoved
             } else {
-                let git_stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                ForcedStep::Fallback(stderr_of(&output))
+            }
+        }
+        (Some(_), true) => {
+            foreign_repository_guard(&canonical, &expected_common_dir)?;
+            write_removal_marker(&canonical, &expected_common_dir)?;
+            let output = remove_worktree_entry(main_worktree, &canonical)?;
+            if output.status.success() {
+                ForcedStep::GitRemoved
+            } else {
+                let git_stderr = stderr_of(&output);
                 foreign_repository_guard(&canonical, &expected_common_dir)?;
                 ForcedStep::Fallback(git_stderr)
             }
@@ -3312,11 +3339,9 @@ pub fn remove_managed_worktree_forced(
     };
 
     let method = match step {
-        ForcedStep::GitRemoved => ForcedRemovalMethod::GitRemove,
-        ForcedStep::PruneOnly => {
-            prune_worktrees(main_worktree)?;
-            ForcedRemovalMethod::PruneFallback
-        }
+        ForcedStep::GitRemoved if present => ForcedRemovalMethod::GitRemove,
+        ForcedStep::GitRemoved => ForcedRemovalMethod::DeleteFallback,
+        ForcedStep::Nothing => ForcedRemovalMethod::AlreadyAbsent,
         ForcedStep::Fallback(git_stderr) => {
             match std::fs::remove_dir_all(&canonical) {
                 Ok(()) => {}
@@ -3329,19 +3354,11 @@ pub fn remove_managed_worktree_forced(
                     });
                 }
             }
-            // Best effort: a lock would otherwise shield the stale entry from prune.
-            let _ = run_worktree_command(
-                main_worktree,
-                [
-                    OsStr::new("worktree"),
-                    OsStr::new("unlock"),
-                    OsStr::new("--"),
-                ]
-                .into_iter()
-                .chain([canonical.as_os_str()]),
-            );
-            prune_worktrees(main_worktree)?;
-            ForcedRemovalMethod::PruneFallback
+            // With the directory gone git drops the entry per path; the
+            // postcondition below surfaces an entry that still survives
+            // rather than reaching for a repository-wide prune.
+            let _ = remove_worktree_entry(main_worktree, &canonical)?;
+            ForcedRemovalMethod::DeleteFallback
         }
     };
 
@@ -3387,6 +3404,7 @@ pub fn remove_managed_worktree_forced(
     Ok(ForcedRemoval {
         path: canonical,
         method,
+        deleted_directory: present,
     })
 }
 /// Compensation-only removal for a worktree that the current uncommitted
@@ -5399,7 +5417,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("git refusal inside root falls back");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
@@ -5419,7 +5437,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("missing registered directory is pruned");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
@@ -5750,7 +5768,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("orphan is reclaimed through the removal marker");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!marker.exists());
             assert!(!inventory_lists(&repo, &wt));
@@ -5828,7 +5846,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("vanished repository directory still prunes");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
@@ -5848,7 +5866,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("a lone HEAD file is no repository");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
@@ -5872,7 +5890,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("a config without bare = true is no repository");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!wt.exists());
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
@@ -5898,7 +5916,7 @@ mod tests {
             let removal = remove_managed_worktree_forced(&repo, &common, &wt)
                 .expect("a wiped managed root still prunes");
 
-            assert_eq!(removal.method, ForcedRemovalMethod::PruneFallback);
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
             assert!(!inventory_lists(&repo, &wt));
             assert_eq!(branch_snapshot(&repo), before);
         }
@@ -5933,6 +5951,120 @@ mod tests {
             assert_untouched(&repo, &wt, &before);
         }
 
+        /// Names of the administrative directories under `<common>/worktrees`.
+        fn admin_entries(common: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(common.join("worktrees"))
+                .expect("read admin dir")
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Whether some administrative entry's `gitdir` file still names `wt`,
+        /// which is what lets git re-attach the worktree when its volume
+        /// returns.
+        fn admin_entry_names(common: &Path, wt: &Path) -> bool {
+            let expected = format!("{}/.git", canonical_through_missing(wt).display());
+            std::fs::read_dir(common.join("worktrees"))
+                .expect("read admin dir")
+                .map(|entry| entry.unwrap().path().join("gitdir"))
+                .filter_map(|gitdir| std::fs::read_to_string(gitdir).ok())
+                .any(|text| text.trim_end() == expected)
+        }
+
+        /// A sibling worktree on an unmounted volume is an "unavailable" row
+        /// at startup, not garbage: removing another row's vanished directory
+        /// must drop only that row's administrative entry.
+        #[test]
+        fn missing_target_removal_keeps_sibling_whose_directory_is_absent() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_dir_all(&wt_a).unwrap();
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            assert_eq!(admin_entries(&common).len(), 2);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+                .expect("missing registered directory is removed per entry");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!removal.deleted_directory);
+            assert!(!inventory_lists(&repo, &wt_a));
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert_eq!(admin_entries(&common).len(), 1);
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn git_refusal_fallback_keeps_sibling_whose_directory_is_absent() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_file(wt_a.join(".git")).unwrap();
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+                .expect("git refusal inside root falls back");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(removal.deleted_directory);
+            assert!(!wt_a.exists());
+            assert!(!inventory_lists(&repo, &wt_a));
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn unregistered_missing_target_is_already_absent_and_touches_nothing() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    OsStr::new("--"),
+                    wt_a.as_os_str(),
+                ],
+            );
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+                .expect("an unregistered missing path is already absent");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::AlreadyAbsent);
+            assert!(!removal.deleted_directory);
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
         #[test]
         fn forced_arguments_never_touch_branches() {
             let arguments = forced_remove_arguments();
@@ -5957,6 +6089,7 @@ mod tests {
             let _ = ForcedRemoval {
                 path: PathBuf::new(),
                 method: ForcedRemovalMethod::GitRemove,
+                deleted_directory: true,
             };
         }
     }
