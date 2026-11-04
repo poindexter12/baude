@@ -196,6 +196,33 @@ pub fn record(root: Option<&Path>, launch_dir: &Path, workspace: &str, now_ms: u
     });
 }
 
+/// Forget the binding recorded for `folder`, if any. Returns `Ok(true)` when
+/// an entry keyed by `folder_key(folder)` was removed and `Ok(false)` when
+/// there was nothing to remove: `root: None`, an absent file, or a file
+/// without that key. Only an exact key match is removed; entries for other
+/// folders bound to the same workspace are untouched.
+///
+/// The absent-key pre-check happens outside the merge lock, so a binding
+/// recorded between the check and the write can survive one call. That gap
+/// is accepted for an advisory file: the worst case is a stale hint that the
+/// next launch overwrites, and the pre-check is what keeps an absent file
+/// absent and an untouched file byte-identical.
+pub fn clear(root: Option<&Path>, folder: &Path) -> std::io::Result<bool> {
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    let key = folder_key(folder);
+    let (on_disk, _) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+    if !on_disk.folders.contains_key(&key) {
+        return Ok(false);
+    }
+    locked_merge_write(root, FILE_NAME, |merged: &mut FolderWorkspaceFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged.folders.remove(&key);
+    })?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

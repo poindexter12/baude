@@ -142,6 +142,37 @@ pub enum PersistenceOutcome {
     SavedDegraded { detail: String },
 }
 
+/// What the clearing stage forgets on behalf of a removed row. Every kind
+/// the phase will report is declared now so later plans add no
+/// serde-visible shape change; this plan only produces `Binding`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearingKind {
+    /// The folder-to-workspace entry in `folder-workspaces.json`.
+    Binding,
+    Marker,
+    RepositoryDir,
+    SuppressionAdded,
+    SuppressionDropped,
+}
+
+/// One thing the clearing stage will forget (preview) or forgot (real run).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClearedItem {
+    pub kind: ClearingKind,
+    pub path: PathBuf,
+}
+
+/// One planned clearing the real run could not perform. Never fails the
+/// removal: the row is already saved out of the state file by the time the
+/// clearing stage runs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClearingFailure {
+    pub kind: ClearingKind,
+    pub path: PathBuf,
+    pub error: String,
+}
+
 /// What a removal will do (`planned == true`) or did.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RemovalReport {
@@ -157,6 +188,12 @@ pub struct RemovalReport {
     /// in a preview; filled only by the real run.
     pub readers_parked: Vec<RowKey>,
     pub persistence: PersistenceOutcome,
+    /// In a preview, every clearing the real run will attempt; in the real
+    /// run, the ones that removed something.
+    pub cleared: Vec<ClearedItem>,
+    /// Clearings the real run attempted and could not perform. Always empty
+    /// in a preview.
+    pub clearing_failures: Vec<ClearingFailure>,
 }
 
 /// Why a managed worktree could not be removed from disk. Owned here so this
@@ -322,7 +359,8 @@ pub fn preview_removal(
     target: RemovalTarget,
 ) -> Result<RemovalReport, RemovalError> {
     let set = select_rows(state, target)?;
-    Ok(report_from_set(&set, None))
+    let planned = planned_clearings(state, &set);
+    Ok(report_from_set(&set, planned, None))
 }
 
 /// One live runtime handed to `remove`, owned for the call. The caller moves
@@ -400,6 +438,7 @@ pub fn remove(
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
     let set = select_rows(state, target)?;
+    let planned = planned_clearings(state, &set);
     preflight(&set, runtimes)?;
     let mut candidate = state.clone();
     candidate.remove_rows(
@@ -413,13 +452,16 @@ pub fn remove(
     let killed = kill_stage(&set, runtimes)?;
     let disk = disk_stage(&set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
+    let clearing = clear_stage(&planned);
     Ok(report_from_set(
         &set,
+        planned,
         Some(StageResults {
             killed,
             disk,
             readers_parked,
             persistence,
+            clearing,
         }),
     ))
 }
@@ -431,6 +473,73 @@ struct StageResults {
     disk: DiskResults,
     readers_parked: Vec<RowKey>,
     persistence: PersistenceOutcome,
+    clearing: ClearingResults,
+}
+
+/// What the clearing stage removed and what it could not.
+struct ClearingResults {
+    cleared: Vec<ClearedItem>,
+    failures: Vec<ClearingFailure>,
+}
+
+/// Everything the clearing stage will attempt for `set`, in `set.rows`
+/// order, derived from the state before the removal so the preview and the
+/// real run name the same items. One `Binding` per row: a repository row
+/// names its main worktree, a checkout row its observed path, a standalone
+/// row its canonical path. A folder two rows share, such as a main checkout
+/// and its repository, is listed once, because the stage clears it once.
+fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedItem> {
+    let mut planned: Vec<ClearedItem> = Vec::new();
+    for row in &set.rows {
+        let path = match row.row {
+            RowKey::Repository(key) => row.main_worktree.clone().or_else(|| {
+                find_repository(state, key)
+                    .map(|repository| repository.observed_main_worktree.to_path_buf())
+            }),
+            RowKey::Checkout(_) | RowKey::Standalone(_) => row.path.clone(),
+        };
+        let Some(path) = path else { continue };
+        let item = ClearedItem {
+            kind: ClearingKind::Binding,
+            path,
+        };
+        if !planned.contains(&item) {
+            planned.push(item);
+        }
+    }
+    planned
+}
+
+/// The fourth stage: forget the advisory records that would re-admit a row
+/// the save just committed. Runs after `persist_stage`, so it never returns
+/// an error and never touches the state file; an I/O failure on one item is
+/// reported as a `ClearingFailure` and the remaining items are still tried.
+fn clear_stage(planned: &[ClearedItem]) -> ClearingResults {
+    let mut results = ClearingResults {
+        cleared: Vec::new(),
+        failures: Vec::new(),
+    };
+    let config_dir = crate::persist::config_dir();
+    for item in planned {
+        match item.kind {
+            ClearingKind::Binding => {
+                match crate::folder_workspace::clear(Some(&config_dir), &item.path) {
+                    Ok(true) => results.cleared.push(item.clone()),
+                    Ok(false) => {}
+                    Err(error) => results.failures.push(ClearingFailure {
+                        kind: item.kind,
+                        path: item.path.clone(),
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            ClearingKind::Marker
+            | ClearingKind::RepositoryDir
+            | ClearingKind::SuppressionAdded
+            | ClearingKind::SuppressionDropped => {}
+        }
+    }
+    results
 }
 
 /// A row whose disk stage will need git must have its owning repository's
@@ -735,8 +844,13 @@ fn probe_disk(action: DiskAction, path: &Path) -> DiskAction {
 /// One assembly path for both the preview and the real run. With `stages`
 /// absent the report is a plan derived from the selected rows; with them
 /// present the runtime, path and persistence fields are what the stages
-/// actually did.
-fn report_from_set(set: &RemovalSet, stages: Option<StageResults>) -> RemovalReport {
+/// actually did. `planned` is what the clearing stage will attempt; the
+/// preview reports it as `cleared`, the real run reports what the stage did.
+fn report_from_set(
+    set: &RemovalSet,
+    planned: Vec<ClearedItem>,
+    stages: Option<StageResults>,
+) -> RemovalReport {
     let rows_removed = set.rows.iter().map(|row| row.row).collect();
     if let Some(stages) = stages {
         return RemovalReport {
@@ -749,6 +863,8 @@ fn report_from_set(set: &RemovalSet, stages: Option<StageResults>) -> RemovalRep
             already_removed: stages.disk.already_removed,
             readers_parked: stages.readers_parked,
             persistence: stages.persistence,
+            cleared: stages.clearing.cleared,
+            clearing_failures: stages.clearing.failures,
         };
     }
     let mut report = RemovalReport {
@@ -761,6 +877,8 @@ fn report_from_set(set: &RemovalSet, stages: Option<StageResults>) -> RemovalRep
         already_removed: Vec::new(),
         readers_parked: Vec::new(),
         persistence: PersistenceOutcome::Planned,
+        cleared: planned,
+        clearing_failures: Vec::new(),
     };
     for row in &set.rows {
         if let Some(runtime) = &row.runtime {
