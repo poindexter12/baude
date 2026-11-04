@@ -3573,4 +3573,80 @@ mod tests {
         assert_eq!(branch_snapshot(&t.clone), before);
         assert_eq!(calls.get(), 1);
     }
+    // ---- binding clear as the fourth stage (phase 19 plan 01) ----
+
+    use crate::breadcrumbs::{folder_key, load_json};
+    use crate::folder_workspace::{self, FolderWorkspaceFile, FILE_NAME as BINDINGS_FILE};
+
+    /// The one workspace-agnostic bindings file under the redirected config
+    /// dir, read the way `find_binding` reads it.
+    fn bindings_on_disk() -> FolderWorkspaceFile {
+        load_json::<FolderWorkspaceFile>(&crate::persist::config_dir().join(BINDINGS_FILE)).0
+    }
+
+    #[test]
+    fn clear_stage_removes_repository_binding_and_reports_it() {
+        let f = RemovalFixture::new("clear-binding");
+        let neighbour = f.root.join("neighbour");
+        fs::create_dir_all(&neighbour).expect("create neighbour folder");
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        let config = crate::persist::config_dir();
+        // Both folders bound to the same workspace: the READM-05 neighbour.
+        folder_workspace::record(Some(&config), &f.repo(), "shared-ws", 10);
+        folder_workspace::record(Some(&config), &neighbour, "shared-ws", 20);
+        let repo_key = folder_key(&f.repo());
+        let neighbour_key = folder_key(&neighbour);
+        let before = bindings_on_disk();
+        assert!(before.folders.contains_key(&repo_key));
+        let neighbour_before = before.folders[&neighbour_key].clone();
+        let state_before = state.clone();
+        let preview =
+            preview_removal(&state_before, RemovalTarget::Repository(k)).expect("preview");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("remove repository");
+
+        let after = bindings_on_disk();
+        assert!(
+            !after.folders.contains_key(&repo_key),
+            "the removed repository's binding must be gone"
+        );
+        assert_eq!(
+            after.folders.get(&neighbour_key),
+            Some(&neighbour_before),
+            "a neighbour sharing the workspace value keeps its entry unchanged"
+        );
+        assert_eq!(after.folders.len(), 1);
+        assert_eq!(after.schema_version, folder_workspace::SCHEMA_VERSION);
+        assert_eq!(
+            folder_workspace::find_binding(&config, &f.repo(), &f.root),
+            None
+        );
+        assert_eq!(
+            folder_workspace::find_binding(&config, &neighbour, &f.root).as_deref(),
+            Some("shared-ws")
+        );
+        assert_eq!(
+            report.cleared,
+            vec![ClearedItem {
+                kind: ClearingKind::Binding,
+                path: f.repo(),
+            }]
+        );
+        assert!(report.clearing_failures.is_empty());
+        assert_eq!(preview.cleared, report.cleared);
+        assert!(preview.clearing_failures.is_empty());
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert!(!state.repositories.iter().any(|r| r.key == k));
+        assert!(!load_state(&f.state_root())
+            .repositories
+            .iter()
+            .any(|r| r.key == k));
+        assert_eq!(calls.get(), 1);
+    }
 }
