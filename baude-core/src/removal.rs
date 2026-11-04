@@ -581,8 +581,13 @@ struct DiskResults {
 }
 
 /// Apply each row's `DiskAction`. A managed directory that is already gone
-/// still goes through the forced helper so its administrative entry is
-/// pruned; `NotRegistered` there means there was nothing left to clean.
+/// still goes through the forced helper so its own administrative entry is
+/// dropped. The report follows what the helper did, not what `select_rows`
+/// planned: a directory that reappeared since the plan and was deleted is
+/// reported as deleted, and one that reappeared unregistered and without a
+/// removal marker is a `NotRegistered` failure rather than a silent drop,
+/// since a directory now sits at the row's path. `NotRegistered` with the
+/// path still absent means there was nothing left to clean.
 fn disk_stage(set: &RemovalSet) -> Result<DiskResults, RemovalError> {
     let mut results = DiskResults {
         deleted: Vec::new(),
@@ -595,19 +600,21 @@ fn disk_stage(set: &RemovalSet) -> Result<DiskResults, RemovalError> {
         };
         match row.disk {
             DiskAction::KeepDirectory => results.kept.push(path.clone()),
-            DiskAction::RemoveManagedWorktree => {
-                let common_dir = owner_common_dir(row, path)?;
-                crate::git::remove_managed_worktree_forced(common_dir, path)
-                    .map_err(|error| disk_error(row, path, error.into()))?;
-                results.deleted.push(path.clone());
-            }
-            DiskAction::AlreadyRemoved => {
+            DiskAction::RemoveManagedWorktree | DiskAction::AlreadyRemoved => {
                 let common_dir = owner_common_dir(row, path)?;
                 match crate::git::remove_managed_worktree_forced(common_dir, path) {
-                    Ok(_) | Err(crate::git::ForcedRemovalError::NotRegistered { .. }) => {}
+                    Ok(removal) if removal.deleted_directory => results.deleted.push(path.clone()),
+                    Ok(_) => results.already_removed.push(path.clone()),
+                    Err(crate::git::ForcedRemovalError::NotRegistered { .. })
+                        if matches!(
+                            std::fs::symlink_metadata(path),
+                            Err(ref error) if error.kind() == ErrorKind::NotFound
+                        ) =>
+                    {
+                        results.already_removed.push(path.clone())
+                    }
                     Err(error) => return Err(disk_error(row, path, error.into())),
                 }
-                results.already_removed.push(path.clone());
             }
         }
     }
@@ -1744,6 +1751,70 @@ mod tests {
         assert_eq!(state, before);
         assert_eq!(calls.get(), 0, "nothing is saved");
         assert!(managed.exists(), "the managed directory survives");
+    }
+
+    /// A directory that reappeared at an already-removed row's path after the
+    /// plan is deleted and reported as deleted, not as already removed.
+    #[test]
+    fn reappeared_directory_at_already_removed_row_is_reported_deleted() {
+        let f = RemovalFixture::new("reappeared");
+        let (state, _k, c1, _c2, c1_dir, _c2_dir) = inactive_pair(&f);
+        fs::remove_dir_all(&c1_dir).expect("directory goes missing");
+        let set = select_rows(&state, RemovalTarget::Checkout(c1)).expect("select");
+        assert_eq!(set.rows[0].disk, DiskAction::AlreadyRemoved);
+        fs::create_dir_all(&c1_dir).expect("volume returns before the disk stage");
+
+        let results = disk_stage(&set).expect("disk stage");
+
+        assert_eq!(results.deleted, vec![c1_dir.clone()]);
+        assert!(results.already_removed.is_empty());
+        assert!(!c1_dir.exists(), "the reappeared directory is deleted");
+        assert!(!worktree_list(&f.repo()).contains(c1_dir.to_str().expect("utf-8")));
+    }
+
+    /// A directory that reappeared unregistered and without a marker is a
+    /// typed failure: the row must not be dropped while a stray directory
+    /// sits inside the managed root at its path.
+    #[test]
+    fn reappeared_unregistered_directory_is_a_typed_failure() {
+        let f = RemovalFixture::new("reappeared-stray");
+        let (mut state, _k, c1, _c2, c1_dir, _c2_dir) = inactive_pair(&f);
+        fs::remove_dir_all(&c1_dir).expect("directory goes missing");
+        let set = select_rows(&state, RemovalTarget::Checkout(c1)).expect("select");
+        assert_eq!(set.rows[0].disk, DiskAction::AlreadyRemoved);
+        git_ok(
+            &f.repo(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                c1_dir.to_str().expect("utf-8"),
+            ],
+        );
+        fs::create_dir_all(&c1_dir).expect("a stray directory appears at the path");
+        let before = state.clone();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let error = remove(
+            &mut state,
+            RemovalTarget::Checkout(c1),
+            &mut Vec::new(),
+            save,
+        )
+        .expect_err("a stray directory at the row's path is refused");
+
+        match error {
+            RemovalError::DiskRemoval { row, path, error } => {
+                assert_eq!(row, RowKey::Checkout(c1));
+                assert_eq!(path, c1_dir);
+                assert_eq!(error.kind, DiskRemovalFailureKind::NotRegistered, "{error}");
+            }
+            other => panic!("expected DiskRemoval, got {other:?}"),
+        }
+        assert!(c1_dir.exists(), "the stray directory survives");
+        assert_eq!(state, before);
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
