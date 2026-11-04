@@ -13,8 +13,11 @@
 //! against `RepositoryState` and classifies each row's disk rule once, and
 //! `preview_removal` turns that set into the report the real run will later
 //! fill in. Preview never signals a process, never runs git and never writes
-//! a file; its only filesystem access is a `symlink_metadata` probe that
-//! labels a managed directory as already removed when it is `NotFound`.
+//! a file; its filesystem access is read-only: a `symlink_metadata` probe
+//! that labels a managed directory as already removed when it is `NotFound`,
+//! the same probe on a removed repository's `repository-<key>` directory,
+//! and a read of the suppression store, so it can name every marker,
+//! directory and entry the clearing stage will touch.
 //!
 //! Callers hold `lifecycle::RepositoryReservations` for every repository in
 //! the set from before `select_rows` until `remove` has returned, including
@@ -33,10 +36,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::marker::{DirectoryOutcome, MarkerOutcome};
 use crate::pty::Pty;
 use crate::repository::{
-    CheckoutKey, CheckoutRole, OwnedRuntime, RepositoryKey, RepositoryState, SavedCheckout,
-    SavedRepository, ShellOwnership, StandaloneKey, ValidationError,
+    CheckoutKey, CheckoutRole, OwnedRuntime, RemovedRows, RepositoryKey, RepositoryState,
+    SavedCheckout, SavedRepository, ShellOwnership, StandaloneKey, ValidationError,
 };
 
 /// What the caller asked to remove.
@@ -142,9 +146,7 @@ pub enum PersistenceOutcome {
     SavedDegraded { detail: String },
 }
 
-/// What the clearing stage forgets on behalf of a removed row. Every kind
-/// the phase will report is declared now so later plans add no
-/// serde-visible shape change; this plan only produces `Binding`.
+/// What the clearing stage forgets on behalf of a removed row.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClearingKind {
@@ -441,7 +443,7 @@ pub fn remove(
     let planned = planned_clearings(state, &set);
     preflight(&set, runtimes)?;
     let mut candidate = state.clone();
-    candidate.remove_rows(
+    let removed = candidate.remove_rows(
         &set.repository_keys(),
         &set.checkout_keys(),
         &set.standalone_keys(),
@@ -452,7 +454,7 @@ pub fn remove(
     let killed = kill_stage(&set, runtimes)?;
     let disk = disk_stage(&set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
-    let clearing = clear_stage(&planned);
+    let clearing = clear_stage(&removed, state, &planned);
     Ok(report_from_set(
         &set,
         planned,
@@ -482,12 +484,20 @@ struct ClearingResults {
     failures: Vec<ClearingFailure>,
 }
 
-/// Everything the clearing stage will attempt for `set`, in `set.rows`
-/// order, derived from the state before the removal so the preview and the
-/// real run name the same items. One `Binding` per row: a repository row
-/// names its main worktree, a checkout row its observed path, a standalone
-/// row its canonical path. A folder two rows share, such as a main checkout
-/// and its repository, is listed once, because the stage clears it once.
+/// Everything the clearing stage will attempt for `set`, derived from the
+/// state before the removal so the preview and the real run name the same
+/// items, in the stage's own order: bindings, then markers and managed
+/// directories, then suppression drops, then suppression adds.
+///
+/// One `Binding` per row: a repository row names its main worktree, a
+/// checkout row its observed path, a standalone row its canonical path. A
+/// folder two rows share, such as a main checkout and its repository, is
+/// listed once, because the stage clears it once. One `Marker` and one
+/// `RepositoryDir` per repository row whose stored directory exists (D-04,
+/// D-05); a refused key is still named as a `Marker`, because the real run
+/// will report it. One `SuppressionDropped` per repository row that has
+/// children in the store, and one `SuppressionAdded` per checkout row whose
+/// parent repository survives the removal (D-10).
 fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedItem> {
     let mut planned: Vec<ClearedItem> = Vec::new();
     for row in &set.rows {
@@ -507,39 +517,269 @@ fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedIt
             planned.push(item);
         }
     }
+    let repository_keys = set.repository_keys();
+    let repositories: Vec<&SavedRepository> = repository_keys
+        .iter()
+        .filter_map(|key| find_repository(state, *key))
+        .collect();
+    for repository in &repositories {
+        match repository_dir(repository) {
+            Ok(dir) if std::fs::symlink_metadata(&dir).is_ok() => {
+                planned.push(ClearedItem {
+                    kind: ClearingKind::Marker,
+                    path: dir.clone(),
+                });
+                planned.push(ClearedItem {
+                    kind: ClearingKind::RepositoryDir,
+                    path: dir,
+                });
+            }
+            Ok(_) | Err(RepositoryDirRefusal::LegacyKey) => {}
+            Err(RepositoryDirRefusal::NotSingleComponent) => planned.push(ClearedItem {
+                kind: ClearingKind::Marker,
+                path: refused_key_path(repository),
+            }),
+        }
+    }
+    if !repositories.is_empty() {
+        let store = crate::breadcrumbs::load_json::<crate::suppression::SuppressionFile>(
+            &crate::suppression::file_path(&crate::persist::config_dir()),
+        )
+        .0;
+        for repository in &repositories {
+            let common_dir = repository.observed_common_dir.to_path_buf();
+            let common_key = crate::breadcrumbs::folder_key(&common_dir);
+            if store
+                .entries
+                .values()
+                .any(|entry| entry.repository_common_dir == common_key)
+            {
+                planned.push(ClearedItem {
+                    kind: ClearingKind::SuppressionDropped,
+                    path: common_dir,
+                });
+            }
+        }
+    }
+    for row in &set.rows {
+        let RowKey::Checkout(key) = row.row else {
+            continue;
+        };
+        let parent_removed = state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .is_none_or(|checkout| repository_keys.contains(&checkout.repository_key));
+        if parent_removed {
+            continue;
+        }
+        let Some(path) = row.path.clone() else {
+            continue;
+        };
+        planned.push(ClearedItem {
+            kind: ClearingKind::SuppressionAdded,
+            path,
+        });
+    }
     planned
+}
+
+/// Why a repository row has no managed directory for the stage to clear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryDirRefusal {
+    /// A row saved before digests carries an empty `physical_key`; it never
+    /// owned a `repository-<key>` directory, so the stage has nothing to do.
+    LegacyKey,
+    /// The key holds a path separator or is `.` or `..`; joined under the
+    /// managed root it could name a path outside it, so it is reported and
+    /// never joined (T-19-10).
+    NotSingleComponent,
+}
+
+/// The managed directory a repository row owns:
+/// `worktrees_base()/<workspace>/repository-<physical_key>`, built from the
+/// stored key and never from a recomputed digest of the common dir, so a
+/// suffixed collision directory is the one cleared (D-05).
+fn repository_dir(repo: &SavedRepository) -> Result<PathBuf, RepositoryDirRefusal> {
+    let key = repo.physical_key.as_str();
+    if key.is_empty() {
+        return Err(RepositoryDirRefusal::LegacyKey);
+    }
+    if key == "." || key == ".." || key.chars().any(|c| c == '/' || c == '\\') {
+        return Err(RepositoryDirRefusal::NotSingleComponent);
+    }
+    Ok(crate::git::worktrees_base()
+        .join(crate::workspace::active().name.as_str())
+        .join(format!("repository-{key}")))
+}
+
+/// The path a refused key is reported under: the bare directory name, never
+/// joined under the managed root.
+fn refused_key_path(repo: &SavedRepository) -> PathBuf {
+    PathBuf::from(format!("repository-{}", repo.physical_key))
+}
+
+/// Unix milliseconds for a suppression entry's `suppressed_ms`.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The fourth stage: forget the advisory records that would re-admit a row
 /// the save just committed. Runs after `persist_stage`, so it never returns
-/// an error and never touches the state file; an I/O failure on one item is
-/// reported as a `ClearingFailure` and the remaining items are still tried.
-fn clear_stage(planned: &[ClearedItem]) -> ClearingResults {
+/// an error and never touches the state file; a refusal or I/O failure on
+/// one item is reported as a `ClearingFailure` and the remaining items are
+/// still tried (D-14). Order: bindings, markers and managed directories,
+/// suppression drops, suppression adds. `removed` is what the save dropped,
+/// so markers and entries are keyed by the rows' stored fields; `state` is
+/// the surviving state, where a removed checkout's parent is looked up.
+fn clear_stage(
+    removed: &RemovedRows,
+    state: &RepositoryState,
+    planned: &[ClearedItem],
+) -> ClearingResults {
     let mut results = ClearingResults {
         cleared: Vec::new(),
         failures: Vec::new(),
     };
     let config_dir = crate::persist::config_dir();
-    for item in planned {
-        match item.kind {
-            ClearingKind::Binding => {
-                match crate::folder_workspace::clear(Some(&config_dir), &item.path) {
-                    Ok(true) => results.cleared.push(item.clone()),
-                    Ok(false) => {}
-                    Err(error) => results.failures.push(ClearingFailure {
-                        kind: item.kind,
-                        path: item.path.clone(),
-                        error: error.to_string(),
-                    }),
-                }
-            }
-            ClearingKind::Marker
-            | ClearingKind::RepositoryDir
-            | ClearingKind::SuppressionAdded
-            | ClearingKind::SuppressionDropped => {}
+    clear_bindings(&config_dir, planned, &mut results);
+    clear_markers(removed, &mut results);
+    update_suppression(&config_dir, removed, state, &mut results);
+    results
+}
+
+fn clear_bindings(config_dir: &Path, planned: &[ClearedItem], results: &mut ClearingResults) {
+    for item in planned
+        .iter()
+        .filter(|item| item.kind == ClearingKind::Binding)
+    {
+        match crate::folder_workspace::clear(Some(config_dir), &item.path) {
+            Ok(true) => results.cleared.push(item.clone()),
+            Ok(false) => {}
+            Err(error) => results.failures.push(ClearingFailure {
+                kind: item.kind,
+                path: item.path.clone(),
+                error: error.to_string(),
+            }),
         }
     }
-    results
+}
+
+/// One `marker::clear_owned` per removed repository row, keyed by the row's
+/// stored `physical_key` and `observed_common_dir` (D-04, D-05). Nothing
+/// recursive runs: a directory that still holds entries is reported and
+/// left in place (D-07).
+fn clear_markers(removed: &RemovedRows, results: &mut ClearingResults) {
+    for repository in &removed.repositories {
+        let dir = match repository_dir(repository) {
+            Ok(dir) => dir,
+            Err(RepositoryDirRefusal::LegacyKey) => continue,
+            Err(RepositoryDirRefusal::NotSingleComponent) => {
+                results.failures.push(ClearingFailure {
+                    kind: ClearingKind::Marker,
+                    path: refused_key_path(repository),
+                    error: "physical key is not a single path component".to_string(),
+                });
+                continue;
+            }
+        };
+        let clear =
+            match crate::marker::clear_owned(&dir, repository.observed_common_dir.as_bytes()) {
+                Ok(clear) => clear,
+                Err(error) => {
+                    results.failures.push(ClearingFailure {
+                        kind: ClearingKind::Marker,
+                        path: dir,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+        match clear.marker {
+            MarkerOutcome::Removed => results.cleared.push(ClearedItem {
+                kind: ClearingKind::Marker,
+                path: dir.clone(),
+            }),
+            MarkerOutcome::Missing => {}
+            MarkerOutcome::Refused(refusal) => results.failures.push(ClearingFailure {
+                kind: ClearingKind::Marker,
+                path: dir.clone(),
+                error: format!("marker refused: {refusal:?}"),
+            }),
+        }
+        match clear.directory {
+            DirectoryOutcome::Removed => results.cleared.push(ClearedItem {
+                kind: ClearingKind::RepositoryDir,
+                path: dir,
+            }),
+            DirectoryOutcome::NotEmpty => results.failures.push(ClearingFailure {
+                kind: ClearingKind::RepositoryDir,
+                path: dir,
+                error: "directory not empty, left in place".to_string(),
+            }),
+            DirectoryOutcome::Missing | DirectoryOutcome::Untouched => {}
+        }
+    }
+}
+
+/// Garbage-collect the entries of every removed repository's children, then
+/// record every removed checkout whose parent survives (D-10). Repository
+/// parents and standalone rows write no entry of their own.
+fn update_suppression(
+    config_dir: &Path,
+    removed: &RemovedRows,
+    state: &RepositoryState,
+    results: &mut ClearingResults,
+) {
+    for repository in &removed.repositories {
+        let common_dir = repository.observed_common_dir.to_path_buf();
+        match crate::suppression::drop_children(config_dir, &common_dir) {
+            Ok(0) => {}
+            Ok(_) => results.cleared.push(ClearedItem {
+                kind: ClearingKind::SuppressionDropped,
+                path: common_dir,
+            }),
+            Err(error) => results.failures.push(ClearingFailure {
+                kind: ClearingKind::SuppressionDropped,
+                path: common_dir,
+                error: error.to_string(),
+            }),
+        }
+    }
+    let now_ms = unix_millis();
+    for checkout in &removed.checkouts {
+        if removed
+            .repositories
+            .iter()
+            .any(|repository| repository.key == checkout.repository_key)
+        {
+            continue;
+        }
+        let path = checkout.observed_path.to_path_buf();
+        let Some(parent) = find_repository(state, checkout.repository_key) else {
+            results.failures.push(ClearingFailure {
+                kind: ClearingKind::SuppressionAdded,
+                path,
+                error: "surviving parent repository row not found".to_string(),
+            });
+            continue;
+        };
+        let common_dir = parent.observed_common_dir.to_path_buf();
+        match crate::suppression::suppress(config_dir, &path, &common_dir, now_ms) {
+            Ok(()) => results.cleared.push(ClearedItem {
+                kind: ClearingKind::SuppressionAdded,
+                path,
+            }),
+            Err(error) => results.failures.push(ClearingFailure {
+                kind: ClearingKind::SuppressionAdded,
+                path,
+                error: error.to_string(),
+            }),
+        }
+    }
 }
 
 /// A row whose disk stage will need git must have its owning repository's
@@ -4120,7 +4360,13 @@ mod tests {
     fn listing(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .expect("read dir")
-            .map(|entry| entry.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         names.sort();
         names
@@ -4207,7 +4453,10 @@ mod tests {
         let snapshot = crate::git::discover_repository(&f.repo()).expect("discover");
         let (new_key, collision) =
             crate::lifecycle::ensure_repository(&mut state, &snapshot).expect("re-admit");
-        assert_eq!(collision, None, "the cleared directory has no owner to collide with");
+        assert_eq!(
+            collision, None,
+            "the cleared directory has no owner to collide with"
+        );
         assert_ne!(new_key, k);
         let row = state
             .repositories
@@ -4587,8 +4836,13 @@ mod tests {
         let mut handles = no_handles();
         let (save, calls) = counting_save(&f.state_root());
 
-        let report = remove(&mut state, RemovalTarget::Repository(ka), &mut handles, save)
-            .expect("remove repository a");
+        let report = remove(
+            &mut state,
+            RemovalTarget::Repository(ka),
+            &mut handles,
+            save,
+        )
+        .expect("remove repository a");
 
         // A is gone from every store, and its main worktree is kept on disk.
         let bindings = bindings_on_disk();
@@ -4605,18 +4859,27 @@ mod tests {
         assert_eq!(marker_bytes(&b_dir), b_marker);
         assert_eq!(marker_bytes(&x_dir), x_marker);
         assert_eq!(
-            listing(&a_dir.parent().expect("workspace dir")),
-            vec!["repository-b-key".to_string(), "repository-x-key".to_string()]
+            listing(a_dir.parent().expect("workspace dir")),
+            vec![
+                "repository-b-key".to_string(),
+                "repository-x-key".to_string()
+            ]
         );
         assert_eq!(listing(&kept), kept_listing);
         assert_eq!(listing(&f.managed_root()), managed_listing);
-        assert_eq!(suppressions.entries.get(&folder_key(&b_child)), Some(&b_entry));
+        assert_eq!(
+            suppressions.entries.get(&folder_key(&b_child)),
+            Some(&b_entry)
+        );
         assert_eq!(suppressions.entries.len(), 1);
         assert!(state.repositories.iter().any(|r| r.key == kb));
         assert!(state.repositories.iter().any(|r| r.key == kx));
         // The report names exactly A's artefacts, and the preview named them.
         assert_eq!(cleared_of(&report, ClearingKind::Binding), vec![a.clone()]);
-        assert_eq!(cleared_of(&report, ClearingKind::Marker), vec![a_dir.clone()]);
+        assert_eq!(
+            cleared_of(&report, ClearingKind::Marker),
+            vec![a_dir.clone()]
+        );
         assert_eq!(
             cleared_of(&report, ClearingKind::RepositoryDir),
             vec![a_dir.clone()]
