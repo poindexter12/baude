@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 19
 current_phase_name: Re-admission Suppression
 status: executing
-stopped_at: Completed 19-01-PLAN.md
-last_updated: "2026-11-04T18:04:37.704Z"
+stopped_at: Completed 19-02-PLAN.md
+last_updated: "2026-11-04T18:11:34.310Z"
 last_activity: 2026-11-04
 last_activity_desc: Phase 19 execution started
-state_head: fd4a84e6ec0949f32e90e46c73c71f3373a6c486
+state_head: 81db4a2f818e4f871f9bcf0ed5f18caa2b22f712
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 15
-  completed_plans: 9
+  completed_plans: 10
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 19 (Re-admission Suppression) — EXECUTING
-Plan: 2 of 7
+Plan: 3 of 7
 Status: Ready to execute
 Last activity: 2026-11-04 — Phase 19 execution started
 
@@ -111,6 +111,7 @@ Last activity: 2026-11-04 — Phase 19 execution started
 | Phase 18 P06 | 25 min | 3 tasks | 2 files |
 | Phase 18 P07 | 33 min | 2 tasks | 0 files |
 | Phase 19 P01 | 35min | 3 tasks | 2 files |
+| Phase 19 P02 | 20min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -258,6 +259,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: 18-07: scripts/gate.sh --linux exit 1 on macOS host is a Docker Desktop bind-mount target-dir race, not a phase defect; Linux proof taken by the unmodified gate script in the same container with CARGO_TARGET_DIR on container disk; gate.sh fix deferred
 - [Phase 19]: planned_clearings lists a folder shared by two rows once so preview and real run agree without a second clear attempt
 - [Phase 19]: folder_workspace::clear pre-checks the key outside the merge lock; the gap is accepted for an advisory file so absent files stay absent and untouched files stay byte-identical
+- [Phase 19]: Suppression store file base is suppressed-admissions, per-workspace beside breadcrumbs; entries kept until lifted or garbage-collected, never pruned by disk existence
 
 ### Pending Todos
 
@@ -340,8 +342,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T18:04:37.188Z
-Stopped at: Completed 19-01-PLAN.md
+Last session: 2026-11-04T18:11:34.179Z
+Stopped at: Completed 19-02-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
