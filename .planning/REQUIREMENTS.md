@@ -32,7 +32,7 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 - [ ] **RMV-03**: User can remove a standalone folder row, which drops the row and its runtime without deleting the folder
 - [ ] **RMV-04**: User can remove a repository parent, which removes every child by the per-child rules above and then drops the parent row
 - [x] **RMV-05**: Removal is a shared `baude-core` lifecycle operation that the TUI and the daemon both call, composed from the existing kill, close and managed-worktree removal stages rather than a parallel code path
-- [ ] **RMV-06**: Removal persists as an atomic state-file write per removed row set, so a crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
+- [x] **RMV-06**: Removal persists as an atomic state-file write per removed row set, so a crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
 - [x] **RMV-07**: Removal never deletes a main checkout, a standalone folder or a local branch, and a test asserts each of these on fixtures shaped like real cloned and `git init` repositories
 
 ### Re-admission suppression
@@ -95,7 +95,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | RMV-03 | Phase 18 | Pending |
 | RMV-04 | Phase 18 | Pending |
 | RMV-05 | Phase 18 | Complete |
-| RMV-06 | Phase 18 | Pending |
+| RMV-06 | Phase 18 | Complete |
 | RMV-07 | Phase 18 | Complete |
 | READM-01 | Phase 19 | Pending |
 | READM-02 | Phase 19 | Pending |

@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 18
 current_phase_name: Shared Kill-Then-Remove Lifecycle
 status: executing
-stopped_at: Completed 18-04-PLAN.md
-last_updated: "2026-11-03T23:44:30.441Z"
+stopped_at: Completed 18-05-PLAN.md
+last_updated: "2026-11-04T00:13:11.760Z"
 last_activity: 2026-11-03
 last_activity_desc: Phase 18 execution started
-state_head: 32a777083ee366acf45ebec1559e46581744216a
+state_head: 368120e879df39e776eb2f4e0d435c97127d2571
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 ## Current Position
 
 Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
-Plan: 6 of 8
+Plan: 7 of 8
 Status: Ready to execute
 Last activity: 2026-11-03 — Phase 18 execution started
 
@@ -106,6 +106,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | Phase 18 P03 | 4 min | 3 tasks | 1 files |
 | Phase 18 P08 | 28 min | 3 tasks | 2 files |
 | Phase 18 P04 | 31 min | 3 tasks | 1 files |
+| Phase 18 P05 | 25 min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -245,6 +246,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: removal::remove matches ForcedRemovalError::NotRegistered at the disk_stage call site for AlreadyRemoved rows so the tolerated case is named where it originates
 - [Phase 18]: Parked-reader fixture copies the 18-08 holder command verbatim including trap '' HUP so the holder survives the leader-exit SIGHUP until setsid
 - [Phase 18]: report_from_set takes Option<StageResults> so preview and remove share one report assembly path
+- [Phase 18]: Refused-row assertion names the row through SaveError::validation().row() plus the CheckoutKey Debug text because ValidationError Display renders the key through Debug
+- [Phase 18]: Both 18-05 crash tests reconcile through one reconcile_missing helper; the plan's record_checkout_reconciliation grep proxy reads 1 while both tests exercise the call
+- [Phase 18]: Task 3 validation-first fixture seeds a second repository on a distinct non-existent common dir because validate refuses duplicate repository identities
 
 ### Pending Todos
 
@@ -324,8 +328,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-03T23:44:30.361Z
-Stopped at: Completed 18-04-PLAN.md
+Last session: 2026-11-04T00:13:11.640Z
+Stopped at: Completed 18-05-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
