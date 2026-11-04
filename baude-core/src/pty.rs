@@ -825,6 +825,7 @@ impl Pty {
                 .map(Option::as_ref)
                 .map_err(String::as_str),
             group_alive,
+            || group_members(self.identity.process_group),
         ) {
             GroupDisposition::Unverifiable => {
                 let Err(error) = observed else {
@@ -936,34 +937,137 @@ pub enum GroupDisposition {
 /// The pid-reuse rule, kept pure so it can be table-tested. `observed_leader`
 /// is what the kernel reports for the recorded pid right now (`Err` when it
 /// could not be inspected), `group_alive` whether the recorded group still
-/// has members.
+/// has members, and `members` enumerates the live members of the recorded
+/// group on demand (`Err` when they could not be inspected).
 ///
 /// The group is the kill unit because POSIX fork() gives a child its parent's
 /// process group id: every descendant the leader spawned without setsid or
 /// setpgid is still inside the recorded group after the leader exits, so an
 /// exited leader is a reason to inspect the group, not to stop.
+///
+/// A group id is reusable once the group is empty, so a live group whose
+/// recorded leader is gone is only ours when its members prove it. The proof
+/// is the session: a session id is only ever created by `setsid`, which
+/// makes the caller its own session, and `setpgid` cannot move a process
+/// into a group of another session. Every member of the recorded session is
+/// therefore a descendant of the recorded leader, and a live group with no
+/// member in that session belongs to a stranger who reused the id. A group
+/// whose members are all zombies has nothing a signal can harm, so it is
+/// signalled and reaped like any extinct-but-unreaped group.
 pub(crate) fn group_disposition(
     recorded: &ProcessIdentity,
     observed_leader: std::result::Result<Option<&ProcessIdentity>, &str>,
     group_alive: bool,
+    members: impl FnOnce() -> std::result::Result<Vec<ProcessIdentity>, String>,
 ) -> GroupDisposition {
     if !group_alive {
         return GroupDisposition::Extinct;
     }
     match observed_leader {
         Err(_) => GroupDisposition::Unverifiable,
-        // The leader exited but descendants remain: they are the kill unit.
-        Ok(None) => GroupDisposition::Signal,
         Ok(Some(live)) if live == recorded => GroupDisposition::Signal,
         // The pid was reused by a process that now sits inside the recorded
         // group: signalling the group would hit a stranger.
         Ok(Some(live)) if live.process_group == recorded.process_group => {
             GroupDisposition::ForeignOwner
         }
-        // The pid was reused elsewhere; the live members of the recorded
-        // group are still our descendants.
-        Ok(Some(_)) => GroupDisposition::Signal,
+        // The leader exited, or its pid was reused elsewhere. The group is
+        // the kill unit only when its live members prove they are ours.
+        Ok(_) => match members() {
+            Err(_) => GroupDisposition::Unverifiable,
+            Ok(members) if members.is_empty() => GroupDisposition::Signal,
+            Ok(members) if members.iter().any(|m| m.session == recorded.session) => {
+                GroupDisposition::Signal
+            }
+            Ok(_) => GroupDisposition::ForeignOwner,
+        },
     }
+}
+
+/// Fold one member's inspection into the enumeration: a live member of the
+/// group is kept, a vanished or zombie one is skipped, and an inspection
+/// error is kept only until a live member of the group proves the group is
+/// ours, since a group holding one of ours cannot hold a stranger.
+fn collect_group_member(
+    process_group: i32,
+    pid: u32,
+    members: &mut Vec<ProcessIdentity>,
+    first_error: &mut Option<String>,
+) {
+    match crate::session::inspect_process_identity(pid) {
+        Ok(Some(identity)) if identity.process_group == process_group => members.push(identity),
+        Ok(_) => {}
+        Err(error) => {
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+    }
+}
+
+fn finish_group_members(
+    members: Vec<ProcessIdentity>,
+    first_error: Option<String>,
+) -> std::result::Result<Vec<ProcessIdentity>, String> {
+    match first_error {
+        Some(error) if members.is_empty() => Err(error),
+        _ => Ok(members),
+    }
+}
+
+/// Live identities of every member of `process_group`, from `/proc`.
+#[cfg(target_os = "linux")]
+fn group_members(process_group: i32) -> std::result::Result<Vec<ProcessIdentity>, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|error| format!("list /proc: {error}"))?;
+    let mut members = Vec::new();
+    let mut first_error = None;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        collect_group_member(process_group, pid, &mut members, &mut first_error);
+    }
+    finish_group_members(members, first_error)
+}
+
+/// Live identities of every member of `process_group`, from
+/// `proc_listpids(PROC_PGRP_ONLY)`.
+#[cfg(target_os = "macos")]
+fn group_members(process_group: i32) -> std::result::Result<Vec<ProcessIdentity>, String> {
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut buf = vec![0 as libc::pid_t; 1024];
+    let bytes = libc::c_int::try_from(buf.len() * std::mem::size_of::<libc::pid_t>())
+        .unwrap_or(libc::c_int::MAX);
+    let group = u32::try_from(process_group)
+        .map_err(|_| format!("process group {process_group} is not a valid pid"))?;
+    // SAFETY: the kernel fills at most `bytes` bytes of `buf` and returns the
+    // number of bytes written.
+    let written =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, buf.as_mut_ptr().cast(), bytes) };
+    if written < 0 {
+        return Err(format!(
+            "list process group {process_group}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let n = (written as usize / std::mem::size_of::<libc::pid_t>()).min(buf.len());
+    let mut members = Vec::new();
+    let mut first_error = None;
+    for pid in buf[..n].iter().filter(|pid| **pid > 0) {
+        collect_group_member(process_group, *pid as u32, &mut members, &mut first_error);
+    }
+    finish_group_members(members, first_error)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn group_members(process_group: i32) -> std::result::Result<Vec<ProcessIdentity>, String> {
+    Err(format!(
+        "process group {process_group} members cannot be enumerated on this platform"
+    ))
 }
 
 fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
@@ -2062,13 +2166,152 @@ mod tests {
                 "matching leader, group gone",
             ),
         ];
+        let descendant = ProcessIdentity {
+            pid: 4300,
+            start_time: 3000,
+            ..recorded.clone()
+        };
         for (observed, group_alive, expected, label) in rows {
             assert_eq!(
-                group_disposition(&recorded, observed, group_alive),
+                group_disposition(&recorded, observed, group_alive, || Ok(vec![
+                    descendant.clone()
+                ])),
                 expected,
                 "{label}"
             );
         }
+    }
+
+    /// A process group id is reusable once the group is empty: a live group
+    /// whose recorded leader is gone is signalled only when a member proves
+    /// it is ours by sitting in the recorded session.
+    #[test]
+    fn group_disposition_requires_a_member_in_the_recorded_session() {
+        let recorded = ProcessIdentity {
+            pid: 4242,
+            start_time: 1000,
+            process_group: 4242,
+            session: 4242,
+        };
+        let descendant = ProcessIdentity {
+            pid: 4300,
+            start_time: 3000,
+            ..recorded.clone()
+        };
+        // A stranger that got pid 4242 after our group emptied and called
+        // setsid: same group id, its own session.
+        let reuser = ProcessIdentity {
+            pid: 4242,
+            start_time: 9000,
+            process_group: 4242,
+            session: 4242,
+        };
+        // A stranger that owns the reused group id through a different pid.
+        let stranger = ProcessIdentity {
+            pid: 7000,
+            start_time: 9000,
+            process_group: 4242,
+            session: 7000,
+        };
+        let elsewhere = ProcessIdentity {
+            pid: 4242,
+            start_time: 9000,
+            process_group: 5151,
+            session: 5151,
+        };
+        type Members = std::result::Result<Vec<ProcessIdentity>, String>;
+        let rows: Vec<(Option<&ProcessIdentity>, Members, GroupDisposition, &str)> = vec![
+            (
+                None,
+                Ok(vec![stranger.clone()]),
+                GroupDisposition::ForeignOwner,
+                "leader gone, group id reused by a stranger",
+            ),
+            (
+                None,
+                Ok(vec![descendant.clone()]),
+                GroupDisposition::Signal,
+                "leader gone, descendant remains",
+            ),
+            (
+                None,
+                Ok(vec![stranger.clone(), descendant.clone()]),
+                GroupDisposition::Signal,
+                "a member in our session proves the group",
+            ),
+            (
+                None,
+                Ok(Vec::new()),
+                GroupDisposition::Signal,
+                "only zombies remain",
+            ),
+            (
+                None,
+                Err(String::from("could not inspect")),
+                GroupDisposition::Unverifiable,
+                "members could not be inspected",
+            ),
+            (
+                Some(&reuser),
+                Ok(vec![reuser.clone()]),
+                GroupDisposition::ForeignOwner,
+                "reused leader pid inside the group",
+            ),
+            (
+                Some(&elsewhere),
+                Ok(vec![stranger.clone()]),
+                GroupDisposition::ForeignOwner,
+                "leader pid reused elsewhere, group reused by a stranger",
+            ),
+            (
+                Some(&elsewhere),
+                Ok(vec![descendant.clone()]),
+                GroupDisposition::Signal,
+                "leader pid reused elsewhere, descendants remain",
+            ),
+        ];
+        for (observed, members, expected, label) in rows {
+            assert_eq!(
+                group_disposition(&recorded, Ok(observed), true, move || members),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// The enumerator sees a real process that leads its own group in our
+    /// session, and reports its session as ours.
+    #[test]
+    fn group_members_lists_a_live_group_leader_in_our_session() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep in its own group");
+        let pid = child.id();
+        // SAFETY: getsid(0) reads the calling process's session id.
+        let our_session = unsafe { libc::getsid(0) };
+
+        let members = group_members(pid as i32).expect("enumerate the child's group");
+
+        let leader = members
+            .iter()
+            .find(|member| member.pid == pid)
+            .unwrap_or_else(|| panic!("child {pid} is listed in group {pid}: {members:?}"));
+        assert_eq!(leader.process_group, pid as i32);
+        assert_eq!(leader.session, our_session);
+        assert!(members
+            .iter()
+            .all(|member| member.process_group == pid as i32));
+
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+        let after = group_members(pid as i32).expect("enumerate after reap");
+        assert!(
+            after.is_empty(),
+            "reaped group lists no live member: {after:?}"
+        );
     }
 
     /// KILL-02: after a successful kill the reader thread has been joined.
