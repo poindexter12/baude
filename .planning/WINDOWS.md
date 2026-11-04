@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 7
+open_count: 9
 waived_count: 0
 fixed_count: 5
-total_count: 12
-last_updated: 2026-09-17T17:47:04.803Z
+total_count: 14
+last_updated: 2026-11-04T01:19:42.031Z
 ---
 
 # Broken Windows Ledger
@@ -27,6 +27,8 @@ last_updated: 2026-09-17T17:47:04.803Z
 | 10 | 10 | stub | baude/src/links.rs |  | collect_bare_links is a planned seam returning no candidates until plan 10-03 wires the bare-URL pass (wrap-join + punctuation trim) | fixed |  | 2026-09-16T07:24:23.865Z | 2026-09-16T08:05:24.696Z |
 | 11 | 11 | stub | baude/src/app.rs |  | forward_key hardcodes EncodeCtx.kitty_child=false (fail-closed per D-04); intentional — plan 11-04 replaces it with the vt100 kitty_keyboard() observed-push read | fixed |  | 2026-09-16T14:34:38.004Z | 2026-09-16T15:09:46.693Z |
 | 12 | 12 | deviation | scripts/assert-real-roots-untouched.sh |  | Local 'after' roots gate exits 1 on the dev host (concurrent live baude pid 8413 + FHIR IG publisher writing under the managed-worktrees root); proven by null bracket, closed by green check (macos-14)/check (ubuntu-22.04) on PR #87 | open |  | 2026-09-17T17:47:04.803Z |  |
+| 13 | 18 | unmet-truth | scripts/gate.sh |  | scripts/gate.sh --linux exits 1 on this macOS host: cargo test after cargo clippy in the same bind-mounted target dir hits E0463 can't find crate for already-built dependency crates, a Docker Desktop bind-mount visibility race; the same gate script passes with CARGO_TARGET_DIR on container-local disk, exit 0 on f1351d2 | open |  | 2026-11-04T01:17:56.062Z |  |
+| 14 | 18 | unmet-truth | scripts/gate.sh |  | scripts/gate.sh --linux exits 1 on a macOS host: cargo test step hits E0463 for already-built crates, a Docker Desktop bind-mount visibility race in the container target dir; fix is CARGO_TARGET_DIR off the bind mount | open |  | 2026-11-04T01:19:42.031Z |  |
 
 ````json
 [
@@ -185,6 +187,32 @@ last_updated: 2026-09-17T17:47:04.803Z
     "recorded_at": "2026-09-17T17:47:04.803Z",
     "resolved_at": null,
     "milestone": "v2.2"
+  },
+  {
+    "id": 13,
+    "kind": "unmet-truth",
+    "phase": "18",
+    "file": "scripts/gate.sh",
+    "line": null,
+    "description": "scripts/gate.sh --linux exits 1 on this macOS host: cargo test after cargo clippy in the same bind-mounted target dir hits E0463 can't find crate for already-built dependency crates, a Docker Desktop bind-mount visibility race; the same gate script passes with CARGO_TARGET_DIR on container-local disk, exit 0 on f1351d2",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-11-04T01:17:56.062Z",
+    "resolved_at": null,
+    "milestone": "v2.8"
+  },
+  {
+    "id": 14,
+    "kind": "unmet-truth",
+    "phase": "18",
+    "file": "scripts/gate.sh",
+    "line": null,
+    "description": "scripts/gate.sh --linux exits 1 on a macOS host: cargo test step hits E0463 for already-built crates, a Docker Desktop bind-mount visibility race in the container target dir; fix is CARGO_TARGET_DIR off the bind mount",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-11-04T01:19:42.031Z",
+    "resolved_at": null,
+    "milestone": "v2.8"
   }
 ]
 ````

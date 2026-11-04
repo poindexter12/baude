@@ -23,7 +23,7 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 - [x] **KILL-01**: Removing a row whose runtime is live terminates the owned child process group before any row or file is dropped, sending SIGTERM first and escalating to SIGKILL after a bounded grace period, on macOS and Linux
 - [x] **KILL-02**: After the kill, baude-owned PTYs and reader threads for that row are closed and no zombie or orphaned child remains attributable to the removed row
   - Scope (Phase 18): "attributable to the removed row" means the row's own agent and shell process groups; a process that left the group but still holds the PTY slave lies outside the whole-session kill unit (18-CONTEXT.md Kill Semantics, D-KILL-01) and is not signalled and the row is reported in `readers_parked` rather than hidden. Details in 18-VALIDATION.md Requirement Scope Notes.
-- [ ] **KILL-03**: A runtime that fails to exit after escalation leaves the row in place with a visible error instead of dropping the row and leaking the process
+- [x] **KILL-03**: A runtime that fails to exit after escalation leaves the row in place with a visible error instead of dropping the row and leaking the process
 
 ### Row removal
 
@@ -89,7 +89,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | KILL-01 | Phase 18 | Complete |
 | KILL-02 | Phase 18 | Complete |
-| KILL-03 | Phase 18 | Pending |
+| KILL-03 | Phase 18 | Complete |
 | RMV-01 | Phase 18 | Complete |
 | RMV-02 | Phase 18 | Complete |
 | RMV-03 | Phase 18 | Complete |

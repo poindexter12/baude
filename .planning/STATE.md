@@ -4,17 +4,17 @@ milestone: v2.8
 milestone_name: Project Removal
 current_phase: 18
 current_phase_name: Shared Kill-Then-Remove Lifecycle
-status: executing
-stopped_at: Completed 18-06-PLAN.md
-last_updated: "2026-11-04T00:41:51.699Z"
+status: verifying
+stopped_at: Completed 18-07-PLAN.md
+last_updated: "2026-11-04T01:19:48.339Z"
 last_activity: 2026-11-03
 last_activity_desc: Phase 18 execution started
-state_head: ba34462e26d20abbb06e6d1e460bc83279822265
+state_head: f1351d24faf74cec0ad4d357ff196b8bbc87b823
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
   percent: 0
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-10-13)
 
 Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
 Plan: 8 of 8
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-03 — Phase 18 execution started
 
 
@@ -108,6 +108,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | Phase 18 P04 | 31 min | 3 tasks | 1 files |
 | Phase 18 P05 | 25 min | 3 tasks | 1 files |
 | Phase 18 P06 | 25 min | 3 tasks | 2 files |
+| Phase 18 P07 | 33 min | 2 tasks | 0 files |
 
 ## Accumulated Context
 
@@ -252,6 +253,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: Task 3 validation-first fixture seeds a second repository on a distinct non-existent common dir because validate refuses duplicate repository identities
 - [Phase 18]: cloned_topology asserts an active TestRedirect before touching the managed root so misuse fails at the fixture
 - [Phase 18]: Branch integrity in removal tests is pinned by for-each-ref refname and OID snapshots, never git branch --list decorations
+- [Phase 18]: 18-07: scripts/gate.sh --linux exit 1 on macOS host is a Docker Desktop bind-mount target-dir race, not a phase defect; Linux proof taken by the unmodified gate script in the same container with CARGO_TARGET_DIR on container disk; gate.sh fix deferred
 
 ### Pending Todos
 
@@ -331,8 +333,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T00:41:51.642Z
-Stopped at: Completed 18-06-PLAN.md
+Last session: 2026-11-04T01:19:48.271Z
+Stopped at: Completed 18-07-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
