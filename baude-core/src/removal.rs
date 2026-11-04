@@ -3767,4 +3767,191 @@ mod tests {
             .any(|r| r.key == k));
         assert_eq!(calls.get(), 1);
     }
+
+    #[test]
+    fn checkout_and_standalone_removals_clear_their_own_keys() {
+        let f = RemovalFixture::new("clear-own-keys");
+        let config = crate::persist::config_dir();
+
+        // Part A: an unmanaged checkout clears its observed path and leaves
+        // the repository's main-worktree key alone.
+        let t = cloned_topology(&f.root);
+        let outside = outside_worktree(&f, &t);
+        let mut state = RepositoryState::default();
+        let rows = seed_cloned(&mut state, &t);
+        let x = checkout(
+            &mut state,
+            rows.k,
+            CheckoutRole::ManagedBranch,
+            false,
+            &outside,
+        );
+        state.validate_for_save().expect("seed is save-valid");
+        folder_workspace::record(Some(&config), &t.clone, "repo-ws", 10);
+        folder_workspace::record(Some(&config), &outside, "outside-ws", 20);
+        let main_key = folder_key(&t.clone);
+        let outside_key = folder_key(&outside);
+        let main_before = bindings_on_disk().folders[&main_key].clone();
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Checkout(x), &mut handles, save)
+            .expect("remove unmanaged checkout");
+
+        let after = bindings_on_disk();
+        assert!(!after.folders.contains_key(&outside_key));
+        assert_eq!(after.folders.get(&main_key), Some(&main_before));
+        assert_eq!(
+            report.cleared,
+            vec![ClearedItem {
+                kind: ClearingKind::Binding,
+                path: outside.clone(),
+            }]
+        );
+        assert!(report.clearing_failures.is_empty());
+        assert!(has_checkout(&state, rows.m));
+        assert_eq!(calls.get(), 1);
+
+        // Part B: a standalone row clears its canonical path.
+        let notes = notes_folder(&f);
+        let mut state = RepositoryState::default();
+        let key = seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None);
+        state.validate_for_save().expect("seed is save-valid");
+        folder_workspace::record(Some(&config), &notes, "notes-ws", 30);
+        let notes_key = folder_key(&notes);
+        assert!(bindings_on_disk().folders.contains_key(&notes_key));
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles,
+            save,
+        )
+        .expect("remove standalone");
+
+        let after = bindings_on_disk();
+        assert!(!after.folders.contains_key(&notes_key));
+        assert_eq!(after.folders.get(&main_key), Some(&main_before));
+        assert_eq!(
+            report.cleared,
+            vec![ClearedItem {
+                kind: ClearingKind::Binding,
+                path: notes.clone(),
+            }]
+        );
+        assert!(report.clearing_failures.is_empty());
+        assert!(notes.exists(), "the standalone folder must stay on disk");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn standalone_without_binding_leaves_bindings_file_byte_identical() {
+        let f = RemovalFixture::new("clear-no-binding");
+        let bindings_path = crate::persist::config_dir().join(BINDINGS_FILE);
+        let notes = notes_folder(&f);
+
+        // Part A: no bindings file at all; the removal must not create one.
+        assert!(
+            !bindings_path.exists(),
+            "fixture starts without a bindings file"
+        );
+        let mut state = RepositoryState::default();
+        let key = seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles,
+            save,
+        )
+        .expect("remove standalone without bindings file");
+        assert!(
+            !bindings_path.exists(),
+            "an absent bindings file must stay absent"
+        );
+        assert!(report.cleared.is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert_eq!(calls.get(), 1);
+
+        // Part B: a file holding only a neighbour; the bytes must not move.
+        let neighbour = f.root.join("neighbour");
+        fs::create_dir_all(&neighbour).expect("create neighbour folder");
+        folder_workspace::record(
+            Some(&crate::persist::config_dir()),
+            &neighbour,
+            "neighbour-ws",
+            40,
+        );
+        let bytes_before = fs::read(&bindings_path).expect("read bindings before");
+        let mut state = RepositoryState::default();
+        let key = seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None);
+        state.validate_for_save().expect("seed is save-valid");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles,
+            save,
+        )
+        .expect("remove standalone beside a neighbour binding");
+        assert_eq!(
+            fs::read(&bindings_path).expect("read bindings after"),
+            bytes_before,
+            "a file without the removed key must be byte-identical"
+        );
+        assert!(report.cleared.is_empty());
+        assert!(report.clearing_failures.is_empty());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn binding_clear_failure_is_reported_not_raised() {
+        let f = RemovalFixture::new("clear-failure");
+        let config = crate::persist::config_dir();
+        let mut state = RepositoryState::default();
+        let k = seed_repository(&mut state, &f);
+        checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+        state.validate_for_save().expect("seed is save-valid");
+        folder_workspace::record(Some(&config), &f.repo(), "repo-ws", 10);
+        let repo_key = folder_key(&f.repo());
+        assert!(bindings_on_disk().folders.contains_key(&repo_key));
+        // A directory where the merge lock file goes makes the locked write
+        // fail to open, after the state save has already committed. `record`
+        // leaves its lock file behind, so clear that first.
+        let lock_path = config.join(format!(".{BINDINGS_FILE}.lock"));
+        let _ = fs::remove_file(&lock_path);
+        fs::create_dir_all(&lock_path).expect("occupy the lock path with a directory");
+        let mut handles = no_handles();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("a binding failure must not fail the removal");
+
+        assert_eq!(report.persistence, PersistenceOutcome::Saved);
+        assert!(report.cleared.is_empty());
+        assert_eq!(report.clearing_failures.len(), 1);
+        let failure = &report.clearing_failures[0];
+        assert_eq!(failure.kind, ClearingKind::Binding);
+        assert_eq!(failure.path, f.repo());
+        assert!(
+            !failure.error.is_empty(),
+            "the failure must carry the io error text"
+        );
+        assert!(
+            bindings_on_disk().folders.contains_key(&repo_key),
+            "the binding stays when the clear could not run"
+        );
+        assert!(!state.repositories.iter().any(|r| r.key == k));
+        assert!(!load_state(&f.state_root())
+            .repositories
+            .iter()
+            .any(|r| r.key == k));
+        assert_eq!(calls.get(), 1);
+    }
 }

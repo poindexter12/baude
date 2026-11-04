@@ -265,6 +265,46 @@ mod tests {
     }
 
     #[test]
+    fn clear_removes_only_the_named_key() {
+        let _redirect = TestRedirect::new(scratch("clear-root"));
+        let dir = scratch("clear");
+        let home = Path::new("/mem");
+        record(Some(&dir), Path::new("/mem/api"), "shared", 10);
+        record(Some(&dir), Path::new("/mem/web"), "shared", 20);
+        let web_before = load_json::<FolderWorkspaceFile>(&dir.join(FILE_NAME))
+            .0
+            .folders[&folder_key(Path::new("/mem/web"))]
+            .clone();
+
+        assert_eq!(clear(Some(&dir), Path::new("/mem/api")).unwrap(), true);
+
+        let (on_disk, corrupted) = load_json::<FolderWorkspaceFile>(&dir.join(FILE_NAME));
+        assert!(!corrupted);
+        assert_eq!(on_disk.schema_version, SCHEMA_VERSION);
+        assert_eq!(on_disk.folders.len(), 1);
+        assert_eq!(
+            on_disk.folders.get(&folder_key(Path::new("/mem/web"))),
+            Some(&web_before)
+        );
+        assert_eq!(find_binding(&dir, Path::new("/mem/api"), home), None);
+        assert_eq!(
+            find_binding(&dir, Path::new("/mem/web"), home).as_deref(),
+            Some("shared")
+        );
+
+        // A second clear of the same folder finds nothing and writes nothing.
+        let bytes_before = std::fs::read(dir.join(FILE_NAME)).unwrap();
+        assert_eq!(clear(Some(&dir), Path::new("/mem/api")).unwrap(), false);
+        assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap(), bytes_before);
+
+        // An absent file stays absent, and in-memory mode clears nothing.
+        let empty = scratch("clear-empty");
+        assert_eq!(clear(Some(&empty), Path::new("/mem/api")).unwrap(), false);
+        assert!(!empty.join(FILE_NAME).exists());
+        assert_eq!(clear(None, Path::new("/mem/web")).unwrap(), false);
+    }
+
+    #[test]
     fn unknown_folder_disabled_switch_or_env_never_consult_memory() {
         let _redirect = TestRedirect::new(scratch("gates-root"));
         let dir = scratch("gates");
