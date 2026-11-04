@@ -174,7 +174,7 @@ status: complete
 - `cargo clippy -p baude-core --tests -- -D warnings` and `cargo fmt -p baude-core -- --check` exit 0 after every task
 - Acceptance greps on the final tree: five Task 1 test names 5; injected variants 4; `reader_finished()` 2; three Task 2 test names 3; `PermissionsExt` 1; `impl Drop for` 5; Task 3 test name 1; `RemovalError::Validation` 2; `record_checkout_reconciliation` 1 (see Deviations)
 - `git log --oneline 9915114..HEAD` lists exactly the three task commits; `git diff --stat` over that range touches only `baude-core/src/removal.rs` (533 insertions, 8 deletions); no file deletions, no `Cargo.toml` change
-- Full workspace suite: see the line appended below after the background run completed
+- Full workspace suite: cargo test --workspace exit 0, all binaries ok, 0 failed; baude-core 514 passed and 1 ignored, integration 249 passed, 107 passed in bauded
 
 ## Decisions Made
 
