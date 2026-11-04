@@ -21,6 +21,7 @@ pub mod pty;
 pub mod removal;
 pub mod repository;
 pub mod session;
+pub mod suppression;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 pub mod workspace;
