@@ -2435,4 +2435,210 @@ mod tests {
         assert_eq!(report.persistence, PersistenceOutcome::Saved);
         assert_eq!(load_state(&f.state_root()), state);
     }
+
+    // ---- crash and disk failure between delete and save (plan 05) ----
+
+    use crate::git::ReconciliationUnavailable;
+    use crate::lifecycle;
+
+    /// Pins `<child>/pin` read-only with `pin/held` inside so neither git nor
+    /// the fallback can unlink it; restores `0o755` on drop so the retry can
+    /// reclaim the child and the fixture root can be removed even after a
+    /// failed assertion. The fault lives inside one child only: the managed
+    /// root and every sibling keep their modes.
+    struct PinGuard(PathBuf);
+
+    impl PinGuard {
+        fn new(child: &Path) -> Self {
+            let pin = child.join("pin");
+            fs::create_dir(&pin).expect("create pin");
+            fs::write(pin.join("held"), b"held\n").expect("write held");
+            set_mode(&pin, 0o555);
+            Self(pin)
+        }
+    }
+
+    impl Drop for PinGuard {
+        fn drop(&mut self) {
+            set_mode(&self.0, 0o755);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fixture mode");
+    }
+
+    /// The existing startup reconcile applied to one managed child whose
+    /// directory vanished: classified `Missing`, recorded as
+    /// `Protected(Missing)`.
+    fn reconcile_missing(
+        state: &mut RepositoryState,
+        f: &RemovalFixture,
+        key: CheckoutKey,
+        path: &Path,
+        branch: &str,
+    ) {
+        let outcome =
+            crate::git::reconcile_checkout(&f.common_dir(), path, Some(branch)).map(|_| ());
+        assert!(
+            matches!(outcome, Err(ReconciliationUnavailable::Missing { .. })),
+            "expected Missing, got {outcome:?}"
+        );
+        assert_eq!(
+            lifecycle::record_checkout_reconciliation(state, key, &outcome),
+            Ok(Some(UnavailableCause::Missing))
+        );
+        assert_eq!(
+            checkout_mut(state, key).lifecycle(),
+            &CheckoutLifecycle::Protected(UnavailableCause::Missing)
+        );
+    }
+
+    /// SC5 for a checkout target: a crash between the disk delete and the
+    /// save leaves the prior file, which still parses and validates; the
+    /// startup reconcile marks the vanished child Missing and the retry
+    /// completes the removal.
+    #[test]
+    fn crash_before_save_reconciles_missing() {
+        let f = RemovalFixture::new("crash-checkout");
+        let (mut state, _k, c, managed) = inactive_row(&f, "x");
+        write_seed(&f, &state);
+        let before = state.clone();
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save_with(&f.state_root(), Some(AtomicFailure::Write));
+
+        let error = remove(&mut state, RemovalTarget::Checkout(c), &mut handles, save)
+            .expect_err("the injected write failure must surface");
+
+        assert!(!persist_error(error).replacement_committed());
+        assert!(!managed.exists());
+        assert_eq!(calls.get(), 1);
+
+        let mut loaded = load_state(&f.state_root());
+        assert_eq!(
+            loaded, before,
+            "parent and child are both still in the file"
+        );
+        assert_eq!(loaded.validate(), Ok(()));
+        reconcile_missing(&mut loaded, &f, c, &managed, "feature/x");
+        assert_eq!(loaded.validate(), Ok(()));
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(&mut loaded, RemovalTarget::Checkout(c), &mut handles, save)
+            .expect("retry on the reconciled state");
+
+        assert_eq!(report.already_removed, vec![managed.clone()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!has_checkout(&loaded, c));
+        assert!(!has_checkout(&load_state(&f.state_root()), c));
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// SC5 for a repository target mid-fan-out: every child directory is
+    /// gone when the save fails, yet the file still holds the parent and
+    /// both children, so no child is ever orphaned from its parent.
+    #[test]
+    fn repository_crash_mid_fan_out_keeps_parent_and_children_in_file() {
+        let f = RemovalFixture::new("crash-repository");
+        let (mut state, k, c1, c2, c1_dir, c2_dir) = inactive_pair(&f);
+        write_seed(&f, &state);
+        let before = state.clone();
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save_with(&f.state_root(), Some(AtomicFailure::Write));
+
+        let error = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect_err("the injected write failure must surface");
+
+        assert!(!persist_error(error).replacement_committed());
+        assert!(!c1_dir.exists(), "the disk stage completed for every row");
+        assert!(!c2_dir.exists());
+        assert!(f.repo().exists());
+        assert_eq!(calls.get(), 1);
+
+        let mut loaded = load_state(&f.state_root());
+        assert_eq!(loaded, before);
+        assert!(loaded.repositories.iter().any(|r| r.key == k));
+        assert!(has_checkout(&loaded, c1));
+        assert!(has_checkout(&loaded, c2));
+        assert_eq!(loaded.validate(), Ok(()));
+        reconcile_missing(&mut loaded, &f, c1, &c1_dir, "feature/one");
+        reconcile_missing(&mut loaded, &f, c2, &c2_dir, "feature/two");
+        assert_eq!(loaded.validate(), Ok(()));
+
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(
+            &mut loaded,
+            RemovalTarget::Repository(k),
+            &mut handles,
+            save,
+        )
+        .expect("retry on the reconciled state");
+
+        assert_eq!(report.already_removed, vec![c1_dir.clone(), c2_dir.clone()]);
+        assert_eq!(report.paths_kept, vec![f.repo()]);
+        assert!(report.paths_deleted.is_empty());
+        assert!(!loaded.checkouts.iter().any(|c| c.repository_key == k));
+        assert!(!loaded.repositories.iter().any(|r| r.key == k));
+        assert_eq!(load_state(&f.state_root()), loaded);
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// A per-child disk fault on the second child after the first is gone:
+    /// git drops c2's administrative entry but cannot unlink `pin/held`, the
+    /// guarded fallback fails on the same entry, and `remove` returns before
+    /// the save with state and file untouched. The retry re-selects c1 as
+    /// already removed and reclaims c2 through plan 02's removal marker.
+    #[test]
+    fn repository_disk_failure_mid_fan_out_leaves_state_and_file_untouched() {
+        let f = RemovalFixture::new("disk-failure");
+        let (mut state, k, _c1, c2, c1_dir, c2_dir) = inactive_pair(&f);
+        let before_bytes = write_seed(&f, &state);
+        let before = state.clone();
+        let guard = PinGuard::new(&c2_dir);
+        let marker = crate::git::removal_marker_path(&c2_dir);
+        let c2_text = c2_dir.to_str().expect("utf-8");
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let error = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect_err("c2 cannot be deleted while pin is read-only");
+
+        match error {
+            RemovalError::DiskRemoval { row, path, error } => {
+                assert_eq!(row, RowKey::Checkout(c2));
+                assert_eq!(path, c2_dir);
+                assert_eq!(error.kind, DiskRemovalFailureKind::Fallback, "{error}");
+            }
+            other => panic!("expected DiskRemoval, got {other:?}"),
+        }
+        assert!(
+            !c1_dir.exists(),
+            "the first child was deleted before c2 failed"
+        );
+        assert!(c2_dir.exists());
+        assert!(
+            !worktree_list(&f.repo()).contains(c2_text),
+            "git dropped the administrative entry despite the failed unlink"
+        );
+        assert!(marker.exists(), "the removal marker persists for the retry");
+        assert_eq!(state, before);
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
+        assert_eq!(calls.get(), 0);
+
+        drop(guard);
+        let (save, calls) = counting_save(&f.state_root());
+        let report = remove(&mut state, RemovalTarget::Repository(k), &mut handles, save)
+            .expect("retry after the cause is cleared");
+
+        assert_eq!(report.already_removed, vec![c1_dir.clone()]);
+        assert_eq!(report.paths_deleted, vec![c2_dir.clone()]);
+        assert_eq!(report.paths_kept, vec![f.repo()]);
+        assert!(!c2_dir.exists());
+        assert!(!marker.exists());
+        assert!(!state.checkouts.iter().any(|c| c.repository_key == k));
+        assert!(!state.repositories.iter().any(|r| r.key == k));
+        assert_eq!(load_state(&f.state_root()), state);
+        assert_eq!(calls.get(), 1);
+    }
 }
