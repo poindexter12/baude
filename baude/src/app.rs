@@ -23,6 +23,7 @@ use baude_core::repository::{
     ValidationRow,
 };
 use baude_core::session::{Session, Status};
+use baude_core::suppression;
 
 use crate::hierarchy::{
     self, ActionKind, ActionView, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
@@ -2009,6 +2010,7 @@ impl App {
         if !canonical.is_dir() {
             anyhow::bail!("not a directory: {}", canonical.display());
         }
+        self.lift_suppression(&canonical);
         let persisted = PersistedPath::from_path(&canonical);
         let (key, fresh) =
             if let Some(saved) = self.repository_state.standalone_session_by_path(&persisted) {
@@ -2289,8 +2291,24 @@ impl App {
         Ok(())
     }
 
+    /// Forget the suppression entry for the repository root of `path`, if any,
+    /// so an explicit admission of a removed checkout re-admits it. The key is
+    /// the admitted path's own `repo_root`, never the main worktree and never a
+    /// child, so admitting the parent root leaves a child's entry alone (D-12).
+    /// The store is advisory: a write failure is a message, never an error out
+    /// of an admission or a launch (D-09).
+    fn lift_suppression(&mut self, path: &Path) {
+        let key_path = git::repo_root(path).unwrap_or_else(|| path.to_path_buf());
+        if let Err(error) = suppression::lift(&persist::config_dir(), &key_path) {
+            self.set_message(format!("suppression lift failed: {error}"));
+        }
+    }
+
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
         let snapshot = git::discover_repository(path)?;
+        // Lift before either sweep site below so an explicit admission of a
+        // removed checkout brings it back in this same pass.
+        self.lift_suppression(path);
         // Admission is the reconciliation seam: resolve origin once here and
         // retain only its browser-addressable identity for gesture-time hints.
         let origin = git::origin_target(&snapshot.main_worktree).map(|target| RepositoryOrigin {
@@ -2503,6 +2521,13 @@ impl App {
                     .iter()
                     .any(|standalone| standalone.canonical_path == path);
             if owned {
+                continue;
+            }
+            // The suppression store is advisory and can only take a candidate
+            // out of this sweep, never admit one. An entry goes away only when
+            // an explicit admission of exactly that path lifts it or when the
+            // parent repository row is removed (D-11, D-12).
+            if suppression::is_suppressed(&persist::config_dir(), &record.path) {
                 continue;
             }
             let main_role_taken = self.repository_state.checkouts.iter().any(|checkout| {
