@@ -2956,13 +2956,57 @@ fn canonicalize_through_missing(path: &Path) -> std::result::Result<PathBuf, For
     })
 }
 
+/// Resolve the managed root itself. Unlike a target, the root may be a
+/// symlink: relocating `$XDG_DATA_HOME/baude/worktrees` to another disk is
+/// routine, creation and discovery follow the link, and the containment
+/// check below compares both sides after they resolve, so refusing the link
+/// would protect nothing. A missing root resolves through its nearest
+/// existing ancestor like any other path.
+fn resolve_managed_root(root: &Path) -> std::result::Result<PathBuf, ForcedRemovalError> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => root
+            .canonicalize()
+            .map_err(|error| ForcedRemovalError::Uninspectable {
+                path: root.to_path_buf(),
+                detail: error.to_string(),
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            canonicalize_through_missing(root)
+        }
+        Err(error) => Err(ForcedRemovalError::Uninspectable {
+            path: root.to_path_buf(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
 /// Prove `path` lies strictly inside baude's managed worktree root. The root
-/// itself is not inside itself; both sides resolve through the
+/// itself is not inside itself; the target resolves through the
 /// nearest-existing-ancestor walk so a vanished workspace directory or a wiped
-/// data directory still resolves and its stale entry can be pruned.
+/// data directory still resolves and its stale entry can be dropped. The
+/// symlink refusal applies to the target and its ancestors below the root: a
+/// missing target spelled through the root link is re-rooted first so its
+/// ancestor walk never meets the link, while a present one resolves as
+/// spelled and is itself refused when it is a link.
 fn managed_root_contains(path: &Path) -> std::result::Result<PathBuf, ForcedRemovalError> {
-    let root = canonicalize_through_missing(&worktrees_base())?;
-    let canonical = canonicalize_through_missing(path)?;
+    let base = worktrees_base();
+    let root = resolve_managed_root(&base)?;
+    let missing = matches!(
+        std::fs::symlink_metadata(path),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let rerooted = match path.strip_prefix(&base) {
+        Ok(rest)
+            if missing
+                && rest
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))) =>
+        {
+            root.join(rest)
+        }
+        _ => path.to_path_buf(),
+    };
+    let canonical = canonicalize_through_missing(&rerooted)?;
     if canonical != root && canonical.starts_with(&root) {
         Ok(canonical)
     } else {
@@ -5536,6 +5580,49 @@ mod tests {
                 .file_type()
                 .is_symlink());
             assert_untouched(&repo, &wt, &before);
+        }
+
+        /// A managed root relocated to another disk through a symlink is
+        /// followed: the target is compared after both sides resolve, so the
+        /// link at the root protects nothing and must not refuse every row.
+        #[test]
+        fn symlinked_managed_root_is_followed() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let store = fixture.root.join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            let base = worktrees_base();
+            std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&store, &base).unwrap();
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+                .expect("a present target under a symlinked root is removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert_eq!(
+                removal.path,
+                store.canonicalize().unwrap().join("ws/repo/wt-a")
+            );
+            assert!(!wt_a.exists());
+            assert!(!inventory_lists(&repo, &wt_a));
+
+            let removal = remove_managed_worktree_forced(&repo, &common, &wt_b)
+                .expect("a missing target spelled through the root link is removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!inventory_lists(&repo, &wt_b));
+            assert!(std::fs::symlink_metadata(&base)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(store.exists());
+            assert_eq!(branch_snapshot(&repo), before);
         }
 
         #[test]
