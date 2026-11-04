@@ -488,4 +488,206 @@ mod tests {
             "Malformed JSON should be invalid"
         );
     }
+
+    fn owner_meta() -> MarkerMetadata {
+        MarkerMetadata {
+            canonical_common_dir: b"/repo/a/.git".to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn clear_owned_removes_owned_marker_and_empty_directory() {
+        // Behaviour 1: an owned marker in an otherwise empty directory.
+        let owned = test_dir("clear_owned");
+        let meta = owner_meta();
+        assert_eq!(write_marker(&owned, &meta), Ok(MarkerWrite::Created));
+
+        let outcome = clear_owned(&owned, &meta.canonical_common_dir).unwrap();
+        assert_eq!(
+            outcome,
+            MarkerClear {
+                marker: MarkerOutcome::Removed,
+                directory: DirectoryOutcome::Removed,
+            }
+        );
+        assert_eq!(read_marker(&owned).unwrap(), MarkerRead::Missing);
+        assert!(!owned.exists(), "directory should be gone after the clear");
+
+        // Behaviour 7: no marker but an empty directory.
+        let empty = test_dir("clear_empty");
+        let outcome = clear_owned(&empty, &meta.canonical_common_dir).unwrap();
+        assert_eq!(
+            outcome,
+            MarkerClear {
+                marker: MarkerOutcome::Missing,
+                directory: DirectoryOutcome::Removed,
+            }
+        );
+        assert!(!empty.exists(), "empty directory should be removed");
+    }
+
+    #[test]
+    fn clear_owned_refuses_foreign_marker_and_leaves_directory() {
+        let test_dir = test_dir("clear_foreign");
+        let foreign = MarkerMetadata {
+            canonical_common_dir: b"/repo/b/.git".to_vec(),
+            scheme_version: 1,
+            recorded_at_ms: 2,
+        };
+        assert_eq!(write_marker(&test_dir, &foreign), Ok(MarkerWrite::Created));
+        let marker_path = test_dir.join(".baude-marker.json");
+        let before = fs::read(&marker_path).unwrap();
+
+        let outcome = clear_owned(&test_dir, b"/repo/a/.git").unwrap();
+        assert_eq!(
+            outcome,
+            MarkerClear {
+                marker: MarkerOutcome::Refused(ClearRefusal::ForeignOwner),
+                directory: DirectoryOutcome::Untouched,
+            }
+        );
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            before,
+            "foreign marker bytes must be unchanged"
+        );
+        assert_eq!(read_marker(&test_dir).unwrap(), MarkerRead::Valid(foreign));
+        assert!(test_dir.is_dir(), "directory must survive a refusal");
+    }
+
+    #[test]
+    fn clear_owned_refuses_invalid_and_symlinked_marker() {
+        let owner = owner_meta();
+
+        // Malformed marker content.
+        let malformed_dir = test_dir("clear_malformed");
+        let malformed_path = malformed_dir.join(".baude-marker.json");
+        fs::write(&malformed_path, "not valid json {{{").unwrap();
+        let before = fs::read(&malformed_path).unwrap();
+
+        let outcome = clear_owned(&malformed_dir, &owner.canonical_common_dir).unwrap();
+        assert!(
+            matches!(
+                outcome.marker,
+                MarkerOutcome::Refused(ClearRefusal::Invalid(InvalidReason::Malformed(_)))
+            ),
+            "malformed marker should be refused as Invalid: {:?}",
+            outcome
+        );
+        assert_eq!(outcome.directory, DirectoryOutcome::Untouched);
+        assert_eq!(fs::read(&malformed_path).unwrap(), before);
+        assert!(malformed_dir.is_dir());
+
+        // Symlinked marker file.
+        #[cfg(unix)]
+        {
+            let link_dir = test_dir("clear_marker_symlink");
+            let marker_path = link_dir.join(".baude-marker.json");
+            let target = link_dir.join("target.json");
+            fs::write(&target, serde_json::to_string(&owner).unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &marker_path).unwrap();
+
+            let outcome = clear_owned(&link_dir, &owner.canonical_common_dir).unwrap();
+            assert_eq!(
+                outcome,
+                MarkerClear {
+                    marker: MarkerOutcome::Refused(ClearRefusal::Invalid(InvalidReason::Symlink)),
+                    directory: DirectoryOutcome::Untouched,
+                }
+            );
+            assert!(target.exists(), "symlink target file must survive");
+            assert!(
+                fs::symlink_metadata(&marker_path).unwrap().is_symlink(),
+                "symlinked marker must not be removed"
+            );
+            assert!(link_dir.is_dir());
+        }
+    }
+
+    #[test]
+    fn clear_owned_missing_directory_is_a_noop() {
+        let parent = test_dir("clear_missing");
+        // The repository- path a legacy empty physical_key resolves to.
+        let missing = parent.join("repository-");
+        assert!(!missing.exists());
+
+        let outcome = clear_owned(&missing, b"/repo/a/.git").unwrap();
+        assert_eq!(
+            outcome,
+            MarkerClear {
+                marker: MarkerOutcome::Missing,
+                directory: DirectoryOutcome::Missing,
+            }
+        );
+        assert!(!missing.exists());
+        assert!(parent.is_dir(), "the parent is not touched");
+    }
+
+    #[test]
+    fn clear_owned_keeps_non_empty_directory_after_marker_removal() {
+        let test_dir = test_dir("clear_non_empty");
+        let meta = owner_meta();
+        assert_eq!(write_marker(&test_dir, &meta), Ok(MarkerWrite::Created));
+        let child = test_dir.join("leftover-worktree");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("file.txt"), "keep me").unwrap();
+
+        let outcome = clear_owned(&test_dir, &meta.canonical_common_dir).unwrap();
+        assert_eq!(
+            outcome,
+            MarkerClear {
+                marker: MarkerOutcome::Removed,
+                directory: DirectoryOutcome::NotEmpty,
+            }
+        );
+        assert_eq!(read_marker(&test_dir).unwrap(), MarkerRead::Missing);
+        assert!(child.is_dir(), "subdirectory must survive");
+        assert_eq!(
+            fs::read_to_string(child.join("file.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(test_dir.is_dir());
+    }
+
+    #[test]
+    fn clear_owned_refuses_symlinked_directory() {
+        #[cfg(unix)]
+        {
+            let parent = test_dir("clear_dir_symlink");
+            let target_dir = parent.join("real");
+            fs::create_dir(&target_dir).unwrap();
+            let meta = owner_meta();
+            assert_eq!(write_marker(&target_dir, &meta), Ok(MarkerWrite::Created));
+            let link = parent.join("repository-link");
+            std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+            let before = fs::read(target_dir.join(".baude-marker.json")).unwrap();
+
+            let outcome = clear_owned(&link, &meta.canonical_common_dir).unwrap();
+            assert_eq!(
+                outcome,
+                MarkerClear {
+                    marker: MarkerOutcome::Refused(ClearRefusal::DirectoryIsSymlink),
+                    directory: DirectoryOutcome::Untouched,
+                }
+            );
+            assert!(
+                fs::symlink_metadata(&link).unwrap().is_symlink(),
+                "the symlink itself must survive"
+            );
+            assert!(target_dir.is_dir(), "link target directory must survive");
+            assert_eq!(
+                fs::read(target_dir.join(".baude-marker.json")).unwrap(),
+                before,
+                "link target marker must be unchanged"
+            );
+            assert_eq!(read_marker(&target_dir).unwrap(), MarkerRead::Valid(meta));
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Symlink test skipped on non-Unix
+        }
+    }
 }
