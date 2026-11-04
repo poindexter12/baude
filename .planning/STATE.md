@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 19
 current_phase_name: Re-admission Suppression
 status: executing
-stopped_at: Completed 19-04-PLAN.md
-last_updated: "2026-11-04T18:44:09.804Z"
+stopped_at: Completed 19-05-PLAN.md
+last_updated: "2026-11-04T20:56:48.468Z"
 last_activity: 2026-11-04
 last_activity_desc: Phase 19 execution started
-state_head: b2a2b28ee424d77b4534cd0bc72b94039d82ed9a
+state_head: f541c6c2e02a80ac69c11e3a77605fa390dfcbd5
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 15
-  completed_plans: 12
+  completed_plans: 13
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 19 (Re-admission Suppression) — EXECUTING
-Plan: 5 of 7
+Plan: 6 of 7
 Status: Ready to execute
 Last activity: 2026-11-04 — Phase 19 execution started
 
@@ -114,6 +114,7 @@ Last activity: 2026-11-04 — Phase 19 execution started
 | Phase 19 P02 | 20min | 3 tasks | 2 files |
 | Phase 19 P03 | 3min | 3 tasks | 1 files |
 | Phase 19 P04 | 19min | 3 tasks | 1 files |
+| Phase 19 P05 | 33min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -266,6 +267,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 19]: MARKER_FILE constant hoisted in the GREEN step so plan 19-03 Task 3 had no refactor
 - [Phase 19]: 19-04: empty or legacy physical_key is a silent no-op in the clearing stage; only keys that could escape the managed root become a ClearingFailure
 - [Phase 19]: 19-04: plan and execute helpers mirror each other per clearing kind so preview agreement is structural
+- [Phase 19]: 19-05: suppression lift key is git::repo_root of the admitted path, so a subfolder launch lifts its checkout and the parent root never lifts a child
+- [Phase 19]: 19-05: a failed suppression lift leaves the entry and the sweep still skips it; the admission returns Ok with its rows intact and the failure is a message
 
 ### Pending Todos
 
@@ -348,8 +351,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T18:44:09.638Z
-Stopped at: Completed 19-04-PLAN.md
+Last session: 2026-11-04T20:56:48.089Z
+Stopped at: Completed 19-05-PLAN.md
 Resume file: None
 
 ## Operator Next Steps

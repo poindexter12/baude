@@ -118,7 +118,7 @@ Plans:
   3. `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity
   4. Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace
 
-**Plans**: 4/7 plans executed
+**Plans**: 5/7 plans executed
 
 Plans:
 **Wave 1**
@@ -128,7 +128,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [x] 19-04-PLAN.md — markers, managed dirs and suppression entries in the clearing stage, D-15 neighbour-safety proof (TDD)
-- [ ] 19-05-PLAN.md — TUI sweep consult and lift on `n`, `c` and launch-dir admission (TDD)
+- [x] 19-05-PLAN.md — TUI sweep consult and lift on `n`, `c` and launch-dir admission (TDD)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 19-06-PLAN.md — relaunch proofs through a second `App`, crumb pruning on flush
