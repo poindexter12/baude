@@ -431,12 +431,40 @@ struct StageResults {
     persistence: PersistenceOutcome,
 }
 
+/// A row whose disk stage will need git must have its owning repository's
+/// common dir on disk now, so a repository deleted outside baude is refused
+/// before the kill stage instead of after every runtime is already dead.
+fn probe_owner_common_dir(row: &PlannedRow) -> Result<(), RemovalError> {
+    if row.disk == DiskAction::KeepDirectory {
+        return Ok(());
+    }
+    let Some(path) = &row.path else {
+        return Ok(());
+    };
+    let common_dir = owner_common_dir(row, path)?;
+    match std::fs::symlink_metadata(common_dir) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(disk_error(
+            row,
+            path,
+            DiskRemovalFailure {
+                kind: DiskRemovalFailureKind::Uninspectable,
+                detail: format!(
+                    "owning repository common dir {} is not on disk: {error}",
+                    common_dir.display()
+                ),
+            },
+        )),
+    }
+}
+
 /// Verify every handle against the persisted runtime of its row before any
 /// signal is sent: exactly one handle per live row, full `ProcessIdentity`
 /// equality for the agent, exact `ShellOwnership` agreement, and no handle
 /// at all for a row without a persisted runtime.
 fn preflight(set: &RemovalSet, runtimes: &[RowRuntime]) -> Result<(), RemovalError> {
     for row in &set.rows {
+        probe_owner_common_dir(row)?;
         let handles: Vec<&RowRuntime> = runtimes
             .iter()
             .filter(|handle| handle.row == row.row)
@@ -566,14 +594,14 @@ fn disk_stage(set: &RemovalSet) -> Result<DiskResults, RemovalError> {
         match row.disk {
             DiskAction::KeepDirectory => results.kept.push(path.clone()),
             DiskAction::RemoveManagedWorktree => {
-                let (main_worktree, common_dir) = owner_paths(row, path)?;
-                crate::git::remove_managed_worktree_forced(main_worktree, common_dir, path)
+                let common_dir = owner_common_dir(row, path)?;
+                crate::git::remove_managed_worktree_forced(common_dir, path)
                     .map_err(|error| disk_error(row, path, error.into()))?;
                 results.deleted.push(path.clone());
             }
             DiskAction::AlreadyRemoved => {
-                let (main_worktree, common_dir) = owner_paths(row, path)?;
-                match crate::git::remove_managed_worktree_forced(main_worktree, common_dir, path) {
+                let common_dir = owner_common_dir(row, path)?;
+                match crate::git::remove_managed_worktree_forced(common_dir, path) {
                     Ok(_) | Err(crate::git::ForcedRemovalError::NotRegistered { .. }) => {}
                     Err(error) => return Err(disk_error(row, path, error.into())),
                 }
@@ -584,12 +612,14 @@ fn disk_stage(set: &RemovalSet) -> Result<DiskResults, RemovalError> {
     Ok(results)
 }
 
-/// The owning repository's main worktree and common directory, which
-/// `select_rows` records on every checkout row.
-fn owner_paths<'a>(row: &'a PlannedRow, path: &Path) -> Result<(&'a Path, &'a Path), RemovalError> {
-    match (&row.main_worktree, &row.common_dir) {
-        (Some(main_worktree), Some(common_dir)) => Ok((main_worktree, common_dir)),
-        _ => Err(disk_error(
+/// The owning repository's common directory, which `select_rows` records on
+/// every checkout row. The main worktree is deliberately not consulted: the
+/// forced helper runs against the common dir so a vanished main checkout
+/// does not strand its managed children.
+fn owner_common_dir<'a>(row: &'a PlannedRow, path: &Path) -> Result<&'a Path, RemovalError> {
+    match &row.common_dir {
+        Some(common_dir) => Ok(common_dir),
+        None => Err(disk_error(
             row,
             path,
             DiskRemovalFailure {
@@ -1355,6 +1385,11 @@ mod tests {
             self.state_root().join("state.json")
         }
 
+        /// The common dir's path on disk, usable after the repository is gone.
+        fn common_dir_path(&self) -> PathBuf {
+            self.repo().join(".git")
+        }
+
         fn common_dir(&self) -> PathBuf {
             crate::git::discover_repository(&self.repo())
                 .expect("discover repository")
@@ -1658,6 +1693,56 @@ mod tests {
     }
 
     // ---- live-runtime orchestration tests (plan 04) ----
+
+    /// A repository deleted outside baude is refused before the kill stage:
+    /// the runtime keeps running, no handle is consumed, nothing is saved.
+    #[test]
+    fn vanished_owner_common_dir_is_refused_before_the_kill() {
+        let f = RemovalFixture::new("owner-gone");
+        let (mut state, key, managed, pty) = live_row(&f, "wt-live");
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        state.validate_for_save().expect("seed is save-valid");
+        let before = state.clone();
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(key),
+            pty,
+            None,
+            &managed,
+            &f.repo(),
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+        fs::remove_dir_all(f.repo()).expect("delete the main checkout and its common dir");
+        assert!(!f.common_dir_path().exists());
+
+        let error = remove(
+            &mut state,
+            RemovalTarget::Checkout(key),
+            &mut handles.0,
+            save,
+        )
+        .expect_err("a vanished owning repository is refused");
+
+        match error {
+            RemovalError::DiskRemoval { row, path, error } => {
+                assert_eq!(row, RowKey::Checkout(key));
+                assert_eq!(path, managed);
+                assert_eq!(error.kind, DiskRemovalFailureKind::Uninspectable, "{error}");
+            }
+            other => panic!("expected DiskRemoval, got {other:?}"),
+        }
+        assert!(!group_is_extinct(pgid), "group {pgid} must still be alive");
+        assert!(
+            crate::session::inspect_process_identity(pid)
+                .expect("inspect")
+                .is_some(),
+            "leader {pid} must still be running"
+        );
+        assert_eq!(handles.0.len(), 1, "no handle is consumed");
+        assert_eq!(state, before);
+        assert_eq!(calls.get(), 0, "nothing is saved");
+        assert!(managed.exists(), "the managed directory survives");
+    }
 
     #[test]
     fn live_runtime_group_is_extinct_after_remove() {

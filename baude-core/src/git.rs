@@ -3036,16 +3036,19 @@ fn record_identity(record: &WorktreeRecord) -> PathBuf {
     canonicalize_through_missing(&record.path).unwrap_or_else(|_| record.path.clone())
 }
 
-/// Re-prove on the live tree that `main_worktree` is the repository the caller
-/// expects, that `canonical` is not its main worktree, and return the
-/// registered linked-worktree record equal to `canonical`, if any.
+/// Re-prove on the live tree that `expected_common_dir` is the common
+/// directory of a repository (git run from inside it must report it back),
+/// that `canonical` is not that repository's main worktree, and return the
+/// registered linked-worktree record equal to `canonical`, if any. Every
+/// command runs against the common dir rather than the main checkout, so a
+/// main checkout deleted outside baude does not block cleanup of its
+/// children inside the managed root.
 fn registered_linked_worktree(
-    main_worktree: &Path,
     expected_common_dir: &Path,
     canonical: &Path,
 ) -> std::result::Result<Option<WorktreeRecord>, ForcedRemovalError> {
     let common_output = git_bytes(
-        main_worktree,
+        expected_common_dir,
         &[
             OsStr::new("rev-parse"),
             OsStr::new("--path-format=absolute"),
@@ -3065,8 +3068,8 @@ fn registered_linked_worktree(
             observed_common_dir,
         });
     }
-    let inventory =
-        worktree_inventory(main_worktree).map_err(|error| discovery_to_forced(canonical, error))?;
+    let inventory = worktree_inventory(expected_common_dir)
+        .map_err(|error| discovery_to_forced(canonical, error))?;
     if let Some(main) = inventory.first() {
         if record_identity(main) == canonical {
             return Err(ForcedRemovalError::MainWorktree {
@@ -3272,15 +3275,16 @@ fn removal_marker_matches(canonical: &Path, expected_common_dir: &Path) -> bool 
         && lines.next() == Some(format!("common_dir={}", expected_common_dir.display()).as_str())
 }
 
-/// Run `git -C <main_worktree> <args>` and capture its output. Shared by the
-/// verified and forced removal paths so neither builds its own `Command`.
+/// Run `git -C <repository> <args>` and capture its output, where
+/// `repository` is a worktree for the verified path and the common dir for
+/// the forced path. Shared so neither builds its own `Command`.
 fn run_worktree_command(
-    main_worktree: &Path,
+    repository: &Path,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> std::io::Result<Output> {
     Command::new("git")
         .arg("-C")
-        .arg(main_worktree)
+        .arg(repository)
         .args(args)
         .output()
 }
@@ -3291,11 +3295,11 @@ fn run_worktree_command(
 /// also drop every other registered worktree whose directory is temporarily
 /// absent (an unmounted volume the startup reconcile keeps as unavailable).
 fn remove_worktree_entry(
-    main_worktree: &Path,
+    common_dir: &Path,
     canonical: &Path,
 ) -> std::result::Result<Output, ForcedRemovalError> {
     run_worktree_command(
-        main_worktree,
+        common_dir,
         forced_remove_arguments()
             .into_iter()
             .chain([canonical.as_os_str()]),
@@ -3319,22 +3323,23 @@ enum ForcedStep {
 /// Main, unmanaged or standalone path. Explicit user removal bypasses only the
 /// clean-tree and lock checks that `inspect_removal` / `topology_blockers`
 /// enforce for the verified path; common-dir identity, main-worktree exclusion
-/// and registration are re-proven here on the live tree. Containment in the
-/// managed root is checked before any effect. No branch command is ever
-/// issued. A registered path whose directory is already gone is accepted so
+/// and registration are re-proven here on the live tree. Every git command
+/// runs against `expected_common_dir`, never the main checkout, so a main
+/// checkout that vanished outside baude does not strand its children.
+/// Containment in the managed root is checked before any effect. No branch
+/// command is ever issued. A registered path whose directory is already gone is accepted so
 /// its own administrative entry is dropped; a directory that Git half-removed is
 /// reclaimed only through the removal marker written before the Git command;
 /// a target whose Git identity cannot be inspected is refused; the `.git`
 /// shape is inspected before the Git command is spawned as well as before the
 /// fallback, and a bare repository occupying the path is a foreign repository.
 pub fn remove_managed_worktree_forced(
-    main_worktree: &Path,
     expected_common_dir: &Path,
     path: &Path,
 ) -> std::result::Result<ForcedRemoval, ForcedRemovalError> {
     let canonical = managed_root_contains(path)?;
     let expected_common_dir = canonicalize_through_missing(expected_common_dir)?;
-    let record = registered_linked_worktree(main_worktree, &expected_common_dir, &canonical)?;
+    let record = registered_linked_worktree(&expected_common_dir, &canonical)?;
     let present = match std::fs::symlink_metadata(&canonical) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -3349,7 +3354,7 @@ pub fn remove_managed_worktree_forced(
     let step = match (record, present) {
         (None, false) => ForcedStep::Nothing,
         (None, true) => {
-            let claimed_beneath = worktree_inventory(main_worktree)
+            let claimed_beneath = worktree_inventory(&expected_common_dir)
                 .map_err(|error| discovery_to_forced(&canonical, error))?
                 .iter()
                 .any(|record| record_identity(record).starts_with(&canonical));
@@ -3361,7 +3366,7 @@ pub fn remove_managed_worktree_forced(
         }
         // Registered, directory gone: git drops a missing worktree per entry.
         (Some(_), false) => {
-            let output = remove_worktree_entry(main_worktree, &canonical)?;
+            let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
             if output.status.success() {
                 ForcedStep::GitRemoved
             } else {
@@ -3371,7 +3376,7 @@ pub fn remove_managed_worktree_forced(
         (Some(_), true) => {
             foreign_repository_guard(&canonical, &expected_common_dir)?;
             write_removal_marker(&canonical, &expected_common_dir)?;
-            let output = remove_worktree_entry(main_worktree, &canonical)?;
+            let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
             if output.status.success() {
                 ForcedStep::GitRemoved
             } else {
@@ -3401,7 +3406,7 @@ pub fn remove_managed_worktree_forced(
             // With the directory gone git drops the entry per path; the
             // postcondition below surfaces an entry that still survives
             // rather than reaching for a repository-wide prune.
-            let _ = remove_worktree_entry(main_worktree, &canonical)?;
+            let _ = remove_worktree_entry(&expected_common_dir, &canonical)?;
             ForcedRemovalMethod::DeleteFallback
         }
     };
@@ -3421,11 +3426,12 @@ pub fn remove_managed_worktree_forced(
             });
         }
     }
-    let inventory =
-        worktree_inventory(main_worktree).map_err(|error| ForcedRemovalError::Postcondition {
+    let inventory = worktree_inventory(&expected_common_dir).map_err(|error| {
+        ForcedRemovalError::Postcondition {
             path: canonical.clone(),
             detail: error.to_string(),
-        })?;
+        }
+    })?;
     if inventory
         .iter()
         .any(|record| record_identity(record) == canonical)
@@ -5408,7 +5414,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("unclean managed worktree is force-removed");
 
             assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
@@ -5439,7 +5445,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("locked managed worktree is force-removed");
 
             assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
@@ -5458,7 +5464,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("git refusal inside root falls back");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5478,7 +5484,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("missing registered directory is pruned");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5497,7 +5503,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("outside-root path is refused");
 
             match error {
@@ -5520,7 +5526,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &root)
+            let error = remove_managed_worktree_forced(&common, &root)
                 .expect_err("the managed root is not inside itself");
 
             assert!(
@@ -5544,7 +5550,7 @@ mod tests {
                 fixture.root.join("data/baude/worktrees/ws"),
                 fixture.root.join(MANAGED),
             ] {
-                let error = remove_managed_worktree_forced(&repo, &common, &ancestor)
+                let error = remove_managed_worktree_forced(&common, &ancestor)
                     .expect_err("an ancestor directory is refused");
                 match error {
                     ForcedRemovalError::NotRegistered { path } => {
@@ -5568,7 +5574,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &link)
+            let error = remove_managed_worktree_forced(&common, &link)
                 .expect_err("a symlink inside the root is refused");
 
             match error {
@@ -5601,7 +5607,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
                 .expect("a present target under a symlinked root is removed");
 
             assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
@@ -5612,7 +5618,7 @@ mod tests {
             assert!(!wt_a.exists());
             assert!(!inventory_lists(&repo, &wt_a));
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt_b)
+            let removal = remove_managed_worktree_forced(&common, &wt_b)
                 .expect("a missing target spelled through the root link is removed");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5625,19 +5631,80 @@ mod tests {
             assert_eq!(branch_snapshot(&repo), before);
         }
 
+        /// A main checkout deleted outside baude, with its common dir kept
+        /// apart, must not strand the managed children: every command runs
+        /// against the common dir.
         #[test]
-        fn common_dir_mismatch_is_refused() {
+        fn vanished_main_checkout_still_removes_managed_child() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let store = fixture.root.join("store.git");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("init"),
+                    OsStr::new("-q"),
+                    OsStr::new("--separate-git-dir"),
+                    store.as_os_str(),
+                ],
+            );
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let common = common_dir(&repo);
+            assert_eq!(common, store.canonicalize().unwrap());
+            let before = branch_snapshot(&repo);
+            std::fs::remove_dir_all(&repo).unwrap();
+            assert!(!repo.exists());
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("a child is removable after its main checkout vanished");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&common, &wt));
+            assert_eq!(branch_snapshot(&common), before);
+        }
+
+        /// Another repository's common dir does not register `wt`, so the
+        /// removal is refused as unregistered and the directory survives.
+        #[test]
+        fn other_repository_common_dir_is_refused() {
             let fixture = GitFixture::new();
             let _root = crate::testing::TestRedirect::new(&fixture.root);
             let repo = fixture.repo("repo");
             let other = fixture.repo("other");
             let wt = managed_worktree(&fixture, &repo, "wt-a");
-            let expected = common_dir(&other);
-            let observed = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &expected, &wt)
+            let error = remove_managed_worktree_forced(&common_dir(&other), &wt)
                 .expect_err("another repository's common dir is refused");
+
+            match error {
+                ForcedRemovalError::NotRegistered { path } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                }
+                other => panic!("expected NotRegistered, got {other:?}"),
+            }
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn common_dir_mismatch_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let _wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            let observed = common_dir(&repo);
+            let expected = observed.join("worktrees").join("wt-b");
+            assert!(
+                expected.join("HEAD").is_file(),
+                "wt-b private gitdir exists"
+            );
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&expected, &wt)
+                .expect_err("a linked worktree's private gitdir is not the common dir");
 
             match error {
                 ForcedRemovalError::IdentityMismatch {
@@ -5664,7 +5731,7 @@ mod tests {
             let common = common_dir(&main);
             let before = branch_snapshot(&main);
 
-            let error = remove_managed_worktree_forced(&main, &common, &main)
+            let error = remove_managed_worktree_forced(&common, &main)
                 .expect_err("the main worktree is refused even inside the root");
 
             match error {
@@ -5691,7 +5758,7 @@ mod tests {
             let before = branch_snapshot(&repo);
 
             for target in [&plain, &stray] {
-                let error = remove_managed_worktree_forced(&repo, &common, target)
+                let error = remove_managed_worktree_forced(&common, target)
                     .expect_err("an unregistered directory is refused");
                 match error {
                     ForcedRemovalError::NotRegistered { path } => {
@@ -5718,7 +5785,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("a replacement repository is refused");
 
             match error {
@@ -5760,7 +5827,7 @@ mod tests {
             let before = branch_snapshot(&repo);
             let canonical = wt.canonicalize().unwrap();
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("a bare replacement repository is refused");
 
             match error {
@@ -5796,7 +5863,7 @@ mod tests {
             let before = branch_snapshot(&repo);
             let canonical = wt.canonicalize().unwrap();
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("a symlinked gitfile is refused before git runs");
 
             match error {
@@ -5833,7 +5900,7 @@ mod tests {
             let canonical = wt.canonicalize().unwrap();
             let marker = removal_marker_path(&canonical);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("git drops the entry but the directory cannot be deleted");
 
             match error {
@@ -5852,7 +5919,7 @@ mod tests {
             assert_eq!(branch_snapshot(&repo), before);
 
             drop(guard);
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("orphan is reclaimed through the removal marker");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5881,7 +5948,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &plain)
+            let error = remove_managed_worktree_forced(&common, &plain)
                 .expect_err("a marker naming another common dir is no proof");
 
             match error {
@@ -5903,7 +5970,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("a malformed gitfile is refused");
 
             match error {
@@ -5930,7 +5997,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("vanished repository directory still prunes");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5950,7 +6017,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("a lone HEAD file is no repository");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -5974,7 +6041,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("a config without bare = true is no repository");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -6000,7 +6067,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt)
+            let removal = remove_managed_worktree_forced(&common, &wt)
                 .expect("a wiped managed root still prunes");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -6023,7 +6090,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&repo, &common, &wt)
+            let error = remove_managed_worktree_forced(&common, &wt)
                 .expect_err("a symlinked marker is refused");
 
             match error {
@@ -6076,7 +6143,7 @@ mod tests {
             assert_eq!(admin_entries(&common).len(), 2);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
                 .expect("missing registered directory is removed per entry");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -6103,7 +6170,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
                 .expect("git refusal inside root falls back");
 
             assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
@@ -6139,7 +6206,7 @@ mod tests {
             let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let removal = remove_managed_worktree_forced(&repo, &common, &wt_a)
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
                 .expect("an unregistered missing path is already absent");
 
             assert_eq!(removal.method, ForcedRemovalMethod::AlreadyAbsent);
