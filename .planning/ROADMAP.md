@@ -69,7 +69,7 @@ Known gaps: see MILESTONES.md.
 
 **Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
 
-- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (0/7 plans)
+- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans)
 - [ ] Phase 19: Re-admission Suppression (0/? plans)
 - [ ] Phase 20: TUI Remove Action (0/? plans)
 - [ ] Phase 21: Daemon and PWA Parity (0/? plans)
