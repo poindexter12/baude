@@ -118,7 +118,23 @@ Plans:
   3. `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity
   4. Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace
 
-**Plans**: TBD
+**Plans**: 7 plans
+
+Plans:
+**Wave 1**
+- [ ] 19-01-PLAN.md — binding clear as the fourth `removal::remove` stage with `ClearedItem` report and preview parity (TDD, tracer)
+- [ ] 19-02-PLAN.md — `suppression.rs` per-workspace advisory store: consult, lift, suppress, drop_children (TDD)
+- [ ] 19-03-PLAN.md — `marker::clear_owned` owner-checked marker clear with non-recursive directory removal (TDD)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+- [ ] 19-04-PLAN.md — markers, managed dirs and suppression entries in the clearing stage, D-15 neighbour-safety proof (TDD)
+- [ ] 19-05-PLAN.md — TUI sweep consult and lift on `n`, `c` and launch-dir admission (TDD)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+- [ ] 19-06-PLAN.md — relaunch proofs through a second `App`, crumb pruning on flush
+
+**Wave 4** *(blocked on Wave 3 completion)*
+- [ ] 19-07-PLAN.md — `scripts/gate.sh` on macOS and `--linux` on the same final commit, gate-driven fixes only
 
 ### Phase 20: TUI Remove Action
 

@@ -444,17 +444,19 @@ persist::load_current_at(state_root, "state.json").expect("load saved state").st
 | A2 | `git::repo_root` of a linked worktree returns that worktree's top level, so a binding keyed by the checkout's `observed_path` exists when baude was launched inside it | Pattern 1 | If it returned the main worktree instead, D-01's per-checkout key would simply find no entry (no-op), and READM-01 still holds via the repository's key. |
 | A3 | Removing an entry from a `BTreeMap` and re-serializing with `to_vec_pretty` leaves untouched entries byte-identical in the pretty output | D-15 tests | If serde ordering differed, assert on parsed entries rather than raw bytes for neighbours. BTreeMap is ordered, so this is low risk. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Should a suppression entry be pruned when its path no longer exists on disk?**
+All three questions below were settled by the plans; none remains open for the executor.
+
+1. **Should a suppression entry be pruned when its path no longer exists on disk?** — **RESOLVED** by plan 19-02 (must_haves truth 5 and the `suppression` module doc comment): entries are kept until lifted or garbage-collected; nothing prunes an entry because its path stopped existing.
    - What we know: CONTEXT leaves this to discretion; `folder-workspaces.json` keeps stale entries by design.
    - What's unclear: whether a stale entry can ever cause harm. It cannot re-admit anything (it only suppresses) and is lifted by explicit admission.
    - Recommendation: keep entries (no pruning); drop them only on parent-repository removal (D-10 GC). Simpler and consistent with the sibling store.
 
-2. **One stage function or three?**
+2. **One stage function or three?** — **RESOLVED** by plan 19-04 Task 3: one `clear_stage` orchestrator fixes the order (bindings, markers and directories, suppression drops, suppression adds); it is split into `clear_bindings`, `clear_markers` and `update_suppression` only if it grows past roughly 80 lines, and the orchestrator keeps the order either way.
    - Recommendation: one `clear_stage` orchestrator calling three small helpers (`clear_bindings`, `clear_markers`, `update_suppression`), each returning outcomes appended to one `Vec`. Tests target the helpers; the orchestrator test proves order and best-effort behaviour.
 
-3. **Where does `RemovedRows` reach the stage?**
+3. **Where does `RemovedRows` reach the stage?** — **RESOLVED** by plan 19-01 (the stage slot after `persist_stage`, with `clear_stage(planned)` taking only the planned list) and plan 19-04 Task 2 (binds the `RemovedRows` return of `candidate.remove_rows` in `remove` and widens `clear_stage` to `(removed, state, planned)` the moment the markers and suppression writes first need it, so plan 01's `clippy -D warnings` gate sees no unused parameter in between).
    - What we know: `remove` builds `candidate` and calls `candidate.remove_rows(...)` discarding the return value (removal.rs:403-408).
    - Recommendation: bind the `RemovedRows` return value and pass it to `clear_stage` after `persist_stage`; it carries `physical_key` and `observed_common_dir` for repositories and `observed_path` for checkouts.
 
