@@ -500,6 +500,18 @@ struct ClearingResults {
 /// parent repository survives the removal (D-10).
 fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedItem> {
     let mut planned: Vec<ClearedItem> = Vec::new();
+    plan_bindings(state, set, &mut planned);
+    let repository_keys = set.repository_keys();
+    let repositories: Vec<&SavedRepository> = repository_keys
+        .iter()
+        .filter_map(|key| find_repository(state, *key))
+        .collect();
+    plan_markers(&repositories, &mut planned);
+    plan_suppression(state, set, &repository_keys, &repositories, &mut planned);
+    planned
+}
+
+fn plan_bindings(state: &RepositoryState, set: &RemovalSet, planned: &mut Vec<ClearedItem>) {
     for row in &set.rows {
         let path = match row.row {
             RowKey::Repository(key) => row.main_worktree.clone().or_else(|| {
@@ -517,12 +529,13 @@ fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedIt
             planned.push(item);
         }
     }
-    let repository_keys = set.repository_keys();
-    let repositories: Vec<&SavedRepository> = repository_keys
-        .iter()
-        .filter_map(|key| find_repository(state, *key))
-        .collect();
-    for repository in &repositories {
+}
+
+/// A `Marker` and `RepositoryDir` pair per repository row whose stored
+/// directory exists; a refused key is named as a `Marker` alone, because the
+/// real run will report it under that name.
+fn plan_markers(repositories: &[&SavedRepository], planned: &mut Vec<ClearedItem>) {
+    for repository in repositories {
         match repository_dir(repository) {
             Ok(dir) if std::fs::symlink_metadata(&dir).is_ok() => {
                 planned.push(ClearedItem {
@@ -541,12 +554,24 @@ fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedIt
             }),
         }
     }
+}
+
+/// A `SuppressionDropped` per repository row with children in the store,
+/// then a `SuppressionAdded` per checkout row whose parent survives. The
+/// store is read once, and only when a repository row is in the set.
+fn plan_suppression(
+    state: &RepositoryState,
+    set: &RemovalSet,
+    repository_keys: &[RepositoryKey],
+    repositories: &[&SavedRepository],
+    planned: &mut Vec<ClearedItem>,
+) {
     if !repositories.is_empty() {
         let store = crate::breadcrumbs::load_json::<crate::suppression::SuppressionFile>(
             &crate::suppression::file_path(&crate::persist::config_dir()),
         )
         .0;
-        for repository in &repositories {
+        for repository in repositories {
             let common_dir = repository.observed_common_dir.to_path_buf();
             let common_key = crate::breadcrumbs::folder_key(&common_dir);
             if store
@@ -581,7 +606,6 @@ fn planned_clearings(state: &RepositoryState, set: &RemovalSet) -> Vec<ClearedIt
             path,
         });
     }
-    planned
 }
 
 /// Why a repository row has no managed directory for the stage to clear.
