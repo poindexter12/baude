@@ -9436,6 +9436,344 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A pushed fixture with two linked branch worktrees beside the managed
+    /// root, the shape a user who ran `git worktree add` twice leaves behind.
+    /// Worktree paths are canonicalised up front so they compare equal to what
+    /// the sweep records from `git worktree list` under the macOS temp symlink.
+    struct SuppressionFixture {
+        _fixture: AdmissionRepo,
+        repo: PathBuf,
+        root: PathBuf,
+        state_root: PathBuf,
+        kept: PathBuf,
+        suppressed: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    fn suppression_fixture(name: &str) -> SuppressionFixture {
+        let fixture = admission_repo(name);
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let kept = root.join("wt-kept");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/kept",
+                kept.to_str().unwrap(),
+            ],
+        );
+        let suppressed = root.join("wt-suppressed");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/suppressed",
+                suppressed.to_str().unwrap(),
+            ],
+        );
+        let common_dir = baude_core::git::discover_repository(&repo)
+            .unwrap()
+            .common_dir;
+        SuppressionFixture {
+            _fixture: fixture,
+            repo,
+            root,
+            state_root,
+            kept: kept.canonicalize().unwrap(),
+            suppressed: suppressed.canonicalize().unwrap(),
+            common_dir,
+        }
+    }
+
+    /// An `App` over the fixture's state root with the same stand-in command
+    /// every admission test in this file uses, so the primary spawns and
+    /// stays alive for the assertions.
+    fn suppression_app(fx: &SuppressionFixture, launch: PathBuf) -> App {
+        let mut app = App::new(launch);
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(fx.state_root.clone());
+        app
+    }
+
+    /// Seed one entry the way plan 04's clearing stage writes it: keyed by the
+    /// checkout path, tagged with the surviving parent's common dir.
+    fn seed_suppression(path: &Path, common_dir: &Path) {
+        let config = baude_core::persist::config_dir();
+        baude_core::suppression::suppress(&config, path, common_dir, 1).unwrap();
+        assert!(baude_core::suppression::is_suppressed(&config, path));
+    }
+
+    fn is_suppressed(path: &Path) -> bool {
+        baude_core::suppression::is_suppressed(&baude_core::persist::config_dir(), path)
+    }
+
+    fn checkout_row<'a>(app: &'a App, path: &Path) -> Option<&'a SavedCheckout> {
+        let persisted = PersistedPath::from_path(path);
+        app.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.observed_path == persisted)
+    }
+
+    fn last_message(app: &App) -> Option<&str> {
+        app.message.as_ref().map(|(message, _)| message.as_str())
+    }
+
+    /// READM-03 read side, D-09 and D-11: an entry for a linked worktree keeps
+    /// the inventory sweep from admitting it while its siblings still come in.
+    #[test]
+    fn suppressed_worktree_is_skipped_by_admission_sweep() {
+        let fx = suppression_fixture("suppression-sweep-skip");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+
+        let main = fx.repo.canonicalize().unwrap();
+        assert!(checkout_row(&app, &main).is_some(), "primary admitted");
+        let kept = checkout_row(&app, &fx.kept).expect("unsuppressed sibling admitted");
+        assert_eq!(kept.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert!(
+            checkout_row(&app, &fx.suppressed).is_none(),
+            "suppressed worktree must not be swept back in: {:?}",
+            app.repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.observed_path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert!(is_suppressed(&fx.suppressed), "the sweep never lifts");
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// READM-04, D-12 and D-13: `n` with the checkout's own path lifts the
+    /// entry before the sweep, so the same pass admits it as a fresh row with
+    /// new keys and nothing carried from the removed one.
+    #[test]
+    fn admitting_suppressed_path_lifts_entry_and_admits_fresh_identity() {
+        let fx = suppression_fixture("suppression-lift-open");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert!(checkout_row(&app, &fx.suppressed).is_none());
+        let max_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .max()
+            .unwrap();
+        let max_order = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.first_seen_order)
+            .max()
+            .unwrap();
+
+        app.admit_repository(&fx.suppressed)
+            .expect("explicit admission of the suppressed path");
+
+        assert!(!is_suppressed(&fx.suppressed), "explicit admission lifts");
+        let row = checkout_row(&app, &fx.suppressed).expect("fresh row admitted in the same pass");
+        assert!(
+            row.key > max_key,
+            "new CheckoutKey: {:?} vs {max_key:?}",
+            row.key
+        );
+        assert!(
+            row.first_seen_order > max_order,
+            "new first_seen_order: {} vs {max_order}",
+            row.first_seen_order
+        );
+        assert_eq!(row.session.resume_id, None);
+        assert!(row.owned_runtime().is_none());
+        assert_eq!(row.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert_eq!(row.role, CheckoutRole::ManagedBranch);
+        assert!(!row.managed_by_baude);
+        assert_eq!(
+            row.observed_branch.as_deref(),
+            Some("refs/heads/feature/suppressed")
+        );
+        assert_eq!(app.repository_state.checkouts.len(), 3);
+        assert!(!checkout_row(&app, &fx.kept).unwrap().active_intent());
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-12: the lift key is the admitted path's own repo root. Admitting the
+    /// parent repository, from its root or a subfolder, is the sweep the entry
+    /// exists to suppress and must leave the child's entry in place.
+    #[test]
+    fn admitting_parent_root_does_not_lift_child_entry() {
+        let fx = suppression_fixture("suppression-parent-root");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        app.admit_repository(&fx.repo).unwrap();
+        let subfolder = fx.repo.join("src");
+        std::fs::create_dir_all(&subfolder).unwrap();
+        app.admit_repository(&subfolder).unwrap();
+
+        assert!(
+            is_suppressed(&fx.suppressed),
+            "parent admissions must not lift a child entry"
+        );
+        assert!(checkout_row(&app, &fx.suppressed).is_none());
+        assert!(checkout_row(&app, &fx.kept).is_some());
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert_eq!(app.repository_state.repositories.len(), 1);
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-12, the other two routes: a relaunch inside the removed checkout
+    /// reaches `admit_repository` through `LaunchDirectory` and lifts because
+    /// `repo_root` of the launch dir is the checkout; a clone finishing into a
+    /// suppressed destination lifts through `CloneCompletion`.
+    #[test]
+    fn launch_dir_and_clone_completion_routes_lift_suppression() {
+        let fx = suppression_fixture("suppression-launch-clone");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut first = suppression_app(&fx, fx.repo.clone());
+        first
+            .admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert!(checkout_row(&first, &fx.suppressed).is_none());
+        first.kill_all();
+
+        // Relaunch from a subfolder inside the removed checkout, over the same
+        // state file: the launch-dir admission in `restore` is the route.
+        let inside = fx.suppressed.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+        let mut relaunched = suppression_app(&fx, inside);
+        relaunched.restore();
+
+        assert!(
+            !is_suppressed(&fx.suppressed),
+            "launch dir inside the checkout lifts its entry"
+        );
+        let row = checkout_row(&relaunched, &fx.suppressed)
+            .expect("checkout admitted on the relaunch that lifted it");
+        assert_eq!(row.session.resume_id, None);
+        assert!(checkout_row(&relaunched, &fx.kept).is_some());
+        assert_eq!(
+            relaunched.repository_state.repositories.len(),
+            1,
+            "the launch dir resolves to the same repository"
+        );
+
+        // Clone completion into a suppressed destination.
+        let origin = fx.root.join("origin.git");
+        let dest = fx.root.join("clone-dest");
+        git(
+            &fx.root,
+            &["clone", origin.to_str().unwrap(), dest.to_str().unwrap()],
+        );
+        let dest = dest.canonicalize().unwrap();
+        let dest_common = baude_core::git::discover_repository(&dest)
+            .unwrap()
+            .common_dir;
+        seed_suppression(&dest, &dest_common);
+
+        relaunched.open_repo_session_via(dest.clone(), LocalAdmissionRoute::CloneCompletion);
+
+        assert!(
+            !is_suppressed(&dest),
+            "clone completion lifts the destination's entry; message: {:?}",
+            last_message(&relaunched)
+        );
+        assert!(checkout_row(&relaunched, &dest).is_some());
+        assert!(
+            !is_suppressed(&fx.kept) && checkout_row(&relaunched, &fx.kept).is_some(),
+            "neighbour untouched"
+        );
+        relaunched.repository_state.validate().unwrap();
+
+        relaunched.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-09: the store is advisory. When the lift cannot write, the admission
+    /// still returns Ok with the repository's rows intact and the failure is a
+    /// message, never an error out of `admit_repository`.
+    #[test]
+    fn lift_failure_is_a_message_not_an_admission_error() {
+        let fx = suppression_fixture("suppression-lift-failure");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        let rows_before = app.repository_state.checkouts.len();
+
+        // A directory where the merge lock file goes makes the lock open fail,
+        // the same injection plan 01 used against the binding clear.
+        let config = baude_core::persist::config_dir();
+        let store = baude_core::suppression::file_path(&config);
+        let lock = config.join(format!(
+            ".{}.lock",
+            store.file_name().unwrap().to_string_lossy()
+        ));
+        // The seed write above left the real lock file behind; swap it for a
+        // directory so the next lock open fails.
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir_all(&lock).unwrap();
+        app.message = None;
+
+        let admitted = app.admit_repository(&fx.suppressed);
+
+        assert!(
+            admitted.is_ok(),
+            "lift failure must not fail the admission: {admitted:?}"
+        );
+        assert!(
+            admitted.unwrap().is_some(),
+            "the repository's primary runtime is still handed back"
+        );
+        assert_eq!(app.repository_state.checkouts.len(), rows_before);
+        assert!(checkout_row(&app, &fx.kept).is_some());
+        assert!(
+            is_suppressed(&fx.suppressed),
+            "the entry stays because the write never happened"
+        );
+        let message = last_message(&app).expect("lift failure is surfaced as a message");
+        assert!(
+            message.contains("suppression lift failed"),
+            "got: {message}"
+        );
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// SQ-5, end to end: the user runs `git switch` in their own primary
     /// checkout and reopens the repository. Before, re-admission marked the
     /// repository "identity changed" and refused its topology; now the
