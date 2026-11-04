@@ -118,11 +118,11 @@ Plans:
   3. `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity
   4. Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace
 
-**Plans**: 7 plans
+**Plans**: 1/7 plans executed
 
 Plans:
 **Wave 1**
-- [ ] 19-01-PLAN.md — binding clear as the fourth `removal::remove` stage with `ClearedItem` report and preview parity (TDD, tracer)
+- [x] 19-01-PLAN.md — binding clear as the fourth `removal::remove` stage with `ClearedItem` report and preview parity (TDD, tracer)
 - [ ] 19-02-PLAN.md — `suppression.rs` per-workspace advisory store: consult, lift, suppress, drop_children (TDD)
 - [ ] 19-03-PLAN.md — `marker::clear_owned` owner-checked marker clear with non-recursive directory removal (TDD)
 

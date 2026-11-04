@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 19
 current_phase_name: Re-admission Suppression
 status: executing
-stopped_at: Phase 19 context gathered
-last_updated: "2026-11-04T07:29:44.104Z"
-last_activity: 2026-11-03
-last_activity_desc: Phase 18 complete, transitioned to Phase 19
-state_head: a5f3988f91367da2fd669d9d0efa1b5bd617f4f5
+stopped_at: Completed 19-01-PLAN.md
+last_updated: "2026-11-04T18:04:37.704Z"
+last_activity: 2026-11-04
+last_activity_desc: Phase 19 execution started
+state_head: fd4a84e6ec0949f32e90e46c73c71f3373a6c486
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 15
-  completed_plans: 8
+  completed_plans: 9
   percent: 20
 ---
 
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 
 ## Current Position
 
-Phase: 19 (Re-admission Suppression) — READY TO EXECUTE
-Plan: Not started
+Phase: 19 (Re-admission Suppression) — EXECUTING
+Plan: 2 of 7
 Status: Ready to execute
-Last activity: 2026-11-03 — Phase 18 complete, transitioned to Phase 19
+Last activity: 2026-11-04 — Phase 19 execution started
 
 
 ## Performance Metrics
@@ -110,6 +110,7 @@ Last activity: 2026-11-03 — Phase 18 complete, transitioned to Phase 19
 | Phase 18 P05 | 25 min | 3 tasks | 1 files |
 | Phase 18 P06 | 25 min | 3 tasks | 2 files |
 | Phase 18 P07 | 33 min | 2 tasks | 0 files |
+| Phase 19 P01 | 35min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -255,6 +256,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 18]: cloned_topology asserts an active TestRedirect before touching the managed root so misuse fails at the fixture
 - [Phase 18]: Branch integrity in removal tests is pinned by for-each-ref refname and OID snapshots, never git branch --list decorations
 - [Phase 18]: 18-07: scripts/gate.sh --linux exit 1 on macOS host is a Docker Desktop bind-mount target-dir race, not a phase defect; Linux proof taken by the unmodified gate script in the same container with CARGO_TARGET_DIR on container disk; gate.sh fix deferred
+- [Phase 19]: planned_clearings lists a folder shared by two rows once so preview and real run agree without a second clear attempt
+- [Phase 19]: folder_workspace::clear pre-checks the key outside the merge lock; the gap is accepted for an advisory file so absent files stay absent and untouched files stay byte-identical
 
 ### Pending Todos
 
@@ -337,9 +340,9 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T03:52:30.423Z
-Stopped at: Phase 19 context gathered
-Resume file: .planning/phases/19-re-admission-suppression/19-CONTEXT.md
+Last session: 2026-11-04T18:04:37.188Z
+Stopped at: Completed 19-01-PLAN.md
+Resume file: None
 
 ## Operator Next Steps
 
