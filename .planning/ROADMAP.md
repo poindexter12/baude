@@ -69,7 +69,7 @@ Known gaps: see MILESTONES.md.
 
 **Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
 
-- [ ] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans)
+- [x] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans) (completed 2026-11-03)
 - [ ] Phase 19: Re-admission Suppression (0/? plans)
 - [ ] Phase 20: TUI Remove Action (0/? plans)
 - [ ] Phase 21: Daemon and PWA Parity (0/? plans)
@@ -91,7 +91,7 @@ Known gaps: see MILESTONES.md.
   4. Removing a repository parent removes each child by the per-child rules and then the parent, in one lifecycle operation composed from the existing kill, close and managed-worktree removal stages
   5. A crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
 
-**Plans**: 8/8 plans executed
+**Plans**: 8/8 plans complete
 
 Plans:
 - [x] 18-01-PLAN.md — `removal.rs` vocabulary, `select_rows` and side-effect-free `preview_removal` for every row kind (TDD)

@@ -2,37 +2,37 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase: 18
-current_phase_name: Shared Kill-Then-Remove Lifecycle
-status: verifying
-stopped_at: Completed 18-07-PLAN.md
-last_updated: "2026-11-04T01:19:48.339Z"
+current_phase: 19
+current_phase_name: Re-admission Suppression
+status: planning
+stopped_at: context exhaustion at 75% (2026-11-03)
+last_updated: "2026-11-04T03:18:21.604Z"
 last_activity: 2026-11-03
-last_activity_desc: Phase 18 execution started
-state_head: f1351d24faf74cec0ad4d357ff196b8bbc87b823
+last_activity_desc: Phase 18 complete, transitioned to Phase 19
+state_head: ec9afed318657ca85e179b8943e620eaa660a43c
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 8
   completed_plans: 8
-  percent: 0
+  percent: 20
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-13)
+See: .planning/PROJECT.md (updated 2026-11-03)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 18 — Shared Kill-Then-Remove Lifecycle
+**Current focus:** Phase 19 — Re-admission Suppression
 
 ## Current Position
 
-Phase: 18 (Shared Kill-Then-Remove Lifecycle) — EXECUTING
-Plan: 8 of 8
-Status: Phase complete — ready for verification
-Last activity: 2026-11-03 — Phase 18 execution started
+Phase: 19 — Re-admission Suppression
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-11-03 — Phase 18 complete, transitioned to Phase 19
 
 
 ## Performance Metrics
@@ -58,6 +58,7 @@ Last activity: 2026-11-03 — Phase 18 execution started
 | 15 | 4 | - | - |
 | 16 | 1 | - | - |
 | 17 | 1 | - | - |
+| 18 | 8 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -263,6 +264,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 ### Blockers/Concerns
 
+- ⚠️ [Phase 18] `scripts/gate.sh --linux` is unrunnable verbatim on this host: the container's CARGO_TARGET_DIR sits on the Docker Desktop bind mount and hits a file-visibility race. Proof at HEAD used the same docker run with CARGO_TARGET_DIR=/tmp/linux-gate/target. One-line fix deferred (deferred-items.md, WINDOWS.md 13/14); blocks `/gsd-ship` until landed.
+- ⚠️ [Phase 18] 18-VALIDATION.md still `draft` and no 18-SECURITY.md; `/gsd-validate-phase 18` and `/gsd-secure-phase 18` have not run.
+- ⚠️ [Phase 18] Reviewer lanes OpenCode, Antigravity, Ollama and Qwen stubbed every convergence cycle (Antigravity needs a read_file allow rule; Qwen's Copilot rejects model claude-sonnet-4.6); only Codex and Cursor grounded.
 - ⚠️ [Phase 13] Security enforcement is on but no 13-SECURITY.md exists; run `/gsd-secure-phase 13` to verify the plans' threat-model mitigations. 13-VALIDATION.md is still `draft`; `/gsd-validate-phase 13` fills the Nyquist audit.
 - ⚠️ [Phase 13] Executors in waves 1 and 2 reported CI gates green that were not (fmt/clippy); the orchestrator fixed both post-merge. Watch executor gate claims in Phase 14.
 - Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
@@ -333,8 +337,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T01:19:48.271Z
-Stopped at: Completed 18-07-PLAN.md
+Last session: 2026-11-04T03:18:21.516Z
+Stopped at: context exhaustion at 75% (2026-11-03)
 Resume file: None
 
 ## Operator Next Steps

@@ -34,6 +34,7 @@ v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 throug
 <!-- Shipped and confirmed valuable. -->
 
 - ✓ Multi-session TUI with stable sidebar order, in-place waiting flash, and live status (waiting/working/exited) — v0.1–v0.2
+- ✓ One shared baude-core removal operation: kills the owned process group SIGTERM then SIGKILL before any row or file drops, removes managed worktrees from disk, never deletes a main checkout, standalone folder or local branch, and persists in a single atomic save with a serializable report — Phase 18 (gates green on macOS and Linux at abba527)
 - ✓ Git-worktree sessions for parallel work in one repo; keep/remove on close — v0.1
 - ✓ Per-session shell pane and "open folder in editor" — v0.2
 - ✓ Live Claude metadata from disk (model, context %, permission mode, tokens, GSD state) — v0.3
@@ -77,8 +78,6 @@ v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 throug
 v2.8 Project Removal:
 
 - [ ] User can remove a repository parent with every child, a single checkout or worktree child, or a standalone row from the sidebar in one confirmed action, even while a runtime is live
-- [ ] Removal kills the owned runtime first and never leaves an orphaned process
-- [ ] Removal deletes baude-managed worktrees from disk and never deletes a main checkout, a standalone folder or a local branch
 - [ ] Removed projects stay gone across reconcile and relaunch until re-added by `n`, `c`, or launching inside the folder
 - [ ] The daemon exposes the same removal over REST and the PWA offers it
 
@@ -152,6 +151,8 @@ Carried out of v2.3, not in this milestone:
 | Close v2.3 as `override_closeout` on stale verification rather than re-verifying 5 phases (2026-10-13) | Every phase passed in September; the staleness is digest drift from main advancing through v2.6. Re-running the verifier would check v2.3 goals against three milestones of later rework and report drift as failure | — Pending — honest for a late closeout, but it is the second milestone in a row to close by override |
 | Leave Phase 13 and 14 `VALIDATION.md` as unfilled templates rather than back-filling them at closeout (2026-10-13) | A validation contract invented after the fact never governed the execution it claims to describe; a visible gap is worth more than a fabricated record | ✓ Good — recorded in MILESTONES.md Known Gaps |
 | GSD must not create tags: `git.create_tag: false` (2026-10-13) | release-please owns the `vX.Y.Z` namespace; GSD's closeout would mint a bare `v2.3`, colliding with it | ✓ Good — no bare GSD tag exists for v2.3 |
+| Removal is one ordered pipeline in baude-core: select, preflight, clone, remove rows, validate, kill, disk, single save; forced worktree removal runs against the common dir, proves group membership by session, and refuses worktrees holding submodule gitdirs (2026-11-03) | The TUI and daemon must share one path so parity is structural, and every destructive step must be gated by evidence from the live tree rather than from the saved row | ✓ Good — Phase 18, four cross-AI review cycles then one code review; all Critical and Warning findings fixed |
+| Prove the Linux gate at HEAD with the unmodified gate.sh in rust:1-bookworm and CARGO_TARGET_DIR off the bind mount, rather than editing gate.sh --linux inside the phase (2026-11-03) | The --linux lane fails on this host from a Docker Desktop bind-mount visibility race, not from phase code; the one-line fix is out of plan 07's allowlist and is deferred to the roadmap, so the proof had to come from an equivalent invocation | — Pending — fix tracked in deferred-items and WINDOWS.md; blocks /gsd-ship until landed |
 
 ## Evolution
 
@@ -171,4 +172,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-01 after starting milestone v2.8*
+*Last updated: 2026-11-03 after Phase 18*
