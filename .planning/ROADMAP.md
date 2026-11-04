@@ -91,7 +91,7 @@ Known gaps: see MILESTONES.md.
   4. Removing a repository parent removes each child by the per-child rules and then the parent, in one lifecycle operation composed from the existing kill, close and managed-worktree removal stages
   5. A crash mid-removal leaves either the prior state or the fully removed state, never a parent without children or a child without its parent
 
-**Plans**: 6/8 plans executed
+**Plans**: 7/8 plans executed
 
 Plans:
 - [x] 18-01-PLAN.md — `removal.rs` vocabulary, `select_rows` and side-effect-free `preview_removal` for every row kind (TDD)
@@ -99,7 +99,7 @@ Plans:
 - [x] 18-03-PLAN.md — `RepositoryState::remove_rows` batch aggregate mutation (TDD)
 - [x] 18-04-PLAN.md — `removal::remove` preflight, validate, kill, disk, single-save orchestration with owning handles and live process doubles (TDD)
 - [x] 18-05-PLAN.md — every persistence failure mode, crash and disk failure mid-fan-out, validation-before-kill proof
-- [ ] 18-06-PLAN.md — keep rules with and without live runtimes, unmanaged and already-removed rows, parent fan-out on cloned and `git init` fixtures
+- [x] 18-06-PLAN.md — keep rules with and without live runtimes, unmanaged and already-removed rows, parent fan-out on cloned and `git init` fixtures
 - [ ] 18-07-PLAN.md — `scripts/gate.sh` on macOS and `--linux` on the same final commit, gate-driven fixes only
 - [x] 18-08-PLAN.md — `Pty::kill_and_wait` group extinction after leader exit, pid-reuse disposition and reader join (TDD, wave 1)
 
