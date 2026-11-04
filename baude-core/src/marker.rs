@@ -15,6 +15,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// File name of the ownership marker inside a managed repository directory.
+const MARKER_FILE: &str = ".baude-marker.json";
+
 /// Metadata recorded in a marker file.
 ///
 /// The marker captures the canonical common directory (in non-UTF-8 safe bytes)
@@ -72,6 +75,56 @@ pub enum MarkerError {
     UnknownOwner(InvalidReason),
 }
 
+/// Why [`clear_owned`] left a marker in place.
+///
+/// Every refusal mirrors a case where [`write_marker`] would refuse to
+/// overwrite: the marker is not provably ours, so it is not ours to delete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClearRefusal {
+    /// The marker is valid but its `canonical_common_dir` differs from the
+    /// owner passed in; deleting it would orphan another repository.
+    ForeignOwner,
+    /// The marker is a symlink, oversized, malformed or from a newer scheme,
+    /// so its ownership is unknown.
+    Invalid(InvalidReason),
+    /// The directory itself is a symlink; nothing through it is read or removed.
+    DirectoryIsSymlink,
+}
+
+/// What [`clear_owned`] did to the marker file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarkerOutcome {
+    /// The marker was ours and has been deleted.
+    Removed,
+    /// There was no marker to delete.
+    Missing,
+    /// The marker was left untouched for the given reason.
+    Refused(ClearRefusal),
+}
+
+/// What [`clear_owned`] did to the directory after the marker step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectoryOutcome {
+    /// The empty directory was removed.
+    Removed,
+    /// The directory did not exist.
+    Missing,
+    /// The directory still holds entries and was left in place; nothing
+    /// recursive runs, the caller reports it.
+    NotEmpty,
+    /// Directory removal was not attempted because the marker step refused.
+    Untouched,
+}
+
+/// Combined result of [`clear_owned`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkerClear {
+    /// Outcome for the marker file.
+    pub marker: MarkerOutcome,
+    /// Outcome for the directory.
+    pub directory: DirectoryOutcome,
+}
+
 /// Write a marker file into an existing directory.
 ///
 /// `dir` must already exist. The marker file (`.baude-marker.json`) is written
@@ -86,7 +139,7 @@ pub enum MarkerError {
 /// - `Err(MarkerError::OwnedByOther(existing))` — marker exists with different canonical_common_dir
 /// - `Err(MarkerError::UnknownOwner(reason))` — marker exists but is invalid
 pub fn write_marker(dir: &Path, meta: &MarkerMetadata) -> Result<MarkerWrite, MarkerError> {
-    let marker_path = dir.join(".baude-marker.json");
+    let marker_path = dir.join(MARKER_FILE);
 
     match File::create_new(&marker_path) {
         Ok(mut file) => {
@@ -183,7 +236,7 @@ fn read_marker_settled(dir: &Path) -> io::Result<MarkerRead> {
 /// - `Ok(MarkerRead::Invalid(reason))` — marker exists but is symlink, oversized, malformed, or too-new version
 /// - `Err(io::Error)` — I/O error other than NotFound
 pub fn read_marker(dir: &Path) -> Result<MarkerRead, io::Error> {
-    let marker_path = dir.join(".baude-marker.json");
+    let marker_path = dir.join(MARKER_FILE);
 
     // Use symlink_metadata to detect symlinks (it doesn't follow them)
     match std::fs::symlink_metadata(&marker_path) {
@@ -224,6 +277,74 @@ pub fn read_marker(dir: &Path) -> Result<MarkerRead, io::Error> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(MarkerRead::Missing),
         Err(e) => Err(e),
     }
+}
+
+/// Release ownership of a managed repository directory.
+///
+/// The inverse of [`write_marker`]: delete the marker only when it is
+/// provably ours, then remove the now-empty directory.
+///
+/// Order of checks:
+///
+/// 1. `symlink_metadata(dir)`: a missing directory short-circuits to
+///    `{ Missing, Missing }`; a symlinked directory short-circuits to
+///    `{ Refused(DirectoryIsSymlink), Untouched }` before anything is read
+///    through it.
+/// 2. [`read_marker`]: `Missing` leaves the marker outcome `Missing`; `Valid`
+///    whose `canonical_common_dir` byte-equals `owner_common_dir` deletes the
+///    marker file; any other `Valid` is `Refused(ForeignOwner)` and
+///    `Invalid(reason)` is `Refused(Invalid(reason))`. A refusal returns with
+///    the directory `Untouched`.
+/// 3. `std::fs::remove_dir(dir)`: deliberately non-recursive. `Ok` is
+///    `Removed`, `NotFound` is `Missing`, `DirectoryNotEmpty` is `NotEmpty`
+///    and is reported to the caller, never retried. Nothing below `dir` is
+///    ever deleted by this function.
+///
+/// # Errors
+///
+/// Only I/O errors other than the mapped kinds above are propagated.
+pub fn clear_owned(dir: &Path, owner_common_dir: &[u8]) -> io::Result<MarkerClear> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_symlink() => {
+            return Ok(MarkerClear {
+                marker: MarkerOutcome::Refused(ClearRefusal::DirectoryIsSymlink),
+                directory: DirectoryOutcome::Untouched,
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(MarkerClear {
+                marker: MarkerOutcome::Missing,
+                directory: DirectoryOutcome::Missing,
+            });
+        }
+        Err(e) => return Err(e),
+    }
+
+    let marker = match read_marker(dir)? {
+        MarkerRead::Missing => MarkerOutcome::Missing,
+        MarkerRead::Valid(meta) if meta.canonical_common_dir == owner_common_dir => {
+            std::fs::remove_file(dir.join(MARKER_FILE))?;
+            MarkerOutcome::Removed
+        }
+        MarkerRead::Valid(_) => MarkerOutcome::Refused(ClearRefusal::ForeignOwner),
+        MarkerRead::Invalid(reason) => MarkerOutcome::Refused(ClearRefusal::Invalid(reason)),
+    };
+    if let MarkerOutcome::Refused(_) = marker {
+        return Ok(MarkerClear {
+            marker,
+            directory: DirectoryOutcome::Untouched,
+        });
+    }
+
+    let directory = match std::fs::remove_dir(dir) {
+        Ok(()) => DirectoryOutcome::Removed,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DirectoryOutcome::Missing,
+        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => DirectoryOutcome::NotEmpty,
+        Err(e) => return Err(e),
+    };
+
+    Ok(MarkerClear { marker, directory })
 }
 
 #[cfg(test)]
