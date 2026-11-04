@@ -38,7 +38,7 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 ### Re-admission suppression
 
 - [x] **READM-01**: Removing a row clears its folder-workspace binding so the launch-dir binding walk no longer resolves the removed folder to a workspace
-- [ ] **READM-02**: Removing a row clears baude's marker ownership for its paths so marker recovery does not restore the row
+- [x] **READM-02**: Removing a row clears baude's marker ownership for its paths so marker recovery does not restore the row
 - [x] **READM-03**: After removal, the session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row, verified across a relaunch of the TUI
 - [x] **READM-04**: A removed project can be admitted again only by `n`, by `c`, or by launching baude inside the folder, and that re-admission produces a fresh row with no stale identity carried over
 - [x] **READM-05**: Removal does not alter other rows' bindings, markers or worktrees, including other repositories that share a workspace
@@ -98,7 +98,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | RMV-06 | Phase 18 | Complete |
 | RMV-07 | Phase 18 | Complete |
 | READM-01 | Phase 19 | Complete |
-| READM-02 | Phase 19 | Pending |
+| READM-02 | Phase 19 | Complete |
 | READM-03 | Phase 19 | Complete |
 | READM-04 | Phase 19 | Complete |
 | READM-05 | Phase 19 | Complete |
