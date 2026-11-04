@@ -2641,4 +2641,71 @@ mod tests {
         assert_eq!(load_state(&f.state_root()), state);
         assert_eq!(calls.get(), 1);
     }
+
+    // ---- candidate validation precedes kill and delete (plan 05) ----
+
+    /// The shape an older state file can carry: an `Inactive` row that still
+    /// records a runtime. `validate()` accepts it and `validate_for_save()`
+    /// refuses it, which is what makes it the right premise for proving the
+    /// refusal arrives before anything irreversible.
+    fn stale_runtime() -> OwnedRuntime {
+        OwnedRuntime {
+            generation: RuntimeGeneration::initial(),
+            agent: ProcessIdentity {
+                pid: 100,
+                start_time: 200,
+                process_group: 100,
+                session: 100,
+            },
+            shell: ShellOwnership::Closed,
+        }
+    }
+
+    #[test]
+    fn validation_failure_is_detected_before_any_kill_or_delete() {
+        let f = RemovalFixture::new("validation-first");
+        let (mut state, t, t_dir, pty) = live_row(&f, "wt-t");
+        let pgid = pty.process_identity().process_group;
+        let other_main = f.root.join("other");
+        let j = repository(&mut state, &other_main);
+        let u = checkout(
+            &mut state,
+            j,
+            CheckoutRole::ManagedBranch,
+            true,
+            &other_main.join("u"),
+        );
+        checkout_mut(&mut state, u).set_owned_runtime(Some(stale_runtime()));
+        assert!(state.validate().is_ok(), "validate accepts the stale shape");
+        assert!(
+            state.validate_for_save().is_err(),
+            "validate_for_save refuses the stale shape"
+        );
+        let before = state.clone();
+        let mut handles = LiveHandles(vec![handle_for(
+            RowKey::Checkout(t),
+            pty,
+            None,
+            &t_dir,
+            &f.repo(),
+        )]);
+        let (save, calls) = counting_save(&f.state_root());
+
+        let error = remove(&mut state, RemovalTarget::Checkout(t), &mut handles.0, save)
+            .expect_err("a save-invalid candidate must be refused");
+
+        assert!(
+            matches!(error, RemovalError::Validation(_)),
+            "expected Validation, got {error:?}"
+        );
+        assert!(group_is_alive(pgid), "group {pgid} was never signalled");
+        assert!(t_dir.exists(), "the directory was never deleted");
+        assert_eq!(state, before);
+        assert!(
+            !f.state_path().exists(),
+            "the save closure was never called, so no file was ever written"
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(handles.0.len(), 1);
+    }
 }
