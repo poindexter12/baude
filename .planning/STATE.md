@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 19
 current_phase_name: Re-admission Suppression
 status: executing
-stopped_at: Completed 19-03-PLAN.md
-last_updated: "2026-11-04T18:16:48.619Z"
+stopped_at: Completed 19-04-PLAN.md
+last_updated: "2026-11-04T18:44:09.804Z"
 last_activity: 2026-11-04
 last_activity_desc: Phase 19 execution started
-state_head: 691438ba4907f5747f8ec255082f405a8cec001d
+state_head: b2a2b28ee424d77b4534cd0bc72b94039d82ed9a
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 15
-  completed_plans: 11
+  completed_plans: 12
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 19 (Re-admission Suppression) — EXECUTING
-Plan: 4 of 7
+Plan: 5 of 7
 Status: Ready to execute
 Last activity: 2026-11-04 — Phase 19 execution started
 
@@ -113,6 +113,7 @@ Last activity: 2026-11-04 — Phase 19 execution started
 | Phase 19 P01 | 35min | 3 tasks | 2 files |
 | Phase 19 P02 | 20min | 3 tasks | 2 files |
 | Phase 19 P03 | 3min | 3 tasks | 1 files |
+| Phase 19 P04 | 19min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -263,6 +264,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 19]: Suppression store file base is suppressed-admissions, per-workspace beside breadcrumbs; entries kept until lifted or garbage-collected, never pruned by disk existence
 - [Phase 19]: marker::clear_owned deletes the marker only on Valid plus byte-equal owner and removes the directory with non-recursive remove_dir; refusals are typed, not errors
 - [Phase 19]: MARKER_FILE constant hoisted in the GREEN step so plan 19-03 Task 3 had no refactor
+- [Phase 19]: 19-04: empty or legacy physical_key is a silent no-op in the clearing stage; only keys that could escape the managed root become a ClearingFailure
+- [Phase 19]: 19-04: plan and execute helpers mirror each other per clearing kind so preview agreement is structural
 
 ### Pending Todos
 
@@ -345,8 +348,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-04T18:16:48.046Z
-Stopped at: Completed 19-03-PLAN.md
+Last session: 2026-11-04T18:44:09.638Z
+Stopped at: Completed 19-04-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
