@@ -456,13 +456,21 @@ pub fn holder_pgid(holder: i32) -> Option<i32> {
 /// process that leaves the session with setsid, records its pid at
 /// `holder_pid_path` and sleeps holding the inherited slave terminal, then
 /// the leader exits.
+///
+/// The script is written beside the pid file and the command is `sh <script>`
+/// rather than the script text itself, because a backend composes its spawn
+/// as `exec <command> --port N ...`: an executable plus arguments survives
+/// that, a bare `set +m; ...; exit 0` fragment does not.
 pub fn parked_reader_command(holder_pid_path: &Path) -> String {
-    format!(
-        "set +m; trap '' HUP; perl -MPOSIX -e 'my $sid = POSIX::setsid(); \
+    let script_path = holder_pid_path.with_extension("sh");
+    let script = format!(
+        "set +m\ntrap '' HUP\nperl -MPOSIX -e 'my $sid = POSIX::setsid(); \
          exit 3 unless defined $sid && $sid != -1; \
-         open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' & exit 0",
+         open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' &\nexit 0\n",
         holder_pid_path.display()
-    )
+    );
+    std::fs::write(&script_path, script).expect("write holder script");
+    format!("sh {}", script_path.display())
 }
 
 /// Wait for the holder behind `pty` to record its pid and for the leader to
@@ -482,7 +490,11 @@ pub fn await_parked_holder(pty: &Pty, holder_pid_path: &Path) -> HolderGuard {
         }
         assert!(
             Instant::now() < deadline,
-            "holder.pid was not written or the leader did not exit"
+            "holder.pid was not written or the leader did not exit \
+             (pid file written: {}, leader exited: {}, pty output: {:?})",
+            written.is_some(),
+            pty.is_exited(),
+            String::from_utf8_lossy(&pty.subscribe().0)
         );
         std::thread::sleep(Duration::from_millis(10));
     };
