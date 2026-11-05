@@ -3718,6 +3718,165 @@ mod tests {
         );
     }
 
+    // ---- D confirmation modal render ------------------------------------
+
+    /// A repository with `children` managed worktrees, selected on the parent
+    /// and sitting in `Modal::ConfirmRemove` for the whole repository. Returns
+    /// the row keys the report lists so tests can name the row at any scroll.
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn confirm_remove_fixture(
+        children: u64,
+        error: Option<&str>,
+    ) -> (UiFixture, App, Vec<baude_core::removal::RowKey>) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/removal/repository/.git"),
+            observed_main_worktree: persisted_path("/tmp/removal/repository"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
+        });
+        let mut rows = vec![RowKey::Repository(repository)];
+        for index in 0..children {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let branch = format!("child-{index:02}");
+            let path = format!("/tmp/removal/repository worktrees/{branch}");
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                CheckoutRole::ManagedBranch,
+                true,
+                persisted_path(&path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("repository:{branch}"),
+                    cwd: persisted_path(&path),
+                    repo_root: persisted_path("/tmp/removal/repository"),
+                    branch: Some(branch),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            rows.push(RowKey::Checkout(key));
+        }
+        let fixture = UiFixture::new("confirm-remove");
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Repository(repository));
+        app.focus = Focus::Sidebar;
+        let target = RemovalTarget::Repository(repository);
+        app.modal = Modal::ConfirmRemove {
+            target,
+            report: remove_project::report(target, rows.clone()),
+            scroll: 0,
+            error: error.map(str::to_string),
+        };
+        (fixture, app, rows)
+    }
+
+    /// Rows of the rendered screen that the 76-wide centred modal occupies:
+    /// those whose cells at the modal's left and right border columns are
+    /// both box-drawing glyphs. The sidebar and panes draw their borders at
+    /// other columns, so this isolates the modal's height.
+    fn modal_rows(buffer: &ratatui::buffer::Buffer) -> Vec<u16> {
+        let left = (buffer.area.width - 76) / 2;
+        let right = left + 75;
+        let is_border =
+            |x: u16, y: u16| matches!(buffer[(x, y)].symbol(), "│" | "╭" | "╮" | "╰" | "╯");
+        (0..buffer.area.height)
+            .filter(|&y| is_border(left, y) && is_border(right, y))
+            .collect()
+    }
+
+    /// The trimmed text of the line directly under the `rows dropped` heading.
+    fn first_dropped_row(rendered: &str) -> String {
+        let lines: Vec<&str> = rendered.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|l| l.contains("rows dropped ("))
+            .unwrap_or_else(|| panic!("no rows dropped heading in:\n{rendered}"));
+        // Columns inside the 76-wide centred modal on a 100-column screen; the
+        // sidebar text left of the border is not part of the modal.
+        lines[heading + 1]
+            .chars()
+            .skip(13)
+            .take(74)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// D-07: a repository with twenty children on a 30-row screen draws the
+    /// report inside at most 24 rows (80%), names the hidden remainder as
+    /// `+N more`, and scrolling moves the window without changing the heading
+    /// count that keeps the full row set visible.
+    #[test]
+    fn confirm_remove_modal_renders_report_lines_within_80_percent_height() {
+        let (_fixture, mut app, rows) = confirm_remove_fixture(20, None);
+
+        let (rendered, buffer) = render(&app, 100, 30);
+        assert!(rendered.contains(" remove repository "), "{rendered}");
+        assert!(rendered.contains("Remove this repository?"), "{rendered}");
+        assert!(rendered.contains("rows dropped (21)"), "{rendered}");
+        assert!(
+            rendered.contains("y/enter remove · n/esc cancel"),
+            "{rendered}"
+        );
+        let occupied = modal_rows(&buffer);
+        assert!(
+            !occupied.is_empty() && occupied.len() <= 24,
+            "modal occupies {} rows of 30: {rendered}",
+            occupied.len()
+        );
+        let more = rendered
+            .lines()
+            .find(|l| l.contains(" more"))
+            .unwrap_or_else(|| panic!("no +N more line in:\n{rendered}"));
+        assert!(more.contains("+11 more"), "{more}");
+        let first_at_top = first_dropped_row(&rendered);
+        assert_eq!(first_at_top, app.removal_row_label(&rows[0]));
+
+        if let Modal::ConfirmRemove { scroll, .. } = &mut app.modal {
+            *scroll = 5;
+        } else {
+            panic!("fixture did not leave the app in ConfirmRemove");
+        }
+        let (scrolled, buffer) = render(&app, 100, 30);
+        assert!(scrolled.contains("rows dropped (21)"), "{scrolled}");
+        assert!(scrolled.contains("+6 more"), "{scrolled}");
+        let first_scrolled = first_dropped_row(&scrolled);
+        assert_eq!(first_scrolled, app.removal_row_label(&rows[5]));
+        assert_ne!(first_scrolled, first_at_top);
+        assert_eq!(modal_rows(&buffer).len(), occupied.len());
+    }
+
+    /// D-06: a failed run leaves the modal open with the error text and the
+    /// retry legend in place of the remove legend.
+    #[test]
+    fn confirm_remove_modal_renders_error_and_retry_legend() {
+        let (_fixture, app, _rows) = confirm_remove_fixture(2, Some("state file is locked"));
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(
+            rendered.contains("error: state file is locked"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("enter retry · esc cancel"), "{rendered}");
+        assert!(!rendered.contains("y/enter remove"), "{rendered}");
+    }
+
     // ---- UI fixture ownership regressions -------------------------------
     //
     // Authored `#[ignore]`d by plan 08-03 so the ownership contract was pinned
