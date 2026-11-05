@@ -2416,6 +2416,26 @@ fn remove_confirmation_lines(
     ]
 }
 
+/// Modal lines for the `D` confirmation. A pure transform over the
+/// `RemovalReport` that `preview_removal` produced: every section is read
+/// from a report field, so the confirmation cannot promise less than the real
+/// run performs (D-05). `scroll`/`max_rows` window the dropped-row list; the
+/// hidden remainder renders as `+N more` (D-07). An `error` switches the
+/// legend to retry (D-06).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_project_confirmation_lines(
+    report: &baude_core::removal::RemovalReport,
+    kind_label: &str,
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+    error: Option<&str>,
+    scroll: usize,
+    max_rows: usize,
+    width: usize,
+) -> Vec<String> {
+    let _ = (report, kind_label, row_name, error, scroll, max_rows, width);
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2432,7 +2452,10 @@ mod tests {
 
     use crate::app::{App, Focus, Modal, SelId};
 
-    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines, tilde_path};
+    use super::{
+        close_confirmation_lines, rate_5h_chip, remove_confirmation_lines,
+        remove_project_confirmation_lines, tilde_path,
+    };
 
     fn persisted_path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
@@ -3310,6 +3333,231 @@ mod tests {
             .any(|line| line.contains("refs/heads/feature/safe-remove")));
         assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
         assert!(lines.iter().any(|line| line.contains("branch is retained")));
+    }
+
+    // ---- remove_project_confirmation_lines (plan 20-01) -------------------
+
+    mod remove_project {
+        use std::path::PathBuf;
+
+        use baude_core::removal::{
+            ClearedItem, ClearingKind, KilledRuntime, PersistenceOutcome, RemovalReport,
+            RemovalTarget, RowKey,
+        };
+        use baude_core::repository::{CheckoutKey, RepositoryKey};
+
+        /// The key newtypes keep their field private; serde is the one public
+        /// road to a value without building a repository graph on disk.
+        pub(super) fn checkout(n: u64) -> CheckoutKey {
+            serde_json::from_value(serde_json::json!(n)).expect("checkout key")
+        }
+
+        pub(super) fn repository(n: u64) -> RepositoryKey {
+            serde_json::from_value(serde_json::json!(n)).expect("repository key")
+        }
+
+        pub(super) fn report(target: RemovalTarget, rows: Vec<RowKey>) -> RemovalReport {
+            RemovalReport {
+                target,
+                planned: true,
+                rows_removed: rows,
+                runtimes_killed: Vec::new(),
+                paths_deleted: Vec::new(),
+                paths_kept: Vec::new(),
+                already_removed: Vec::new(),
+                readers_parked: Vec::new(),
+                persistence: PersistenceOutcome::Planned,
+                cleared: Vec::new(),
+                clearing_failures: Vec::new(),
+            }
+        }
+
+        pub(super) fn killed(row: RowKey, agent_pid: u32) -> KilledRuntime {
+            KilledRuntime {
+                row,
+                agent_pid,
+                shell_pid: None,
+            }
+        }
+
+        pub(super) fn cleared(kind: ClearingKind, path: &str) -> ClearedItem {
+            ClearedItem {
+                kind,
+                path: PathBuf::from(path),
+            }
+        }
+
+        /// Names rows the way the hierarchy would: `repo:child-<n>` for a
+        /// checkout, `repo` for the parent.
+        pub(super) fn name(key: &RowKey) -> String {
+            match key {
+                RowKey::Repository(_) => "repo".to_string(),
+                RowKey::Checkout(key) => format!("repo:child-{}", key.get()),
+                RowKey::Standalone(key) => format!("folder-{}", key.get()),
+            }
+        }
+
+        /// The entry lines under a heading: everything indented that follows
+        /// the first line starting with `heading`, up to the next unindented
+        /// line. Empty when the heading is absent.
+        pub(super) fn section<'a>(lines: &'a [String], heading: &str) -> Vec<&'a str> {
+            let Some(start) = lines.iter().position(|l| l.starts_with(heading)) else {
+                return Vec::new();
+            };
+            lines[start + 1..]
+                .iter()
+                .take_while(|l| l.starts_with(' '))
+                .map(|l| l.trim())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn remove_project_lines_sections_come_from_report_fields() {
+        use baude_core::removal::{ClearingKind, RemovalTarget, RowKey};
+        use remove_project::{cleared, killed, name, report, section};
+
+        let child = RowKey::Checkout(remove_project::checkout(7));
+        let mut r = report(
+            RemovalTarget::Checkout(remove_project::checkout(7)),
+            vec![child],
+        );
+        r.runtimes_killed = vec![killed(child, 4242)];
+        r.paths_deleted = vec!["/tmp/wt/feature".into()];
+        r.paths_kept = vec!["/tmp/wt/main".into()];
+        r.cleared = vec![cleared(ClearingKind::Binding, "/tmp/wt/feature")];
+
+        let lines =
+            remove_project_confirmation_lines(&r, "managed worktree", &name, None, 0, 10, 100);
+
+        assert!(
+            lines[0].contains("managed worktree"),
+            "title names the kind: {:?}",
+            lines[0]
+        );
+        assert!(lines.iter().any(|l| l.starts_with("rows dropped (1)")));
+        assert_eq!(section(&lines, "rows dropped"), vec!["repo:child-7"]);
+        assert!(lines.iter().any(|l| l.starts_with("runtimes killed (1)")));
+        assert!(section(&lines, "runtimes killed")
+            .iter()
+            .any(|l| l.contains("repo:child-7")));
+        let deleted = section(&lines, "paths deleted");
+        assert!(deleted.iter().any(|l| l.contains("/tmp/wt/feature")));
+        assert!(
+            !deleted.iter().any(|l| l.contains("/tmp/wt/main")),
+            "a kept path must never be promised as deleted: {deleted:?}"
+        );
+        assert!(section(&lines, "paths kept")
+            .iter()
+            .any(|l| l.contains("/tmp/wt/main")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("cleared") && l.contains("binding")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("y/enter remove · n/esc cancel")
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_repository_parent_lists_every_child_and_scrolls() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report, section};
+
+        let rows: Vec<RowKey> = (1..=6)
+            .map(|n| RowKey::Checkout(remove_project::checkout(n)))
+            .collect();
+        let r = report(
+            RemovalTarget::Repository(remove_project::repository(1)),
+            rows,
+        );
+
+        let top = remove_project_confirmation_lines(&r, "repository", &name, None, 0, 3, 100);
+        assert!(top.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&top, "rows dropped"),
+            vec!["repo:child-1", "repo:child-2", "repo:child-3", "+3 more"]
+        );
+
+        let mid = remove_project_confirmation_lines(&r, "repository", &name, None, 2, 3, 100);
+        assert!(mid.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&mid, "rows dropped"),
+            vec!["repo:child-3", "repo:child-4", "repo:child-5", "+1 more"]
+        );
+
+        let past = remove_project_confirmation_lines(&r, "repository", &name, None, 99, 3, 100);
+        assert!(past.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&past, "rows dropped"),
+            vec!["repo:child-4", "repo:child-5", "repo:child-6"],
+            "scroll past the end clamps so the last child stays visible"
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_error_switches_legend_to_retry() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report};
+
+        let child = RowKey::Checkout(remove_project::checkout(3));
+        let r = report(
+            RemovalTarget::Checkout(remove_project::checkout(3)),
+            vec![child],
+        );
+
+        let failed = remove_project_confirmation_lines(
+            &r,
+            "managed worktree",
+            &name,
+            Some("runtime survived: pid 123"),
+            0,
+            10,
+            100,
+        );
+        assert!(failed
+            .iter()
+            .any(|l| l.contains("runtime survived: pid 123")));
+        assert_eq!(
+            failed.last().map(String::as_str),
+            Some("enter retry · esc cancel")
+        );
+
+        let clean =
+            remove_project_confirmation_lines(&r, "managed worktree", &name, None, 0, 10, 100);
+        assert!(
+            !clean.iter().any(|l| l.contains("retry")),
+            "no retry legend without an error: {clean:?}"
+        );
+        assert_eq!(
+            clean.last().map(String::as_str),
+            Some("y/enter remove · n/esc cancel")
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_already_removed_and_empty_sections() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report, section};
+
+        let child = RowKey::Checkout(remove_project::checkout(5));
+        let mut r = report(
+            RemovalTarget::Checkout(remove_project::checkout(5)),
+            vec![child],
+        );
+        r.already_removed = vec!["/tmp/wt/gone".into()];
+
+        let lines =
+            remove_project_confirmation_lines(&r, "unavailable worktree", &name, None, 0, 10, 100);
+
+        assert!(section(&lines, "already removed")
+            .iter()
+            .any(|l| l.contains("/tmp/wt/gone")));
+        let deleted = section(&lines, "paths deleted");
+        assert!(
+            !deleted.iter().any(|l| l.contains('/')),
+            "nothing may be listed as deleted when the report deletes nothing: {deleted:?}"
+        );
     }
 
     // ---- UI fixture ownership regressions -------------------------------
