@@ -14,28 +14,28 @@ The same kill-then-remove operation that Phase 18 built in `baude-core` and Phas
 ## Implementation Decisions
 
 ### REST Removal Contract
-- `POST /removals` executes and `POST /removals/preview` previews; the request body is the core `RemovalTarget` JSON (`{"repository": k}`, `{"checkout": k}`, `{"standalone": k}`), one route family for all four row kinds, mirroring the preview/execute split Phase 18 locked.
-- The response body is the core `RemovalReport` serialized verbatim as 200 JSON; it already names rows removed, runtimes killed, paths deleted and kept, and clearings, and 18-CONTEXT fixed that the REST response reuses this report.
-- Errors keep the daemon's existing plain-text `(StatusCode, String)` convention: 404 unknown target, 409 when the recheck row set differs from the preview (body is the fresh `RemovalReport` JSON), 500 runtime survived or disk failure, 503 persistence, matching `mutation_error`.
-- Recheck before execute over REST: the execute body echoes the preview's `rows_removed` (and the runtimes killed and paths deleted sets, per WR-01); the daemon recomputes under the lock and returns 409 with the fresh report when any set changed, so the client re-shows it exactly like TUI D-08.
+- **D-01:** `POST /removals` executes and `POST /removals/preview` previews; the request body is the core `RemovalTarget` JSON (`{"repository": k}`, `{"checkout": k}`, `{"standalone": k}`), one route family for all four row kinds, mirroring the preview/execute split Phase 18 locked.
+- **D-02:** The response body is the core `RemovalReport` serialized verbatim as 200 JSON; it already names rows removed, runtimes killed, paths deleted and kept, and clearings, and 18-CONTEXT fixed that the REST response reuses this report.
+- **D-03:** Errors keep the daemon's existing plain-text `(StatusCode, String)` convention: 404 unknown target, 409 when the recheck row set differs from the preview (body is the fresh `RemovalReport` JSON), 500 runtime survived or disk failure, 503 persistence, matching `mutation_error`.
+- **D-04:** Recheck before execute over REST: the execute body echoes the preview's `rows_removed` (and the runtimes killed and paths deleted sets, per WR-01); the daemon recomputes under the lock and returns 409 with the fresh report when any set changed, so the client re-shows it exactly like TUI D-08.
 
 ### List-Level SSE and Client Updates
-- A new daemon-wide `GET /events` SSE stream backed by a `tokio::sync::broadcast` channel owned by `Manager`; the two existing per-session streams (`/stream`, `/activity-stream`) are untouched.
-- One `rows_removed` event whose data is the `RemovalReport` (the same JSON the REST call returned), so a listener drops rows by `RowKey` without a refetch.
-- `Manager` publishes after the removal's persist stage succeeds, inside the same lock, so no listener can observe a removed row resurrect.
-- The PWA subscribes to `/events` and drops rows by key immediately, keeping the existing 3 s poll as reconciliation; TUI remote rows drop on the same event through the existing remote client path.
+- **D-05:** A new daemon-wide `GET /events` SSE stream backed by a `tokio::sync::broadcast` channel owned by `Manager`; the two existing per-session streams (`/stream`, `/activity-stream`) are untouched.
+- **D-06:** One `rows_removed` event whose data is the `RemovalReport` (the same JSON the REST call returned), so a listener drops rows by `RowKey` without a refetch.
+- **D-07:** `Manager` publishes after the removal's persist stage succeeds, inside the same lock, so no listener can observe a removed row resurrect.
+- **D-08:** The PWA subscribes to `/events` and drops rows by key immediately, keeping the existing 3 s poll as reconciliation; TUI remote rows drop on the same event through the existing remote client path.
 
 ### PWA Row Reach and Hierarchy
-- Add a read-only `GET /rows` hierarchy projection (repository → checkouts, plus standalone roots) carrying core keys, and extend `SessionInfo` with its `checkout_key`. The flat `/sessions` array stays a non-hierarchical compatibility projection (Phase 7 decision), so the existing test `flat_session_api_remains_a_non_hierarchical_compatibility_projection` keeps passing.
-- The PWA offers remove on all four kinds: a repository group header removes every child; each checkout/worktree row and each standalone row removes itself. A row with no durable key shows no remove.
-- `bauded` admission is wired through the same `baude-core` suppression helper the TUI uses (19 D-11) in this phase, since the daemon now removes rows and must not re-admit them. The suppression write rule is inherited unchanged (19 D-10: entry only for a checkout removed while its repository row remains).
-- The TUI's remote-row refusal becomes a real action: `D` on a remote row calls the daemon's preview and execute endpoints and renders the same modal from the returned report, with the same recheck and failure posture.
+- **D-09:** Add a read-only `GET /rows` hierarchy projection (repository → checkouts, plus standalone roots) carrying core keys, and extend `SessionInfo` with its `checkout_key`. The flat `/sessions` array stays a non-hierarchical compatibility projection (Phase 7 decision), so the existing test `flat_session_api_remains_a_non_hierarchical_compatibility_projection` keeps passing.
+- **D-10:** The PWA offers remove on all four kinds: a repository group header removes every child; each checkout/worktree row and each standalone row removes itself. A row with no durable key shows no remove.
+- **D-11:** `bauded` admission is wired through the same `baude-core` suppression helper the TUI uses (19 D-11) in this phase, since the daemon now removes rows and must not re-admit them. The suppression write rule is inherited unchanged (19 D-10: entry only for a checkout removed while its repository row remains).
+- **D-12:** The TUI's remote-row refusal becomes a real action: `D` on a remote row calls the daemon's preview and execute endpoints and renders the same modal from the returned report, with the same recheck and failure posture.
 
 ### PWA Confirmation and Failure Handling
-- Reuse the hand-rolled `openModal`/`closeModal` pattern in `bauded/web/app.js` (not native `confirm()`), rendered from the `/removals/preview` report with the same sections the TUI shows: title naming the row kind, rows dropped, runtimes killed (count plus names), paths deleted, paths kept, clearings. Confirm and cancel buttons; backdrop click and Escape cancel without mutating anything.
-- On a 409 the modal re-renders in place from the fresh report in the response body and stays open; no removal is performed, same as TUI D-08.
-- On 500/503 the modal stays open showing the daemon's plain-text error with a Retry button; nothing is dropped client-side until the 200 response or the `rows_removed` SSE event arrives. Clearing failures inside a 200 report surface as a non-blocking toast, matching 19 D-14.
-- For a repository parent the modal lists every child checkout by name and branch (the TUI's "every child listed" rule); long lists scroll inside the modal box. A path is never shown under deleted unless the report lists it there.
+- **D-13:** Reuse the hand-rolled `openModal`/`closeModal` pattern in `bauded/web/app.js` (not native `confirm()`), rendered from the `/removals/preview` report with the same sections the TUI shows: title naming the row kind, rows dropped, runtimes killed (count plus names), paths deleted, paths kept, clearings. Confirm and cancel buttons; backdrop click and Escape cancel without mutating anything.
+- **D-14:** On a 409 the modal re-renders in place from the fresh report in the response body and stays open; no removal is performed, same as TUI D-08.
+- **D-15:** On 500/503 the modal stays open showing the daemon's plain-text error with a Retry button; nothing is dropped client-side until the 200 response or the `rows_removed` SSE event arrives. Clearing failures inside a 200 report surface as a non-blocking toast, matching 19 D-14.
+- **D-16:** For a repository parent the modal lists every child checkout by name and branch (the TUI's "every child listed" rule); long lists scroll inside the modal box. A path is never shown under deleted unless the report lists it there.
 
 ### Claude's Discretion
 - Exact broadcast channel capacity and lag handling for `/events`.
