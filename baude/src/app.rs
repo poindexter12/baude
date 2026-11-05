@@ -9967,6 +9967,63 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// READM-04, D-13: relaunching inside the removed unmanaged checkout lifts
+    /// its entry through the `LaunchDirectory` route and admits it in that same
+    /// restore as a row sharing nothing with the one that was removed.
+    #[test]
+    fn relaunch_inside_removed_checkout_readmits_it_fresh() {
+        let fx = relaunch_fixture("relaunch-inside-removed");
+        let (mut first, removed) = remove_four_rows(&fx);
+        assert!(is_suppressed(&fx.unmanaged), "removal wrote the entry");
+
+        let mut restarted = relaunch_app(&fx, fx.unmanaged.clone());
+        restarted.restore();
+
+        assert!(
+            !is_suppressed(&fx.unmanaged),
+            "the launch-dir admission lifts"
+        );
+        let rows: Vec<&SavedCheckout> = restarted
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|row| row.observed_path == PersistedPath::from_path(&fx.unmanaged))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row for the relaunched checkout");
+        let row = rows[0];
+        assert!(
+            row.key > removed.max_key && row.key != removed.key,
+            "new CheckoutKey"
+        );
+        assert!(
+            row.first_seen_order > removed.max_order
+                && row.first_seen_order != removed.first_seen_order,
+            "new first_seen_order"
+        );
+        assert_eq!(row.session.resume_id, None);
+        match row.owned_runtime() {
+            None => {}
+            Some(runtime) => {
+                let session = restarted
+                    .sessions
+                    .iter()
+                    .find(|session| session.claude.process_identity() == &runtime.agent)
+                    .expect("the spawned runtime is a live session of this App");
+                assert_eq!(session.cwd, fx.unmanaged, "runtime belongs to the new row");
+            }
+        }
+        assert!(
+            checkout_row(&restarted, &fx.linked).is_none(),
+            "sibling stays removed"
+        );
+        assert_eq!(restarted.repository_state.repositories.len(), 1);
+        restarted.repository_state.validate().unwrap();
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.
