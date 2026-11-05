@@ -12915,6 +12915,409 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// Signal zero to the group: `true` once no member is left to probe.
+    fn group_is_extinct(pgid: i32) -> bool {
+        // SAFETY: signal zero performs a liveness probe only.
+        unsafe { libc::kill(-pgid, 0) != 0 }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not happen within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    /// The modal after a failed confirm: still `ConfirmRemove` for `target`,
+    /// now carrying the typed error.
+    fn confirm_remove_error(app: &App, target: baude_core::removal::RemovalTarget) -> String {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target: kept,
+                error: Some(error),
+                ..
+            } => {
+                assert_eq!(*kept, target, "the modal keeps its target");
+                error.clone()
+            }
+            Modal::ConfirmRemove { error: None, .. } => {
+                panic!("expected ConfirmRemove carrying an error, got none")
+            }
+            Modal::None => panic!("expected Modal::ConfirmRemove, got Modal::None"),
+            _ => panic!("expected Modal::ConfirmRemove, got another modal"),
+        }
+    }
+
+    /// TUI-04, D-09, T-20-09: a kill failure returns before any row drops.
+    /// The runtime is the real parked-reader shape spawned through the App's
+    /// own `opencode_cmd` path, armed so its first teardown fails naming the
+    /// surviving pid; the row stays in the hierarchy and the state file, no
+    /// save ran, the disk is untouched and the handle is back in the registry
+    /// under its row. Releasing the holder and pressing Enter again removes
+    /// the row and leaves the real process group extinct.
+    #[test]
+    fn remove_project_failure_kill_keeps_rows_and_handles_then_retry_succeeds() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::removal::RemovalTarget;
+        use baude_core::testing::{arm_unkillable_runtime, holder_pgid, parked_reader_command};
+
+        let fx = relaunch_fixture("d-kill-failure");
+        let (mut app, _rows) = remove_project_app(&fx, "feature/d-kill-sleeper");
+        let holder_pid_path = fx.root.join("holder.pid");
+        let parked = parked_reader_command(&holder_pid_path);
+        app.config.claude_cmd = Some(parked.clone());
+        app.config.opencode_cmd = Some(parked);
+        let (target_row, runtime_id) = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-unkillable")
+            .unwrap()
+        {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = Modal::None;
+        let holder = arm_unkillable_runtime(
+            &app.session(runtime_id).expect("armed runtime").claude,
+            &holder_pid_path,
+        );
+        let identity = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .clone();
+        let managed_path = checkout_row_by_key(&app, target_row)
+            .observed_path
+            .to_path_buf();
+        assert!(managed_path.is_dir());
+        let sessions_before = app.sessions.len();
+        let file_before = state_file_bytes(&fx);
+        let saves_before = app.save_attempts_for_test.get();
+        let target = RemovalTarget::Checkout(target_row);
+
+        app.selected_id = Some(SelId::Checkout(target_row));
+        app.handle_sidebar_key(d_key());
+        assert_eq!(confirm_remove_modal(&app).0, target);
+        app.handle_modal_key(enter_key());
+
+        let error = confirm_remove_error(&app, target);
+        assert!(
+            error.contains(&identity.pid.to_string()),
+            "the error names the surviving pid {}: {error}",
+            identity.pid
+        );
+        assert!(
+            error.contains("survived the kill stage"),
+            "the error is the typed kill failure: {error}"
+        );
+        assert!(
+            app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(target_row)),
+            "the row is still in the hierarchy"
+        );
+        assert!(
+            saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == target_row),
+            "the row is still in the state file"
+        );
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert!(managed_path.is_dir(), "the disk stage never ran");
+        assert_eq!(
+            app.runtime_checkouts.get(&target_row),
+            Some(&runtime_id),
+            "the row still maps to its runtime"
+        );
+        let restored = app
+            .session(runtime_id)
+            .expect("the Session handle is back in the registry");
+        assert_eq!(restored.claude.process_identity(), &identity);
+        assert_eq!(app.sessions.len(), sessions_before, "no handle lost");
+
+        let holder_pid = holder.pid();
+        drop(holder);
+        wait_until("holder exit", || holder_pgid(holder_pid).is_none());
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the retry closes the modal"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(target_row)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == target_row),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert!(!app.runtime_checkouts.contains_key(&target_row));
+        assert!(app.session(runtime_id).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        assert!(!managed_path.exists(), "the managed directory was deleted");
+        wait_until("group extinction", || {
+            group_is_extinct(identity.process_group)
+        });
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row") && message.contains("1 runtime"),
+            "footer reports the retry's counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-04, D-09, T-20-10: a save failure after the kill stage leaves the
+    /// row in the hierarchy and the state file with the typed error, the
+    /// handle back in the registry; clearing the failure and pressing Enter
+    /// removes the row.
+    #[test]
+    fn remove_project_failure_save_keeps_rows_then_retry_succeeds() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::persist::AtomicFailure;
+        use baude_core::removal::RemovalTarget;
+
+        let fx = relaunch_fixture("d-save-failure");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-save");
+        let runtime_id = app.runtime_standalones[&rows.standalone];
+        let live_pid = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        assert!(pid_is_live(live_pid));
+        let sessions_before = app.sessions.len();
+        let file_before = state_file_bytes(&fx);
+        let saves_before = app.save_attempts_for_test.get();
+        let target = RemovalTarget::Standalone(rows.standalone);
+
+        app.selected_id = Some(SelId::Standalone(rows.standalone));
+        app.handle_sidebar_key(d_key());
+        assert_eq!(confirm_remove_modal(&app).0, target);
+        app.atomic_failure_for_test = Some(AtomicFailure::Rename);
+        app.handle_modal_key(enter_key());
+
+        let error = confirm_remove_error(&app, target);
+        assert!(
+            error.contains("could not persist") && error.contains("rename"),
+            "the error is the typed save failure: {error}"
+        );
+        assert!(
+            app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Standalone(rows.standalone)),
+            "the row is still in the hierarchy"
+        );
+        assert!(
+            saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row is still in the state file"
+        );
+        assert_eq!(
+            state_file_bytes(&fx),
+            file_before,
+            "the failed save committed nothing"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert_eq!(
+            app.runtime_standalones.get(&rows.standalone),
+            Some(&runtime_id)
+        );
+        assert!(
+            app.session(runtime_id).is_some(),
+            "the Session handle is back in the registry"
+        );
+        assert_eq!(app.sessions.len(), sessions_before, "no handle lost");
+        assert!(
+            !pid_is_live(live_pid),
+            "the kill stage ran before the save failed; the retry copes with a dead group"
+        );
+        assert!(
+            app.atomic_failure_for_test.is_none(),
+            "the injected failure models one atomic boundary"
+        );
+
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the retry closes the modal"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Standalone(rows.standalone)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 2);
+        assert!(!app.runtime_standalones.contains_key(&rows.standalone));
+        assert!(app.session(runtime_id).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row") && message.contains("1 runtime"),
+            "footer reports the retry's counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-10, T-20-11: a clearing failure after the committed save does not
+    /// fail the removal. The suppression merge lock path is occupied by a
+    /// directory, so recording the removed managed worktree fails after the
+    /// state save; the rows are gone, the modal is closed and the footer
+    /// names what could not be cleared.
+    #[test]
+    fn remove_project_clearing_failure_is_a_footer_notice_not_an_error() {
+        use crate::hierarchy::LocalRowId;
+
+        let fx = relaunch_fixture("d-clearing-failure");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-clearing");
+        let managed_path = checkout_row_by_key(&app, rows.managed)
+            .observed_path
+            .to_path_buf();
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        let suppression_file = baude_core::suppression::file_path(&config);
+        let lock_path = config.join(format!(
+            ".{}.lock",
+            suppression_file.file_name().unwrap().to_string_lossy()
+        ));
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        assert!(previewed.clearing_failures.is_empty());
+        std::fs::create_dir_all(&lock_path).expect("occupy the lock path with a directory");
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a clearing failure is not an error"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(rows.managed)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert!(!managed_path.exists());
+        assert!(app.session(rows.managed_runtime).is_none());
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &managed_path),
+            "the suppression entry could not be written"
+        );
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("removed 1 row") && message.contains("could not clear 1"),
+            "the footer reports the removal and the clearing failure: {message}"
+        );
+        assert!(
+            message.contains("SuppressionAdded")
+                && message.contains(&managed_path.display().to_string()),
+            "the footer names what could not be cleared: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-08: a row set that changed behind the modal refreshes the modal
+    /// instead of removing. A child checkout activated after the preview
+    /// shows up in the reinstalled report and nothing is removed.
+    #[test]
+    fn remove_project_recheck_refreshes_modal_when_row_set_changes() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("d-recheck");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-recheck-one");
+        let target = RemovalTarget::Repository(rows.repository);
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        let modal = std::mem::replace(&mut app.modal, Modal::None);
+        let behind = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-recheck-two")
+            .unwrap()
+        {
+            LifecycleOutcome::Created { checkout, .. } => checkout,
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = modal;
+        assert!(!previewed.rows_removed.contains(&RowKey::Checkout(behind)));
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+
+        app.handle_modal_key(enter_key());
+
+        let (kept, fresh) = confirm_remove_modal(&app);
+        assert_eq!(kept, target);
+        assert!(
+            fresh.rows_removed.contains(&RowKey::Checkout(behind)),
+            "the refreshed report lists the new child: {fresh:?}"
+        );
+        assert!(previewed
+            .rows_removed
+            .iter()
+            .all(|row| fresh.rows_removed.contains(row)));
+        assert_eq!(app.repository_state, state_before, "no row was removed");
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("rows changed since the preview"),
+            "footer explains the refresh: {message}"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     fn checkout_row_by_key(app: &App, key: CheckoutKey) -> &SavedCheckout {
         app.repository_state
             .checkouts
