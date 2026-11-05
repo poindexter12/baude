@@ -1773,6 +1773,58 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 );
             frame.render_widget(p, rect);
         }
+        Modal::ConfirmRemove {
+            target,
+            report,
+            scroll,
+            error,
+        } => {
+            let kind_label = app.removal_kind_label(*target);
+            let row_name = |key: &baude_core::removal::RowKey| app.removal_row_label(key);
+            // D-07: the modal grows to at most 80% of the screen; the
+            // dropped-row list gets whatever that leaves after the fixed
+            // sections, and the hidden remainder renders as "+N more".
+            let max_height = u16::try_from(u32::from(area.height) * 80 / 100)
+                .unwrap_or(u16::MAX)
+                .max(6);
+            let fixed_lines = 6 // prompt, blank, "rows dropped", blank, legend, blank
+                + 2 * 3 // "runtimes killed", "paths deleted", "paths kept" headings + one entry each
+                + report.runtimes_killed.len().saturating_sub(1)
+                + report.paths_deleted.len().saturating_sub(1)
+                + report.paths_kept.len().saturating_sub(1)
+                + if report.already_removed.is_empty() { 0 } else { 1 + report.already_removed.len() }
+                + if report.cleared.is_empty() { 0 } else { 1 + report.cleared.len() }
+                + usize::from(error.is_some());
+            let max_rows = usize::from(max_height)
+                .saturating_sub(2)
+                .saturating_sub(fixed_lines)
+                .max(1);
+            let width: u16 = 76;
+            let inner_width = usize::from(width.saturating_sub(2));
+            let lines = remove_project_confirmation_lines(
+                report,
+                kind_label,
+                &row_name,
+                error.as_deref(),
+                *scroll,
+                max_rows,
+                inner_width,
+            );
+            let height = u16::try_from(lines.len() + 2)
+                .unwrap_or(u16::MAX)
+                .min(max_height);
+            let rect = centered(area, width, height);
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(format!(" remove {kind_label} ")),
+                );
+            frame.render_widget(p, rect);
+        }
         Modal::Info => {
             if let Some(r) = app.selected_remote() {
                 let dim = Style::default().fg(Color::DarkGray);
@@ -2422,9 +2474,6 @@ fn remove_confirmation_lines(
 /// run performs (D-05). `scroll`/`max_rows` window the dropped-row list; the
 /// hidden remainder renders as `+N more` (D-07). An `error` switches the
 /// legend to retry (D-06).
-// Consumed by the `D` modal that plan 20-02 wires into `App`; drop the
-// dead_code allowance there.
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remove_project_confirmation_lines(
     report: &baude_core::removal::RemovalReport,

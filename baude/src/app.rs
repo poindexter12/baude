@@ -296,6 +296,8 @@ enum SidebarRefusal {
     RemoteShell,
     RemoteEditor,
     RemoteGsd,
+    /// `D` on a remote row: remote removal arrives with the daemon (Phase 21).
+    RemoteRemove,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,10 +327,29 @@ enum SidebarAction {
     RemoteClose,
     RemoteRestart,
     RemoteArchive,
+    /// `D`: the Phase 18 kill-then-remove path over `removal::remove`, offered
+    /// on every local row kind (D-01, D-02).
+    RemoveProject,
     Refuse(SidebarRefusal),
 }
 
 fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
+    let remove_project_key = matches!(key.code, KeyCode::Char('D'))
+        || matches!(key.code, KeyCode::Char('d')) && key.modifiers.contains(KeyModifiers::SHIFT);
+    if remove_project_key {
+        // No `can_remove` or `RetryRecovery` gate: recovery state does not
+        // block the force path, and a missing worktree is the already-removed
+        // case the core reports (D-02).
+        return match view.kind {
+            ActionKind::Remote => SidebarAction::Refuse(SidebarRefusal::RemoteRemove),
+            ActionKind::Repository
+            | ActionKind::Main
+            | ActionKind::Managed
+            | ActionKind::External
+            | ActionKind::Standalone
+            | ActionKind::Unavailable => SidebarAction::RemoveProject,
+        };
+    }
     let remove_key = matches!(key.code, KeyCode::Char('X'))
         || matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::SHIFT);
     if remove_key {
@@ -473,6 +494,51 @@ pub enum Modal {
     ConfirmRemoveWorktree {
         confirmation: lifecycle::RemovalConfirmation,
     },
+    /// `D`: the report `preview_removal` produced for `target`, shown before
+    /// the Phase 18 kill-then-remove path runs (D-05). `scroll` windows the
+    /// dropped-row list (D-07); `error` is the typed failure of the last
+    /// confirm, which keeps the modal open for retry (D-09).
+    ConfirmRemove {
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        scroll: usize,
+        error: Option<String>,
+    },
+}
+
+/// What `confirm_remove_project` did with a confirmed modal.
+#[derive(Debug)]
+pub(crate) enum RemoveProjectOutcome {
+    /// `removal::remove` returned `Ok`: rows are gone and the state is saved.
+    Removed(baude_core::removal::RemovalReport),
+    /// The row set differs from the previewed report; the modal is refreshed
+    /// with this report and asks again instead of removing (D-08).
+    Recheck(baude_core::removal::RemovalReport),
+}
+
+/// Why `confirm_remove_project` did not remove.
+#[derive(Debug)]
+pub(crate) enum RemoveProjectError {
+    /// The repository is reserved by another lifecycle operation.
+    Reservation(String),
+    /// The core refused or failed before any row dropped; every handle is
+    /// back in the registry.
+    Removal(baude_core::removal::RemovalError),
+}
+
+impl std::fmt::Display for RemoveProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reservation(detail) => write!(f, "repository is busy: {detail}"),
+            Self::Removal(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<baude_core::removal::RemovalError> for RemoveProjectError {
+    fn from(error: baude_core::removal::RemovalError) -> Self {
+        Self::Removal(error)
+    }
 }
 
 /// Active text selection within a content pane (claude or shell).
@@ -1254,6 +1320,9 @@ impl App {
                 "remote session — folder lives on the daemon host".into()
             }
             SidebarRefusal::RemoteGsd => "GSD view is for local sessions".into(),
+            SidebarRefusal::RemoteRemove => format!(
+                "Cannot remove “{target}”: remote rows are removed from the daemon and PWA in a later release. Nothing was changed."
+            ),
         };
         self.set_message(message);
     }
@@ -3711,6 +3780,400 @@ impl App {
         Err(failure)
     }
 
+    /// The row-kind noun the `D` modal title and prompt use for `target`.
+    pub(crate) fn removal_kind_label(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> &'static str {
+        use baude_core::removal::RemovalTarget;
+        match target {
+            RemovalTarget::Repository(_) => "repository",
+            RemovalTarget::Standalone(_) => "standalone session",
+            RemovalTarget::Checkout(key) => self
+                .hierarchy_rows()
+                .into_iter()
+                .find_map(|row| match row {
+                    LocalRow::Checkout(child) if child.key == key => {
+                        Some(match child.actions.kind {
+                            ActionKind::Main => "main checkout",
+                            ActionKind::Managed => "managed worktree",
+                            ActionKind::External => "unmanaged checkout",
+                            ActionKind::Unavailable => "unavailable worktree",
+                            _ => "checkout",
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or("checkout"),
+        }
+    }
+
+    /// The sidebar name of a row named in a `RemovalReport`, falling back to
+    /// its recorded path so a row the hierarchy no longer projects still
+    /// reads as something concrete.
+    pub(crate) fn removal_row_label(&self, key: &baude_core::removal::RowKey) -> String {
+        use baude_core::removal::RowKey;
+        let from_rows = self
+            .hierarchy_rows()
+            .into_iter()
+            .find_map(|row| match (row, key) {
+                (LocalRow::Repository(parent), RowKey::Repository(k)) if parent.key == *k => {
+                    Some(parent.name)
+                }
+                (LocalRow::Checkout(child), RowKey::Checkout(k)) if child.key == *k => {
+                    Some(child.name)
+                }
+                (LocalRow::Standalone(standalone), RowKey::Standalone(k))
+                    if standalone.key == *k =>
+                {
+                    Some(standalone.name)
+                }
+                _ => None,
+            });
+        if let Some(name) = from_rows {
+            return name;
+        }
+        let path = match key {
+            RowKey::Repository(k) => self
+                .repository_state
+                .repositories
+                .iter()
+                .find(|repository| repository.key == *k)
+                .map(|repository| repository.observed_main_worktree.to_path_buf()),
+            RowKey::Checkout(k) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == *k)
+                .map(|checkout| checkout.observed_path.to_path_buf()),
+            RowKey::Standalone(k) => self
+                .repository_state
+                .standalone_session(*k)
+                .map(|standalone| standalone.canonical_path.to_path_buf()),
+        };
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("{key:?}"))
+    }
+
+    /// The `RemovalTarget` the selected local row names, or `None` for a
+    /// remote row or an empty selection.
+    fn removal_target_for_selection(&self) -> Option<baude_core::removal::RemovalTarget> {
+        use baude_core::removal::RemovalTarget;
+        match self.selected_id? {
+            SelId::Repository(key) => Some(RemovalTarget::Repository(key)),
+            SelId::Checkout(key) => Some(RemovalTarget::Checkout(key)),
+            SelId::Standalone(key) => Some(RemovalTarget::Standalone(key)),
+            SelId::Remote(_) => None,
+        }
+    }
+
+    /// The repository a removal target reserves; standalone rows have none.
+    fn removal_target_repository(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> Option<RepositoryKey> {
+        use baude_core::removal::RemovalTarget;
+        match target {
+            RemovalTarget::Repository(key) => Some(key),
+            RemovalTarget::Checkout(key) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .map(|checkout| checkout.repository_key),
+            RemovalTarget::Standalone(_) => None,
+        }
+    }
+
+    /// Hold the target's repository the way `prepare_remove_worktree` does,
+    /// so a concurrent reopen cannot interleave with preview or removal.
+    fn reserve_removal_target(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> std::result::Result<Option<lifecycle::RepositoryReservation>, RemoveProjectError> {
+        let Some(repository) = self.removal_target_repository(target) else {
+            return Ok(None);
+        };
+        self.repository_reservations
+            .reserve(repository)
+            .map(Some)
+            .map_err(|outcome| RemoveProjectError::Reservation(format!("{outcome:?}")))
+    }
+
+    /// `D`: build `Modal::ConfirmRemove` from `preview_removal` for the
+    /// selected row (D-03, D-05). A `RemovalError` becomes a footer notice.
+    fn open_remove_project_modal(&mut self) {
+        let Some(target) = self.removal_target_for_selection() else {
+            self.set_message("Cannot remove: select a local row first.".into());
+            return;
+        };
+        let label = self.selected_target_label();
+        let reservation = match self.reserve_removal_target(target) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.set_message(format!(
+                    "Cannot remove “{label}”: {error}. Nothing was changed."
+                ));
+                return;
+            }
+        };
+        let preview = baude_core::removal::preview_removal(&self.repository_state, target);
+        drop(reservation);
+        match preview {
+            Ok(report) => {
+                self.modal = Modal::ConfirmRemove {
+                    target,
+                    report,
+                    scroll: 0,
+                    error: None,
+                };
+                self.dirty = true;
+            }
+            Err(error) => self.set_message(format!(
+                "Cannot remove “{label}”: {error}. Nothing was removed."
+            )),
+        }
+    }
+
+    /// Move the live `Session` handles for the report's rows out of the App
+    /// registry into the shape `removal::remove` demands. The
+    /// `runtime_checkouts` / `runtime_standalones` entries stay until the
+    /// core returns `Ok`, so `restore_row_runtimes` can put a handle back
+    /// without rebuilding the mapping.
+    fn collect_row_runtimes(
+        &mut self,
+        report: &baude_core::removal::RemovalReport,
+    ) -> Vec<baude_core::removal::RowRuntime> {
+        use baude_core::removal::{RowKey, RowRuntime};
+        let mut runtimes = Vec::new();
+        for row in &report.rows_removed {
+            let runtime_id = match row {
+                RowKey::Checkout(key) => self.runtime_checkouts.get(key).copied(),
+                RowKey::Standalone(key) => self.runtime_standalones.get(key).copied(),
+                RowKey::Repository(_) => None,
+            };
+            let Some(runtime_id) = runtime_id else {
+                continue;
+            };
+            let Some(index) = self
+                .sessions
+                .iter()
+                .position(|session| session.id == runtime_id)
+            else {
+                continue;
+            };
+            runtimes.push(RowRuntime {
+                row: *row,
+                session: self.sessions.remove(index),
+            });
+        }
+        runtimes
+    }
+
+    /// Return every handle the core did not consume to the registry. On
+    /// `Err` that is all of them; after a kill-stage abort some may already
+    /// be dead, which the existing exit detection and close path reconcile.
+    fn restore_row_runtimes(&mut self, runtimes: Vec<baude_core::removal::RowRuntime>) {
+        for runtime in runtimes {
+            // The `runtime_checkouts` / `runtime_standalones` entry was never
+            // dropped, so the handle slots straight back under its row; the
+            // registry keeps id order so the sidebar's runtime decorations
+            // and `ordered_ids` are stable.
+            let session = runtime.session;
+            let index = self
+                .sessions
+                .iter()
+                .position(|existing| existing.id > session.id)
+                .unwrap_or(self.sessions.len());
+            self.sessions.insert(index, session);
+        }
+    }
+
+    /// Enter or `y` on `Modal::ConfirmRemove`: re-reserve, recheck the row
+    /// set against the previewed report (D-08), then run `removal::remove`
+    /// with the atomic save. On `Err` every handle is back in the registry
+    /// and the rows are untouched (D-09). On `Ok` the removed rows leave the
+    /// registry, selection moves to the parent or next repository (D-11),
+    /// clearing failures are a footer notice (D-10) and the footer confirms
+    /// with counts.
+    pub(crate) fn confirm_remove_project(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> std::result::Result<RemoveProjectOutcome, RemoveProjectError> {
+        use baude_core::removal::{self, PersistenceOutcome, RemovalTarget, RowKey};
+        let rows_before = self.visible_hierarchy_rows();
+        let parent = match target {
+            RemovalTarget::Checkout(_) => self.removal_target_repository(target),
+            RemovalTarget::Repository(_) | RemovalTarget::Standalone(_) => None,
+        };
+        let _reservation = self.reserve_removal_target(target)?;
+        // D-08: the row set is recomputed at confirm time; a difference from
+        // the previewed report refreshes the modal instead of removing.
+        let fresh = removal::preview_removal(&self.repository_state, target)?;
+        if fresh.rows_removed != previewed.rows_removed {
+            return Ok(RemoveProjectOutcome::Recheck(fresh));
+        }
+        let mut runtimes = self.collect_row_runtimes(&fresh);
+        #[cfg(test)]
+        let save_failure = self.atomic_failure_for_test;
+        #[cfg(test)]
+        let save_root = self.persistence_root_for_test.clone();
+        #[cfg(test)]
+        let save_attempts = &self.save_attempts_for_test;
+        let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            #[cfg(test)]
+            {
+                save_attempts.set(save_attempts.get() + 1);
+                if let Some(root) = &save_root {
+                    return persist::save_current_at_test(
+                        root,
+                        &baude_core::workspace::active().state_file("state"),
+                        file,
+                        save_failure,
+                        None,
+                    );
+                }
+            }
+            persist::save_for_workspace_status("state", baude_core::workspace::active(), file)
+        };
+        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        #[cfg(test)]
+        {
+            // Failure injection models one atomic boundary, so a retry
+            // exercises the recovered path.
+            self.atomic_failure_for_test = None;
+        }
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                // D-09: `*state` is untouched and every handle is still in
+                // the Vec; put them all back before the modal is reinstalled.
+                self.restore_row_runtimes(runtimes);
+                return Err(error.into());
+            }
+        };
+        for row in &report.rows_removed {
+            match row {
+                RowKey::Checkout(key) => {
+                    self.runtime_checkouts.remove(key);
+                }
+                RowKey::Standalone(key) => {
+                    self.runtime_standalones.remove(key);
+                }
+                RowKey::Repository(_) => {}
+            }
+        }
+        // Handles the core did not consume stay in the registry.
+        self.restore_row_runtimes(runtimes);
+        self.persistence_dirty =
+            matches!(report.persistence, PersistenceOutcome::SavedDegraded { .. });
+        self.select_after_removal(&rows_before, target, parent);
+        self.focus = Focus::Sidebar;
+        Ok(RemoveProjectOutcome::Removed(report))
+    }
+
+    /// The footer line for a completed removal: counts of what the committed
+    /// report says happened, plus any clearing failure by name (D-10: those
+    /// come after the save and do not fail the removal).
+    fn removal_notice(report: &baude_core::removal::RemovalReport) -> String {
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let rows = report.rows_removed.len();
+        let killed = report.runtimes_killed.len();
+        let deleted = report.paths_deleted.len();
+        let mut message = format!(
+            "removed {rows} row{}, killed {killed} runtime{}, deleted {deleted} path{}",
+            plural(rows),
+            plural(killed),
+            plural(deleted)
+        );
+        if !report.clearing_failures.is_empty() {
+            let failures: Vec<String> = report
+                .clearing_failures
+                .iter()
+                .map(|failure| {
+                    format!(
+                        "{:?} {}: {}",
+                        failure.kind,
+                        failure.path.display(),
+                        failure.error
+                    )
+                })
+                .collect();
+            message.push_str(&format!(
+                "; could not clear {}: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        message
+    }
+
+    /// D-11: after a removal the selection lands on the parent repository of
+    /// a removed child, else the next repository in the pre-removal order,
+    /// else the first selectable surviving row.
+    fn select_after_removal(
+        &mut self,
+        rows_before: &[LocalRow],
+        target: baude_core::removal::RemovalTarget,
+        parent: Option<RepositoryKey>,
+    ) {
+        use baude_core::removal::RemovalTarget;
+        let exists = |key: RepositoryKey| {
+            self.repository_state
+                .repositories
+                .iter()
+                .any(|repository| repository.key == key)
+        };
+        if let Some(parent) = parent.filter(|key| exists(*key)) {
+            self.selected_id = Some(SelId::Repository(parent));
+            return;
+        }
+        let repositories: Vec<RepositoryKey> = rows_before
+            .iter()
+            .filter_map(|row| match row {
+                LocalRow::Repository(repository) => Some(repository.key),
+                _ => None,
+            })
+            .collect();
+        let removed_at = match target {
+            RemovalTarget::Repository(key) => repositories.iter().position(|k| *k == key),
+            _ => None,
+        };
+        let next = match removed_at {
+            Some(at) => repositories
+                .iter()
+                .skip(at + 1)
+                .copied()
+                .find(|key| exists(*key))
+                .or_else(|| {
+                    repositories[..at]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|key| exists(*key))
+                }),
+            None => repositories.iter().copied().find(|key| exists(*key)),
+        };
+        if let Some(key) = next {
+            self.selected_id = Some(SelId::Repository(key));
+            return;
+        }
+        self.selected_id = hierarchy::selectable_local_ids(&self.visible_hierarchy_rows())
+            .first()
+            .map(|id| match id {
+                LocalRowId::Repository(key) => SelId::Repository(*key),
+                LocalRowId::Checkout(key) => SelId::Checkout(*key),
+                LocalRowId::Standalone(key) => SelId::Standalone(*key),
+            })
+            .or_else(|| {
+                self.remote_snap
+                    .sessions
+                    .first()
+                    .map(|remote| SelId::Remote(remote.id))
+            });
+    }
+
     pub fn prepare_remove_worktree(
         &self,
         checkout: CheckoutKey,
@@ -5156,6 +5619,7 @@ impl App {
                     SidebarAction::RetryReopen => self.open_local_target(),
                     SidebarAction::RetryRecovery => self.retry_selected_recovery(),
                     SidebarAction::Remove => self.prepare_selected_removal(),
+                    SidebarAction::RemoveProject => self.open_remove_project_modal(),
                     SidebarAction::Shell => self.toggle_shell(true),
                     SidebarAction::Editor => self.open_editor_for_selection(),
                     SidebarAction::Info => self.modal = Modal::Info,
@@ -5313,6 +5777,62 @@ impl App {
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                _ => {}
+            },
+            Modal::ConfirmRemove { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let modal = std::mem::replace(&mut self.modal, Modal::None);
+                    let Modal::ConfirmRemove {
+                        target,
+                        report,
+                        scroll,
+                        ..
+                    } = modal
+                    else {
+                        unreachable!();
+                    };
+                    match self.confirm_remove_project(target, &report) {
+                        Ok(RemoveProjectOutcome::Removed(report)) => {
+                            self.set_message(Self::removal_notice(&report));
+                        }
+                        Ok(RemoveProjectOutcome::Recheck(fresh)) => {
+                            self.modal = Modal::ConfirmRemove {
+                                target,
+                                report: fresh,
+                                scroll: 0,
+                                error: None,
+                            };
+                            self.set_message(
+                                "rows changed since the preview; review the refreshed confirmation"
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            // D-09: rows and handles are intact; keep the
+                            // modal open with the typed error for retry.
+                            self.modal = Modal::ConfirmRemove {
+                                target,
+                                report,
+                                scroll,
+                                error: Some(error.to_string()),
+                            };
+                            self.dirty = true;
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Modal::ConfirmRemove { scroll, .. } = &mut self.modal {
+                        *scroll = scroll.saturating_add(1);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Modal::ConfirmRemove { scroll, .. } = &mut self.modal {
+                        *scroll = scroll.saturating_sub(1);
+                        self.dirty = true;
+                    }
+                }
                 _ => {}
             },
             Modal::None => {}
@@ -11773,6 +12293,487 @@ mod tests {
             ],
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- D remove action (plan 20-02) ---------------------------------------
+
+    fn d_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)
+    }
+
+    /// TUI-01, D-01, D-02: `D` resolves to `RemoveProject` on every local row
+    /// kind, with no `can_remove` or recovery gate, for both key encodings.
+    #[test]
+    fn sidebar_action_d_yields_remove_project_on_every_local_kind() {
+        use super::{sidebar_action, SidebarAction};
+        use crate::hierarchy::{ActionKind, ActionView};
+        use baude_core::lifecycle::LifecycleCapability;
+
+        let view = |kind: ActionKind, can_remove: bool, capability| ActionView {
+            kind,
+            has_runtime: false,
+            capability,
+            can_activate_branch: false,
+            can_close: false,
+            can_remove,
+        };
+        let views = [
+            view(ActionKind::Repository, false, None),
+            view(ActionKind::Main, false, None),
+            view(ActionKind::Managed, false, None),
+            view(ActionKind::Managed, true, None),
+            view(ActionKind::External, false, None),
+            view(ActionKind::Standalone, false, None),
+            view(ActionKind::Unavailable, false, None),
+            view(
+                ActionKind::Unavailable,
+                false,
+                Some(LifecycleCapability::RetryRecovery),
+            ),
+        ];
+        let keys = [
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT),
+        ];
+        for view in views {
+            for key in keys {
+                assert_eq!(
+                    sidebar_action(view, key),
+                    SidebarAction::RemoveProject,
+                    "{view:?} with {key:?}"
+                );
+            }
+        }
+        // Plain `d` is unbound: only the shifted key is destructive.
+        assert_eq!(
+            sidebar_action(
+                views[0],
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            ),
+            SidebarAction::None
+        );
+    }
+
+    /// TUI-01, D-02: remote rows refuse with `RemoteRemove`; no target is
+    /// built for them.
+    #[test]
+    fn sidebar_action_d_refuses_remote_rows() {
+        use super::{sidebar_action, SidebarAction, SidebarRefusal};
+        use crate::hierarchy::{action_view, ActionSelection};
+
+        for has_runtime in [false, true] {
+            let view = action_view(ActionSelection::Remote, has_runtime, None);
+            for key in [
+                KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT),
+            ] {
+                assert_eq!(
+                    sidebar_action(view, key),
+                    SidebarAction::Refuse(SidebarRefusal::RemoteRemove),
+                    "remote has_runtime={has_runtime} with {key:?}"
+                );
+            }
+        }
+    }
+
+    /// D-02: `D` on a remote row through the sidebar leaves no modal and
+    /// names the daemon as where remote removal arrives.
+    #[test]
+    fn d_on_remote_row_sets_footer_notice() {
+        let _scope = isolation_scope("d-remote-refusal");
+        let remote = serde_json::from_value::<crate::remote::RemoteInfo>(serde_json::json!({
+            "id": 41,
+            "name": "active-zeta",
+            "title": null,
+            "status": "busy",
+            "waiting_for_ms": null,
+            "model": null,
+            "permission_mode": null,
+            "context_used_pct": null,
+            "branch": "main",
+            "session_cost_usd": null,
+            "archived": false
+        }))
+        .unwrap();
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = None;
+        app.remote_snap = crate::remote::RemoteSnapshot {
+            sessions: vec![remote],
+            fetched_ms: 1,
+            ok: true,
+            daemon_workspace: None,
+            daemon_workspace_source: None,
+            daemon_collision_count: 0,
+        };
+        app.selected_id = Some(SelId::Remote(41));
+
+        app.handle_sidebar_key(d_key());
+
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("active-zeta") && message.contains("daemon"),
+            "notice names the row and the daemon: {message}"
+        );
+    }
+
+    /// Every local row kind `D` reaches over `relaunch_fixture`: the clone's
+    /// primary checkout with the runtime `restore` spawned, which is
+    /// `PrimaryDefault` and so an `External` row, a managed worktree with its
+    /// own runtime, the unmanaged linked worktree, a standalone folder with a
+    /// runtime, and a second repository. The `Main` role needs the pushed
+    /// shape and is reached by the `sidebar_action_d` dispatch test instead.
+    struct RemoveProjectRows {
+        repository: baude_core::repository::RepositoryKey,
+        main: CheckoutKey,
+        managed: CheckoutKey,
+        managed_runtime: u64,
+        unmanaged: CheckoutKey,
+        standalone: StandaloneKey,
+        second: baude_core::repository::RepositoryKey,
+    }
+
+    fn remove_project_app(fx: &RelaunchFixture, branch: &str) -> (App, RemoveProjectRows) {
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.restore();
+        let main_row = checkout_row(&app, &fx.repo).expect("clone admitted");
+        assert_eq!(
+            main_row.role,
+            CheckoutRole::PrimaryDefault,
+            "cloned shape primary"
+        );
+        let main = main_row.key;
+        let repository = main_row.repository_key;
+        assert!(
+            app.runtime_checkouts.contains_key(&main),
+            "restore spawned the clone's primary runtime"
+        );
+        let (managed, managed_runtime) =
+            match app.activate_branch_worktree(&fx.repo, branch).unwrap() {
+                LifecycleOutcome::Created {
+                    checkout,
+                    runtime: Some(runtime),
+                } => (checkout, runtime),
+                other => panic!("unexpected activation outcome: {other:?}"),
+            };
+        let unmanaged = checkout_row(&app, &fx.unmanaged)
+            .expect("unmanaged swept in")
+            .key;
+        app.admit_standalone(&fx.standalone)
+            .unwrap()
+            .expect("standalone runtime");
+        let standalone = app
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .find(|row| row.canonical_path == PersistedPath::from_path(&fx.standalone))
+            .expect("standalone row")
+            .key;
+        app.admit_repository(&fx.second_repo).unwrap();
+        let second = app
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&fx.second_common_dir))
+            .expect("second repository row")
+            .key;
+        app.repository_state.validate().unwrap();
+        app.modal = Modal::None;
+        (
+            app,
+            RemoveProjectRows {
+                repository,
+                main,
+                managed,
+                managed_runtime,
+                unmanaged,
+                standalone,
+                second,
+            },
+        )
+    }
+
+    fn saved_state(fx: &RelaunchFixture) -> RepositoryState {
+        persist::load_current_at(
+            &fx.state_root,
+            &baude_core::workspace::active().state_file("state"),
+        )
+        .expect("state file loads")
+        .state
+    }
+
+    fn state_file_bytes(fx: &RelaunchFixture) -> Vec<u8> {
+        std::fs::read(
+            fx.state_root
+                .join(baude_core::workspace::active().state_file("state")),
+        )
+        .expect("state file exists")
+    }
+
+    fn confirm_remove_modal(
+        app: &App,
+    ) -> (
+        baude_core::removal::RemovalTarget,
+        baude_core::removal::RemovalReport,
+    ) {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target,
+                report,
+                scroll,
+                error,
+            } => {
+                assert_eq!(*scroll, 0, "a fresh modal starts unscrolled");
+                assert!(error.is_none(), "a fresh modal carries no error");
+                (*target, report.clone())
+            }
+            Modal::None => panic!("expected Modal::ConfirmRemove, got Modal::None"),
+            _ => panic!("expected Modal::ConfirmRemove, got another modal"),
+        }
+    }
+
+    /// TUI-02, D-03, D-05: `D` on each row kind opens `Modal::ConfirmRemove`
+    /// carrying exactly `preview_removal`'s report for that row, including an
+    /// Unavailable row whose directory was deleted before a relaunch.
+    #[test]
+    fn d_opens_confirm_remove_modal_with_preview_report_on_each_row_kind() {
+        use crate::hierarchy::ActionKind;
+        use baude_core::removal::{preview_removal, RemovalTarget};
+
+        let fx = relaunch_fixture("d-modal-each-kind");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-modal");
+        let cases = [
+            (
+                SelId::Repository(rows.repository),
+                ActionKind::Repository,
+                RemovalTarget::Repository(rows.repository),
+            ),
+            (
+                SelId::Checkout(rows.main),
+                ActionKind::External,
+                RemovalTarget::Checkout(rows.main),
+            ),
+            (
+                SelId::Checkout(rows.managed),
+                ActionKind::Managed,
+                RemovalTarget::Checkout(rows.managed),
+            ),
+            (
+                SelId::Checkout(rows.unmanaged),
+                ActionKind::External,
+                RemovalTarget::Checkout(rows.unmanaged),
+            ),
+            (
+                SelId::Standalone(rows.standalone),
+                ActionKind::Standalone,
+                RemovalTarget::Standalone(rows.standalone),
+            ),
+        ];
+        for (selected, kind, target) in cases {
+            app.selected_id = Some(selected);
+            assert_eq!(
+                app.selected_action_view().map(|view| view.kind),
+                Some(kind),
+                "fixture row kind for {selected:?}"
+            );
+            let before = app.repository_state.clone();
+            app.handle_sidebar_key(d_key());
+            let (modal_target, report) = confirm_remove_modal(&app);
+            assert_eq!(modal_target, target);
+            assert_eq!(
+                report,
+                preview_removal(&app.repository_state, target).unwrap()
+            );
+            assert_eq!(
+                app.repository_state, before,
+                "opening the modal mutates nothing"
+            );
+            app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(matches!(app.modal, Modal::None));
+        }
+        // The already-removed case, the way a user produces it: a session ran
+        // in the unmanaged worktree, baude exited, the directory vanished
+        // outside baude, and the relaunch reconciles the row to Unavailable;
+        // `D` is still offered.
+        app.reopen_checkout(rows.unmanaged).unwrap();
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.unmanaged).unwrap();
+        let mut relaunched = relaunch_app(&fx, fx.repo.clone());
+        relaunched.restore();
+        let linked = checkout_row(&relaunched, &fx.unmanaged)
+            .expect("unmanaged row survives the relaunch")
+            .key;
+        relaunched.selected_id = Some(SelId::Checkout(linked));
+        assert_eq!(
+            relaunched.selected_action_view().map(|view| view.kind),
+            Some(ActionKind::Unavailable),
+            "deleted directory projects as Unavailable"
+        );
+        relaunched.handle_sidebar_key(d_key());
+        let (modal_target, report) = confirm_remove_modal(&relaunched);
+        assert_eq!(modal_target, RemovalTarget::Checkout(linked));
+        assert_eq!(
+            report,
+            preview_removal(
+                &relaunched.repository_state,
+                RemovalTarget::Checkout(linked)
+            )
+            .unwrap()
+        );
+        relaunched.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        relaunched.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-02, D-03: a row with a live runtime is not refused; the report
+    /// names the runtime that will be killed, with the pid of the process the
+    /// fixture actually spawned.
+    #[test]
+    fn d_on_row_with_live_runtime_reports_runtime_killed() {
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("d-live-runtime");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-live");
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .expect("managed runtime is live")
+            .claude
+            .process_identity()
+            .pid;
+        assert!(pid_is_live(live_pid), "fixture spawned a live agent");
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (_, report) = confirm_remove_modal(&app);
+        let killed: Vec<_> = report
+            .runtimes_killed
+            .iter()
+            .filter(|killed| killed.row == RowKey::Checkout(rows.managed))
+            .collect();
+        assert_eq!(killed.len(), 1, "one runtime named for the row: {report:?}");
+        assert_eq!(killed[0].agent_pid, live_pid);
+        assert!(
+            pid_is_live(live_pid),
+            "preview kills nothing; the agent is still live"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-03, D-08, D-11: Enter removes the managed worktree row from the
+    /// hierarchy and the state file in exactly one save, kills its runtime,
+    /// moves selection to the parent repository and confirms with counts.
+    #[test]
+    fn confirm_remove_managed_worktree_drops_row_in_one_save() {
+        use crate::hierarchy::LocalRowId;
+
+        let fx = relaunch_fixture("d-confirm-managed");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-confirm");
+        let managed_path = checkout_row_by_key(&app, rows.managed)
+            .observed_path
+            .to_path_buf();
+        assert!(managed_path.is_dir(), "managed worktree exists on disk");
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        let sessions_before = app.sessions.len();
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        confirm_remove_modal(&app);
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(rows.managed)),
+            "row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "row left the state file"
+        );
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            saves_before + 1,
+            "exactly one save"
+        );
+        assert!(!app.persistence_dirty);
+        assert!(!app.runtime_checkouts.contains_key(&rows.managed));
+        assert!(app.session(rows.managed_runtime).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        assert!(!pid_is_live(live_pid), "the agent was killed");
+        assert!(!managed_path.exists(), "the managed directory was deleted");
+        assert_eq!(app.selected_id, Some(SelId::Repository(rows.repository)));
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row")
+                && message.contains("1 runtime")
+                && message.contains("1 path"),
+            "footer reports counts: {message}"
+        );
+        assert!(
+            app.repository_state
+                .repositories
+                .iter()
+                .any(|row| row.key == rows.second),
+            "removal is scoped: the other repository is untouched"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// T-20-03, D-06: Esc closes the modal and nothing moved: state, state
+    /// file, runtime registry and process are as before.
+    #[test]
+    fn esc_on_confirm_remove_is_non_mutating() {
+        let fx = relaunch_fixture("d-esc");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-esc");
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let runtimes_before = app.runtime_checkouts.clone();
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        confirm_remove_modal(&app);
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.repository_state, state_before);
+        assert_eq!(state_file_bytes(&fx), file_before);
+        assert_eq!(app.runtime_checkouts, runtimes_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert!(pid_is_live(live_pid));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    fn checkout_row_by_key(app: &App, key: CheckoutKey) -> &SavedCheckout {
+        app.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .expect("checkout row by key")
     }
 
     #[test]
