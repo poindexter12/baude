@@ -15401,7 +15401,9 @@ mod tests {
         app.admit_repository(&repo).unwrap().expect("runtime");
         app.message = None;
         app.focus = super::Focus::Sidebar;
-        let backend = ratatui::backend::TestBackend::new(220, 30);
+        // Wide enough that the right-side chips survive the full-width
+        // hint plus the fixture's long tmp path; the bar drops them first.
+        let backend = ratatui::backend::TestBackend::new(260, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
         let buffer = terminal.backend().buffer();

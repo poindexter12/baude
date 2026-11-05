@@ -1469,53 +1469,53 @@ fn action_status_hint(focus: Focus, view: Option<ActionView>, width: usize) -> &
             }
             if width < 80 {
                 return match view.kind {
-                    ActionKind::Repository => "enter open · w branch · ? more",
+                    ActionKind::Repository => "enter open · w branch · D rm · ? more",
                     ActionKind::Unavailable => match view.capability {
                         Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
-                            "i details · r reopen · ? more"
+                            "i details · r reopen · D rm · ? more"
                         }
                         Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
-                            "i details · r recovery · ? more"
+                            "i details · r recovery · D rm · ? more"
                         }
-                        None => "i details · ? help",
+                        None => "i details · D remove* · ? help",
                     },
                     ActionKind::Standalone => {
                         if view.has_runtime {
-                            "enter attach · x close · ? more"
+                            "enter attach · x close · D rm · ? more"
                         } else {
-                            "enter reopen · e edit · ? more"
+                            "enter reopen · e edit · D rm · ? more"
                         }
                     }
-                    _ if view.has_runtime => "enter attach · x close · ? more",
-                    _ if view.can_remove => "enter reopen · X remove · ? more",
-                    _ => "enter reopen · e edit · ? more",
+                    _ if view.has_runtime => "enter attach · x close · D rm · ? more",
+                    _ if view.can_remove => "enter reopen · X remove · D rm · ? more",
+                    _ => "enter reopen · e edit · D rm · ? more",
                 };
             }
             match view.kind {
                 ActionKind::Repository => {
-                    "enter open default · w branch · e edit · i info · ? help"
+                    "enter open default · w branch · e edit · i info · D remove* · ? help"
                 }
                 ActionKind::Unavailable => match view.capability {
                     Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
-                        "i details · r recheck and reopen · ? help"
+                        "i details · r recheck and reopen · D remove* · ? help"
                     }
                     Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
-                        "i details · r continue recovery · ? help"
+                        "i details · r continue recovery · D remove* · ? help"
                     }
-                    None => "i details · ? help",
+                    None => "i details · D remove* · ? help",
                 },
                 ActionKind::Standalone if view.has_runtime => {
-                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · D remove* · t shell · e edit · a archive · ? help"
                 }
-                ActionKind::Standalone => "enter reopen · e edit · i info · g gsd · ? help",
+                ActionKind::Standalone => "enter reopen · e edit · i info · g gsd · D remove* · ? help",
                 _ if view.has_runtime && view.can_remove => {
-                    "enter attach · x close · X remove* · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · X remove* · D remove* · t shell · e edit · a archive · ? help"
                 }
                 _ if view.has_runtime => {
-                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · D remove* · t shell · e edit · a archive · ? help"
                 }
-                _ if view.can_remove => "enter reopen · X remove* · e edit · i info · ? help",
-                _ => "enter reopen · e edit · i info · ? help",
+                _ if view.can_remove => "enter reopen · X remove* · D remove* · e edit · i info · ? help",
+                _ => "enter reopen · e edit · i info · D remove* · ? help",
             }
         }
     }
@@ -2365,10 +2365,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Help => {
-            // 41 paragraph lines + 2 border rows; keep in sync when adding
+            // 43 paragraph lines + 2 border rows; keep in sync when adding
             // rows or `help_overlay_lists_shift_enter`'s closing-line assert
             // fails on the clip.
-            let rect = centered(area, 60, 43);
+            let rect = centered(area, 60, 45);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2381,6 +2381,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  x           close session; keep checkout"),
                 Line::raw("  X removes verified clean managed worktree"),
                 Line::raw("              local branch is retained"),
+                Line::raw("  D removes row, kills runtime, deletes managed worktrees"),
+                Line::raw("              repository parents remove every child"),
                 Line::raw("  t           open shell pane (focuses it)"),
                 Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
@@ -2885,6 +2887,7 @@ mod tests {
         let (rendered, _) = render(&app, 40, 12);
         assert!(rendered.contains("repository or checkout"), "{rendered}");
         assert!(rendered.contains("X removes"), "{rendered}");
+        assert!(rendered.contains("D removes"), "{rendered}");
     }
 
     /// D-12/TKEY-03: the help overlay's global section documents the
@@ -3087,7 +3090,7 @@ mod tests {
         app.selected_id = Some(SelId::Repository(repository));
         assert_eq!(
             super::status_hint(&app, 160),
-            "enter open default · w branch · e edit · i info · ? help"
+            "enter open default · w branch · e edit · i info · D remove* · ? help"
         );
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child) if child.managed_by_baude => {
@@ -3097,11 +3100,11 @@ mod tests {
         });
         assert_eq!(
             super::status_hint(&app, 160),
-            "enter reopen · X remove* · e edit · i info · ? help"
+            "enter reopen · X remove* · D remove* · e edit · i info · ? help"
         );
         assert_eq!(
             super::status_hint(&app, 59),
-            "enter reopen · X remove · ? more"
+            "enter reopen · X remove · D rm · ? more"
         );
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child) if !child.managed_by_baude => {
@@ -3111,7 +3114,7 @@ mod tests {
         });
         assert_eq!(
             super::status_hint(&app, 59),
-            "enter reopen · e edit · ? more"
+            "enter reopen · e edit · D rm · ? more"
         );
         app.focus = Focus::Claude;
         assert_eq!(
@@ -3172,33 +3175,39 @@ mod tests {
             false,
             None,
         );
+        // D-04: remote rows never list D; the refusal is the only path there.
+        let remote = action_view(ActionSelection::Remote, true, None);
+        let remote_hint = super::action_status_hint(Focus::Sidebar, Some(remote), 160);
+        assert_eq!(remote_hint, "enter attach · r restart · x close · ? help");
+        assert!(!remote_hint.contains("D remove"), "{remote_hint}");
+        assert!(!super::action_status_hint(Focus::Sidebar, Some(remote), 59).contains("D remove"));
         for (focus, view, expected) in [
             (
                 Focus::Sidebar,
                 Some(repository),
-                "enter open default · w branch · e edit · i info · ? help",
+                "enter open default · w branch · e edit · i info · D remove* · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(live),
-                "enter attach · x close · X remove* · t shell · e edit · a archive · ? help",
+                "enter attach · x close · X remove* · D remove* · t shell · e edit · a archive · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retained),
-                "enter reopen · X remove* · e edit · i info · ? help",
+                "enter reopen · X remove* · D remove* · e edit · i info · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retry_reopen),
-                "i details · r recheck and reopen · ? help",
+                "i details · r recheck and reopen · D remove* · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retry_recovery),
-                "i details · r continue recovery · ? help",
+                "i details · r continue recovery · D remove* · ? help",
             ),
-            (Focus::Sidebar, Some(unavailable), "i details · ? help"),
+            (Focus::Sidebar, Some(unavailable), "i details · D remove* · ? help"),
             (
                 Focus::Claude,
                 None,
@@ -3214,7 +3223,7 @@ mod tests {
         }
         assert_eq!(
             super::action_status_hint(Focus::Sidebar, Some(retained), 59),
-            "enter reopen · X remove · ? more"
+            "enter reopen · X remove · D rm · ? more"
         );
         let retained_main = action_view(
             ActionSelection::Checkout {
@@ -3227,7 +3236,7 @@ mod tests {
         );
         assert_eq!(
             super::action_status_hint(Focus::Sidebar, Some(retained_main), 59),
-            "enter reopen · e edit · ? more"
+            "enter reopen · e edit · D rm · ? more"
         );
 
         let source = include_str!("app.rs");
@@ -3875,6 +3884,14 @@ mod tests {
         );
         assert!(rendered.contains("enter retry · esc cancel"), "{rendered}");
         assert!(!rendered.contains("y/enter remove"), "{rendered}");
+
+        // Narrow screen: the modal shrinks to the 59-column width and the
+        // 80% cap of 16 rows still leaves the prompt, the legend and the
+        // hidden-row count visible.
+        let (narrow, _) = render(&app, 59, 20);
+        assert!(narrow.contains("Remove this repository?"), "{narrow}");
+        assert!(narrow.contains("enter retry · esc cancel"), "{narrow}");
+        assert!(narrow.contains("+2 more"), "{narrow}");
     }
 
     // ---- UI fixture ownership regressions -------------------------------
