@@ -13077,9 +13077,14 @@ mod tests {
         assert_eq!(restored.claude.process_identity(), &identity);
         assert_eq!(app.sessions.len(), sessions_before, "no handle lost");
 
+        // The user reads the error and retries seconds later; the main loop
+        // keeps ticking over the restored handle in between, and the retry
+        // must still find the runtime and its row in agreement.
+        app.tick();
         let holder_pid = holder.pid();
         drop(holder);
         wait_until("holder exit", || holder_pgid(holder_pid).is_none());
+        app.tick();
         app.handle_modal_key(enter_key());
 
         assert!(
@@ -13189,6 +13194,10 @@ mod tests {
             "the injected failure models one atomic boundary"
         );
 
+        // The kill stage already ran, so the restored handle is dead when
+        // the main loop ticks over it before the user retries; the retry
+        // must still match that handle to the row's persisted runtime.
+        app.tick();
         app.handle_modal_key(enter_key());
 
         assert!(
