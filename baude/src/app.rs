@@ -4008,10 +4008,17 @@ impl App {
             RemovalTarget::Repository(_) | RemovalTarget::Standalone(_) => None,
         };
         let _reservation = self.reserve_removal_target(target)?;
-        // D-08: the row set is recomputed at confirm time; a difference from
-        // the previewed report refreshes the modal instead of removing.
+        // D-08: the report is recomputed at confirm time; a difference in
+        // what the run would do (the rows, the runtimes it kills, the paths
+        // it deletes) refreshes the modal instead of removing, so the
+        // confirmation never promises less than the run performs (D-05).
+        // `cleared` and `already_removed` are filesystem probes that would
+        // make the recheck flap on advisory state, so they are not compared.
         let fresh = removal::preview_removal(&self.repository_state, target)?;
-        if fresh.rows_removed != previewed.rows_removed {
+        let action_changed = fresh.rows_removed != previewed.rows_removed
+            || fresh.runtimes_killed != previewed.runtimes_killed
+            || fresh.paths_deleted != previewed.paths_deleted;
+        if action_changed {
             return Ok(RemoveProjectOutcome::Recheck(fresh));
         }
         let mut runtimes = self.collect_row_runtimes(&fresh);
@@ -13304,6 +13311,81 @@ mod tests {
             .rows_removed
             .iter()
             .all(|row| fresh.rows_removed.contains(row)));
+        assert_eq!(app.repository_state, state_before, "no row was removed");
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("rows changed since the preview"),
+            "footer explains the refresh: {message}"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-05, D-08: a runtime admitted for a row already in the set after
+    /// the preview changes what the run would do without changing the row
+    /// set. Enter refreshes the modal with the runtime listed instead of
+    /// killing a process the confirmation never named.
+    #[test]
+    fn remove_project_recheck_refreshes_modal_when_runtime_set_changes() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("d-recheck-runtime");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-recheck-runtime");
+        let target = RemovalTarget::Repository(rows.repository);
+        assert!(
+            !app.runtime_checkouts.contains_key(&rows.unmanaged),
+            "the swept-in checkout starts without a runtime"
+        );
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        assert!(previewed
+            .rows_removed
+            .contains(&RowKey::Checkout(rows.unmanaged)));
+        assert!(
+            !previewed
+                .runtimes_killed
+                .iter()
+                .any(|killed| killed.row == RowKey::Checkout(rows.unmanaged)),
+            "the preview lists no runtime for the dormant row: {previewed:?}"
+        );
+        let modal = std::mem::replace(&mut app.modal, Modal::None);
+        let runtime_id = match app.reopen_checkout(rows.unmanaged).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let live_pid = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        app.modal = modal;
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+
+        app.handle_modal_key(enter_key());
+
+        let (kept, fresh) = confirm_remove_modal(&app);
+        assert_eq!(kept, target);
+        assert_eq!(
+            fresh.rows_removed, previewed.rows_removed,
+            "the row set itself did not change"
+        );
+        assert!(
+            fresh.runtimes_killed.iter().any(|killed| {
+                killed.row == RowKey::Checkout(rows.unmanaged) && killed.agent_pid == live_pid
+            }),
+            "the refreshed report names the new runtime: {fresh:?}"
+        );
+        assert!(pid_is_live(live_pid), "nothing was killed");
         assert_eq!(app.repository_state, state_before, "no row was removed");
         assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
         assert_eq!(app.save_attempts_for_test.get(), saves_before);
