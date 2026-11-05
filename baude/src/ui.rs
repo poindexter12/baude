@@ -1783,22 +1783,11 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let row_name = |key: &baude_core::removal::RowKey| app.removal_row_label(key);
             // D-07: the modal grows to at most 80% of the screen; the
             // dropped-row list gets whatever that leaves after the fixed
-            // sections, and the hidden remainder renders as "+N more".
-            let max_height = u16::try_from(u32::from(area.height) * 80 / 100)
-                .unwrap_or(u16::MAX)
-                .max(6);
-            let fixed_lines = 6 // prompt, blank, "rows dropped", blank, legend, blank
-                + 2 * 3 // "runtimes killed", "paths deleted", "paths kept" headings + one entry each
-                + report.runtimes_killed.len().saturating_sub(1)
-                + report.paths_deleted.len().saturating_sub(1)
-                + report.paths_kept.len().saturating_sub(1)
-                + if report.already_removed.is_empty() { 0 } else { 1 + report.already_removed.len() }
-                + if report.cleared.is_empty() { 0 } else { 1 + report.cleared.len() }
-                + usize::from(error.is_some());
-            let max_rows = usize::from(max_height)
-                .saturating_sub(2)
-                .saturating_sub(fixed_lines)
-                .max(1);
+            // sections, and the hidden remainder renders as "+N more". The
+            // budget is measured against the line generator itself, so a
+            // section added there cannot clip the legend here.
+            let max_height = remove_project_modal_max_height(area.height);
+            let max_rows = remove_project_modal_max_rows(report, error.as_deref(), area.height);
             let width: u16 = 76;
             let inner_width = usize::from(width.saturating_sub(2));
             let lines = remove_project_confirmation_lines(
@@ -2468,6 +2457,46 @@ fn remove_confirmation_lines(
         ),
         truncate("y/enter remove · n/esc keep worktree", width),
     ]
+}
+
+/// D-07: the tallest the `D` confirmation may grow on a screen of
+/// `area_height` rows, borders included: 80% of the screen, never under six.
+fn remove_project_modal_max_height(area_height: u16) -> u16 {
+    u16::try_from(u32::from(area_height) * 80 / 100)
+        .unwrap_or(u16::MAX)
+        .max(6)
+}
+
+/// D-07: how many dropped rows the confirmation window shows on a screen of
+/// `area_height` rows. The fixed sections are measured by asking
+/// `remove_project_confirmation_lines` for the whole list (nothing hidden, so
+/// no `+N more` line), which keeps this budget true to whatever the generator
+/// emits; when the list overflows, one line is reserved for `+N more`. The key
+/// handler and the renderer both clamp the scroll offset with this value.
+pub(crate) fn remove_project_modal_max_rows(
+    report: &baude_core::removal::RemovalReport,
+    error: Option<&str>,
+    area_height: u16,
+) -> usize {
+    let inner_height = usize::from(remove_project_modal_max_height(area_height)).saturating_sub(2);
+    // Labels never wrap, so the count does not depend on their text.
+    let unwindowed = remove_project_confirmation_lines(
+        report,
+        "",
+        &|_| String::new(),
+        error,
+        0,
+        usize::MAX,
+        usize::MAX,
+    );
+    let rows = report.rows_removed.len();
+    let fixed = unwindowed.len().saturating_sub(rows);
+    let available = inner_height.saturating_sub(fixed);
+    if rows <= available {
+        available.max(1)
+    } else {
+        available.saturating_sub(1).max(1)
+    }
 }
 
 /// Modal lines for the `D` confirmation. A pure transform over the
@@ -3827,10 +3856,12 @@ mod tests {
             .to_string()
     }
 
-    /// D-07: a repository with twenty children on a 30-row screen draws the
-    /// report inside at most 24 rows (80%), names the hidden remainder as
-    /// `+N more`, and scrolling moves the window without changing the heading
-    /// count that keeps the full row set visible.
+    /// D-07: a repository with twenty children on a 30-row screen fills the
+    /// 24-row budget (80%) exactly, names the hidden remainder as `+N more`,
+    /// and scrolling moves the window without changing the heading count
+    /// that keeps the full row set visible. The fixed sections are nine
+    /// lines (prompt, four headings, three `none` entries, legend), so with
+    /// the `+N more` line the window shows twelve of twenty-one rows.
     #[test]
     fn confirm_remove_modal_renders_report_lines_within_80_percent_height() {
         let (_fixture, mut app, rows) = confirm_remove_fixture(20, None);
@@ -3844,16 +3875,16 @@ mod tests {
             "{rendered}"
         );
         let occupied = modal_rows(&buffer);
-        assert!(
-            !occupied.is_empty() && occupied.len() <= 24,
-            "modal occupies {} rows of 30: {rendered}",
-            occupied.len()
+        assert_eq!(
+            occupied.len(),
+            24,
+            "modal fills its 80% budget of 30 rows: {rendered}"
         );
         let more = rendered
             .lines()
             .find(|l| l.contains(" more"))
             .unwrap_or_else(|| panic!("no +N more line in:\n{rendered}"));
-        assert!(more.contains("+11 more"), "{more}");
+        assert!(more.contains("+9 more"), "{more}");
         let first_at_top = first_dropped_row(&rendered);
         assert_eq!(first_at_top, app.removal_row_label(&rows[0]));
 
@@ -3864,7 +3895,7 @@ mod tests {
         }
         let (scrolled, buffer) = render(&app, 100, 30);
         assert!(scrolled.contains("rows dropped (21)"), "{scrolled}");
-        assert!(scrolled.contains("+6 more"), "{scrolled}");
+        assert!(scrolled.contains("+4 more"), "{scrolled}");
         let first_scrolled = first_dropped_row(&scrolled);
         assert_eq!(first_scrolled, app.removal_row_label(&rows[5]));
         assert_ne!(first_scrolled, first_at_top);
@@ -3885,13 +3916,16 @@ mod tests {
         assert!(rendered.contains("enter retry · esc cancel"), "{rendered}");
         assert!(!rendered.contains("y/enter remove"), "{rendered}");
 
-        // Narrow screen: the modal shrinks to the 59-column width and the
-        // 80% cap of 16 rows still leaves the prompt, the legend and the
-        // hidden-row count visible.
-        let (narrow, _) = render(&app, 59, 20);
+        // Narrow screen with a longer list: the modal shrinks to the
+        // 59-column width and the 80% cap of 16 rows (14 inside the border,
+        // ten of them fixed once the error line is counted) still leaves the
+        // prompt, the error, the legend and the hidden-row count visible.
+        let (_tall, tall_app, _) = confirm_remove_fixture(6, Some("state file is locked"));
+        let (narrow, _) = render(&tall_app, 59, 20);
         assert!(narrow.contains("Remove this repository?"), "{narrow}");
+        assert!(narrow.contains("error: state file is locked"), "{narrow}");
         assert!(narrow.contains("enter retry · esc cancel"), "{narrow}");
-        assert!(narrow.contains("+2 more"), "{narrow}");
+        assert!(narrow.contains("+4 more"), "{narrow}");
     }
 
     // ---- UI fixture ownership regressions -------------------------------
