@@ -151,7 +151,13 @@ Plans:
   3. On confirm the rows disappear from the sidebar and the state file in one step
   4. A failure at any stage leaves the affected rows visible with an error notice and the user can retry
 
-**Plans**: TBD
+**Plans:** 4 plans
+
+Plans:
+- [ ] 20-01-PLAN.md — Pure RemovalReport modal-line renderer with scroll and +N more
+- [ ] 20-02-PLAN.md — D dispatch, ConfirmRemove modal, prepare and confirm over removal::remove with handle custody
+- [ ] 20-03-PLAN.md — draw_modal arm at 80% height, footer and help strings with exact-string tests
+- [ ] 20-04-PLAN.md — Kill and save failure retry proofs, clearing notice, recheck, gates
 
 ### Phase 21: Daemon and PWA Parity
 
