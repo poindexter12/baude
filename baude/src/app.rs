@@ -9645,6 +9645,328 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// The cloned shape plus two linked worktrees outside the managed root,
+    /// a standalone folder and a second repository: everything the removal
+    /// stage can forget, laid out so a relaunch can prove it stays forgotten.
+    struct RelaunchFixture {
+        _fixture: AdmissionRepo,
+        repo: PathBuf,
+        root: PathBuf,
+        state_root: PathBuf,
+        linked: PathBuf,
+        unmanaged: PathBuf,
+        standalone: PathBuf,
+        second_repo: PathBuf,
+        second_common_dir: PathBuf,
+    }
+
+    fn relaunch_fixture(name: &str) -> RelaunchFixture {
+        let fixture = admission_repo_cloned(name);
+        let repo = fixture.path().to_path_buf();
+        let root = fixture.root().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let linked = root.join("wt-linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let unmanaged = root.join("wt-unmanaged");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/unmanaged",
+                unmanaged.to_str().unwrap(),
+            ],
+        );
+        let standalone = root.join("notes");
+        std::fs::create_dir_all(&standalone).unwrap();
+        let second_repo = root.join("second");
+        std::fs::create_dir_all(&second_repo).unwrap();
+        git(&second_repo, &["init", "-b", "main"]);
+        git(&second_repo, &["config", "user.email", "test@example.com"]);
+        git(&second_repo, &["config", "user.name", "Test"]);
+        std::fs::write(second_repo.join("file"), b"two").unwrap();
+        git(&second_repo, &["add", "file"]);
+        git(&second_repo, &["commit", "-m", "initial"]);
+        let second_common_dir = baude_core::git::discover_repository(&second_repo)
+            .unwrap()
+            .common_dir;
+        RelaunchFixture {
+            _fixture: fixture,
+            repo: repo.canonicalize().unwrap(),
+            root,
+            state_root,
+            linked: linked.canonicalize().unwrap(),
+            unmanaged: unmanaged.canonicalize().unwrap(),
+            standalone: standalone.canonicalize().unwrap(),
+            second_repo: second_repo.canonicalize().unwrap(),
+            second_common_dir,
+        }
+    }
+
+    fn relaunch_app(fx: &RelaunchFixture, launch: PathBuf) -> App {
+        let mut app = App::new(launch);
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(fx.state_root.clone());
+        app
+    }
+
+    /// Hand the App's live session for `runtime` to the removal stage the way
+    /// the TUI does, so preflight sees the handle it demands for a row whose
+    /// persisted runtime is set.
+    fn row_runtime(
+        app: &mut App,
+        row: baude_core::removal::RowKey,
+        runtime: u64,
+    ) -> baude_core::removal::RowRuntime {
+        let index = app
+            .sessions
+            .iter()
+            .position(|session| session.id == runtime)
+            .expect("live session for the row being removed");
+        baude_core::removal::RowRuntime {
+            row,
+            session: app.sessions.remove(index),
+        }
+    }
+
+    fn remove_row(
+        fx: &RelaunchFixture,
+        app: &mut App,
+        target: baude_core::removal::RemovalTarget,
+        mut runtimes: Vec<baude_core::removal::RowRuntime>,
+    ) {
+        let state_root = fx.state_root.clone();
+        let report =
+            baude_core::removal::remove(&mut app.repository_state, target, &mut runtimes, |file| {
+                persist::save_current_at_test(
+                    &state_root,
+                    &baude_core::workspace::active().state_file("state"),
+                    file,
+                    None,
+                    None,
+                )
+            })
+            .expect("removal succeeds");
+        assert_eq!(
+            report.persistence,
+            baude_core::removal::PersistenceOutcome::Saved,
+            "{target:?} persisted"
+        );
+    }
+
+    /// The identity a removed row carried, recorded before the relaunch so the
+    /// fresh admission can be shown to share none of it (D-13).
+    struct RemovedIdentity {
+        key: CheckoutKey,
+        first_seen_order: u64,
+        max_key: CheckoutKey,
+        max_order: u64,
+    }
+
+    /// App 1 over the fixture: launch-dir admission of the clone, then the
+    /// standalone and the second repository, then the four removals. Returns
+    /// the App still holding the clone's primary runtime, alive so the
+    /// relaunch adopts it instead of recovering it.
+    fn remove_four_rows(fx: &RelaunchFixture) -> (App, RemovedIdentity) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        assert!(checkout_row(&app, &fx.repo).is_some(), "clone admitted");
+        assert!(checkout_row(&app, &fx.linked).is_some(), "linked swept in");
+        assert!(
+            checkout_row(&app, &fx.unmanaged).is_some(),
+            "unmanaged swept in"
+        );
+        let standalone_runtime = app
+            .admit_standalone(&fx.standalone)
+            .unwrap()
+            .expect("standalone runtime");
+        let second_runtime = app.admit_repository(&fx.second_repo).unwrap();
+        app.repository_state.validate().unwrap();
+
+        let linked_key = checkout_row(&app, &fx.linked).unwrap().key;
+        let unmanaged_row = checkout_row(&app, &fx.unmanaged).unwrap();
+        let removed_key = unmanaged_row.key;
+        let removed_order = unmanaged_row.first_seen_order;
+        let standalone_key = app
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .find(|row| row.canonical_path == PersistedPath::from_path(&fx.standalone))
+            .expect("standalone row")
+            .key;
+        let second_key = app
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&fx.second_common_dir))
+            .expect("second repository row")
+            .key;
+        let second_primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|row| row.repository_key == second_key && row.owned_runtime().is_some())
+            .map(|row| row.key);
+
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Checkout(linked_key),
+            Vec::new(),
+        );
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Checkout(removed_key),
+            Vec::new(),
+        );
+        let handle = row_runtime(
+            &mut app,
+            RowKey::Standalone(standalone_key),
+            standalone_runtime,
+        );
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Standalone(standalone_key),
+            vec![handle],
+        );
+        let handles = match (second_primary, second_runtime) {
+            (Some(primary), Some(runtime)) => {
+                vec![row_runtime(&mut app, RowKey::Checkout(primary), runtime)]
+            }
+            _ => Vec::new(),
+        };
+        remove_row(fx, &mut app, RemovalTarget::Repository(second_key), handles);
+
+        let max_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .max()
+            .unwrap();
+        let max_order = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.first_seen_order)
+            .max()
+            .unwrap();
+        (
+            app,
+            RemovedIdentity {
+                key: removed_key,
+                first_seen_order: removed_order,
+                max_key,
+                max_order,
+            },
+        )
+    }
+
+    fn row_keys(
+        app: &App,
+    ) -> (
+        Vec<baude_core::repository::RepositoryKey>,
+        Vec<CheckoutKey>,
+        Vec<StandaloneKey>,
+    ) {
+        (
+            app.repository_state
+                .repositories
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+            app.repository_state
+                .checkouts
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+            app.repository_state
+                .standalone_sessions
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+        )
+    }
+
+    /// READM-03, D-16: a second App over the same state file shows none of the
+    /// four removed rows, recovers nothing for them, and the sweep leaves the
+    /// unmanaged worktree alone even though its directory is still there.
+    #[test]
+    fn removed_rows_stay_removed_across_relaunch() {
+        let fx = relaunch_fixture("relaunch-removed-rows");
+        let (mut first, _removed) = remove_four_rows(&fx);
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+
+        assert!(
+            fx.unmanaged.is_dir(),
+            "the removed worktree's directory survives"
+        );
+        assert!(fx.linked.is_dir());
+        for path in [&fx.linked, &fx.unmanaged] {
+            assert!(
+                checkout_row(&restarted, path).is_none(),
+                "removed checkout swept back in on relaunch: {}",
+                path.display()
+            );
+        }
+        assert!(
+            restarted
+                .repository_state
+                .standalone_sessions
+                .iter()
+                .all(|row| row.canonical_path != PersistedPath::from_path(&fx.standalone)),
+            "removed standalone came back"
+        );
+        assert!(
+            restarted.repository_state.repositories.iter().all(|row| {
+                row.observed_common_dir != PersistedPath::from_path(&fx.second_common_dir)
+            }),
+            "removed repository came back"
+        );
+        assert!(
+            checkout_row(&restarted, &fx.repo).is_some(),
+            "launch repository restored"
+        );
+        assert_eq!(restarted.repository_state.repositories.len(), 1);
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        assert!(restarted.repository_state.standalone_sessions.is_empty());
+
+        assert!(
+            baude_core::lifecycle::startup_recovery_program(&restarted.repository_state).is_empty(),
+            "nothing to recover for a restarted state with the removed rows gone"
+        );
+        let before = row_keys(&restarted);
+        restarted.reconcile_teardown_recoveries().unwrap();
+        restarted.reconcile_activation_recoveries().unwrap();
+        assert_eq!(
+            row_keys(&restarted),
+            before,
+            "reconciliation touched no row"
+        );
+        restarted.repository_state.validate().unwrap();
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.
