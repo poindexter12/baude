@@ -12768,6 +12768,153 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// TUI-03, D-05, D-11: `D` on a repository row previews the parent and
+    /// every child, Enter drops them all from the hierarchy and the state
+    /// file in one save, kills each child's runtime, and selection moves to
+    /// the next repository.
+    #[test]
+    fn confirm_remove_repository_parent_drops_every_child_in_one_save() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("d-confirm-parent");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-parent-one");
+        let (second_managed, second_runtime) = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-parent-two")
+            .unwrap()
+        {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = Modal::None;
+        let main_runtime = app.runtime_checkouts[&rows.main];
+        let linked = checkout_row(&app, &fx.linked)
+            .expect("linked worktree swept in")
+            .key;
+        let children = [
+            rows.main,
+            linked,
+            rows.managed,
+            second_managed,
+            rows.unmanaged,
+        ];
+        let runtimes = [main_runtime, rows.managed_runtime, second_runtime];
+        let pids: Vec<u32> = runtimes
+            .iter()
+            .map(|id| app.session(*id).unwrap().claude.process_identity().pid)
+            .collect();
+        assert!(
+            pids.iter().all(|pid| pid_is_live(*pid)),
+            "fixture agents are live"
+        );
+        let paths: Vec<PathBuf> = [rows.managed, second_managed]
+            .iter()
+            .map(|key| checkout_row_by_key(&app, *key).observed_path.to_path_buf())
+            .collect();
+        assert!(paths.iter().all(|path| path.is_dir()));
+        let sessions_before = app.sessions.len();
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (target, report) = confirm_remove_modal(&app);
+        assert_eq!(
+            target,
+            baude_core::removal::RemovalTarget::Repository(rows.repository)
+        );
+        let mut expected: Vec<RowKey> = children.iter().map(|key| RowKey::Checkout(*key)).collect();
+        expected.push(RowKey::Repository(rows.repository));
+        assert_eq!(
+            report.rows_removed.len(),
+            expected.len(),
+            "report lists the parent and every child: {:?}",
+            report.rows_removed
+        );
+        for row in &expected {
+            assert!(
+                report.rows_removed.contains(row),
+                "report names {row:?}: {:?}",
+                report.rows_removed
+            );
+        }
+        assert_eq!(report.runtimes_killed.len(), runtimes.len());
+
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        let visible = app.visible_hierarchy_rows();
+        assert!(
+            !visible
+                .iter()
+                .any(|row| row.id() == LocalRowId::Repository(rows.repository)),
+            "parent left the hierarchy"
+        );
+        for child in children {
+            assert!(
+                !visible
+                    .iter()
+                    .any(|row| row.id() == LocalRowId::Checkout(child)),
+                "child {child:?} left the hierarchy"
+            );
+            assert!(!app.runtime_checkouts.contains_key(&child));
+        }
+        let saved = saved_state(&fx);
+        assert!(
+            !saved
+                .repositories
+                .iter()
+                .any(|row| row.key == rows.repository),
+            "parent left the state file"
+        );
+        assert!(
+            !saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.repository_key == rows.repository),
+            "every child left the state file"
+        );
+        assert!(
+            saved.repositories.iter().any(|row| row.key == rows.second),
+            "the other repository stays"
+        );
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            saves_before + 1,
+            "exactly one save"
+        );
+        assert!(!app.persistence_dirty);
+        for id in runtimes {
+            assert!(
+                app.session(id).is_none(),
+                "runtime {id} left the session list"
+            );
+        }
+        assert_eq!(app.sessions.len(), sessions_before - runtimes.len());
+        assert!(
+            pids.iter().all(|pid| !pid_is_live(*pid)),
+            "every child agent was killed"
+        );
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "managed directories were deleted"
+        );
+        assert_eq!(
+            app.selected_id,
+            Some(SelId::Repository(rows.second)),
+            "selection moves to the next repository"
+        );
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("6 rows") && message.contains("3 runtimes"),
+            "footer reports counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     fn checkout_row_by_key(app: &App, key: CheckoutKey) -> &SavedCheckout {
         app.repository_state
             .checkouts
