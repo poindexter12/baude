@@ -278,11 +278,14 @@ Not a rename/refactor phase. Omitted.
 | A5 | TUI refusal string: grep for "arrives with Phase 21" found no match in `baude/src`; wording differs or lives elsewhere | TUI remote path | Planner must grep `Phase 21`/`remote` in `baude/src/app.rs` to locate the refusal |
 | A6 | No JS test harness for the PWA | Validation | PWA checks stay manual |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Where exactly is the TUI remote refusal?** Grep for the literal CONTEXT.md phrase found nothing; locate it by searching `remote` near the `D` keymap arm (`app.rs:5795` per CONTEXT.md).
+   RESOLVED: the TUI remote refusal sits at `baude/src/app.rs:299`, `:344` and `:1328`; 21-06 Task 2 cites those sites and replaces the refusal with the daemon-backed action.
 2. **How does the TUI remote client currently consume daemon lists?** Not read this session; the planner should read the remote client module in `baude/src` before assigning the `/events` consumption task.
+   RESOLVED: the remote client module is read in 21-06 Task 1 read_first before the `/events` subscriber and the removal calls are added to it.
 3. **Daemon admission entry point:** which `Manager` method admits a repository/checkout (session creation vs rediscovery) needs confirming before wiring `is_suppressed`.
+   RESOLVED: the explicit admission entry is `Manager::create` at `bauded/src/manager.rs:813`, which 21-02 Task 3 wires through `lift`; the same task greps every implicit admission path, the `git::discover_repository` callers and restore-time `reconcile_legacy_session`, for an `is_suppressed` guard.
 
 ## Sources
 
