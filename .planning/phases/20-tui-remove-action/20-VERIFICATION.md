@@ -1,7 +1,7 @@
 ---
 phase: 20-tui-remove-action
 verified: 2026-11-05T09:03:05Z
-status: human_needed
+status: passed
 score: 19/19 must-haves verified
 covered_files:
   - ".planning/phases/20-tui-remove-action/20-01-PLAN.md"
