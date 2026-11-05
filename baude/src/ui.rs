@@ -2422,6 +2422,9 @@ fn remove_confirmation_lines(
 /// run performs (D-05). `scroll`/`max_rows` window the dropped-row list; the
 /// hidden remainder renders as `+N more` (D-07). An `error` switches the
 /// legend to retry (D-06).
+// Consumed by the `D` modal that plan 20-02 wires into `App`; drop the
+// dead_code allowance there.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remove_project_confirmation_lines(
     report: &baude_core::removal::RemovalReport,
@@ -2432,8 +2435,114 @@ pub(crate) fn remove_project_confirmation_lines(
     max_rows: usize,
     width: usize,
 ) -> Vec<String> {
-    let _ = (report, kind_label, row_name, error, scroll, max_rows, width);
-    todo!()
+    use baude_core::removal::ClearingKind;
+
+    let mut lines: Vec<String> = Vec::new();
+    let heading = |lines: &mut Vec<String>, label: &str, count: usize| {
+        lines.push(truncate(&format!("{label} ({count})"), width));
+    };
+    let entry = |text: &str| truncate(&format!("  {text}"), width);
+
+    lines.push(truncate(&format!("Remove this {kind_label}?"), width));
+
+    // rows dropped: the whole list is counted in the heading; the window is
+    // what fits, and the remainder is named so a long list cannot hide a row.
+    let rows = &report.rows_removed;
+    heading(&mut lines, "rows dropped", rows.len());
+    let scroll = scroll.min(rows.len().saturating_sub(max_rows));
+    let shown = rows.iter().skip(scroll).take(max_rows);
+    for key in shown {
+        lines.push(entry(&row_name(key)));
+    }
+    let hidden = rows.len().saturating_sub(scroll + max_rows);
+    if hidden > 0 {
+        lines.push(entry(&format!("+{hidden} more")));
+    }
+
+    heading(&mut lines, "runtimes killed", report.runtimes_killed.len());
+    if report.runtimes_killed.is_empty() {
+        lines.push(entry("none"));
+    }
+    for killed in &report.runtimes_killed {
+        let pids = match killed.shell_pid {
+            Some(shell) => format!("pid {} shell {shell}", killed.agent_pid),
+            None => format!("pid {}", killed.agent_pid),
+        };
+        lines.push(entry(&format!("{} ({pids})", row_name(&killed.row))));
+    }
+
+    heading(&mut lines, "paths deleted", report.paths_deleted.len());
+    if report.paths_deleted.is_empty() {
+        lines.push(entry("none"));
+    }
+    for path in &report.paths_deleted {
+        lines.push(entry(&path.display().to_string()));
+    }
+
+    heading(&mut lines, "paths kept", report.paths_kept.len());
+    if report.paths_kept.is_empty() {
+        lines.push(entry("none"));
+    }
+    for path in &report.paths_kept {
+        lines.push(entry(&path.display().to_string()));
+    }
+
+    if !report.already_removed.is_empty() {
+        heading(&mut lines, "already removed", report.already_removed.len());
+        for path in &report.already_removed {
+            lines.push(entry(&path.display().to_string()));
+        }
+    }
+
+    if !report.cleared.is_empty() {
+        let count = |kinds: &[ClearingKind]| {
+            report
+                .cleared
+                .iter()
+                .filter(|item| kinds.contains(&item.kind))
+                .count()
+        };
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("{n} {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        let mut parts: Vec<String> = Vec::new();
+        let bindings = count(&[ClearingKind::Binding]);
+        if bindings > 0 {
+            parts.push(plural(bindings, "binding", "bindings"));
+        }
+        let markers = count(&[ClearingKind::Marker, ClearingKind::RepositoryDir]);
+        if markers > 0 {
+            parts.push(plural(markers, "marker", "markers"));
+        }
+        let suppression = count(&[
+            ClearingKind::SuppressionAdded,
+            ClearingKind::SuppressionDropped,
+        ]);
+        if suppression > 0 {
+            parts.push(plural(
+                suppression,
+                "suppression entry",
+                "suppression entries",
+            ));
+        }
+        lines.push(truncate(&format!("cleared: {}", parts.join(", ")), width));
+    }
+
+    if let Some(text) = error {
+        lines.push(truncate(&format!("error: {text}"), width));
+    }
+
+    let legend = if error.is_some() {
+        "enter retry · esc cancel"
+    } else {
+        "y/enter remove · n/esc cancel"
+    };
+    lines.push(truncate(legend, width));
+    lines
 }
 
 #[cfg(test)]
