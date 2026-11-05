@@ -3902,6 +3902,42 @@ mod tests {
         assert_eq!(modal_rows(&buffer).len(), occupied.len());
     }
 
+    /// D-07: `j` held past the end of the list cannot bank an invisible
+    /// surplus; one `k` afterwards moves the window up by exactly one row.
+    #[test]
+    fn confirm_remove_modal_scroll_past_end_then_up_moves_one_row() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (_fixture, mut app, rows) = confirm_remove_fixture(20, None);
+        // The main loop lays the frame out before any key arrives.
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+
+        for _ in 0..(rows.len() * 3) {
+            app.handle_modal_key(key(KeyCode::Char('j')));
+        }
+        let (at_end, _) = render(&app, 100, 30);
+        let last_page_top = first_dropped_row(&at_end);
+        assert!(
+            !at_end.contains(" more"),
+            "the last page hides nothing: {at_end}"
+        );
+
+        app.handle_modal_key(key(KeyCode::Char('k')));
+        let (after_k, _) = render(&app, 100, 30);
+        let moved_top = first_dropped_row(&after_k);
+        assert_ne!(
+            moved_top, last_page_top,
+            "one k after over-scrolling moves the window: {after_k}"
+        );
+        let last_index = rows
+            .iter()
+            .position(|key| app.removal_row_label(key) == last_page_top)
+            .expect("last page top is a report row");
+        assert_eq!(moved_top, app.removal_row_label(&rows[last_index - 1]));
+        assert!(after_k.contains("+1 more"), "{after_k}");
+    }
+
     /// D-06: a failed run leaves the modal open with the error text and the
     /// retry legend in place of the remove legend.
     #[test]

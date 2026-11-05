@@ -686,6 +686,10 @@ pub struct App {
     /// fsync and no gated child is released before its record is durable.
     deferring_saves: bool,
     deferred_save_pending: std::cell::Cell<bool>,
+    /// The screen the last frame was laid out for, recorded by `sync_sizes`
+    /// so key handlers can reproduce a draw-time window (the `D` modal's
+    /// scroll clamp) without the renderer writing state back.
+    terminal_area: Rect,
     /// Restore Phase B: gated sessions still awaiting release, released one per
     /// loop iteration by `restore_step`.
     restore_total: usize,
@@ -970,6 +974,7 @@ impl App {
             contradict_restore_for_test: None,
             deferring_saves: false,
             deferred_save_pending: std::cell::Cell::new(false),
+            terminal_area: Rect::default(),
             restore_total: 0,
             restore_released: 0,
             restore_releasing: false,
@@ -4961,6 +4966,7 @@ impl App {
 
     /// Resize every session's PTYs to match the geometry they would render at.
     pub fn sync_sizes(&mut self, area: Rect) {
+        self.terminal_area = area;
         if area.height < 13 && self.focus == Focus::Shell {
             let live_agent = self
                 .selected()
@@ -5655,7 +5661,7 @@ impl App {
         }
     }
 
-    fn handle_modal_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_modal_key(&mut self, key: KeyEvent) {
         match &mut self.modal {
             Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
@@ -5829,8 +5835,25 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if let Modal::ConfirmRemove { scroll, .. } = &mut self.modal {
-                        *scroll = scroll.saturating_add(1);
+                    // Clamp with the same window the renderer draws, so `j`
+                    // past the end cannot bank an invisible surplus that
+                    // makes the next `k` presses appear dead. The renderer's
+                    // own clamp is display-only and never written back.
+                    let height = self.terminal_area.height;
+                    if let Modal::ConfirmRemove {
+                        scroll,
+                        report,
+                        error,
+                        ..
+                    } = &mut self.modal
+                    {
+                        let window = crate::ui::remove_project_modal_max_rows(
+                            report,
+                            error.as_deref(),
+                            height,
+                        );
+                        let last = report.rows_removed.len().saturating_sub(window);
+                        *scroll = scroll.saturating_add(1).min(last);
                         self.dirty = true;
                     }
                 }
