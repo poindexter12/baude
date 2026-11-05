@@ -4,17 +4,17 @@ milestone: v2.8
 milestone_name: Project Removal
 current_phase: 19
 current_phase_name: Re-admission Suppression
-status: executing
-stopped_at: Completed 19-06-PLAN.md
-last_updated: "2026-11-05T02:45:09.855Z"
+status: verifying
+stopped_at: Completed 19-07-PLAN.md
+last_updated: "2026-11-05T06:46:46.084Z"
 last_activity: 2026-11-04
 last_activity_desc: Phase 19 execution started
-state_head: da360f53f06923ffa83caa1e606d13fe2cf3fd5e
+state_head: 09dd8c4498bee7d2977cdc1a9d1ac674f816f44c
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 15
-  completed_plans: 14
+  total_plans: 19
+  completed_plans: 15
   percent: 20
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 
 Phase: 19 (Re-admission Suppression) — EXECUTING
 Plan: 7 of 7
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-04 — Phase 19 execution started
 
 
@@ -116,6 +116,7 @@ Last activity: 2026-11-04 — Phase 19 execution started
 | Phase 19 P04 | 19min | 3 tasks | 1 files |
 | Phase 19 P05 | 33min | 3 tasks | 1 files |
 | Phase 19 P06 | 2 sessions | 3 tasks | 2 files |
+| Phase 19 P07 | 50 min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -270,6 +271,7 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 19]: 19-04: plan and execute helpers mirror each other per clearing kind so preview agreement is structural
 - [Phase 19]: 19-05: suppression lift key is git::repo_root of the admitted path, so a subfolder launch lifts its checkout and the parent root never lifts a child
 - [Phase 19]: 19-05: a failed suppression lift leaves the entry and the sweep still skips it; the admission returns Ok with its rows intact and the failure is a message
+- [Phase 19]: Phase 19 gates green on both platforms at 4ec8989 with no fix commit; verbatim --linux lane passed, Phase 18 bind-mount race did not recur
 
 ### Pending Todos
 
@@ -352,8 +354,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-05T02:45:09.496Z
-Stopped at: Completed 19-06-PLAN.md
+Last session: 2026-11-05T06:46:45.669Z
+Stopped at: Completed 19-07-PLAN.md
 Resume file: None
 
 ## Operator Next Steps

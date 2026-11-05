@@ -118,7 +118,7 @@ Plans:
   3. `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity
   4. Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace
 
-**Plans**: 6/7 plans executed
+**Plans**: 7/7 plans executed
 
 Plans:
 **Wave 1**
@@ -134,7 +134,7 @@ Plans:
 - [x] 19-06-PLAN.md — relaunch proofs through a second `App`, crumb pruning on flush
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 19-07-PLAN.md — `scripts/gate.sh` on macOS and `--linux` on the same final commit, gate-driven fixes only
+- [x] 19-07-PLAN.md — `scripts/gate.sh` on macOS and `--linux` on the same final commit, gate-driven fixes only
 
 ### Phase 20: TUI Remove Action
 
