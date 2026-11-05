@@ -1711,6 +1711,7 @@ mod tests {
     use crate::meta::ClaudeMeta;
     use crate::persist::{self, SaveError, StateFile};
     use crate::session::Session;
+    use crate::testing::{holder_pgid, spawn_parked_reader_runtime};
     use std::cell::Cell;
     use std::process::Command;
     use std::rc::Rc;
@@ -1970,67 +1971,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         pty
-    }
-
-    /// Kills the out-of-group slave holder on drop so an assertion panic never
-    /// leaks a 30 s perl process.
-    struct HolderGuard(i32);
-
-    impl Drop for HolderGuard {
-        fn drop(&mut self) {
-            // SAFETY: the pid was written by this fixture's own holder.
-            unsafe {
-                libc::kill(self.0, libc::SIGKILL);
-            }
-        }
-    }
-
-    fn holder_pgid(holder: i32) -> Option<i32> {
-        let out = Command::new("ps")
-            .args(["-o", "pgid=", "-p", &holder.to_string()])
-            .output()
-            .expect("ps");
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-    }
-
-    /// The plan 08 holder shape: the leader backgrounds a perl process that
-    /// leaves the session with setsid, records its pid outside the managed
-    /// directory and sleeps holding the inherited slave terminal, then the
-    /// leader exits. Returns once the holder is proven outside the recorded
-    /// group and the leader has exited.
-    fn spawn_parked_reader_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, HolderGuard) {
-        let _ = fs::remove_file(holder_pid_path);
-        let cmd = format!(
-            "set +m; trap '' HUP; perl -MPOSIX -e 'my $sid = POSIX::setsid(); \
-             exit 3 unless defined $sid && $sid != -1; \
-             open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' & exit 0",
-            holder_pid_path.display()
-        );
-        let pty = Pty::spawn(Some(&cmd), cwd, 5, 40).expect("spawn parked-reader runtime");
-        let pgid = pty.process_identity().process_group;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let holder: i32 = loop {
-            let written = fs::read_to_string(holder_pid_path)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok());
-            if let Some(holder) = written {
-                if pty.is_exited() {
-                    break holder;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "holder.pid was not written or the leader did not exit"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let guard = HolderGuard(holder);
-        let observed = holder_pgid(holder).expect("holder pgid");
-        assert_ne!(
-            observed, pgid,
-            "setsid did not move the holder out of the recorded group"
-        );
-        (pty, guard)
     }
 
     fn session_for(pty: Pty, shell: Option<Pty>, cwd: &Path, repo: &Path) -> Session {
@@ -2787,7 +2727,7 @@ mod tests {
         }
         assert_eq!(report.runtimes_killed[0].agent_pid, pid);
 
-        let holder_pid = holder.0;
+        let holder_pid = holder.pid();
         drop(holder);
         let deadline = Instant::now() + Duration::from_secs(2);
         while holder_pgid(holder_pid).is_some() {
