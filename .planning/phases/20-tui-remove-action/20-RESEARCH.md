@@ -312,16 +312,18 @@ The borrow of `self` inside the save closure while `self.repository_state` is mu
 | A1 | Phase 18 process-group and teardown doubles are reachable from `baude` tests via the `test-support` feature | Pattern 5 | Kill-failure TUI test needs a fixture exposed first (small extra task) |
 | A2 | `atomic_failure_for_test` is consumed by the same save path `remove`'s closure will call | Pattern 5 | Save-failure test would not trigger; planner should verify by reading app.rs:1498-1510 |
 | A3 | The remote `ActionKind` variants are the only ones not listed in the `X` arm | Code Examples | Dispatch arm misses a kind; compile error or missing refusal |
-| A4 | `kill_stage` removes killed handles from the vector so remaining entries on `Err` are exactly the un-killed ones | Pattern 3 | Restore helper could double-restore or miss; read removal.rs:916-963 |
+| A4 | RESOLVED (PATTERNS.md): `kill_stage` takes `&mut [RowRuntime]` and kills in place without draining; only `persist_stage` drains, after a successful save, so on any `Err` every supplied handle is still in the vector and the restore helper puts every element back | Pattern 3 | Resolved by reading removal.rs 840, 918, 1032 |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **How does `remove` leave `runtimes` on `Err`?**
    - What we know: signature is `&mut Vec<RowRuntime>`; `preflight` checks handle presence.
    - What's unclear: whether killed sessions are drained before a later disk/save failure.
    - Recommendation: first plan task reads `kill_stage`/`preflight` and writes the restore helper to match; test asserts no handle lost.
+   - RESOLVED: `kill_stage` and `preflight` never drain the vector; draining happens only in `persist_stage` after the save succeeds. On `Err` every `RowRuntime` is still present, killed ones included. Plan 20-04 Task 1 re-confirms and the App restores every element.
 2. **Does the save closure need `&self`?**
    - Recommendation: reuse whatever `confirm_remove_worktree` does today.
+   - RESOLVED: no. The closure is built from locals, config or workspace plus a copied `atomic_failure_for_test`, as `save_removal_revocation` does, because `&mut self.repository_state` is borrowed by `remove`. Plan 20-02 Task 2.
 
 ## Environment Availability
 
