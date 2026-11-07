@@ -77,3 +77,21 @@ OPEN DECISIONS FOR JOE (do not let an executor guess):
      checkpoint:decision. Option A amend-test (one-way, breaks published
      compatibility invariant) vs Option B rows-only + client join (reversible).
   2. use_worktrees was flipped accidentally in 0aee924 -- still needs reverting.
+
+## UPDATE: 21-07 landed (self-committed fe30842)
+DONE now: outline 09fd57f | 21-01 04c7345 | 21-02 e8ca9d3 | 21-07 fe30842 | patterns 6431160
+REMAINING: 21-09 (w3) -> 21-10 (w4) -> 21-03 (w5) -> 21-04 (w6) -> 21-05 (w7) -> 21-08 (w7) -> 21-06 (w8) -> 21-11 (w9)
+
+### Two inherited source pointers are WRONG -- correct them in later chunk prompts
+Both came via 21-PATTERNS.md / the cycle-3 orchestrator prompts and were
+corrected against source by the 21-07 planner. Do not re-issue the bad values:
+  * tilde_path is at baude/src/ui.rs:1360  (NOT :2646)
+  * bauded/src/web.rs:11-24 is per-file include_bytes!, NOT a directory embed.
+    So bauded/web/tests/ is NOT compiled into the binary; keeping tests out of
+    the asset dir is hygiene, not a correctness constraint. Any later plan that
+    justifies a path by "the directory is embedded" is reasoning from a false
+    premise.
+21-05 depends on 21-07 and consumes its 15 exports: escapeHtml, rowKeyId,
+rowsIndex, confirmationView, renderConfirmation, tildePath, reportRowNames,
+dropRows, parseDriftBody, clearingFailures, removalNotice, keyEquals,
+tombstone, pruneTombstones, applySnapshot. 21-05 is controller/wiring only.
