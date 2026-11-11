@@ -17,10 +17,13 @@ use baude_core::lifecycle::{self, CollisionReport, LifecycleOutcome, RepositoryR
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
+use baude_core::removal::{
+    self, PersistenceOutcome, RemovalError, RemovalReport, RemovalTarget, RowKey, RowRuntime,
+};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
-    SavedRepository, ShellOwnership, UnavailableCause,
+    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState, RuntimeGeneration,
+    SavedCheckout, SavedRepository, ShellOwnership, UnavailableCause,
 };
 use baude_core::session::{Session, StateSource, Status};
 
@@ -100,6 +103,43 @@ impl From<persist::SaveError> for MutationError {
 }
 
 type MutationResult<T> = std::result::Result<T, MutationError>;
+
+/// Why `Manager::remove_rows` did not remove anything.
+#[derive(Debug)]
+pub enum RemoveRowsError {
+    /// The row set, runtimes or deleted paths changed since the preview; the
+    /// payload is the fresh report the caller re-shows. Boxed so the error
+    /// stays small next to the report it replaces.
+    Drift(Box<RemovalReport>),
+    Removal(RemovalError),
+    Blocked(persist::SaveError),
+    Busy(RepositoryKey),
+}
+
+impl std::fmt::Display for RemoveRowsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Drift(_) => f.write_str("the removal changed since it was previewed"),
+            Self::Removal(error) => write!(f, "{error}"),
+            Self::Blocked(error) => write!(f, "{error}"),
+            Self::Busy(repository) => write!(f, "repository busy: {repository:?}"),
+        }
+    }
+}
+
+/// Overwrite the retained session metadata of every checkout still present in
+/// `state` with its live value. The single merge implementation: both the
+/// ordinary save and the removal save go through it, so the two cannot drift.
+fn merge_live_runtime_metadata(
+    state: &mut RepositoryState,
+    overrides: &[(CheckoutKey, RetainedSessionState)],
+) {
+    for checkout in &mut state.checkouts {
+        if let Some((_, live)) = overrides.iter().find(|(key, _)| *key == checkout.key) {
+            checkout.session = live.clone();
+        }
+    }
+}
 
 /// Lock the manager, recovering from poisoning (a panicked handler must not
 /// take the whole daemon's session list with it).
@@ -778,7 +818,16 @@ impl Manager {
 
     fn state_for_save(&self) -> RepositoryState {
         let mut state = self.repository_state.clone();
-        for checkout in &mut state.checkouts {
+        merge_live_runtime_metadata(&mut state, &self.survivor_runtime_overrides());
+        state
+    }
+
+    /// The live metadata of every checkout that owns a runtime, in the shape
+    /// the state file retains it. Taken as an owned snapshot so the removal
+    /// save closure can apply it while core holds `&mut self.repository_state`.
+    fn survivor_runtime_overrides(&self) -> Vec<(CheckoutKey, RetainedSessionState)> {
+        let mut overrides = Vec::new();
+        for checkout in &self.repository_state.checkouts {
             let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
                 continue;
             };
@@ -789,23 +838,227 @@ impl Manager {
             else {
                 continue;
             };
-            checkout.session = RetainedSessionState {
-                name: session.name.clone(),
-                cwd: PersistedPath::from_path(&session.cwd),
-                repo_root: PersistedPath::from_path(&session.repo_root),
-                branch: session.branch.clone(),
-                is_worktree: session.is_worktree,
-                shell_open: session.shell_open,
-                archived: session.archived,
-                archived_by_user: session.archived_by_user,
-                resume_id: session
-                    .meta
-                    .session_id
-                    .clone()
-                    .or_else(|| checkout.session.resume_id.clone()),
-            };
+            overrides.push((
+                checkout.key,
+                RetainedSessionState {
+                    name: session.name.clone(),
+                    cwd: PersistedPath::from_path(&session.cwd),
+                    repo_root: PersistedPath::from_path(&session.repo_root),
+                    branch: session.branch.clone(),
+                    is_worktree: session.is_worktree,
+                    shell_open: session.shell_open,
+                    archived: session.archived,
+                    archived_by_user: session.archived_by_user,
+                    resume_id: session
+                        .meta
+                        .session_id
+                        .clone()
+                        .or_else(|| checkout.session.resume_id.clone()),
+                },
+            ));
         }
-        state
+        overrides
+    }
+
+    /// `POST /removals/preview`: what removing `target` would do.
+    pub fn preview_removal(
+        &self,
+        target: RemovalTarget,
+    ) -> std::result::Result<RemovalReport, RemovalError> {
+        // No reservation: the caller holds the global manager mutex, which
+        // already serializes this read against every mutation, and core's
+        // own `remove` re-selects its rows rather than trusting a preview.
+        removal::preview_removal(&self.repository_state, target)
+    }
+
+    /// `POST /removals`: kill, delete and drop the previewed rows in one save.
+    ///
+    /// The Phase 18 force path, not the close protocol: nothing here routes
+    /// through `Manager::remove` or `teardown_retained_runtime`.
+    pub fn remove_rows(
+        &mut self,
+        previewed: &RemovalReport,
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+        if self.persistence_blocked {
+            return Err(RemoveRowsError::Blocked(
+                persist::SaveError::before_replacement(anyhow!(
+                    "persistence is blocked after a state load failure"
+                )),
+            ));
+        }
+        let target = previewed.target;
+        let _reservation = match self.removal_target_repository(target) {
+            Some(repository) => Some(
+                self.repository_reservations
+                    .reserve(repository)
+                    .map_err(|_| RemoveRowsError::Busy(repository))?,
+            ),
+            None => None,
+        };
+        // The report is recomputed under the caller's lock. Only what the run
+        // would do is compared; `cleared` and `already_removed` are filesystem
+        // probes that would make the recheck flap on advisory state.
+        let fresh = self
+            .preview_removal(target)
+            .map_err(RemoveRowsError::Removal)?;
+        if fresh.rows_removed != previewed.rows_removed
+            || fresh.runtimes_killed != previewed.runtimes_killed
+            || fresh.paths_deleted != previewed.paths_deleted
+        {
+            return Err(RemoveRowsError::Drift(Box::new(fresh)));
+        }
+        // Snapshot before the core call: the closure cannot borrow `self`
+        // while `remove` holds `&mut self.repository_state`. The removed rows'
+        // sessions are still registered here, and the merge skips them because
+        // their checkouts are gone from the candidate.
+        let overrides = self.survivor_runtime_overrides();
+        let mut runtimes = self.collect_row_runtimes(&fresh);
+        let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        let persist_enabled = self.persist;
+        #[cfg(test)]
+        let test_target = self.persistence_target_for_test.clone();
+        #[cfg(test)]
+        let atomic_failure = self.atomic_failure_for_test;
+        let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            if !persist_enabled {
+                return Ok(());
+            }
+            // `file` is core's candidate and must stay untouched: core assigns
+            // it to the live state after this returns. The merge is applied to
+            // a copy, so only the bytes on disk carry the live metadata.
+            let mut merged = file.state.clone();
+            merge_live_runtime_metadata(&mut merged, &overrides);
+            let merged = StateFile::new(merged);
+            #[cfg(test)]
+            if let Some((root, file_name)) = &test_target {
+                return persist::save_current_at_test(
+                    root,
+                    file_name,
+                    &merged,
+                    atomic_failure,
+                    None,
+                );
+            }
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &merged)
+        };
+        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                // Core left `repository_state` untouched and every handle in
+                // the Vec, so the rows and their registry entries all stand.
+                self.restore_row_runtimes(runtimes);
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                if matches!(error, RemovalError::Persist { .. }) {
+                    self.persistence_dirty = true;
+                    self.persistence_error = Some(error.to_string());
+                }
+                return Err(RemoveRowsError::Removal(error));
+            }
+        };
+        for row in &report.rows_removed {
+            if let RowKey::Checkout(key) = row {
+                self.runtime_checkouts.remove(key);
+            }
+        }
+        // Handles the core did not consume stay registered.
+        let restored: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        self.restore_row_runtimes(runtimes);
+        for id in consumed.iter().filter(|id| !restored.contains(id)) {
+            // Wake before forgetting, so no long-poll hangs on a row that no
+            // longer exists.
+            if let Some(notify) = self.permission_notify.remove(id) {
+                notify.notify_waiters();
+            }
+        }
+        match &report.persistence {
+            PersistenceOutcome::Saved => {
+                self.persistence_dirty = false;
+                self.persistence_error = None;
+            }
+            PersistenceOutcome::SavedDegraded { detail } => {
+                self.persistence_dirty = true;
+                self.persistence_error = Some(detail.clone());
+            }
+            // A real run never reports a planned outcome.
+            PersistenceOutcome::Planned => {}
+        }
+        Ok(report)
+    }
+
+    /// The repository whose reservation a removal of `target` holds.
+    fn removal_target_repository(&self, target: RemovalTarget) -> Option<RepositoryKey> {
+        match target {
+            RemovalTarget::Repository(key) => Some(key),
+            RemovalTarget::Checkout(key) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .map(|checkout| checkout.repository_key),
+            RemovalTarget::Standalone(_) => None,
+        }
+    }
+
+    /// Move the live `Session` of every checkout row in `report` out of the
+    /// registry into the shape core demands. The `runtime_checkouts` entries
+    /// stay until core returns `Ok`, so a handle can be put straight back.
+    /// A repository row carries no runtime of its own, and standalone rows
+    /// have no daemon registry yet.
+    fn collect_row_runtimes(&mut self, report: &RemovalReport) -> Vec<RowRuntime> {
+        let mut runtimes = Vec::new();
+        for row in &report.rows_removed {
+            let RowKey::Checkout(key) = row else {
+                continue;
+            };
+            let Some(runtime_id) = self.runtime_checkouts.get(key).copied() else {
+                continue;
+            };
+            let Some(index) = self
+                .sessions
+                .iter()
+                .position(|session| session.id == runtime_id)
+            else {
+                continue;
+            };
+            runtimes.push(RowRuntime {
+                row: *row,
+                session: self.sessions.remove(index),
+            });
+        }
+        runtimes
+    }
+
+    /// Return every handle core did not consume to the registry, in id order.
+    fn restore_row_runtimes(&mut self, runtimes: Vec<RowRuntime>) {
+        for runtime in runtimes {
+            let session = runtime.session;
+            let index = self
+                .sessions
+                .iter()
+                .position(|existing| existing.id > session.id)
+                .unwrap_or(self.sessions.len());
+            self.sessions.insert(index, session);
+        }
+    }
+
+    /// The observed main worktree of a repository, for a busy refusal's body.
+    pub fn repository_path(&self, repository: RepositoryKey) -> Option<PathBuf> {
+        self.repository_state
+            .repositories
+            .iter()
+            .find(|saved| saved.key == repository)
+            .map(|saved| saved.observed_main_worktree.to_path_buf())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_key_for_runtime_for_test(&self, id: u64) -> Option<CheckoutKey> {
+        self.runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
     }
 
     /// `POST /sessions` — spawn a fresh session in `repo`, optionally in a

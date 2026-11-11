@@ -14,8 +14,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use baude_core::meta::{HookEvent, ACTIVITY_CAP};
+use baude_core::removal::{RemovalError, RemovalReport, RemovalTarget};
 
-use crate::manager::{lock, MutationError, PermissionView, SessionInfo, Shared};
+use crate::manager::{lock, MutationError, PermissionView, RemoveRowsError, SessionInfo, Shared};
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
 pub fn router(state: Shared) -> Router {
@@ -44,6 +45,8 @@ pub fn router(state: Shared) -> Router {
         )
         .route("/sessions/{id}/activity", get(get_activity))
         .route("/sessions/{id}/activity-stream", get(activity_stream))
+        .route("/removals/preview", post(preview_removal))
+        .route("/removals", post(execute_removal))
         .with_state(state)
 }
 
@@ -114,6 +117,69 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
         // failure, never the caller's "not found"/"bad request" fallback.
         MutationError::Teardown(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         MutationError::Domain(error) => (fallback, error.to_string()),
+    }
+}
+
+/// Status for a removal that did not happen. Every body is plain text except
+/// the 409 drift response, which carries the fresh report as JSON (D-03).
+fn removal_error(error: RemoveRowsError) -> axum::response::Response {
+    let status = match &error {
+        RemoveRowsError::Drift(_) => StatusCode::CONFLICT,
+        RemoveRowsError::Removal(RemovalError::UnknownTarget(_)) => StatusCode::NOT_FOUND,
+        RemoveRowsError::Removal(RemovalError::Persist { .. })
+        | RemoveRowsError::Blocked(_)
+        | RemoveRowsError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        RemoveRowsError::Removal(
+            RemovalError::RuntimeSurvived { .. }
+            | RemovalError::DiskRemoval { .. }
+            | RemovalError::RuntimeHandleMissing(_)
+            | RemovalError::RuntimeIdentityMismatch { .. }
+            | RemovalError::Validation(_),
+        ) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    match error {
+        RemoveRowsError::Drift(report) => (status, Json(*report)).into_response(),
+        other => (status, other.to_string()).into_response(),
+    }
+}
+
+/// `POST /removals/preview`: the core dry run for one target, mutating nothing.
+async fn preview_removal(
+    State(state): State<Shared>,
+    Json(target): Json<RemovalTarget>,
+) -> Result<Json<RemovalReport>, ApiError> {
+    lock(&state)
+        .preview_removal(target)
+        .map(Json)
+        .map_err(|error| match error {
+            RemovalError::UnknownTarget(_) => (StatusCode::NOT_FOUND, error.to_string()),
+            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })
+}
+
+/// `POST /removals`: the body is the previewed report echoed verbatim. Only
+/// its target and its three compared sets are read; every path, runtime and
+/// row acted on comes from the daemon's own state.
+async fn execute_removal(
+    State(state): State<Shared>,
+    Json(previewed): Json<RemovalReport>,
+) -> axum::response::Response {
+    let mut manager = lock(&state);
+    match manager.remove_rows(&previewed) {
+        Ok(report) => Json(report).into_response(),
+        Err(RemoveRowsError::Busy(repository)) => {
+            // The key alone names nothing a client can show, so the body
+            // carries the repository path the daemon resolved for itself.
+            match manager.repository_path(repository) {
+                Some(path) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("repository busy: {}", path.display()),
+                )
+                    .into_response(),
+                None => removal_error(RemoveRowsError::Busy(repository)),
+            }
+        }
+        Err(error) => removal_error(error),
     }
 }
 
@@ -698,7 +764,12 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::manager::Manager;
+    use axum::Router;
+    use baude_core::repository::CheckoutKey;
+    use baude_core::workspace::Workspace;
+    use std::path::PathBuf;
+
+    use crate::manager::{Manager, Shared};
 
     /// The minimal API isolation owner: a unique synthetic root, the redirect
     /// that pins every resolved path inside it, and the literal workspace
@@ -1946,6 +2017,224 @@ mod tests {
             json["startup_ms"]["total"].is_number(),
             "startup_ms.total field must be a number"
         );
+    }
+
+    /// The removal fixtures' agent command. The daemon appends a permission
+    /// flag to every spawn, and a bare `sleep 30` rejects it and exits, so the
+    /// runtime would be dead before any removal ran. The shell wrapper takes
+    /// the appended argument as `$0` and keeps sleeping, which is the double
+    /// the Docker smoke in `ci.yml` uses for the same reason.
+    const REMOVAL_AGENT_CMD: &str = "sh -c \"sleep 30\"";
+
+    /// Whether `pid` is a live process, asked of `ps` rather than inferred
+    /// from a non-zero persisted pid.
+    fn pid_is_alive(pid: u64) -> bool {
+        Command::new("ps")
+            .args(["-o", "pid=", "-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Poll until `pid` is gone, bounded at five seconds.
+    fn wait_for_pid_gone(pid: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// One fixture repository whose main checkout carries a live runtime,
+    /// behind a persisting daemon whose state file lives under the returned
+    /// root. Returns the root, the fixture owner, the workspace, the shared
+    /// manager, the router, the session id and the checkout key.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    async fn removal_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        FixtureRepo,
+        Workspace,
+        Shared,
+        Router,
+        u64,
+        CheckoutKey,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = initialized_repo(&root, "repo");
+        let repo = fixture.path().canonicalize().unwrap();
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let shared: Shared = Arc::new(Mutex::new(Manager::new(REMOVAL_AGENT_CMD.into(), true)));
+        crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+        let app = super::router(Arc::clone(&shared));
+        let (id, key) = admit_removal_session(&shared, &app, &repo, None).await;
+        (root, fixture, workspace, shared, app, id, key)
+    }
+
+    /// `POST /sessions` through the router, returning the created session id
+    /// and the durable checkout key its runtime is registered under.
+    async fn admit_removal_session(
+        shared: &Shared,
+        app: &Router,
+        repo: &Path,
+        worktree: Option<&str>,
+    ) -> (u64, CheckoutKey) {
+        let body = match worktree {
+            Some(branch) => serde_json::json!({ "repo": repo, "worktree": branch }),
+            None => serde_json::json!({ "repo": repo }),
+        };
+        let create = app
+            .clone()
+            .oneshot(post_json("/sessions", &body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let id = body_json(create).await["id"].as_u64().unwrap();
+        let key = crate::manager::lock(shared)
+            .checkout_key_for_runtime_for_test(id)
+            .expect("a created session is registered under a checkout key");
+        (id, key)
+    }
+
+    async fn preview_report(app: &Router, key: CheckoutKey) -> serde_json::Value {
+        let preview = app
+            .clone()
+            .oneshot(post_json(
+                "/removals/preview",
+                &serde_json::json!({ "checkout": key }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        body_json(preview).await
+    }
+
+    /// The agent pid a preview report names for `key`'s one live runtime.
+    fn previewed_agent_pid(report: &serde_json::Value, key: CheckoutKey) -> u64 {
+        let killed = report["runtimes_killed"].as_array().unwrap();
+        assert_eq!(killed.len(), 1, "{report}");
+        assert_eq!(killed[0]["row"], serde_json::json!({ "checkout": key }));
+        let agent_pid = killed[0]["agent_pid"].as_u64().unwrap();
+        assert_ne!(agent_pid, 0);
+        agent_pid
+    }
+
+    #[tokio::test]
+    async fn removals_execute_drops_a_checkout_row_in_one_save() {
+        let (_root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
+        let repo = fixture.path().canonicalize().unwrap();
+
+        let report = preview_report(&app, key).await;
+        assert_eq!(report["planned"], true);
+        assert_eq!(
+            report["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        let agent_pid = previewed_agent_pid(&report, key);
+        assert_eq!(report["paths_deleted"], serde_json::json!([]));
+        assert!(
+            report["paths_kept"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(repo)),
+            "{report}"
+        );
+        let listed = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        assert_eq!(
+            listed.as_array().unwrap().len(),
+            1,
+            "preview removed nothing"
+        );
+
+        assert!(
+            pid_is_alive(agent_pid),
+            "the fixture runtime must be live before the removal"
+        );
+
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed = body_json(executed).await;
+        assert_eq!(executed["planned"], false);
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        let listed = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        assert_eq!(listed, serde_json::json!([]));
+        let manager = crate::manager::lock(&shared);
+        assert_eq!(manager.checkout_key_for_runtime_for_test(id), None);
+        assert!(manager.info(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn removals_unknown_target_is_404() {
+        let _scope = api_scope("removals-unknown");
+        let app = super::router(Arc::new(Mutex::new(Manager::new(
+            REMOVAL_AGENT_CMD.into(),
+            false,
+        ))));
+        let unknown_report = serde_json::json!({
+            "target": { "checkout": 9999 },
+            "planned": true,
+            "rows_removed": [{ "checkout": 9999 }],
+            "runtimes_killed": [],
+            "paths_deleted": [],
+            "paths_kept": [],
+            "already_removed": [],
+            "readers_parked": [],
+            "persistence": { "outcome": "planned" },
+            "cleared": [],
+            "clearing_failures": [],
+        });
+        for (path, body) in [
+            (
+                "/removals/preview",
+                serde_json::json!({ "checkout": 9999 }).to_string(),
+            ),
+            ("/removals", unknown_report.to_string()),
+        ] {
+            let response = app.clone().oneshot(post_json(path, &body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(!content_type.contains("json"), "{path}: {content_type}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("9999"), "{path}: {text}");
+        }
     }
 }
 
