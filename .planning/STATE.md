@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 20
 current_phase_name: TUI Remove Action
 status: executing
-stopped_at: context exhaustion at 86% (2026-11-11)
-last_updated: "2026-11-11T19:16:33.419Z"
+stopped_at: Completed 21-01-PLAN.md
+last_updated: "2026-11-11T21:00:29.499Z"
 last_activity: 2026-11-04
 last_activity_desc: Phase 20 execution started
-state_head: a76906c33458744eb0d653aabe091b01e92683d1
+state_head: 79e4f45ed0123e39744951f48882bfc0764efc9d
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 19
+  completed_plans: 20
   percent: 20
 ---
 
@@ -30,8 +30,8 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 20 (TUI Remove Action) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 20
+Plan: 2 of 4
+Status: Ready to execute
 Last activity: 2026-11-04 — Phase 20 execution started
 
 
@@ -117,6 +117,7 @@ Last activity: 2026-11-04 — Phase 20 execution started
 | Phase 19 P05 | 33min | 3 tasks | 1 files |
 | Phase 19 P06 | 2 sessions | 3 tasks | 2 files |
 | Phase 19 P07 | 50 min | 2 tasks | 1 files |
+| Phase 21 P01 | 11min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -272,6 +273,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 19]: 19-05: suppression lift key is git::repo_root of the admitted path, so a subfolder launch lifts its checkout and the parent root never lifts a child
 - [Phase 19]: 19-05: a failed suppression lift leaves the entry and the sweep still skips it; the admission returns Ok with its rows intact and the failure is a message
 - [Phase 19]: Phase 19 gates green on both platforms at 4ec8989 with no fix commit; verbatim --linux lane passed, Phase 18 bind-mount race did not recur
+- [Phase 21]: RemoveRowsError::Drift carries a boxed RemovalReport to satisfy clippy result_large_err; the 409 wire body is unchanged
+- [Phase 21]: removal_fixture and removal_fixture_two_checkouts are async and the two-checkout repository has a real bare origin, because the daemon refuses a managed worktree in a git init only repository
+- [Phase 21]: The removal save closure merges live survivor metadata into a copy of core's candidate through merge_live_runtime_metadata, the one merge state_for_save also uses
+- [Phase 21]: A repeated POST /removals for an already removed checkout answers 404, observed in the concurrency test
 
 ### Pending Todos
 
@@ -354,8 +359,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-11T19:16:31.919Z
-Stopped at: context exhaustion at 86% (2026-11-11)
+Last session: 2026-11-11T21:00:29.254Z
+Stopped at: Completed 21-01-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
