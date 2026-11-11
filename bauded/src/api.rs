@@ -853,13 +853,21 @@ mod tests {
             .unwrap()
     }
 
+    /// Run git in `repo`, asserting success. Output is captured and shown
+    /// only on failure: an inherited stdout lands in the middle of libtest's
+    /// own `test name ... ok` line and splits it across lines.
     fn git(repo: &Path, args: &[&str]) {
-        assert!(Command::new("git")
+        let out = Command::new("git")
             .args(args)
             .current_dir(repo)
-            .status()
-            .unwrap()
-            .success());
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A fixture repository together with the redirect that contains it.
@@ -2148,11 +2156,26 @@ mod tests {
     /// initialized fixture repository, and a persisting daemon whose state
     /// file lives under that root. No session is admitted yet.
     fn removal_setup(label: &str) -> (PathBuf, FixtureRepo, Workspace, Shared, Router) {
+        let root = removal_root(label);
+        let fixture = initialized_repo(&root, "repo");
+        let (workspace, shared, app) = removal_daemon(&root);
+        (root, fixture, workspace, shared, app)
+    }
+
+    /// A fresh, empty, isolated root for one removal fixture.
+    fn removal_root(label: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let fixture = initialized_repo(&root, "repo");
+        root
+    }
+
+    /// A persisting daemon whose state file lives under `root`, over
+    /// whatever repositories the caller already built there. Requires the
+    /// caller to hold a `FixtureRepo` for `root` first: the workspace is
+    /// resolved under the identity scope that owner installed.
+    fn removal_daemon(root: &Path) -> (Workspace, Shared, Router) {
         let workspace = baude_core::workspace::resolve(
             Some("claude"),
             None,
@@ -2160,9 +2183,9 @@ mod tests {
             |_| {},
         );
         let shared: Shared = Arc::new(Mutex::new(Manager::new(REMOVAL_AGENT_CMD.into(), true)));
-        crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+        crate::manager::lock(&shared).persist_at_for_test(root, &workspace, None);
         let app = super::router(Arc::clone(&shared));
-        (root, fixture, workspace, shared, app)
+        (workspace, shared, app)
     }
 
     /// One fixture repository whose main checkout carries a live runtime,
@@ -2214,14 +2237,7 @@ mod tests {
         // the shape `gh repo create` leaves behind and the one the manager's
         // own worktree fixtures use, so admission is not helped by a
         // hand-written `refs/remotes/origin/HEAD`.
-        let origin = root.join("origin.git");
-        std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "--bare", "-b", "main"]);
-        git(
-            repo.path(),
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
-        git(repo.path(), &["push", "-u", "origin", "main"]);
+        push_to_bare_origin(&root, repo.path());
         let repo_path = repo.path().canonicalize().unwrap();
         let (main_id, main_key, _) = admit_removal_session(&shared, &app, &repo_path, None).await;
         let (worktree_id, worktree_key, worktree_info) =
@@ -2250,6 +2266,16 @@ mod tests {
             worktree_key,
             worktree_path,
         }
+    }
+
+    /// Give `repo` a real bare `origin` under `root` and push `main` to it
+    /// with upstream tracking.
+    fn push_to_bare_origin(root: &Path, repo: &Path) {
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(repo, &["push", "-u", "origin", "main"]);
     }
 
     /// `POST /sessions` through the router, returning the created session id
@@ -3229,6 +3255,280 @@ mod tests {
         assert!(restored.rows().repositories.is_empty());
 
         removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// A real `git clone`, not a `git init`: an upstream built by
+    /// `initialized_repo`, cloned once into a sibling directory under the
+    /// same isolated root. Returns the upstream's owner, which holds the
+    /// root redirect and identity scope for the whole test, and the
+    /// canonicalized clone path. Sessions point at the clone, never at the
+    /// upstream.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn cloned_repo(root: &Path) -> (FixtureRepo, PathBuf) {
+        let upstream = initialized_repo(root, "upstream");
+        let clone = root.join("clone");
+        let out = Command::new("git")
+            .arg("clone")
+            .arg(upstream.path())
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git clone exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (upstream, clone.canonicalize().unwrap())
+    }
+
+    #[tokio::test]
+    async fn row_kinds_branch_is_the_short_name_git_reports() {
+        let root = removal_root("kinds-branch");
+        let (_upstream, clone) = cloned_repo(&root);
+        git(&clone, &["switch", "-c", "chore/workspace"]);
+        let (_workspace, shared, app) = removal_daemon(&root);
+        let (clone_id, clone_key, _) = admit_removal_session(&shared, &app, &clone, None).await;
+        let (worktree_id, worktree_key, _) =
+            admit_removal_session(&shared, &app, &clone, Some("topic")).await;
+
+        let rows = rows_body(&app).await;
+        let clone_row = rows_checkout_for_session(&rows, clone_id);
+        let worktree_row = rows_checkout_for_session(&rows, worktree_id);
+        assert_eq!(clone_row["path"], clone.to_str().unwrap());
+
+        // What git itself reports in each row's directory.
+        let reported = |row: &serde_json::Value| {
+            let path = PathBuf::from(row["path"].as_str().unwrap());
+            let short = git_read(&path, &["symbolic-ref", "--short", "-q", "HEAD"])
+                .expect("the row's directory sits on a branch");
+            let full = git_read(&path, &["symbolic-ref", "-q", "HEAD"])
+                .expect("the row's directory sits on a branch");
+            (short, full)
+        };
+        let (clone_short, clone_full) = reported(&clone_row);
+        let (worktree_short, worktree_full) = reported(&worktree_row);
+        // Preconditions on the fixture, so the pin cannot pass vacuously.
+        assert!(clone_short.contains('/'), "{clone_short}");
+        assert_ne!(clone_short, worktree_short);
+
+        for (row, short) in [(&clone_row, &clone_short), (&worktree_row, &worktree_short)] {
+            assert_eq!(
+                row["branch"],
+                short.as_str(),
+                "21-09 branch pin: /rows served {} where git reports {short}",
+                row["branch"]
+            );
+        }
+
+        // The label follows git's main worktree, not a branch name.
+        assert_eq!(clone_row["role"], "main", "{clone_row}");
+        assert_eq!(worktree_row["role"], "managed_branch", "{worktree_row}");
+
+        // The stored value is still the full ref.
+        for (key, full) in [(clone_key, &clone_full), (worktree_key, &worktree_full)] {
+            assert!(full.starts_with("refs/heads/"), "{full}");
+            assert_eq!(
+                crate::manager::lock(&shared).stored_observed_branch_for_test(key),
+                Some(full.clone())
+            );
+        }
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The ids `GET /sessions` lists, sorted.
+    async fn session_ids(app: &Router) -> Vec<u64> {
+        let sessions = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        let mut ids: Vec<u64> = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn row_kinds_detached_head_reads_a_null_branch() {
+        let root = removal_root("kinds-detached");
+        let (_upstream, clone) = cloned_repo(&root);
+        git(&clone, &["checkout", "--detach"]);
+        // Precondition on the fixture: git reports no branch here.
+        assert_eq!(git_read(&clone, &["symbolic-ref", "-q", "HEAD"]), None);
+        let (_workspace, shared, app) = removal_daemon(&root);
+        let (id, key, _) = admit_removal_session(&shared, &app, &clone, None).await;
+
+        let rows = rows_body(&app).await;
+        let row = rows_checkout_for_session(&rows, id);
+        assert_eq!(row["path"], clone.to_str().unwrap());
+        assert_eq!(
+            row.as_object().unwrap().get("branch"),
+            Some(&serde_json::Value::Null),
+            "{row}"
+        );
+        assert_eq!(row["role"], "main", "{row}");
+        assert_eq!(
+            crate::manager::lock(&shared).stored_observed_branch_for_test(key),
+            None
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn row_kinds_second_plain_session_on_a_main_checkout_is_admitted() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("kinds-second");
+        push_to_bare_origin(&root, fixture.path());
+        let repo = fixture.path().canonicalize().unwrap();
+        let (first_id, _, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        let (second_id, _, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        assert_ne!(first_id, second_id);
+
+        let rows = rows_body(&app).await;
+        let repositories = rows["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{rows}");
+        let checkouts = repositories[0]["checkouts"].as_array().unwrap();
+        assert_eq!(checkouts.len(), 2, "{rows}");
+        for entry in checkouts {
+            assert_eq!(entry["path"], repo.to_str().unwrap(), "{entry}");
+        }
+        let (mains, others): (Vec<_>, Vec<_>) =
+            checkouts.iter().partition(|entry| entry["role"] == "main");
+        assert_eq!(mains.len(), 1, "{rows}");
+        assert_eq!(others.len(), 1, "{rows}");
+        let other = others[0];
+        assert_eq!(other["role"], "managed_branch", "{other}");
+        assert_eq!(other["managed_by_baude"], false, "{other}");
+
+        // The save path still validates with both rows present.
+        admit_removal_session(&shared, &app, &repo, Some("topic")).await;
+
+        let preview = preview_target(
+            &app,
+            &serde_json::json!({ "checkout": other["checkout_key"] }),
+        )
+        .await;
+        assert!(
+            report_paths(&preview, "paths_deleted").is_empty(),
+            "{preview}"
+        );
+        assert!(
+            report_paths(&preview, "paths_kept")
+                .iter()
+                .any(|kept| kept == other["path"].as_str().unwrap()),
+            "{preview}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn row_kinds_main_checkout_removal_keeps_the_directory() {
+        let fixture = removal_fixture_two_checkouts("kinds-main").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        let rows = rows_body(app).await;
+        let main_row = rows_checkout_for_session(&rows, fixture.main_id);
+        let repository_key = main_row["repository_key"].clone();
+        let target = serde_json::json!({ "checkout": main_row["checkout_key"] });
+
+        let preview = preview_target(app, &target).await;
+        assert_eq!(
+            preview["rows_removed"],
+            serde_json::json!([target]),
+            "{preview}"
+        );
+        assert!(
+            report_paths(&preview, "paths_deleted").is_empty(),
+            "{preview}"
+        );
+        let kept = report_paths(&preview, "paths_kept");
+        assert_eq!(kept.len(), 1, "{preview}");
+        assert_eq!(Path::new(&kept[0]).canonicalize().unwrap(), main_path);
+
+        let (status, body) = removal_call(app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            executed["runtimes_killed"].as_array().unwrap().len(),
+            1,
+            "{executed}"
+        );
+
+        assert!(main_path.is_dir());
+        assert!(git_read(&main_path, &["rev-parse", "--git-dir"]).is_some());
+        let after = rows_body(app).await;
+        let repositories = after["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{after}");
+        assert_eq!(repositories[0]["repository_key"], repository_key);
+        let checkouts = repositories[0]["checkouts"].as_array().unwrap();
+        assert_eq!(checkouts.len(), 1, "{after}");
+        assert_eq!(checkouts[0]["checkout_key"], fixture.worktree_key.get());
+        assert_eq!(checkouts[0]["session_id"], fixture.worktree_id);
+        assert_eq!(session_ids(app).await, [fixture.worktree_id]);
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn row_kinds_parent_removal_leaves_a_sibling_repository_untouched() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("kinds-sibling");
+        let repo = fixture.path().canonicalize().unwrap();
+        // A second repository whose directory name extends the first's,
+        // built while the first owner's redirect is alive.
+        let sibling = root.join("repo-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        git(&sibling, &["init", "-b", "main"]);
+        git(&sibling, &["config", "user.email", "test@example.com"]);
+        git(&sibling, &["config", "user.name", "Test"]);
+        std::fs::write(sibling.join("file"), b"one").unwrap();
+        git(&sibling, &["add", "file"]);
+        git(&sibling, &["commit", "-m", "initial"]);
+        let sibling = sibling.canonicalize().unwrap();
+        assert!(sibling
+            .to_str()
+            .unwrap()
+            .starts_with(repo.to_str().unwrap()));
+
+        let (repo_id, _, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        let (sibling_id, _, _) = admit_removal_session(&shared, &app, &sibling, None).await;
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 2, "{rows}");
+        let repo_row = rows_checkout_for_session(&rows, repo_id);
+        let sibling_row = rows_checkout_for_session(&rows, sibling_id);
+        assert_ne!(repo_row["repository_key"], sibling_row["repository_key"]);
+
+        let target = serde_json::json!({ "repository": repo_row["repository_key"] });
+        let preview = preview_target(&app, &target).await;
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let removed = executed["rows_removed"].as_array().unwrap();
+        for sibling_key in [
+            serde_json::json!({ "repository": sibling_row["repository_key"] }),
+            serde_json::json!({ "checkout": sibling_row["checkout_key"] }),
+        ] {
+            assert!(!removed.contains(&sibling_key), "{executed}");
+        }
+        assert_eq!(report_paths(&executed, "paths_deleted").len(), 0);
+
+        let after = rows_body(&app).await;
+        let repositories = after["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{after}");
+        assert_eq!(repositories[0]["path"], sibling.to_str().unwrap());
+        assert_eq!(
+            repositories[0]["checkouts"],
+            serde_json::json!([sibling_row]),
+            "{after}"
+        );
+        assert_eq!(session_ids(&app).await, [sibling_id]);
+        assert!(sibling.is_dir());
+        assert!(git_read(&sibling, &["rev-parse", "--git-dir"]).is_some());
+
+        removal_teardown(&shared, &root);
     }
 }
 

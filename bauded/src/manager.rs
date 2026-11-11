@@ -249,7 +249,10 @@ pub struct CheckoutRowView {
     /// The parent key repeated, so a flattened client list still finds it.
     pub repository_key: u64,
     pub display_name: String,
-    /// The observed branch, verbatim and unnormalized.
+    /// The short branch name, `None` for a detached HEAD. The stored
+    /// `observed_branch` is git's full ref and is never rewritten: core
+    /// compares and re-observes full refs, so the short form exists in this
+    /// projection only.
     pub branch: Option<String>,
     pub path: String,
     pub role: CheckoutRole,
@@ -258,6 +261,17 @@ pub struct CheckoutRowView {
     /// The live daemon session id, `None` when the row has no runtime. Equal
     /// to `SessionInfo::id`, which is the join column to `GET /sessions`.
     pub session_id: Option<u64>,
+}
+
+/// The branch name `GET /rows` serves for a stored `observed_branch`.
+///
+/// A value beginning `refs/heads/` loses that one leading prefix and keeps
+/// the rest verbatim, so a slash-bearing branch is never split. Any other
+/// value is served as stored: the daemon does not guess at a ref it does not
+/// recognize. No stored value is `None`, with no fallback to a default
+/// branch.
+fn short_branch_name(observed: Option<&str>) -> Option<String> {
+    observed.map(|full| full.strip_prefix("refs/heads/").unwrap_or(full).to_string())
 }
 
 /// A standalone root entry of `GET /rows`.
@@ -1155,7 +1169,7 @@ impl Manager {
                             checkout_key: checkout.key.get(),
                             repository_key: checkout.repository_key.get(),
                             display_name: checkout.session.name.clone(),
-                            branch: checkout.observed_branch.clone(),
+                            branch: short_branch_name(checkout.observed_branch.as_deref()),
                             path: checkout.observed_path.to_path_buf().display().to_string(),
                             role: checkout.role,
                             managed_by_baude: checkout.managed_by_baude,
