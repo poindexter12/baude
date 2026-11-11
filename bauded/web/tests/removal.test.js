@@ -525,3 +525,197 @@ test("removal_notice_and_clearing_failures_read_the_report", () => {
     "binding ~/code/repo: read-only file system",
   ]);
 });
+
+// ---- Task 3: snapshot arbitration ----
+
+// A committed 200 report: what a tombstone is built from.
+function committed(report) {
+  return { ...report, planned: false, persistence: { outcome: "saved" } };
+}
+
+// The tombstone set is a null-prototype object; compare it as plain entries.
+function entries(tombstones) {
+  return Object.keys(tombstones).sort().map((id) => [id, tombstones[id]]);
+}
+
+test("apply_snapshot_suppresses_a_tombstoned_row_the_snapshot_still_lists", () => {
+  const { applySnapshot, tombstone } = BaudeRemoval;
+  const tombstones = tombstone(Object.create(null), committed(checkoutReport()), 1000);
+  const tombstonesBefore = entries(tombstones);
+  // HIGH #5: a poll that left before the removal lands after it, and still
+  // lists checkout 7.
+  const snapshot = rowsBody();
+  const snapshotBefore = structuredClone(snapshot);
+
+  const body = applySnapshot(snapshot, tombstones);
+
+  assert.deepStrictEqual(
+    body.repositories[0].checkouts.map((c) => c.checkout_key),
+    [8],
+    "checkout 7 stays gone and its sibling survives",
+  );
+  assert.equal(body.repositories[0].repository_key, 1, "the parent survives");
+  assert.deepStrictEqual(body.standalone, [standaloneRow()]);
+  assert.deepStrictEqual(snapshot, snapshotBefore);
+  assert.deepStrictEqual(entries(tombstones), tombstonesBefore);
+  assert.deepStrictEqual(tombstonesBefore, [["checkout:7", 1000]]);
+});
+
+test("apply_snapshot_suppresses_a_tombstoned_repository_and_its_children", () => {
+  const { applySnapshot, tombstone } = BaudeRemoval;
+  // The parent key alone is enough: the children live inside it.
+  const report = committed(repositoryReport({ rows_removed: [{ repository: 1 }] }));
+  const tombstones = tombstone(Object.create(null), report, 1000);
+  const tombstonesBefore = entries(tombstones);
+  const snapshot = rowsBody();
+  const snapshotBefore = structuredClone(snapshot);
+  assert.equal(snapshot.repositories[0].checkouts.length, 2);
+
+  const body = applySnapshot(snapshot, tombstones);
+
+  assert.deepStrictEqual(body.repositories, []);
+  assert.deepStrictEqual(body.standalone, [standaloneRow()]);
+  assert.deepStrictEqual(snapshot, snapshotBefore);
+  assert.deepStrictEqual(entries(tombstones), tombstonesBefore);
+});
+
+test("apply_snapshot_passes_untombstoned_rows_through_unchanged", () => {
+  const { applySnapshot } = BaudeRemoval;
+  const snapshot = rowsBody();
+  const snapshotBefore = structuredClone(snapshot);
+  const empty = Object.create(null);
+
+  assert.deepStrictEqual(applySnapshot(snapshot, empty), snapshotBefore);
+  assert.deepStrictEqual(snapshot, snapshotBefore);
+  assert.deepStrictEqual(entries(empty), []);
+
+  // A plain {} and a missing set are empty sets too, and a tombstone for a
+  // row of another kind with the same number suppresses nothing.
+  assert.deepStrictEqual(applySnapshot(snapshot, {}), snapshotBefore);
+  assert.deepStrictEqual(applySnapshot(snapshot, undefined), snapshotBefore);
+  assert.deepStrictEqual(applySnapshot(snapshot, { "standalone:7": 1000, "checkout:1": 1000 }), snapshotBefore);
+});
+
+test("apply_snapshot_is_idempotent", () => {
+  const { applySnapshot, tombstone } = BaudeRemoval;
+  const tombstones = tombstone(Object.create(null), committed(checkoutReport()), 1000);
+  const tombstonesBefore = entries(tombstones);
+  const snapshot = rowsBody();
+  const snapshotBefore = structuredClone(snapshot);
+
+  const first = applySnapshot(snapshot, tombstones);
+  const second = applySnapshot(snapshot, tombstones);
+  assert.deepStrictEqual(second, first);
+  // Feeding the result back in changes nothing either.
+  assert.deepStrictEqual(applySnapshot(first, tombstones), first);
+  assert.deepStrictEqual(snapshot, snapshotBefore);
+  assert.deepStrictEqual(entries(tombstones), tombstonesBefore);
+});
+
+test("tombstoning_the_same_report_twice_adds_nothing", () => {
+  const { tombstone } = BaudeRemoval;
+  const report = committed(repositoryReport());
+  const empty = Object.create(null);
+
+  const once = tombstone(empty, report, 1000);
+  const onceBefore = entries(once);
+  // A duplicate 200, or the removal's own rows_removed frame reaching the tab
+  // that started it.
+  const twice = tombstone(once, report, 2000);
+
+  assert.strictEqual(Object.keys(twice).length, Object.keys(once).length);
+  assert.deepStrictEqual(entries(twice), [
+    ["checkout:7", 1000],
+    ["checkout:8", 1000],
+    ["repository:1", 1000],
+  ]);
+  assert.deepStrictEqual(entries(once), onceBefore, "the earlier set is not mutated");
+  assert.deepStrictEqual(entries(empty), [], "the empty set is not mutated");
+  assert.notStrictEqual(twice, once);
+
+  // A later, different report adds its own rows at its own time and leaves
+  // the earlier stamps alone. A row key the module cannot read is skipped.
+  const later = tombstone(once, committed(standaloneReport({ rows_removed: [{ standalone: 2 }, { session: 9 }] })), 3000);
+  assert.deepStrictEqual(entries(later), [
+    ["checkout:7", 1000],
+    ["checkout:8", 1000],
+    ["repository:1", 1000],
+    ["standalone:2", 3000],
+  ]);
+});
+
+test("drop_rows_then_apply_snapshot_agree", () => {
+  const { dropRows, applySnapshot, tombstone } = BaudeRemoval;
+  const reports = [
+    checkoutReport(),
+    repositoryReport(),
+    repositoryReport({ rows_removed: [{ repository: 1 }] }),
+    standaloneReport(),
+    checkoutReport({ rows_removed: [{ checkout: 99 }] }),
+    checkoutReport({ rows_removed: [] }),
+  ];
+  for (const report of reports) {
+    const body = rowsBody();
+    const before = structuredClone(body);
+    const tombstones = tombstone({}, committed(report), 1000);
+    assert.deepStrictEqual(
+      applySnapshot(body, tombstones),
+      dropRows(body, committed(report)),
+      `scope disagrees for ${JSON.stringify(report.rows_removed)}`,
+    );
+    assert.deepStrictEqual(body, before);
+  }
+});
+
+test("prune_tombstones_expires_after_the_ttl_and_not_before", () => {
+  const { pruneTombstones, tombstone, applySnapshot } = BaudeRemoval;
+  const t = 1_700_000_000_000;
+  const set = tombstone(Object.create(null), committed(checkoutReport()), t);
+  const setBefore = entries(set);
+
+  assert.deepStrictEqual(entries(pruneTombstones(set, t + 59_999, 60_000)), [["checkout:7", t]]);
+  assert.deepStrictEqual(entries(pruneTombstones(set, t + 60_001, 60_000)), []);
+  assert.deepStrictEqual(entries(set), setBefore, "pruning returns a new set");
+  assert.notStrictEqual(pruneTombstones(set, t, 60_000), set);
+
+  // The default window is 60 s.
+  assert.deepStrictEqual(entries(pruneTombstones(set, t + 59_999)), [["checkout:7", t]]);
+  assert.deepStrictEqual(entries(pruneTombstones(set, t + 60_001)), []);
+
+  // Only the expired entry goes, and once it has, the daemon's row shows
+  // again: a client cannot hide a row the daemon keeps reporting forever.
+  const mixed = tombstone(set, committed(standaloneReport()), t + 30_000);
+  const pruned = pruneTombstones(mixed, t + 60_001, 60_000);
+  assert.deepStrictEqual(entries(pruned), [["standalone:2", t + 30_000]]);
+  const body = applySnapshot(rowsBody(), pruned);
+  assert.deepStrictEqual(body.repositories[0].checkouts.map((c) => c.checkout_key), [7, 8]);
+  assert.deepStrictEqual(body.standalone, []);
+});
+
+test("apply_snapshot_tolerates_a_partial_body", () => {
+  const { applySnapshot, tombstone } = BaudeRemoval;
+  const tombstones = tombstone(Object.create(null), committed(checkoutReport()), 1000);
+  const tombstonesBefore = entries(tombstones);
+
+  const noStandalone = { repositories: [repositoryRow()] };
+  const noStandaloneBefore = structuredClone(noStandalone);
+  const first = applySnapshot(noStandalone, tombstones);
+  assert.deepStrictEqual(first.standalone, []);
+  assert.deepStrictEqual(first.repositories[0].checkouts.map((c) => c.checkout_key), [8]);
+  assert.deepStrictEqual(noStandalone, noStandaloneBefore);
+
+  const noRepositories = { standalone: [standaloneRow()] };
+  const noRepositoriesBefore = structuredClone(noRepositories);
+  const second = applySnapshot(noRepositories, tombstones);
+  assert.deepStrictEqual(second, { repositories: [], standalone: [standaloneRow()] });
+  assert.deepStrictEqual(noRepositories, noRepositoriesBefore);
+
+  // A truncated or wrong-typed response still yields a renderable body, and
+  // a parent the daemon serves with no checkouts at all passes through.
+  for (const broken of [null, undefined, "", [], { repositories: "x", standalone: 3 }]) {
+    assert.deepStrictEqual(applySnapshot(broken, tombstones), { repositories: [], standalone: [] });
+  }
+  const childless = { repositories: [repositoryRow({ checkouts: [] })], standalone: [] };
+  assert.deepStrictEqual(applySnapshot(childless, tombstones), childless);
+  assert.deepStrictEqual(entries(tombstones), tombstonesBefore);
+});

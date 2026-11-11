@@ -312,6 +312,68 @@
       + `deleted ${plural(deleted, "path", "paths")}`;
   }
 
+  // ---- snapshot arbitration ----
+  //
+  // A list poll that left before a removal can land after it and still list
+  // the removed row. Assigning that response straight into render state would
+  // resurrect the row until the next poll. The three functions below let the
+  // controller hold a removal's scope as a tombstone set and filter every
+  // later snapshot through it. The wiring is the controller's, in app.js:
+  //
+  //   - every GET /rows response goes through applySnapshot before it reaches
+  //     render state;
+  //   - a 200 report, or a rows_removed frame, goes through tombstone;
+  //   - pruneTombstones runs on the poll tick.
+  //
+  // All three are pure. None reads a clock: the caller passes nowMs.
+
+  const TOMBSTONE_TTL_MS = 60000;
+
+  function copyTombstones(tombstones, keep) {
+    const next = Object.create(null);
+    if (!isRecord(tombstones)) return next;
+    for (const id of Object.keys(tombstones)) {
+      if (keep(tombstones[id])) next[id] = tombstones[id];
+    }
+    return next;
+  }
+
+  // The set plus one `rowKeyId -> nowMs` entry per report.rows_removed. An id
+  // already present keeps its ORIGINAL stamp: marking a row again must not
+  // extend how long it is suppressed, and that is what makes a duplicate
+  // report a no-op. A row key that cannot be read is skipped.
+  function tombstone(tombstones, report, nowMs) {
+    const next = copyTombstones(tombstones, () => true);
+    const removed = isObject(report) ? asArray(report.rows_removed) : [];
+    for (const rowKey of removed) {
+      const id = rowKeyId(rowKey);
+      if (id !== null && !hasOwn(next, id)) next[id] = nowMs;
+    }
+    return next;
+  }
+
+  // The set without entries older than ttlMs. The PWA list poll runs every
+  // 3 s (bauded/web/app.js:800), so the 60 s default covers any response in
+  // flight twenty times over. It still expires, so a client can never
+  // permanently hide a row the daemon keeps reporting.
+  function pruneTombstones(tombstones, nowMs, ttlMs) {
+    const ttl = ttlMs === undefined ? TOMBSTONE_TTL_MS : ttlMs;
+    return copyTombstones(tombstones, (stamp) => nowMs - stamp <= ttl);
+  }
+
+  // A /rows snapshot with every tombstoned row left out, both root keys
+  // present as arrays. Built on filterRows, the same walk dropRows uses, with
+  // the same rowKeyId match, so the immediate local drop and the arbitration
+  // of a later snapshot cannot disagree about scope. Does not prune: expiry
+  // is the caller's explicit pruneTombstones call.
+  function applySnapshot(snapshot, tombstones) {
+    const set = isRecord(tombstones) ? tombstones : null;
+    return filterRows(snapshot, (rowKey) => {
+      const id = rowKeyId(rowKey);
+      return set !== null && id !== null && hasOwn(set, id);
+    });
+  }
+
   const BaudeRemoval = {
     escapeHtml,
     tildePath,
@@ -322,6 +384,9 @@
     confirmationView,
     renderConfirmation,
     dropRows,
+    tombstone,
+    pruneTombstones,
+    applySnapshot,
     parseDriftBody,
     clearingFailures,
     removalNotice,
