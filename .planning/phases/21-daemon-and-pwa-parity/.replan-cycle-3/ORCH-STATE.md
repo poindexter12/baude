@@ -139,3 +139,14 @@ IN FLIGHT: 21-06. NEXT: 21-11 -> resolve 21-02 checkpoint to B -> checker.
 CHECKER: error-text register implemented TUI-only; 21-05 PWA shows daemon text verbatim -> revise 21-05 or accept. 21-08 tick block pointer app.rs:4888-4898.
 SURFACE TO JOE: REQUIREMENTS.md:82 replacement wording; TUI offers no remote repository-parent removal (sidebar has no remote parent row).
 IN FLIGHT: 21-11. NEXT: resolve 21-02 checkpoint to B (+21-CONTEXT.md) -> gsd-plan-checker over all 11, max 3 rounds -> steps 13-15.
+
+21-11 DONE (3 tasks, autonomous:false, files_modified [], 15-step human-verify). ALL 11 PLANS WRITTEN + COMMITTED (cycle 3).
+SURFACE TO JOE: add node --test step to scripts/gate.sh + CI (21-07 ledger expects it; 21-11 only runs suites once)? Unshortened PWA paths OK?
+
+## RESUME POINT 2026-11-11 10:25 PST (orchestrator context exhausted)
+REMAINING, in order:
+ 1. Resolve 21-02 Task 1 checkpoint:decision to Option B in 21-02-PLAN.md (Joe decided B 2026-11-11) and record D-09=B in 21-CONTEXT.md; commit.
+ 2. gsd-plan-checker over all 11 plans (omit model), revision loop max 3. Feed it every CHECKER/CARRY line above, notably: 21-01/21-02 `test A; test B` verify -> &&; 21-05 error-text register vs 21-06; planners of 21-04/05/08/11 read REVIEWS by grep only so ledgers need a completeness check; uncalibrated estimates; stale line pointers.
+ 3. plan-phase steps 13-15 (STATE/ROADMAP update, next-up). STATE.md has an uncommitted diff and 21-VALIDATION.md + .review-diagnostics/ are untracked.
+ 4. Then /gsd-execute-phase 21 can run autonomously; human stops only at 21-11 human-verify.
+Do NOT re-run plan-phase --reviews from step 0.
