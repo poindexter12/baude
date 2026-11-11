@@ -134,3 +134,8 @@ IN FLIGHT: 21-08. NEXT: 21-06 (depends 21-08; chunk prompt pattern = see git sho
 
 21-08 DONE (3 tasks, autonomous, files baude/src/remote.rs only, threats T-21-70..76). Exposes to 21-06: RemoteRows + rows()/label()/target_for_session, spawn_preview_removal/spawn_execute_removal -> RemovalTicket::try_take -> RemovalAnswer{reply,rows}, RemovalReply {Report,Drift,Gone,Refused,Unreachable,Indeterminate}, REMOVAL_TIMEOUT 60s, stop()+Drop. 21-06 obligations: pending modal state, Gone closes w/o retry, Indeterminate wording, neutral label when label() is None, store RemoteRows beside remote_snap, fix comment app.rs:891. Planner skipped RESEARCH/VALIDATION/full REVIEWS reads; unverified: ureq 2.12.1 reader surviving timed-out read (made a test), execute body shape.
 IN FLIGHT: 21-06. NEXT: 21-11 -> resolve 21-02 checkpoint to B -> checker.
+
+21-06 DONE (3 tasks, autonomous, files app.rs+ui.rs+REQUIREMENTS.md, threats T-21-80..89 range). Third invalidated test found: hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints ui.rs:3106.
+CHECKER: error-text register implemented TUI-only; 21-05 PWA shows daemon text verbatim -> revise 21-05 or accept. 21-08 tick block pointer app.rs:4888-4898.
+SURFACE TO JOE: REQUIREMENTS.md:82 replacement wording; TUI offers no remote repository-parent removal (sidebar has no remote parent row).
+IN FLIGHT: 21-11. NEXT: resolve 21-02 checkpoint to B (+21-CONTEXT.md) -> gsd-plan-checker over all 11, max 3 rounds -> steps 13-15.
