@@ -260,3 +260,268 @@ test("module_loads_as_a_browser_script_with_no_globals", () => {
   assert.ok(html.includes("a&lt;b"));
   assert.equal(html.includes("<b"), false);
 });
+
+// ---- Task 2: paths, the key-to-name join, dropRows, the drift body ----
+
+// A repository-parent preview: both children, then the parent itself.
+function repositoryReport(overrides = {}) {
+  return checkoutReport({
+    target: { repository: 1 },
+    rows_removed: [{ checkout: 7 }, { checkout: 8 }, { repository: 1 }],
+    paths_deleted: [`${WORKTREES}/topic-7`, `${WORKTREES}/other-8`],
+    ...overrides,
+  });
+}
+
+function standaloneReport(overrides = {}) {
+  return checkoutReport({
+    target: { standalone: 2 },
+    rows_removed: [{ standalone: 2 }],
+    runtimes_killed: [],
+    paths_deleted: [],
+    paths_kept: [`${HOME}/notes`],
+    ...overrides,
+  });
+}
+
+// A /rows body the client fetched before checkout 8 existed: the HIGH #6
+// shape, where a fresh report names a child the page has never seen.
+function rowsBodyWithoutCheckout8() {
+  return rowsBody({ repositories: [repositoryRow({ checkouts: [checkoutRow()] })] });
+}
+
+test("tilde_path_mirrors_the_tui_helper", () => {
+  const { tildePath } = BaudeRemoval;
+  assert.equal(tildePath("/Users/joe/code/x", "/Users/joe"), "~/code/x");
+  assert.equal(tildePath("/var/tmp/x", "/Users/joe"), "/var/tmp/x");
+  assert.equal(tildePath("/Users/joe", "/Users/joe"), "~");
+});
+
+test("tilde_path_keeps_the_plain_prefix_quirk", () => {
+  // strip_prefix in baude/src/ui.rs:1370 is a string prefix strip, not a path
+  // segment comparison. The PWA agrees with it, quirk included.
+  assert.equal(BaudeRemoval.tildePath("/Users/joe2/x", "/Users/joe"), "~2/x");
+});
+
+test("tilde_path_without_a_home_is_the_identity", () => {
+  const { tildePath } = BaudeRemoval;
+  const p = "/Users/joe/code/x";
+  assert.equal(tildePath(p, "/"), p);
+  assert.equal(tildePath(p, ""), p);
+  assert.equal(tildePath(p, null), p);
+  assert.equal(tildePath(p, undefined), p);
+  assert.equal(tildePath(p), p);
+});
+
+test("confirmation_view_shortens_paths_only_when_given_a_home", () => {
+  const { confirmationView, rowsIndex } = BaudeRemoval;
+  const report = checkoutReport({ already_removed: [`${WORKTREES}/gone-9`] });
+  const index = rowsIndex(rowsBody());
+  const lines = (view, label) => view.sections.find((s) => s.label === label).lines;
+
+  // No home: the absolute paths /rows and the report already carry.
+  const absolute = confirmationView(report, index);
+  assert.deepStrictEqual(lines(absolute, "paths deleted"), [`${WORKTREES}/topic-7`]);
+  assert.deepStrictEqual(lines(absolute, "paths kept"), [REPO_PATH]);
+  assert.deepStrictEqual(lines(absolute, "already removed"), [`${WORKTREES}/gone-9`]);
+
+  const short = confirmationView(report, index, { home: HOME });
+  assert.deepStrictEqual(lines(short, "paths deleted"), [
+    "~/.local/share/baude/worktrees/claude/repository-1/topic-7",
+  ]);
+  assert.deepStrictEqual(lines(short, "paths kept"), ["~/code/repo"]);
+  assert.deepStrictEqual(lines(short, "already removed"), [
+    "~/.local/share/baude/worktrees/claude/repository-1/gone-9",
+  ]);
+});
+
+test("report_row_names_resolves_every_key_through_the_index", () => {
+  const { reportRowNames, confirmationView, rowsIndex } = BaudeRemoval;
+  const report = repositoryReport();
+  const index = rowsIndex(rowsBody());
+
+  assert.deepStrictEqual(reportRowNames(report, index), [
+    { id: "checkout:7", kind: "checkout", key: 7, label: "repo:topic", branch: "refs/heads/topic", resolved: true },
+    { id: "checkout:8", kind: "checkout", key: 8, label: "repo:other", branch: "refs/heads/other", resolved: true },
+    { id: "repository:1", kind: "repository", key: 1, label: "repo", branch: null, resolved: true },
+  ]);
+
+  const dropped = confirmationView(report, index).sections[0];
+  assert.equal(dropped.label, "rows dropped");
+  assert.strictEqual(dropped.lines.length, report.rows_removed.length);
+  assert.deepStrictEqual(dropped.lines, [
+    "repo:topic ⎇ refs/heads/topic",
+    "repo:other ⎇ refs/heads/other",
+    "repo",
+  ]);
+});
+
+test("report_row_names_never_invents_a_name", () => {
+  const { reportRowNames, confirmationView, rowsIndex } = BaudeRemoval;
+  const report = repositoryReport();
+  const index = rowsIndex(rowsBodyWithoutCheckout8());
+
+  const names = reportRowNames(report, index);
+  assert.strictEqual(names.length, 3, "an unresolved row is still listed");
+  assert.deepStrictEqual(names[1], {
+    id: "checkout:8", kind: "checkout", key: 8, label: "checkout 8", branch: null, resolved: false,
+  });
+  assert.strictEqual(names[1].resolved, false);
+  assert.strictEqual(names[1].label, "checkout 8");
+  assert.equal(names[0].resolved, true);
+  assert.equal(names[2].resolved, true);
+
+  const dropped = confirmationView(report, index).sections[0];
+  assert.strictEqual(dropped.lines.length, report.rows_removed.length);
+  assert.deepStrictEqual(dropped.lines, ["repo:topic ⎇ refs/heads/topic", "checkout 8", "repo"]);
+
+  // The other two kinds get the same honest label, and a key the module
+  // cannot read at all is still listed rather than dropped.
+  const strange = reportRowNames(
+    { rows_removed: [{ repository: 4 }, { standalone: 5 }, { session: 6 }, null] },
+    rowsIndex(rowsBody()),
+  );
+  assert.deepStrictEqual(strange.map((n) => [n.label, n.resolved]), [
+    ["repository 4", false],
+    ["standalone 5", false],
+    ["unknown row", false],
+    ["unknown row", false],
+  ]);
+});
+
+test("report_row_names_resolves_a_child_with_no_live_session", () => {
+  const { reportRowNames, rowsIndex } = BaudeRemoval;
+  const index = rowsIndex(rowsBody());
+  // D-16 parity: checkout 8 has no runtime and is listed all the same.
+  assert.strictEqual(index["checkout:8"].session_id, null);
+  assert.strictEqual(index["checkout:7"].session_id, 3);
+
+  const child = reportRowNames(repositoryReport(), index)[1];
+  assert.equal(child.resolved, true);
+  assert.equal(child.label, "repo:other");
+  assert.equal(child.branch, "refs/heads/other");
+});
+
+test("drop_rows_removes_exactly_the_reported_keys", () => {
+  const { dropRows } = BaudeRemoval;
+  const body = rowsBody();
+  const before = structuredClone(body);
+
+  // A checkout: gone, with its parent and its sibling left alone.
+  const afterCheckout = dropRows(body, checkoutReport());
+  assert.deepStrictEqual(body, before);
+  assert.deepStrictEqual(afterCheckout, {
+    repositories: [repositoryRow({ checkouts: [before.repositories[0].checkouts[1]] })],
+    standalone: [standaloneRow()],
+  });
+
+  // A repository: gone with every checkout under it.
+  const afterRepository = dropRows(body, repositoryReport());
+  assert.deepStrictEqual(body, before);
+  assert.deepStrictEqual(afterRepository, { repositories: [], standalone: [standaloneRow()] });
+
+  // A repository key alone still takes its children: they live inside it.
+  const parentOnly = dropRows(body, repositoryReport({ rows_removed: [{ repository: 1 }] }));
+  assert.deepStrictEqual(body, before);
+  assert.deepStrictEqual(parentOnly, { repositories: [], standalone: [standaloneRow()] });
+
+  // A standalone session: only that entry.
+  const afterStandalone = dropRows(body, standaloneReport());
+  assert.deepStrictEqual(body, before);
+  assert.deepStrictEqual(afterStandalone, { repositories: [repositoryRow()], standalone: [] });
+
+  // The three key types share one number space and are never conflated:
+  // checkout 1 is not repository 1, and standalone 7 is not checkout 7.
+  const crossKind = dropRows(body, checkoutReport({ rows_removed: [{ checkout: 1 }, { standalone: 7 }] }));
+  assert.deepStrictEqual(crossKind, before);
+});
+
+test("drop_rows_is_a_noop_for_an_absent_key", () => {
+  const { dropRows } = BaudeRemoval;
+  const body = rowsBody();
+  const before = structuredClone(body);
+  // API-03: an SSE frame for a row another client already removed.
+  const after = dropRows(body, checkoutReport({ target: { checkout: 99 }, rows_removed: [{ checkout: 99 }] }));
+  assert.deepStrictEqual(after, before);
+  assert.deepStrictEqual(body, before);
+});
+
+test("parse_drift_body_reads_the_409_json_and_preserves_plain_text", () => {
+  const { parseDriftBody } = BaudeRemoval;
+  const report = repositoryReport({ planned: true });
+
+  assert.deepStrictEqual(parseDriftBody(JSON.stringify(report)), { report, text: null });
+  assert.deepStrictEqual(parseDriftBody("removal failed: runtime survived"), {
+    report: null,
+    text: "removal failed: runtime survived",
+  });
+  assert.deepStrictEqual(parseDriftBody(""), { report: null, text: "" });
+
+  // JSON that is not a report is plain text to the caller.
+  assert.deepStrictEqual(parseDriftBody("null"), { report: null, text: "null" });
+  assert.deepStrictEqual(parseDriftBody("42"), { report: null, text: "42" });
+  assert.deepStrictEqual(parseDriftBody('{"error":"nope"}'), { report: null, text: '{"error":"nope"}' });
+  assert.deepStrictEqual(parseDriftBody("[1,2]"), { report: null, text: "[1,2]" });
+});
+
+test("key_equals_compares_row_keys_by_kind_and_key", () => {
+  assert.strictEqual(typeof BaudeRemoval.keyEquals, "function");
+  const { keyEquals } = BaudeRemoval;
+  const both = (a, b) => [keyEquals(a, b), keyEquals(b, a)];
+
+  // Two distinct instances of the same kind and key, in all three shapes.
+  assert.deepStrictEqual(both({ repository: 1 }, { repository: 1 }), [true, true]);
+  assert.deepStrictEqual(both({ checkout: 7 }, { checkout: 7 }), [true, true]);
+  assert.deepStrictEqual(both({ standalone: 2 }, { standalone: 2 }), [true, true]);
+
+  // Same kind, different key.
+  assert.deepStrictEqual(both({ checkout: 7 }, { checkout: 8 }), [false, false]);
+
+  // Same number, different kind: the key types share a u64 space.
+  assert.deepStrictEqual(both({ checkout: 7 }, { repository: 7 }), [false, false]);
+  assert.deepStrictEqual(both({ checkout: 7 }, { standalone: 7 }), [false, false]);
+
+  // An unrecognised shape equals nothing, itself included.
+  assert.deepStrictEqual(both({ Checkout: 7 }, { Checkout: 7 }), [false, false]);
+  assert.deepStrictEqual(both({ session: 7 }, { session: 7 }), [false, false]);
+  assert.deepStrictEqual(both({}, {}), [false, false]);
+  const sameInstance = { session: 7 };
+  assert.strictEqual(keyEquals(sameInstance, sameInstance), false);
+
+  // A missing side is false, never a throw.
+  assert.deepStrictEqual(both(null, { checkout: 7 }), [false, false]);
+  assert.deepStrictEqual(both({ checkout: 7 }, undefined), [false, false]);
+  assert.deepStrictEqual(both(null, undefined), [false, false]);
+  assert.deepStrictEqual(both("checkout:7", { checkout: 7 }), [false, false]);
+});
+
+test("removal_notice_and_clearing_failures_read_the_report", () => {
+  const { removalNotice, clearingFailures } = BaudeRemoval;
+
+  assert.equal(
+    removalNotice(repositoryReport({ planned: false, persistence: { outcome: "saved" } })),
+    "removed 3 rows, killed 1 runtime, deleted 2 paths",
+  );
+  assert.equal(
+    removalNotice(standaloneReport({ planned: false, persistence: { outcome: "saved" } })),
+    "removed 1 row, killed 0 runtimes, deleted 0 paths",
+  );
+
+  assert.deepStrictEqual(clearingFailures(checkoutReport()), []);
+  const failed = checkoutReport({
+    planned: false,
+    persistence: { outcome: "saved_degraded", detail: "marker left behind" },
+    clearing_failures: [
+      { kind: "marker", path: `${WORKTREES}/topic-7`, error: "Permission denied (os error 13)" },
+      { kind: "binding", path: REPO_PATH, error: "read-only file system" },
+    ],
+  });
+  assert.deepStrictEqual(clearingFailures(failed), [
+    `marker ${WORKTREES}/topic-7: Permission denied (os error 13)`,
+    `binding ${REPO_PATH}: read-only file system`,
+  ]);
+  assert.deepStrictEqual(clearingFailures(failed, { home: HOME }), [
+    "marker ~/.local/share/baude/worktrees/claude/repository-1/topic-7: Permission denied (os error 13)",
+    "binding ~/code/repo: read-only file system",
+  ]);
+});

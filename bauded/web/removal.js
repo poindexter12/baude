@@ -23,6 +23,11 @@
     return value !== null && typeof value === "object";
   }
 
+  // A JSON object, as opposed to a JSON array.
+  function isRecord(value) {
+    return isObject(value) && !Array.isArray(value);
+  }
+
   function asArray(value) {
     return Array.isArray(value) ? value : [];
   }
@@ -38,10 +43,24 @@
     return String(value).replace(/[&<>"']/g, (c) => HTML_ENTITIES[c]);
   }
 
+  // Shorten a path for display: home becomes `~`. The authority is tilde_path
+  // at baude/src/ui.rs:1360, which uses Rust's strip_prefix on the displayed
+  // string: a plain string prefix strip, NOT a path segment comparison. So
+  // `/Users/joe2/x` under home `/Users/joe` reads `~2/x` in the TUI, and it
+  // reads the same here on purpose. Do not make this segment-aware unless the
+  // TUI changes first. The daemon serves no home path, so the caller passes
+  // one; no home (or `/`, the resolver's "no home at all") is the identity.
+  function tildePath(path, home) {
+    const text = String(path);
+    if (!home || home === "/") return text;
+    const prefix = String(home);
+    return text.startsWith(prefix) ? `~${text.slice(prefix.length)}` : text;
+  }
+
   // An externally tagged RowKey ({"checkout":7}) as the string "checkout:7".
   // Anything else is null: an unknown tag, a second key, a non-integer key.
   function rowKeyId(rowKey) {
-    if (!isObject(rowKey)) return null;
+    if (!isRecord(rowKey)) return null;
     const names = Object.keys(rowKey);
     if (names.length !== 1) return null;
     const kind = names[0];
@@ -49,6 +68,16 @@
     const key = rowKey[kind];
     if (typeof key !== "number" || !Number.isInteger(key) || key < 0) return null;
     return `${kind}:${key}`;
+  }
+
+  // RowKey equality: same kind AND same key. The three key types share one
+  // number space, so {"checkout":7} is not {"repository":7}. An unrecognised
+  // shape equals nothing, itself included. This is the one matching rule in
+  // the module; dropRows and applySnapshot both decide through rowKeyId.
+  function keyEquals(a, b) {
+    if (!isObject(a) || !isObject(b)) return false;
+    const left = rowKeyId(a);
+    return left !== null && left === rowKeyId(b);
   }
 
   function indexEntry(kind, key, row, repositoryKey) {
@@ -59,7 +88,7 @@
       branch: kind === "checkout" && typeof row.branch === "string" ? row.branch : null,
       path: row.path,
       session_id: row.session_id === undefined ? null : row.session_id,
-      repository_key: repositoryKey,
+      repository_key: repositoryKey === undefined ? null : repositoryKey,
     };
   }
 
@@ -67,32 +96,49 @@
   // Read-only and tolerant: a missing or malformed part of the body is empty.
   function rowsIndex(rowsBody) {
     const index = Object.create(null);
-    const body = isObject(rowsBody) ? rowsBody : {};
+    const body = isRecord(rowsBody) ? rowsBody : {};
     const add = (kind, key, row, repositoryKey) => {
       const id = rowKeyId({ [kind]: key });
       if (id !== null) index[id] = indexEntry(kind, key, row, repositoryKey);
     };
     for (const repository of asArray(body.repositories)) {
-      if (!isObject(repository)) continue;
+      if (!isRecord(repository)) continue;
       add("repository", repository.repository_key, repository, repository.repository_key);
       for (const checkout of asArray(repository.checkouts)) {
-        if (!isObject(checkout)) continue;
+        if (!isRecord(checkout)) continue;
         add("checkout", checkout.checkout_key, checkout, checkout.repository_key);
       }
     }
     for (const standalone of asArray(body.standalone)) {
-      if (!isObject(standalone)) continue;
+      if (!isRecord(standalone)) continue;
       add("standalone", standalone.standalone_key, standalone, null);
     }
     return index;
   }
 
-  function rowLabel(rowKey, index) {
+  // One RowKey as { id, kind, key, label, branch, resolved }. A key the index
+  // cannot name is labelled from the key itself ("checkout 8") and marked
+  // unresolved. A name is never guessed.
+  function rowName(rowKey, index) {
     const id = rowKeyId(rowKey);
-    if (id === null) return "unknown row";
-    const entry = isObject(index) ? index[id] : undefined;
-    if (entry && typeof entry.display_name === "string") return entry.display_name;
-    return id.replace(":", " ");
+    if (id === null) {
+      return { id: null, kind: null, key: null, label: "unknown row", branch: null, resolved: false };
+    }
+    const kind = Object.keys(rowKey)[0];
+    const key = rowKey[kind];
+    const entry = isObject(index) && hasOwn(index, id) ? index[id] : null;
+    if (isObject(entry) && typeof entry.display_name === "string" && entry.display_name !== "") {
+      const branch = typeof entry.branch === "string" ? entry.branch : null;
+      return { id, kind, key, label: entry.display_name, branch, resolved: true };
+    }
+    return { id, kind, key, label: `${kind} ${key}`, branch: null, resolved: false };
+  }
+
+  // Every entry of report.rows_removed, named through the index. No input row
+  // is ever dropped from the result, resolved or not.
+  function reportRowNames(report, index) {
+    const rows = isObject(report) ? asArray(report.rows_removed) : [];
+    return rows.map((rowKey) => rowName(rowKey, index));
   }
 
   function targetKind(target) {
@@ -119,14 +165,22 @@
     return parts.join(", ");
   }
 
+  function homeOf(options) {
+    return isObject(options) && typeof options.home === "string" ? options.home : null;
+  }
+
   // A RemovalReport as { title, sections: [{ label, count, lines }] }, in the
   // order of remove_project_confirmation_lines (baude/src/ui.rs:2509). Every
   // value is RAW daemon data. Escaping happens once, in renderConfirmation.
-  function confirmationView(report, index) {
+  // `options.home` shortens paths through tildePath; without it they stay the
+  // absolute paths the daemon sent.
+  function confirmationView(report, index, options) {
     const source = isObject(report) ? report : {};
+    const home = homeOf(options);
     const orNone = (lines) => (lines.length === 0 ? ["none"] : lines);
+    const paths = (list) => list.map((path) => tildePath(path, home));
 
-    const rows = asArray(source.rows_removed);
+    const rows = reportRowNames(source, index);
     const killed = asArray(source.runtimes_killed);
     const deleted = asArray(source.paths_deleted);
     const kept = asArray(source.paths_kept);
@@ -137,7 +191,7 @@
       {
         label: "rows dropped",
         count: rows.length,
-        lines: rows.map((rowKey) => rowLabel(rowKey, index)),
+        lines: rows.map((row) => (row.branch ? `${row.label} ⎇ ${row.branch}` : row.label)),
       },
       {
         label: "runtimes killed",
@@ -147,17 +201,17 @@
           const shell = entry.shell_pid === null || entry.shell_pid === undefined
             ? ""
             : ` shell ${entry.shell_pid}`;
-          return `${rowLabel(entry.row, index)} (pid ${entry.agent_pid}${shell})`;
+          return `${rowName(entry.row, index).label} (pid ${entry.agent_pid}${shell})`;
         })),
       },
-      { label: "paths deleted", count: deleted.length, lines: orNone(deleted.map(String)) },
-      { label: "paths kept", count: kept.length, lines: orNone(kept.map(String)) },
+      { label: "paths deleted", count: deleted.length, lines: orNone(paths(deleted)) },
+      { label: "paths kept", count: kept.length, lines: orNone(paths(kept)) },
     ];
     if (alreadyRemoved.length > 0) {
       sections.push({
         label: "already removed",
         count: alreadyRemoved.length,
-        lines: alreadyRemoved.map(String),
+        lines: paths(alreadyRemoved),
       });
     }
     if (cleared.length > 0) {
@@ -185,12 +239,92 @@
     return `<h3>${escapeHtml(view.title)}</h3>${sections.join("")}`;
   }
 
+  // A /rows body with every row `isGone` names left out. A repository takes
+  // its checkouts with it; a checkout leaves its parent. Returns a new body
+  // with both root keys present as arrays and never mutates its argument:
+  // untouched entries are reused, a parent that lost a child is rebuilt.
+  function filterRows(rowsBody, isGone) {
+    const body = isRecord(rowsBody) ? rowsBody : {};
+    const repositories = [];
+    for (const repository of asArray(body.repositories)) {
+      if (!isRecord(repository)) {
+        repositories.push(repository);
+        continue;
+      }
+      if (isGone({ repository: repository.repository_key })) continue;
+      const checkouts = asArray(repository.checkouts);
+      const kept = checkouts.filter(
+        (checkout) => !(isRecord(checkout) && isGone({ checkout: checkout.checkout_key })),
+      );
+      repositories.push(
+        kept.length === checkouts.length ? repository : { ...repository, checkouts: kept },
+      );
+    }
+    const standalone = asArray(body.standalone).filter(
+      (entry) => !(isRecord(entry) && isGone({ standalone: entry.standalone_key })),
+    );
+    return { ...body, repositories, standalone };
+  }
+
+  // The /rows body with every row named by report.rows_removed absent. A key
+  // the body does not hold changes nothing.
+  function dropRows(rowsBody, report) {
+    const removed = isObject(report) ? asArray(report.rows_removed) : [];
+    return filterRows(rowsBody, (rowKey) => removed.some((gone) => keyEquals(gone, rowKey)));
+  }
+
+  // The raw text of an error response as { report, text }. A 409 is the only
+  // JSON error body the daemon sends and it is a fresh RemovalReport; every
+  // other error is plain text. JSON that is not a report ("null", "42", some
+  // other object) is text to the caller, so it cannot pass for a drift report.
+  function parseDriftBody(bodyText) {
+    const text = String(bodyText);
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (_) {
+      return { report: null, text };
+    }
+    if (isRecord(parsed) && hasOwn(parsed, "rows_removed")) return { report: parsed, text: null };
+    return { report: null, text };
+  }
+
+  // One display string per report.clearing_failures entry. Those happen after
+  // the save and do not fail the removal, so they are reported, not thrown.
+  function clearingFailures(report, options) {
+    const home = homeOf(options);
+    const failures = isObject(report) ? asArray(report.clearing_failures) : [];
+    return failures.map((failure) => {
+      const entry = isObject(failure) ? failure : {};
+      return `${entry.kind} ${tildePath(entry.path, home)}: ${entry.error}`;
+    });
+  }
+
+  // The footer line for a completed removal, counts worded as the TUI's
+  // removal_notice (baude/src/app.rs) words them. Clearing failures are not
+  // folded in; clearingFailures returns those for the caller to show.
+  function removalNotice(report) {
+    const source = isObject(report) ? report : {};
+    const rows = asArray(source.rows_removed).length;
+    const killed = asArray(source.runtimes_killed).length;
+    const deleted = asArray(source.paths_deleted).length;
+    return `removed ${plural(rows, "row", "rows")}, killed ${plural(killed, "runtime", "runtimes")}, `
+      + `deleted ${plural(deleted, "path", "paths")}`;
+  }
+
   const BaudeRemoval = {
     escapeHtml,
+    tildePath,
     rowKeyId,
+    keyEquals,
     rowsIndex,
+    reportRowNames,
     confirmationView,
     renderConfirmation,
+    dropRows,
+    parseDriftBody,
+    clearingFailures,
+    removalNotice,
   };
 
   globalThis.BaudeRemoval = BaudeRemoval;
