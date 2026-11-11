@@ -217,6 +217,59 @@ fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliati
     }
 }
 
+/// The body of `GET /rows`: the daemon's hierarchy, and the authoritative
+/// index from a durable row key to a display name, a path and a live session
+/// id. An object with two arrays and never a bare array, so a third root kind
+/// is additive. The field names are a wire contract read by the PWA and the
+/// TUI remote client; renaming one means touching every caller.
+///
+/// Deliberately absent: any conversation identifier, the owned runtime, the
+/// lifecycle, and any `removable` flag. Removal eligibility is core's, through
+/// the preview report, and a second daemon-computed answer could disagree.
+#[derive(Serialize, Clone)]
+pub struct RowsView {
+    pub repositories: Vec<RepositoryRowView>,
+    pub standalone: Vec<StandaloneRowView>,
+}
+
+/// A repository parent entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct RepositoryRowView {
+    pub repository_key: u64,
+    pub display_name: String,
+    pub path: String,
+    pub health: RepositoryHealth,
+    pub checkouts: Vec<CheckoutRowView>,
+}
+
+/// A checkout child entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct CheckoutRowView {
+    pub checkout_key: u64,
+    /// The parent key repeated, so a flattened client list still finds it.
+    pub repository_key: u64,
+    pub display_name: String,
+    /// The observed branch, verbatim and unnormalized.
+    pub branch: Option<String>,
+    pub path: String,
+    pub role: CheckoutRole,
+    pub managed_by_baude: bool,
+    pub archived: bool,
+    /// The live daemon session id, `None` when the row has no runtime. Equal
+    /// to `SessionInfo::id`, which is the join column to `GET /sessions`.
+    pub session_id: Option<u64>,
+}
+
+/// A standalone root entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct StandaloneRowView {
+    pub standalone_key: u64,
+    pub display_name: String,
+    pub path: String,
+    pub archived: bool,
+    pub session_id: Option<u64>,
+}
+
 /// One row of `GET /sessions`.
 ///
 /// `checkout_key` is deliberately NOT a field here. D-09 was resolved to
@@ -1065,6 +1118,78 @@ impl Manager {
             .iter()
             .find(|saved| saved.key == repository)
             .map(|saved| saved.observed_main_worktree.to_path_buf())
+    }
+
+    /// `GET /rows` — the hierarchy projection. A pure read: it admits nothing,
+    /// allocates no key and saves nothing.
+    pub fn rows(&self) -> RowsView {
+        // The durable rows with live session metadata merged in, the same view
+        // every save writes. `repository_state` alone is stale for a row that
+        // owns a runtime: archiving or renaming a live session reaches it only
+        // at the next save, and an archived row must never read as active.
+        let state = &self.state_for_save();
+        let mut repositories: Vec<&SavedRepository> = state.repositories.iter().collect();
+        repositories.sort_by_key(|repository| repository.first_seen_order);
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| {
+                let mut checkouts: Vec<&SavedCheckout> = state
+                    .checkouts
+                    .iter()
+                    .filter(|checkout| checkout.repository_key == repository.key)
+                    .collect();
+                checkouts.sort_by_key(|checkout| checkout.first_seen_order);
+                let path = repository.observed_main_worktree.to_path_buf();
+                RepositoryRowView {
+                    repository_key: repository.key.get(),
+                    // A root path has no file name; its full form is the name.
+                    display_name: path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    ),
+                    path: path.display().to_string(),
+                    health: repository.health.clone(),
+                    checkouts: checkouts
+                        .into_iter()
+                        .map(|checkout| CheckoutRowView {
+                            checkout_key: checkout.key.get(),
+                            repository_key: checkout.repository_key.get(),
+                            display_name: checkout.session.name.clone(),
+                            branch: checkout.observed_branch.clone(),
+                            path: checkout.observed_path.to_path_buf().display().to_string(),
+                            role: checkout.role,
+                            managed_by_baude: checkout.managed_by_baude,
+                            archived: checkout.session.archived,
+                            session_id: self.session_id_for_checkout(checkout.key),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let mut standalone: Vec<_> = state.standalone_sessions.iter().collect();
+        standalone.sort_by_key(|session| session.first_seen_order);
+        let standalone = standalone
+            .into_iter()
+            .map(|session| StandaloneRowView {
+                standalone_key: session.key.get(),
+                display_name: session.session.name.clone(),
+                path: session.canonical_path.to_path_buf().display().to_string(),
+                archived: session.session.archived,
+                // Not an oversight: the daemon has no standalone runtime
+                // registry yet. 21-10 adds it and fills this in.
+                session_id: None,
+            })
+            .collect();
+        RowsView {
+            repositories,
+            standalone,
+        }
+    }
+
+    /// The live daemon session id of a checkout row, from the same registry
+    /// `POST /removals` resolves runtime handles through.
+    fn session_id_for_checkout(&self, key: CheckoutKey) -> Option<u64> {
+        self.runtime_checkouts.get(&key).copied()
     }
 
     #[cfg(test)]

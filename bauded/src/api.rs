@@ -16,7 +16,9 @@ use serde::Deserialize;
 use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 use baude_core::removal::{RemovalError, RemovalReport, RemovalTarget};
 
-use crate::manager::{lock, MutationError, PermissionView, RemoveRowsError, SessionInfo, Shared};
+use crate::manager::{
+    lock, MutationError, PermissionView, RemoveRowsError, RowsView, SessionInfo, Shared,
+};
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
 pub fn router(state: Shared) -> Router {
@@ -47,6 +49,7 @@ pub fn router(state: Shared) -> Router {
         .route("/sessions/{id}/activity-stream", get(activity_stream))
         .route("/removals/preview", post(preview_removal))
         .route("/removals", post(execute_removal))
+        .route("/rows", get(list_rows))
         .with_state(state)
 }
 
@@ -216,6 +219,12 @@ async fn info(State(state): State<Shared>) -> Json<serde_json::Value> {
 
 async fn list_sessions(State(state): State<Shared>) -> Json<Vec<SessionInfo>> {
     Json(lock(&state).list())
+}
+
+/// `GET /rows` — the hierarchy projection and the key to name index. A read
+/// of owned state cannot fail, and the guard is held across no await.
+async fn list_rows(State(state): State<Shared>) -> Json<RowsView> {
+    Json(lock(&state).rows())
 }
 
 async fn get_session(
@@ -2602,6 +2611,243 @@ mod tests {
             let text = String::from_utf8_lossy(&bytes);
             assert!(text.contains("9999"), "{path}: {text}");
         }
+    }
+
+    /// The field names the `GET /rows` wire contract pins for a repository
+    /// parent entry, sorted.
+    const ROWS_REPOSITORY_FIELDS: [&str; 5] = [
+        "checkouts",
+        "display_name",
+        "health",
+        "path",
+        "repository_key",
+    ];
+
+    /// The field names the wire contract pins for a checkout child entry,
+    /// sorted.
+    const ROWS_CHECKOUT_FIELDS: [&str; 9] = [
+        "archived",
+        "branch",
+        "checkout_key",
+        "display_name",
+        "managed_by_baude",
+        "path",
+        "repository_key",
+        "role",
+        "session_id",
+    ];
+
+    /// `GET /rows` through the router, as the raw response bytes.
+    async fn rows_bytes(app: &Router) -> Vec<u8> {
+        let response = app.clone().oneshot(get("/rows")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    async fn rows_body(app: &Router) -> serde_json::Value {
+        serde_json::from_slice(&rows_bytes(app).await).unwrap()
+    }
+
+    /// An entry carries exactly the pinned names: none missing, and none
+    /// extra, so a conversation identifier cannot ride along unnoticed.
+    fn assert_rows_fields(entry: &serde_json::Value, pinned: &[&str]) {
+        let mut names: Vec<&str> = entry
+            .as_object()
+            .unwrap_or_else(|| panic!("a rows entry is a JSON object: {entry}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, pinned, "{entry}");
+    }
+
+    /// The checkout entry for `key`, searched under every repository parent.
+    fn rows_checkout(rows: &serde_json::Value, key: CheckoutKey) -> Option<serde_json::Value> {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|parent| parent["checkouts"].as_array().unwrap().iter())
+            .find(|entry| entry["checkout_key"] == key.get())
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn rows_projection_names_every_row_by_key() {
+        let fixture = removal_fixture_two_checkouts("rows-names").await;
+        let repo_path = fixture.repo.path().canonicalize().unwrap();
+
+        let rows = rows_body(&fixture.app).await;
+        // Shown on failure, and under --nocapture for a client plan that
+        // wants a real body to copy.
+        println!("GET /rows -> {rows:#}");
+        assert_rows_fields(&rows, &["repositories", "standalone"]);
+
+        let repositories = rows["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{rows}");
+        let parent = &repositories[0];
+        assert_rows_fields(parent, &ROWS_REPOSITORY_FIELDS);
+        assert!(parent["repository_key"].is_u64(), "{parent}");
+        assert_eq!(
+            parent["display_name"],
+            repo_path.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(parent["path"], repo_path.to_str().unwrap());
+        assert_eq!(
+            parent["health"],
+            serde_json::json!({ "status": "available" })
+        );
+
+        let checkouts = parent["checkouts"].as_array().unwrap();
+        assert_eq!(checkouts.len(), 2, "{parent}");
+        let sessions =
+            body_json(fixture.app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        let sessions = sessions.as_array().unwrap();
+        for (id, key) in [
+            (fixture.main_id, fixture.main_key),
+            (fixture.worktree_id, fixture.worktree_key),
+        ] {
+            let entry = checkouts
+                .iter()
+                .find(|entry| entry["checkout_key"] == key.get())
+                .unwrap_or_else(|| panic!("no checkout entry for {key:?}: {parent}"));
+            assert_rows_fields(entry, &ROWS_CHECKOUT_FIELDS);
+            assert_eq!(entry["repository_key"], parent["repository_key"]);
+
+            // The D-09 Option B join, both ways. From the row to the session:
+            // `session_id` names exactly one `/sessions` entry.
+            assert_eq!(entry["session_id"], id, "{entry}");
+            let session = sessions
+                .iter()
+                .find(|session| session["id"] == entry["session_id"])
+                .unwrap_or_else(|| panic!("no /sessions entry for {entry}"));
+            // And from the session back to the row: the key the daemon holds
+            // for that session id is the key the entry carries.
+            let registered = crate::manager::lock(&fixture.shared)
+                .checkout_key_for_runtime_for_test(session["id"].as_u64().unwrap())
+                .expect("a live session is registered under a checkout key");
+            assert_eq!(entry["checkout_key"], registered.get(), "{entry}");
+
+            assert_eq!(entry["display_name"], session["name"], "{entry}");
+            assert!(
+                !entry["display_name"].as_str().unwrap().is_empty(),
+                "{entry}"
+            );
+            assert_eq!(entry["path"], session["cwd"], "{entry}");
+            assert_eq!(entry["archived"], false, "{entry}");
+            assert!(entry["managed_by_baude"].is_boolean(), "{entry}");
+            // Branch and role are served verbatim. Their correctness is
+            // 21-09's, so only presence and type are asserted here.
+            assert!(
+                entry["branch"].is_null() || entry["branch"].is_string(),
+                "branch is a string or null: {entry}"
+            );
+            assert!(entry["role"].is_string(), "role is a string: {entry}");
+        }
+        let main = rows_checkout(&rows, fixture.main_key).unwrap();
+        assert_eq!(main["path"], repo_path.to_str().unwrap());
+        let worktree = rows_checkout(&rows, fixture.worktree_key).unwrap();
+        assert_eq!(worktree["path"], fixture.worktree_path.to_str().unwrap());
+
+        // No standalone session exists on this fixture. 21-10 adds the daemon
+        // standalone registry and extends this with the five standalone names:
+        // standalone_key, display_name, path, archived, session_id.
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// HIGH #6: a parent's children resolve to a key and a name with no live
+    /// session, which is what lets a client render a parent removal report or
+    /// a 409 drift body that names a child it holds no session for.
+    #[tokio::test]
+    async fn rows_parent_lists_children_with_no_live_session() {
+        let fixture = removal_fixture_two_checkouts("rows-no-live").await;
+        let before = rows_checkout(&rows_body(&fixture.app).await, fixture.worktree_key).unwrap();
+        assert_eq!(before["session_id"], fixture.worktree_id);
+
+        let deleted = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/sessions/{}", fixture.worktree_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let rows = rows_body(&fixture.app).await;
+        let parent = &rows["repositories"][0];
+        assert_eq!(parent["checkouts"].as_array().unwrap().len(), 2, "{rows}");
+        let child = rows_checkout(&rows, fixture.worktree_key)
+            .unwrap_or_else(|| panic!("the durable child row is gone: {rows}"));
+        assert_rows_fields(&child, &ROWS_CHECKOUT_FIELDS);
+        assert!(child["session_id"].is_null(), "{child}");
+        assert!(!child["display_name"].as_str().unwrap().is_empty());
+        assert_eq!(child["display_name"], before["display_name"], "{child}");
+        assert_eq!(child["branch"], before["branch"], "{child}");
+        assert_eq!(child["path"], before["path"], "{child}");
+
+        let main = rows_checkout(&rows, fixture.main_key).unwrap();
+        assert_eq!(main["session_id"], fixture.main_id, "{main}");
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// API-03 idempotency: the projection is a pure read. Two successive
+    /// fetches are byte-identical and leave the state file byte-identical.
+    #[tokio::test]
+    async fn rows_projection_is_a_pure_idempotent_read() {
+        let fixture = removal_fixture_two_checkouts("rows-pure").await;
+        let state_file = removal_state_file(&fixture.root, &fixture.workspace);
+        let state_before = std::fs::read(&state_file).unwrap();
+        assert!(!state_before.is_empty());
+
+        let first = rows_bytes(&fixture.app).await;
+        let second = rows_bytes(&fixture.app).await;
+        assert_eq!(
+            first,
+            second,
+            "two reads differ:\n{}\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
+        assert_eq!(std::fs::read(&state_file).unwrap(), state_before);
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// A row the user archived must read as archived on the index, and its
+    /// sibling must not, so a client can tell the two apart.
+    #[tokio::test]
+    async fn rows_reports_an_archived_row_as_archived() {
+        let fixture = removal_fixture_two_checkouts("rows-archived").await;
+        let archived = fixture
+            .app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{}/archive", fixture.worktree_id),
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert!(archived.status().is_success(), "{}", archived.status());
+
+        let rows = rows_body(&fixture.app).await;
+        let child = rows_checkout(&rows, fixture.worktree_key).unwrap();
+        assert_eq!(child["archived"], true, "{child}");
+        let main = rows_checkout(&rows, fixture.main_key).unwrap();
+        assert_eq!(main["archived"], false, "{main}");
+
+        removal_teardown(&fixture.shared, &fixture.root);
     }
 }
 
