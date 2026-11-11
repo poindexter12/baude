@@ -2,14 +2,14 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase: 20
-current_phase_name: TUI Remove Action
+current_phase: 21
+current_phase_name: Daemon and PWA Parity
 status: executing
 stopped_at: Completed 21-01-PLAN.md
-last_updated: "2026-11-11T21:00:29.499Z"
-last_activity: 2026-11-04
-last_activity_desc: Phase 20 execution started
-state_head: 79e4f45ed0123e39744951f48882bfc0764efc9d
+last_updated: "2026-11-11T21:01:13.126Z"
+last_activity: 2026-11-11
+last_activity_desc: Phase 21 execution started
+state_head: cdda945e599fd79fa1245cf444a831e4b5198a2f
 progress:
   total_phases: 5
   completed_phases: 1
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-11-03)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 20 — TUI Remove Action
+**Current focus:** Phase 21 — Daemon and PWA Parity
 
 ## Current Position
 
-Phase: 20 (TUI Remove Action) — EXECUTING
-Plan: 2 of 4
-Status: Ready to execute
-Last activity: 2026-11-04 — Phase 20 execution started
+Phase: 21 (Daemon and PWA Parity) — EXECUTING
+Plan: 2 of 11
+Status: Executing Phase 21
+Last activity: 2026-11-11 — Phase 21 execution started
 
 
 ## Performance Metrics
