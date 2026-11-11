@@ -1192,6 +1192,18 @@ impl Manager {
         self.runtime_checkouts.get(&key).copied()
     }
 
+    /// The stored `observed_branch` of the checkout with `key`, the full ref
+    /// the state file is written from, so a test can assert it without
+    /// parsing the state file's layout.
+    #[cfg(test)]
+    pub(crate) fn stored_observed_branch_for_test(&self, key: CheckoutKey) -> Option<String> {
+        self.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .and_then(|checkout| checkout.observed_branch.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn checkout_key_for_runtime_for_test(&self, id: u64) -> Option<CheckoutKey> {
         self.runtime_checkouts
@@ -1453,6 +1465,34 @@ impl Manager {
         Ok(activation.outcome(Some(id)))
     }
 
+    /// The role a newly admitted checkout row is stored with.
+    ///
+    /// `Main` when all three hold: git discovery succeeded for the session's
+    /// working directory, the discovered worktree is the repository's main
+    /// worktree, and no checkout row of that repository already holds
+    /// `Main`. `ManagedBranch` in every other case, including a directory
+    /// git discovery returned nothing for. The third condition is required,
+    /// not cosmetic: `RepositoryState::validate` rejects a second `Main` in
+    /// one repository, so a second plain session on the same main checkout
+    /// would otherwise fail every later save. `PrimaryDefault` is never
+    /// assigned here.
+    fn admitted_checkout_role(
+        &self,
+        repository_key: RepositoryKey,
+        snapshot: Option<&git::RepositorySnapshot>,
+    ) -> CheckoutRole {
+        let is_main_worktree = snapshot
+            .is_some_and(|snapshot| snapshot.selected_worktree.path == snapshot.main_worktree);
+        let main_role_taken = self.repository_state.checkouts.iter().any(|checkout| {
+            checkout.repository_key == repository_key && checkout.role == CheckoutRole::Main
+        });
+        if is_main_worktree && !main_role_taken {
+            CheckoutRole::Main
+        } else {
+            CheckoutRole::ManagedBranch
+        }
+    }
+
     fn record_checkout_intent(
         &mut self,
         cwd: &Path,
@@ -1496,12 +1536,13 @@ impl Manager {
             });
             key
         };
+        let role = self.admitted_checkout_role(repository_key, snapshot.as_ref());
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
         self.repository_state.checkouts.push(SavedCheckout::new(
             checkout_key,
             repository_key,
-            CheckoutRole::ManagedBranch,
+            role,
             is_worktree,
             PersistedPath::from_path(cwd),
             snapshot
@@ -1771,12 +1812,13 @@ impl Manager {
                 key
             }
         };
+        let role = self.admitted_checkout_role(repository_key, snapshot.as_ref());
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
         self.repository_state.checkouts.push(SavedCheckout::new(
             checkout_key,
             repository_key,
-            CheckoutRole::ManagedBranch,
+            role,
             session.is_worktree,
             PersistedPath::from_path(&session.cwd),
             snapshot

@@ -1453,26 +1453,108 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// End a fixture runtime the way a crashed agent does, by signalling its
+    /// process from outside, and wait until the daemon reports the session
+    /// as exited. Restart refuses a session whose agent is still running, so
+    /// a restart test over a live fixture would get its 409 for that reason
+    /// and prove nothing about the branch.
+    async fn exit_fixture_runtime(fixture: &TwoCheckoutFixture, id: u64, key: CheckoutKey) {
+        let report = preview_report(&fixture.app, key).await;
+        let pid = previewed_agent_pid(&report, key);
+        assert!(Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::manager::lock(&fixture.shared)
+            .info(id)
+            .unwrap()
+            .status
+            != "exited"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "runtime {pid} never read as exited"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A managed worktree row is pinned to its branch, so a restart after a
+    /// real branch switch in that worktree is refused and nothing moves.
+    /// Until 21-09 this ran on a main checkout, which the daemon mis-roled as
+    /// `managed_branch`; the subject is now a row that is pinned by design.
     #[tokio::test]
     async fn restart_api_refuses_checkout_branch_change() {
-        let root =
-            std::env::temp_dir().join(format!("bauded-api-restart-branch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let fixture = initialized_repo(&root, "repo");
-        let repo = fixture.path().to_path_buf();
-        let (state, id) = exited_tracked_manager(&repo);
-        git(&repo, &["checkout", "-b", "changed"]);
+        let fixture = removal_fixture_two_checkouts("restart-pinned").await;
+        let app = &fixture.app;
+        let stored = crate::manager::lock(&fixture.shared)
+            .stored_observed_branch_for_test(fixture.worktree_key);
+        exit_fixture_runtime(&fixture, fixture.worktree_id, fixture.worktree_key).await;
+        git(&fixture.worktree_path, &["checkout", "-b", "changed"]);
+        let before = rows_body(app).await["repositories"][0]["checkouts"].clone();
 
-        let response = super::router(Arc::clone(&state))
-            .oneshot(post_json(&format!("/sessions/{id}/restart"), ""))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let (status, body) = removal_call(
+            app,
+            &format!("/sessions/{}/restart", fixture.worktree_id),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert!(
+            !body.contains("still running"),
+            "the refusal must be about the branch, not a live agent: {body}"
+        );
+        assert!(body.contains("BranchChanged"), "body={body}");
+
+        // The refusal records the repository as unavailable, which is the
+        // one thing allowed to move; both checkout rows read as they did.
+        assert_eq!(rows_body(app).await["repositories"][0]["checkouts"], before);
         assert_eq!(
-            crate::manager::lock(&state).info(id).unwrap().status,
+            crate::manager::lock(&fixture.shared)
+                .stored_observed_branch_for_test(fixture.worktree_key),
+            stored
+        );
+        assert_eq!(
+            crate::manager::lock(&fixture.shared)
+                .info(fixture.worktree_id)
+                .unwrap()
+                .status,
             "exited"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// A main checkout follows its branch: after a real `git switch` in the
+    /// main checkout, restart is accepted and the stored observed branch is
+    /// the new branch's full ref, read back from the fixture.
+    #[tokio::test]
+    async fn restart_api_follows_a_branch_switch_on_a_main_checkout() {
+        let fixture = removal_fixture_two_checkouts("restart-follows").await;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        exit_fixture_runtime(&fixture, fixture.main_id, fixture.main_key).await;
+        git(&main_path, &["switch", "-c", "changed"]);
+        let expected = git_read(&main_path, &["symbolic-ref", "-q", "HEAD"])
+            .expect("the main checkout sits on a branch");
+        assert_ne!(
+            crate::manager::lock(&fixture.shared).stored_observed_branch_for_test(fixture.main_key),
+            Some(expected.clone()),
+            "the switch must be something the daemon has not yet observed"
+        );
+
+        let (status, body) = removal_call(
+            &fixture.app,
+            &format!("/sessions/{}/restart", fixture.main_id),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+        assert_eq!(
+            crate::manager::lock(&fixture.shared).stored_observed_branch_for_test(fixture.main_key),
+            Some(expected)
+        );
+        removal_teardown(&fixture.shared, &fixture.root);
     }
 
     #[cfg(unix)]
@@ -2938,6 +3020,215 @@ mod tests {
 
             removal_teardown(&shared, &root);
         }
+    }
+
+    /// Trimmed stdout of a git read in `dir`, or `None` when git exits
+    /// non-zero. Reads go through this and not `git`, which asserts success,
+    /// because a non-zero exit is an expected answer for a detached HEAD.
+    fn git_read(dir: &Path, args: &[&str]) -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap().trim().to_string())
+    }
+
+    /// The `/rows` checkout entry whose `session_id` is `id`. D-09 Option B:
+    /// a client joins `/rows` to a created session on `session_id`.
+    fn rows_checkout_for_session(rows: &serde_json::Value, id: u64) -> serde_json::Value {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|parent| parent["checkouts"].as_array().unwrap().iter())
+            .find(|entry| entry["session_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no /rows checkout carries session_id {id}: {rows}"))
+    }
+
+    /// `POST` a JSON body to a removal route, returning the status and the
+    /// raw body, which is JSON on 200 and 409 and plain text otherwise.
+    async fn removal_call(
+        app: &Router,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> (StatusCode, String) {
+        let res = app
+            .clone()
+            .oneshot(post_json(path, &body.to_string()))
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Preview a removal target, asserting 200, and return the report.
+    async fn preview_target(app: &Router, target: &serde_json::Value) -> serde_json::Value {
+        let (status, body) = removal_call(app, "/removals/preview", target).await;
+        assert_eq!(status, StatusCode::OK, "preview {target}: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// The paths a report lists under `field`, as strings.
+    fn report_paths(report: &serde_json::Value, field: &str) -> Vec<String> {
+        report[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// `rows_removed` without its last element, sorted by JSON text so two
+    /// reports compare as sets.
+    fn child_rows(report: &serde_json::Value) -> Vec<String> {
+        let rows = report["rows_removed"].as_array().unwrap();
+        let mut children: Vec<String> = rows[..rows.len() - 1]
+            .iter()
+            .map(|row| row.to_string())
+            .collect();
+        children.sort();
+        children
+    }
+
+    #[tokio::test]
+    async fn row_kinds_repository_parent_drops_three_rows_in_one_save() {
+        let fixture = removal_fixture_two_checkouts("kinds-parent").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        let worktree_path = fixture.worktree_path.canonicalize().unwrap();
+
+        // Role pin, first, so it is what goes red.
+        let rows = rows_body(app).await;
+        let main_row = rows_checkout_for_session(&rows, fixture.main_id);
+        let worktree_row = rows_checkout_for_session(&rows, fixture.worktree_id);
+        assert_eq!(main_row["path"], main_path.to_str().unwrap());
+        assert_eq!(
+            main_row["role"], "main",
+            "21-09 role pin: the checkout at the repository path was served as {}",
+            main_row["role"]
+        );
+        assert_eq!(main_row["managed_by_baude"], false);
+        assert_eq!(worktree_row["role"], "managed_branch", "{worktree_row}");
+        assert_eq!(worktree_row["managed_by_baude"], true);
+
+        let worktree_branch = git_read(&worktree_path, &["symbolic-ref", "--short", "-q", "HEAD"])
+            .expect("the managed worktree sits on a branch");
+        let repository_key = main_row["repository_key"].clone();
+        let main_key = main_row["checkout_key"].clone();
+        let worktree_key = worktree_row["checkout_key"].clone();
+        let target = serde_json::json!({ "repository": repository_key });
+        let mut expected_children = vec![
+            serde_json::json!({ "checkout": main_key }).to_string(),
+            serde_json::json!({ "checkout": worktree_key }).to_string(),
+        ];
+        expected_children.sort();
+
+        // Preview.
+        let preview = preview_target(app, &target).await;
+        assert_eq!(
+            preview["rows_removed"].as_array().unwrap().last().unwrap(),
+            &target,
+            "{preview}"
+        );
+        assert_eq!(child_rows(&preview), expected_children, "{preview}");
+        let deleted = report_paths(&preview, "paths_deleted");
+        assert_eq!(deleted.len(), 1, "{preview}");
+        assert_eq!(
+            Path::new(&deleted[0]).canonicalize().unwrap(),
+            worktree_path
+        );
+        assert!(
+            report_paths(&preview, "paths_kept")
+                .iter()
+                .any(|kept| Path::new(kept).canonicalize().unwrap() == main_path),
+            "{preview}"
+        );
+        assert_eq!(
+            preview["persistence"],
+            serde_json::json!({ "outcome": "planned" })
+        );
+
+        let state_file = removal_state_file(&fixture.root, &fixture.workspace);
+        let before = std::fs::read(&state_file).unwrap();
+
+        // Execute, echoing the previewed report verbatim.
+        let (status, body) = removal_call(app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], preview["rows_removed"]);
+        assert_eq!(executed["paths_deleted"], preview["paths_deleted"]);
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+        let killed = executed["runtimes_killed"].as_array().unwrap();
+        assert_eq!(killed.len(), 2, "{executed}");
+        let mut killed_rows: Vec<String> = killed.iter().map(|k| k["row"].to_string()).collect();
+        killed_rows.sort();
+        assert_eq!(killed_rows, expected_children);
+
+        // The world afterwards.
+        let after_rows = rows_body(app).await;
+        assert!(
+            after_rows["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|parent| parent["repository_key"] != repository_key),
+            "{after_rows}"
+        );
+        let sessions = app
+            .clone()
+            .oneshot(Request::get("/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let sessions = body_json(sessions).await;
+        for id in [fixture.main_id, fixture.worktree_id] {
+            assert!(
+                sessions
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|session| session["id"] != id),
+                "{sessions}"
+            );
+        }
+        for entry in killed {
+            let pid = entry["agent_pid"].as_u64().unwrap();
+            assert!(wait_for_pid_gone(pid), "agent {pid} outlived the removal");
+        }
+        assert!(!worktree_path.exists(), "{}", worktree_path.display());
+        assert!(main_path.is_dir());
+        assert!(git_read(&main_path, &["rev-parse", "--git-dir"]).is_some());
+        let branch_ref = format!("refs/heads/{worktree_branch}");
+        assert!(
+            git_read(
+                &main_path,
+                &["show-ref", "--verify", "--quiet", &branch_ref]
+            )
+            .is_some(),
+            "the local branch {branch_ref} must survive a repository removal"
+        );
+
+        // One save, and it survives a fresh restore.
+        assert_ne!(std::fs::read(&state_file).unwrap(), before);
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&fixture.root, &fixture.workspace), 0);
+        assert_eq!(restored.list().len(), 0);
+        for key in [fixture.main_key, fixture.worktree_key] {
+            assert!(matches!(
+                restored.preview_removal(RemovalTarget::Checkout(key)),
+                Err(RemovalError::UnknownTarget(_))
+            ));
+        }
+        assert!(restored.rows().repositories.is_empty());
+
+        removal_teardown(&fixture.shared, &fixture.root);
     }
 }
 
