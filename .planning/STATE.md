@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-02-PLAN.md
-last_updated: "2026-11-11T21:10:34.139Z"
+stopped_at: Completed 21-07-PLAN.md
+last_updated: "2026-11-11T21:25:43.917Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: b49e2d7ed16b6f7a9510035fafb9db00147552e2
+state_head: 79860eace628e2da17958c1c1bd7953310678853
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 21
+  completed_plans: 22
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 3 of 11
+Plan: 4 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -119,6 +119,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 19 P07 | 50 min | 2 tasks | 1 files |
 | Phase 21 P01 | 11min | 3 tasks | 2 files |
 | Phase 21 P02 | 7 min | 3 tasks | 2 files |
+| Phase 21 P07 | 13min | 4 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -281,6 +282,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: D-09 Option B: checkout_key is served only from GET /rows, clients join on session_id, SessionInfo gains no field
 - [Phase 21]: Manager::rows projects over state_for_save, the merged view, because raw repository_state reports an archived live session as not archived
 - [Phase 21]: Removing a repository's last checkout leaves an empty parent in GET /rows; clients must render or hide a childless parent deliberately
+- [Phase 21]: 21-07: tildePath copies the TUI plain string prefix strip, quirk included, so both clients shorten a path the same way
+- [Phase 21]: 21-07: dropRows and applySnapshot share one walk and one match rule, rowKeyId, so the local drop and the later snapshot arbitration cannot disagree
+- [Phase 21]: 21-07: a tombstone keeps its first stamp and expires after 60 s, so a duplicate report is a no-op and a client cannot permanently hide a row
+- [Phase 21]: 21-07: the PWA node suites run first in gate.sh, gate.sh --linux and the ci.yml check job through scripts/check-web-suites.sh, outside the isolated bracket
 
 ### Pending Todos
 
@@ -363,8 +368,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-11T21:10:33.897Z
-Stopped at: Completed 21-02-PLAN.md
+Last session: 2026-11-11T21:25:43.666Z
+Stopped at: Completed 21-07-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
