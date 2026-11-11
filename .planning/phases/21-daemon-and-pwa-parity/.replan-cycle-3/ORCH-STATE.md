@@ -118,3 +118,10 @@ REMAINING: 21-03 -> 21-04 -> 21-05 || 21-08 -> 21-06 -> 21-11
 CARRY: /stream has NO existing test (only activity_stream_guards_known_and_unknown at api.rs:1551).
 SURFACE TO JOE: API-02 readings - only POST /removals publishes; missed events converge by polling /rows; no ordering vs POST response; silent lag.
 IN FLIGHT: 21-03. NEXT: 21-05 || 21-08 -> 21-06 -> 21-11
+
+21-03 DONE (3 tasks, autonomous, files manager.rs+api.rs, threats T-21-39..47).
+STATUS TABLE lives in 21-03-PLAN.md: 404 target missing/already executed (plain text); 409 fresh report JSON; 500 RuntimeSurvived/DiskRemoval/IdentityMismatch/Validation; 503 RuntimeHandleMissing/Persist/Blocked/Busy; 200 saved_degraded; 400 admission refused. Blocked(503) beats not-found(404).
+21-05 and 21-08 were dispatched BEFORE the 404 was known -> checker/revision must confirm both handle 404 (row already gone = treat as removed).
+CARRY: removal.rs committed-replacement arm at :1041; fail_next_agent_teardown_for_test at manager.rs:2528. Outline 200-bogus-paths wording impossible as written (paths_deleted is compared) - 21-03 planned the intended property.
+SURFACE TO JOE: row behind a missing runtime handle has no REST path out (503 forever until daemon state changes), accepted as T-21-45.
+IN FLIGHT: 21-05, 21-08, 21-04 revision. NEXT: 21-06 -> 21-11 -> resolve 21-02 checkpoint to B -> checker.
