@@ -150,3 +150,36 @@ REMAINING, in order:
  3. plan-phase steps 13-15 (STATE/ROADMAP update, next-up). STATE.md has an uncommitted diff and 21-VALIDATION.md + .review-diagnostics/ are untracked.
  4. Then /gsd-execute-phase 21 can run autonomously; human stops only at 21-11 human-verify.
 Do NOT re-run plan-phase --reviews from step 0.
+
+## CHECK PASS STARTED 2026-11-11 11:05 PST (Joe: keep going until all 11 planned and checked)
+Running: resolver for 21-02 D-09=B + 21-01/21-02 verify-joiner fix (edits 21-01, 21-02, 21-CONTEXT; uncommitted until it returns). Checker lanes: A daemon 21-09/10/03/04; B PWA 21-07/05; C TUI+gate 21-08/06/11. STILL TO RUN: lane D 21-01/21-02 after resolver commits.
+Then: one gsd-planner revision agent per plan with ISSUES (give it the checker issue list verbatim), re-check only revised plans, max 3 rounds; then steps 13-15.
+
+## CHECK ROUND 1 RESULTS 2026-11-11 11:08 PST
+All 3 checker lanes reported (each ran out of context; gaps listed below).
+Revisions dispatched, NOT yet committed: 21-07, 21-05 (PWA blockers: keyEquals undefined, verbatim error text, D-13 Escape/backdrop), 21-09+21-03 (D-09 wording, standalone runtime-survived case, RED verify, api.rs:965 anchor), 21-04 (removals_ filter, mutant log), 21-08 (BLOCKER: Timeouts private + no drop-connection reply for 21-06 tests; RED verify), 21-11 (step 11 TUI remote parent unexecutable; R2 live sessions). Resolver for 21-02 D-09=B + 21-01/21-02 fmt-verify fix still running.
+AFTER revisions land: verify.plan-structure each, commit each, then ROUND 2 re-check of changed plans only. Round 2 must also cover gaps round 1 skipped: (a) 21-REVIEWS HIGH/MEDIUM ledger sweep + anchor spot-checks for 21-09/21-10/21-03/21-04, (b) 21-05 status handling vs 21-03 table, (c) 21-01 + 21-02 as their own lane, (d) Nyquist/VALIDATION dimension for 21-08/21-06/21-11. Max 3 rounds total.
+Then steps 13-15: STATE/ROADMAP update, commit 21-VALIDATION.md.
+
+ROUND 1 REVISIONS COMMITTED 11:15 PST: 21-01/02 (99b9652), 21-04 (f4fca95, 8461cbc), 21-09+03 (489eef4), 21-07+11 (8461cbc), 21-08+06 (this commit). 21-05 revision STILL RUNNING. 21-03 now has 14 matrix tests (21-04 precondition updated). 21-07 needs Node>=20; node absent from ci.yml and gate.sh. Round 2 extra item: 21-11 step 11 assumes a checkout row stays listed after PWA kill - confirm in source.
+
+ROUND 2 STARTED 11:16 PST. All round-1 revisions committed incl 21-05. Round-2 lanes running: 21-01+02, 21-09+10, 21-03+04, 21-08+06+11. PWA lane (21-07+05) dispatched after 21-05 commit. Carry-over fixes for round-2 revision: 21-11 needs manual steps for Escape and backdrop-tap closing the PWA confirmation with row still listed; 21-06:145-148 and :486 say PWA register share is open - now stale, 21-05 implements it.
+
+ROUND 2 RESULTS 11:18 PST. gsd-plan-checker agents exhaust context at ~60k tokens: give each ONE narrow question, or use general-purpose for audits.
+Lanes back: 21-01+02 ISSUES (RED in final verify BLOCKER, fixture pin, ten-vs-nine fields, outline rows) -> revision running. 21-03+04 partial (seam session(id) for standalone, MATRIX -eq 14) -> small-fixes agent running (also 21-06 stale PWA-register text). 21-07 PASS; 21-05 ISSUES (no saved_degraded 200 handling BLOCKER, 503-before-404, no pass floor) -> revision running. 21-08 PASS, 21-06 PASS on names. 21-11 -> revision running (verify step 11 vs source, Escape/backdrop steps, Node>=20, pass-count in command).
+STILL OPEN: (1) 21-09+10 lane not back. (2) general-purpose ledger sweep of 21-REVIEWS for 21-03/21-04 running. (3) 21-VALIDATION.md has ZERO rows naming 21-06/21-08/21-11 - needs reconciling with all 11 plans (untracked file from an earlier cycle) - NOT yet dispatched. (4) After these land: commit each, then ROUND 3 (final) = narrow confirmations only of round-2 blockers.
+
+11:19 PST: committed 5d8e14c (21-03 seam fact, 21-04 MATRIX -eq 14, 21-06 stale text). 21-09+10 PASS, 21-07 PASS, 21-08 PASS, ledger sweep 21-03/04 clean. RUNNING, uncommitted when they land: revise 21-01+02 (+outline), revise 21-05 (+21-07 line 521), revise 21-11. TODO after: structure-check+commit each; reconcile untracked 21-VALIDATION.md with all 11 plans then commit it; ROUND 3 narrow confirmations (21-01/02 RED moved, 21-05 saved_degraded test, 21-11 step 11); then STATE/ROADMAP update. Do NOT execute phase 21 until round 3 is clean.
+
+11:21 PST: 21-05+21-07 round-2 revision committed. Round 3 must confirm 21-05 floors (T1>=6,T2>=33,T3>=59) match actual test counts and fails_when texts.
+
+11:22 PST: 21-11 round-2 revision committed (17 manual steps; step 13 drift verified vs manager.rs:1810-1817 gives 409). 21-11 floor: PASS>=20 and >= SUMMARY sum; 21-05 now has floors 6/33/59 - round 3 should make 21-11 consistent. ONLY 21-01+02 revision still running.
+
+11:24 PST: 21-01+02+outline round-2 revision committed. ALL round-2 revisions committed. Fixture helper: removal_fixture_two_checkouts -> TwoCheckoutFixture, worktree branch topic (round 3: confirm 21-02/21-09/21-10 use that name). NEXT: VALIDATION reconcile, round 3, STATE/ROADMAP.
+
+## 12:13 PST ROUND 3 DISPATCHED (Joe: "and?")
+All round-2 revisions committed through 3788925. Two background general-purpose agents running: (a) rewrite 21-VALIDATION.md for the 11 plans, uncommitted when done; (b) read-only round-3 audit, 8 narrow questions (RED gates in verify, fixture name removal_fixture_two_checkouts across 02/09/10/03/04, 21-05 floors 6/33/59, 21-11 pass-floor file, pipe-judged verdicts, nested parens, stale D-09 text, wave/file graph).
+NEXT: commit 21-VALIDATION.md; fix any round-3 offenders with one narrow gsd-planner each (this is the LAST allowed round, so remaining issues go to Joe, not a round 4); then STATE.md + ROADMAP update (steps 13-15), commit STATE.md and .review-diagnostics/. Do NOT execute Phase 21 until round 3 is clean.
+
+## 12:20 PST ROUND 3 CLOSED
+Round 3 offenders fixed and committed: 06f6a74, cf17846, 7752640; validation map 8850d8e. All 11 plans valid. Clean: wave graph, nested parens, piped verdicts, pass floors (6/33/59), fixture name, D-09 text, RED verifies now read recorded status. ROADMAP plan list rewritten for 11 plans. NOT done by any round: checking each named test asserts what its ledger row claims; 21-VALIDATION.md stays draft, nyquist_compliant false. NEXT: Joe reviews open decisions, then /gsd-execute-phase 21.

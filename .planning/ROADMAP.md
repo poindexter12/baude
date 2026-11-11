@@ -173,15 +173,20 @@ Plans:
   2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
   3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
 
-**Plans**: 6 plans
+**Plans**: 0/11 plans executed
 
 Plans:
-- [ ] 21-01-PLAN.md — Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout row
-- [ ] 21-02-PLAN.md — GET /rows hierarchy with core keys, checkout_key on sessions, repository/standalone/main kinds, suppression lift on daemon admission
-- [ ] 21-03-PLAN.md — Failure posture over REST: 409 drift with fresh report, 500 and 503 with handles restored, echoed paths never trusted
-- [ ] 21-04-PLAN.md — Daemon-wide GET /events SSE stream publishing rows_removed after the durable save
-- [ ] 21-05-PLAN.md — PWA remove on all four row kinds with a report-backed modal, 409 re-render, retry, and live row drops on /events
-- [ ] 21-06-PLAN.md — TUI D on remote rows through the daemon with the shared modal, plus the remote /events subscriber and repository gates
+- [ ] 21-01-PLAN.md — Wave 1. Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout
+- [ ] 21-02-PLAN.md — Wave 2. GET /rows hierarchy with core keys; checkout_key served from /rows only and joined on session_id, per D-09
+- [ ] 21-07-PLAN.md — Wave 3. PWA pure removal module with node tests
+- [ ] 21-09-PLAN.md — Wave 3. Repository parent and main checkout row kinds over the removal routes, role admission and branch projection on /rows
+- [ ] 21-10-PLAN.md — Wave 4. Standalone folder rows through real admission, runtime custody and suppression lift
+- [ ] 21-03-PLAN.md — Wave 5. Drift and failure status matrix over REST: 404, 409 with fresh report, 500, 503 and the saved_degraded 200
+- [ ] 21-04-PLAN.md — Wave 6. Daemon-wide GET /events SSE stream publishing rows_removed after the durable save
+- [ ] 21-05-PLAN.md — Wave 7. PWA removal controller and report-backed modal on all row kinds, 409 re-render and live row drops on /events
+- [ ] 21-08-PLAN.md — Wave 7. TUI remote client: off-thread removal requests, /rows index and /events subscriber in remote.rs
+- [ ] 21-06-PLAN.md — Wave 8. TUI D on remote rows through the daemon with the shared modal
+- [ ] 21-11-PLAN.md — Wave 9. Phase gate: host and Linux gates, both node suites and the 17-step manual check
 
 ### Phase 22: Validation and v2.8.0 Release
 
