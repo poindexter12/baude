@@ -95,3 +95,15 @@ corrected against source by the 21-07 planner. Do not re-issue the bad values:
 rowsIndex, confirmationView, renderConfirmation, tildePath, reportRowNames,
 dropRows, parseDriftBody, clearingFailures, removalNotice, keyEquals,
 tombstone, pruneTombstones, applySnapshot. 21-05 is controller/wiring only.
+
+## DECISION 2026-11-11 07:33 PST: D-09 = OPTION B (Joe)
+checkout_key served ONLY from /rows; clients join on session_id; bauded/src/api.rs:1002-1010 test stays unchanged.
+Tell every remaining chunk. After chunks land and before plan-checker: resolve the 21-02 Task 1 checkpoint:decision to B in 21-02-PLAN.md and record in 21-CONTEXT.md.
+
+## 2026-11-11 PROGRESS
+21-09 DONE (3 tasks, autonomous, files manager.rs+api.rs, threats T-21-24..29; next plan numbers from T-21-30).
+verify form that works: gsd_run query verify.plan-structure <plan path>
+CARRY TO CHECKER: 21-01 and 21-02 end fmt/clippy verify with `test $FMT -eq 0; test $CLIPPY -eq 0` (exit is clippy only) -> must be &&.
+CARRY: CheckoutRole::ManagedBranch literal is at bauded/src/manager.rs:1113 (not :1110), second at :1388.
+SURFACE TO JOE (non-blocking): heal pre-existing main rows stored as managed_branch at restore? 21-09 does not.
+REMAINING: 21-10 -> 21-03 -> 21-04 -> 21-05 -> 21-08 -> 21-06 -> 21-11
