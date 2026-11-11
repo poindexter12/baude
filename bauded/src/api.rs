@@ -2809,6 +2809,567 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// The command `recording_folder_fixture` hands its daemon for `root`.
+    fn recording_agent_cmd(root: &Path) -> String {
+        format!("sh {}", root.join("agent.sh").display())
+    }
+
+    /// `folder_fixture` with an agent double that records every launch. The
+    /// command is `sh` followed by `agent.sh` in the test root; the script
+    /// appends its whole argument list as one line to `launches.log` in that
+    /// root and then replaces itself with `sleep 30`. It accepts every
+    /// argument the daemon appends, so a continuation launch is recorded and
+    /// not refused. Tests read the log to learn how many launches happened
+    /// and whether two of them were given the same arguments.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn recording_folder_fixture(
+        label: &str,
+    ) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+        let (root, owner, folder, workspace, _plain_shared, _plain_app) = folder_fixture(label);
+        let root_text = root.to_str().unwrap();
+        assert!(
+            !root_text.contains(char::is_whitespace) && !root_text.contains('\''),
+            "the recording agent command is spliced unquoted: {root_text}"
+        );
+        std::fs::write(
+            root.join("agent.sh"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec sleep 30\n",
+                root.join("launches.log").display()
+            ),
+        )
+        .unwrap();
+        let shared: Shared = Arc::new(Mutex::new(Manager::new(recording_agent_cmd(&root), true)));
+        crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+        let app = super::router(Arc::clone(&shared));
+        (root, owner, folder, workspace, shared, app)
+    }
+
+    /// The lines of `launches.log`, read once at least `expected` launches
+    /// are recorded or the five second bound has passed. The agent double
+    /// writes its line a moment after the daemon reports the launch.
+    fn launch_lines(root: &Path, expected: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let lines: Vec<String> = std::fs::read_to_string(root.join("launches.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.len() >= expected || Instant::now() >= deadline {
+                return lines;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// A second persisting daemon over the same root and command, restored
+    /// from the state file the first one wrote. The first instance is neither
+    /// dropped nor asked to end anything first: its agent process is still
+    /// alive when this one restores, which is the state a crashed daemon
+    /// leaves. Callers `std::mem::forget` the first instance at their end.
+    fn restarted_daemon(root: &Path, workspace: &Workspace, cmd: &str) -> (Shared, Router) {
+        let mut manager = Manager::new(cmd.to_string(), true);
+        manager.persist_at_for_test(root, workspace, None);
+        manager.restore_at(root, workspace);
+        let shared: Shared = Arc::new(Mutex::new(manager));
+        let app = super::router(Arc::clone(&shared));
+        (shared, app)
+    }
+
+    /// `POST /sessions` for a folder, returning the status and the raw body.
+    async fn open_folder(app: &Router, repo: &str, name: Option<&str>) -> (StatusCode, String) {
+        let mut body = serde_json::json!({ "repo": repo });
+        if let Some(name) = name {
+            body["name"] = serde_json::json!(name);
+        }
+        removal_call(app, "/sessions", &body).await
+    }
+
+    /// Open `folder` as a new session, asserting 201, and return its id.
+    async fn opened_folder_id(app: &Router, folder: &Path) -> u64 {
+        let (status, body) = open_folder(app, folder.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// The single standalone entry `/rows` serves, with no repository row.
+    async fn only_standalone_row(app: &Router) -> serde_json::Value {
+        let rows = rows_body(app).await;
+        assert_eq!(rows["repositories"], serde_json::json!([]), "{rows}");
+        let entries = rows["standalone"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{rows}");
+        entries[0].clone()
+    }
+
+    fn standalone_key_of(entry: &serde_json::Value) -> u64 {
+        entry["standalone_key"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("standalone_key is a JSON number: {entry}"))
+    }
+
+    /// The agent pid of the one runtime a report plans to kill or killed.
+    fn only_runtime_pid(report: &serde_json::Value) -> u64 {
+        let runtimes = report["runtimes_killed"].as_array().unwrap();
+        assert_eq!(runtimes.len(), 1, "{report}");
+        runtimes[0]["agent_pid"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the runtime names its agent pid: {report}"))
+    }
+
+    async fn delete_session_status(app: &Router, id: u64) -> (StatusCode, String) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/sessions/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn assert_folder_untouched(folder: &Path) {
+        assert!(folder.is_dir(), "{} is gone", folder.display());
+        assert_eq!(
+            std::fs::read(folder.join("todo.txt")).unwrap(),
+            FOLDER_TODO_BYTES
+        );
+    }
+
+    /// Custody on close. `DELETE /sessions/{id}` on a folder session ends the
+    /// runtime and keeps the row, closed; a daemon restart does not relaunch
+    /// it; and the closed row is removed with nothing left to kill.
+    #[tokio::test]
+    async fn standalone_closed_row_stays_closed_across_a_restart_and_is_removable() {
+        let (root, _owner, folder, workspace, shared, app) =
+            recording_folder_fixture("standalone-closed");
+        let id = opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(agent_pid));
+        assert_eq!(launch_lines(&root, 1).len(), 1);
+
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["session_id"], serde_json::Value::Null, "{entry}");
+
+        // The custody pin, asserted next so it is what goes red.
+        let (status, body) = removal_call(&app, "/removals/preview", &row).await;
+        let nothing_to_kill = status == StatusCode::OK
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|report| report["runtimes_killed"].as_array().cloned())
+                .is_some_and(|runtimes| runtimes.is_empty());
+        assert!(
+            nothing_to_kill,
+            "21-10 custody pin: a closed folder row records no runtime, but its preview \
+             returned {status}: {body}"
+        );
+
+        let (restarted, restarted_app) =
+            restarted_daemon(&root, &workspace, &recording_agent_cmd(&root));
+        let entry = only_standalone_row(&restarted_app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["session_id"], serde_json::Value::Null, "{entry}");
+        assert_eq!(session_ids(&restarted_app).await, Vec::<u64>::new());
+        let launches = launch_lines(&root, 1);
+        assert_eq!(launches.len(), 1, "{launches:?}");
+
+        let preview = preview_target(&restarted_app, &row).await;
+        let (status, body) = removal_call(&restarted_app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+        assert_eq!(executed["runtimes_killed"], serde_json::json!([]));
+        assert_folder_untouched(&folder);
+        let rows = rows_body(&restarted_app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+
+        std::mem::forget((shared, app));
+        removal_teardown(&restarted, &root);
+    }
+
+    /// Custody across a daemon restart. The first daemon's agent is still
+    /// alive when the second restores: the second ends it by its recorded
+    /// identity, relaunches the row under the same key as a continuation and
+    /// keeps the archive flag, and the relaunched row is removable.
+    #[tokio::test]
+    async fn standalone_restart_tears_down_the_recorded_runtime_and_relaunches() {
+        let (root, _owner, folder, workspace, shared, app) =
+            recording_folder_fixture("standalone-restart");
+        let id = opened_folder_id(&app, &folder).await;
+        let (status, body) = removal_call(
+            &app,
+            &format!("/sessions/{id}/archive"),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let first_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(first_pid));
+        assert_eq!(launch_lines(&root, 1).len(), 1);
+
+        let (restarted, restarted_app) =
+            restarted_daemon(&root, &workspace, &recording_agent_cmd(&root));
+        assert!(
+            wait_for_pid_gone(first_pid),
+            "the restart left the first daemon's agent running"
+        );
+        let entry = only_standalone_row(&restarted_app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["archived"], serde_json::json!(true), "{entry}");
+        assert!(
+            entry["session_id"].as_u64().is_some(),
+            "21-10 custody pin: a folder session that was live at the restart is relaunched \
+             under its row, but /rows served: {entry}"
+        );
+
+        let preview = preview_target(&restarted_app, &row).await;
+        let second_pid = only_runtime_pid(&preview);
+        assert_ne!(second_pid, first_pid);
+        assert!(pid_is_alive(second_pid));
+        let (status, body) = removal_call(&restarted_app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(only_runtime_pid(&executed), second_pid);
+        assert!(wait_for_pid_gone(second_pid));
+        assert_folder_untouched(&folder);
+        let rows = rows_body(&restarted_app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+
+        // The first launch was fresh and the second was a continuation.
+        let launches = launch_lines(&root, 2);
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert_ne!(launches[0], launches[1], "{launches:?}");
+
+        std::mem::forget((shared, app));
+        removal_teardown(&restarted, &root);
+    }
+
+    /// One row per folder. A repeated `POST /sessions` for a live folder is
+    /// the same session; for a closed folder it reopens the same row.
+    #[tokio::test]
+    async fn standalone_reposting_a_folder_reuses_its_row() {
+        let (root, _owner, folder, _workspace, shared, app) =
+            recording_folder_fixture("standalone-repost");
+        let id = opened_folder_id(&app, &folder).await;
+        let first = only_standalone_row(&app).await;
+        let key = standalone_key_of(&first);
+        let admitted_name = first["display_name"].clone();
+
+        // The same folder, spelled through a parent hop.
+        let respelled = format!("{}/notes/../notes", root.display());
+        let (status, body) = open_folder(&app, &respelled, Some("renamed by a repost")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let reposted: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reposted["id"].as_u64(), Some(id), "{reposted}");
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["display_name"], admitted_name, "{entry}");
+        assert_eq!(session_ids(&app).await, vec![id]);
+        let launches = launch_lines(&root, 1);
+        assert_eq!(launches.len(), 1, "{launches:?}");
+
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = open_folder(&app, folder.to_str().unwrap(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "21-10 custody pin: a closed folder row is reopened by a new POST /sessions, but \
+             the daemon answered: {body}"
+        );
+        let reopened_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["session_id"].as_u64(), Some(reopened_id), "{entry}");
+        assert_eq!(entry["display_name"], admitted_name, "{entry}");
+        assert_eq!(session_ids(&app).await, vec![reopened_id]);
+        let launches = launch_lines(&root, 2);
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert_ne!(launches[0], launches[1], "{launches:?}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The restart route on a folder session whose agent died under the
+    /// user. The relaunch stays owned by the row, so the row is removable.
+    #[tokio::test]
+    async fn standalone_restart_route_keeps_the_row_removable() {
+        let (root, _owner, folder, _workspace, shared, app) =
+            recording_folder_fixture("standalone-restart-route");
+        let id = opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let ended_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(ended_pid));
+        assert_eq!(launch_lines(&root, 1).len(), 1);
+
+        // End the agent from outside, the way it dies under a user.
+        let killed = Command::new("kill")
+            .arg(ended_pid.to_string())
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        assert!(wait_for_pid_gone(ended_pid));
+
+        // Restart refuses a session whose agent the daemon has not yet seen
+        // exit; repeat until that refusal is over.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (status, body) = loop {
+            let (status, body) = removal_call(
+                &app,
+                &format!("/sessions/{id}/restart"),
+                &serde_json::json!({}),
+            )
+            .await;
+            if status != StatusCode::CONFLICT || Instant::now() >= deadline {
+                break (status, body);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(status.is_success(), "restart answered {status}: {body}");
+
+        // The session id is read back; it is never assumed unchanged.
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        let restarted_id = entry["session_id"].as_u64();
+        assert!(
+            restarted_id.is_some(),
+            "21-10 custody pin: a restarted folder session stays owned by its row, but /rows \
+             served: {entry}"
+        );
+        assert_eq!(session_ids(&app).await, vec![restarted_id.unwrap()]);
+
+        let preview = preview_target(&app, &row).await;
+        let relaunched_pid = only_runtime_pid(&preview);
+        assert_ne!(relaunched_pid, ended_pid);
+        assert!(pid_is_alive(relaunched_pid));
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(only_runtime_pid(&executed), relaunched_pid);
+        assert!(wait_for_pid_gone(relaunched_pid));
+        assert_folder_untouched(&folder);
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// A folder deleted by hand while the daemon was down. The row is still
+    /// served and still removable, and removal recreates nothing.
+    #[tokio::test]
+    async fn standalone_row_whose_folder_vanished_is_still_removable() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("standalone-vanished");
+        let folder_text = folder.to_str().unwrap().to_string();
+        opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let first_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(first_pid));
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        let (restarted, restarted_app) = restarted_daemon(&root, &workspace, REMOVAL_AGENT_CMD);
+        assert!(
+            wait_for_pid_gone(first_pid),
+            "the restart left the first daemon's agent running"
+        );
+        let entry = only_standalone_row(&restarted_app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["path"].as_str(), Some(folder_text.as_str()));
+        assert_eq!(
+            entry["session_id"],
+            serde_json::Value::Null,
+            "21-10 custody pin: a row whose folder vanished is served closed, but /rows \
+             served: {entry}"
+        );
+
+        let preview = preview_target(&restarted_app, &row).await;
+        assert_eq!(preview["runtimes_killed"], serde_json::json!([]));
+        assert_eq!(
+            report_paths(&preview, "paths_deleted"),
+            Vec::<String>::new()
+        );
+        let (status, body) = removal_call(&restarted_app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+        let rows = rows_body(&restarted_app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        assert!(!folder.exists(), "removal recreated {}", folder.display());
+
+        std::mem::forget((shared, app));
+        removal_teardown(&restarted, &root);
+    }
+
+    /// Two executes of one previewed standalone report contend on the manager
+    /// mutex; exactly one commits and only it reports the kill.
+    #[tokio::test]
+    async fn standalone_concurrent_removals_of_one_folder_commit_once() {
+        let (root, _owner, folder, workspace, shared, app) =
+            folder_fixture("standalone-concurrent");
+        opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let preview = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&preview);
+        assert!(pid_is_alive(agent_pid));
+        let body = preview.to_string();
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(post_json("/removals", &body)),
+            app.clone().oneshot(post_json("/removals", &body)),
+        );
+        let mut outcomes = Vec::new();
+        for response in [first.unwrap(), second.unwrap()] {
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            outcomes.push((status, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        let winners = outcomes.iter().filter(|(status, _)| *status == 200).count();
+        assert_eq!(winners, 1, "exactly one removal commits: {outcomes:?}");
+        for (status, text) in &outcomes {
+            let reports_a_kill = serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|value| value["runtimes_killed"].as_array().cloned())
+                .is_some_and(|killed| !killed.is_empty());
+            assert_eq!(reports_a_kill, *status == 200, "{outcomes:?}");
+        }
+
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_folder_untouched(&folder);
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert!(restored.rows().standalone.is_empty());
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The standalone sibling of `delete_teardown_failure_is_500_and_unknown_id_stays_404`.
+    /// A folder session whose agent refuses to stop answers 500, keeps its
+    /// session and its row, and is closed by the retry.
+    #[tokio::test]
+    async fn standalone_delete_teardown_failure_is_500_and_is_retryable() {
+        let (root, _owner, folder, _workspace, shared, app) =
+            folder_fixture("standalone-teardown-failure");
+        let id = opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "21-10 custody pin: a folder session whose teardown fails answers 500: {body}"
+        );
+        assert!(body.contains("agent stop refused once"), "body={body}");
+        assert_eq!(
+            session_ids(&app).await,
+            vec![id],
+            "a failed teardown must keep the session"
+        );
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+
+        // The failure is retryable: the next DELETE closes it for real.
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(wait_for_pid_gone(agent_pid));
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_of(&entry), key);
+        assert_eq!(entry["session_id"], serde_json::Value::Null, "{entry}");
+        let preview = preview_target(&app, &row).await;
+        assert_eq!(preview["runtimes_killed"], serde_json::json!([]));
+        // The closed session's id is unknown from then on.
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The standalone sibling of the `DELETE` step of
+    /// `real_atomic_persistence_failures_are_503_for_every_mutation`. A save
+    /// that never replaced the file refuses the close before anything is
+    /// ended; a save that replaced it but could not confirm durability ends
+    /// the runtime and still answers 503.
+    #[tokio::test]
+    async fn standalone_delete_persistence_failure_is_503() {
+        use baude_core::persist::{self, AtomicFailure};
+
+        for (failure, committed, label) in [
+            (AtomicFailure::Rename, false, "standalone-503-rename"),
+            (AtomicFailure::DirectorySync, true, "standalone-503-sync"),
+        ] {
+            let (root, _owner, folder, workspace, shared, app) = folder_fixture(label);
+            let id = opened_folder_id(&app, &folder).await;
+            let key = standalone_key_of(&only_standalone_row(&app).await);
+            let row = serde_json::json!({ "standalone": key });
+            let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+            crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, Some(failure));
+
+            let (status, body) = delete_session_status(&app, id).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "21-10 custody pin: DELETE /sessions/{{id}} on a folder session under \
+                 {failure:?}: {body}"
+            );
+            assert_eq!(
+                crate::manager::lock(&shared).info(id).is_none(),
+                committed,
+                "{failure:?}"
+            );
+            let retained = persist::load_current_at(&root, &workspace.state_file("daemon-state"))
+                .unwrap()
+                .state;
+            assert_eq!(retained.standalone_sessions.len(), 1, "{failure:?}");
+            assert_eq!(
+                retained.standalone_sessions[0].owned_runtime().is_some(),
+                !committed,
+                "{failure:?}"
+            );
+            let entry = only_standalone_row(&app).await;
+            assert_eq!(standalone_key_of(&entry), key);
+            if committed {
+                assert!(wait_for_pid_gone(agent_pid), "{failure:?}");
+                assert_eq!(entry["session_id"], serde_json::Value::Null, "{entry}");
+            } else {
+                assert!(pid_is_alive(agent_pid), "{failure:?}");
+                assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+                // With the disk healthy again the same close goes through.
+                crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+                let (status, body) = delete_session_status(&app, id).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+                assert!(wait_for_pid_gone(agent_pid), "{failure:?}");
+            }
+
+            removal_teardown(&shared, &root);
+        }
+    }
+
     /// API-01 concurrency edge. Both requests carry the same previewed report
     /// and contend on the manager mutex; whichever loses must find the row
     /// already gone. The fresh restore at the end is what witnesses that no
