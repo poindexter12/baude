@@ -183,3 +183,11 @@ NEXT: commit 21-VALIDATION.md; fix any round-3 offenders with one narrow gsd-pla
 
 ## 12:20 PST ROUND 3 CLOSED
 Round 3 offenders fixed and committed: 06f6a74, cf17846, 7752640; validation map 8850d8e. All 11 plans valid. Clean: wave graph, nested parens, piped verdicts, pass floors (6/33/59), fixture name, D-09 text, RED verifies now read recorded status. ROADMAP plan list rewritten for 11 plans. NOT done by any round: checking each named test asserts what its ledger row claims; 21-VALIDATION.md stays draft, nyquist_compliant false. NEXT: Joe reviews open decisions, then /gsd-execute-phase 21.
+
+## 12:46 PST Joe: add node suites to gate, then execute. 21-07 Task 4 adds scripts/check-web-suites.sh to gate.sh + ci.yml (setup-node, node 26) and node into the baude-gate image for --linux. Committed. EXECUTION STARTING via /gsd-execute-phase 21. Planning is DONE; resume execution with /gsd-execute-phase 21 (it skips plans that have a SUMMARY).
+
+## 2026-11-11 12:47 PST execution start
+
+- worktree.base-check: shouldDegrade=true, HEAD c052a9d differs from origin/HEAD cf64ade. Per the workflow, isolation forced to none for this run; executors run sequentially on the main tree on branch gsd/phase-18-shared-kill-then-remove-lifecycle. config use_worktrees stays true.
+- Parallel waves 3 and 7 therefore run one plan at a time: 21-07 then 21-09; 21-05 then 21-08.
+- Resume: /gsd-execute-phase 21 skips plans that have a SUMMARY.
