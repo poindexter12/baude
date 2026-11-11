@@ -107,3 +107,8 @@ CARRY TO CHECKER: 21-01 and 21-02 end fmt/clippy verify with `test $FMT -eq 0; t
 CARRY: CheckoutRole::ManagedBranch literal is at bauded/src/manager.rs:1113 (not :1110), second at :1388.
 SURFACE TO JOE (non-blocking): heal pre-existing main rows stored as managed_branch at restore? 21-09 does not.
 REMAINING: 21-10 -> 21-03 -> 21-04 -> 21-05 -> 21-08 -> 21-06 -> 21-11
+
+21-10 DONE (3 tasks, autonomous, files manager.rs+api.rs tests, threats T-21-30..38; next from T-21-39). D-09=B.
+CARRY: record_checkout_intent is at bauded/src/manager.rs:1065 (not :1073).
+SURFACE TO JOE: 21-10 behaviour change - second POST /sessions on a live folder returns the live session (one standalone row per canonical path) and a closed folder row resumes instead of starting fresh; stored legacy folder rows not migrated; discovery errors other than not-a-repo now refuse.
+REMAINING: 21-03 -> 21-04 -> 21-05 || 21-08 -> 21-06 -> 21-11
