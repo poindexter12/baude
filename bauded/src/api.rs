@@ -2849,6 +2849,96 @@ mod tests {
 
         removal_teardown(&fixture.shared, &fixture.root);
     }
+
+    /// D-09 Option B: a removal report names rows by key only. Holding
+    /// nothing but the key a report carries, a client resolves a label
+    /// through `GET /rows` alone, with no `/sessions` read and no join.
+    #[tokio::test]
+    async fn rows_resolves_a_label_for_a_key_with_no_sessions_field() {
+        let fixture = removal_fixture_two_checkouts("rows-label").await;
+        let report = preview_report(&fixture.app, fixture.worktree_key).await;
+        let removed = report["rows_removed"].as_array().unwrap();
+        assert_eq!(removed.len(), 1, "{report}");
+        let key = &removed[0]["checkout"];
+        assert!(key.is_u64(), "a report names a row by a bare key: {report}");
+
+        let rows = rows_body(&fixture.app).await;
+        let entry = rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|parent| parent["checkouts"].as_array().unwrap().iter())
+            .find(|entry| &entry["checkout_key"] == key)
+            .unwrap_or_else(|| panic!("key {key} from {report} has no entry in {rows}"));
+        assert!(
+            !entry["display_name"].as_str().unwrap().is_empty(),
+            "{entry}"
+        );
+        assert_eq!(
+            entry["path"],
+            fixture.worktree_path.to_str().unwrap(),
+            "{entry}"
+        );
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// API-03 concurrency: a read racing a removal sees the projection from
+    /// before the removal or from after it, never a half-applied one, because
+    /// both handlers take the one manager mutex. Both candidates are observed
+    /// bodies. No sleep forces an ordering: the mutex is what is under test.
+    ///
+    /// The two requests are joined on the test thread, since the fixture's
+    /// containment redirect is thread-local and a worker thread would escape
+    /// it. Each join order runs once, so neither is the only one exercised.
+    #[tokio::test]
+    async fn rows_concurrent_with_a_removal_is_never_half_applied() {
+        for read_first in [true, false] {
+            let label = if read_first {
+                "rows-race-read"
+            } else {
+                "rows-race-removal"
+            };
+            let (root, _fixture, _workspace, shared, app, _id, key) = removal_fixture(label).await;
+            let report = preview_report(&app, key).await;
+            let before = rows_body(&app).await;
+            assert!(rows_checkout(&before, key).is_some(), "{before}");
+
+            let read = app.clone().oneshot(get("/rows"));
+            let removal = app
+                .clone()
+                .oneshot(post_json("/removals", &report.to_string()));
+            let (read, removal) = if read_first {
+                tokio::join!(read, removal)
+            } else {
+                let (removal, read) = tokio::join!(removal, read);
+                (read, removal)
+            };
+            let read = read.unwrap();
+            let removal = removal.unwrap();
+            assert_eq!(removal.status(), StatusCode::OK);
+            assert_eq!(read.status(), StatusCode::OK);
+            let raced = body_json(read).await;
+
+            let after = rows_body(&app).await;
+            assert!(rows_checkout(&after, key).is_none(), "{after}");
+            assert_ne!(before, after);
+            println!(
+                "{label}: the raced read saw the {} projection\nbefore: {before}\nafter: {after}",
+                if raced == before {
+                    "pre-removal"
+                } else {
+                    "post-removal"
+                }
+            );
+            assert!(
+                raced == before || raced == after,
+                "{label}: a read racing a removal saw a third shape\nraced: {raced}\nbefore: {before}\nafter: {after}"
+            );
+
+            removal_teardown(&shared, &root);
+        }
+    }
 }
 
 #[cfg(test)]
