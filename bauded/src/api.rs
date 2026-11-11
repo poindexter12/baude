@@ -870,6 +870,21 @@ mod tests {
         );
     }
 
+    /// A real repository with one commit under `root`, with no redirect of its
+    /// own: for a test that already holds a scope and needs a path git reports
+    /// as a repository, so the admitted row is a checkout.
+    fn committed_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
     /// A fixture repository together with the redirect that contains it.
     ///
     /// The redirect is thread-local and drops with this value, so the owner must
@@ -1245,8 +1260,12 @@ mod tests {
                 &workspace,
                 Some(failure),
             );
+            let create_repo = committed_repo(&create_root);
             let response = super::router(Arc::clone(&create_state))
-                .oneshot(post_json("/sessions", r#"{"repo":"/tmp"}"#))
+                .oneshot(post_json(
+                    "/sessions",
+                    &serde_json::json!({ "repo": create_repo }).to_string(),
+                ))
                 .await
                 .unwrap();
             assert_status(
@@ -1277,7 +1296,11 @@ mod tests {
             let delete_id = {
                 let mut manager = crate::manager::lock(&delete_state);
                 manager.persist_at_for_test(&delete_root, &workspace, None);
-                let id = manager.create("/tmp", None, None).unwrap().id;
+                let repo = committed_repo(&delete_root);
+                let id = manager
+                    .create(repo.to_str().unwrap(), None, None)
+                    .unwrap()
+                    .id;
                 manager.persist_at_for_test(&delete_root, &workspace, Some(failure));
                 id
             };
@@ -1317,7 +1340,11 @@ mod tests {
             let archive_id = {
                 let mut manager = crate::manager::lock(&archive_state);
                 manager.persist_at_for_test(&archive_root, &workspace, None);
-                let id = manager.create("/tmp", None, None).unwrap().id;
+                let repo = committed_repo(&archive_root);
+                let id = manager
+                    .create(repo.to_str().unwrap(), None, None)
+                    .unwrap()
+                    .id;
                 manager.persist_at_for_test(&archive_root, &workspace, Some(failure));
                 id
             };
@@ -1429,7 +1456,11 @@ mod tests {
         let id = {
             let mut manager = crate::manager::lock(&state);
             manager.persist_at_for_test(&root, &workspace, None);
-            let id = manager.create("/tmp", None, None).unwrap().id;
+            let repo = committed_repo(&root);
+            let id = manager
+                .create(repo.to_str().unwrap(), None, None)
+                .unwrap()
+                .id;
             manager.fail_next_agent_teardown_for_test(id, "agent stop refused once");
             id
         };
@@ -2585,6 +2616,194 @@ mod tests {
         assert!(matches!(
             restored.preview_removal(RemovalTarget::Checkout(key)),
             Err(RemovalError::UnknownTarget(_))
+        ));
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The bytes `folder_fixture` writes to `todo.txt`, read back after a
+    /// removal to prove the folder's contents were left alone.
+    const FOLDER_TODO_BYTES: &[u8] = b"water the ferns\ncall the plumber\n";
+
+    /// What a user really has when they open a plain folder: a directory
+    /// `notes` that is not a git repository, holding `todo.txt`, behind a
+    /// persisting daemon whose state file lives under the returned root. No
+    /// row is seeded. Returns the root, the redirect owner, the canonicalized
+    /// folder, the workspace, the shared manager and the router.
+    #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
+                  to a named local that outlives every handler await"]
+    fn folder_fixture(label: &str) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+        let root = removal_root(label);
+        // Root first, identity second, the order `initialized_repo_in_workspace`
+        // acquires them in.
+        let redirect = baude_core::testing::TestRedirect::new(&root);
+        let identity = baude_core::workspace::override_for_test(
+            &baude_core::persist::Config {
+                workspace: Some("claude".to_string()),
+                ..baude_core::persist::Config::default()
+            },
+            None,
+        );
+        let folder = root.join("notes");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("todo.txt"), FOLDER_TODO_BYTES).unwrap();
+        let folder = folder.canonicalize().unwrap();
+
+        // Precondition, asked of git and not assumed: a temp directory that
+        // happens to sit inside a repository fails here, loudly, and never
+        // reaches the wrong admission route.
+        let probe = Command::new("git")
+            .arg("-C")
+            .arg(&folder)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            !probe.status.success(),
+            "the fixture folder {} sits inside a git repository",
+            folder.display()
+        );
+        assert!(
+            stderr.starts_with("fatal: not a git repository"),
+            "git refused {} for another reason: {stderr}",
+            folder.display()
+        );
+
+        let owner = FixtureRepo {
+            repo: folder.clone(),
+            _identity: identity,
+            _redirect: redirect,
+        };
+        let (workspace, shared, app) = removal_daemon(&root);
+        (root, owner, folder, workspace, shared, app)
+    }
+
+    /// 21-10 tracer. A plain folder opened over `POST /sessions` is one
+    /// standalone row with a live runtime; the two removal routes remove the
+    /// row and end the runtime, and the folder and its contents stay.
+    #[tokio::test]
+    async fn standalone_folder_session_is_removed_end_to_end() {
+        let (root, owner, folder, workspace, shared, app) = folder_fixture("standalone-e2e");
+        assert_eq!(owner.path(), folder.as_path());
+        let folder_text = folder.to_str().unwrap().to_string();
+
+        let created = app
+            .clone()
+            .oneshot(post_json(
+                "/sessions",
+                &serde_json::json!({ "repo": folder_text }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let id = body_json(created).await["id"].as_u64().unwrap();
+
+        // The standalone pin, asserted first so it is what goes red.
+        let rows = rows_body(&app).await;
+        let pinned = rows["repositories"].as_array().is_some_and(Vec::is_empty)
+            && rows["standalone"]
+                .as_array()
+                .is_some_and(|entries| entries.len() == 1);
+        assert!(
+            pinned,
+            "21-10 standalone pin: a plain folder is exactly one standalone row and no \
+             repository row, but /rows served: {rows}"
+        );
+        let entry = &rows["standalone"][0];
+        assert_rows_fields(
+            entry,
+            &[
+                "archived",
+                "display_name",
+                "path",
+                "session_id",
+                "standalone_key",
+            ],
+        );
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+        assert_eq!(entry["path"].as_str(), Some(folder_text.as_str()));
+        assert_eq!(entry["archived"], serde_json::json!(false));
+        let key = entry["standalone_key"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("standalone_key is a JSON number: {entry}"));
+        let row = serde_json::json!({ "standalone": key });
+
+        // D-09 Option B: `/sessions` lists the session and carries no row key.
+        let sessions = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        let listed = sessions.as_array().unwrap();
+        assert_eq!(listed.len(), 1, "{sessions}");
+        assert_eq!(listed[0]["id"].as_u64(), Some(id));
+        assert!(
+            listed[0].get("standalone_key").is_none() && listed[0].get("checkout_key").is_none(),
+            "{sessions}"
+        );
+
+        // Preview.
+        let preview = preview_target(&app, &row).await;
+        assert_eq!(preview["rows_removed"], serde_json::json!([row]));
+        assert_eq!(
+            report_paths(&preview, "paths_deleted"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report_paths(&preview, "paths_kept"),
+            vec![folder_text.clone()]
+        );
+        let planned = preview["runtimes_killed"].as_array().unwrap();
+        assert_eq!(planned.len(), 1, "{preview}");
+        assert_eq!(planned[0]["row"], row, "{preview}");
+        assert_eq!(
+            preview["persistence"],
+            serde_json::json!({ "outcome": "planned" })
+        );
+        assert!(
+            preview["cleared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["kind"] != "suppression_added"),
+            "{preview}"
+        );
+        let agent_pid = planned[0]["agent_pid"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the planned runtime names its agent pid: {preview}"));
+        assert!(pid_is_alive(agent_pid));
+
+        // Execute, echoing the previewed report verbatim.
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], preview["rows_removed"]);
+        let killed = executed["runtimes_killed"].as_array().unwrap();
+        assert_eq!(killed.len(), 1, "{executed}");
+        assert_eq!(killed[0]["row"], row, "{executed}");
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+
+        // The world afterwards.
+        assert!(wait_for_pid_gone(agent_pid));
+        assert!(folder.is_dir());
+        assert_eq!(
+            std::fs::read(folder.join("todo.txt")).unwrap(),
+            FOLDER_TODO_BYTES
+        );
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        assert_eq!(rows["repositories"], serde_json::json!([]), "{rows}");
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert_eq!(restored.list().len(), 0);
+        let restored_rows = restored.rows();
+        assert!(restored_rows.standalone.is_empty());
+        assert!(restored_rows.repositories.is_empty());
+        assert!(!baude_core::suppression::is_suppressed(
+            &baude_core::persist::config_dir(),
+            &folder
         ));
 
         removal_teardown(&shared, &root);
