@@ -127,3 +127,7 @@ SURFACE TO JOE: row behind a missing runtime handle has no REST path out (503 fo
 IN FLIGHT: 21-05, 21-08, 21-04 revision. NEXT: 21-06 -> 21-11 -> resolve 21-02 checkpoint to B -> checker.
 
 21-04 REVISED (reconciled with 21-03 seams, 404 silence test added, keep-alive 15s sourced from axum-0.8.9 sse.rs:524-527, tokio sync transitively via hyper so Cargo edit kept as explicit declaration, wire contract unchanged). Not done: estimate calibration.
+
+21-05 DONE (3 tasks, autonomous; new bauded/web/removal-controller.js + tests/removal-controller.test.js, app.js, style.css, index.html, sw.js, web.rs; handles 404 as gone). Planner skipped CONTEXT/RESEARCH/PATTERNS/21-04 reads -> CHECKER must confirm D-14/D-15/D-16 citations, the POST /removals/preview request body, and tower/http-body-util dep table.
+SURFACE TO JOE: daemon serves no home dir so PWA paths render unshortened (home:null); accept or add home field to /rows in 21-02.
+IN FLIGHT: 21-08. NEXT: 21-06 (depends 21-08; chunk prompt pattern = see git show of this session: pointer to PLANNER-CONTEXT.md + outline row + settled facts D-09=B, status table in 21-03, /events contract above, threat range T-21-80..89, context-budget warning, report <150 words) -> 21-11 (threats T-21-90+) -> resolve 21-02 checkpoint to B + record in 21-CONTEXT.md -> gsd-plan-checker over all 11 (max 3 revision rounds) -> plan-phase steps 13-15.
