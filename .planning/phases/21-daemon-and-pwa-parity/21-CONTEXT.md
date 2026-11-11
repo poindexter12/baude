@@ -27,6 +27,7 @@ The same kill-then-remove operation that Phase 18 built in `baude-core` and Phas
 
 ### PWA Row Reach and Hierarchy
 - **D-09:** Add a read-only `GET /rows` hierarchy projection (repository → checkouts, plus standalone roots) carrying core keys, and extend `SessionInfo` with its `checkout_key`. The flat `/sessions` array stays a non-hierarchical compatibility projection (Phase 7 decision), so the existing test `flat_session_api_remains_a_non_hierarchical_compatibility_projection` keeps passing.
+  - **Resolution (2026-11-11, user): Option B.** `checkout_key` is served ONLY from `GET /rows`; clients join on `session_id`; the `/sessions` forbidden-field test at `bauded/src/api.rs:1002-1010` stays unchanged and keeps passing. `SessionInfo` is not extended.
 - **D-10:** The PWA offers remove on all four kinds: a repository group header removes every child; each checkout/worktree row and each standalone row removes itself. A row with no durable key shows no remove.
 - **D-11:** `bauded` admission is wired through the same `baude-core` suppression helper the TUI uses (19 D-11) in this phase, since the daemon now removes rows and must not re-admit them. The suppression write rule is inherited unchanged (19 D-10: entry only for a checkout removed while its repository row remains).
 - **D-12:** The TUI's remote-row refusal becomes a real action: `D` on a remote row calls the daemon's preview and execute endpoints and renders the same modal from the returned report, with the same recheck and failure posture.
