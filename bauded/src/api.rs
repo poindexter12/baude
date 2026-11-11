@@ -2473,6 +2473,78 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// API-01 concurrency edge. Both requests carry the same previewed report
+    /// and contend on the manager mutex; whichever loses must find the row
+    /// already gone. The fresh restore at the end is what witnesses that no
+    /// partial state is readable: core leaves the state untouched on a
+    /// failure and persists with one atomic save.
+    #[tokio::test]
+    async fn removals_concurrent_execute_of_the_same_row_commits_once() {
+        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("concurrent").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        assert!(pid_is_alive(agent_pid));
+        let body = report.to_string();
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(post_json("/removals", &body)),
+            app.clone().oneshot(post_json("/removals", &body)),
+        );
+        let mut outcomes = Vec::new();
+        for response in [first.unwrap(), second.unwrap()] {
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            outcomes.push((status, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        outcomes.sort();
+        let statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
+        assert!(
+            statuses == [200, 404] || statuses == [200, 409],
+            "one removal must win and the other must find the row gone: {outcomes:?}"
+        );
+
+        // One kill: the process is gone, and only the winner reports it.
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        let kills_reported = outcomes
+            .iter()
+            .filter(|(_, text)| {
+                serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .and_then(|value| value["runtimes_killed"].as_array().cloned())
+                    .is_some_and(|killed| !killed.is_empty())
+            })
+            .count();
+        assert_eq!(kills_reported, 1, "{outcomes:?}");
+        let winner: serde_json::Value = serde_json::from_str(&outcomes[0].1).unwrap();
+        assert_eq!(winner["planned"], false);
+        assert_eq!(
+            winner["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+
+        // One save: a second kill would have reported a survived runtime and
+        // a second persist would have left an error behind.
+        {
+            let manager = crate::manager::lock(&shared);
+            let status = manager.persistence_status();
+            assert_eq!(status.error, None);
+            assert!(!status.dirty);
+            assert!(manager.info(id).is_none());
+            assert_eq!(manager.checkout_key_for_runtime_for_test(id), None);
+        }
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_preview_leaves_the_state_file_untouched() {
         let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("preview").await;
