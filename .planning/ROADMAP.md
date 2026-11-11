@@ -173,11 +173,11 @@ Plans:
   2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
   3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
 
-**Plans**: 1/11 plans executed
+**Plans**: 2/11 plans executed
 
 Plans:
 - [x] 21-01-PLAN.md — Wave 1. Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout
-- [ ] 21-02-PLAN.md — Wave 2. GET /rows hierarchy with core keys; checkout_key served from /rows only and joined on session_id, per D-09
+- [x] 21-02-PLAN.md — Wave 2. GET /rows hierarchy with core keys; checkout_key served from /rows only and joined on session_id, per D-09
 - [ ] 21-07-PLAN.md — Wave 3. PWA pure removal module with node tests
 - [ ] 21-09-PLAN.md — Wave 3. Repository parent and main checkout row kinds over the removal routes, role admission and branch projection on /rows
 - [ ] 21-10-PLAN.md — Wave 4. Standalone folder rows through real admission, runtime custody and suppression lift

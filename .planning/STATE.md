@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-01-PLAN.md
-last_updated: "2026-11-11T21:01:13.126Z"
+stopped_at: Completed 21-02-PLAN.md
+last_updated: "2026-11-11T21:10:34.139Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: cdda945e599fd79fa1245cf444a831e4b5198a2f
+state_head: b49e2d7ed16b6f7a9510035fafb9db00147552e2
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 20
+  completed_plans: 21
   percent: 20
 ---
 
@@ -30,8 +30,8 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 2 of 11
-Status: Executing Phase 21
+Plan: 3 of 11
+Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
 
@@ -118,6 +118,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 19 P06 | 2 sessions | 3 tasks | 2 files |
 | Phase 19 P07 | 50 min | 2 tasks | 1 files |
 | Phase 21 P01 | 11min | 3 tasks | 2 files |
+| Phase 21 P02 | 7 min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -277,6 +278,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: removal_fixture and removal_fixture_two_checkouts are async and the two-checkout repository has a real bare origin, because the daemon refuses a managed worktree in a git init only repository
 - [Phase 21]: The removal save closure merges live survivor metadata into a copy of core's candidate through merge_live_runtime_metadata, the one merge state_for_save also uses
 - [Phase 21]: A repeated POST /removals for an already removed checkout answers 404, observed in the concurrency test
+- [Phase 21]: D-09 Option B: checkout_key is served only from GET /rows, clients join on session_id, SessionInfo gains no field
+- [Phase 21]: Manager::rows projects over state_for_save, the merged view, because raw repository_state reports an archived live session as not archived
+- [Phase 21]: Removing a repository's last checkout leaves an empty parent in GET /rows; clients must render or hide a childless parent deliberately
 
 ### Pending Todos
 
@@ -359,8 +363,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-11T21:00:29.254Z
-Stopped at: Completed 21-01-PLAN.md
+Last session: 2026-11-11T21:10:33.897Z
+Stopped at: Completed 21-02-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
