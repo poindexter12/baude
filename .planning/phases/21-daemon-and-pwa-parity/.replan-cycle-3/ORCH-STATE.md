@@ -125,3 +125,5 @@ STATUS TABLE lives in 21-03-PLAN.md: 404 target missing/already executed (plain 
 CARRY: removal.rs committed-replacement arm at :1041; fail_next_agent_teardown_for_test at manager.rs:2528. Outline 200-bogus-paths wording impossible as written (paths_deleted is compared) - 21-03 planned the intended property.
 SURFACE TO JOE: row behind a missing runtime handle has no REST path out (503 forever until daemon state changes), accepted as T-21-45.
 IN FLIGHT: 21-05, 21-08, 21-04 revision. NEXT: 21-06 -> 21-11 -> resolve 21-02 checkpoint to B -> checker.
+
+21-04 REVISED (reconciled with 21-03 seams, 404 silence test added, keep-alive 15s sourced from axum-0.8.9 sse.rs:524-527, tokio sync transitively via hyper so Cargo edit kept as explicit declaration, wire contract unchanged). Not done: estimate calibration.
