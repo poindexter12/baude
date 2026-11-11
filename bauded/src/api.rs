@@ -3530,6 +3530,258 @@ mod tests {
 
         removal_teardown(&shared, &root);
     }
+
+    /// Whether `/rows` still carries a repository parent with `key`.
+    fn rows_has_repository(rows: &serde_json::Value, key: &serde_json::Value) -> bool {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parent| &parent["repository_key"] == key)
+    }
+
+    #[tokio::test]
+    async fn row_kinds_parent_removal_racing_a_child_removal_commits_one() {
+        for parent_first in [true, false] {
+            let label = if parent_first {
+                "kinds-race-parent"
+            } else {
+                "kinds-race-child"
+            };
+            let fixture = removal_fixture_two_checkouts(label).await;
+            let app = &fixture.app;
+            let main_path = fixture.repo.path().canonicalize().unwrap();
+            let worktree_path = fixture.worktree_path.canonicalize().unwrap();
+            let rows = rows_body(app).await;
+            let main_row = rows_checkout_for_session(&rows, fixture.main_id);
+            let repository_key = main_row["repository_key"].clone();
+
+            // Both previews are taken before either execute is issued.
+            let parent_report =
+                preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
+            let child_report = preview_report(app, fixture.worktree_key).await;
+
+            let parent = removal_call(app, "/removals", &parent_report);
+            let child = removal_call(app, "/removals", &child_report);
+            let ((parent_status, parent_body), (child_status, child_body)) = if parent_first {
+                tokio::join!(parent, child)
+            } else {
+                let (child, parent) = tokio::join!(child, parent);
+                (parent, child)
+            };
+            let outcome = format!(
+                "{label}: exactly one of a repository removal and a removal of its own child \
+                 must commit; repository removal answered {parent_status} ({parent_body}), \
+                 child removal answered {child_status} ({child_body})"
+            );
+            let parent_won = parent_status == StatusCode::OK;
+            let child_won = child_status == StatusCode::OK;
+            assert!(parent_won != child_won, "{outcome}");
+
+            let after = rows_body(app).await;
+            if parent_won {
+                assert!(
+                    !rows_has_repository(&after, &repository_key),
+                    "{outcome}\n{after}"
+                );
+                assert_eq!(session_ids(app).await, [0u64; 0], "{outcome}");
+            } else {
+                let repositories = after["repositories"].as_array().unwrap();
+                assert_eq!(repositories.len(), 1, "{outcome}\n{after}");
+                assert_eq!(repositories[0]["repository_key"], repository_key);
+                assert_eq!(
+                    repositories[0]["checkouts"],
+                    serde_json::json!([main_row]),
+                    "{outcome}\n{after}"
+                );
+                assert_eq!(session_ids(app).await, [fixture.main_id], "{outcome}");
+            }
+            println!(
+                "{label}: the {} removal won; repository {parent_status}, child {child_status}",
+                if parent_won { "repository" } else { "child" }
+            );
+            assert!(main_path.is_dir(), "{outcome}");
+            assert!(git_read(&main_path, &["rev-parse", "--git-dir"]).is_some());
+            assert!(!worktree_path.exists(), "{outcome}");
+
+            removal_teardown(&fixture.shared, &fixture.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn row_kinds_rows_read_racing_a_parent_removal_is_all_or_nothing() {
+        for read_first in [true, false] {
+            let label = if read_first {
+                "kinds-rows-race-read"
+            } else {
+                "kinds-rows-race-removal"
+            };
+            let fixture = removal_fixture_two_checkouts(label).await;
+            let app = &fixture.app;
+            let before = rows_bytes(app).await;
+            let before_json: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            let repository_key =
+                rows_checkout_for_session(&before_json, fixture.main_id)["repository_key"].clone();
+            let report =
+                preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
+
+            let read = rows_bytes(app);
+            let removal = removal_call(app, "/removals", &report);
+            let (raced, (status, body)) = if read_first {
+                tokio::join!(read, removal)
+            } else {
+                let (removal, read) = tokio::join!(removal, read);
+                (read, removal)
+            };
+            assert_eq!(status, StatusCode::OK, "{body}");
+
+            let after = rows_bytes(app).await;
+            assert_ne!(before, after);
+            let after_json: serde_json::Value = serde_json::from_slice(&after).unwrap();
+            assert!(!rows_has_repository(&after_json, &repository_key));
+            println!(
+                "{label}: the raced read saw the {} projection",
+                if raced == before {
+                    "pre-removal"
+                } else {
+                    "post-removal"
+                }
+            );
+            assert!(
+                raced == before || raced == after,
+                "{label}: a read racing a repository removal saw a third shape\nraced: {}\nbefore: {}\nafter: {}",
+                String::from_utf8_lossy(&raced),
+                String::from_utf8_lossy(&before),
+                String::from_utf8_lossy(&after)
+            );
+
+            removal_teardown(&fixture.shared, &fixture.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn row_kinds_parent_removal_converges_after_the_worktree_was_removed_by_hand() {
+        let fixture = removal_fixture_two_checkouts("kinds-by-hand").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        let rows = rows_body(app).await;
+        let main_row = rows_checkout_for_session(&rows, fixture.main_id);
+        let worktree_row = rows_checkout_for_session(&rows, fixture.worktree_id);
+        let stored_worktree_path = worktree_row["path"].as_str().unwrap().to_string();
+        assert_eq!(
+            Path::new(&stored_worktree_path).canonicalize().unwrap(),
+            fixture.worktree_path.canonicalize().unwrap()
+        );
+        let worktree_branch = git_read(
+            &fixture.worktree_path,
+            &["symbolic-ref", "--short", "-q", "HEAD"],
+        )
+        .expect("the managed worktree sits on a branch");
+
+        // What an interruption between core's disk stage and its save
+        // leaves behind, and what a user does in a terminal.
+        git(
+            &main_path,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                fixture.worktree_path.to_str().unwrap(),
+            ],
+        );
+        assert!(!fixture.worktree_path.exists());
+
+        let repository_key = main_row["repository_key"].clone();
+        let target = serde_json::json!({ "repository": repository_key });
+        let preview = preview_target(app, &target).await;
+        assert_eq!(
+            report_paths(&preview, "already_removed"),
+            [stored_worktree_path],
+            "{preview}"
+        );
+        assert!(
+            report_paths(&preview, "paths_deleted").is_empty(),
+            "{preview}"
+        );
+        let mut expected_children = vec![
+            serde_json::json!({ "checkout": main_row["checkout_key"] }).to_string(),
+            serde_json::json!({ "checkout": worktree_row["checkout_key"] }).to_string(),
+        ];
+        expected_children.sort();
+        assert_eq!(child_rows(&preview), expected_children, "{preview}");
+        assert_eq!(
+            preview["rows_removed"].as_array().unwrap().last().unwrap(),
+            &target,
+            "{preview}"
+        );
+
+        let (status, body) = removal_call(app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+
+        let after = rows_body(app).await;
+        assert!(!rows_has_repository(&after, &repository_key), "{after}");
+        assert!(git_read(&main_path, &["rev-parse", "--git-dir"]).is_some());
+        let branch_ref = format!("refs/heads/{worktree_branch}");
+        assert!(
+            git_read(
+                &main_path,
+                &["show-ref", "--verify", "--quiet", &branch_ref]
+            )
+            .is_some(),
+            "the local branch {branch_ref} must survive"
+        );
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn row_kinds_legacy_mis_roled_main_row_keeps_its_directory() {
+        let fixture = removal_fixture_two_checkouts("kinds-legacy").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        let worktree_path = fixture.worktree_path.canonicalize().unwrap();
+        // The stored shape every daemon before 21-09 wrote for a main
+        // checkout: `managed_branch`, with the managed flag already false.
+        crate::manager::lock(&fixture.shared).set_checkout_role_for_test(
+            fixture.main_key,
+            baude_core::repository::CheckoutRole::ManagedBranch,
+        );
+
+        let rows = rows_body(app).await;
+        let main_row = rows_checkout_for_session(&rows, fixture.main_id);
+        assert_eq!(main_row["path"], main_path.to_str().unwrap());
+        // Served verbatim: the projection does not relabel a stored row.
+        assert_eq!(main_row["role"], "managed_branch", "{main_row}");
+        assert_eq!(main_row["managed_by_baude"], false, "{main_row}");
+
+        let target = serde_json::json!({ "repository": main_row["repository_key"] });
+        let preview = preview_target(app, &target).await;
+        let deleted = report_paths(&preview, "paths_deleted");
+        assert_eq!(deleted.len(), 1, "{preview}");
+        assert_eq!(
+            Path::new(&deleted[0]).canonicalize().unwrap(),
+            worktree_path
+        );
+        assert!(
+            report_paths(&preview, "paths_kept")
+                .iter()
+                .any(|kept| Path::new(kept).canonicalize().unwrap() == main_path),
+            "{preview}"
+        );
+
+        let (status, body) = removal_call(app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(main_path.is_dir());
+        assert!(git_read(&main_path, &["rev-parse", "--git-dir"]).is_some());
+        assert!(!worktree_path.exists());
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
 }
 
 #[cfg(test)]

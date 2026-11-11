@@ -1218,6 +1218,23 @@ impl Manager {
             .and_then(|checkout| checkout.observed_branch.clone())
     }
 
+    /// Overwrite the stored role of the checkout with `key`, to reproduce
+    /// the stored shape an earlier daemon wrote: before 21-09 every admitted
+    /// row, the main checkout included, was stored as `ManagedBranch`. Not a
+    /// general mutator. It does not save, and it touches neither the managed
+    /// flag nor any runtime.
+    #[cfg(test)]
+    pub(crate) fn set_checkout_role_for_test(&mut self, key: CheckoutKey, role: CheckoutRole) {
+        if let Some(checkout) = self
+            .repository_state
+            .checkouts
+            .iter_mut()
+            .find(|checkout| checkout.key == key)
+        {
+            checkout.role = role;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn checkout_key_for_runtime_for_test(&self, id: u64) -> Option<CheckoutKey> {
         self.runtime_checkouts
