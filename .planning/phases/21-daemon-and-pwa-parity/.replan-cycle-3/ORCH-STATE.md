@@ -112,3 +112,9 @@ REMAINING: 21-10 -> 21-03 -> 21-04 -> 21-05 -> 21-08 -> 21-06 -> 21-11
 CARRY: record_checkout_intent is at bauded/src/manager.rs:1065 (not :1073).
 SURFACE TO JOE: 21-10 behaviour change - second POST /sessions on a live folder returns the live session (one standalone row per canonical path) and a closed folder row resumes instead of starting fresh; stored legacy folder rows not migrated; discovery errors other than not-a-repo now refuse.
 REMAINING: 21-03 -> 21-04 -> 21-05 || 21-08 -> 21-06 -> 21-11
+
+21-04 WRITTEN (3 tasks, autonomous, files bauded/Cargo.toml+manager.rs+api.rs, threats T-21-50..56; next from T-21-57) BUT planner ran short on context: skipped STATE/ROADMAP/RESEARCH, sampled REVIEWS. NEEDS a revision pass after 21-03 lands: reconcile Task 2 precondition with 21-03 seam names, confirm tokio sync feature need via cargo tree, read axum KeepAlive default from pinned source, full read of SSE review findings.
+/events contract: GET /events, named event rows_removed, data = RemovalReport JSON, one per committed removal incl SavedDegraded, none on preview/409/500/503, no id/retry/replay, capacity 64 skip-on-lag silent, KeepAlive::default.
+CARRY: /stream has NO existing test (only activity_stream_guards_known_and_unknown at api.rs:1551).
+SURFACE TO JOE: API-02 readings - only POST /removals publishes; missed events converge by polling /rows; no ordering vs POST response; silent lag.
+IN FLIGHT: 21-03. NEXT: 21-05 || 21-08 -> 21-06 -> 21-11
