@@ -765,6 +765,7 @@ mod tests {
     use tower::ServiceExt;
 
     use axum::Router;
+    use baude_core::removal::{RemovalError, RemovalTarget};
     use baude_core::repository::CheckoutKey;
     use baude_core::workspace::Workspace;
     use std::path::PathBuf;
@@ -2052,6 +2053,27 @@ mod tests {
         }
     }
 
+    /// The setup every removal fixture shares: an isolated root, one
+    /// initialized fixture repository, and a persisting daemon whose state
+    /// file lives under that root. No session is admitted yet.
+    fn removal_setup(label: &str) -> (PathBuf, FixtureRepo, Workspace, Shared, Router) {
+        let root =
+            std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = initialized_repo(&root, "repo");
+        let workspace = baude_core::workspace::resolve(
+            Some("claude"),
+            None,
+            &baude_core::persist::Config::default(),
+            |_| {},
+        );
+        let shared: Shared = Arc::new(Mutex::new(Manager::new(REMOVAL_AGENT_CMD.into(), true)));
+        crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+        let app = super::router(Arc::clone(&shared));
+        (root, fixture, workspace, shared, app)
+    }
+
     /// One fixture repository whose main checkout carries a live runtime,
     /// behind a persisting daemon whose state file lives under the returned
     /// root. Returns the root, the fixture owner, the workspace, the shared
@@ -2069,23 +2091,74 @@ mod tests {
         u64,
         CheckoutKey,
     ) {
-        let root =
-            std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let fixture = initialized_repo(&root, "repo");
+        let (root, fixture, workspace, shared, app) = removal_setup(label);
         let repo = fixture.path().canonicalize().unwrap();
-        let workspace = baude_core::workspace::resolve(
-            Some("claude"),
-            None,
-            &baude_core::persist::Config::default(),
-            |_| {},
-        );
-        let shared: Shared = Arc::new(Mutex::new(Manager::new(REMOVAL_AGENT_CMD.into(), true)));
-        crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
-        let app = super::router(Arc::clone(&shared));
-        let (id, key) = admit_removal_session(&shared, &app, &repo, None).await;
+        let (id, key, _) = admit_removal_session(&shared, &app, &repo, None).await;
         (root, fixture, workspace, shared, app, id, key)
+    }
+
+    /// One fixture repository with two checkouts, each owning a live runtime:
+    /// the main checkout and a managed worktree on branch `topic`.
+    struct TwoCheckoutFixture {
+        root: PathBuf,
+        repo: FixtureRepo,
+        workspace: Workspace,
+        shared: Shared,
+        app: Router,
+        main_id: u64,
+        main_key: CheckoutKey,
+        worktree_id: u64,
+        worktree_key: CheckoutKey,
+        worktree_path: PathBuf,
+    }
+
+    /// The two-checkout fixture, built on `removal_setup`. Both sessions are
+    /// admitted by `POST /sessions` through the router, the worktree with
+    /// `"worktree": "topic"`, and both runtimes are seen alive by `ps` before
+    /// this returns.
+    async fn removal_fixture_two_checkouts(label: &str) -> TwoCheckoutFixture {
+        let (root, repo, workspace, shared, app) = removal_setup(label);
+        // A managed worktree needs a repository default the daemon can
+        // verify, which a bare `git init` cannot give. Stops at `push -u`,
+        // the shape `gh repo create` leaves behind and the one the manager's
+        // own worktree fixtures use, so admission is not helped by a
+        // hand-written `refs/remotes/origin/HEAD`.
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"]);
+        git(
+            repo.path(),
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(repo.path(), &["push", "-u", "origin", "main"]);
+        let repo_path = repo.path().canonicalize().unwrap();
+        let (main_id, main_key, _) = admit_removal_session(&shared, &app, &repo_path, None).await;
+        let (worktree_id, worktree_key, worktree_info) =
+            admit_removal_session(&shared, &app, &repo_path, Some("topic")).await;
+        assert_ne!(main_key, worktree_key);
+        let worktree_path = PathBuf::from(worktree_info["cwd"].as_str().unwrap());
+        assert!(worktree_path.is_dir(), "{}", worktree_path.display());
+        assert_ne!(worktree_path.canonicalize().unwrap(), repo_path);
+        for key in [main_key, worktree_key] {
+            let report = preview_report(&app, key).await;
+            let agent_pid = previewed_agent_pid(&report, key);
+            assert!(
+                pid_is_alive(agent_pid),
+                "runtime {agent_pid} must be live before the fixture is handed out"
+            );
+        }
+        TwoCheckoutFixture {
+            root,
+            repo,
+            workspace,
+            shared,
+            app,
+            main_id,
+            main_key,
+            worktree_id,
+            worktree_key,
+            worktree_path,
+        }
     }
 
     /// `POST /sessions` through the router, returning the created session id
@@ -2095,7 +2168,7 @@ mod tests {
         app: &Router,
         repo: &Path,
         worktree: Option<&str>,
-    ) -> (u64, CheckoutKey) {
+    ) -> (u64, CheckoutKey, serde_json::Value) {
         let body = match worktree {
             Some(branch) => serde_json::json!({ "repo": repo, "worktree": branch }),
             None => serde_json::json!({ "repo": repo }),
@@ -2105,12 +2178,40 @@ mod tests {
             .oneshot(post_json("/sessions", &body.to_string()))
             .await
             .unwrap();
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let id = body_json(create).await["id"].as_u64().unwrap();
+        let status = create.status();
+        let bytes = create.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "POST /sessions {body}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = info["id"].as_u64().unwrap();
         let key = crate::manager::lock(shared)
             .checkout_key_for_runtime_for_test(id)
             .expect("a created session is registered under a checkout key");
-        (id, key)
+        (id, key, info)
+    }
+
+    /// Preview `key` and execute the previewed report echoed verbatim.
+    async fn execute_previewed(app: &Router, key: CheckoutKey) -> axum::response::Response {
+        let report = preview_report(app, key).await;
+        app.clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap()
+    }
+
+    /// The state file a persisting removal fixture writes.
+    fn removal_state_file(root: &Path, workspace: &Workspace) -> PathBuf {
+        root.join(workspace.state_file("daemon-state"))
+    }
+
+    /// Stop every runtime the fixture still owns and drop its root.
+    fn removal_teardown(shared: &Shared, root: &Path) {
+        crate::manager::lock(shared).kill_all();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn preview_report(app: &Router, key: CheckoutKey) -> serde_json::Value {
@@ -2138,7 +2239,7 @@ mod tests {
 
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
-        let (_root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
+        let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
         let repo = fixture.path().canonicalize().unwrap();
 
         let report = preview_report(&app, key).await;
@@ -2191,9 +2292,203 @@ mod tests {
         );
         let listed = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
         assert_eq!(listed, serde_json::json!([]));
-        let manager = crate::manager::lock(&shared);
-        assert_eq!(manager.checkout_key_for_runtime_for_test(id), None);
-        assert!(manager.info(id).is_none());
+        {
+            let manager = crate::manager::lock(&shared);
+            assert_eq!(manager.checkout_key_for_runtime_for_test(id), None);
+            assert!(manager.info(id).is_none());
+        }
+        removal_teardown(&shared, &root);
+    }
+
+    /// HIGH #1 regression: the removal save must carry the live metadata of
+    /// every surviving row. Archiving reaches the state file only through the
+    /// merged projection, so a save that wrote core's bare candidate would
+    /// read back un-archived here.
+    #[tokio::test]
+    async fn removals_preserve_surviving_session_metadata() {
+        let fixture = removal_fixture_two_checkouts("survivor").await;
+        let app = &fixture.app;
+
+        let archived = app
+            .clone()
+            .oneshot(post_json(
+                &format!("/sessions/{}/archive", fixture.main_id),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+        let live = crate::manager::lock(&fixture.shared)
+            .info(fixture.main_id)
+            .unwrap();
+        assert!(live.archived);
+
+        let executed = execute_previewed(app, fixture.worktree_key).await;
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed = body_json(executed).await;
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": fixture.worktree_key }])
+        );
+        assert!(
+            crate::manager::lock(&fixture.shared)
+                .info(fixture.worktree_id)
+                .is_none(),
+            "the removed worktree runtime is still registered"
+        );
+
+        let reloaded = baude_core::persist::load_current_at(
+            &fixture.root,
+            &fixture.workspace.state_file("daemon-state"),
+        )
+        .unwrap();
+        assert_eq!(reloaded.state.checkouts.len(), 1, "{:?}", reloaded.state);
+        let survivor = &reloaded.state.checkouts[0];
+        assert_eq!(survivor.key, fixture.main_key);
+        assert!(
+            survivor.session.archived,
+            "the removal save regressed the survivor's archived flag"
+        );
+        assert_eq!(survivor.session.name, live.name);
+        assert_eq!(survivor.session.branch, live.branch);
+
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        restored.restore_at(&fixture.root, &fixture.workspace);
+        assert!(restored
+            .preview_removal(RemovalTarget::Checkout(fixture.main_key))
+            .is_ok());
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(fixture.worktree_key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+        let after_restore = baude_core::persist::load_current_at(
+            &fixture.root,
+            &fixture.workspace.state_file("daemon-state"),
+        )
+        .unwrap();
+        let survivor = &after_restore.state.checkouts[0];
+        assert_eq!(survivor.key, fixture.main_key);
+        assert!(survivor.session.archived);
+        assert_eq!(survivor.session.name, live.name);
+        assert_eq!(survivor.session.branch, live.branch);
+
+        restored.kill_all();
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn removals_persistence_bookkeeping_matches_save_checked() {
+        use baude_core::persist::AtomicFailure;
+
+        let fixture = removal_fixture_two_checkouts("bookkeeping").await;
+        let app = &fixture.app;
+        let repo_path = fixture.repo.path().canonicalize().unwrap();
+
+        let first = execute_previewed(app, fixture.worktree_key).await;
+        assert_status(
+            first,
+            StatusCode::OK,
+            "POST /removals for the managed worktree",
+            &AtomicFailure::Rename,
+        )
+        .await;
+        assert!(
+            !fixture.worktree_path.exists(),
+            "the managed worktree directory survived its removal"
+        );
+        assert!(repo_path.is_dir(), "the main checkout must be kept");
+        let status = crate::manager::lock(&fixture.shared).persistence_status();
+        assert!(!status.dirty, "{:?}", status.error);
+        assert_eq!(status.error, None);
+
+        let report = preview_report(app, fixture.main_key).await;
+        let main_pid = previewed_agent_pid(&report, fixture.main_key);
+        assert!(
+            pid_is_alive(main_pid),
+            "the main runtime must be live before the failing removal"
+        );
+        crate::manager::lock(&fixture.shared).persist_at_for_test(
+            &fixture.root,
+            &fixture.workspace,
+            Some(AtomicFailure::Rename),
+        );
+        let second = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        assert_status(
+            second,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "POST /removals for the main checkout",
+            &AtomicFailure::Rename,
+        )
+        .await;
+
+        {
+            let manager = crate::manager::lock(&fixture.shared);
+            let status = manager.persistence_status();
+            assert!(status.dirty);
+            assert!(status.error.is_some_and(|error| !error.is_empty()));
+            assert!(manager
+                .preview_removal(RemovalTarget::Checkout(fixture.main_key))
+                .is_ok());
+            assert_eq!(
+                manager.checkout_key_for_runtime_for_test(fixture.main_id),
+                Some(fixture.main_key)
+            );
+        }
+        let listed = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        let listed_ids: Vec<u64> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(listed_ids, vec![fixture.main_id]);
+        // Restored is not running: core kills before it persists, so the
+        // handle that came back belongs to a runtime that is already gone.
+        assert!(
+            wait_for_pid_gone(main_pid),
+            "core kills before it persists, so the restored handle must be dead"
+        );
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn removals_execute_survives_a_fresh_restore() {
+        let (root, _fixture, workspace, shared, app, _id, key) = removal_fixture("restore").await;
+        let executed = execute_previewed(&app, key).await;
+        assert_eq!(executed.status(), StatusCode::OK);
+
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert_eq!(restored.list().len(), 0);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn removals_preview_leaves_the_state_file_untouched() {
+        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("preview").await;
+        let state_file = removal_state_file(&root, &workspace);
+        let before = std::fs::read(&state_file).unwrap();
+        assert!(!before.is_empty());
+
+        let report = preview_report(&app, key).await;
+        assert_eq!(report["planned"], true);
+
+        assert_eq!(std::fs::read(&state_file).unwrap(), before);
+        let listed = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"].as_u64(), Some(id));
+
+        removal_teardown(&shared, &root);
     }
 
     #[tokio::test]

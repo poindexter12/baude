@@ -548,7 +548,11 @@ impl Manager {
     }
 
     #[cfg(test)]
-    fn restore_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) -> usize {
+    pub(crate) fn restore_at(
+        &mut self,
+        root: &Path,
+        workspace: &baude_core::workspace::Workspace,
+    ) -> usize {
         if !self.persist {
             return 0;
         }
