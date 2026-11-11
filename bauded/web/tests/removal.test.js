@@ -719,3 +719,63 @@ test("apply_snapshot_tolerates_a_partial_body", () => {
   assert.deepStrictEqual(applySnapshot(childless, tombstones), childless);
   assert.deepStrictEqual(entries(tombstones), tombstonesBefore);
 });
+
+// ---- plan-level edges ----
+
+test("drop_rows_applied_twice_changes_nothing_more", () => {
+  // API-03 idempotency: the same report arriving twice, as a duplicate 200 or
+  // as a 200 followed by its own rows_removed frame.
+  const { dropRows } = BaudeRemoval;
+  for (const report of [checkoutReport(), repositoryReport(), standaloneReport()]) {
+    const body = rowsBody();
+    const before = structuredClone(body);
+    const once = dropRows(body, report);
+    const onceBefore = structuredClone(once);
+    assert.deepStrictEqual(dropRows(once, report), once);
+    assert.deepStrictEqual(once, onceBefore);
+    assert.deepStrictEqual(body, before);
+  }
+});
+
+test("rendered_confirmation_carries_no_session_identifier", () => {
+  // The view names rows by display name, branch, path, pid and count. The
+  // session id is a join column in the index and never reaches the page.
+  const { renderConfirmation, confirmationView, rowsIndex } = BaudeRemoval;
+  const sessionId = 987654321;
+  const rows = rowsBody({
+    repositories: [repositoryRow({ checkouts: [checkoutRow({ session_id: sessionId })] })],
+  });
+  const index = rowsIndex(rows);
+  assert.strictEqual(index["checkout:7"].session_id, sessionId, "the index does carry it");
+
+  const view = confirmationView(checkoutReport(), index);
+  const html = renderConfirmation(view);
+  assert.equal(JSON.stringify(view).includes(String(sessionId)), false);
+  assert.equal(html.includes(String(sessionId)), false);
+  assert.ok(html.includes("repo:topic"), "the row is still named");
+});
+
+test("indices_and_tombstones_ignore_prototype_shaped_keys", () => {
+  // Daemon-derived strings become property names. Neither store has a
+  // prototype, and a lookup never answers from one.
+  const { rowsIndex, reportRowNames, tombstone, applySnapshot } = BaudeRemoval;
+  const index = rowsIndex(rowsBody());
+  assert.strictEqual(Object.getPrototypeOf(index), null);
+  const set = tombstone(Object.create(null), committed(checkoutReport()), 1000);
+  assert.strictEqual(Object.getPrototypeOf(set), null);
+
+  // A key shaped like an inherited property name is an unknown row, and a
+  // plain-object index does not resolve it through Object.prototype.
+  const hostile = JSON.parse('{"rows_removed":[{"__proto__":1},{"constructor":1},{"toString":1}]}');
+  assert.deepStrictEqual(reportRowNames(hostile, {}).map((n) => n.label), [
+    "unknown row",
+    "unknown row",
+    "unknown row",
+  ]);
+  assert.deepStrictEqual(entries(tombstone(Object.create(null), hostile, 1000)), []);
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "checkout:7"), false);
+
+  // A plain-object tombstone set only suppresses what it owns.
+  const body = rowsBody();
+  assert.deepStrictEqual(applySnapshot(body, {}), body);
+});
