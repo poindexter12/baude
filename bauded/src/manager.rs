@@ -218,6 +218,15 @@ fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliati
 }
 
 /// One row of `GET /sessions`.
+///
+/// `checkout_key` is deliberately NOT a field here. D-09 was resolved to
+/// Option B by the user on 2026-11-11: durable keys are served only from
+/// `GET /rows`, and a client joins a `/rows` checkout entry to a `/sessions`
+/// row on `session_id`, which equals `id` below. `/sessions` stays the flat
+/// compatibility projection Phase 7 locked. The enforcement point is the test
+/// `flat_session_api_remains_a_non_hierarchical_compatibility_projection` in
+/// `api.rs`, which forbids `checkout_key` and seven sibling names on every
+/// entry. Do not add the field on the strength of D-09's original wording.
 #[derive(Serialize, Clone)]
 pub struct SessionInfo {
     pub id: u64,
