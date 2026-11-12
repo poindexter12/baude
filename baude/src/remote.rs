@@ -3,6 +3,7 @@
 //! thread and an attach IO thread feed shared state the draw loop reads,
 //! mirroring how local PTYs work.
 
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -11,10 +12,18 @@ use serde::Deserialize;
 
 use baude_core::meta::HookEvent;
 use baude_core::pty::now_ms;
+use baude_core::removal::{RemovalReport, RemovalTarget, RowKey};
+use baude_core::repository::{CheckoutKey, RepositoryKey, StandaloneKey};
 use baude_core::vt100;
 
 const POLL_SECS: u64 = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// The most of a `RemovalReport` body this client will read.
+const MAX_REPORT_BYTES: u64 = 1024 * 1024;
+/// The most of a plain-text error body this client will read.
+const MAX_TEXT_BYTES: u64 = 4 * 1024;
+/// The longest daemon-supplied message handed to the UI, in characters.
+const MAX_MESSAGE_CHARS: usize = 512;
 
 /// One row of the daemon's `GET /sessions`.
 #[derive(Deserialize, Clone, Default)]
@@ -129,6 +138,346 @@ impl RemoteSnapshot {
     }
 }
 
+/// The daemon's `GET /rows`: every durable row with the key the daemon
+/// issued for it. This index is the only source of a removal key, because
+/// `GET /sessions` carries none; the join column is `session_id`.
+#[derive(Deserialize, Clone, Default, PartialEq, Debug)]
+pub struct RemoteRows {
+    #[serde(default)]
+    pub repositories: Vec<RemoteRepositoryRow>,
+    #[serde(default)]
+    pub standalone: Vec<RemoteStandaloneRow>,
+}
+
+/// One repository parent of `GET /rows`. It has no `Default`: a key is only
+/// ever read from the daemon, never made up by the client.
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+pub struct RemoteRepositoryRow {
+    pub repository_key: RepositoryKey,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub path: String,
+    /// Core's `RepositoryHealth` serde form, kept untyped so a variant this
+    /// client has never heard of cannot fail the whole parse.
+    #[serde(default)]
+    pub health: serde_json::Value,
+    #[serde(default)]
+    pub checkouts: Vec<RemoteCheckoutRow>,
+}
+
+/// One checkout child of a repository in `GET /rows`.
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+pub struct RemoteCheckoutRow {
+    pub checkout_key: CheckoutKey,
+    pub repository_key: RepositoryKey,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    /// Core's `CheckoutRole` serde form, untyped for the same reason as
+    /// `RemoteRepositoryRow::health`.
+    #[serde(default)]
+    pub role: serde_json::Value,
+    #[serde(default)]
+    pub managed_by_baude: bool,
+    #[serde(default)]
+    pub archived: bool,
+    /// The live daemon session on this checkout, `None` when it has none.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+}
+
+/// One standalone root of `GET /rows`.
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+pub struct RemoteStandaloneRow {
+    pub standalone_key: StandaloneKey,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub session_id: Option<u64>,
+}
+
+/// What the UI may call a row a `RemovalReport` names by key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRowLabel {
+    pub display_name: String,
+    pub branch: Option<String>,
+    pub path: String,
+    pub session_id: Option<u64>,
+}
+
+// Wired into the TUI by 21-06; until then only tests call these.
+#[allow(dead_code)]
+impl RemoteRows {
+    /// The removal target of the checkout or standalone row that owns this
+    /// live session. `None` means the daemon issued no key for it, so no
+    /// removal may be offered.
+    pub fn target_for_session(&self, session_id: u64) -> Option<RemovalTarget> {
+        let checkout = self
+            .repositories
+            .iter()
+            .flat_map(|repository| repository.checkouts.iter())
+            .find(|checkout| checkout.session_id == Some(session_id))
+            .map(|checkout| RemovalTarget::Checkout(checkout.checkout_key));
+        checkout.or_else(|| {
+            self.standalone
+                .iter()
+                .find(|row| row.session_id == Some(session_id))
+                .map(|row| RemovalTarget::Standalone(row.standalone_key))
+        })
+    }
+
+    /// The parent repository of the checkout that owns this live session.
+    pub fn repository_target_for_session(&self, session_id: u64) -> Option<RemovalTarget> {
+        self.repositories
+            .iter()
+            .find(|repository| {
+                repository
+                    .checkouts
+                    .iter()
+                    .any(|checkout| checkout.session_id == Some(session_id))
+            })
+            .map(|repository| RemovalTarget::Repository(repository.repository_key))
+    }
+
+    /// Name a row by its key, whether or not it has a live session.
+    pub fn label(&self, key: &RowKey) -> Option<RemoteRowLabel> {
+        match key {
+            RowKey::Repository(key) => self
+                .repositories
+                .iter()
+                .find(|repository| repository.repository_key == *key)
+                .map(|repository| RemoteRowLabel {
+                    display_name: repository.display_name.clone(),
+                    branch: None,
+                    path: repository.path.clone(),
+                    session_id: None,
+                }),
+            RowKey::Checkout(key) => self
+                .repositories
+                .iter()
+                .flat_map(|repository| repository.checkouts.iter())
+                .find(|checkout| checkout.checkout_key == *key)
+                .map(|checkout| RemoteRowLabel {
+                    display_name: checkout.display_name.clone(),
+                    branch: checkout.branch.clone(),
+                    path: checkout.path.clone(),
+                    session_id: checkout.session_id,
+                }),
+            RowKey::Standalone(key) => self
+                .standalone
+                .iter()
+                .find(|row| row.standalone_key == *key)
+                .map(|row| RemoteRowLabel {
+                    display_name: row.display_name.clone(),
+                    branch: None,
+                    path: row.path.clone(),
+                    session_id: row.session_id,
+                }),
+        }
+    }
+}
+
+/// How one removal round trip ended.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // matched by the TUI in 21-06
+pub enum RemovalReply {
+    /// 200: the preview, or the committed report.
+    Report(RemovalReport),
+    /// 409: the row set drifted. Holds the daemon's fresh preview; nothing
+    /// was removed.
+    Drift(RemovalReport),
+    /// 404: the target row no longer exists. Never worth a retry.
+    Gone { message: String },
+    /// Any other status, with the daemon's own text. 500 and 503 are worth a
+    /// retry.
+    Refused { status: u16, message: String },
+    /// A preview that got no answer. Nothing was asked to change.
+    Unreachable { message: String },
+    /// An execute that was sent and got no answer: the outcome is unknown.
+    /// `rows_gone` is true only when a fresh `GET /rows` no longer lists any
+    /// row of the previewed report.
+    Indeterminate { message: String, rows_gone: bool },
+}
+
+/// Which removal call was made, so a missing answer is named truthfully.
+#[derive(Clone, Copy)]
+enum RemovalCall {
+    Preview,
+    Execute,
+}
+
+impl RemovalCall {
+    fn unanswered(self, message: String) -> RemovalReply {
+        match self {
+            RemovalCall::Preview => RemovalReply::Unreachable { message },
+            RemovalCall::Execute => RemovalReply::Indeterminate {
+                message,
+                rows_gone: false,
+            },
+        }
+    }
+}
+
+/// Remove every control character, collapse whitespace runs to one space and
+/// cap the length. Every daemon-supplied string shown to the user passes
+/// through here: the daemon is another machine and its text is untrusted.
+fn sanitize_daemon_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut kept = 0usize;
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            gap = kept > 0;
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if gap {
+            if kept + 1 >= MAX_MESSAGE_CHARS {
+                break;
+            }
+            out.push(' ');
+            kept += 1;
+            gap = false;
+        }
+        if kept >= MAX_MESSAGE_CHARS {
+            break;
+        }
+        out.push(c);
+        kept += 1;
+    }
+    out
+}
+
+/// Read at most `cap` bytes of a response body. `Ok(None)` means the body
+/// ran past the cap; the rest is never read.
+fn read_capped(response: ureq::Response, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// The daemon's plain-text error body, sanitized, or `fallback` when it sent
+/// none that survives sanitizing.
+fn read_daemon_text(response: ureq::Response, fallback: &str) -> String {
+    let mut bytes = Vec::new();
+    // A failed read keeps whatever arrived: the status is already known.
+    let _ = response
+        .into_reader()
+        .take(MAX_TEXT_BYTES)
+        .read_to_end(&mut bytes);
+    let text = sanitize_daemon_text(&String::from_utf8_lossy(&bytes));
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    }
+}
+
+/// Turn one removal round trip into a typed reply, reading the body every
+/// time: 200 and 409 carry a `RemovalReport`, every other status carries
+/// plain text.
+fn read_reply(result: Result<ureq::Response, ureq::Error>, call: RemovalCall) -> RemovalReply {
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            match read_capped(response, MAX_REPORT_BYTES) {
+                Ok(Some(bytes)) => match serde_json::from_slice::<RemovalReport>(&bytes) {
+                    Ok(report) => RemovalReply::Report(report),
+                    Err(_) => RemovalReply::Refused {
+                        status,
+                        message: "the daemon's answer was not a removal report".to_string(),
+                    },
+                },
+                Ok(None) => RemovalReply::Refused {
+                    status,
+                    message: "the daemon's answer was too large to read".to_string(),
+                },
+                // The status arrived and the body did not: for an execute the
+                // outcome is not known to be a failure, so it is not called one.
+                Err(error) => call.unanswered(sanitize_daemon_text(&error.to_string())),
+            }
+        }
+        Err(ureq::Error::Status(409, response)) => match read_capped(response, MAX_REPORT_BYTES) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<RemovalReport>(&bytes) {
+                Ok(report) => RemovalReply::Drift(report),
+                Err(_) => {
+                    let shown = &bytes[..bytes.len().min(MAX_TEXT_BYTES as usize)];
+                    let text = sanitize_daemon_text(&String::from_utf8_lossy(shown));
+                    RemovalReply::Refused {
+                        status: 409,
+                        message: if text.is_empty() {
+                            "daemon said 409".to_string()
+                        } else {
+                            text
+                        },
+                    }
+                }
+            },
+            Ok(None) => RemovalReply::Refused {
+                status: 409,
+                message: "the daemon's answer was too large to read".to_string(),
+            },
+            Err(error) => call.unanswered(sanitize_daemon_text(&error.to_string())),
+        },
+        Err(ureq::Error::Status(404, response)) => RemovalReply::Gone {
+            message: read_daemon_text(response, "daemon said 404"),
+        },
+        Err(ureq::Error::Status(status, response)) => RemovalReply::Refused {
+            status,
+            message: read_daemon_text(response, &format!("daemon said {status}")),
+        },
+        Err(ureq::Error::Transport(transport)) => {
+            call.unanswered(sanitize_daemon_text(&transport.to_string()))
+        }
+    }
+}
+
+/// One blocking `POST /removals/preview`. Mutates nothing on the daemon.
+fn preview_call(base: &str, timeout: Duration, target: &RemovalTarget) -> RemovalReply {
+    let Ok(body) = serde_json::to_string(target) else {
+        return RemovalReply::Unreachable {
+            message: "could not encode the removal request".to_string(),
+        };
+    };
+    let result = ureq::post(&format!("{base}/removals/preview"))
+        .timeout(timeout)
+        .set("Content-Type", "application/json")
+        .send_string(&body);
+    read_reply(result, RemovalCall::Preview)
+}
+
+/// One blocking `POST /removals`, whose body is the previewed report
+/// verbatim. Sent once: nothing here ever resends it.
+fn execute_call(base: &str, timeout: Duration, previewed: &RemovalReport) -> RemovalReply {
+    let Ok(body) = serde_json::to_string(previewed) else {
+        // Nothing left this machine, so nothing was asked to change.
+        return RemovalReply::Unreachable {
+            message: "could not encode the removal request".to_string(),
+        };
+    };
+    let result = ureq::post(&format!("{base}/removals"))
+        .timeout(timeout)
+        .set("Content-Type", "application/json")
+        .send_string(&body);
+    read_reply(result, RemovalCall::Execute)
+}
+
 /// Background poller for one daemon.
 pub struct RemotePoller {
     pub base: String,
@@ -193,6 +542,28 @@ impl RemotePoller {
 
     pub fn snapshot(&self) -> RemoteSnapshot {
         self.data.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// A poller that starts no thread, for tests that must not race one.
+    #[cfg(test)]
+    pub(crate) fn idle(base: String) -> RemotePoller {
+        RemotePoller {
+            base: base.trim_end_matches('/').to_string(),
+            data: Arc::new(Mutex::new(RemoteSnapshot::default())),
+        }
+    }
+
+    /// Blocking `POST /removals/preview`. Never call it on the draw thread.
+    #[allow(dead_code)] // wired by 21-06
+    pub fn preview_removal(&self, target: &RemovalTarget) -> RemovalReply {
+        preview_call(&self.base, REQUEST_TIMEOUT, target)
+    }
+
+    /// Blocking `POST /removals` with the previewed report echoed verbatim.
+    /// Never call it on the draw thread.
+    #[allow(dead_code)] // wired by 21-06
+    pub fn execute_removal(&self, previewed: &RemovalReport) -> RemovalReply {
+        execute_call(&self.base, REQUEST_TIMEOUT, previewed)
     }
 
     pub fn delete(&self, id: u64) -> Result<(), String> {
@@ -1204,6 +1575,43 @@ mod tests {
         assert_eq!(standalone.display_name, "notes");
         assert_eq!(standalone.session_id, Some(9));
         assert_eq!(rows.label(&RowKey::Checkout(checkout_key(99))), None);
+    }
+
+    /// The double's own slow shapes, asked for with a bare HTTP call so the
+    /// fixture is proven apart from the client it will be used against.
+    #[test]
+    fn double_delays_a_reply_and_holds_a_connection_as_scripted() {
+        let double = serve(vec![
+            route(
+                "POST",
+                "/slow",
+                vec![Reply::text(200, "late").delayed(Duration::from_millis(150))],
+            ),
+            route("POST", "/stuck", vec![Reply::held(Duration::from_secs(1))]),
+        ]);
+
+        let started = Instant::now();
+        let late = ureq::post(&format!("{}/slow", double.base()))
+            .timeout(Duration::from_secs(2))
+            .send_string("{}")
+            .expect("a delayed reply still arrives")
+            .into_string()
+            .expect("body");
+        assert_eq!(late, "late");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+
+        let started = Instant::now();
+        let stuck = ureq::post(&format!("{}/stuck", double.base()))
+            .timeout(Duration::from_millis(200))
+            .send_string("{}");
+        assert!(
+            matches!(stuck, Err(ureq::Error::Transport(_))),
+            "a held connection answers nothing"
+        );
+        assert!(started.elapsed() < Duration::from_millis(900));
+        // The held request was read and recorded, and it was scripted.
+        assert_eq!(double.requests()[1].path, "/stuck");
+        assert_settled(&double, 2);
     }
 
     #[test]
