@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-09-PLAN.md
-last_updated: "2026-11-11T21:45:14.408Z"
+stopped_at: Completed 21-10-PLAN.md
+last_updated: "2026-11-12T16:04:21.558Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: 3741088100c8946ef6b1966cc9815898dfd2c468
+state_head: d53a39b6dd45ef86acf4d232d0707a039f8a962d
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 23
+  completed_plans: 24
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 5 of 11
+Plan: 6 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -121,6 +121,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P02 | 7 min | 3 tasks | 2 files |
 | Phase 21 P07 | 13min | 4 tasks | 5 files |
 | Phase 21 P09 | 25min | 3 tasks | 2 files |
+| Phase 21 P10 | Task 3 and close 65min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -291,6 +292,11 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-09: restart on a main checkout now follows a branch switch and returns 202; a managed worktree row stays pinned and still returns 409
 - [Phase 21]: 21-09: GET /rows serves the short branch name by stripping one leading refs/heads/ prefix at read time; the stored ref is never rewritten and a detached HEAD reads null
 - [Phase 21]: 21-09: rows written by an earlier daemon are not re-roled; healing them at restore is an open decision
+- [Phase 21]: 21-10: a plain POST /sessions takes the first matching route of five: reuse a standalone row, the checkout arm for a discovered repository, join a stored repository holding the path, admit a standalone row, or refuse with 400
+- [Phase 21]: 21-10: DELETE /sessions/{id} on a folder session ends the runtime and keeps the row closed; a repeated POST for that folder reopens the same row
+- [Phase 21]: 21-10: only an explicit admission through Manager::create lifts a suppression entry, for the path the admitted row stores; restore, reopen, the restart route and legacy migration lift nothing
+- [Phase 21]: 21-10: a plain admission takes the repository path and the worktree fact from git discovery and always stores the checkout as unmanaged, so a hand-made linked worktree opens by path and its directory survives removal
+- [Phase 21]: 21-10: delete_teardown_failure_is_500_and_unknown_id_stays_404 and real_atomic_persistence_failures_are_503_for_every_mutation were moved from /tmp onto a real repository with assertions untouched; standalone DELETE has its own failure-mapping tests
 
 ### Pending Todos
 
@@ -373,8 +379,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-11T21:45:14.174Z
-Stopped at: Completed 21-09-PLAN.md
+Last session: 2026-11-12T16:04:21.218Z
+Stopped at: Completed 21-10-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
