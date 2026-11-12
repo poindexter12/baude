@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-05-PLAN.md
-last_updated: "2026-11-12T17:09:12.634Z"
+stopped_at: Completed 21-08-PLAN.md
+last_updated: "2026-11-12T18:01:55.215Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: 66ee732fa7372f1063e35480969e73240b277ed9
+state_head: 2eaafcccf15d306e36c784a8ba586f1ae8b8a8e8
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 27
+  completed_plans: 28
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 9 of 11
+Plan: 10 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -125,6 +125,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P03 | 45min | 3 tasks | 2 files |
 | Phase 21 P04 | 17min | 3 tasks | 3 files |
 | Phase 21 P05 | 40min | 3 tasks | 7 files |
+| Phase 21 P08 | 96min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -310,6 +311,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-05: a 409 from POST /removals refetches /rows on its own request, redraws the fresh report and never confirms for the user; a 404 is treated as already removed
 - [Phase 21]: 21-05: PWA removal error text keeps the daemon wording and swaps Rust key tokens for the row label or the words unknown row
 - [Phase 21]: 21-05: API-02 and API-03 stay pending until the 21-11 browser check; the Escape and backdrop bindings are unverified until then
+- [Phase 21]: 21-08: remote removals run on a worker under REMOVAL_TIMEOUT of 60 s; an execute with no answer is Indeterminate, reconciled by one GET /rows and never resent
+- [Phase 21]: 21-08: a removed remote row is held out by an Instant-dated tombstone until a poll that started after the removal is applied; then the daemon's read wins
+- [Phase 21]: 21-08: the events reader keeps one connection through timed-out reads; ureq 2.12.1 survived them, silence limit 35 s from the 15 s keep-alive
 
 ### Pending Todos
 
@@ -392,8 +396,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-12T17:09:12.195Z
-Stopped at: Completed 21-05-PLAN.md
+Last session: 2026-11-12T18:01:54.346Z
+Stopped at: Completed 21-08-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
