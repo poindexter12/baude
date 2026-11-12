@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 9
+open_count: 10
 waived_count: 0
 fixed_count: 5
-total_count: 14
-last_updated: 2026-11-04T01:19:42.031Z
+total_count: 15
+last_updated: 2026-11-12T17:08:47.780Z
 ---
 
 # Broken Windows Ledger
@@ -29,6 +29,7 @@ last_updated: 2026-11-04T01:19:42.031Z
 | 12 | 12 | deviation | scripts/assert-real-roots-untouched.sh |  | Local 'after' roots gate exits 1 on the dev host (concurrent live baude pid 8413 + FHIR IG publisher writing under the managed-worktrees root); proven by null bracket, closed by green check (macos-14)/check (ubuntu-22.04) on PR #87 | open |  | 2026-09-17T17:47:04.803Z |  |
 | 13 | 18 | unmet-truth | scripts/gate.sh |  | scripts/gate.sh --linux exits 1 on this macOS host: cargo test after cargo clippy in the same bind-mounted target dir hits E0463 can't find crate for already-built dependency crates, a Docker Desktop bind-mount visibility race; the same gate script passes with CARGO_TARGET_DIR on container-local disk, exit 0 on f1351d2 | open |  | 2026-11-04T01:17:56.062Z |  |
 | 14 | 18 | unmet-truth | scripts/gate.sh |  | scripts/gate.sh --linux exits 1 on a macOS host: cargo test step hits E0463 for already-built crates, a Docker Desktop bind-mount visibility race in the container target dir; fix is CARGO_TARGET_DIR off the bind mount | open |  | 2026-11-04T01:19:42.031Z |  |
+| 15 | 21 | deviation | bauded/web/app.js | 715 | 21-05: renderRowsList options.keyless is tested but app.js does not pass it; unclaimed sessions are listed by app.js with no other sessions heading | open |  | 2026-11-12T17:08:47.780Z |  |
 
 ````json
 [
@@ -211,6 +212,19 @@ last_updated: 2026-11-04T01:19:42.031Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-11-04T01:19:42.031Z",
+    "resolved_at": null,
+    "milestone": "v2.8"
+  },
+  {
+    "id": 15,
+    "kind": "deviation",
+    "phase": "21",
+    "file": "bauded/web/app.js",
+    "line": 715,
+    "description": "21-05: renderRowsList options.keyless is tested but app.js does not pass it; unclaimed sessions are listed by app.js with no other sessions heading",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-11-12T17:08:47.780Z",
     "resolved_at": null,
     "milestone": "v2.8"
   }

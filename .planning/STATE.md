@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-04-PLAN.md
-last_updated: "2026-11-12T16:42:19.771Z"
+stopped_at: Completed 21-05-PLAN.md
+last_updated: "2026-11-12T17:09:12.634Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: c26d0ea2a5027ee434d7dd1dac23ac9f83b6138a
+state_head: 66ee732fa7372f1063e35480969e73240b277ed9
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 26
+  completed_plans: 27
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 8 of 11
+Plan: 9 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -124,6 +124,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P10 | Task 3 and close 65min | 3 tasks | 2 files |
 | Phase 21 P03 | 45min | 3 tasks | 2 files |
 | Phase 21 P04 | 17min | 3 tasks | 3 files |
+| Phase 21 P05 | 40min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -305,6 +306,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-04: rows_removed is published only from the single Ok return of Manager::remove_rows, so saved and saved_degraded publish and no non-200 can
 - [Phase 21]: 21-04: a lagging GET /events subscriber silently skips the oldest events and keeps its stream; capacity 64, no replay, no id, no lag notice, so clients reconcile through GET /rows
 - [Phase 21]: 21-04: an event whose report cannot be serialized is skipped, not sent with empty data
+- [Phase 21]: 21-05: every fetched /rows body enters PWA state through applyRows, and /sessions is filtered through the controller too, so a stale poll cannot resurrect a removed row
+- [Phase 21]: 21-05: a 409 from POST /removals refetches /rows on its own request, redraws the fresh report and never confirms for the user; a 404 is treated as already removed
+- [Phase 21]: 21-05: PWA removal error text keeps the daemon wording and swaps Rust key tokens for the row label or the words unknown row
+- [Phase 21]: 21-05: API-02 and API-03 stay pending until the 21-11 browser check; the Escape and backdrop bindings are unverified until then
 
 ### Pending Todos
 
@@ -387,8 +392,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-12T16:42:19.179Z
-Stopped at: Completed 21-04-PLAN.md
+Last session: 2026-11-12T17:09:12.195Z
+Stopped at: Completed 21-05-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
