@@ -1756,4 +1756,636 @@ mod tests {
             .expect("deserialize without workspace_source (backward-compat)");
         assert_eq!(r_old.workspace_source, None);
     }
+
+    // ---- Task 2: tickets, the removal timeout, the unanswered execute -----
+
+    /// The `/rows` body with one checkout entry taken out.
+    fn rows_body_without(checkout: u64) -> String {
+        let mut rows: serde_json::Value =
+            serde_json::from_str(&rows_body()).expect("the rows body is JSON");
+        for repository in rows["repositories"]
+            .as_array_mut()
+            .expect("repositories array")
+        {
+            repository["checkouts"]
+                .as_array_mut()
+                .expect("checkouts array")
+                .retain(|entry| entry["checkout_key"] != serde_json::json!(checkout));
+        }
+        rows.to_string()
+    }
+
+    /// Put an index into an idle poller, as an applied poll would.
+    fn seed_rows(poller: &RemotePoller, rows: RemoteRows) {
+        poller.shared.lock().expect("poller state").rows = rows;
+    }
+
+    /// Poll a ticket the way the draw tick will, with a deadline.
+    fn wait_for(ticket: &RemovalTicket, limit: Duration) -> RemovalAnswer {
+        let started = Instant::now();
+        loop {
+            if let Some(answer) = ticket.try_take() {
+                return answer;
+            }
+            assert!(started.elapsed() < limit, "no answer within {limit:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn method_and_path(double: &Double) -> Vec<(String, String)> {
+        double
+            .requests()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect()
+    }
+
+    fn pair(method: &str, path: &str) -> (String, String) {
+        (method.to_string(), path.to_string())
+    }
+
+    fn checkout_10() -> (RemovalTarget, RemovalReport) {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        (target, previewed)
+    }
+
+    #[test]
+    fn ticket_execute_outlasting_the_request_timeout_still_returns_its_report() {
+        let (_, previewed) = checkout_10();
+        let committed = committed_report(&previewed);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(200, wire(&committed)).delayed(Duration::from_millis(400))],
+        )]);
+        let poller = RemotePoller::idle_with(
+            double.base(),
+            Timeouts {
+                request: Duration::from_millis(100),
+                removal: Duration::from_secs(2),
+                ..Timeouts::default()
+            },
+        );
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed.clone());
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert_eq!(answer.reply, RemovalReply::Report(committed));
+        assert_eq!(answer.rows, None);
+        // The committed rows left the client index with the answer.
+        assert_eq!(
+            poller.rows().label(&RowKey::Checkout(checkout_key(10))),
+            None
+        );
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(11)))
+            .is_some());
+        // The blocking call runs under the same removal timeout.
+        let double_again = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(200, wire(&committed_report(&previewed)))
+                .delayed(Duration::from_millis(400))],
+        )]);
+        let blocking = RemotePoller::idle_with(
+            double_again.base(),
+            Timeouts {
+                request: Duration::from_millis(100),
+                removal: Duration::from_secs(2),
+                ..Timeouts::default()
+            },
+        );
+        assert!(matches!(
+            blocking.execute_removal(&previewed),
+            RemovalReply::Report(_)
+        ));
+        assert_settled(&double, 1);
+        assert_settled(&double_again, 1);
+    }
+
+    #[test]
+    fn ticket_spawn_returns_before_the_daemon_answers() {
+        let (target, previewed) = checkout_10();
+        let committed = committed_report(&previewed);
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals",
+                vec![Reply::json(200, wire(&committed)).delayed(Duration::from_millis(400))],
+            ),
+            route(
+                "POST",
+                "/removals/preview",
+                vec![Reply::json(200, wire(&previewed)).delayed(Duration::from_millis(400))],
+            ),
+            route("GET", "/rows", vec![Reply::json(200, rows_body())]),
+        ]);
+        let poller = idle_poller(&double);
+
+        let started = Instant::now();
+        let execute = poller.spawn_execute_removal(previewed.clone());
+        let preview = poller.spawn_preview_removal(target);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(execute.try_take().is_none());
+        assert!(preview.try_take().is_none());
+
+        let answer = wait_for(&execute, Duration::from_secs(3));
+        assert_eq!(answer.reply, RemovalReply::Report(committed));
+        assert!(execute.try_take().is_none(), "an answer is taken once");
+        let answer = wait_for(&preview, Duration::from_secs(3));
+        assert_eq!(answer.reply, RemovalReply::Report(previewed));
+        assert!(preview.try_take().is_none(), "an answer is taken once");
+        assert_settled(&double, 3);
+    }
+
+    #[test]
+    fn ticket_execute_timeout_is_indeterminate_and_reconciles_through_rows() {
+        let (_, previewed) = checkout_10();
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals",
+                vec![Reply::held(Duration::from_secs(1))],
+            ),
+            route(
+                "GET",
+                "/rows",
+                vec![Reply::json(200, rows_body_without(10))],
+            ),
+        ]);
+        let poller = RemotePoller::idle_with(
+            double.base(),
+            Timeouts {
+                removal: Duration::from_millis(200),
+                ..Timeouts::default()
+            },
+        );
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert!(
+            matches!(
+                answer.reply,
+                RemovalReply::Indeterminate {
+                    rows_gone: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(
+            poller.rows().label(&RowKey::Checkout(checkout_key(10))),
+            None
+        );
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(11)))
+            .is_some());
+        // One POST, then the fresh read. The execute was never resent.
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+        assert_settled(&double, 2);
+    }
+
+    #[test]
+    fn ticket_execute_timeout_with_rows_still_listed_is_indeterminate_not_gone() {
+        let (_, previewed) = checkout_10();
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals",
+                vec![Reply::held(Duration::from_secs(1))],
+            ),
+            route("GET", "/rows", vec![Reply::json(200, rows_body())]),
+        ]);
+        let poller = RemotePoller::idle_with(
+            double.base(),
+            Timeouts {
+                removal: Duration::from_millis(200),
+                ..Timeouts::default()
+            },
+        );
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert!(
+            matches!(
+                answer.reply,
+                RemovalReply::Indeterminate {
+                    rows_gone: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            answer.reply
+        );
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+        assert_settled(&double, 2);
+    }
+
+    #[test]
+    fn ticket_execute_timeout_with_rows_unreadable_is_indeterminate_not_gone() {
+        let (_, previewed) = checkout_10();
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::held(Duration::from_secs(1))],
+        )]);
+        let poller = RemotePoller::idle_with(
+            double.base(),
+            Timeouts {
+                removal: Duration::from_millis(200),
+                ..Timeouts::default()
+            },
+        );
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert!(
+            matches!(
+                answer.reply,
+                RemovalReply::Indeterminate {
+                    rows_gone: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(answer.rows, None);
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+        // The one unscripted request is the rows read this test left unrouted.
+        let unscripted = double.unscripted();
+        assert_eq!(unscripted.len(), 1, "{unscripted:?}");
+        assert_eq!(unscripted[0].method, "GET");
+        assert_eq!(unscripted[0].path, "/rows");
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+    }
+
+    #[test]
+    fn ticket_execute_404_drops_the_echoed_rows() {
+        let target = RemovalTarget::Repository(repository_key(1));
+        let previewed = planned_report(
+            target,
+            vec![
+                RowKey::Checkout(checkout_key(10)),
+                RowKey::Checkout(checkout_key(11)),
+                RowKey::Repository(repository_key(1)),
+            ],
+        );
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::text(404, "unknown removal target")],
+        )]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed.clone());
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert_eq!(
+            answer.reply,
+            RemovalReply::Gone {
+                message: "unknown removal target".to_string(),
+            }
+        );
+        let rows = poller.rows();
+        for key in &previewed.rows_removed {
+            assert_eq!(rows.label(key), None, "{key:?} is still listed");
+        }
+        assert!(rows
+            .label(&RowKey::Standalone(standalone_key(20)))
+            .is_some());
+        assert_eq!(method_and_path(&double), vec![pair("POST", "/removals")]);
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn ticket_preview_404_drops_only_the_target_row() {
+        let (target, _) = checkout_10();
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::text(404, "unknown removal target")],
+        )]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert!(
+            matches!(answer.reply, RemovalReply::Gone { .. }),
+            "{:?}",
+            answer.reply
+        );
+        let rows = poller.rows();
+        assert_eq!(rows.label(&RowKey::Checkout(checkout_key(10))), None);
+        assert!(rows.label(&RowKey::Checkout(checkout_key(11))).is_some());
+        assert!(rows.label(&RowKey::Repository(repository_key(1))).is_some());
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn ticket_preview_unanswered_is_unreachable() {
+        let (target, _) = checkout_10();
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::held(Duration::from_secs(1))],
+        )]);
+        let poller = RemotePoller::idle_with(
+            double.base(),
+            Timeouts {
+                removal: Duration::from_millis(200),
+                ..Timeouts::default()
+            },
+        );
+
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert!(
+            matches!(answer.reply, RemovalReply::Unreachable { .. }),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(answer.rows, None);
+        // Nothing was asked to change, so nothing is reconciled.
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals/preview")]
+        );
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn ticket_closed_without_an_answer_is_unreachable_for_preview_and_indeterminate_for_execute() {
+        let (target, previewed) = checkout_10();
+
+        // A preview the daemon dropped: nothing changed, nothing reconciled.
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::closed_unanswered()],
+        )]);
+        let poller = idle_poller(&double);
+        let started = Instant::now();
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(answer.reply, RemovalReply::Unreachable { .. }),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals/preview")]
+        );
+        assert_settled(&double, 1);
+
+        // An execute the daemon dropped, the row still listed afterwards.
+        let double = serve(vec![
+            route("POST", "/removals", vec![Reply::closed_unanswered()]),
+            route("GET", "/rows", vec![Reply::json(200, rows_body())]),
+        ]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+        let started = Instant::now();
+        let ticket = poller.spawn_execute_removal(previewed.clone());
+        let answer = wait_for(&ticket, Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(
+                answer.reply,
+                RemovalReply::Indeterminate {
+                    rows_gone: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+        assert_settled(&double, 2);
+
+        // The same, but the fresh read no longer lists the echoed row.
+        let double = serve(vec![
+            route("POST", "/removals", vec![Reply::closed_unanswered()]),
+            route(
+                "GET",
+                "/rows",
+                vec![Reply::json(200, rows_body_without(10))],
+            ),
+        ]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+        let started = Instant::now();
+        let ticket = poller.spawn_execute_removal(previewed);
+        let answer = wait_for(&ticket, Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(
+                answer.reply,
+                RemovalReply::Indeterminate {
+                    rows_gone: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            answer.reply
+        );
+        assert_eq!(
+            poller.rows().label(&RowKey::Checkout(checkout_key(10))),
+            None
+        );
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+        assert_settled(&double, 2);
+    }
+
+    #[test]
+    fn ticket_answer_carries_rows_fetched_after_the_response() {
+        let target = RemovalTarget::Repository(repository_key(1));
+        let previewed = planned_report(
+            target,
+            vec![
+                RowKey::Checkout(checkout_key(10)),
+                RowKey::Checkout(checkout_key(11)),
+                RowKey::Repository(repository_key(1)),
+            ],
+        );
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals/preview",
+                vec![Reply::json(200, wire(&previewed))],
+            ),
+            route(
+                "POST",
+                "/removals",
+                vec![Reply::json(409, wire(&previewed))],
+            ),
+            route(
+                "GET",
+                "/rows",
+                vec![Reply::json(200, rows_body()), Reply::json(200, rows_body())],
+            ),
+        ]);
+        let poller = idle_poller(&double);
+        // The polled index is older: it has never heard of checkout 11.
+        let older: RemoteRows =
+            serde_json::from_str(&rows_body_without(11)).expect("older rows parse");
+        seed_rows(&poller, older);
+        let child = RowKey::Checkout(checkout_key(11));
+        assert_eq!(poller.rows().label(&child), None);
+
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+        assert_eq!(answer.reply, RemovalReply::Report(previewed.clone()));
+        let fresh = answer.rows.expect("a 200 preview carries a fresh index");
+        assert_eq!(
+            fresh.label(&child).map(|label| label.display_name),
+            Some("topic".to_string())
+        );
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals/preview"), pair("GET", "/rows")]
+        );
+
+        let ticket = poller.spawn_execute_removal(previewed.clone());
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+        assert_eq!(answer.reply, RemovalReply::Drift(previewed));
+        let fresh = answer.rows.expect("a 409 carries a fresh index");
+        assert!(fresh.label(&child).is_some());
+        assert_eq!(
+            method_and_path(&double)[2..],
+            [pair("POST", "/removals"), pair("GET", "/rows")]
+        );
+        // A drift removed nothing, so the client index is untouched.
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+        assert_settled(&double, 4);
+    }
+
+    #[test]
+    fn ticket_answer_rows_is_none_when_the_refetch_fails() {
+        let (target, previewed) = checkout_10();
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals/preview",
+                vec![Reply::json(200, wire(&previewed))],
+            ),
+            route(
+                "GET",
+                "/rows",
+                vec![
+                    Reply::text(503, "daemon is restoring sessions"),
+                    Reply::text(503, "daemon is\u{1b}[31m restoring\n sessions"),
+                ],
+            ),
+        ]);
+        let poller = idle_poller(&double);
+
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert_eq!(answer.reply, RemovalReply::Report(previewed));
+        assert_eq!(answer.rows, None);
+        // The blocking read says why, in the daemon's own sanitized words.
+        assert_eq!(
+            poller.refresh_rows(),
+            Err("daemon said 503: daemon is[31m restoring sessions".to_string())
+        );
+        assert_settled(&double, 3);
+    }
+
+    #[test]
+    fn removal_timeout_exceeds_the_request_timeout() {
+        assert_eq!(REMOVAL_TIMEOUT, Duration::from_secs(60));
+        let defaults = Timeouts::default();
+        assert_eq!(defaults.request, REQUEST_TIMEOUT);
+        assert_eq!(defaults.removal, REMOVAL_TIMEOUT);
+        assert!(defaults.removal > defaults.request);
+
+        // The way 21-06's tests build one: struct update, one field named.
+        let short = Timeouts {
+            removal: Duration::from_millis(200),
+            ..Timeouts::default()
+        };
+        assert_ne!(short.removal, defaults.removal);
+        assert_eq!(short.request, defaults.request);
+        assert_eq!(short.events_slice, defaults.events_slice);
+        assert_eq!(short.events_silence, defaults.events_silence);
+    }
+
+    #[test]
+    fn ticket_dropped_before_the_answer_does_not_panic_the_worker() {
+        let (_, previewed) = checkout_10();
+        let committed = committed_report(&previewed);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(200, wire(&committed)).delayed(Duration::from_millis(300))],
+        )]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_execute_removal(previewed);
+        drop(ticket);
+
+        // The worker still finishes its round trip and records the removal;
+        // only the send into the dropped ticket is ignored.
+        let started = Instant::now();
+        while poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some()
+        {
+            assert!(started.elapsed() < Duration::from_secs(3), "worker died");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(method_and_path(&double), vec![pair("POST", "/removals")]);
+        assert_settled(&double, 1);
+    }
 }
