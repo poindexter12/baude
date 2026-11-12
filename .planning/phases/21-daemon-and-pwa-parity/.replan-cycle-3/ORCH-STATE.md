@@ -191,3 +191,10 @@ Round 3 offenders fixed and committed: 06f6a74, cf17846, 7752640; validation map
 - worktree.base-check: shouldDegrade=true, HEAD c052a9d differs from origin/HEAD cf64ade. Per the workflow, isolation forced to none for this run; executors run sequentially on the main tree on branch gsd/phase-18-shared-kill-then-remove-lifecycle. config use_worktrees stays true.
 - Parallel waves 3 and 7 therefore run one plan at a time: 21-07 then 21-09; 21-05 then 21-08.
 - Resume: /gsd-execute-phase 21 skips plans that have a SUMMARY.
+
+## 2026-11-12 07:25 PST execution status
+
+- Done with SUMMARY: 21-01, 21-02, 21-07, 21-09. 21-10 Tasks 1 and 2 committed as 4236eeb and 6e027da; Task 3 and the SUMMARY remain.
+- Decisions taken by the orchestrator: restart on a main checkout follows a branch switch, 409 kept for pinned worktrees; two DELETE failure tests re-fixtured onto a real repository.
+- Executors must be told that CONTEXT WARNING hook lines report the orchestrator session, and must not read whole plans over 60 KB.
+- OPEN flake on macOS: DELETE /sessions on a repository row intermittently returns 500, failed to terminate exact PTY process group. Seen 1 of 3 and 1 of 5 full single-threaded bauded runs after 21-10, 0 of 5 at aebb3e1; ten further baseline runs were lost to a login expiry. Suspect signal_group in baude-core/src/pty.rs tolerating ESRCH but not EPERM for an unreaped group leader. Not fixed, not assigned to a plan.
