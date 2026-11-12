@@ -156,4 +156,64 @@ mod tests {
         );
         assert!(controller < app_js, "the controller must precede app.js");
     }
+
+    /// Every `src` of a `<script>` tag in the served page, in page order.
+    fn script_sources(page: &str) -> Vec<String> {
+        let open = "<script src=\"";
+        let mut sources = Vec::new();
+        let mut rest = page;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len()..];
+            let end = after
+                .find('"')
+                .expect("a script tag's src attribute is closed");
+            sources.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        sources
+    }
+
+    #[tokio::test]
+    async fn service_worker_shell_matches_served_assets() {
+        let (_scope, app) = app("service-worker-shell");
+
+        let (status, content_type, worker) = fetch(&app, "/sw.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/javascript"),
+            "/sw.js served as {content_type:?}"
+        );
+        // A new cache name is what makes an installed page drop the shell it
+        // cached before the removal scripts existed.
+        assert!(
+            worker.contains("\"baude-v7\""),
+            "cache name is not baude-v7"
+        );
+        assert!(
+            !worker.contains("baude-v6"),
+            "the old cache name is still served"
+        );
+
+        let (status, _, page) = fetch(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        let scripts = script_sources(&page);
+        for expected in ["/removal.js", "/removal-controller.js", "/app.js"] {
+            assert!(
+                scripts.iter().any(|script| script == expected),
+                "the served page does not load {expected}; it loads {scripts:?}"
+            );
+        }
+        for script in &scripts {
+            // The page asks for it, so the router has to answer for it...
+            let (status, _, body) = fetch(&app, script).await;
+            assert_eq!(status, StatusCode::OK, "{script}");
+            assert!(!body.is_empty(), "{script} served an empty body");
+            // ...and the worker has to cache it with the rest of the shell,
+            // or an offline page pairs one script with a stale sibling.
+            assert!(
+                worker.contains(&format!("\"{script}\"")),
+                "{script} is loaded by the page but missing from the worker's shell"
+            );
+        }
+    }
 }

@@ -1260,3 +1260,273 @@ test("removed_row_session_is_filtered_from_sessions", async () => {
   h.counters.clock += 60001;
   assert.deepEqual(h.controller.filterSessions(sessions).map((s) => s.id), [2, 3, 4]);
 });
+
+// ---- Task 3: the row list over all four row kinds ----
+
+// The page's card for a live session, in the markup app.js writes for one,
+// and a record of every card handed out.
+function cards(sessions) {
+  const emitted = [];
+  const card = (sessionId) => {
+    const s = sessions.find((candidate) => candidate.id === sessionId);
+    if (!s) return null;
+    const html = `<button class="row${s.archived ? " archived" : ""}" data-sid="${s.id}">`
+      + `<div class="line1"><span class="dot exited">✗</span><span class="name">${s.name}</span>`
+      + `<span class="wait"></span></div>`
+      + `<div class="line2">⎇ ${s.branch || "none"}</div></button>`;
+    emitted.push(html);
+    return html;
+  };
+  return { card, emitted };
+}
+
+function renderList(body, options = {}) {
+  return controllerModule().renderRowsList(body, { removal: BaudeRemoval, ...options });
+}
+
+// Every remove control in the rendered list, in document order.
+function removeControls(html) {
+  const controls = [];
+  const tag = /<button\b[^>]*\bclass="rm"[^>]*>/g;
+  for (const match of html.matchAll(tag)) {
+    const kind = /\bdata-kind="([^"]*)"/.exec(match[0]);
+    const key = /\bdata-key="([^"]*)"/.exec(match[0]);
+    controls.push({
+      kind: kind ? kind[1] : null,
+      key: key ? key[1] : null,
+      at: match.index,
+      tag: match[0],
+    });
+  }
+  return controls;
+}
+
+function kindsAndKeys(html) {
+  return removeControls(html).map((control) => [control.kind, control.key]);
+}
+
+// One entry per row wrapper: whether it is marked archived, and its control.
+function wrappers(html) {
+  return html.split('<div class="rowwrap').slice(1).map((chunk) => {
+    const control = removeControls(chunk)[0];
+    return {
+      archived: chunk.startsWith(' archived"'),
+      kind: control ? control.kind : null,
+      key: control ? control.key : null,
+    };
+  });
+}
+
+// One repository with its main checkout and one worktree, and one folder.
+function fourKindsBody() {
+  return rowsBody({
+    repositories: [
+      repositoryRow({
+        checkouts: [
+          mainCheckout({ checkout_key: 7 }),
+          worktreeCheckout({ checkout_key: 8 }),
+        ],
+      }),
+    ],
+    standalone: [standaloneRow({ standalone_key: 3 })],
+  });
+}
+
+function liveSessions() {
+  return [
+    sessionInfo(2, "repo", { branch: "main" }),
+    sessionInfo(3, "repo:topic", { branch: "topic", cwd: `${WORKTREES}/topic-7`, is_worktree: true }),
+    sessionInfo(4, "notes", { cwd: `${HOME}/notes`, repo_root: `${HOME}/notes` }),
+  ];
+}
+
+test("rows_list_offers_remove_on_all_four_kinds", () => {
+  const { card } = cards(liveSessions());
+  const html = renderList(fourKindsBody(), { card });
+
+  assert.deepEqual(kindsAndKeys(html), [
+    ["repository", "1"],
+    ["checkout", "7"],
+    ["checkout", "8"],
+    ["standalone", "3"],
+  ]);
+  // The repository heading names the repository and its path.
+  const head = html.slice(html.indexOf('class="repohead"'), removeControls(html)[0].at);
+  assert.ok(head.includes(">repo<"), head);
+  assert.ok(head.includes(REPO_PATH), head);
+  // Each checkout says what it is; a folder sits under its own heading.
+  assert.ok(html.includes('<span class="role">main</span>'));
+  assert.ok(html.includes('<span class="role">worktree</span>'));
+  assert.ok(html.indexOf(">folders<") > removeControls(html)[2].at);
+  assert.ok(html.indexOf(">folders<") < removeControls(html)[3].at);
+
+  // primary_default is the repository's own checkout too.
+  const primary = renderList(rowsBody({
+    repositories: [repositoryRow({ checkouts: [mainCheckout({ role: "primary_default" })] })],
+    standalone: [],
+  }), { card });
+  assert.ok(primary.includes('<span class="role">main</span>'));
+  assert.ok(!primary.includes('<span class="role">worktree</span>'));
+  assert.ok(!primary.includes(">folders<"), "no heading over an empty section");
+
+  // Removing a repository's last checkout leaves the parent with none. It
+  // still renders, and can still be removed.
+  const emptied = renderList(rowsBody({
+    repositories: [repositoryRow({ checkouts: [] })],
+    standalone: [],
+  }), { card });
+  assert.deepEqual(kindsAndKeys(emptied), [["repository", "1"]]);
+  assert.ok(emptied.includes(REPO_PATH));
+});
+
+test("rows_list_never_nests_remove_inside_a_card_button", () => {
+  const sessions = [...liveSessions(), sessionInfo(9, "scratch", { cwd: "/tmp/scratch", repo_root: null })];
+  const { card, emitted } = cards(sessions);
+  const html = renderList(fourKindsBody(), { card, keyless: [sessions[3]] });
+
+  assert.equal(emitted.length, 4, "two checkouts, one folder, one keyless session");
+  const controls = removeControls(html);
+  assert.equal(controls.length, 4);
+  let from = 0;
+  for (const emittedCard of emitted) {
+    const start = html.indexOf('<button class="row', from);
+    assert.ok(start >= 0, "every card is in the list");
+    const end = html.indexOf("</button>", start) + "</button>".length;
+    const inside = html.slice(start, end);
+    assert.equal(inside, emittedCard, "the card is written as the page built it");
+    assert.ok(!inside.includes("data-kind"), inside);
+    for (const control of controls) {
+      assert.ok(control.at < start || control.at >= end, "a remove control sits outside every card");
+    }
+    from = end;
+  }
+});
+
+test("keyless_session_has_no_remove_control", () => {
+  const sessions = [...liveSessions(), sessionInfo(9, "scratch", { cwd: "/tmp/scratch", repo_root: null })];
+  const { card, emitted } = cards(sessions);
+  const html = renderList(fourKindsBody(), { card, keyless: [sessions[3]] });
+
+  const heading = html.indexOf(">other sessions<");
+  assert.ok(heading >= 0);
+  const tail = html.slice(heading);
+  assert.ok(tail.includes(emitted[3]), "the keyless session's card is listed");
+  assert.ok(tail.includes('data-sid="9"'));
+  assert.ok(!tail.includes("data-kind"), "nothing under that heading can be removed");
+  assert.ok(heading > removeControls(html)[3].at, "keyless sessions come last");
+  // The same four controls as without it.
+  assert.equal(removeControls(html).length, 4);
+
+  // No keyless session, no heading.
+  assert.ok(!renderList(fourKindsBody(), { card }).includes(">other sessions<"));
+  assert.ok(!renderList(fourKindsBody(), { card, keyless: [] }).includes(">other sessions<"));
+});
+
+test("rows_without_a_live_session_still_offer_remove", () => {
+  const { card, emitted } = cards(liveSessions());
+  const body = rowsBody({
+    repositories: [
+      repositoryRow({
+        checkouts: [mainCheckout(), worktreeCheckout({ session_id: null })],
+      }),
+    ],
+    standalone: [standaloneRow({ session_id: null })],
+  });
+
+  const html = renderList(body, { card });
+
+  assert.deepEqual(kindsAndKeys(html), [
+    ["repository", "1"],
+    ["checkout", "5"],
+    ["checkout", "7"],
+    ["standalone", "2"],
+  ]);
+  assert.equal(emitted.length, 1, "only the row with a live session has a card");
+  // A row with nothing to open is still named, with its branch and path.
+  assert.ok(html.includes(">repo:topic<"));
+  assert.ok(html.includes("topic"));
+  assert.ok(html.includes(`${WORKTREES}/topic-7`));
+  assert.ok(html.includes(">notes<"));
+  assert.ok(html.includes(`${HOME}/notes`));
+
+  // A session id the page holds no session for is the same case.
+  const strangers = renderList(fourKindsBody(), { card: () => null });
+  assert.equal(removeControls(strangers).length, 4);
+  // And so is a caller that passes no card callback at all.
+  assert.equal(removeControls(renderList(fourKindsBody())).length, 4);
+});
+
+test("rows_list_escapes_daemon_strings", () => {
+  const branch = "<img src=x onerror=alert(1)>";
+  const body = rowsBody({
+    repositories: [
+      repositoryRow({
+        display_name: "<i>repo</i>",
+        path: "/tmp/<b>repo</b>",
+        checkouts: [
+          worktreeCheckout({
+            display_name: "\"><script>alert(2)</script>",
+            branch,
+            path: "/tmp/<u>wt</u>",
+            session_id: null,
+          }),
+        ],
+      }),
+    ],
+    standalone: [
+      standaloneRow({ display_name: "it's <em>notes</em>", path: "/tmp/a&b", session_id: null }),
+    ],
+  });
+
+  const html = renderList(body);
+
+  assert.ok(html.includes("&lt;img src=x onerror=alert(1)&gt;"), html);
+  assert.ok(!html.includes("<img"));
+  for (const raw of ["<script", "<i>", "<b>", "<u>", "<em>", "\"><", "a&b"]) {
+    assert.ok(!html.includes(raw), `${raw} reached the list unescaped`);
+  }
+  assert.ok(html.includes("/tmp/a&amp;b"));
+  // The names sit inside an attribute as well, and stay inside it.
+  assert.deepEqual(kindsAndKeys(html), [
+    ["repository", "1"],
+    ["checkout", "7"],
+    ["standalone", "2"],
+  ]);
+  for (const control of removeControls(html)) {
+    assert.ok(!/[<>]/.test(control.tag.slice(1, -1)), control.tag);
+  }
+});
+
+test("archived_siblings_sort_last_and_carry_the_archived_class", () => {
+  const { card } = cards(liveSessions());
+  const body = rowsBody({
+    repositories: [
+      repositoryRow({
+        checkouts: [
+          worktreeCheckout({ checkout_key: 6, display_name: "repo:old", archived: true, session_id: null }),
+          mainCheckout(),
+          worktreeCheckout({ checkout_key: 9, display_name: "repo:older", archived: true, session_id: null }),
+          worktreeCheckout(),
+        ],
+      }),
+    ],
+    standalone: [
+      standaloneRow({ standalone_key: 4, display_name: "attic", archived: true, session_id: null }),
+      standaloneRow(),
+    ],
+  });
+
+  const html = renderList(body, { card });
+
+  // /rows order within each group, the archived group after the live one.
+  assert.deepEqual(wrappers(html), [
+    { archived: false, kind: "checkout", key: "5" },
+    { archived: false, kind: "checkout", key: "7" },
+    { archived: true, kind: "checkout", key: "6" },
+    { archived: true, kind: "checkout", key: "9" },
+    { archived: false, kind: "standalone", key: "2" },
+    { archived: true, kind: "standalone", key: "4" },
+  ]);
+  // The body handed in is not reordered.
+  assert.deepEqual(body.repositories[0].checkouts.map((c) => c.checkout_key), [6, 5, 9, 7]);
+});
