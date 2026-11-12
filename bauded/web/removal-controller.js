@@ -454,19 +454,21 @@
   // button inside a button is invalid HTML and a tap would mean two things.
   function removeControl(removal, kind, key, name) {
     if (!ROW_KINDS.includes(kind) || !Number.isSafeInteger(key) || key < 0) return "";
-    const label = removal.escapeHtml(`remove ${name}`);
+    // A repository and its own checkout share a name, and removing one is
+    // not removing the other, so the larger one says what it is.
+    const label = removal.escapeHtml(kind === "repository" ? `remove repository ${name}` : `remove ${name}`);
     return `<button type="button" class="rm" data-kind="${kind}" data-key="${key}" `
       + `aria-label="${label}" title="${label}">✕</button>`;
   }
 
   // A row with no live session: nothing to open, so nothing to tap.
-  function plainLine(removal, row, archived) {
+  function plainLine(removal, row) {
     const esc = removal.escapeHtml;
     const detail = [
       typeof row.branch === "string" && row.branch !== "" ? `⎇ ${esc(row.branch)}` : null,
       esc(row.path),
     ].filter(Boolean).join(" · ");
-    return `<div class="rowline${archived ? " archived" : ""}">`
+    return `<div class="rowline">`
       + `<div class="line1"><span class="name">${esc(row.display_name)}</span></div>`
       + `<div class="line2">${detail}</div></div>`;
   }
@@ -478,17 +480,40 @@
     return typeof html === "string" && html !== "" ? html : null;
   }
 
-  function checkoutHtml(removal, checkout, options) {
-    const card = cardFor(options, checkout.session_id);
-    const body = card !== null ? card : plainLine(removal, checkout, checkout.archived === true);
-    return `<div class="rowwrap">${body}`
-      + `${removeControl(removal, "checkout", checkout.checkout_key, checkout.display_name)}</div>`;
+  // What a checkout is, in the two words a user has for it. The repository's
+  // own checkout is `main` whichever of its two roles the daemon gave it.
+  function roleLabel(role) {
+    if (role === "main" || role === "primary_default") return "main";
+    if (role === "managed_branch") return "worktree";
+    return "";
   }
 
-  // The GET /rows body as the list's HTML: one heading per repository with
-  // its checkouts beneath. `options.removal` is the BaudeRemoval object and
-  // `options.card(sessionId)` returns the page's card HTML for a live session,
-  // or null. Every daemon string goes through removal.escapeHtml.
+  // The rows of one group in the order served, archived ones after the rest.
+  // A new array: the body is never reordered.
+  function archivedLast(list) {
+    const rows = asArray(list).filter(isRecord);
+    return rows.filter((row) => row.archived !== true).concat(rows.filter((row) => row.archived === true));
+  }
+
+  // One row: its card when it has a live session the page knows, else its
+  // name and path, then what it is, then its remove control.
+  function rowHtml(removal, kind, key, row, role, options) {
+    const card = cardFor(options, row.session_id);
+    const body = card !== null ? card : plainLine(removal, row);
+    const tag = role !== "" ? `<span class="role">${removal.escapeHtml(role)}</span>` : "";
+    return `<div class="rowwrap${row.archived === true ? " archived" : ""}">${body}${tag}`
+      + `${removeControl(removal, kind, key, row.display_name)}</div>`;
+  }
+
+  // The GET /rows body as the list's HTML: each repository as a heading with
+  // its checkouts beneath, then folders, then the sessions no row claims.
+  // Options:
+  //   removal   the BaudeRemoval object
+  //   card      card(sessionId) returns the page's card HTML for a live
+  //             session, or null when the page holds no such session
+  //   keyless   sessions matching no /rows session_id; listed last as cards
+  //             with no remove control, since they have no key to remove by
+  // Every daemon string goes through removal.escapeHtml.
   function renderRowsList(rowsBody, options) {
     const removal = options && options.removal ? options.removal : globalThis.BaudeRemoval;
     const esc = removal.escapeHtml;
@@ -496,13 +521,28 @@
     let html = "";
     for (const repository of asArray(body.repositories)) {
       if (!isRecord(repository)) continue;
-      html += `<div class="repo"><div class="repohead">`
+      html += `<div class="repo"><div class="repohead"><div class="repotitle">`
         + `<span class="name">${esc(repository.display_name)}</span>`
-        + `<span class="path">${esc(repository.path)}</span></div>`;
-      for (const checkout of asArray(repository.checkouts)) {
-        if (isRecord(checkout)) html += checkoutHtml(removal, checkout, options);
+        + `<span class="path">${esc(repository.path)}</span></div>`
+        + `${removeControl(removal, "repository", repository.repository_key, repository.display_name)}`
+        + `</div>`;
+      for (const checkout of archivedLast(repository.checkouts)) {
+        html += rowHtml(removal, "checkout", checkout.checkout_key, checkout, roleLabel(checkout.role), options);
       }
       html += "</div>";
+    }
+    const folders = archivedLast(body.standalone);
+    if (folders.length > 0) {
+      html += `<div class="secthead">folders</div>`;
+      for (const folder of folders) {
+        html += rowHtml(removal, "standalone", folder.standalone_key, folder, "", options);
+      }
+    }
+    const others = asArray(options ? options.keyless : null)
+      .map((session) => (isRecord(session) ? cardFor(options, session.id) : null))
+      .filter((card) => card !== null);
+    if (others.length > 0) {
+      html += `<div class="secthead">other sessions</div>${others.join("")}`;
     }
     return html;
   }

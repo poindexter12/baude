@@ -1,8 +1,11 @@
 // Minimal service worker: cache the app shell for installability/offline
 // shell; never cache API calls (they're live session state). Also receives
 // Web Push notifications from the daemon.
-const CACHE = "baude-v6";
-const SHELL = ["/", "/app.js", "/style.css", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "baude-v7";
+const SHELL = [
+  "/", "/removal.js", "/removal-controller.js", "/app.js",
+  "/style.css", "/manifest.webmanifest", "/icon.svg",
+];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

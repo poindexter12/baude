@@ -1482,9 +1482,11 @@ test("rows_list_escapes_daemon_strings", () => {
 
   assert.ok(html.includes("&lt;img src=x onerror=alert(1)&gt;"), html);
   assert.ok(!html.includes("<img"));
-  for (const raw of ["<script", "<i>", "<b>", "<u>", "<em>", "\"><", "a&b"]) {
+  for (const raw of ["<script", "<i>", "<b>", "<u>", "<em>", "a&b"]) {
     assert.ok(!html.includes(raw), `${raw} reached the list unescaped`);
   }
+  // The quote that would close an attribute early is encoded with the rest.
+  assert.ok(html.includes("&quot;&gt;&lt;script&gt;alert(2)&lt;/script&gt;"), html);
   assert.ok(html.includes("/tmp/a&amp;b"));
   // The names sit inside an attribute as well, and stay inside it.
   assert.deepEqual(kindsAndKeys(html), [
