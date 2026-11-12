@@ -6053,6 +6053,223 @@ mod tests {
 
         removal_teardown(&fixture.shared, &fixture.root);
     }
+
+    /// An open `GET /events` response body, with the bytes read off it that
+    /// no message has consumed yet.
+    struct EventsBody {
+        body: Body,
+        pending: Vec<u8>,
+    }
+
+    /// One SSE message as it arrived on the wire.
+    #[derive(Debug)]
+    struct SseFrame {
+        /// The `event:` field.
+        event: String,
+        /// Every `data:` line, joined by a newline. A single-line payload
+        /// holds no newline.
+        data: String,
+        /// The message exactly as read, terminator included.
+        raw: String,
+    }
+
+    /// `GET /events` through the router, pinned to 200 and an SSE content
+    /// type. The subscription exists once this returns: the handler takes its
+    /// receiver before it builds the stream.
+    async fn open_events(app: &Router) -> EventsBody {
+        let response = app.clone().oneshot(get("/events")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "21-04 events pin: GET /events must open a stream"
+        );
+        let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "21-04 events pin: GET /events content-type is {content_type}"
+        );
+        EventsBody {
+            body: response.into_body(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The next SSE message off `events`, or `None` when `within` passes
+    /// without a complete one. A message made only of comment lines, which is
+    /// what a keep-alive is, is skipped. `body_json` cannot stand in: its
+    /// `collect` never returns on a stream that stays open.
+    ///
+    /// Panics when the body ends. The daemon ends this stream only at
+    /// shutdown, so an end inside a test is the route giving up on its
+    /// subscriber, never an empty read.
+    async fn next_sse_frame(events: &mut EventsBody, within: Duration) -> Option<SseFrame> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            while let Some(end) = events
+                .pending
+                .windows(2)
+                .position(|pair| pair == b"\n\n")
+                .map(|start| start + 2)
+            {
+                let raw: Vec<u8> = events.pending.drain(..end).collect();
+                let raw = String::from_utf8(raw).expect("an SSE message is UTF-8");
+                let mut event = String::new();
+                let mut data: Vec<&str> = Vec::new();
+                for line in raw.lines() {
+                    if let Some(value) = line.strip_prefix("event:") {
+                        event = value.strip_prefix(' ').unwrap_or(value).to_string();
+                    } else if let Some(value) = line.strip_prefix("data:") {
+                        data.push(value.strip_prefix(' ').unwrap_or(value));
+                    }
+                }
+                if event.is_empty() && data.is_empty() {
+                    continue;
+                }
+                let data = data.join("\n");
+                return Some(SseFrame { event, data, raw });
+            }
+            let chunk = match tokio::time::timeout_at(deadline, events.body.frame()).await {
+                Err(_) => return None,
+                Ok(None) => panic!("21-04 events pin: the events stream ended"),
+                Ok(Some(chunk)) => chunk.expect("the events body reads without error"),
+            };
+            if let Ok(bytes) = chunk.into_data() {
+                events.pending.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    /// The next message, pinned to the named `rows_removed` event carrying
+    /// one data line, parsed.
+    async fn expect_rows_removed(events: &mut EventsBody, marker: &str) -> serde_json::Value {
+        let frame = next_sse_frame(events, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| {
+                panic!("21-04 events pin: {marker}: no message within 5 s of a committed removal")
+            });
+        assert_eq!(frame.event, "rows_removed", "{marker}: {frame:?}");
+        assert!(
+            !frame.data.contains('\n'),
+            "{marker}: the report must travel on one data line: {frame:?}"
+        );
+        assert!(
+            frame.raw.starts_with("event: rows_removed\ndata: {") && frame.raw.ends_with("}\n\n"),
+            "{marker}: unexpected wire framing: {:?}",
+            frame.raw
+        );
+        serde_json::from_str(&frame.data)
+            .unwrap_or_else(|error| panic!("{marker}: the data line is JSON: {error}: {frame:?}"))
+    }
+
+    /// Whether `/rows` still serves the row a report names as `row`.
+    fn rows_lists(rows: &serde_json::Value, row: &serde_json::Value) -> bool {
+        let repositories = rows["repositories"].as_array().unwrap();
+        if let Some(key) = row.get("checkout") {
+            return checkout_entries(rows)
+                .iter()
+                .any(|entry| &entry["checkout_key"] == key);
+        }
+        if let Some(key) = row.get("repository") {
+            return repositories
+                .iter()
+                .any(|parent| &parent["repository_key"] == key);
+        }
+        if let Some(key) = row.get("standalone") {
+            return rows["standalone"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| &entry["standalone_key"] == key);
+        }
+        panic!("not a row key: {row}");
+    }
+
+    #[tokio::test]
+    async fn events_removal_over_rest_reaches_a_subscriber() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("events-tracer").await;
+        let row = serde_json::json!({ "checkout": key });
+        let mut events = open_events(&app).await;
+        assert!(rows_lists(&rows_body(&app).await, &row));
+
+        let previewed = preview_report(&app, key).await;
+        let response = removal_response(&app, &previewed).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let executed = body_json(response).await;
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+
+        let announced = expect_rows_removed(&mut events, "one checkout row").await;
+        assert_eq!(
+            announced, executed,
+            "the message carries the JSON the removal returned"
+        );
+
+        // What a client acting on the message finds: the row is gone from
+        // the listing and from the state a fresh daemon would restore.
+        assert!(!rows_lists(&rows_body(&app).await, &row));
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn events_two_subscribers_each_receive_one_message() {
+        let (root, _fixture, _workspace, shared, app, _id, key) =
+            removal_fixture("events-two-subscribers").await;
+        let mut first = open_events(&app).await;
+        let mut second = open_events(&app).await;
+
+        let previewed = preview_report(&app, key).await;
+        let response = removal_response(&app, &previewed).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let executed = body_json(response).await;
+
+        for (name, events) in [("first", &mut first), ("second", &mut second)] {
+            let announced = expect_rows_removed(events, name).await;
+            assert_eq!(announced, executed, "{name} subscriber");
+            let extra = next_sse_frame(events, Duration::from_millis(300)).await;
+            assert!(
+                extra.is_none(),
+                "{name} subscriber read a second message for one removal: {extra:?}"
+            );
+        }
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn events_no_history_for_a_late_subscriber() {
+        let (root, _fixture, _workspace, shared, app, _id, key) =
+            removal_fixture("events-late-subscriber").await;
+        // An earlier subscriber proves the removal was announced at all, so
+        // the silence below is the absence of replay and not of publishing.
+        let mut early = open_events(&app).await;
+        let executed = execute_previewed(&app, key).await;
+        assert_eq!(executed.status(), StatusCode::OK);
+        expect_rows_removed(&mut early, "the subscriber that was connected").await;
+
+        let mut late = open_events(&app).await;
+        let replayed = next_sse_frame(&mut late, Duration::from_millis(500)).await;
+        assert!(
+            replayed.is_none(),
+            "a subscriber that connected after the removal was sent its history: {replayed:?}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Characterization: `/stream` had no test for its unknown-session guard.
+    #[tokio::test]
+    async fn stream_guards_unknown_session() {
+        let (_scope, app) = app();
+        let response = app.oneshot(get("/sessions/999999/stream")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(test)]
