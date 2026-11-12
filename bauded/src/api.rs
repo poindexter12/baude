@@ -6546,6 +6546,100 @@ mod tests {
         removal_teardown(&fixture.shared, &fixture.root);
     }
 
+    /// A report no real removal produces, numbered so a reader can tell which
+    /// of a flood it is holding.
+    fn synthetic_report(number: u64) -> baude_core::removal::RemovalReport {
+        serde_json::from_value(serde_json::json!({
+            "target": { "checkout": number },
+            "planned": false,
+            "rows_removed": [{ "checkout": number }],
+            "runtimes_killed": [],
+            "paths_deleted": [],
+            "paths_kept": [],
+            "already_removed": [],
+            "readers_parked": [],
+            "persistence": { "outcome": "saved" },
+            "cleared": [],
+            "clearing_failures": [],
+        }))
+        .unwrap()
+    }
+
+    /// A subscriber that falls behind keeps its stream. The flood goes
+    /// through the real sender while nothing reads the response body, so the
+    /// receiver the handler owns overflows and the handler's own loop has to
+    /// carry on past the lag.
+    #[tokio::test]
+    async fn events_route_survives_lag() {
+        use crate::manager::{DaemonEvent, EVENTS_CAPACITY};
+
+        const FLOOD: u64 = 80;
+        assert!(FLOOD > EVENTS_CAPACITY as u64, "the flood must overflow");
+
+        let (root, _fixture, _workspace, shared, app, _id, key) =
+            removal_fixture("events-lag").await;
+        let mut events = open_events(&app).await;
+
+        for number in 0..FLOOD {
+            crate::manager::lock(&shared)
+                .publish_for_test(DaemonEvent::RowsRemoved(synthetic_report(number)));
+        }
+        let previewed = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &previewed, "a removal after the flood").await;
+
+        // `next_sse_frame` panics if the body ends, so reaching the real
+        // removal's message is also the proof the stream stayed open.
+        let mut numbers: Vec<u64> = Vec::new();
+        loop {
+            let frame = next_sse_frame(&mut events, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "21-04 lag pin: the stream went quiet after {} flood messages, before \
+                         the real removal arrived",
+                        numbers.len()
+                    )
+                });
+            assert_eq!(frame.event, "rows_removed", "{frame:?}");
+            let report: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+            if report == executed {
+                break;
+            }
+            let number = report["rows_removed"][0]["checkout"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("not a flood message: {report}"));
+            if numbers.is_empty() {
+                assert_ne!(
+                    number, 0,
+                    "21-04 lag pin: the first message read is the oldest of {FLOOD}, so nothing \
+                     was skipped"
+                );
+            }
+            numbers.push(number);
+        }
+        assert!(
+            numbers.windows(2).all(|pair| pair[0] < pair[1]),
+            "flood messages arrived out of order: {numbers:?}"
+        );
+        assert!(
+            (numbers.len() as u64) < FLOOD,
+            "every flood message arrived, so the subscriber never lagged: {numbers:?}"
+        );
+        assert_eq!(
+            numbers.last().copied(),
+            Some(FLOOD - 1),
+            "the newest flood message is retained: {numbers:?}"
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(300),
+            "after the real removal",
+        )
+        .await;
+
+        removal_teardown(&shared, &root);
+    }
+
     /// Characterization: `/stream` had no test for its unknown-session guard.
     #[tokio::test]
     async fn stream_guards_unknown_session() {

@@ -1248,6 +1248,13 @@ impl Manager {
         let _ = self.events.send(event);
     }
 
+    /// Send `event` on the real sender, so a test can overflow a receiver the
+    /// `GET /events` handler owns without sixty-five live removals.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: DaemonEvent) {
+        self.publish(event);
+    }
+
     /// The repository whose reservation a removal of `target` holds.
     fn removal_target_repository(&self, target: RemovalTarget) -> Option<RepositoryKey> {
         match target {
