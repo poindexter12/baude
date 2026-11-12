@@ -5203,6 +5203,387 @@ mod tests {
 
         removal_teardown(&shared, &root);
     }
+
+    /// `/sessions` without the three fields the daemon derives from the clock
+    /// and from PTY output, which move between two reads with no request in
+    /// between. Everything a removal could change stays in.
+    fn settled_sessions(sessions: &serde_json::Value) -> serde_json::Value {
+        let mut settled = sessions.clone();
+        for entry in settled.as_array_mut().unwrap() {
+            let entry = entry.as_object_mut().unwrap();
+            for field in ["status", "state_source", "waiting_for_ms"] {
+                entry.remove(field);
+            }
+        }
+        settled
+    }
+
+    /// The world still equals `before`: `/rows` and the state file exactly,
+    /// `/sessions` through `settled_sessions`.
+    async fn assert_world_unchanged(
+        app: &Router,
+        state_path: &Path,
+        before: &(serde_json::Value, serde_json::Value, Vec<u8>),
+        marker: &str,
+    ) {
+        let after = world_snapshot(app, state_path).await;
+        assert_eq!(after.0, before.0, "{marker}: /rows changed");
+        assert_eq!(
+            settled_sessions(&after.1),
+            settled_sessions(&before.1),
+            "{marker}: /sessions changed"
+        );
+        assert!(after.2 == before.2, "{marker}: the state file changed");
+    }
+
+    /// `POST /removals` with `body`, pinned to 409. The one JSON error body:
+    /// it must deserialize as a `RemovalReport` and be a preview. Returns the
+    /// raw body, which a client resends verbatim, and its JSON value.
+    async fn assert_drift(
+        app: &Router,
+        body: &serde_json::Value,
+        marker: &str,
+    ) -> (String, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(post_json("/removals", &body.to_string()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_string());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "21-03 status pin: {marker}: the daemon answered {status} with body {raw}"
+        );
+        assert!(
+            content_type
+                .as_deref()
+                .is_some_and(|value| value.contains("json")),
+            "21-03 body pin: {marker}: a 409 carried content-type {content_type:?}"
+        );
+        let fresh: baude_core::removal::RemovalReport = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("{marker}: a 409 body is a report: {error}: {raw}"));
+        assert!(fresh.planned, "{marker}: a 409 body is a preview: {raw}");
+        let value = serde_json::from_str(&raw).unwrap();
+        (raw, value)
+    }
+
+    /// Every agent pid a report names under `runtimes_killed`.
+    fn runtime_pids(report: &serde_json::Value) -> Vec<u64> {
+        report["runtimes_killed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|runtime| runtime["agent_pid"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// A real directory beside the fixture's repositories, holding one file.
+    /// Returns the directory, the file and the file's bytes.
+    fn sibling_directory(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let sibling = root.join("sibling-project");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let sibling = sibling.canonicalize().unwrap();
+        let file = sibling.join("thesis.md");
+        let bytes = b"three years of work\n".to_vec();
+        std::fs::write(&file, &bytes).unwrap();
+        (sibling, file, bytes)
+    }
+
+    #[tokio::test]
+    async fn matrix_drift_row_set_change_is_409_then_resend_executes_then_replay_is_404() {
+        let fixture = removal_fixture_two_checkouts("matrix-drift-rows").await;
+        let app = &fixture.app;
+        let state_path = removal_state_file(&fixture.root, &fixture.workspace);
+        let repo_path = fixture.repo.path().canonicalize().unwrap();
+        let main_row = rows_checkout_for_session(&rows_body(app).await, fixture.main_id);
+        let repository_key = main_row["repository_key"].clone();
+        let target = serde_json::json!({ "repository": repository_key });
+
+        let stale = preview_target(app, &target).await;
+        let stale_rows = stale["rows_removed"].as_array().unwrap().len();
+
+        // The row set changes while the modal is open: a third session on a
+        // second managed worktree of the same repository.
+        let (_third_id, third_key, third_info) =
+            admit_removal_session(&fixture.shared, app, &repo_path, Some("second")).await;
+        let second_worktree = PathBuf::from(third_info["cwd"].as_str().unwrap());
+        assert!(second_worktree.is_dir());
+        let pids = runtime_pids(&preview_target(app, &target).await);
+        assert_eq!(pids.len(), 3);
+        let before = world_snapshot(app, &state_path).await;
+
+        let (raw, fresh) = assert_drift(app, &stale, "a row-set change").await;
+        assert_eq!(
+            fresh["rows_removed"].as_array().unwrap().len(),
+            stale_rows + 1,
+            "{raw}"
+        );
+        assert!(
+            fresh["rows_removed"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({ "checkout": third_key })),
+            "{raw}"
+        );
+        assert_world_unchanged(app, &state_path, &before, "after the 409").await;
+        for pid in &pids {
+            assert!(pid_is_alive(*pid), "a 409 stopped agent {pid}");
+        }
+        assert!(fixture.worktree_path.is_dir());
+        assert!(second_worktree.is_dir());
+
+        // Resending the 409 body verbatim executes it.
+        let resent = app
+            .clone()
+            .oneshot(post_json("/removals", &raw))
+            .await
+            .unwrap();
+        let status = resent.status();
+        let executed =
+            String::from_utf8_lossy(&resent.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "21-03 status pin: a resent 409 body: the daemon answered {status} with body {executed}"
+        );
+        let rows_after = rows_bytes(app).await;
+        let rows: serde_json::Value = serde_json::from_slice(&rows_after).unwrap();
+        assert!(!rows_has_repository(&rows, &repository_key), "{rows}");
+        for pid in &pids {
+            assert!(wait_for_pid_gone(*pid), "agent {pid} outlived its row");
+        }
+        assert_eq!(session_ids(app).await, Vec::<u64>::new());
+
+        // The executed report is state-bound, not time-bound: it is now 404.
+        let state_after = std::fs::read(&state_path).unwrap();
+        let replayed = app
+            .clone()
+            .oneshot(post_json("/removals", &raw))
+            .await
+            .unwrap();
+        assert_refused(
+            replayed,
+            StatusCode::NOT_FOUND,
+            "an executed report sent again",
+        )
+        .await;
+        assert_eq!(rows_bytes(app).await, rows_after);
+        assert!(std::fs::read(&state_path).unwrap() == state_after);
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn matrix_drift_runtime_only_change_is_409() {
+        let (root, _fixture, workspace, shared, app, id, key) =
+            removal_fixture("matrix-drift-runtime").await;
+        let state_path = removal_state_file(&root, &workspace);
+
+        let stale = preview_report(&app, key).await;
+        let previewed_pid = previewed_agent_pid(&stale, key);
+
+        // The agent dies and is restarted while the modal is open.
+        let signalled = Command::new("kill")
+            .arg(previewed_pid.to_string())
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let sessions = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+            let exited = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["id"] == id && session["status"] == "exited");
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session {id} never read as exited: {sessions}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let (status, body) = removal_call(
+            &app,
+            &format!("/sessions/{id}/restart"),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "restart: {body}");
+        let before = world_snapshot(&app, &state_path).await;
+
+        let (raw, fresh) = assert_drift(&app, &stale, "a runtime-only change").await;
+        assert_eq!(fresh["rows_removed"], stale["rows_removed"], "{raw}");
+        assert_eq!(fresh["paths_deleted"], stale["paths_deleted"], "{raw}");
+        assert_ne!(fresh["runtimes_killed"], stale["runtimes_killed"], "{raw}");
+        let fresh_pid = previewed_agent_pid(&fresh, key);
+        assert_ne!(fresh_pid, previewed_pid);
+        assert_world_unchanged(&app, &state_path, &before, "after the 409").await;
+        assert!(
+            pid_is_alive(fresh_pid),
+            "a 409 stopped the restarted agent {fresh_pid}"
+        );
+        eprintln!(
+            "21-03 observation: runtime-only drift previewed agent_pid {previewed_pid}, fresh \
+             agent_pid {fresh_pid}, session ids after restart {:?}, previewed session id {id}",
+            session_ids(&app).await
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_drift_tampered_paths_deleted_is_409_and_touches_nothing() {
+        let fixture = removal_fixture_two_checkouts("matrix-drift-paths").await;
+        let app = &fixture.app;
+        let state_path = removal_state_file(&fixture.root, &fixture.workspace);
+        let target = serde_json::json!({ "checkout": fixture.worktree_key });
+        let previewed = preview_target(app, &target).await;
+        let planned_paths = report_paths(&previewed, "paths_deleted");
+        assert_eq!(planned_paths.len(), 1, "{previewed}");
+        assert_eq!(
+            Path::new(&planned_paths[0]).canonicalize().unwrap(),
+            fixture.worktree_path.canonicalize().unwrap()
+        );
+        let (sibling, sibling_file, sibling_bytes) = sibling_directory(&fixture.root);
+
+        let mut tampered = previewed.clone();
+        tampered["paths_deleted"] = serde_json::json!([sibling]);
+        let before = world_snapshot(app, &state_path).await;
+
+        let (raw, fresh) = assert_drift(app, &tampered, "a tampered paths_deleted").await;
+        assert_eq!(
+            report_paths(&fresh, "paths_deleted"),
+            planned_paths,
+            "{raw}"
+        );
+        assert!(sibling.is_dir());
+        assert_eq!(std::fs::read(&sibling_file).unwrap(), sibling_bytes);
+        assert!(fixture.worktree_path.is_dir());
+        assert_world_unchanged(app, &state_path, &before, "after the 409").await;
+        for pid in runtime_pids(&previewed) {
+            assert!(pid_is_alive(pid), "a 409 stopped agent {pid}");
+        }
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// The property the superseded plan registered as T-21-05: a body that
+    /// passes the recheck names nothing the daemon acts on.
+    #[tokio::test]
+    async fn matrix_drift_uncompared_fields_cannot_steer_the_daemon() {
+        let fixture = removal_fixture_two_checkouts("matrix-drift-steer").await;
+        let app = &fixture.app;
+        let target = serde_json::json!({ "checkout": fixture.worktree_key });
+        let previewed = preview_target(app, &target).await;
+        let planned_paths = report_paths(&previewed, "paths_deleted");
+        assert_eq!(planned_paths.len(), 1, "{previewed}");
+        let (sibling, sibling_file, sibling_bytes) = sibling_directory(&fixture.root);
+        let sibling_text = sibling.to_str().unwrap().to_string();
+
+        // The three compared sets and the target stay exactly as previewed.
+        // Every other field is rewritten with a type-valid value that names
+        // the sibling.
+        let mut steering = previewed.clone();
+        steering["paths_kept"] = serde_json::json!([sibling]);
+        steering["already_removed"] = serde_json::json!([sibling]);
+        steering["planned"] = serde_json::json!(false);
+        steering["persistence"] = serde_json::json!({ "outcome": "saved" });
+        steering["cleared"] = serde_json::json!([
+            { "kind": "repository_dir", "path": sibling },
+            { "kind": "marker", "path": sibling },
+        ]);
+        steering["extra"] = serde_json::json!({ "delete": sibling });
+        for field in ["target", "rows_removed", "runtimes_killed", "paths_deleted"] {
+            assert_eq!(steering[field], previewed[field]);
+        }
+
+        let (status, body) = removal_call(app, "/removals", &steering).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "21-03 status pin: uncompared fields rewritten: the daemon answered {status} with \
+             body {body}"
+        );
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report_paths(&executed, "paths_deleted"), planned_paths);
+        for field in ["paths_kept", "already_removed"] {
+            assert!(
+                !report_paths(&executed, field).contains(&sibling_text),
+                "{field} echoed the sibling: {body}"
+            );
+        }
+        assert!(
+            !executed["cleared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["path"] == sibling_text.as_str()),
+            "cleared echoed the sibling: {body}"
+        );
+        assert!(!fixture.worktree_path.exists());
+        assert!(sibling.is_dir());
+        assert_eq!(std::fs::read(&sibling_file).unwrap(), sibling_bytes);
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn matrix_drift_holds_for_a_standalone_row() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("matrix-drift-folder");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+        let row = serde_json::json!({ "standalone": key });
+
+        let stale = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&stale);
+
+        // Closing the session keeps the row and ends its runtime.
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(wait_for_pid_gone(agent_pid));
+        let before = world_snapshot(&app, &state_path).await;
+
+        let (raw, fresh) = assert_drift(&app, &stale, "a standalone row whose runtime ended").await;
+        assert_eq!(fresh["rows_removed"], stale["rows_removed"], "{raw}");
+        assert_eq!(fresh["runtimes_killed"], serde_json::json!([]), "{raw}");
+        assert_eq!(fresh["paths_deleted"], serde_json::json!([]), "{raw}");
+        assert_world_unchanged(&app, &state_path, &before, "after the 409").await;
+
+        let resent = app
+            .clone()
+            .oneshot(post_json("/removals", &raw))
+            .await
+            .unwrap();
+        let status = resent.status();
+        let executed =
+            String::from_utf8_lossy(&resent.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "21-03 status pin: a resent 409 body: the daemon answered {status} with body {executed}"
+        );
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert!(folder.is_dir());
+        assert_eq!(
+            std::fs::read(folder.join("todo.txt")).unwrap(),
+            FOLDER_TODO_BYTES
+        );
+
+        removal_teardown(&shared, &root);
+    }
 }
 
 #[cfg(test)]
