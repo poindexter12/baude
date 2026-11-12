@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -36,6 +36,9 @@ const EVENTS_SILENCE: Duration = Duration::from_secs(2 * EVENTS_KEEP_ALIVE.as_se
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 /// The most of a `GET /rows` body this client will read.
 const MAX_ROWS_BYTES: u64 = 4 * 1024 * 1024;
+/// The longest `/events` line, and the most `data:` text in one event, this
+/// client will buffer.
+const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 /// The most of a plain-text error body this client will read.
 const MAX_TEXT_BYTES: u64 = 4 * 1024;
 /// The longest daemon-supplied message handed to the UI, in characters.
@@ -300,6 +303,33 @@ impl RemoteRows {
         }
     }
 
+    /// The live sessions the index joins to a row. A repository key gives
+    /// the sessions of all its checkouts.
+    fn session_ids(&self, key: &RowKey) -> Vec<u64> {
+        match key {
+            RowKey::Repository(key) => self
+                .repositories
+                .iter()
+                .filter(|repository| repository.repository_key == *key)
+                .flat_map(|repository| repository.checkouts.iter())
+                .filter_map(|checkout| checkout.session_id)
+                .collect(),
+            RowKey::Checkout(key) => self
+                .repositories
+                .iter()
+                .flat_map(|repository| repository.checkouts.iter())
+                .filter(|checkout| checkout.checkout_key == *key)
+                .filter_map(|checkout| checkout.session_id)
+                .collect(),
+            RowKey::Standalone(key) => self
+                .standalone
+                .iter()
+                .filter(|row| row.standalone_key == *key)
+                .filter_map(|row| row.session_id)
+                .collect(),
+        }
+    }
+
     /// Drop the rows named by `keys`. A repository key takes its checkouts
     /// with it; a key the index never held is ignored.
     fn forget(&mut self, keys: &[RowKey]) {
@@ -331,10 +361,8 @@ pub(crate) struct Timeouts {
     /// One removal round trip, preview or execute.
     pub(crate) removal: Duration,
     /// One blocking read of the `/events` stream.
-    #[allow(dead_code)] // read by the events thread, which lands next
     pub(crate) events_slice: Duration,
     /// Silence on `/events` after which the stream is reopened.
-    #[allow(dead_code)] // read by the events thread, which lands next
     pub(crate) events_silence: Duration,
 }
 
@@ -573,18 +601,331 @@ fn fetch_rows(base: &str, timeout: Duration) -> Result<RemoteRows, String> {
     }
 }
 
-/// What the poll thread, the removal workers and the draw loop share, behind
-/// one mutex so a reader never sees the snapshot and the index disagree.
+/// A row the daemon reported gone, kept until a poll cycle that started
+/// after the report has been applied.
+struct Tombstone {
+    key: RowKey,
+    /// The sessions the index joined to the row when it was dropped. A later
+    /// poll may bring `/sessions` without `/rows`, and then only these ids
+    /// can name what to keep out.
+    session_ids: Vec<u64>,
+    /// When this client learned of the removal. `Instant`, never the wall
+    /// clock, which can step.
+    at: Instant,
+}
+
+/// What one poll cycle fetched.
+struct PollResult {
+    /// Taken before the cycle's first request.
+    started: Instant,
+    /// `None` when `/sessions` could not be read.
+    sessions: Option<Vec<RemoteInfo>>,
+    /// `None` when `/rows` could not be read, an older daemon included.
+    rows: Option<RemoteRows>,
+    info: Option<serde_json::Value>,
+}
+
+/// One poll cycle: the start instant first, then `/sessions`, `/rows` and
+/// `/info` in that order.
+fn fetch_poll(base: &str, timeouts: Timeouts) -> PollResult {
+    let started = Instant::now();
+    let sessions = ureq::get(&format!("{base}/sessions"))
+        .timeout(timeouts.request)
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Vec<RemoteInfo>>().ok());
+    let rows = fetch_rows(base, timeouts.request).ok();
+    let info = ureq::get(&format!("{base}/info"))
+        .timeout(timeouts.request)
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok());
+    PollResult {
+        started,
+        sessions,
+        rows,
+        info,
+    }
+}
+
+/// What the poll thread, the events thread, the removal workers and the draw
+/// loop share, behind one mutex so a reader never sees the snapshot and the
+/// index disagree.
 #[derive(Default)]
 struct Shared {
     snapshot: RemoteSnapshot,
     rows: RemoteRows,
+    tombstones: Vec<Tombstone>,
 }
 
 impl Shared {
-    /// The daemon no longer has these rows: stop listing them.
-    fn apply_removed(&mut self, keys: &[RowKey]) {
+    /// The daemon removed the rows of `report`: stop listing them now, and
+    /// keep them out of any poll that was already under way at `at`.
+    ///
+    /// The same removal arrives as the POST answer, as the event, as a 404
+    /// on a second attempt and as a reconciled timeout, in any order, so a
+    /// repeat for a key already dropped changes nothing.
+    fn apply_removed(&mut self, report: &RemovalReport, at: Instant) {
+        self.drop_rows(&report.rows_removed, at);
+    }
+
+    fn drop_rows(&mut self, keys: &[RowKey], at: Instant) {
+        for key in keys {
+            let session_ids = self.rows.session_ids(key);
+            self.snapshot
+                .sessions
+                .retain(|session| !session_ids.contains(&session.id));
+            match self
+                .tombstones
+                .iter_mut()
+                .find(|tombstone| tombstone.key == *key)
+            {
+                // The first report dates the removal; a repeat only adds
+                // whatever sessions the index has joined since.
+                Some(tombstone) => {
+                    for id in session_ids {
+                        if !tombstone.session_ids.contains(&id) {
+                            tombstone.session_ids.push(id);
+                        }
+                    }
+                }
+                None => self.tombstones.push(Tombstone {
+                    key: *key,
+                    session_ids,
+                    at,
+                }),
+            }
+        }
         self.rows.forget(keys);
+    }
+
+    /// Install what one poll cycle fetched. A removal reported at or after
+    /// the cycle's start may be missing from what the cycle read, so its
+    /// rows and sessions are kept out; a removal reported before the start
+    /// is forgotten, and from then on the daemon's word stands.
+    fn apply_poll(&mut self, poll: PollResult) {
+        let Some(mut sessions) = poll.sessions else {
+            // Keep the stale list visible, just mark it offline.
+            self.snapshot.ok = false;
+            return;
+        };
+        // An unreadable `/rows` leaves the sessions and an empty index.
+        let mut rows = poll.rows.unwrap_or_default();
+
+        self.tombstones
+            .retain(|tombstone| tombstone.at >= poll.started);
+        let mut gone_keys = Vec::new();
+        let mut gone_sessions = Vec::new();
+        for tombstone in &self.tombstones {
+            gone_sessions.extend(tombstone.session_ids.iter().copied());
+            gone_sessions.extend(rows.session_ids(&tombstone.key));
+            gone_keys.push(tombstone.key);
+        }
+        sessions.retain(|session| !gone_sessions.contains(&session.id));
+        rows.forget(&gone_keys);
+
+        let info = poll.info.as_ref();
+        let collisions = info
+            .and_then(|v| v["collision_count"].as_u64())
+            .unwrap_or(0);
+        self.snapshot = RemoteSnapshot {
+            sessions,
+            fetched_ms: now_ms(),
+            ok: true,
+            daemon_workspace: info
+                .and_then(|v| v["workspace"].as_str())
+                .map(str::to_string),
+            daemon_workspace_source: info
+                .and_then(|v| v["workspace_source"].as_str())
+                .map(str::to_string),
+            daemon_collision_count: collisions as u32,
+        };
+        self.rows = rows;
+    }
+}
+
+/// Sleep `total` in slices of at most 100 ms. True when the stop flag was
+/// set before or during the wait.
+fn stopped_during(total: Duration, stop: &AtomicBool) -> bool {
+    let until = Instant::now() + total;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// The poll thread: one cycle every `POLL_SECS` until stopped.
+fn poll_loop(base: &str, timeouts: Timeouts, shared: &Mutex<Shared>, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        let poll = fetch_poll(base, timeouts);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        lock_shared(shared).apply_poll(poll);
+        if stopped_during(Duration::from_secs(POLL_SECS), stop) {
+            return;
+        }
+    }
+}
+
+/// An incremental reader of the daemon's `text/event-stream`. Fed raw bytes
+/// in whatever pieces the socket gives, it returns the report of every
+/// complete `rows_removed` event and discards everything else: comments,
+/// other event names, data that is not a `RemovalReport`.
+#[derive(Default)]
+struct SseParser {
+    line: Vec<u8>,
+    /// The current line ran past the cap: discard up to the next newline.
+    skipping: bool,
+    event: String,
+    data: String,
+    /// The pending event's data ran past the cap: it will not dispatch.
+    spoiled: bool,
+}
+
+impl SseParser {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<RemovalReport> {
+        let mut reports = Vec::new();
+        for &byte in bytes {
+            if byte == b'\n' {
+                // The newline that ends a discarded line ends the discard.
+                if !std::mem::take(&mut self.skipping) {
+                    let mut line = std::mem::take(&mut self.line);
+                    if let Some(report) = self.end_line(&line) {
+                        reports.push(report);
+                    }
+                    line.clear();
+                    self.line = line;
+                }
+                continue;
+            }
+            if self.skipping {
+                continue;
+            }
+            if self.line.len() >= MAX_EVENT_LINE_BYTES {
+                self.skipping = true;
+                self.line = Vec::new();
+                continue;
+            }
+            self.line.push(byte);
+        }
+        reports
+    }
+
+    /// One complete line, its newline already removed.
+    fn end_line(&mut self, line: &[u8]) -> Option<RemovalReport> {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            // A blank line ends the event, whatever it held.
+            let event = std::mem::take(&mut self.event);
+            let data = std::mem::take(&mut self.data);
+            let spoiled = std::mem::take(&mut self.spoiled);
+            if spoiled || event != "rows_removed" {
+                return None;
+            }
+            return serde_json::from_str::<RemovalReport>(&data).ok();
+        }
+        if line[0] == b':' {
+            // A comment, the daemon's keep-alive among them.
+            return None;
+        }
+        let (field, value) = match line.iter().position(|byte| *byte == b':') {
+            Some(at) => (&line[..at], &line[at + 1..]),
+            None => (line, &line[line.len()..]),
+        };
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        match field {
+            b"event" => self.event = String::from_utf8_lossy(value).into_owned(),
+            b"data" => {
+                if self.data.len() + value.len() >= MAX_EVENT_LINE_BYTES {
+                    self.spoiled = true;
+                    self.data = String::new();
+                } else if !self.spoiled {
+                    if !self.data.is_empty() {
+                        self.data.push('\n');
+                    }
+                    self.data.push_str(&String::from_utf8_lossy(value));
+                }
+            }
+            // `id`, `retry` and anything newer: not this client's concern.
+            _ => {}
+        }
+        None
+    }
+}
+
+/// The events thread: hold `GET /events` open, apply every removal it
+/// carries, and reopen it `POLL_SECS` after it ends, until stopped. A daemon
+/// with no such route, a refused or timed-out connect and a stream that
+/// went quiet all take the same road: wait and try again. Nothing here is
+/// surfaced, because the rows poll converges without it.
+fn events_loop(base: &str, timeouts: Timeouts, shared: &Mutex<Shared>, stop: &AtomicBool) {
+    // No overall request timeout, which would cut a healthy stream: only a
+    // connect timeout, and a read timeout short enough to notice `stop`.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.request)
+        .timeout_read(timeouts.events_slice)
+        .build();
+    let url = format!("{base}/events");
+    while !stop.load(Ordering::Relaxed) {
+        read_events(&agent, &url, timeouts, shared, stop);
+        if stopped_during(Duration::from_secs(POLL_SECS), stop) {
+            return;
+        }
+    }
+}
+
+/// One `/events` connection, from request to whatever ends it. Returning
+/// drops the reader, which closes the socket.
+fn read_events(
+    agent: &ureq::Agent,
+    url: &str,
+    timeouts: Timeouts,
+    shared: &Mutex<Shared>,
+    stop: &AtomicBool,
+) {
+    let Ok(response) = agent.get(url).set("Accept", "text/event-stream").call() else {
+        return;
+    };
+    if response.status() != 200 {
+        return;
+    }
+    let mut reader = response.into_reader();
+    let mut parser = SseParser::default();
+    let mut buf = [0u8; 4096];
+    let mut quiet_since = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        match reader.read(&mut buf) {
+            // The daemon ended the stream: a restart, with no replay.
+            Ok(0) => return,
+            Ok(n) => {
+                quiet_since = Instant::now();
+                for report in parser.feed(&buf[..n]) {
+                    lock_shared(shared).apply_removed(&report, Instant::now());
+                }
+            }
+            // A read slice with nothing in it is not a failure. Linux says
+            // `WouldBlock` and macOS says `TimedOut` for the same thing.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Not even a keep-alive: the stream is dead, whatever the
+                // socket says.
+                if quiet_since.elapsed() >= timeouts.events_silence {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
     }
 }
 
@@ -633,7 +974,7 @@ fn run_preview(
     let rows = match &reply {
         RemovalReply::Report(_) | RemovalReply::Drift(_) => fetch_rows(base, timeouts.request).ok(),
         RemovalReply::Gone { .. } => {
-            lock_shared(shared).apply_removed(&[target_row(target)]);
+            lock_shared(shared).drop_rows(&[target_row(target)], Instant::now());
             None
         }
         _ => None,
@@ -652,7 +993,7 @@ fn run_execute(
     let reply = execute_call(base, timeouts.removal, previewed);
     match reply {
         RemovalReply::Report(report) => {
-            lock_shared(shared).apply_removed(&report.rows_removed);
+            lock_shared(shared).apply_removed(&report, Instant::now());
             RemovalAnswer {
                 reply: RemovalReply::Report(report),
                 rows: None,
@@ -664,7 +1005,7 @@ fn run_execute(
         },
         RemovalReply::Gone { message } => {
             // A missing target means its rows are already gone.
-            lock_shared(shared).apply_removed(&previewed.rows_removed);
+            lock_shared(shared).apply_removed(previewed, Instant::now());
             RemovalAnswer {
                 reply: RemovalReply::Gone { message },
                 rows: None,
@@ -679,7 +1020,7 @@ fn run_execute(
                 Err(_) => false,
             };
             if rows_gone {
-                lock_shared(shared).apply_removed(&previewed.rows_removed);
+                lock_shared(shared).apply_removed(previewed, Instant::now());
             }
             RemovalAnswer {
                 reply: RemovalReply::Indeterminate { message, rows_gone },
@@ -690,72 +1031,57 @@ fn run_execute(
     }
 }
 
-/// Background poller for one daemon.
+/// Background poller for one daemon: a poll thread and an events thread,
+/// both stopped when the poller is dropped.
 pub struct RemotePoller {
     pub base: String,
     shared: Arc<Mutex<Shared>>,
     timeouts: Timeouts,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for RemotePoller {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl RemotePoller {
     pub fn start(base: String) -> RemotePoller {
-        let base = base.trim_end_matches('/').to_string();
-        let data = Arc::new(Mutex::new(Shared::default()));
-        let shared = Arc::clone(&data);
-        let url = format!("{base}/sessions");
-        let info_url = format!("{base}/info");
-        std::thread::spawn(move || loop {
-            // Fetch sessions list
-            let fetched = ureq::get(&url)
-                .timeout(REQUEST_TIMEOUT)
-                .call()
-                .ok()
-                .and_then(|r| r.into_json::<Vec<RemoteInfo>>().ok());
+        RemotePoller::start_with(base, Timeouts::default())
+    }
 
-            // Fetch daemon workspace info from /info
-            let daemon_info = ureq::get(&info_url)
-                .timeout(REQUEST_TIMEOUT)
-                .call()
-                .ok()
-                .and_then(|r| r.into_json::<serde_json::Value>().ok());
-
-            if let Ok(mut state) = shared.lock() {
-                let d = &mut state.snapshot;
-                match fetched {
-                    Some(sessions) => {
-                        let daemon_workspace = daemon_info
-                            .as_ref()
-                            .and_then(|v| v["workspace"].as_str())
-                            .map(str::to_string);
-                        let daemon_workspace_source = daemon_info
-                            .as_ref()
-                            .and_then(|v| v["workspace_source"].as_str())
-                            .map(str::to_string);
-                        let daemon_collision_count = daemon_info
-                            .as_ref()
-                            .and_then(|v| v["collision_count"].as_u64())
-                            .unwrap_or(0)
-                            as u32;
-                        *d = RemoteSnapshot {
-                            sessions,
-                            fetched_ms: now_ms(),
-                            ok: true,
-                            daemon_workspace,
-                            daemon_workspace_source,
-                            daemon_collision_count,
-                        }
-                    }
-                    // Keep the stale list visible, just mark it offline.
-                    None => d.ok = false,
-                }
-            }
-            std::thread::sleep(Duration::from_secs(POLL_SECS));
-        });
-        RemotePoller {
-            base,
-            shared: data,
-            timeouts: Timeouts::default(),
+    fn start_with(base: String, timeouts: Timeouts) -> RemotePoller {
+        let poller = RemotePoller::unstarted(base, timeouts);
+        {
+            let base = poller.base.clone();
+            let shared = Arc::clone(&poller.shared);
+            let stop = Arc::clone(&poller.stop);
+            std::thread::spawn(move || poll_loop(&base, timeouts, &shared, &stop));
         }
+        {
+            let base = poller.base.clone();
+            let shared = Arc::clone(&poller.shared);
+            let stop = Arc::clone(&poller.stop);
+            std::thread::spawn(move || events_loop(&base, timeouts, &shared, &stop));
+        }
+        poller
+    }
+
+    fn unstarted(base: String, timeouts: Timeouts) -> RemotePoller {
+        RemotePoller {
+            base: base.trim_end_matches('/').to_string(),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            timeouts,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Stop the poll thread and the events thread. Each notices within its
+    /// current wait: 100 ms asleep, one request timeout mid-poll, one read
+    /// slice on the events stream. Removals already in flight finish.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> RemoteSnapshot {
@@ -782,11 +1108,7 @@ impl RemotePoller {
     /// production waits a minute for.
     #[cfg(test)]
     pub(crate) fn idle_with(base: String, timeouts: Timeouts) -> RemotePoller {
-        RemotePoller {
-            base: base.trim_end_matches('/').to_string(),
-            shared: Arc::new(Mutex::new(Shared::default())),
-            timeouts,
-        }
+        RemotePoller::unstarted(base, timeouts)
     }
 
     /// Blocking `POST /removals/preview`, for up to the removal timeout.
