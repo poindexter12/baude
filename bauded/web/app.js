@@ -33,6 +33,7 @@ const state = {
 // only renders what it holds. Null when either removal script failed to load,
 // in which case the list is the flat session list with no remove controls.
 let removalController = null;
+let removalEvents = null; // the one EventSource on /events, opened by the controller
 let removalModalShown = null; // the controller modal object last drawn
 
 // ---- helpers ----
@@ -146,7 +147,10 @@ async function refresh() {
   // through its tombstones, so a fetched body is never assigned in this file.
   if (removalController) removalController.loadRows().catch(() => {});
   try {
-    state.sessions = await api("/sessions");
+    // A /sessions body that left before a removal can still list the removed
+    // row's session, so every fetched list goes through the controller.
+    const sessions = await api("/sessions");
+    state.sessions = removalController ? removalController.filterSessions(sessions) : sessions;
     state.fetchedAt = Date.now();
     if (state.sid !== null) {
       state.queue = await api(`/sessions/${state.sid}/queue`).catch(() => []);
@@ -918,8 +922,18 @@ function stopTimers() {
   clearInterval(state.tickTimer);
 }
 
+// The daemon-wide removal stream. The browser reconnects it on its own until
+// it gives up and reports CLOSED; only then is a new one opened. subscribe()
+// closes the source it replaces, so there is never more than one.
+function ensureRemovalEvents() {
+  if (!removalController) return;
+  if (removalEvents && removalEvents.readyState !== EventSource.CLOSED) return;
+  removalEvents = removalController.subscribe();
+}
+
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
+    ensureRemovalEvents();
     refresh();
     if (state.sid !== null && !state.es) openChat(state.sid);
     if (state.sid !== null && !state.aes) openActivity(state.sid);
@@ -948,6 +962,7 @@ if (typeof BaudeRemoval !== "undefined" && typeof BaudeRemovalController !== "un
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && removalController.getModal() !== null) removalController.cancel();
   });
+  ensureRemovalEvents();
 }
 startTimers();
 route();
