@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use baude_core::backend;
 use baude_core::git;
@@ -167,6 +167,33 @@ fn route_plain_admission(
     }
 }
 
+/// How many events a `GET /events` subscriber may fall behind before it
+/// starts losing the oldest ones. The stream itself survives the loss.
+pub const EVENTS_CAPACITY: usize = 64;
+
+/// A daemon-wide event, published to every `GET /events` subscriber.
+#[derive(Clone, Debug)]
+pub enum DaemonEvent {
+    /// One committed `POST /removals`, carrying the report that call returned.
+    RowsRemoved(RemovalReport),
+}
+
+impl DaemonEvent {
+    /// The SSE `event:` name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DaemonEvent::RowsRemoved(_) => "rows_removed",
+        }
+    }
+
+    /// The SSE `data:` payload: the same serde derive as the REST body.
+    pub fn data(&self) -> serde_json::Result<String> {
+        match self {
+            DaemonEvent::RowsRemoved(report) => serde_json::to_string(report),
+        }
+    }
+}
+
 /// Why `Manager::remove_rows` did not remove anything.
 #[derive(Debug)]
 pub enum RemoveRowsError {
@@ -240,6 +267,9 @@ pub struct Manager {
     /// permission never stalls other sessions (Pitfall 4 — "decide under the
     /// lock, act outside it"). `resolve_pending` fires `notify_waiters()`.
     permission_notify: HashMap<u64, Arc<Notify>>,
+    /// The sender behind `GET /events`. Nothing is retained for a subscriber
+    /// that is not connected: `GET /rows` stays the record of what exists.
+    events: broadcast::Sender<DaemonEvent>,
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
     /// The live session of each standalone row. A session id is in at most one
@@ -669,6 +699,7 @@ impl Manager {
             auto_archive_ms: default_auto_archive_ms(),
             idle_child_policy: default_idle_child_policy(),
             permission_notify: HashMap::new(),
+            events: broadcast::channel(EVENTS_CAPACITY).0,
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
@@ -1196,7 +1227,25 @@ impl Manager {
             // A real run never reports a planned outcome.
             PersistenceOutcome::Planned => {}
         }
+        // The caller holds the manager mutex for this whole method, so no
+        // reader can see the row after the event is queued. That is a
+        // property of this code position, not something a test observes.
+        // Core's durable save has returned, which covers `SavedDegraded`: the
+        // replacement committed. No other exit of this method publishes.
+        self.publish(DaemonEvent::RowsRemoved(report.clone()));
         Ok(report)
+    }
+
+    /// A receiver for every event published from now on. Nothing published
+    /// earlier is replayed.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, event: DaemonEvent) {
+        // The only send error is "no receiver", which is the normal state of
+        // a daemon nobody is watching.
+        let _ = self.events.send(event);
     }
 
     /// The repository whose reservation a removal of `target` holds.

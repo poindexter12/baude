@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use tokio::sync::broadcast::error::RecvError;
 
 use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 use baude_core::removal::{RemovalError, RemovalReport, RemovalTarget};
@@ -25,6 +26,7 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .merge(crate::web::router())
         .route("/info", get(info))
+        .route("/events", get(events))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route(
@@ -719,6 +721,37 @@ async fn stream(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// `GET /events`: the daemon-wide stream. One named `rows_removed` message per
+/// committed `POST /removals`, its data the report that call returned. No
+/// history and no replay: a subscriber that connects late, or falls more than
+/// `EVENTS_CAPACITY` events behind, reconciles through `GET /rows`.
+async fn events(
+    State(state): State<Shared>,
+) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
+    // Subscribed before the stream is built, so the subscription exists when
+    // this handler returns and the guard is gone before any await.
+    let mut receiver = lock(&state).subscribe_events();
+
+    let stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    // A report that cannot be serialized is not sent as an
+                    // empty message: the subscriber's poll covers the gap.
+                    let Ok(data) = event.data() else { continue };
+                    yield Ok(Event::default().event(event.name()).data(data));
+                }
+                // A slow subscriber loses the oldest events and keeps its
+                // stream. Ending here would drop every client that lags.
+                Err(RecvError::Lagged(_)) => continue,
+                // The manager is gone: the daemon is shutting down.
+                Err(RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// SSE live tail of the session's hook-event file — a standalone channel,
