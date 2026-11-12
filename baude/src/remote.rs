@@ -1113,6 +1113,7 @@ pub(crate) mod test_double {
         },
         ClosedUnanswered,
         Held(Duration),
+        Stream(Vec<(Duration, String)>),
     }
 
     /// One scripted answer to one request.
@@ -1171,6 +1172,17 @@ pub(crate) mod test_double {
                 delay: Duration::ZERO,
             }
         }
+
+        /// A `text/event-stream` answer sent chunked, as axum sends one: the
+        /// head at once, then each chunk after its own delay, then the
+        /// connection held open until the client leaves or the double is
+        /// dropped. No chunks at all is a stream that never says a word.
+        pub(crate) fn stream(chunks: Vec<(Duration, String)>) -> Reply {
+            Reply {
+                kind: ReplyKind::Stream(chunks),
+                delay: Duration::ZERO,
+            }
+        }
     }
 
     /// The replies one method and path hands out, first in first out.
@@ -1198,10 +1210,21 @@ pub(crate) mod test_double {
         pub(crate) body: String,
     }
 
+    /// One streamed connection, as the double saw it.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Streamed {
+        /// When the response head was written.
+        pub(crate) opened: Instant,
+        /// When the client closed or reset the connection; `None` while it
+        /// is still there.
+        pub(crate) closed: Option<Instant>,
+    }
+
     struct State {
         routes: Vec<Route>,
         requests: Vec<Recorded>,
         unscripted: Vec<Recorded>,
+        streams: Vec<Streamed>,
     }
 
     pub(crate) struct Double {
@@ -1229,6 +1252,11 @@ pub(crate) mod test_double {
         pub(crate) fn unscripted(&self) -> Vec<Recorded> {
             lock(&self.state).unscripted.clone()
         }
+
+        /// Every streamed connection, in the order they were answered.
+        pub(crate) fn streams(&self) -> Vec<Streamed> {
+            lock(&self.state).streams.clone()
+        }
     }
 
     impl Drop for Double {
@@ -1253,6 +1281,7 @@ pub(crate) mod test_double {
             routes,
             requests: Vec::new(),
             unscripted: Vec::new(),
+            streams: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let accept_state = Arc::clone(&state);
@@ -1317,6 +1346,75 @@ pub(crate) mod test_double {
             }
             ReplyKind::ClosedUnanswered => {}
             ReplyKind::Held(hold) => pause(hold, stop),
+            ReplyKind::Stream(chunks) => {
+                let index = {
+                    let mut guard = lock(state);
+                    guard.streams.push(Streamed {
+                        opened: Instant::now(),
+                        closed: None,
+                    });
+                    guard.streams.len() - 1
+                };
+                if stream_out(&mut stream, chunks, stop) {
+                    lock(state).streams[index].closed = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Write a chunked event stream and then hold the connection. True when
+    /// the client closed or reset it; false when the double was dropped
+    /// first.
+    fn stream_out(
+        stream: &mut TcpStream,
+        chunks: Vec<(Duration, String)>,
+        stop: &AtomicBool,
+    ) -> bool {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+        if stream.write_all(head.as_bytes()).is_err() || stream.flush().is_err() {
+            return true;
+        }
+        for (delay, chunk) in chunks {
+            if client_left(stream, Some(delay), stop) {
+                return true;
+            }
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            // One whole HTTP chunk per write, as hyper frames a body frame.
+            let framed = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+            if stream.write_all(framed.as_bytes()).is_err() || stream.flush().is_err() {
+                return true;
+            }
+        }
+        client_left(stream, None, stop)
+    }
+
+    /// Wait `total`, or with `None` until the double is dropped, watching
+    /// the socket. True when the client closed or reset the connection
+    /// first. The client sends nothing after its request, so a read that
+    /// returns is a read of the end.
+    fn client_left(stream: &mut TcpStream, total: Option<Duration>, stop: &AtomicBool) -> bool {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(5)));
+        let until = total.map(|total| Instant::now() + total);
+        let mut buf = [0u8; 64];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if until.is_some_and(|until| Instant::now() >= until) {
+                return false;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return true,
+            }
         }
     }
 
@@ -1408,7 +1506,7 @@ mod tests {
     };
     use baude_core::repository::{CheckoutKey, RepositoryKey, StandaloneKey};
 
-    use super::test_double::{route, serve, Double, Reply};
+    use super::test_double::{route, serve, Double, Reply, Route};
     use super::*;
 
     /// The key newtypes keep their field private; serde is the one public
@@ -2667,5 +2765,623 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(method_and_path(&double), vec![pair("POST", "/removals")]);
         assert_settled(&double, 1);
+    }
+    // ---- Task 3: snapshot arbitration, the events parser, the stream ------
+
+    /// A `/sessions` body: session 7 lives in checkout 10, session 9 in the
+    /// standalone row 20, the same join the rows fixture carries.
+    fn sessions_body() -> String {
+        serde_json::json!([
+            {"id": 7, "name": "baude", "status": "working"},
+            {"id": 9, "name": "notes", "status": "idle"}
+        ])
+        .to_string()
+    }
+
+    fn sessions_fixture() -> Vec<RemoteInfo> {
+        serde_json::from_str(&sessions_body()).expect("the sessions body parses")
+    }
+
+    fn poll_at(
+        started: Instant,
+        sessions: Option<Vec<RemoteInfo>>,
+        rows: Option<RemoteRows>,
+    ) -> PollResult {
+        PollResult {
+            started,
+            sessions,
+            rows,
+            info: None,
+        }
+    }
+
+    fn ids(snapshot: &RemoteSnapshot) -> Vec<u64> {
+        snapshot.sessions.iter().map(|session| session.id).collect()
+    }
+
+    /// The committed report for one removed checkout, as the daemon sends it
+    /// in a 200 and on `/events`.
+    fn removed_checkout_10() -> RemovalReport {
+        let (_, previewed) = checkout_10();
+        committed_report(&previewed)
+    }
+
+    /// Shared state after one ordinary poll that started at `started`.
+    fn polled(started: Instant) -> Shared {
+        let mut shared = Shared::default();
+        shared.apply_poll(poll_at(
+            started,
+            Some(sessions_fixture()),
+            Some(rows_fixture()),
+        ));
+        shared
+    }
+
+    const TICK: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn snapshot_stale_poll_after_an_event_does_not_resurrect_the_row() {
+        let t0 = Instant::now();
+        let mut shared = polled(t0);
+        assert_eq!(ids(&shared.snapshot), vec![7, 9]);
+
+        // A poll cycle starts and reads the daemon before the removal lands.
+        let stale = poll_at(t0 + TICK, Some(sessions_fixture()), Some(rows_fixture()));
+        shared.apply_removed(&removed_checkout_10(), t0 + 2 * TICK);
+        assert_eq!(ids(&shared.snapshot), vec![9]);
+        assert_eq!(shared.rows.label(&RowKey::Checkout(checkout_key(10))), None);
+
+        shared.apply_poll(stale);
+
+        assert!(shared.snapshot.ok);
+        assert_eq!(ids(&shared.snapshot), vec![9]);
+        assert_eq!(shared.rows.label(&RowKey::Checkout(checkout_key(10))), None);
+        assert!(shared
+            .rows
+            .label(&RowKey::Checkout(checkout_key(11)))
+            .is_some());
+        assert!(shared
+            .rows
+            .label(&RowKey::Repository(repository_key(1)))
+            .is_some());
+
+        // The same removal arriving again, as a POST answer after the event,
+        // changes nothing.
+        let once = (shared.snapshot.clone(), shared.rows.clone());
+        shared.apply_removed(&removed_checkout_10(), t0 + 3 * TICK);
+        assert!(shared.snapshot.same_view(&once.0));
+        assert_eq!(shared.rows, once.1);
+    }
+
+    #[test]
+    fn snapshot_fresh_poll_prunes_the_tombstone_and_the_daemon_wins() {
+        let t0 = Instant::now();
+        let mut shared = polled(t0);
+        shared.apply_removed(&removed_checkout_10(), t0 + 2 * TICK);
+        assert_eq!(ids(&shared.snapshot), vec![9]);
+
+        // A poll that started after the removal still lists the row: the
+        // daemon has it again, and the daemon is the authority.
+        shared.apply_poll(poll_at(
+            t0 + 3 * TICK,
+            Some(sessions_fixture()),
+            Some(rows_fixture()),
+        ));
+        assert_eq!(ids(&shared.snapshot), vec![7, 9]);
+        assert!(shared
+            .rows
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+
+        // The tombstone is spent: an apply that looks stale against it is no
+        // longer filtered.
+        shared.apply_poll(poll_at(
+            t0 + TICK,
+            Some(sessions_fixture()),
+            Some(rows_fixture()),
+        ));
+        assert_eq!(ids(&shared.snapshot), vec![7, 9]);
+        assert!(shared
+            .rows
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+    }
+
+    /// The fixture with a second live session, 8, in checkout 11.
+    fn two_child_sessions() -> (Vec<RemoteInfo>, RemoteRows) {
+        let sessions: Vec<RemoteInfo> = serde_json::from_value(serde_json::json!([
+            {"id": 7, "name": "baude", "status": "working"},
+            {"id": 8, "name": "topic", "status": "working"},
+            {"id": 9, "name": "notes", "status": "idle"}
+        ]))
+        .expect("sessions parse");
+        let mut rows: serde_json::Value =
+            serde_json::from_str(&rows_body()).expect("the rows body is JSON");
+        rows["repositories"][0]["checkouts"][1]["session_id"] = serde_json::json!(8);
+        let rows: RemoteRows = serde_json::from_value(rows).expect("rows parse");
+        (sessions, rows)
+    }
+
+    #[test]
+    fn snapshot_repository_removal_drops_every_child_session() {
+        let target = RemovalTarget::Repository(repository_key(1));
+        let whole_subtree = vec![
+            RowKey::Checkout(checkout_key(10)),
+            RowKey::Checkout(checkout_key(11)),
+            RowKey::Repository(repository_key(1)),
+        ];
+        // The daemon lists the subtree; a bare repository key must reach the
+        // same children through the index.
+        for rows_removed in [whole_subtree, vec![RowKey::Repository(repository_key(1))]] {
+            let (sessions, rows) = two_child_sessions();
+            let t0 = Instant::now();
+            let mut shared = Shared::default();
+            shared.apply_poll(poll_at(t0, Some(sessions.clone()), Some(rows.clone())));
+            assert_eq!(ids(&shared.snapshot), vec![7, 8, 9]);
+
+            let stale = poll_at(t0 + TICK, Some(sessions), Some(rows));
+            let report = committed_report(&planned_report(target, rows_removed));
+            shared.apply_removed(&report, t0 + 2 * TICK);
+
+            assert_eq!(ids(&shared.snapshot), vec![9]);
+            assert_eq!(shared.rows.repositories, Vec::new());
+            assert!(shared
+                .rows
+                .label(&RowKey::Standalone(standalone_key(20)))
+                .is_some());
+
+            shared.apply_poll(stale);
+            assert_eq!(ids(&shared.snapshot), vec![9]);
+            assert_eq!(shared.rows.repositories, Vec::new());
+        }
+    }
+
+    #[test]
+    fn snapshot_stale_sessions_are_filtered_by_the_session_id_joined_at_drop_time() {
+        let t0 = Instant::now();
+        let mut shared = polled(t0);
+        // The stale cycle got its sessions and lost its rows read, so only
+        // the id joined when the row was dropped can name the session.
+        let stale = poll_at(t0 + TICK, Some(sessions_fixture()), None);
+        shared.apply_removed(&removed_checkout_10(), t0 + 2 * TICK);
+
+        shared.apply_poll(stale);
+
+        assert!(shared.snapshot.ok);
+        assert_eq!(ids(&shared.snapshot), vec![9]);
+        assert_eq!(shared.rows, RemoteRows::default());
+    }
+
+    #[test]
+    fn snapshot_failed_sessions_fetch_keeps_the_stale_list_marked_offline() {
+        let t0 = Instant::now();
+        let mut shared = polled(t0);
+        let before = shared.snapshot.clone();
+        assert!(before.ok);
+
+        shared.apply_poll(poll_at(t0 + TICK, None, None));
+
+        assert!(!shared.snapshot.ok);
+        assert_eq!(ids(&shared.snapshot), vec![7, 9]);
+        assert_eq!(shared.snapshot.fetched_ms, before.fetched_ms);
+        // The index is as stale as the list beside it, and as visible.
+        assert_eq!(shared.rows, rows_fixture());
+    }
+
+    #[test]
+    fn snapshot_rows_fetch_404_keeps_sessions_and_empties_the_index() {
+        // A daemon from before 21-02: it has sessions and no `/rows` route.
+        let double = serve(vec![
+            route("GET", "/sessions", vec![Reply::json(200, sessions_body())]),
+            route("GET", "/rows", vec![Reply::text(404, "")]),
+            route(
+                "GET",
+                "/info",
+                vec![Reply::json(
+                    200,
+                    r#"{"workspace":"main","workspace_source":"derived","collision_count":2}"#,
+                )],
+            ),
+        ]);
+        let poller = idle_poller(&double);
+        seed_rows(&poller, rows_fixture());
+
+        let poll = fetch_poll(&poller.base, Timeouts::default());
+        assert!(poll.rows.is_none());
+        lock_shared(&poller.shared).apply_poll(poll);
+
+        let snapshot = poller.snapshot();
+        assert!(snapshot.ok);
+        assert_eq!(ids(&snapshot), vec![7, 9]);
+        assert_eq!(snapshot.daemon_workspace.as_deref(), Some("main"));
+        assert_eq!(snapshot.daemon_workspace_source.as_deref(), Some("derived"));
+        assert_eq!(snapshot.daemon_collision_count, 2);
+        assert_eq!(poller.rows(), RemoteRows::default());
+        assert_eq!(
+            method_and_path(&double),
+            vec![
+                pair("GET", "/sessions"),
+                pair("GET", "/rows"),
+                pair("GET", "/info")
+            ]
+        );
+        assert_settled(&double, 3);
+    }
+
+    /// One event exactly as 21-04 recorded the daemon sending it: the
+    /// `event:` line, one `data:` line, a blank line.
+    fn rows_removed_frame(report: &RemovalReport) -> String {
+        format!("event: rows_removed\ndata: {}\n\n", wire(report))
+    }
+
+    /// axum's default keep-alive: a comment with empty text.
+    const KEEP_ALIVE_FRAME: &str = ":\n\n";
+
+    #[test]
+    fn events_parser_reads_one_rows_removed_frame() {
+        let report = removed_checkout_10();
+        let mut parser = SseParser::default();
+        assert_eq!(
+            parser.feed(rows_removed_frame(&report).as_bytes()),
+            vec![report.clone()]
+        );
+
+        // The same frame with CRLF line ends, which the format also allows.
+        let crlf = rows_removed_frame(&report).replace('\n', "\r\n");
+        assert_eq!(parser.feed(crlf.as_bytes()), vec![report.clone()]);
+
+        // Two frames in one read are two reports, in order.
+        let other = committed_report(&planned_report(
+            RemovalTarget::Standalone(standalone_key(20)),
+            vec![RowKey::Standalone(standalone_key(20))],
+        ));
+        let both = format!(
+            "{}{}",
+            rows_removed_frame(&report),
+            rows_removed_frame(&other)
+        );
+        assert_eq!(parser.feed(both.as_bytes()), vec![report, other]);
+    }
+
+    #[test]
+    fn events_parser_ignores_comment_frames_and_other_event_names() {
+        let report = removed_checkout_10();
+        let json = wire(&report);
+        let mut parser = SseParser::default();
+
+        assert_eq!(parser.feed(KEEP_ALIVE_FRAME.as_bytes()), Vec::new());
+        assert_eq!(parser.feed(b": a comment with text\n\n"), Vec::new());
+        // A report under another name, and under no name, is not a removal.
+        assert_eq!(
+            parser.feed(format!("event: rows_added\ndata: {json}\n\n").as_bytes()),
+            Vec::new()
+        );
+        assert_eq!(
+            parser.feed(format!("data: {json}\n\n").as_bytes()),
+            Vec::new()
+        );
+        // A name does not carry over a blank line into the next frame.
+        assert_eq!(
+            parser.feed(format!("event: rows_removed\n\ndata: {json}\n\n").as_bytes()),
+            Vec::new()
+        );
+        // Unknown fields beside a real frame are skipped, not fatal.
+        let dressed = format!(":\nid: 4\nretry: 100\nevent: rows_removed\ndata: {json}\n\n");
+        assert_eq!(parser.feed(dressed.as_bytes()), vec![report]);
+    }
+
+    #[test]
+    fn events_parser_survives_a_frame_split_across_reads() {
+        let report = removed_checkout_10();
+        let frame = rows_removed_frame(&report);
+        let mut parser = SseParser::default();
+
+        let mut seen = Vec::new();
+        for byte in frame.as_bytes() {
+            seen.extend(parser.feed(std::slice::from_ref(byte)));
+        }
+        assert_eq!(seen, vec![report.clone()]);
+
+        // Split between the two lines, with a keep-alive's worth of nothing.
+        let (head, tail) = frame.split_at(frame.find('\n').expect("event line") + 1);
+        assert_eq!(parser.feed(head.as_bytes()), Vec::new());
+        assert_eq!(parser.feed(b""), Vec::new());
+        assert_eq!(parser.feed(tail.as_bytes()), vec![report]);
+    }
+
+    #[test]
+    fn events_parser_drops_malformed_json_without_panicking() {
+        let report = removed_checkout_10();
+        let mut parser = SseParser::default();
+
+        assert_eq!(
+            parser.feed(b"event: rows_removed\ndata: {\"target\": \n\n"),
+            Vec::new()
+        );
+        assert_eq!(
+            parser.feed(b"event: rows_removed\ndata: [1, 2, 3]\n\n"),
+            Vec::new()
+        );
+        assert_eq!(parser.feed(b"event: rows_removed\n\n"), Vec::new());
+        // Bytes that are not text at all.
+        assert_eq!(
+            parser.feed(b"event: rows_removed\ndata: \xff\xfe\x00\x80\n\n"),
+            Vec::new()
+        );
+        assert_eq!(parser.feed(b"\xff\xff\xff\n\n"), Vec::new());
+
+        // None of it poisons the frame that follows.
+        assert_eq!(
+            parser.feed(rows_removed_frame(&report).as_bytes()),
+            vec![report]
+        );
+    }
+
+    #[test]
+    fn events_parser_drops_an_oversize_line() {
+        let report = removed_checkout_10();
+        let mut parser = SseParser::default();
+
+        // A data line past the cap, fed in reads the size of a socket buffer.
+        assert_eq!(parser.feed(b"event: rows_removed\ndata: "), Vec::new());
+        let filler = vec![b'x'; 64 * 1024];
+        for _ in 0..17 {
+            assert_eq!(parser.feed(&filler), Vec::new());
+        }
+        assert_eq!(parser.feed(b"\n\n"), Vec::new());
+
+        // The parser found its feet at the newline.
+        assert_eq!(
+            parser.feed(rows_removed_frame(&report).as_bytes()),
+            vec![report.clone()]
+        );
+
+        // An oversize line that is not part of any frame, then a real frame
+        // with no blank line between them.
+        for _ in 0..17 {
+            assert_eq!(parser.feed(&filler), Vec::new());
+        }
+        let after = format!("\n{}", rows_removed_frame(&report));
+        assert_eq!(parser.feed(after.as_bytes()), vec![report]);
+    }
+
+    /// The three poll routes, each good for `cycles` poll cycles.
+    fn poll_routes(cycles: usize, sessions: Reply) -> Vec<Route> {
+        vec![
+            route("GET", "/sessions", vec![sessions; cycles]),
+            route("GET", "/rows", vec![Reply::json(200, rows_body()); cycles]),
+            route("GET", "/info", vec![Reply::json(200, "{}"); cycles]),
+        ]
+    }
+
+    fn with_events(mut routes: Vec<Route>, events: Vec<Reply>) -> Vec<Route> {
+        routes.push(route("GET", "/events", events));
+        routes
+    }
+
+    fn wait_until(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < limit, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn requests_to(double: &Double, path: &str) -> usize {
+        double
+            .requests()
+            .iter()
+            .filter(|request| request.path == path)
+            .count()
+    }
+
+    #[test]
+    fn events_drop_reaches_the_snapshot_before_a_slow_poll_lands() {
+        let report = removed_checkout_10();
+        // The daemon read its session list before the removal committed and
+        // answers late; the event overtakes that answer. The frame waits
+        // 50 ms so it lands after the poll cycle has taken its start.
+        let double = serve(with_events(
+            poll_routes(
+                1,
+                Reply::json(200, sessions_body()).delayed(Duration::from_millis(300)),
+            ),
+            vec![Reply::stream(vec![(
+                Duration::from_millis(50),
+                rows_removed_frame(&report),
+            )])],
+        ));
+        let poller = RemotePoller::start_with(
+            double.base(),
+            Timeouts {
+                events_slice: Duration::from_millis(100),
+                ..Timeouts::default()
+            },
+        );
+
+        wait_until(Duration::from_secs(3), "the slow poll to apply", || {
+            poller.snapshot().ok
+        });
+
+        assert_eq!(ids(&poller.snapshot()), vec![9]);
+        let rows = poller.rows();
+        assert_eq!(rows.label(&RowKey::Checkout(checkout_key(10))), None);
+        assert!(rows.label(&RowKey::Checkout(checkout_key(11))).is_some());
+        assert_eq!(requests_to(&double, "/events"), 1);
+    }
+
+    #[test]
+    fn events_frame_split_by_a_pause_longer_than_the_slice_arrives_once() {
+        let report = removed_checkout_10();
+        let frame = rows_removed_frame(&report);
+        let (head, tail) = frame.split_at(frame.find('\n').expect("event line") + 1);
+        let slice = Duration::from_millis(100);
+        let double = serve(with_events(
+            poll_routes(1, Reply::json(200, sessions_body())),
+            vec![Reply::stream(vec![
+                (Duration::from_millis(150), head.to_string()),
+                // Three read slices of nothing between the two lines.
+                (3 * slice + Duration::from_millis(50), tail.to_string()),
+            ])],
+        ));
+        let poller = RemotePoller::start_with(
+            double.base(),
+            Timeouts {
+                events_slice: slice,
+                ..Timeouts::default()
+            },
+        );
+
+        wait_until(Duration::from_secs(2), "the first poll", || {
+            poller.snapshot().ok
+        });
+        // The row is listed until the whole frame has arrived.
+        assert_eq!(ids(&poller.snapshot()), vec![7, 9]);
+
+        wait_until(Duration::from_secs(3), "the split frame", || {
+            !ids(&poller.snapshot()).contains(&7)
+        });
+
+        // One drop: the row the frame names, and nothing else.
+        assert_eq!(ids(&poller.snapshot()), vec![9]);
+        let rows = poller.rows();
+        assert_eq!(rows.label(&RowKey::Checkout(checkout_key(10))), None);
+        assert!(rows.label(&RowKey::Checkout(checkout_key(11))).is_some());
+        // It arrived on the connection that sat through the timed-out reads.
+        assert_eq!(requests_to(&double, "/events"), 1);
+        let streams = double.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].closed, None);
+    }
+
+    #[test]
+    fn events_keep_alive_frames_hold_the_connection_open() {
+        let report = removed_checkout_10();
+        let silence = Duration::from_millis(400);
+        let gap = Duration::from_millis(150);
+        // Keep-alives for three silence limits, then a real frame.
+        let mut chunks = vec![(gap, KEEP_ALIVE_FRAME.to_string()); 8];
+        chunks.push((gap, rows_removed_frame(&report)));
+        let double = serve(with_events(
+            poll_routes(1, Reply::json(200, sessions_body())),
+            vec![Reply::stream(chunks)],
+        ));
+        let started = Instant::now();
+        let poller = RemotePoller::start_with(
+            double.base(),
+            Timeouts {
+                events_slice: Duration::from_millis(50),
+                events_silence: silence,
+                ..Timeouts::default()
+            },
+        );
+
+        wait_until(
+            Duration::from_secs(3),
+            "the frame after the keep-alives",
+            || poller.snapshot().ok && !ids(&poller.snapshot()).contains(&7),
+        );
+
+        assert!(started.elapsed() > 3 * silence, "{:?}", started.elapsed());
+        assert_eq!(requests_to(&double, "/events"), 1);
+        let streams = double.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].closed, None);
+    }
+
+    #[test]
+    fn events_total_silence_past_the_limit_reconnects() {
+        let silence = Duration::from_millis(300);
+        // Headers, then nothing: no frame and no keep-alive.
+        let double = serve(with_events(
+            poll_routes(2, Reply::json(200, sessions_body())),
+            vec![Reply::stream(Vec::new()), Reply::stream(Vec::new())],
+        ));
+        let poller = RemotePoller::start_with(
+            double.base(),
+            Timeouts {
+                events_slice: Duration::from_millis(100),
+                events_silence: silence,
+                ..Timeouts::default()
+            },
+        );
+
+        wait_until(Duration::from_secs(2), "the client to hang up", || {
+            double
+                .streams()
+                .first()
+                .is_some_and(|stream| stream.closed.is_some())
+        });
+        let first = double.streams()[0];
+        let open_for = first.closed.expect("closed").duration_since(first.opened);
+        assert!(open_for >= silence, "hung up after only {open_for:?}");
+
+        wait_until(
+            Duration::from_millis(4500),
+            "a second /events request",
+            || requests_to(&double, "/events") >= 2,
+        );
+        // The poll never stopped while the stream was down.
+        assert!(poller.snapshot().ok);
+        assert_eq!(ids(&poller.snapshot()), vec![7, 9]);
+    }
+
+    #[test]
+    fn events_drop_closes_the_connection_within_two_seconds() {
+        let double = serve(with_events(
+            poll_routes(1, Reply::json(200, sessions_body())),
+            vec![Reply::stream(Vec::new())],
+        ));
+        // The production constructor and the production timeouts.
+        let poller = RemotePoller::start(double.base());
+        wait_until(Duration::from_secs(2), "the events stream to open", || {
+            !double.streams().is_empty()
+        });
+        assert_eq!(double.streams()[0].closed, None);
+
+        let dropped = Instant::now();
+        drop(poller);
+
+        wait_until(
+            Duration::from_secs(2),
+            "the double to see the close",
+            || double.streams()[0].closed.is_some(),
+        );
+        let closed = double.streams()[0].closed.expect("closed");
+        let took = closed.saturating_duration_since(dropped);
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn events_missing_route_does_not_stop_the_poll() {
+        // A daemon from before 21-04: no `/events` route.
+        let double = serve(with_events(
+            poll_routes(1, Reply::json(200, sessions_body())),
+            vec![Reply::text(404, "")],
+        ));
+        let poller = RemotePoller::start_with(
+            double.base(),
+            Timeouts {
+                events_slice: Duration::from_millis(100),
+                ..Timeouts::default()
+            },
+        );
+
+        wait_until(Duration::from_secs(2), "the first poll", || {
+            poller.snapshot().ok
+        });
+        wait_until(Duration::from_secs(2), "the events request", || {
+            requests_to(&double, "/events") == 1
+        });
+
+        assert_eq!(ids(&poller.snapshot()), vec![7, 9]);
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+        // `stop` is the same switch `Drop` throws, and is safe to throw twice.
+        poller.stop();
+        poller.stop();
+        assert_eq!(double.unscripted(), Vec::new());
     }
 }
