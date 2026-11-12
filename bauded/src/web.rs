@@ -31,6 +31,16 @@ pub fn router() -> Router<Shared> {
             "/app.js",
             asset!("app.js", "text/javascript; charset=utf-8"),
         )
+        // The removal view model and its controller. index.html loads both
+        // ahead of app.js, which constructs the controller at boot.
+        .route(
+            "/removal.js",
+            asset!("removal.js", "text/javascript; charset=utf-8"),
+        )
+        .route(
+            "/removal-controller.js",
+            asset!("removal-controller.js", "text/javascript; charset=utf-8"),
+        )
         .route("/style.css", asset!("style.css", "text/css; charset=utf-8"))
         .route("/sw.js", asset!("sw.js", "text/javascript; charset=utf-8"))
         .route(
