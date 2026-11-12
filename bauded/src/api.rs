@@ -6296,6 +6296,256 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// No complete message arrives on `events` within `within`. An empty read
+    /// passes; a keep-alive comment is not a message.
+    async fn expect_silence(events: &mut EventsBody, within: Duration, marker: &str) {
+        let frame = next_sse_frame(events, within).await;
+        assert!(
+            frame.is_none(),
+            "{marker}: a message was published where none belongs: {frame:?}"
+        );
+    }
+
+    /// The message for a removal that returned `executed`, and nothing after
+    /// it: one removal is one message.
+    async fn expect_exactly_one(
+        events: &mut EventsBody,
+        executed: &serde_json::Value,
+        marker: &str,
+    ) -> serde_json::Value {
+        let announced = expect_rows_removed(events, marker).await;
+        assert_eq!(
+            announced["rows_removed"], executed["rows_removed"],
+            "{marker}: the message lists the rows the 200 body listed"
+        );
+        assert_eq!(&announced, executed, "{marker}");
+        expect_silence(events, Duration::from_millis(300), marker).await;
+        announced
+    }
+
+    #[tokio::test]
+    async fn events_cover_standalone_and_repository_rows() {
+        {
+            let (root, _owner, folder, _workspace, shared, app) =
+                folder_fixture("events-standalone");
+            opened_folder_id(&app, &folder).await;
+            let entry = only_standalone_row(&app).await;
+            let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+            let mut events = open_events(&app).await;
+
+            let previewed = preview_target(&app, &row).await;
+            let executed = assert_executed(&app, &previewed, "a standalone row").await;
+            assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+            expect_exactly_one(&mut events, &executed, "a standalone row").await;
+            assert!(!rows_lists(&rows_body(&app).await, &row));
+
+            removal_teardown(&shared, &root);
+        }
+
+        let fixture = removal_fixture_two_checkouts("events-repository").await;
+        let app = &fixture.app;
+        let main_row = rows_checkout_for_session(&rows_body(app).await, fixture.main_id);
+        let target = serde_json::json!({ "repository": main_row["repository_key"] });
+        let mut events = open_events(app).await;
+
+        let previewed = preview_target(app, &target).await;
+        let executed = assert_executed(app, &previewed, "a repository parent").await;
+        let removed = executed["rows_removed"].as_array().unwrap().clone();
+        for row in [
+            serde_json::json!({ "checkout": fixture.main_key }),
+            serde_json::json!({ "checkout": fixture.worktree_key }),
+            target.clone(),
+        ] {
+            assert!(removed.contains(&row), "{row} is missing from {executed}");
+        }
+        assert_eq!(removed.len(), 3, "{executed}");
+        // The parent and both children travel in one message, not three.
+        expect_exactly_one(&mut events, &executed, "a repository parent").await;
+        let rows = rows_body(app).await;
+        for row in &removed {
+            assert!(!rows_lists(&rows, row), "{row} is still served: {rows}");
+        }
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn events_silent_on_drift_409() {
+        let fixture = removal_fixture_two_checkouts("events-drift").await;
+        let app = &fixture.app;
+        let repo_path = fixture.repo.path().canonicalize().unwrap();
+        let main_row = rows_checkout_for_session(&rows_body(app).await, fixture.main_id);
+        let target = serde_json::json!({ "repository": main_row["repository_key"] });
+        let mut events = open_events(app).await;
+
+        let stale = preview_target(app, &target).await;
+        // The row set changes between preview and execute.
+        admit_removal_session(&fixture.shared, app, &repo_path, Some("second")).await;
+        assert_drift(app, &stale, "a row-set change").await;
+        expect_silence(&mut events, Duration::from_millis(500), "after the 409").await;
+
+        let retried = preview_target(app, &target).await;
+        let executed = assert_executed(app, &retried, "the re-previewed removal").await;
+        assert_eq!(
+            executed["rows_removed"].as_array().unwrap().len(),
+            4,
+            "{executed}"
+        );
+        expect_exactly_one(&mut events, &executed, "the re-previewed removal").await;
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn events_silent_on_runtime_survived_500() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("events-survived").await;
+        let mut events = open_events(&app).await;
+        let previewed = preview_report(&app, key).await;
+
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        assert_refused(
+            removal_response(&app, &previewed).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a runtime that survived the kill stage",
+        )
+        .await;
+        expect_silence(&mut events, Duration::from_millis(500), "after the 500").await;
+
+        // The double fails one teardown, so a fresh preview then executes.
+        let retried = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &retried, "the retry after a 500").await;
+        expect_exactly_one(&mut events, &executed, "the retry after a 500").await;
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The early-send detector. Core kills, deletes and only then saves, so a
+    /// daemon that published before the save returned would announce a
+    /// removal this 503 never committed.
+    #[tokio::test]
+    async fn events_silent_on_persistence_503() {
+        let fixture = removal_fixture_two_checkouts("events-persist").await;
+        let app = &fixture.app;
+        let target = serde_json::json!({ "checkout": fixture.worktree_key });
+        let mut events = open_events(app).await;
+        let previewed = preview_target(app, &target).await;
+
+        crate::manager::lock(&fixture.shared).persist_at_for_test(
+            &fixture.root,
+            &fixture.workspace,
+            Some(baude_core::persist::AtomicFailure::Rename),
+        );
+        assert_refused(
+            removal_response(app, &previewed).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a save that failed before the replacement committed",
+        )
+        .await;
+        assert!(rows_lists(&rows_body(app).await, &target));
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "21-04 early-send pin: a 503 removed nothing",
+        )
+        .await;
+
+        // The worktree directory is already gone, so the stale body drifted.
+        // That 409 commits nothing either.
+        assert_drift(app, &previewed, "the interrupted removal replayed").await;
+        expect_silence(&mut events, Duration::from_millis(500), "after the 409").await;
+
+        let retried = preview_target(app, &target).await;
+        let executed = assert_executed(app, &retried, "the retry after a 503").await;
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+        expect_exactly_one(&mut events, &executed, "the retry after a 503").await;
+        assert!(!rows_lists(&rows_body(app).await, &target));
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    #[tokio::test]
+    async fn events_saved_degraded_publishes_exactly_one() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("events-degraded").await;
+        let mut events = open_events(&app).await;
+        let previewed = preview_report(&app, key).await;
+
+        crate::manager::lock(&shared).persist_at_for_test(
+            &root,
+            &workspace,
+            Some(baude_core::persist::AtomicFailure::DirectorySync),
+        );
+        let executed =
+            assert_executed(&app, &previewed, "a save whose replacement committed").await;
+        let announced = expect_exactly_one(&mut events, &executed, "a degraded commit").await;
+        assert_eq!(
+            announced["persistence"]["outcome"], "saved_degraded",
+            "{announced}"
+        );
+        assert!(
+            announced["persistence"]["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "{announced}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn events_silent_on_404_and_pre_kill_503() {
+        let fixture = removal_fixture_two_checkouts("events-refusals").await;
+        let app = &fixture.app;
+        let main_row = rows_checkout_for_session(&rows_body(app).await, fixture.main_id);
+        let repository: baude_core::repository::RepositoryKey =
+            serde_json::from_value(main_row["repository_key"].clone()).unwrap();
+        let mut events = open_events(app).await;
+        let within = Duration::from_millis(500);
+
+        // 503: another mutation holds the repository.
+        let previewed = preview_report(app, fixture.worktree_key).await;
+        let reservation =
+            crate::manager::lock(&fixture.shared).reserve_repository_for_test(repository);
+        assert_refused(
+            removal_response(app, &previewed).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a repository another mutation holds",
+        )
+        .await;
+        expect_silence(&mut events, within, "after the busy 503").await;
+
+        drop(reservation);
+        let executed = assert_executed(app, &previewed, "the same body once free").await;
+        expect_exactly_one(&mut events, &executed, "the same body once free").await;
+
+        // 404: the executed report sent again names a row that is gone.
+        assert_refused(
+            removal_response(app, &previewed).await,
+            StatusCode::NOT_FOUND,
+            "an executed report sent again",
+        )
+        .await;
+        expect_silence(&mut events, within, "after the 404").await;
+
+        // 503: the daemon does not hold the second row's runtime handle.
+        crate::manager::lock(&fixture.shared).forget_runtime_handle_for_test(fixture.main_key);
+        let handleless = preview_report(app, fixture.main_key).await;
+        assert_refused(
+            removal_response(app, &handleless).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a row whose runtime handle the daemon does not hold",
+        )
+        .await;
+        expect_silence(&mut events, within, "after the missing-handle 503").await;
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
     /// Characterization: `/stream` had no test for its unknown-session guard.
     #[tokio::test]
     async fn stream_guards_unknown_session() {
