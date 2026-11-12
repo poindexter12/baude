@@ -3401,6 +3401,13 @@ mod tests {
         }
         let winners = outcomes.iter().filter(|(status, _)| *status == 200).count();
         assert_eq!(winners, 1, "exactly one removal commits: {outcomes:?}");
+        let mut statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
+        statuses.sort_unstable();
+        assert_eq!(
+            statuses,
+            [200, 404],
+            "exactly one removal commits: {outcomes:?}"
+        );
         for (status, text) in &outcomes {
             let reports_a_kill = serde_json::from_str::<serde_json::Value>(text)
                 .ok()
@@ -3939,8 +3946,9 @@ mod tests {
         }
         outcomes.sort();
         let statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
-        assert!(
-            statuses == [200, 404] || statuses == [200, 409],
+        assert_eq!(
+            statuses,
+            [200, 404],
             "one removal must win and the other must find the row gone: {outcomes:?}"
         );
 
@@ -4901,6 +4909,13 @@ mod tests {
             let parent_won = parent_status == StatusCode::OK;
             let child_won = child_status == StatusCode::OK;
             assert!(parent_won != child_won, "{outcome}");
+            // The loser's status names why: its target is gone, or its
+            // compared sets changed under it.
+            if parent_won {
+                assert_eq!(child_status, StatusCode::NOT_FOUND, "{outcome}");
+            } else {
+                assert_eq!(parent_status, StatusCode::CONFLICT, "{outcome}");
+            }
 
             let after = rows_body(app).await;
             if parent_won {
@@ -5583,6 +5598,460 @@ mod tests {
         );
 
         removal_teardown(&shared, &root);
+    }
+
+    /// `POST /removals` with `body`, pinned to 200. Returns the executed
+    /// report.
+    async fn assert_executed(
+        app: &Router,
+        body: &serde_json::Value,
+        marker: &str,
+    ) -> serde_json::Value {
+        let (status, text) = removal_call(app, "/removals", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "21-03 status pin: {marker}: the daemon answered {status} with body {text}"
+        );
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// `POST /removals` with `body` and hand back the response unread, for
+    /// `assert_refused`.
+    async fn removal_response(app: &Router, body: &serde_json::Value) -> axum::response::Response {
+        app.clone()
+            .oneshot(post_json("/removals", &body.to_string()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_runtime_survived_is_500_then_retry_succeeds() {
+        let (root, _fixture, workspace, shared, app, id, key) =
+            removal_fixture("matrix-survived").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let previewed = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&previewed, key);
+        let before = world_snapshot(&app, &state_path).await;
+
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let body = assert_refused(
+            removal_response(&app, &previewed).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a runtime that survived the kill stage",
+        )
+        .await;
+        assert!(body.contains("survived the kill stage"), "{body}");
+        assert!(
+            body.contains(&format!("{:?}", RowKey::Checkout(key))),
+            "{body}"
+        );
+        assert_eq!(session_ids(&app).await, [id]);
+        {
+            let manager = crate::manager::lock(&shared);
+            assert_eq!(manager.checkout_key_for_runtime_for_test(id), Some(key));
+            assert!(!manager.persistence_status().dirty);
+        }
+        assert_eq!(rows_body(&app).await, before.0);
+        assert!(std::fs::read(&state_path).unwrap() == before.2);
+
+        // A fresh preview and its execute then succeed.
+        let retried = preview_report(&app, key).await;
+        assert_executed(&app, &retried, "the retry after a survived runtime").await;
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_standalone_runtime_survived_is_500_then_retry_succeeds() {
+        let (root, _owner, folder, workspace, shared, app) =
+            folder_fixture("matrix-survived-folder");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+
+        let previewed = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&previewed);
+        let before = world_snapshot(&app, &state_path).await;
+
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let body = assert_refused(
+            removal_response(&app, &previewed).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a standalone runtime that survived the kill stage",
+        )
+        .await;
+        assert!(body.contains("survived the kill stage"), "{body}");
+        assert_eq!(session_ids(&app).await, [id]);
+        let held = only_standalone_row(&app).await;
+        assert_eq!(held["session_id"].as_u64(), Some(id), "{held}");
+        assert!(std::fs::read(&state_path).unwrap() == before.2);
+        assert!(!crate::manager::lock(&shared).persistence_status().dirty);
+        assert_folder_untouched(&folder);
+
+        let retried = preview_target(&app, &row).await;
+        let executed = assert_executed(&app, &retried, "the retry on a standalone row").await;
+        let killed = executed["runtimes_killed"].as_array().unwrap();
+        assert_eq!(killed.len(), 1, "{executed}");
+        assert_eq!(killed[0]["row"], row, "{executed}");
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_parent_abort_keeps_every_handle_held() {
+        let fixture = removal_fixture_two_checkouts("matrix-parent-abort").await;
+        let app = &fixture.app;
+        let state_path = removal_state_file(&fixture.root, &fixture.workspace);
+        let main_row = rows_checkout_for_session(&rows_body(app).await, fixture.main_id);
+        let repository_key = main_row["repository_key"].clone();
+        let target = serde_json::json!({ "repository": repository_key });
+        let previewed = preview_target(app, &target).await;
+        let planned = previewed["runtimes_killed"].as_array().unwrap();
+        assert_eq!(planned.len(), 2, "{previewed}");
+        let main_json = serde_json::json!({ "checkout": fixture.main_key });
+        let worktree_json = serde_json::json!({ "checkout": fixture.worktree_key });
+
+        // Arm the row the preview lists last, so one child may stop first.
+        let armed_is_main = planned[1]["row"] == main_json;
+        assert!(armed_is_main || planned[1]["row"] == worktree_json);
+        let (armed_id, armed_key, other_pid) = if armed_is_main {
+            (fixture.main_id, fixture.main_key, &planned[0]["agent_pid"])
+        } else {
+            (
+                fixture.worktree_id,
+                fixture.worktree_key,
+                &planned[0]["agent_pid"],
+            )
+        };
+        let other_pid = other_pid.as_u64().unwrap();
+        let before = world_snapshot(app, &state_path).await;
+
+        crate::manager::lock(&fixture.shared)
+            .fail_next_agent_teardown_for_test(armed_id, "agent stop refused once");
+        let body = assert_refused(
+            removal_response(app, &previewed).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a repository removal that aborted on its second runtime",
+        )
+        .await;
+        assert!(
+            body.contains(&format!("{:?}", RowKey::Checkout(armed_key))),
+            "the 500 names the armed row: {body}"
+        );
+        assert_eq!(
+            session_ids(app).await,
+            [fixture.main_id, fixture.worktree_id]
+        );
+        {
+            let manager = crate::manager::lock(&fixture.shared);
+            assert_eq!(
+                manager.checkout_key_for_runtime_for_test(fixture.main_id),
+                Some(fixture.main_key)
+            );
+            assert_eq!(
+                manager.checkout_key_for_runtime_for_test(fixture.worktree_id),
+                Some(fixture.worktree_key)
+            );
+            assert!(!manager.persistence_status().dirty);
+        }
+        assert_eq!(
+            rows_body(app).await,
+            before.0,
+            "all three rows still served"
+        );
+        assert!(fixture.worktree_path.is_dir());
+        assert!(std::fs::read(&state_path).unwrap() == before.2);
+        eprintln!(
+            "21-03 observation: parent abort armed the {} row, listed last; the other child's \
+             agent pid {other_pid} was {} after the 500",
+            if armed_is_main { "main" } else { "worktree" },
+            if pid_is_alive(other_pid) {
+                "alive"
+            } else {
+                "dead"
+            }
+        );
+
+        let retried = preview_target(app, &target).await;
+        let executed = assert_executed(app, &retried, "the retry after a parent abort").await;
+        assert_eq!(executed["rows_removed"].as_array().unwrap().len(), 3);
+        assert!(!rows_has_repository(&rows_body(app).await, &repository_key));
+        assert_eq!(session_ids(app).await, Vec::<u64>::new());
+        for pid in runtime_pids(&previewed) {
+            assert!(wait_for_pid_gone(pid), "agent {pid} outlived its row");
+        }
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// The API-01 interrupted edge: core's disk stage runs before its one
+    /// save, so a save that fails leaves the row stored and the worktree
+    /// gone. The retry converges through 409 to 200.
+    #[tokio::test]
+    async fn matrix_failure_persist_is_503_and_the_retry_converges() {
+        let root = removal_root("matrix-persist");
+        let (_upstream, clone) = cloned_repo(&root);
+        let (workspace, shared, app) = removal_daemon(&root);
+        let state_path = removal_state_file(&root, &workspace);
+        admit_removal_session(&shared, &app, &clone, None).await;
+        let (worktree_id, worktree_key, info) =
+            admit_removal_session(&shared, &app, &clone, Some("topic")).await;
+        let worktree_path = PathBuf::from(info["cwd"].as_str().unwrap());
+        assert!(worktree_path.is_dir());
+        let branch_ref = git_read(&worktree_path, &["symbolic-ref", "-q", "HEAD"])
+            .expect("the managed worktree sits on a branch");
+        let target = serde_json::json!({ "checkout": worktree_key });
+        let previewed = preview_target(&app, &target).await;
+        let planned_paths = report_paths(&previewed, "paths_deleted");
+        assert_eq!(planned_paths.len(), 1, "{previewed}");
+        let before = world_snapshot(&app, &state_path).await;
+
+        crate::manager::lock(&shared).persist_at_for_test(
+            &root,
+            &workspace,
+            Some(baude_core::persist::AtomicFailure::Rename),
+        );
+        let interrupted = assert_refused(
+            removal_response(&app, &previewed).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a save that failed before the replacement committed",
+        )
+        .await;
+        assert!(interrupted.contains("could not persist"), "{interrupted}");
+        let rows = rows_body(&app).await;
+        assert_eq!(
+            rows_checkout_for_session(&rows, worktree_id)["checkout_key"],
+            serde_json::json!(worktree_key),
+            "the row is stored and its handle restored: {rows}"
+        );
+        assert!(session_ids(&app).await.contains(&worktree_id));
+        assert!(std::fs::read(&state_path).unwrap() == before.2);
+        {
+            let status = crate::manager::lock(&shared).persistence_status();
+            assert!(status.dirty, "a failed save leaves the daemon dirty");
+            assert!(status.error.is_some(), "a failed save records its error");
+        }
+        assert!(
+            !worktree_path.exists(),
+            "the disk stage ran before the save"
+        );
+
+        // Replayed with no re-arming: the path is gone, so the body drifted.
+        let (replayed, fresh) =
+            assert_drift(&app, &previewed, "the interrupted removal replayed").await;
+        assert_eq!(report_paths(&fresh, "already_removed"), planned_paths);
+        assert_eq!(fresh["paths_deleted"], serde_json::json!([]), "{replayed}");
+
+        let (status, converged) = removal_call(&app, "/removals", &fresh).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "21-03 status pin: the 409 body resent: the daemon answered {status} with body \
+             {converged}"
+        );
+        let executed: serde_json::Value = serde_json::from_str(&converged).unwrap();
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+        eprintln!("21-03 observation: convergence 503 body: {interrupted}");
+        eprintln!("21-03 observation: convergence 409 body: {replayed}");
+        eprintln!("21-03 observation: convergence 200 body: {converged}");
+
+        assert!(
+            git_read(&clone, &["show-ref", "--verify", &branch_ref]).is_some(),
+            "{branch_ref} no longer resolves"
+        );
+        assert!(git_read(&clone, &["rev-parse", "--git-dir"]).is_some());
+        assert!(!crate::manager::lock(&shared).persistence_status().dirty);
+
+        // A fresh restore does not list the row.
+        crate::manager::lock(&shared).kill_all();
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        restored.restore_at(&root, &workspace);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(worktree_key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+        restored.kill_all();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_committed_replacement_is_a_200_saved_degraded() {
+        let (root, _fixture, workspace, shared, app, id, key) =
+            removal_fixture("matrix-degraded").await;
+        let previewed = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&previewed, key);
+
+        crate::manager::lock(&shared).persist_at_for_test(
+            &root,
+            &workspace,
+            Some(baude_core::persist::AtomicFailure::DirectorySync),
+        );
+        let executed =
+            assert_executed(&app, &previewed, "a save whose replacement committed").await;
+        assert_eq!(
+            executed["persistence"]["outcome"], "saved_degraded",
+            "{executed}"
+        );
+        let detail = executed["persistence"]["detail"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a degraded save carries a detail: {executed}"))
+            .to_string();
+        assert!(!detail.is_empty());
+        assert_eq!(
+            checkout_entries(&rows_body(&app).await),
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+        assert!(wait_for_pid_gone(agent_pid));
+        {
+            let manager = crate::manager::lock(&shared);
+            assert_eq!(manager.checkout_key_for_runtime_for_test(id), None);
+            let status = manager.persistence_status();
+            assert!(status.dirty, "a degraded save leaves the daemon dirty");
+            assert_eq!(status.error.as_deref(), Some(detail.as_str()));
+        }
+
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_busy_repository_is_503_before_any_kill() {
+        let (root, _fixture, workspace, shared, app, id, key) =
+            removal_fixture("matrix-busy").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let row = rows_checkout_for_session(&rows_body(&app).await, id);
+        let repository: baude_core::repository::RepositoryKey =
+            serde_json::from_value(row["repository_key"].clone()).unwrap();
+        let previewed = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&previewed, key);
+        let before = world_snapshot(&app, &state_path).await;
+
+        // A real reservation, held across the request with the manager lock
+        // released.
+        let reservation = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let body = assert_refused(
+            removal_response(&app, &previewed).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a repository another mutation holds",
+        )
+        .await;
+        assert!(body.starts_with("repository busy:"), "{body}");
+        assert!(pid_is_alive(agent_pid), "a busy refusal stopped the agent");
+        assert_world_unchanged(&app, &state_path, &before, "after the busy 503").await;
+
+        drop(reservation);
+        assert_executed(
+            &app,
+            &previewed,
+            "the same body once the repository is free",
+        )
+        .await;
+        assert!(wait_for_pid_gone(agent_pid));
+
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_failure_blocked_persistence_is_503_before_the_target_is_looked_up() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("matrix-blocked").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        // A second daemon whose state file the loader rejects: persistence is
+        // blocked by its real cause, and this daemon stores no row at all.
+        let second_root = removal_root("matrix-blocked-second");
+        let second_state = removal_state_file(&second_root, &workspace);
+        std::fs::create_dir_all(second_state.parent().unwrap()).unwrap();
+        std::fs::write(&second_state, b"this is not a state file\n").unwrap();
+        let (blocked, blocked_app) = restarted_daemon(&second_root, &workspace, REMOVAL_AGENT_CMD);
+        {
+            let manager = crate::manager::lock(&blocked);
+            assert!(
+                manager.persistence_status().blocked,
+                "the loader rejected the state file, so persistence is blocked"
+            );
+            assert!(matches!(
+                manager.preview_removal(RemovalTarget::Checkout(key)),
+                Err(RemovalError::UnknownTarget(_))
+            ));
+        }
+
+        let body = assert_refused(
+            removal_response(&blocked_app, &report).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "blocked persistence, for a target this daemon does not store",
+        )
+        .await;
+        assert!(body.contains("persistence is blocked"), "{body}");
+        assert!(pid_is_alive(agent_pid));
+
+        std::fs::remove_dir_all(&second_root).unwrap();
+        removal_teardown(&shared, &root);
+    }
+
+    #[tokio::test]
+    async fn matrix_refused_admission_is_400_plain_text() {
+        let fixture = removal_fixture_two_checkouts("matrix-admission").await;
+        let app = &fixture.app;
+
+        // 21-10's recorded case: the path of a managed worktree the daemon
+        // removed, so nothing is there to admit.
+        let removed = fixture.worktree_path.clone();
+        removed_over_routes(
+            app,
+            &serde_json::json!({ "checkout": fixture.worktree_key }),
+        )
+        .await;
+        assert!(!removed.exists());
+        // A path that never existed, and a path that is a file.
+        let never_made = fixture.root.join("never-made");
+        let file = fixture.root.join("notes.txt");
+        std::fs::write(&file, b"not a folder\n").unwrap();
+
+        for (case, path) in [
+            ("a removed managed worktree", &removed),
+            ("a path that never existed", &never_made),
+            ("a regular file", &file),
+        ] {
+            let rows_before = rows_bytes(app).await;
+            let sessions_before = session_ids(app).await;
+            let response = app
+                .clone()
+                .oneshot(post_json(
+                    "/sessions",
+                    &serde_json::json!({ "repo": path }).to_string(),
+                ))
+                .await
+                .unwrap();
+            let body = assert_refused(response, StatusCode::BAD_REQUEST, case).await;
+            assert!(body.contains("not a directory"), "{case}: {body}");
+            assert_eq!(rows_bytes(app).await, rows_before, "{case}");
+            assert_eq!(session_ids(app).await, sessions_before, "{case}");
+        }
+
+        removal_teardown(&fixture.shared, &fixture.root);
     }
 }
 

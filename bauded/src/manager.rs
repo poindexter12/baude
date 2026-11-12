@@ -1388,6 +1388,20 @@ impl Manager {
         self.runtime_checkouts.remove(&key);
     }
 
+    /// Take the real reservation of repository `key`, so a test can hold it
+    /// across a request and drive `RemoveRowsError::Busy` by its cause. The
+    /// guard owns its share of the reservation table and outlives the manager
+    /// lock; this adds no second locking mechanism.
+    #[cfg(test)]
+    pub(crate) fn reserve_repository_for_test(
+        &self,
+        key: RepositoryKey,
+    ) -> lifecycle::RepositoryReservation {
+        self.repository_reservations
+            .reserve(key)
+            .unwrap_or_else(|_| panic!("repository {key:?} is already reserved"))
+    }
+
     /// Store and launch what a daemon before 21-10 stored and launched for a
     /// folder git does not report as a repository, so a test can stand on
     /// that shape. The allocation is the one `record_checkout_intent` made
