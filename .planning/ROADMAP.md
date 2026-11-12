@@ -173,7 +173,7 @@ Plans:
   2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
   3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
 
-**Plans**: 6/11 plans executed
+**Plans**: 7/11 plans executed
 
 Plans:
 - [x] 21-01-PLAN.md — Wave 1. Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout
@@ -182,7 +182,7 @@ Plans:
 - [x] 21-09-PLAN.md — Wave 3. Repository parent and main checkout row kinds over the removal routes, role admission and branch projection on /rows
 - [x] 21-10-PLAN.md — Wave 4. Standalone folder rows through real admission, runtime custody and suppression lift
 - [x] 21-03-PLAN.md — Wave 5. Drift and failure status matrix over REST: 404, 409 with fresh report, 500, 503 and the saved_degraded 200
-- [ ] 21-04-PLAN.md — Wave 6. Daemon-wide GET /events SSE stream publishing rows_removed after the durable save
+- [x] 21-04-PLAN.md — Wave 6. Daemon-wide GET /events SSE stream publishing rows_removed after the durable save
 - [ ] 21-05-PLAN.md — Wave 7. PWA removal controller and report-backed modal on all row kinds, 409 re-render and live row drops on /events
 - [ ] 21-08-PLAN.md — Wave 7. TUI remote client: off-thread removal requests, /rows index and /events subscriber in remote.rs
 - [ ] 21-06-PLAN.md — Wave 8. TUI D on remote rows through the daemon with the shared modal
