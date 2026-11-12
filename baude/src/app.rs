@@ -12385,11 +12385,12 @@ mod tests {
         );
     }
 
-    /// TUI-01, D-02: remote rows refuse with `RemoteRemove`; no target is
-    /// built for them.
+    /// D-12: `D` on a remote row resolves to `RemoveProject`, with or without
+    /// a runtime and for both key encodings. The daemon decides what the row
+    /// is; the sidebar only routes the key.
     #[test]
-    fn sidebar_action_d_refuses_remote_rows() {
-        use super::{sidebar_action, SidebarAction, SidebarRefusal};
+    fn sidebar_action_d_yields_remove_project_on_remote_rows() {
+        use super::{sidebar_action, SidebarAction};
         use crate::hierarchy::{action_view, ActionSelection};
 
         for has_runtime in [false, true] {
@@ -12400,7 +12401,7 @@ mod tests {
             ] {
                 assert_eq!(
                     sidebar_action(view, key),
-                    SidebarAction::Refuse(SidebarRefusal::RemoteRemove),
+                    SidebarAction::RemoveProject,
                     "remote has_runtime={has_runtime} with {key:?}"
                 );
             }
