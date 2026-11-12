@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-10-PLAN.md
-last_updated: "2026-11-12T16:04:21.558Z"
+stopped_at: Completed 21-03-PLAN.md
+last_updated: "2026-11-12T16:23:10.549Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: d53a39b6dd45ef86acf4d232d0707a039f8a962d
+state_head: 0691318731fefe22152b02b9369f09d7ef261b5c
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 24
+  completed_plans: 25
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 6 of 11
+Plan: 7 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -122,6 +122,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P07 | 13min | 4 tasks | 5 files |
 | Phase 21 P09 | 25min | 3 tasks | 2 files |
 | Phase 21 P10 | Task 3 and close 65min | 3 tasks | 2 files |
+| Phase 21 P03 | 45min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -297,6 +298,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-10: only an explicit admission through Manager::create lifts a suppression entry, for the path the admitted row stores; restore, reopen, the restart route and legacy migration lift nothing
 - [Phase 21]: 21-10: a plain admission takes the repository path and the worktree fact from git discovery and always stores the checkout as unmanaged, so a hand-made linked worktree opens by path and its directory survives removal
 - [Phase 21]: 21-10: delete_teardown_failure_is_500_and_unknown_id_stays_404 and real_atomic_persistence_failures_are_503_for_every_mutation were moved from /tmp onto a real repository with assertions untouched; standalone DELETE has its own failure-mapping tests
+- [Phase 21]: 21-03: a missing runtime handle on POST /removals is 503, not 500, because core raises it in preflight before anything is signalled, deleted or saved
+- [Phase 21]: 21-03: a same-row removal race loser is 404; a parent versus child race loser is 404 when the repository removal won and 409 when the child removal won
+- [Phase 21]: 21-03: a removal is committed only at the single Ok return of Manager::remove_rows, for both saved and saved_degraded; no non-200 commits anything
 
 ### Pending Todos
 
@@ -379,8 +383,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-12T16:04:21.218Z
-Stopped at: Completed 21-10-PLAN.md
+Last session: 2026-11-12T16:23:10.295Z
+Stopped at: Completed 21-03-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
