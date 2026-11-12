@@ -13029,6 +13029,723 @@ mod tests {
         assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
     }
 
+    // ---- every other daemon answer to a remote removal (plan 21-06) ------
+
+    /// The footer the local recheck sets; a remote 409 reuses it word for word.
+    const RECHECK_NOTICE: &str =
+        "rows changed since the preview; review the refreshed confirmation";
+
+    /// A `/rows` body that lists nothing.
+    const EMPTY_ROWS_BODY: &str = r#"{"repositories":[],"standalone":[]}"#;
+
+    /// The script of a scripted daemon: the given answers to each removal
+    /// call in order, and the given `/rows` bodies in order. A worker reads
+    /// `/rows` once after a 200 preview, a 409, and an unanswered execute.
+    fn removal_routes(
+        previews: Vec<crate::remote::test_double::Reply>,
+        removals: Vec<crate::remote::test_double::Reply>,
+        rows: Vec<&str>,
+    ) -> Vec<crate::remote::test_double::Route> {
+        use crate::remote::test_double::{route, Reply};
+        vec![
+            route("POST", "/removals/preview", previews),
+            route("POST", "/removals", removals),
+            route(
+                "GET",
+                "/rows",
+                rows.into_iter()
+                    .map(|body| Reply::json(200, body))
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The daemon's fresh preview after drift: the worktree directory went
+    /// away between the preview and the execute.
+    fn drifted_report(
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> baude_core::removal::RemovalReport {
+        let mut fresh = previewed.clone();
+        let moved = std::mem::take(&mut fresh.paths_deleted);
+        assert!(!moved.is_empty(), "the preview deletes the worktree path");
+        fresh.already_removed.extend(moved);
+        fresh
+    }
+
+    /// The open remote confirmation: its report, its error text, and whether
+    /// it stands for an unknown outcome.
+    fn remote_confirmation(app: &App) -> (&baude_core::removal::RemovalReport, Option<&str>, bool) {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                report,
+                scroll,
+                error,
+                origin: super::RemovalOrigin::Remote(confirm),
+                ..
+            } => {
+                assert_eq!(*scroll, 0, "a re-installed confirmation starts unscrolled");
+                (report, error.as_deref(), confirm.unknown_outcome)
+            }
+            _ => panic!(
+                "expected an open remote confirmation; pending: {:?}, footer: {:?}",
+                pending_stage(app),
+                last_message(app)
+            ),
+        }
+    }
+
+    /// Which wait the pending modal shows, if it is up.
+    fn pending_stage(app: &App) -> Option<super::RemoteRemovalStage> {
+        match &app.modal {
+            Modal::RemoteRemovePending { stage, .. } => Some(*stage),
+            _ => None,
+        }
+    }
+
+    /// `D` on the remote row, then wait for the daemon's preview.
+    fn open_remote_confirmation(app: &mut App) {
+        app.handle_sidebar_key(d_key());
+        settle_remote_removal(app);
+    }
+
+    /// Enter on the open confirmation, then wait for the daemon's answer.
+    fn confirm_and_settle(app: &mut App) {
+        app.handle_modal_key(enter_key());
+        settle_remote_removal(app);
+    }
+
+    /// The bodies of every `POST /removals` the double read, parsed.
+    fn sent_removals(
+        double: &crate::remote::test_double::Double,
+    ) -> Vec<baude_core::removal::RemovalReport> {
+        recorded(double, "POST", "/removals")
+            .iter()
+            .map(|request| {
+                serde_json::from_str(&request.body).expect("the execute body is a report")
+            })
+            .collect()
+    }
+
+    /// Long enough for a worker, had one been started, to reach the double.
+    fn let_a_stray_request_land() {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    fn end_remote_remove(mut app: App, fx: &RelaunchFixture) {
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-12: `D` hands the preview to a worker and returns; the draw thread
+    /// never waits out a slow daemon.
+    #[test]
+    fn d_on_remote_row_returns_before_a_slow_daemon_answers() {
+        use crate::remote::test_double::Reply;
+
+        // The double is bound for the whole test: dropping it stops the daemon.
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-slow", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed)).delayed(std::time::Duration::from_secs(1))],
+                Vec::new(),
+                vec![rows_body],
+            )
+        });
+
+        let started = std::time::Instant::now();
+        app.handle_sidebar_key(d_key());
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the key handler waited on the daemon: {took:?}"
+        );
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview)
+        );
+
+        settle_remote_removal(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, None);
+        assert!(!unknown);
+        end_remote_remove(app, &fx);
+    }
+
+    /// D-14: a 409 puts the daemon's fresh report in front of the user and
+    /// sends nothing until Enter is pressed on it.
+    #[test]
+    fn remote_remove_drift_reinstalls_fresh_report_and_sends_nothing_until_confirmed() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-drift", |previewed, rows_body| {
+            let fresh = drifted_report(previewed);
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![
+                    Reply::json(409, wire(&fresh)),
+                    Reply::json(200, wire(&executed_report(&fresh))),
+                ],
+                vec![rows_body, rows_body],
+            )
+        });
+        let fresh = drifted_report(&previewed);
+        assert_ne!(fresh, previewed);
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &fresh, "the daemon's fresh report is shown");
+        assert_eq!(error, None);
+        assert!(!unknown);
+        assert_eq!(last_message(&app), Some(RECHECK_NOTICE));
+        assert!(app.remote_removal.is_none());
+        let_a_stray_request_land();
+        assert_eq!(
+            sent_removals(&double),
+            vec![previewed.clone()],
+            "a 409 leads to no request the user did not press Enter for"
+        );
+
+        confirm_and_settle(&mut app);
+        assert_eq!(sent_removals(&double), vec![previewed, fresh.clone()]);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed_report(&fresh)).as_str())
+        );
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// D-15: a 500 and a 503 keep the confirmation open with the daemon's
+    /// own words, and Enter sends the same held report again.
+    #[test]
+    fn remote_remove_refused_keeps_modal_with_daemon_text_and_enter_retries_same_report() {
+        use crate::remote::test_double::Reply;
+
+        const BUSY: &str = "repository busy: another removal holds the lock";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-refused", |previewed, rows_body| {
+            let survived = format!(
+                "row {:?}: runtime survived the kill stage: still running",
+                previewed.rows_removed[0]
+            );
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![
+                    Reply::text(500, survived),
+                    Reply::text(503, BUSY),
+                    Reply::json(200, wire(&executed_report(previewed))),
+                ],
+                vec![rows_body],
+            )
+        });
+        let survived = format!(
+            "row {:?}: runtime survived the kill stage: still running",
+            previewed.rows_removed[0]
+        );
+        assert!(
+            survived.starts_with("row Checkout(CheckoutKey("),
+            "core's shape: {survived}"
+        );
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed, "the held report stays");
+        assert_eq!(error, Some(survived.as_str()));
+        assert!(!unknown);
+        assert_eq!(sent_removals(&double).len(), 1);
+
+        confirm_and_settle(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, Some(BUSY));
+        assert!(!unknown);
+        let sent = sent_removals(&double);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], sent[0], "Enter retries with an equal body");
+        assert_eq!(sent[0], previewed);
+
+        confirm_and_settle(&mut app);
+        let sent = sent_removals(&double);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2], sent[0]);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            recorded(&double, "POST", "/removals/preview").len(),
+            1,
+            "a refusal is retried without a new preview"
+        );
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// A 404 means the row is already gone: the modal closes, says so, and
+    /// holds nothing a key could resend.
+    #[test]
+    fn remote_remove_gone_closes_with_already_removed_notice_and_offers_no_retry() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-gone", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::text(404, "unknown target"),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::text(404, "unknown target")],
+                vec![rows_body],
+            )
+        });
+
+        // A 404 to the preview.
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("already removed"),
+            "{message}"
+        );
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+
+        // A 404 to the removal.
+        app.message = None;
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        confirm_and_settle(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("already removed"),
+            "{message}"
+        );
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+
+        app.handle_modal_key(enter_key());
+        assert!(app.remote_removal.is_none());
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 2);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// An execute that was sent and never answered is an unknown outcome,
+    /// never a failure, and it is never sent again: Enter previews.
+    #[test]
+    fn remote_remove_unanswered_execute_is_unknown_outcome_and_enter_previews_again() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-unknown", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::json(200, wire(previewed)),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::closed_unanswered()],
+                // After the preview, after the unanswered execute, after the
+                // second preview: the row is listed every time.
+                vec![rows_body, rows_body, rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed, "the held report stays");
+        assert!(unknown, "an unanswered execute is an unknown outcome");
+        let error = error.expect("the unknown outcome is explained").to_string();
+        assert!(
+            error.contains("may or may not have been removed"),
+            "{error}"
+        );
+        assert!(!error.contains("failed"), "{error}");
+        let footer = last_message(&app).unwrap_or_default().to_string();
+        assert!(!footer.contains("failed"), "{footer}");
+
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "Enter on an unknown outcome previews again"
+        );
+        settle_remote_removal(&mut app);
+        let (_, error, unknown) = remote_confirmation(&app);
+        assert_eq!(error, None);
+        assert!(!unknown, "a fresh preview is an ordinary confirmation");
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 2);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// An unanswered execute whose row the daemon no longer lists did
+    /// happen: the modal closes and says the row was removed.
+    #[test]
+    fn remote_remove_unanswered_execute_with_rows_gone_reports_removed() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-rows-gone", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::closed_unanswered()],
+                // Listed after the preview, gone after the execute.
+                vec![rows_body, EMPTY_ROWS_BODY],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("was removed"),
+            "{message}"
+        );
+        assert!(!message.contains("failed"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// A preview the daemon refuses, or never answers, closes the modal with
+    /// a notice: nothing was asked to change.
+    #[test]
+    fn remote_remove_preview_refused_or_unanswered_closes_with_notice() {
+        use crate::remote::test_double::Reply;
+
+        const BUSY: &str = "repository busy: another removal holds the lock";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-preview-refused", |_previewed, _rows_body| {
+            removal_routes(
+                vec![Reply::text(503, BUSY), Reply::closed_unanswered()],
+                Vec::new(),
+                Vec::new(),
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.contains(BUSY), "the daemon's text: {message}");
+        assert!(message.contains("active-zeta"), "{message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.starts_with("No answer from the daemon"),
+            "{message}"
+        );
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        assert!(app.remote_removal.is_none());
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// Esc always ends a preview wait, and never pretends to recall a
+    /// removal that was already sent.
+    #[test]
+    fn remote_remove_esc_cancels_a_preview_wait_and_stays_during_an_execute_wait() {
+        use crate::remote::test_double::Reply;
+
+        let slow = std::time::Duration::from_millis(400);
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-esc", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::json(200, wire(previewed)).delayed(slow),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::json(200, wire(&executed_report(previewed))).delayed(slow)],
+                vec![rows_body, rows_body],
+            )
+        });
+        let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.handle_sidebar_key(d_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview)
+        );
+        app.handle_modal_key(esc());
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
+        // The late answer arrives and finds no one waiting for it.
+        std::thread::sleep(slow * 2);
+        app.poll_remote_removal();
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a late answer opens nothing"
+        );
+
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        app.handle_modal_key(esc());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute),
+            "a sent removal keeps its wait"
+        );
+        assert!(app.remote_removal.is_some(), "the removal is still pending");
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.contains("cannot be recalled"), "{message}");
+
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed_report(&previewed)).as_str())
+        );
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// A worker that never answers does not hold the modal forever: at the
+    /// deadline a preview wait ends as no answer and a removal wait as an
+    /// unknown outcome.
+    #[test]
+    fn remote_remove_silent_worker_resolves_at_the_deadline() {
+        use crate::remote::test_double::Reply;
+
+        let forever = std::time::Duration::from_secs(120);
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-deadline", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::held(forever), Reply::json(200, wire(previewed))],
+                vec![Reply::held(forever)],
+                vec![rows_body],
+            )
+        });
+
+        app.handle_sidebar_key(d_key());
+        app.poll_remote_removal();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "before the deadline the wait goes on"
+        );
+        app.remote_removal
+            .as_mut()
+            .expect("a pending preview")
+            .deadline = std::time::Instant::now();
+        app.poll_remote_removal();
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.starts_with("No answer from the daemon"),
+            "{message}"
+        );
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        app.handle_modal_key(enter_key());
+        app.poll_remote_removal();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        app.remote_removal
+            .as_mut()
+            .expect("a pending removal")
+            .deadline = std::time::Instant::now();
+        app.poll_remote_removal();
+        assert!(app.remote_removal.is_none());
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert!(unknown, "a silent removal is an unknown outcome");
+        let error = error.expect("the unknown outcome is explained");
+        assert!(
+            error.contains("may or may not have been removed"),
+            "{error}"
+        );
+        assert!(!error.contains("failed"), "{error}");
+        drop(double);
+        end_remote_remove(app, &fx);
+    }
+
+    /// A second Enter while the removal is on its way sends nothing.
+    #[test]
+    fn remote_remove_double_enter_sends_one_execute() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-double-enter", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, wire(&executed_report(previewed)))
+                    .delayed(std::time::Duration::from_millis(300))],
+                vec![rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.handle_modal_key(enter_key());
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// `tick` is what collects the answer in the running app. The idle
+    /// poller hands `tick` a remote view that lists nothing, so this also
+    /// pins that a daemon listing nothing for a moment does not end the wait.
+    #[test]
+    fn remote_remove_tick_polls_the_pending_removal() {
+        use crate::remote::test_double::Reply;
+
+        // The double is bound for the whole test: dropping it stops the daemon.
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-tick", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))
+                    .delayed(std::time::Duration::from_millis(200))],
+                Vec::new(),
+                vec![rows_body],
+            )
+        });
+
+        app.handle_sidebar_key(d_key());
+        app.tick();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "an empty remote view does not dismiss the wait"
+        );
+        let started = std::time::Instant::now();
+        while app.remote_removal.is_some() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "tick never collected the answer"
+            );
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, None);
+        assert!(!unknown);
+        end_remote_remove(app, &fx);
+    }
+
+    /// A changed rows index is a reason to redraw; an unchanged one is not.
+    #[test]
+    fn remote_remove_rows_index_change_marks_dirty() {
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            ..
+        } = remote_remove_app("d-remote-rows-dirty", |_previewed, _rows_body| Vec::new());
+        let snap = app.remote_snap.clone();
+        let rows = app.remote_rows.clone();
+
+        app.dirty = false;
+        app.apply_remote_view(snap.clone(), rows.clone());
+        assert!(
+            !app.dirty,
+            "the same view and the same index change nothing"
+        );
+
+        let other: crate::remote::RemoteRows =
+            serde_json::from_str(EMPTY_ROWS_BODY).expect("the /rows body parses");
+        assert!(other != rows);
+        app.apply_remote_view(snap, other);
+        assert!(
+            app.dirty,
+            "a different rows index marks the view for redraw"
+        );
+        end_remote_remove(app, &fx);
+    }
+
     /// Every local row kind `D` reaches over `relaunch_fixture`: the clone's
     /// primary checkout with the runtime `restore` spawned, which is
     /// `PrimaryDefault` and so an `External` row, a managed worktree with its

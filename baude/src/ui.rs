@@ -4065,6 +4065,64 @@ mod tests {
         assert!(rendered.contains("esc cancel"), "{rendered}");
     }
 
+    /// A removal that was sent and never answered is shown as an unknown
+    /// outcome with a way to look again. It is never called a failure and
+    /// never offers to send the same removal again.
+    #[test]
+    fn remote_removal_modal_unknown_outcome_never_says_failed() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let checkout: baude_core::repository::CheckoutKey =
+            serde_json::from_value(serde_json::json!(7)).expect("checkout key");
+        let target = RemovalTarget::Checkout(checkout);
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-unknown-outcome",
+            Modal::ConfirmRemove {
+                target,
+                report: remove_project::report(target, vec![RowKey::Checkout(checkout)]),
+                scroll: 0,
+                error: Some(
+                    "the daemon did not answer; “active-zeta” may or may not have been removed"
+                        .into(),
+                ),
+                origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                    rows: crate::remote::RemoteRows::default(),
+                    label: "active-zeta".into(),
+                    unknown_outcome: true,
+                })),
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("unknown outcome"), "{rendered}");
+        assert!(rendered.contains("enter preview again"), "{rendered}");
+        assert!(!rendered.contains("failed"), "{rendered}");
+        assert!(!rendered.contains("retry"), "{rendered}");
+    }
+
+    /// The wait for a sent removal says it cannot be recalled and how long
+    /// the TUI waits, and offers no cancel.
+    #[test]
+    fn remote_removal_modal_pending_execute_says_cannot_be_recalled() {
+        use crate::app::RemoteRemovalStage;
+
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-pending-execute",
+            Modal::RemoteRemovePending {
+                label: "active-zeta".into(),
+                stage: RemoteRemovalStage::Execute,
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("active-zeta"), "{rendered}");
+        assert!(rendered.contains("cannot be recalled"), "{rendered}");
+        let seconds = crate::remote::REMOVAL_TIMEOUT.as_secs().to_string();
+        assert!(rendered.contains(&seconds), "{seconds}: {rendered}");
+        assert!(!rendered.contains("esc cancel"), "{rendered}");
+    }
+
     // ---- UI fixture ownership regressions -------------------------------
     //
     // Authored `#[ignore]`d by plan 08-03 so the ownership contract was pinned
