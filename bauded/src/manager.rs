@@ -1377,6 +1377,17 @@ impl Manager {
             .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
     }
 
+    /// Drop the registry entry that maps `key` to its live session, and
+    /// nothing else. Reproduces the stale runtime row a daemon is left with
+    /// when restore could not reopen a checkout that still records an owned
+    /// runtime: the row keeps its runtime, the daemon holds no handle for it.
+    /// The process keeps running, the `Session` stays in `self.sessions`,
+    /// `repository_state` is untouched and nothing is saved.
+    #[cfg(test)]
+    pub(crate) fn forget_runtime_handle_for_test(&mut self, key: CheckoutKey) {
+        self.runtime_checkouts.remove(&key);
+    }
+
     /// Store and launch what a daemon before 21-10 stored and launched for a
     /// folder git does not report as a repository, so a test can stand on
     /// that shape. The allocation is the one `record_checkout_intent` made

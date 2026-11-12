@@ -129,13 +129,17 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
     let status = match &error {
         RemoveRowsError::Drift(_) => StatusCode::CONFLICT,
         RemoveRowsError::Removal(RemovalError::UnknownTarget(_)) => StatusCode::NOT_FOUND,
-        RemoveRowsError::Removal(RemovalError::Persist { .. })
+        // 503: refused because of the daemon's own state. A missing runtime
+        // handle is raised by core's preflight before any stage runs, so
+        // nothing was signalled, deleted or saved, unlike every 500 below.
+        RemoveRowsError::Removal(
+            RemovalError::Persist { .. } | RemovalError::RuntimeHandleMissing(_),
+        )
         | RemoveRowsError::Blocked(_)
         | RemoveRowsError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         RemoveRowsError::Removal(
             RemovalError::RuntimeSurvived { .. }
             | RemovalError::DiskRemoval { .. }
-            | RemovalError::RuntimeHandleMissing(_)
             | RemovalError::RuntimeIdentityMismatch { .. }
             | RemovalError::Validation(_),
         ) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -774,7 +778,7 @@ mod tests {
     use tower::ServiceExt;
 
     use axum::Router;
-    use baude_core::removal::{RemovalError, RemovalTarget};
+    use baude_core::removal::{RemovalError, RemovalTarget, RowKey};
     use baude_core::repository::CheckoutKey;
     use baude_core::workspace::Workspace;
     use std::path::PathBuf;
@@ -5101,6 +5105,103 @@ mod tests {
         assert!(!worktree_path.exists());
 
         removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// Collect a refused response. The status is pinned with `marker`, and
+    /// the message carries the status and body actually returned. A refusal
+    /// other than 409 is plain text, so the `content-type` must not be JSON.
+    /// Returns the body text.
+    async fn assert_refused(
+        response: axum::response::Response,
+        expected: StatusCode,
+        marker: &str,
+    ) -> String {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_string());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(
+            status, expected,
+            "21-03 status pin: {marker}: the daemon answered {status} with body {body}"
+        );
+        assert!(
+            !content_type
+                .as_deref()
+                .is_some_and(|value| value.contains("json")),
+            "21-03 body pin: {marker}: a {status} refusal carried content-type {content_type:?}"
+        );
+        body
+    }
+
+    /// The world a refused removal must leave alone: the `/rows` body, the
+    /// `/sessions` body and the state file bytes.
+    async fn world_snapshot(
+        app: &Router,
+        state_path: &Path,
+    ) -> (serde_json::Value, serde_json::Value, Vec<u8>) {
+        let rows = rows_body(app).await;
+        let sessions = body_json(app.clone().oneshot(get("/sessions")).await.unwrap()).await;
+        let state = std::fs::read(state_path).unwrap();
+        (rows, sessions, state)
+    }
+
+    #[tokio::test]
+    async fn matrix_missing_runtime_handle_is_503_and_touches_nothing() {
+        let (root, _fixture, workspace, shared, app, id, key) =
+            removal_fixture("matrix-handle-missing").await;
+        let state_path = removal_state_file(&root, &workspace);
+
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        assert!(pid_is_alive(agent_pid));
+
+        crate::manager::lock(&shared).forget_runtime_handle_for_test(key);
+        assert_eq!(
+            crate::manager::lock(&shared).checkout_key_for_runtime_for_test(id),
+            None,
+            "the seam drops the registry entry"
+        );
+        let stale = preview_report(&app, key).await;
+        assert_eq!(
+            stale["runtimes_killed"].as_array().unwrap().len(),
+            1,
+            "the row still records its runtime: {stale}"
+        );
+        // The world the refusal must leave alone is the one the request
+        // found: `/rows` reads `session_id` through the registry the seam
+        // just emptied.
+        let (rows_before, _sessions_before, state_before) = world_snapshot(&app, &state_path).await;
+
+        let refused = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let body = assert_refused(
+            refused,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a row whose runtime handle the daemon does not hold",
+        )
+        .await;
+        let row = format!("{:?}", RowKey::Checkout(key));
+        assert!(body.contains(&row), "the body names the row {row}: {body}");
+        assert!(
+            body.contains("runtime") && body.contains("handle"),
+            "the body says the runtime handle is missing: {body}"
+        );
+
+        let (rows_after, _sessions_after, state_after) = world_snapshot(&app, &state_path).await;
+        assert_eq!(rows_after, rows_before);
+        assert_eq!(state_after, state_before);
+        assert!(
+            pid_is_alive(agent_pid),
+            "a refused removal must not stop the agent process"
+        );
+
+        removal_teardown(&shared, &root);
     }
 }
 
