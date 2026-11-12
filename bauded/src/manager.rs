@@ -27,6 +27,7 @@ use baude_core::repository::{
     SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
 };
 use baude_core::session::{Session, StateSource, Status};
+use baude_core::suppression;
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
 /// that Claude Code's TUI lays out sanely in the transcript-driving sense.
@@ -1376,9 +1377,148 @@ impl Manager {
             .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
     }
 
+    /// Store and launch what a daemon before 21-10 stored and launched for a
+    /// folder git does not report as a repository, so a test can stand on
+    /// that shape. The allocation is the one `record_checkout_intent` made
+    /// before 21-10 removed it: a repository row whose common directory and
+    /// main worktree are the folder and whose health is unavailable for the
+    /// not-a-repository cause, holding one unmanaged `ManagedBranch` checkout
+    /// at the folder. No route reaches this.
+    #[cfg(test)]
+    pub(crate) fn create_pre_plan_folder_session_for_test(
+        &mut self,
+        folder: &Path,
+        name: Option<&str>,
+    ) -> MutationResult<u64> {
+        let state_before = self.repository_state.clone();
+        let base = name.map(str::to_owned).unwrap_or_else(|| {
+            folder
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_else(|| folder.display().to_string())
+        });
+        let session_name = self.unique_name(&base);
+        let allocated = (|| -> Result<CheckoutKey> {
+            let key = self.repository_state.allocate_repository_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: PersistedPath::from_path(folder),
+                observed_main_worktree: PersistedPath::from_path(folder),
+                first_seen_order,
+                health: RepositoryHealth::Unavailable(UnavailableCause::NotRepository),
+                physical_key: key.get().to_string(),
+            });
+            let checkout_key = self.repository_state.allocate_checkout_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.checkouts.push(SavedCheckout::new(
+                checkout_key,
+                key,
+                CheckoutRole::ManagedBranch,
+                false,
+                PersistedPath::from_path(folder),
+                None,
+                first_seen_order,
+                CheckoutLifecycle::Active,
+                RetainedSessionState {
+                    name: session_name.clone(),
+                    cwd: PersistedPath::from_path(folder),
+                    repo_root: PersistedPath::from_path(folder),
+                    branch: None,
+                    is_worktree: false,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            Ok(checkout_key)
+        })();
+        let checkout_key = match allocated {
+            Ok(key) => key,
+            Err(error) => {
+                self.repository_state = state_before;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        let id = self.spawn_retained_with_mode(
+            checkout_key,
+            folder.to_path_buf(),
+            folder.to_path_buf(),
+            None,
+            false,
+            Some(&session_name),
+            backend::SpawnMode::Fresh,
+            false,
+        )?;
+        self.runtime_checkouts.insert(checkout_key, id);
+        Ok(id)
+    }
+
     /// `POST /sessions` — spawn a fresh session in `repo`, optionally in a
     /// managed worktree for `worktree` (branch name).
+    ///
+    /// An explicit admission is the one thing that lifts a suppression
+    /// entry (D-11). Every arm of `admit` that returns a session has stored
+    /// its row durably and launched it by then, so the lift runs here, once,
+    /// with the path that row stores: core keyed the entry on the stored
+    /// path of the row it removed, never on a request string. An arm that
+    /// returns an error lifts nothing, and a non-persisting manager stores
+    /// no row and lifts nothing. Restore, reopen, the restart route and the
+    /// legacy migration never come through here.
     pub fn create(
+        &mut self,
+        repo: &str,
+        worktree: Option<&str>,
+        name: Option<&str>,
+    ) -> MutationResult<SessionInfo> {
+        let info = self.admit(repo, worktree, name)?;
+        if self.persist {
+            if let Some(admitted) = self.stored_row_path(info.id) {
+                self.lift_admission_suppression(&admitted);
+            }
+        }
+        Ok(info)
+    }
+
+    /// The path stored on the row that owns live session `id`: a standalone
+    /// row's `canonical_path` or a checkout row's `observed_path`.
+    fn stored_row_path(&self, id: u64) -> Option<PathBuf> {
+        if let Some(key) = self.standalone_owner(id) {
+            return self
+                .repository_state
+                .standalone_sessions
+                .iter()
+                .find(|row| row.key == key)
+                .map(|row| row.canonical_path.to_path_buf());
+        }
+        let key = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))?;
+        self.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .map(|checkout| checkout.observed_path.to_path_buf())
+    }
+
+    /// Forget the suppression entry for exactly `admitted`. Advisory: a
+    /// store error is logged with the path and never fails the admission
+    /// that asked for it. It reads no row and writes no state of its own.
+    fn lift_admission_suppression(&self, admitted: &Path) {
+        if let Err(error) = suppression::lift(&persist::config_dir(), admitted) {
+            eprintln!("lift suppression {}: {error}", admitted.display());
+        }
+    }
+
+    fn admit(
         &mut self,
         repo: &str,
         worktree: Option<&str>,

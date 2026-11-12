@@ -3522,6 +3522,394 @@ mod tests {
         }
     }
 
+    /// The paths of the `kind` items an executed report cleared.
+    fn cleared_paths(
+        report: &baude_core::removal::RemovalReport,
+        kind: baude_core::removal::ClearingKind,
+    ) -> Vec<PathBuf> {
+        report
+            .cleared
+            .iter()
+            .filter(|item| item.kind == kind)
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
+    /// The one path an executed report says it suppressed. Every suppressed
+    /// path in these tests comes from here and none is rebuilt by a test.
+    fn suppression_added_path(report: &baude_core::removal::RemovalReport) -> PathBuf {
+        let added = cleared_paths(report, baude_core::removal::ClearingKind::SuppressionAdded);
+        assert_eq!(
+            added.len(),
+            1,
+            "exactly one suppression entry was written: {report:?}"
+        );
+        added[0].clone()
+    }
+
+    /// Whether the store under the test root holds an entry for `path`.
+    fn reads_suppressed(path: &Path) -> bool {
+        baude_core::suppression::is_suppressed(&baude_core::persist::config_dir(), path)
+    }
+
+    /// D-11 lift rule. An explicit admission lifts the entry for exactly the
+    /// path it admits. A refused request and a branch recreated on a new
+    /// path lift nothing.
+    #[tokio::test]
+    async fn suppression_explicit_admission_lifts_the_exact_path() {
+        let fixture = removal_fixture_two_checkouts("suppress-lift").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+
+        // A managed worktree removed with its directory: P.
+        let removed = removed_over_routes(
+            app,
+            &serde_json::json!({ "checkout": fixture.worktree_key }),
+        )
+        .await;
+        let p = suppression_added_path(&removed);
+        assert!(!removed.paths_deleted.is_empty(), "{removed:?}");
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+
+        // A refused request lifts nothing: nothing is at P to admit.
+        let (status, body) = open_folder(app, p.to_str().unwrap(), None).await;
+        assert_ne!(status, StatusCode::CREATED, "{body}");
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+
+        // Recreating the branch is not a lift: it lands on a new path.
+        let (status, body) = removal_call(
+            app,
+            "/sessions",
+            &serde_json::json!({ "repo": main_path, "worktree": "topic" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let recreated_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let rows = rows_body(app).await;
+        let recreated = rows_checkout_for_session(&rows, recreated_id);
+        let recreated_path = PathBuf::from(recreated["path"].as_str().unwrap());
+        assert_ne!(recreated_path, p, "{rows}");
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+        assert!(
+            !reads_suppressed(&recreated_path),
+            "{}",
+            recreated_path.display()
+        );
+
+        // A worktree the user made by hand, removed with its directory kept: Q.
+        let by_hand = fixture.root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+        let by_hand_id = opened_folder_id(app, &by_hand).await;
+        let rows = rows_body(app).await;
+        let by_hand_entries = checkout_entries_at(&rows, &by_hand);
+        assert_eq!(by_hand_entries.len(), 1, "{rows}");
+        assert_eq!(
+            by_hand_entries[0]["session_id"].as_u64(),
+            Some(by_hand_id),
+            "{rows}"
+        );
+        let removed = removed_over_routes(
+            app,
+            &serde_json::json!({ "checkout": by_hand_entries[0]["checkout_key"] }),
+        )
+        .await;
+        assert_eq!(removed.paths_deleted, Vec::<PathBuf>::new(), "{removed:?}");
+        assert!(removed.paths_kept.contains(&by_hand), "{removed:?}");
+        let q = suppression_added_path(&removed);
+        assert!(by_hand.is_dir());
+        assert!(by_hand.join(".git").is_file());
+        assert!(q.is_dir(), "{}", q.display());
+        assert!(reads_suppressed(&q), "{}", q.display());
+
+        // The suppression pin: the directory is present throughout, and the
+        // only thing that changes between the two readings is the admission.
+        let (status, body) = open_folder(app, q.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(q.is_dir(), "{}", q.display());
+        assert!(
+            !reads_suppressed(&q),
+            "21-10 suppression pin: an explicit POST /sessions admitted {} and its \
+             suppression entry is still in the store",
+            q.display()
+        );
+        let rows = rows_body(app).await;
+        assert_eq!(checkout_entries_at(&rows, &q).len(), 1, "{rows}");
+
+        // Admitting Q lifted Q and nothing else.
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// D-11 write rule, the direction a user sees: removing the repository
+    /// parent drops the entry its removed child left behind.
+    #[tokio::test]
+    async fn suppression_parent_removal_drops_the_child_entry() {
+        let fixture = removal_fixture_two_checkouts("suppress-parent").await;
+        let app = &fixture.app;
+
+        let removed = removed_over_routes(
+            app,
+            &serde_json::json!({ "checkout": fixture.worktree_key }),
+        )
+        .await;
+        let p = suppression_added_path(&removed);
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+
+        let rows = rows_body(app).await;
+        let parents = rows["repositories"].as_array().unwrap();
+        assert_eq!(parents.len(), 1, "{rows}");
+        let removed = removed_over_routes(
+            app,
+            &serde_json::json!({ "repository": parents[0]["repository_key"] }),
+        )
+        .await;
+        assert!(
+            !cleared_paths(
+                &removed,
+                baude_core::removal::ClearingKind::SuppressionDropped
+            )
+            .is_empty(),
+            "{removed:?}"
+        );
+        assert!(!p.exists(), "{}", p.display());
+        assert!(!reads_suppressed(&p), "{}", p.display());
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// D-11: nothing but an explicit admission lifts. A daemon restart admits
+    /// no row for a removed path, relaunches what was running, and leaves
+    /// every entry in the store, including one for a row it does relaunch.
+    #[tokio::test]
+    async fn suppression_restart_admits_nothing_and_lifts_nothing() {
+        let fixture = removal_fixture_two_checkouts("suppress-restart").await;
+        let app = &fixture.app;
+        let main_path = fixture.repo.path().canonicalize().unwrap();
+        let before = checkout_entries(&rows_body(app).await).len();
+
+        let removed = removed_over_routes(
+            app,
+            &serde_json::json!({ "checkout": fixture.worktree_key }),
+        )
+        .await;
+        let p = suppression_added_path(&removed);
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+
+        // An entry for the main checkout, written the way the TUI's removal
+        // writes one through core: the path, and the repository's common
+        // directory as git reports it for that path.
+        let common_dir = PathBuf::from(
+            git_read(
+                &main_path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .expect("git reports the main checkout's common directory"),
+        );
+        baude_core::suppression::suppress(
+            &baude_core::persist::config_dir(),
+            &main_path,
+            &common_dir,
+            baude_core::meta::now_unix_ms(),
+        )
+        .unwrap();
+        assert!(reads_suppressed(&main_path));
+
+        let (restarted, restarted_app) =
+            restarted_daemon(&fixture.root, &fixture.workspace, REMOVAL_AGENT_CMD);
+        let rows = rows_body(&restarted_app).await;
+        let entries = checkout_entries(&rows);
+        assert_eq!(entries.len(), before - 1, "{rows}");
+        assert_eq!(
+            checkout_entries_at(&rows, &p),
+            Vec::<serde_json::Value>::new(),
+            "{rows}"
+        );
+        let main_entries = checkout_entries_at(&rows, &main_path);
+        assert_eq!(main_entries.len(), 1, "{rows}");
+        assert!(
+            main_entries[0]["session_id"].is_u64(),
+            "the restart relaunched the main checkout: {rows}"
+        );
+        assert!(!p.exists(), "{}", p.display());
+        assert!(reads_suppressed(&p), "{}", p.display());
+        assert!(reads_suppressed(&main_path), "{}", main_path.display());
+
+        crate::manager::lock(&fixture.shared).kill_all();
+        removal_teardown(&restarted, &fixture.root);
+    }
+
+    /// D-11 write rule: a standalone row writes no entry of its own, so a
+    /// removed folder is admitted again at once.
+    #[tokio::test]
+    async fn suppression_standalone_removal_writes_no_entry() {
+        let (root, _owner, folder, _workspace, shared, app) = folder_fixture("suppress-standalone");
+        opened_folder_id(&app, &folder).await;
+        let key = standalone_key_of(&only_standalone_row(&app).await);
+
+        let removed = removed_over_routes(&app, &serde_json::json!({ "standalone": key })).await;
+        assert_eq!(
+            cleared_paths(
+                &removed,
+                baude_core::removal::ClearingKind::SuppressionAdded
+            ),
+            Vec::<PathBuf>::new(),
+            "{removed:?}"
+        );
+        assert!(folder.is_dir());
+        assert!(!reads_suppressed(&folder));
+
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// A folder an earlier daemon stored as an unavailable repository plus a
+    /// checkout keeps that shape, takes a second session into the same
+    /// repository row, and becomes a standalone row only after that
+    /// repository row is removed.
+    #[tokio::test]
+    async fn standalone_earlier_folder_row_keeps_its_shape_and_is_removable() {
+        let (root, _owner, folder, _workspace, shared, app) = folder_fixture("standalone-earlier");
+        let folder_text = folder.to_str().unwrap();
+        let first_id = crate::manager::lock(&shared)
+            .create_pre_plan_folder_session_for_test(&folder, None)
+            .unwrap_or_else(|error| panic!("the earlier shape is stored and launched: {error}"));
+
+        // Served verbatim.
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        let parents = rows["repositories"].as_array().unwrap();
+        assert_eq!(parents.len(), 1, "{rows}");
+        let children = parents[0]["checkouts"].as_array().unwrap();
+        assert_eq!(children.len(), 1, "{rows}");
+        assert_eq!(children[0]["path"].as_str(), Some(folder_text), "{rows}");
+        assert_eq!(children[0]["role"], "managed_branch", "{rows}");
+        assert_eq!(children[0]["session_id"].as_u64(), Some(first_id), "{rows}");
+        let repository_key = parents[0]["repository_key"].clone();
+
+        // A second session joins the stored repository row.
+        let second_id = opened_folder_id(&app, &folder).await;
+        assert_ne!(second_id, first_id);
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        let parents = rows["repositories"].as_array().unwrap();
+        assert_eq!(parents.len(), 1, "{rows}");
+        assert_eq!(parents[0]["repository_key"], repository_key, "{rows}");
+        assert_eq!(
+            parents[0]["checkouts"].as_array().unwrap().len(),
+            2,
+            "{rows}"
+        );
+
+        // Removing the repository row frees the folder and keeps it.
+        let target = serde_json::json!({ "repository": repository_key });
+        let preview = preview_target(&app, &target).await;
+        let agent_pids: Vec<u64> = preview["runtimes_killed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|killed| killed["agent_pid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(agent_pids.len(), 2, "{preview}");
+        for pid in &agent_pids {
+            assert!(pid_is_alive(*pid), "{preview}");
+        }
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            executed["rows_removed"].as_array().unwrap().len(),
+            3,
+            "{executed}"
+        );
+        assert_eq!(
+            executed["runtimes_killed"].as_array().unwrap().len(),
+            2,
+            "{executed}"
+        );
+        for pid in &agent_pids {
+            assert!(wait_for_pid_gone(*pid), "{executed}");
+        }
+        assert_folder_untouched(&folder);
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"], serde_json::json!([]), "{rows}");
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+
+        // Only now is the path free for a standalone row.
+        let third_id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(entry["session_id"].as_u64(), Some(third_id), "{entry}");
+        assert_eq!(entry["path"].as_str(), Some(folder_text), "{entry}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The folder a user is left with after deleting a repository but not
+    /// its worktree: a `.git` file pointing at nothing. Git says it is not a
+    /// repository, so it is one standalone row and no repository row.
+    #[tokio::test]
+    async fn standalone_stale_worktree_folder_is_admitted_without_a_repository() {
+        let (root, _owner, _notes, _workspace, shared, app) = folder_fixture("standalone-stale");
+        let canonical_root = root.canonicalize().unwrap();
+        let repo = committed_repo(&canonical_root);
+        let stale = canonical_root.join("stale");
+        git(
+            &repo,
+            &["worktree", "add", "-b", "stale", stale.to_str().unwrap()],
+        );
+        assert!(stale.join(".git").is_file());
+        assert_eq!(std::fs::read(stale.join("file")).unwrap(), b"one");
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert!(!repo.exists());
+        assert!(stale.join(".git").is_file());
+        assert_eq!(std::fs::read(stale.join("file")).unwrap(), b"one");
+
+        let probe = Command::new("git")
+            .arg("-C")
+            .arg(&stale)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&probe.stderr);
+        assert!(!probe.status.success(), "{stderr}");
+        assert!(
+            stderr.starts_with("fatal: not a git repository"),
+            "git refused {} for another reason: {stderr}",
+            stale.display()
+        );
+
+        let id = opened_folder_id(&app, &stale).await;
+        let entry = only_standalone_row(&app).await;
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+        assert_eq!(entry["path"].as_str(), stale.to_str(), "{entry}");
+
+        let removed = removed_over_routes(
+            &app,
+            &serde_json::json!({ "standalone": standalone_key_of(&entry) }),
+        )
+        .await;
+        assert_eq!(removed.rows_removed.len(), 1, "{removed:?}");
+        assert!(stale.is_dir());
+        assert!(stale.join(".git").is_file());
+        assert_eq!(std::fs::read(stale.join("file")).unwrap(), b"one");
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        assert_eq!(rows["repositories"], serde_json::json!([]), "{rows}");
+
+        removal_teardown(&shared, &root);
+    }
+
     /// API-01 concurrency edge. Both requests carry the same previewed report
     /// and contend on the manager mutex; whichever loses must find the row
     /// already gone. The fresh restore at the end is what witnesses that no
