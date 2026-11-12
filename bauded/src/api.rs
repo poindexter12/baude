@@ -2621,6 +2621,158 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// Remove `target` over the two removal routes, asserting 200 on both,
+    /// and return the executed report as core's own type.
+    async fn removed_over_routes(
+        app: &Router,
+        target: &serde_json::Value,
+    ) -> baude_core::removal::RemovalReport {
+        let preview = preview_target(app, target).await;
+        let (status, body) = removal_call(app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "execute {target}: {body}");
+        serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("the 200 body is a removal report: {error}: {body}"))
+    }
+
+    /// Every checkout entry `/rows` serves, across all repository parents.
+    fn checkout_entries(rows: &serde_json::Value) -> Vec<serde_json::Value> {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|parent| parent["checkouts"].as_array().unwrap().iter().cloned())
+            .collect()
+    }
+
+    /// The checkout entries `/rows` serves whose `path` is `path`.
+    fn checkout_entries_at(rows: &serde_json::Value, path: &Path) -> Vec<serde_json::Value> {
+        checkout_entries(rows)
+            .into_iter()
+            .filter(|entry| entry["path"].as_str().map(Path::new) == Some(path))
+            .collect()
+    }
+
+    /// The worktree a user makes by hand: `git worktree add -b <branch> <dir>`
+    /// run from `main`, asserted to exit 0. The daemon is not involved.
+    fn add_by_hand_worktree(main: &Path, dir: &Path, branch: &str) {
+        assert!(!dir.exists(), "{}", dir.display());
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(main)
+            .args(["worktree", "add", "-b", branch])
+            .arg(dir)
+            .output()
+            .unwrap();
+        assert_eq!(
+            added.status.code(),
+            Some(0),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+
+    /// Every regular file directly inside `dir` with its bytes, sorted by
+    /// name: what a user's directory holds, read from disk.
+    fn dir_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A linked worktree the user made with git, opened by its path. It is a
+    /// checkout of its repository that the daemon does not manage: the
+    /// session records the repository's main worktree and the worktree fact
+    /// from discovery, and removing the row keeps the directory.
+    #[tokio::test]
+    async fn by_hand_worktree_is_admitted_unmanaged_and_removed_with_its_directory_kept() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("by-hand");
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+        // The `.git` file and every checked-out file, with their bytes.
+        let files_before = dir_files(&by_hand);
+        assert!(files_before.len() > 1, "{files_before:?}");
+        assert!(files_before.iter().any(|(name, _)| name == ".git"));
+
+        // Admitted first, before any row of its repository is stored.
+        let (status, body) = open_folder(&app, by_hand.to_str().unwrap(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "21-10 by-hand worktree pin: POST /sessions for the hand-made linked worktree {} \
+             was refused: {body}",
+            by_hand.display()
+        );
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = info["id"].as_u64().unwrap();
+        assert_eq!(info["cwd"].as_str(), by_hand.to_str(), "{info}");
+        assert_eq!(info["repo_root"].as_str(), main_path.to_str(), "{info}");
+        assert_eq!(info["is_worktree"], true, "{info}");
+
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["standalone"], serde_json::json!([]), "{rows}");
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 1, "{rows}");
+        let entries = checkout_entries_at(&rows, &by_hand);
+        assert_eq!(entries.len(), 1, "{rows}");
+        let entry = &entries[0];
+        assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+        assert_eq!(entry["role"], "managed_branch", "{entry}");
+        assert_eq!(
+            entry["managed_by_baude"], false,
+            "21-10 by-hand worktree pin: a worktree the user made is never managed: {entry}"
+        );
+
+        // The main checkout joins the same repository row afterwards.
+        let main_id = opened_folder_id(&app, &main_path).await;
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 1, "{rows}");
+        assert_eq!(checkout_entries(&rows).len(), 2, "{rows}");
+        let main_entries = checkout_entries_at(&rows, &main_path);
+        assert_eq!(main_entries.len(), 1, "{rows}");
+        assert_eq!(main_entries[0]["role"], "main", "{rows}");
+        assert_eq!(
+            main_entries[0]["session_id"].as_u64(),
+            Some(main_id),
+            "{rows}"
+        );
+
+        // Removing the row ends its runtime and keeps the user's directory.
+        let target = serde_json::json!({ "checkout": entry["checkout_key"] });
+        let preview = preview_target(&app, &target).await;
+        let agent_pid = only_runtime_pid(&preview);
+        assert!(pid_is_alive(agent_pid));
+        let removed = removed_over_routes(&app, &target).await;
+        assert!(
+            !removed.paths_deleted.contains(&by_hand),
+            "21-10 by-hand worktree pin: removal must not delete the user's directory: \
+             {removed:?}"
+        );
+        assert_eq!(removed.paths_deleted, Vec::<PathBuf>::new(), "{removed:?}");
+        assert!(removed.paths_kept.contains(&by_hand), "{removed:?}");
+        assert!(wait_for_pid_gone(agent_pid));
+        assert!(by_hand.is_dir());
+        assert_eq!(dir_files(&by_hand), files_before);
+        let rows = rows_body(&app).await;
+        assert_eq!(
+            checkout_entries_at(&rows, &by_hand),
+            Vec::<serde_json::Value>::new(),
+            "{rows}"
+        );
+        assert_eq!(checkout_entries_at(&rows, &main_path).len(), 1, "{rows}");
+
+        removal_teardown(&shared, &root);
+    }
+
     /// The bytes `folder_fixture` writes to `todo.txt`, read back after a
     /// removal to prove the folder's contents were left alone.
     const FOLDER_TODO_BYTES: &[u8] = b"water the ferns\ncall the plumber\n";

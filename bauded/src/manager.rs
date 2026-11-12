@@ -1432,6 +1432,19 @@ impl Manager {
         if self.persist {
             let discovery = git::discover_repository(&cwd);
             let route = route_plain_admission(&self.repository_state, &cwd, &discovery);
+            // What core validation holds a checkout's retained session to:
+            // its repository path is the repository's main worktree, and it
+            // is a worktree exactly when it is not that main worktree. Both
+            // come from discovery. `git rev-parse --show-toplevel` answers
+            // with the linked worktree itself, which core rejects, so a
+            // worktree the user made by hand could not be opened by path.
+            let (repo_root, is_worktree) = match &discovery {
+                Ok(snapshot) => (
+                    snapshot.main_worktree.clone(),
+                    snapshot.selected_worktree.path != snapshot.main_worktree,
+                ),
+                Err(_) => (repo_root, is_worktree),
+            };
             let join = match &route {
                 PlainAdmission::ReuseStandalone(key) => {
                     // One row per folder. A live row is the same session; a
@@ -1729,7 +1742,11 @@ impl Manager {
             checkout_key,
             repository_key,
             role,
-            is_worktree,
+            // Never managed: a plain admission opens a directory the user
+            // already has, so removing its row must keep that directory.
+            // Whether the directory is a linked worktree is a separate
+            // fact, recorded on the retained session below.
+            false,
             PersistedPath::from_path(cwd),
             snapshot
                 .as_ref()
