@@ -30,7 +30,10 @@ use crate::hierarchy::{
 };
 use crate::keys::{encode_key, EncodeCtx};
 use crate::notify_desktop::{self, DesktopNotifier, Row};
-use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
+use crate::remote::{
+    RemoteAttach, RemoteInfo, RemotePoller, RemoteRows, RemoteSnapshot, RemovalReply,
+    RemovalTicket, REMOVAL_TIMEOUT,
+};
 use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
@@ -296,8 +299,6 @@ enum SidebarRefusal {
     RemoteShell,
     RemoteEditor,
     RemoteGsd,
-    /// `D` on a remote row: remote removal arrives with the daemon (Phase 21).
-    RemoteRemove,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,9 +341,11 @@ fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
         // No `can_remove` or `RetryRecovery` gate: recovery state does not
         // block the force path, and a missing worktree is the already-removed
         // case the core reports (D-02).
+        // A remote row takes the same action: the daemon that owns the row
+        // previews and performs the removal (D-12).
         return match view.kind {
-            ActionKind::Remote => SidebarAction::Refuse(SidebarRefusal::RemoteRemove),
-            ActionKind::Repository
+            ActionKind::Remote
+            | ActionKind::Repository
             | ActionKind::Main
             | ActionKind::Managed
             | ActionKind::External
@@ -503,7 +506,97 @@ pub enum Modal {
         report: baude_core::removal::RemovalReport,
         scroll: usize,
         error: Option<String>,
+        /// Who previewed the report and who will act on a confirm.
+        origin: RemovalOrigin,
     },
+    /// A remote removal round trip is running on a worker; the answer is
+    /// collected by `poll_remote_removal` from `tick`.
+    RemoteRemovePending {
+        label: String,
+        stage: RemoteRemovalStage,
+    },
+}
+
+/// The words a confirmation shows for a row key no index can name.
+pub(crate) const REMOVAL_UNKNOWN_ROW: &str = "unknown row";
+
+/// How long past `REMOVAL_TIMEOUT` a wait gives its worker before it stops
+/// waiting. It covers the one rows read the worker makes after an unanswered
+/// execute, plus slack. Passing the deadline never reads as a failure.
+const REMOTE_REMOVAL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where a removal confirmation came from, and so who acts on a confirm.
+pub enum RemovalOrigin {
+    /// This process: `preview_removal` and `confirm_remove_project`.
+    Local,
+    /// A daemon: its preview, its rows index, its execute. Boxed so a local
+    /// confirmation does not carry the size of a rows index it never has.
+    Remote(Box<RemoteConfirm>),
+}
+
+/// What a remote confirmation carries besides the report.
+pub struct RemoteConfirm {
+    /// The daemon's rows index, the only namer of a key in its report.
+    pub(crate) rows: RemoteRows,
+    /// The sidebar name of the row `D` was pressed on.
+    pub(crate) label: String,
+    /// An execute was sent and never answered. Enter previews again; the
+    /// same execute is never resent.
+    // Read once the unknown-outcome path lands with the other daemon answers.
+    #[allow(dead_code)]
+    pub(crate) unknown_outcome: bool,
+}
+
+impl RemoteConfirm {
+    /// The daemon's own name for a row of its report: display name, then
+    /// the branch in parentheses when the row has one. It reads nothing but
+    /// the daemon's index. The local hierarchy hands out the same small key
+    /// numbers to different rows, so it is never consulted here (D-16).
+    pub(crate) fn row_label(&self, key: &baude_core::removal::RowKey) -> String {
+        match self.rows.label(key) {
+            Some(label) => match label.branch {
+                Some(branch) => format!("{} ({branch})", label.display_name),
+                None => label.display_name,
+            },
+            None => REMOVAL_UNKNOWN_ROW.to_string(),
+        }
+    }
+}
+
+/// Which round trip a remote removal is waiting on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteRemovalStage {
+    Preview,
+    Execute,
+}
+
+/// One remote removal round trip in flight; polled from `tick`.
+struct PendingRemoteRemoval {
+    stage: RemoteRemovalStage,
+    target: baude_core::removal::RemovalTarget,
+    label: String,
+    /// The report the user confirmed; `None` while previewing.
+    // Read once a refused or unanswered execute re-installs the confirmation.
+    #[allow(dead_code)]
+    previewed: Option<baude_core::removal::RemovalReport>,
+    /// The rows index as it stood when the round trip started.
+    rows: RemoteRows,
+    ticket: RemovalTicket,
+    /// When the wait stops whether or not the worker ever answers.
+    deadline: std::time::Instant,
+}
+
+/// The row-kind noun a remote confirmation uses. The daemon's index carries
+/// no role this client may rely on, so the noun comes from the target alone.
+pub(crate) fn remote_removal_kind_label(
+    target: baude_core::removal::RemovalTarget,
+) -> &'static str {
+    use baude_core::removal::RemovalTarget;
+    match target {
+        RemovalTarget::Repository(_) => "repository",
+        RemovalTarget::Checkout(_) => "checkout",
+        RemovalTarget::Standalone(_) => "standalone session",
+    }
 }
 
 /// What `confirm_remove_project` did with a confirmed modal.
@@ -608,6 +701,11 @@ pub struct App {
     pub remote_snap: RemoteSnapshot,
     /// Previous snapshot to detect changes (for dirty flag gating).
     remote_snap_prev: RemoteSnapshot,
+    /// The daemon's rows index: the only source of a remote removal key and
+    /// of every row name in a remote confirmation.
+    pub remote_rows: RemoteRows,
+    /// At most one remote removal round trip in flight.
+    remote_removal: Option<PendingRemoteRemoval>,
     /// At most one live raw attach to a remote session.
     pub attach: Option<RemoteAttach>,
     /// Scrollback offset for the selected session's claude pane.
@@ -887,11 +985,12 @@ impl App {
             .or_else(|| config.daemon_url.clone())
             .filter(|u| !u.trim().is_empty())
             .map(RemotePoller::start);
-        // The selection EXPRESSION is what is disabled, not its result. A
-        // detached `RemotePoller` worker outlives the handle, so assigning
-        // `app.remote = None` after construction does not stop one — by then it
-        // has already been started against whatever daemon the developer's
-        // environment named. Tests that want a remote attach their own
+        // The selection EXPRESSION is what is disabled, not its result.
+        // Dropping or stopping a `RemotePoller` does stop its poll and events
+        // threads, but only after the fact: a poller started here has already
+        // sent its first requests to whatever daemon the developer's
+        // environment named, and a removal already in flight still finishes.
+        // So none is started. Tests that want a remote attach their own
         // synthetic loopback poller after construction.
         #[cfg(test)]
         let remote: Option<RemotePoller> = None;
@@ -931,6 +1030,8 @@ impl App {
             remote,
             remote_snap: RemoteSnapshot::default(),
             remote_snap_prev: RemoteSnapshot::default(),
+            remote_rows: RemoteRows::default(),
+            remote_removal: None,
             attach: None,
             claude_scroll: 0,
             shell_scroll: 0,
@@ -1325,9 +1426,6 @@ impl App {
                 "remote session — folder lives on the daemon host".into()
             }
             SidebarRefusal::RemoteGsd => "GSD view is for local sessions".into(),
-            SidebarRefusal::RemoteRemove => format!(
-                "Cannot remove “{target}”: remote rows are removed from the daemon and PWA in a later release. Nothing was changed."
-            ),
         };
         self.set_message(message);
     }
@@ -3908,6 +4006,11 @@ impl App {
     /// `D`: build `Modal::ConfirmRemove` from `preview_removal` for the
     /// selected row (D-03, D-05). A `RemovalError` becomes a footer notice.
     fn open_remove_project_modal(&mut self) {
+        // A remote row is previewed and removed by its daemon, never here.
+        if let Some(SelId::Remote(id)) = self.selected_id {
+            self.open_remote_remove(id);
+            return;
+        }
         let Some(target) = self.removal_target_for_selection() else {
             self.set_message("Cannot remove: select a local row first.".into());
             return;
@@ -3931,12 +4034,159 @@ impl App {
                     report,
                     scroll: 0,
                     error: None,
+                    origin: RemovalOrigin::Local,
                 };
                 self.dirty = true;
             }
             Err(error) => self.set_message(format!(
                 "Cannot remove “{label}”: {error}. Nothing was removed."
             )),
+        }
+    }
+
+    /// Install the remote view a poll produced. A changed session list or a
+    /// changed rows index marks the view for redraw; nothing else does.
+    pub(crate) fn apply_remote_view(&mut self, snap: RemoteSnapshot, rows: RemoteRows) {
+        // Mark dirty only if meaningful fields changed (not just fetched_ms timestamp)
+        // Use same_view() to compare sessions, ok, daemon_workspace, and collision_count,
+        // ignoring the time-based fetched_ms field which changes every poll.
+        if !snap.same_view(&self.remote_snap_prev) {
+            self.dirty = true;
+        }
+        self.remote_snap_prev = snap.clone();
+        self.remote_snap = snap;
+        if rows != self.remote_rows {
+            self.dirty = true;
+        }
+        self.remote_rows = rows;
+    }
+
+    /// When a remote removal wait stops by itself.
+    fn remote_removal_deadline() -> std::time::Instant {
+        std::time::Instant::now() + REMOVAL_TIMEOUT + REMOTE_REMOVAL_GRACE
+    }
+
+    /// `D` on a remote row: ask that row's daemon for a preview on a worker
+    /// and show the waiting modal. Nothing here waits on the network, and a
+    /// row the daemon's index gives no key gets no request at all (D-10).
+    fn open_remote_remove(&mut self, session_id: u64) {
+        let label = self.selected_target_label();
+        if self.remote.is_none() {
+            self.set_message(format!(
+                "Cannot remove “{label}”: no daemon connection. Nothing was changed."
+            ));
+            return;
+        }
+        let Some(target) = self.remote_rows.target_for_session(session_id) else {
+            self.set_message(format!(
+                "Cannot remove “{label}”: the daemon lists no removable row for it. Nothing was changed."
+            ));
+            return;
+        };
+        let Some(ticket) = self
+            .remote
+            .as_ref()
+            .map(|poller| poller.spawn_preview_removal(target))
+        else {
+            return;
+        };
+        self.remote_removal = Some(PendingRemoteRemoval {
+            stage: RemoteRemovalStage::Preview,
+            target,
+            label: label.clone(),
+            previewed: None,
+            rows: self.remote_rows.clone(),
+            ticket,
+            deadline: Self::remote_removal_deadline(),
+        });
+        self.modal = Modal::RemoteRemovePending {
+            label,
+            stage: RemoteRemovalStage::Preview,
+        };
+        self.dirty = true;
+    }
+
+    /// Enter or `y` on a remote confirmation: send the previewed report back
+    /// to the daemon on a worker, unchanged and once, and show the waiting
+    /// modal. Nothing on this machine is touched.
+    fn confirm_remote_remove(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        confirm: RemoteConfirm,
+    ) {
+        let Some(ticket) = self
+            .remote
+            .as_ref()
+            .map(|poller| poller.spawn_execute_removal(report.clone()))
+        else {
+            self.set_message(format!(
+                "Cannot remove “{}”: no daemon connection. Nothing was changed.",
+                confirm.label
+            ));
+            return;
+        };
+        self.remote_removal = Some(PendingRemoteRemoval {
+            stage: RemoteRemovalStage::Execute,
+            target,
+            label: confirm.label.clone(),
+            previewed: Some(report),
+            rows: confirm.rows,
+            ticket,
+            deadline: Self::remote_removal_deadline(),
+        });
+        self.modal = Modal::RemoteRemovePending {
+            label: confirm.label,
+            stage: RemoteRemovalStage::Execute,
+        };
+        self.dirty = true;
+    }
+
+    /// Collect the answer of the remote removal in flight, if it has one.
+    /// Called from `tick`; it never waits.
+    pub(crate) fn poll_remote_removal(&mut self) {
+        let Some(pending) = self.remote_removal.as_ref() else {
+            return;
+        };
+        let answer = pending.ticket.try_take();
+        if answer.is_none() && std::time::Instant::now() < pending.deadline {
+            return;
+        }
+        let Some(pending) = self.remote_removal.take() else {
+            return;
+        };
+        self.dirty = true;
+        let (reply, fresh_rows) = match answer {
+            Some(answer) => (Some(answer.reply), answer.rows),
+            None => (None, None),
+        };
+        match (pending.stage, reply) {
+            (RemoteRemovalStage::Preview, Some(RemovalReply::Report(report))) => {
+                self.modal = Modal::ConfirmRemove {
+                    target: pending.target,
+                    report,
+                    scroll: 0,
+                    error: None,
+                    origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                        rows: fresh_rows.unwrap_or(pending.rows),
+                        label: pending.label,
+                        unknown_outcome: false,
+                    })),
+                };
+            }
+            (RemoteRemovalStage::Execute, Some(RemovalReply::Report(report))) => {
+                self.modal = Modal::None;
+                self.set_message(Self::removal_notice(&report));
+            }
+            _ => {
+                // True for every other answer and for none at all: it claims
+                // no error and sends nothing.
+                self.modal = Modal::None;
+                self.set_message(format!(
+                    "The daemon did not confirm the removal of “{}”. Press D to look again.",
+                    pending.label
+                ));
+            }
         }
     }
 
@@ -4886,16 +5136,11 @@ impl App {
         }
 
         if let Some(r) = &self.remote {
-            let new_snap = r.snapshot();
-            // Mark dirty only if meaningful fields changed (not just fetched_ms timestamp)
-            // Use same_view() to compare sessions, ok, daemon_workspace, and collision_count,
-            // ignoring the time-based fetched_ms field which changes every poll.
-            if !new_snap.same_view(&self.remote_snap_prev) {
-                self.dirty = true;
-            }
-            self.remote_snap_prev = new_snap.clone();
-            self.remote_snap = new_snap;
+            let snap = r.snapshot();
+            let rows = r.rows();
+            self.apply_remote_view(snap, rows);
         }
+        self.poll_remote_removal();
         if let Some(context) = self.folder_context.as_mut() {
             context.maybe_flush(&self.repository_state, now_ms());
         }
@@ -5799,37 +6044,49 @@ impl App {
                         target,
                         report,
                         scroll,
+                        origin,
                         ..
                     } = modal
                     else {
                         unreachable!();
                     };
-                    match self.confirm_remove_project(target, &report) {
-                        Ok(RemoveProjectOutcome::Removed(report)) => {
-                            self.set_message(Self::removal_notice(&report));
+                    match origin {
+                        // The daemon acts on its own rows; the local removal
+                        // below is never reached for a remote confirmation.
+                        RemovalOrigin::Remote(confirm) => {
+                            self.confirm_remote_remove(target, report, *confirm);
                         }
-                        Ok(RemoveProjectOutcome::Recheck(fresh)) => {
-                            self.modal = Modal::ConfirmRemove {
-                                target,
-                                report: fresh,
-                                scroll: 0,
-                                error: None,
-                            };
-                            self.set_message(
-                                "rows changed since the preview; review the refreshed confirmation"
-                                    .into(),
-                            );
-                        }
-                        Err(error) => {
-                            // D-09: rows and handles are intact; keep the
-                            // modal open with the typed error for retry.
-                            self.modal = Modal::ConfirmRemove {
-                                target,
-                                report,
-                                scroll,
-                                error: Some(error.to_string()),
-                            };
-                            self.dirty = true;
+                        RemovalOrigin::Local => {
+                            match self.confirm_remove_project(target, &report) {
+                                Ok(RemoveProjectOutcome::Removed(report)) => {
+                                    self.set_message(Self::removal_notice(&report));
+                                }
+                                Ok(RemoveProjectOutcome::Recheck(fresh)) => {
+                                    self.modal = Modal::ConfirmRemove {
+                                        target,
+                                        report: fresh,
+                                        scroll: 0,
+                                        error: None,
+                                        origin: RemovalOrigin::Local,
+                                    };
+                                    self.set_message(
+                                    "rows changed since the preview; review the refreshed confirmation"
+                                        .into(),
+                                );
+                                }
+                                Err(error) => {
+                                    // D-09: rows and handles are intact; keep the
+                                    // modal open with the typed error for retry.
+                                    self.modal = Modal::ConfirmRemove {
+                                        target,
+                                        report,
+                                        scroll,
+                                        error: Some(error.to_string()),
+                                        origin: RemovalOrigin::Local,
+                                    };
+                                    self.dirty = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -5865,6 +6122,17 @@ impl App {
                 }
                 _ => {}
             },
+            Modal::RemoteRemovePending { stage, .. } => {
+                // Only a preview can be cancelled, and dropping the ticket is
+                // all that takes: a preview asks the daemon to change nothing.
+                let cancels = *stage == RemoteRemovalStage::Preview
+                    && matches!(key.code, KeyCode::Char('n') | KeyCode::Esc);
+                if cancels {
+                    self.remote_removal = None;
+                    self.modal = Modal::None;
+                    self.set_message("Removal preview cancelled. Nothing was changed.".into());
+                }
+            }
             Modal::None => {}
         }
     }
@@ -12408,45 +12676,357 @@ mod tests {
         }
     }
 
-    /// D-02: `D` on a remote row through the sidebar leaves no modal and
-    /// names the daemon as where remote removal arrives.
-    #[test]
-    fn d_on_remote_row_sets_footer_notice() {
-        let _scope = isolation_scope("d-remote-refusal");
-        let remote = serde_json::from_value::<crate::remote::RemoteInfo>(serde_json::json!({
-            "id": 41,
-            "name": "active-zeta",
+    // ---- D on a remote row (plan 21-06) -----------------------------------
+
+    /// The daemon session id of the remote row every remote removal test
+    /// presses `D` on.
+    const REMOTE_ROW_SESSION: u64 = 41;
+
+    /// One remote session as `GET /sessions` lists it.
+    fn remote_session(id: u64, name: &str, branch: &str) -> crate::remote::RemoteInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
             "title": null,
             "status": "busy",
             "waiting_for_ms": null,
             "model": null,
             "permission_mode": null,
             "context_used_pct": null,
-            "branch": "main",
+            "branch": branch,
             "session_cost_usd": null,
             "archived": false
         }))
-        .unwrap();
-        let mut app = App::new(PathBuf::from("/not-a-repository"));
-        app.remote = None;
-        app.remote_snap = crate::remote::RemoteSnapshot {
-            sessions: vec![remote],
+        .expect("a /sessions row parses")
+    }
+
+    fn remote_snapshot(sessions: Vec<crate::remote::RemoteInfo>) -> crate::remote::RemoteSnapshot {
+        crate::remote::RemoteSnapshot {
+            sessions,
             fetched_ms: 1,
             ok: true,
             daemon_workspace: None,
             daemon_workspace_source: None,
             daemon_collision_count: 0,
-        };
-        app.selected_id = Some(SelId::Remote(41));
+        }
+    }
+
+    /// A `/rows` body in the field list the 21-08 client tests send: one
+    /// repository whose checkouts are the given ones, each
+    /// `(key, display name, branch, session id)`.
+    fn remote_rows_body(
+        repository: baude_core::repository::RepositoryKey,
+        checkouts: &[(CheckoutKey, &str, &str, Option<u64>)],
+    ) -> String {
+        let checkouts: Vec<serde_json::Value> = checkouts
+            .iter()
+            .map(|(key, name, branch, session_id)| {
+                serde_json::json!({
+                    "checkout_key": key,
+                    "repository_key": repository,
+                    "display_name": name,
+                    "branch": branch,
+                    "path": format!("/srv/daemon/.baude-worktrees/{name}"),
+                    "role": "managed_branch",
+                    "managed_by_baude": true,
+                    "archived": false,
+                    "session_id": session_id
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "repositories": [{
+                "repository_key": repository,
+                "display_name": "daemon-repo",
+                "path": "/srv/daemon/repo",
+                "health": {"status": "available"},
+                "checkouts": checkouts
+            }],
+            "standalone": []
+        })
+        .to_string()
+    }
+
+    /// A core value as the daemon puts it on the wire.
+    fn wire<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string(value).expect("serialize a core value")
+    }
+
+    /// The 200 body of `POST /removals` for a preview. Derived, not produced
+    /// by a real execution: no test here runs the real daemon router.
+    fn executed_report(
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> baude_core::removal::RemovalReport {
+        baude_core::removal::RemovalReport {
+            planned: false,
+            persistence: baude_core::removal::PersistenceOutcome::Saved,
+            ..previewed.clone()
+        }
+    }
+
+    /// Every request the double read for one method and path, in order.
+    fn recorded(
+        double: &crate::remote::test_double::Double,
+        method: &str,
+        path: &str,
+    ) -> Vec<crate::remote::test_double::Recorded> {
+        double
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == method && request.path == path)
+            .collect()
+    }
+
+    /// A TUI over a real local repository, attached to a scripted daemon
+    /// whose one checkout row carries the same key number as the local
+    /// managed worktree. Two machines hand out small integers independently,
+    /// so that collision is the ordinary case.
+    struct RemoteRemove {
+        fx: RelaunchFixture,
+        app: App,
+        double: crate::remote::test_double::Double,
+        /// A real preview from core over the local git fixture; the double
+        /// serves it as the daemon's preview.
+        previewed: baude_core::removal::RemovalReport,
+        /// The daemon's key for the remote row.
+        target: baude_core::removal::RemovalTarget,
+        rows: RemoveProjectRows,
+    }
+
+    /// `routes` gets the previewed report and the `/rows` body that lists the
+    /// remote row, and returns the whole script: a request to anything else
+    /// shows up in `Double::unscripted`.
+    fn remote_remove_app(
+        name: &str,
+        routes: impl FnOnce(
+            &baude_core::removal::RemovalReport,
+            &str,
+        ) -> Vec<crate::remote::test_double::Route>,
+    ) -> RemoteRemove {
+        let fx = relaunch_fixture(name);
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-remote-local");
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+
+        let rows_body = remote_rows_body(
+            rows.repository,
+            &[(
+                rows.managed,
+                "active-zeta",
+                "feat/zeta",
+                Some(REMOTE_ROW_SESSION),
+            )],
+        );
+        let double = crate::remote::test_double::serve(routes(&previewed, &rows_body));
+        app.remote = Some(crate::remote::RemotePoller::idle(double.base()));
+        app.apply_remote_view(
+            remote_snapshot(vec![remote_session(
+                REMOTE_ROW_SESSION,
+                "active-zeta",
+                "feat/zeta",
+            )]),
+            serde_json::from_str(&rows_body).expect("the /rows body parses"),
+        );
+        app.selected_id = Some(SelId::Remote(REMOTE_ROW_SESSION));
+        RemoteRemove {
+            fx,
+            app,
+            double,
+            previewed,
+            target,
+            rows,
+        }
+    }
+
+    /// Poll the pending remote removal the way `tick` does until it is
+    /// answered.
+    fn settle_remote_removal(app: &mut App) {
+        let started = std::time::Instant::now();
+        while app.remote_removal.is_some() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the remote removal never settled"
+            );
+            app.poll_remote_removal();
+            if app.remote_removal.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// D-12, D-04, D-16: `D` then Enter on a remote row previews and removes
+    /// through the daemon, sends the previewed report back unchanged and
+    /// once, names the row from the daemon's index, and leaves the local row
+    /// that carries the same key number exactly as it was.
+    #[test]
+    fn d_on_remote_row_previews_then_removes_through_the_daemon() {
+        use super::{RemoteRemovalStage, RemovalOrigin};
+        use crate::remote::test_double::{route, Reply};
+        use baude_core::removal::{RemovalReport, RowKey};
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            target,
+            rows,
+        } = remote_remove_app("d-remote-tracer", |previewed, rows_body| {
+            vec![
+                route(
+                    "POST",
+                    "/removals/preview",
+                    vec![Reply::json(200, wire(previewed))],
+                ),
+                route("GET", "/rows", vec![Reply::json(200, rows_body)]),
+                route(
+                    "POST",
+                    "/removals",
+                    vec![Reply::json(200, wire(&executed_report(previewed)))],
+                ),
+            ]
+        });
+        let executed = executed_report(&previewed);
+        let local_key = RowKey::Checkout(rows.managed);
+        let local_name = app.removal_row_label(&local_key);
+        let local_dir = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == rows.managed)
+            .expect("local managed worktree row")
+            .observed_path
+            .to_path_buf();
+        assert!(local_dir.is_dir(), "the local worktree exists on disk");
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let runtimes_before = app.runtime_checkouts.clone();
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+
+        app.handle_sidebar_key(d_key());
+        assert!(matches!(
+            app.modal,
+            Modal::RemoteRemovePending {
+                stage: RemoteRemovalStage::Preview,
+                ..
+            }
+        ));
+        settle_remote_removal(&mut app);
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target: shown,
+                report,
+                scroll,
+                error,
+                origin: RemovalOrigin::Remote(confirm),
+            } => {
+                assert_eq!(*shown, target, "the daemon's key is the target");
+                assert_eq!(
+                    Some(*shown),
+                    app.remote_rows.target_for_session(REMOTE_ROW_SESSION)
+                );
+                assert_eq!(report, &previewed);
+                assert_eq!(*scroll, 0);
+                assert!(error.is_none());
+                let label = confirm.row_label(&local_key);
+                assert!(
+                    label.contains("active-zeta") && label.contains("feat/zeta"),
+                    "named from the daemon's index: {label}"
+                );
+                assert!(
+                    !label.contains(&local_name),
+                    "the local row {local_name} shares the key number and is never named: {label}"
+                );
+            }
+            _ => panic!("expected a remote confirmation after the preview settled"),
+        }
+
+        app.handle_modal_key(enter_key());
+        assert!(matches!(
+            app.modal,
+            Modal::RemoteRemovePending {
+                stage: RemoteRemovalStage::Execute,
+                ..
+            }
+        ));
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed).as_str())
+        );
+
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 1);
+        let removals = recorded(&double, "POST", "/removals");
+        assert_eq!(removals.len(), 1, "{removals:?}");
+        let sent: RemovalReport =
+            serde_json::from_str(&removals[0].body).expect("the execute body is a report");
+        assert_eq!(sent, previewed, "the previewed report goes back unchanged");
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+
+        // The local row with the same key number is untouched: state, state
+        // file, runtime registry, process, and the worktree on disk.
+        assert_eq!(app.repository_state, state_before);
+        assert_eq!(state_file_bytes(&fx), file_before);
+        assert_eq!(app.runtime_checkouts, runtimes_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.removal_row_label(&local_key), local_name);
+        assert!(local_dir.is_dir(), "the local worktree is still on disk");
+        assert!(pid_is_live(live_pid));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-10: a remote session the daemon's rows index gives no key gets a
+    /// footer notice, and no request leaves the machine.
+    #[test]
+    fn d_on_remote_row_without_daemon_key_sends_nothing() {
+        let _scope = isolation_scope("d-remote-no-key");
+        let double = crate::remote::test_double::serve(Vec::new());
+        // The index lists a row, but it belongs to another session.
+        let other_rows = remote_rows_body(
+            serde_json::from_value(serde_json::json!(1)).expect("repository key"),
+            &[(
+                serde_json::from_value(serde_json::json!(10)).expect("checkout key"),
+                "other",
+                "main",
+                Some(7),
+            )],
+        );
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = Some(crate::remote::RemotePoller::idle(double.base()));
+        app.apply_remote_view(
+            remote_snapshot(vec![remote_session(
+                REMOTE_ROW_SESSION,
+                "active-zeta",
+                "feat/zeta",
+            )]),
+            serde_json::from_str(&other_rows).expect("the /rows body parses"),
+        );
+        app.selected_id = Some(SelId::Remote(REMOTE_ROW_SESSION));
 
         app.handle_sidebar_key(d_key());
 
         assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
         let message = last_message(&app).expect("footer notice");
-        assert!(
-            message.contains("active-zeta") && message.contains("daemon"),
-            "notice names the row and the daemon: {message}"
-        );
+        assert!(message.contains("active-zeta"), "names the row: {message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+        // Long enough for a worker, had one been started, to reach the double.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(double.request_count(), 0, "{:?}", double.requests());
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
     }
 
     /// Every local row kind `D` reaches over `relaunch_fixture`: the clone's
@@ -12555,6 +13135,7 @@ mod tests {
                 report,
                 scroll,
                 error,
+                ..
             } => {
                 assert_eq!(*scroll, 0, "a fresh modal starts unscrolled");
                 assert!(error.is_none(), "a fresh modal carries no error");

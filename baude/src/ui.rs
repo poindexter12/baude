@@ -14,7 +14,10 @@ use baude_core::repository::{
 use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
-use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
+use crate::app::{
+    inner, pane_rects, remote_removal_kind_label, App, Focus, Modal, RemoteRemovalStage,
+    RemovalOrigin, SelId,
+};
 use crate::hierarchy::{
     ActionKind, ActionView, LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStandaloneRow,
     LocalStatus,
@@ -1465,7 +1468,7 @@ fn action_status_hint(focus: Focus, view: Option<ActionView>, width: usize) -> &
                 return "n open · c clone · ? help";
             };
             if view.kind == ActionKind::Remote {
-                return "enter attach · r restart · x close · ? help";
+                return "enter attach · r restart · x close · D remove* · ? help";
             }
             if width < 80 {
                 return match view.kind {
@@ -1778,9 +1781,23 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             report,
             scroll,
             error,
+            origin,
         } => {
-            let kind_label = app.removal_kind_label(*target);
-            let row_name = |key: &baude_core::removal::RowKey| app.removal_row_label(key);
+            // A remote confirmation is named from the daemon's own index and
+            // nothing else: the local hierarchy gives the same key numbers
+            // to different rows (D-16).
+            let kind_label = match origin {
+                RemovalOrigin::Local => app.removal_kind_label(*target),
+                RemovalOrigin::Remote(_) => remote_removal_kind_label(*target),
+            };
+            let row_name = |key: &baude_core::removal::RowKey| match origin {
+                RemovalOrigin::Local => app.removal_row_label(key),
+                RemovalOrigin::Remote(confirm) => confirm.row_label(key),
+            };
+            let title = match origin {
+                RemovalOrigin::Local => format!(" remove {kind_label} "),
+                RemovalOrigin::Remote(_) => format!(" remove remote {kind_label} "),
+            };
             // D-07: the modal grows to at most 80% of the screen; the
             // dropped-row list gets whatever that leaves after the fixed
             // sections, and the hidden remainder renders as "+N more". The
@@ -1810,7 +1827,24 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Red))
-                        .title(format!(" remove {kind_label} ")),
+                        .title(title),
+                );
+            frame.render_widget(p, rect);
+        }
+        Modal::RemoteRemovePending { label, stage } => {
+            let width: u16 = 76;
+            let inner_width = usize::from(width.saturating_sub(2));
+            let lines = remote_removal_pending_lines(label, *stage, inner_width);
+            let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+            let rect = centered(area, width, height);
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(" remote removal "),
                 );
             frame.render_widget(p, rect);
         }
@@ -2497,6 +2531,34 @@ pub(crate) fn remove_project_modal_max_rows(
     } else {
         available.saturating_sub(1).max(1)
     }
+}
+
+/// Modal lines while a remote removal round trip is running: the row, what
+/// is being waited for, and the one key that does anything. A preview asks
+/// the daemon to change nothing, so only that wait offers a cancel.
+pub(crate) fn remote_removal_pending_lines(
+    label: &str,
+    stage: RemoteRemovalStage,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![truncate(&format!("“{label}”"), width), String::new()];
+    match stage {
+        RemoteRemovalStage::Preview => {
+            lines.push(truncate(
+                "Asking the daemon what removing this row would do.",
+                width,
+            ));
+            lines.push(String::new());
+            lines.push(truncate("esc cancel", width));
+        }
+        RemoteRemovalStage::Execute => {
+            lines.push(truncate(
+                "Waiting for the daemon to remove this row.",
+                width,
+            ));
+        }
+    }
+    lines
 }
 
 /// Modal lines for the `D` confirmation. A pure transform over the
@@ -3204,12 +3266,19 @@ mod tests {
             false,
             None,
         );
-        // D-04: remote rows never list D; the refusal is the only path there.
+        // D-12: a remote row lists D like every local row; the daemon that
+        // owns the row previews and performs the removal. One hint at every
+        // width.
         let remote = action_view(ActionSelection::Remote, true, None);
         let remote_hint = super::action_status_hint(Focus::Sidebar, Some(remote), 160);
-        assert_eq!(remote_hint, "enter attach · r restart · x close · ? help");
-        assert!(!remote_hint.contains("D remove"), "{remote_hint}");
-        assert!(!super::action_status_hint(Focus::Sidebar, Some(remote), 59).contains("D remove"));
+        assert_eq!(
+            remote_hint,
+            "enter attach · r restart · x close · D remove* · ? help"
+        );
+        assert_eq!(
+            super::action_status_hint(Focus::Sidebar, Some(remote), 59),
+            "enter attach · r restart · x close · D remove* · ? help"
+        );
         for (focus, view, expected) in [
             (
                 Focus::Sidebar,
@@ -3820,6 +3889,7 @@ mod tests {
             report: remove_project::report(target, rows.clone()),
             scroll: 0,
             error: error.map(str::to_string),
+            origin: crate::app::RemovalOrigin::Local,
         };
         (fixture, app, rows)
     }
@@ -3962,6 +4032,37 @@ mod tests {
         assert!(narrow.contains("error: state file is locked"), "{narrow}");
         assert!(narrow.contains("enter retry · esc cancel"), "{narrow}");
         assert!(narrow.contains("+4 more"), "{narrow}");
+    }
+
+    // ---- remote removal modals (plan 21-06) -----------------------------
+
+    /// An App with nothing in it but the modal under test.
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn modal_only_fixture(name: &str, modal: Modal) -> (UiFixture, App) {
+        let fixture = UiFixture::new(name);
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.focus = Focus::Sidebar;
+        app.modal = modal;
+        (fixture, app)
+    }
+
+    /// The wait for a daemon's preview names the row and can be cancelled.
+    #[test]
+    fn remote_removal_modal_pending_renders_row_name() {
+        use crate::app::RemoteRemovalStage;
+
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-pending-preview",
+            Modal::RemoteRemovePending {
+                label: "active-zeta".into(),
+                stage: RemoteRemovalStage::Preview,
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("active-zeta"), "{rendered}");
+        assert!(rendered.contains("esc cancel"), "{rendered}");
     }
 
     // ---- UI fixture ownership regressions -------------------------------
