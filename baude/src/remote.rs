@@ -18,8 +18,24 @@ use baude_core::vt100;
 
 const POLL_SECS: u64 = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long one removal round trip may take. The daemon stops a subtree one
+/// runtime after another and each stop can wait 2 s on its reader, so the
+/// 3 s request timeout would abandon removals that are still succeeding.
+#[allow(dead_code)] // quoted by the pending modal in 21-06
+pub const REMOVAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest one read of the `/events` stream blocks before the reader
+/// looks at its stop flag again.
+const EVENTS_SLICE: Duration = Duration::from_millis(500);
+/// The daemon's keep-alive comment interval on `/events`, as 21-04 recorded
+/// it from axum's `KeepAlive::default()`.
+const EVENTS_KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// Silence on `/events` past two missed keep-alives and a margin means the
+/// stream is dead, whatever the socket says.
+const EVENTS_SILENCE: Duration = Duration::from_secs(2 * EVENTS_KEEP_ALIVE.as_secs() + 5);
 /// The most of a `RemovalReport` body this client will read.
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
+/// The most of a `GET /rows` body this client will read.
+const MAX_ROWS_BYTES: u64 = 4 * 1024 * 1024;
 /// The most of a plain-text error body this client will read.
 const MAX_TEXT_BYTES: u64 = 4 * 1024;
 /// The longest daemon-supplied message handed to the UI, in characters.
@@ -283,6 +299,54 @@ impl RemoteRows {
                 }),
         }
     }
+
+    /// Drop the rows named by `keys`. A repository key takes its checkouts
+    /// with it; a key the index never held is ignored.
+    fn forget(&mut self, keys: &[RowKey]) {
+        for key in keys {
+            match key {
+                RowKey::Repository(key) => self
+                    .repositories
+                    .retain(|repository| repository.repository_key != *key),
+                RowKey::Checkout(key) => {
+                    for repository in &mut self.repositories {
+                        repository
+                            .checkouts
+                            .retain(|checkout| checkout.checkout_key != *key);
+                    }
+                }
+                RowKey::Standalone(key) => self.standalone.retain(|row| row.standalone_key != *key),
+            }
+        }
+    }
+}
+
+/// Every wait this client imposes on a daemon. Production code uses the
+/// default; tests shorten one field by struct update and pass the value to
+/// `RemotePoller::idle_with`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timeouts {
+    /// Every call but a removal: polls, session actions, the rows read.
+    pub(crate) request: Duration,
+    /// One removal round trip, preview or execute.
+    pub(crate) removal: Duration,
+    /// One blocking read of the `/events` stream.
+    #[allow(dead_code)] // read by the events thread, which lands next
+    pub(crate) events_slice: Duration,
+    /// Silence on `/events` after which the stream is reopened.
+    #[allow(dead_code)] // read by the events thread, which lands next
+    pub(crate) events_silence: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            request: REQUEST_TIMEOUT,
+            removal: REMOVAL_TIMEOUT,
+            events_slice: EVENTS_SLICE,
+            events_silence: EVENTS_SILENCE,
+        }
+    }
 }
 
 /// How one removal round trip ended.
@@ -478,16 +542,165 @@ fn execute_call(base: &str, timeout: Duration, previewed: &RemovalReport) -> Rem
     read_reply(result, RemovalCall::Execute)
 }
 
+/// The row a removal target names.
+fn target_row(target: &RemovalTarget) -> RowKey {
+    match target {
+        RemovalTarget::Repository(key) => RowKey::Repository(*key),
+        RemovalTarget::Checkout(key) => RowKey::Checkout(*key),
+        RemovalTarget::Standalone(key) => RowKey::Standalone(*key),
+    }
+}
+
+/// One blocking `GET /rows`. The error is text fit to show: the daemon's
+/// own words are sanitized and capped.
+fn fetch_rows(base: &str, timeout: Duration) -> Result<RemoteRows, String> {
+    match ureq::get(&format!("{base}/rows")).timeout(timeout).call() {
+        Ok(response) => match read_capped(response, MAX_ROWS_BYTES) {
+            Ok(Some(bytes)) => serde_json::from_slice::<RemoteRows>(&bytes)
+                .map_err(|_| "the daemon's rows answer could not be read".to_string()),
+            Ok(None) => Err("the daemon's rows answer was too large to read".to_string()),
+            Err(error) => Err(sanitize_daemon_text(&error.to_string())),
+        },
+        Err(ureq::Error::Status(status, response)) => {
+            let text = read_daemon_text(response, "");
+            if text.is_empty() {
+                Err(format!("daemon said {status}"))
+            } else {
+                Err(format!("daemon said {status}: {text}"))
+            }
+        }
+        Err(ureq::Error::Transport(transport)) => Err(sanitize_daemon_text(&transport.to_string())),
+    }
+}
+
+/// What the poll thread, the removal workers and the draw loop share, behind
+/// one mutex so a reader never sees the snapshot and the index disagree.
+#[derive(Default)]
+struct Shared {
+    snapshot: RemoteSnapshot,
+    rows: RemoteRows,
+}
+
+impl Shared {
+    /// The daemon no longer has these rows: stop listing them.
+    fn apply_removed(&mut self, keys: &[RowKey]) {
+        self.rows.forget(keys);
+    }
+}
+
+fn lock_shared(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    // A panic elsewhere must not hide the last good state from the UI.
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A removal reply with the rows index read after it, when one was read.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // read by the TUI in 21-06
+pub struct RemovalAnswer {
+    pub reply: RemovalReply,
+    /// The index fetched after a 200 preview or a 409, for naming the rows
+    /// of the report. `None` for every other reply, and when that read
+    /// failed.
+    pub rows: Option<RemoteRows>,
+}
+
+/// The pending end of one off-thread removal round trip.
+#[allow(dead_code)] // held by the TUI in 21-06
+pub struct RemovalTicket {
+    answer: mpsc::Receiver<RemovalAnswer>,
+}
+
+#[allow(dead_code)] // polled by the TUI in 21-06
+impl RemovalTicket {
+    /// The answer, once. Never blocks: `None` while the round trip is still
+    /// running, and `None` again after the answer was taken.
+    pub fn try_take(&self) -> Option<RemovalAnswer> {
+        self.answer.try_recv().ok()
+    }
+}
+
+/// The body of a preview worker: one preview, then the bookkeeping its
+/// reply calls for.
+fn run_preview(
+    base: &str,
+    timeouts: Timeouts,
+    shared: &Mutex<Shared>,
+    target: &RemovalTarget,
+) -> RemovalAnswer {
+    let reply = preview_call(base, timeouts.removal, target);
+    let rows = match &reply {
+        RemovalReply::Report(_) | RemovalReply::Drift(_) => fetch_rows(base, timeouts.request).ok(),
+        RemovalReply::Gone { .. } => {
+            lock_shared(shared).apply_removed(&[target_row(target)]);
+            None
+        }
+        _ => None,
+    };
+    RemovalAnswer { reply, rows }
+}
+
+/// The body of an execute worker. The execute is sent exactly once; a
+/// missing answer is checked against a fresh rows read, never resent.
+fn run_execute(
+    base: &str,
+    timeouts: Timeouts,
+    shared: &Mutex<Shared>,
+    previewed: &RemovalReport,
+) -> RemovalAnswer {
+    let reply = execute_call(base, timeouts.removal, previewed);
+    match reply {
+        RemovalReply::Report(report) => {
+            lock_shared(shared).apply_removed(&report.rows_removed);
+            RemovalAnswer {
+                reply: RemovalReply::Report(report),
+                rows: None,
+            }
+        }
+        RemovalReply::Drift(report) => RemovalAnswer {
+            reply: RemovalReply::Drift(report),
+            rows: fetch_rows(base, timeouts.request).ok(),
+        },
+        RemovalReply::Gone { message } => {
+            // A missing target means its rows are already gone.
+            lock_shared(shared).apply_removed(&previewed.rows_removed);
+            RemovalAnswer {
+                reply: RemovalReply::Gone { message },
+                rows: None,
+            }
+        }
+        RemovalReply::Indeterminate { message, .. } => {
+            let rows_gone = match fetch_rows(base, timeouts.request) {
+                Ok(fresh) => previewed
+                    .rows_removed
+                    .iter()
+                    .all(|key| fresh.label(key).is_none()),
+                Err(_) => false,
+            };
+            if rows_gone {
+                lock_shared(shared).apply_removed(&previewed.rows_removed);
+            }
+            RemovalAnswer {
+                reply: RemovalReply::Indeterminate { message, rows_gone },
+                rows: None,
+            }
+        }
+        reply => RemovalAnswer { reply, rows: None },
+    }
+}
+
 /// Background poller for one daemon.
 pub struct RemotePoller {
     pub base: String,
-    data: Arc<Mutex<RemoteSnapshot>>,
+    shared: Arc<Mutex<Shared>>,
+    timeouts: Timeouts,
 }
 
 impl RemotePoller {
     pub fn start(base: String) -> RemotePoller {
         let base = base.trim_end_matches('/').to_string();
-        let data = Arc::new(Mutex::new(RemoteSnapshot::default()));
+        let data = Arc::new(Mutex::new(Shared::default()));
         let shared = Arc::clone(&data);
         let url = format!("{base}/sessions");
         let info_url = format!("{base}/info");
@@ -506,7 +719,8 @@ impl RemotePoller {
                 .ok()
                 .and_then(|r| r.into_json::<serde_json::Value>().ok());
 
-            if let Ok(mut d) = shared.lock() {
+            if let Ok(mut state) = shared.lock() {
+                let d = &mut state.snapshot;
                 match fetched {
                     Some(sessions) => {
                         let daemon_workspace = daemon_info
@@ -537,33 +751,99 @@ impl RemotePoller {
             }
             std::thread::sleep(Duration::from_secs(POLL_SECS));
         });
-        RemotePoller { base, data }
+        RemotePoller {
+            base,
+            shared: data,
+            timeouts: Timeouts::default(),
+        }
     }
 
     pub fn snapshot(&self) -> RemoteSnapshot {
-        self.data.lock().map(|d| d.clone()).unwrap_or_default()
+        self.shared
+            .lock()
+            .map(|state| state.snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    /// The daemon's rows index as last known, less every row a removal has
+    /// since reported gone. A per-tick read, like `snapshot`.
+    #[allow(dead_code)] // read by the TUI in 21-06
+    pub fn rows(&self) -> RemoteRows {
+        lock_shared(&self.shared).rows.clone()
     }
 
     /// A poller that starts no thread, for tests that must not race one.
     #[cfg(test)]
     pub(crate) fn idle(base: String) -> RemotePoller {
+        RemotePoller::idle_with(base, Timeouts::default())
+    }
+
+    /// `idle` with injected timeouts, so a test waits milliseconds for what
+    /// production waits a minute for.
+    #[cfg(test)]
+    pub(crate) fn idle_with(base: String, timeouts: Timeouts) -> RemotePoller {
         RemotePoller {
             base: base.trim_end_matches('/').to_string(),
-            data: Arc::new(Mutex::new(RemoteSnapshot::default())),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            timeouts,
         }
     }
 
-    /// Blocking `POST /removals/preview`. Never call it on the draw thread.
-    #[allow(dead_code)] // wired by 21-06
+    /// Blocking `POST /removals/preview`, for up to the removal timeout.
+    /// Never call it on the draw thread; `spawn_preview_removal` is the
+    /// draw thread's road.
+    #[allow(dead_code)] // tests and the workers; 21-06 uses the ticket
     pub fn preview_removal(&self, target: &RemovalTarget) -> RemovalReply {
-        preview_call(&self.base, REQUEST_TIMEOUT, target)
+        preview_call(&self.base, self.timeouts.removal, target)
     }
 
-    /// Blocking `POST /removals` with the previewed report echoed verbatim.
-    /// Never call it on the draw thread.
-    #[allow(dead_code)] // wired by 21-06
+    /// Blocking `POST /removals` with the previewed report echoed verbatim,
+    /// for up to the removal timeout. Never call it on the draw thread;
+    /// `spawn_execute_removal` is the draw thread's road.
+    #[allow(dead_code)] // tests and the workers; 21-06 uses the ticket
     pub fn execute_removal(&self, previewed: &RemovalReport) -> RemovalReply {
-        execute_call(&self.base, REQUEST_TIMEOUT, previewed)
+        execute_call(&self.base, self.timeouts.removal, previewed)
+    }
+
+    /// Blocking `GET /rows` under the request timeout. Call it only off the
+    /// draw thread; the removal workers already do.
+    #[allow(dead_code)] // wired by 21-06
+    pub fn refresh_rows(&self) -> Result<RemoteRows, String> {
+        fetch_rows(&self.base, self.timeouts.request)
+    }
+
+    /// Start a preview on its own thread and return at once. A 200 or a 409
+    /// answer carries a rows index read after it; a 404 drops the target
+    /// row from `rows`.
+    #[allow(dead_code)] // wired by 21-06
+    pub fn spawn_preview_removal(&self, target: RemovalTarget) -> RemovalTicket {
+        let base = self.base.clone();
+        let timeouts = self.timeouts;
+        let shared = Arc::clone(&self.shared);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = run_preview(&base, timeouts, &shared, &target);
+            // A ticket dropped before the answer no longer wants it.
+            let _ = tx.send(answer);
+        });
+        RemovalTicket { answer: rx }
+    }
+
+    /// Start an execute on its own thread and return at once. The execute is
+    /// sent once and never resent: an unanswered one comes back as
+    /// `Indeterminate` after one fresh rows read.
+    #[allow(dead_code)] // wired by 21-06
+    pub fn spawn_execute_removal(&self, previewed: RemovalReport) -> RemovalTicket {
+        let base = self.base.clone();
+        let timeouts = self.timeouts;
+        let shared = Arc::clone(&self.shared);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = run_execute(&base, timeouts, &shared, &previewed);
+            // A ticket dropped before the answer no longer wants it.
+            let _ = tx.send(answer);
+        });
+        RemovalTicket { answer: rx }
     }
 
     pub fn delete(&self, id: u64) -> Result<(), String> {
