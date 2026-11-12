@@ -441,9 +441,865 @@ impl Drop for RemoteAttach {
     }
 }
 
+/// A scripted daemon on a real local listener. Tests in this crate route
+/// requests by method and path, so a background poll can never consume a
+/// reply scripted for a removal.
+#[cfg(test)]
+pub(crate) mod test_double {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Debug)]
+    enum ReplyKind {
+        Body {
+            status: u16,
+            content_type: &'static str,
+            body: String,
+        },
+        ClosedUnanswered,
+        Held(Duration),
+    }
+
+    /// One scripted answer to one request.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Reply {
+        kind: ReplyKind,
+        delay: Duration,
+    }
+
+    impl Reply {
+        /// A JSON body under `status`, as axum's `Json` sends it.
+        pub(crate) fn json(status: u16, body: impl Into<String>) -> Reply {
+            Reply {
+                kind: ReplyKind::Body {
+                    status,
+                    content_type: "application/json",
+                    body: body.into(),
+                },
+                delay: Duration::ZERO,
+            }
+        }
+
+        /// A plain-text body under `status`, the daemon's error shape.
+        pub(crate) fn text(status: u16, body: impl Into<String>) -> Reply {
+            Reply {
+                kind: ReplyKind::Body {
+                    status,
+                    content_type: "text/plain; charset=utf-8",
+                    body: body.into(),
+                },
+                delay: Duration::ZERO,
+            }
+        }
+
+        /// Wait this long after reading the request before the status line.
+        pub(crate) fn delayed(mut self, delay: Duration) -> Reply {
+            self.delay = delay;
+            self
+        }
+
+        /// Read and record the request, then close the connection without
+        /// writing a byte: a daemon killed with the request in hand.
+        pub(crate) fn closed_unanswered() -> Reply {
+            Reply {
+                kind: ReplyKind::ClosedUnanswered,
+                delay: Duration::ZERO,
+            }
+        }
+
+        /// Read and record the request, write nothing, and keep the
+        /// connection open this long or until the double is dropped: a
+        /// handler stuck behind a lock.
+        pub(crate) fn held(hold: Duration) -> Reply {
+            Reply {
+                kind: ReplyKind::Held(hold),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// The replies one method and path hands out, first in first out.
+    pub(crate) struct Route {
+        method: String,
+        path: String,
+        replies: VecDeque<Reply>,
+    }
+
+    pub(crate) fn route(method: &str, path: &str, replies: Vec<Reply>) -> Route {
+        Route {
+            method: method.to_string(),
+            path: path.to_string(),
+            replies: replies.into(),
+        }
+    }
+
+    /// One request as the double read it off the socket.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct Recorded {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        /// The `Content-Type` header, empty when the client sent none.
+        pub(crate) content_type: String,
+        pub(crate) body: String,
+    }
+
+    struct State {
+        routes: Vec<Route>,
+        requests: Vec<Recorded>,
+        unscripted: Vec<Recorded>,
+    }
+
+    pub(crate) struct Double {
+        base: String,
+        state: Arc<Mutex<State>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Double {
+        /// `http://127.0.0.1:<port>`, ready for `RemotePoller::idle`.
+        pub(crate) fn base(&self) -> String {
+            self.base.clone()
+        }
+
+        /// Every request read in full, scripted or not.
+        pub(crate) fn request_count(&self) -> usize {
+            lock(&self.state).requests.len()
+        }
+
+        pub(crate) fn requests(&self) -> Vec<Recorded> {
+            lock(&self.state).requests.clone()
+        }
+
+        /// Requests that matched no route, or a route with no reply left.
+        pub(crate) fn unscripted(&self) -> Vec<Recorded> {
+            lock(&self.state).unscripted.clone()
+        }
+    }
+
+    impl Drop for Double {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn serve(routes: Vec<Route>) -> Double {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the daemon double");
+        let addr = listener.local_addr().expect("daemon double address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking daemon double listener");
+        let state = Arc::new(Mutex::new(State {
+            routes,
+            requests: Vec::new(),
+            unscripted: Vec::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept_state = Arc::clone(&state);
+        let accept_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !accept_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let state = Arc::clone(&accept_state);
+                        let stop = Arc::clone(&accept_stop);
+                        std::thread::spawn(move || handle(stream, &state, &stop));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        });
+        Double {
+            base: format!("http://{addr}"),
+            state,
+            stop,
+        }
+    }
+
+    fn handle(mut stream: TcpStream, state: &Mutex<State>, stop: &AtomicBool) {
+        // macOS hands an accepted socket the listener's nonblocking flag.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let Some(request) = read_request(&mut stream) else {
+            return;
+        };
+        let reply = {
+            let mut state = lock(state);
+            state.requests.push(request.clone());
+            let scripted = state
+                .routes
+                .iter_mut()
+                .find(|route| route.method == request.method && route.path == request.path)
+                .and_then(|route| route.replies.pop_front());
+            if scripted.is_none() {
+                state.unscripted.push(request);
+            }
+            scripted
+        };
+        let reply = reply.unwrap_or_else(|| Reply::text(500, "unscripted"));
+        pause(reply.delay, stop);
+        match reply.kind {
+            ReplyKind::Body {
+                status,
+                content_type,
+                body,
+            } => {
+                let head = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reason(status),
+                    body.len()
+                );
+                // A client that already left is not the double's problem.
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+            ReplyKind::ClosedUnanswered => {}
+            ReplyKind::Held(hold) => pause(hold, stop),
+        }
+    }
+
+    /// Sleep in short slices so a dropped double releases its threads.
+    fn pause(total: Duration, stop: &AtomicBool) {
+        let until = Instant::now() + total;
+        while !stop.load(Ordering::Relaxed) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn reason(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            404 => "Not Found",
+            409 => "Conflict",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
+
+    /// Read one request: the head up to the blank line, then exactly
+    /// `Content-Length` body bytes. `None` when the peer left first.
+    fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        let head_end = loop {
+            if let Some(at) = find(&bytes, b"\r\n\r\n") {
+                break at;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next()?.split(' ');
+        let method = request_line.next()?.to_string();
+        let path = request_line.next()?.to_string();
+        let mut content_length = 0usize;
+        let mut content_type = String::new();
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().ok()?;
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = value.trim().to_string();
+            }
+        }
+        let mut body = bytes[head_end + 4..].to_vec();
+        while body.len() < content_length {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+            }
+        }
+        body.truncate(content_length);
+        Some(Recorded {
+            method,
+            path,
+            content_type,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        })
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use baude_core::removal::{
+        ClearedItem, ClearingKind, KilledRuntime, PersistenceOutcome, RemovalReport, RemovalTarget,
+        RowKey,
+    };
+    use baude_core::repository::{CheckoutKey, RepositoryKey, StandaloneKey};
+
+    use super::test_double::{route, serve, Double, Reply};
     use super::*;
+
+    /// The key newtypes keep their field private; serde is the one public
+    /// road to a value without building a repository graph on disk.
+    fn checkout_key(n: u64) -> CheckoutKey {
+        serde_json::from_value(serde_json::json!(n)).expect("checkout key")
+    }
+
+    fn repository_key(n: u64) -> RepositoryKey {
+        serde_json::from_value(serde_json::json!(n)).expect("repository key")
+    }
+
+    fn standalone_key(n: u64) -> StandaloneKey {
+        serde_json::from_value(serde_json::json!(n)).expect("standalone key")
+    }
+
+    /// A preview as the daemon answers `POST /removals/preview`.
+    fn planned_report(target: RemovalTarget, rows: Vec<RowKey>) -> RemovalReport {
+        RemovalReport {
+            target,
+            planned: true,
+            runtimes_killed: rows
+                .first()
+                .map(|row| KilledRuntime {
+                    row: *row,
+                    agent_pid: 91134,
+                    shell_pid: None,
+                })
+                .into_iter()
+                .collect(),
+            rows_removed: rows,
+            paths_deleted: Vec::new(),
+            paths_kept: vec![PathBuf::from("/src/baude")],
+            already_removed: Vec::new(),
+            readers_parked: Vec::new(),
+            persistence: PersistenceOutcome::Planned,
+            cleared: vec![ClearedItem {
+                kind: ClearingKind::SuppressionAdded,
+                path: PathBuf::from("/src/baude"),
+            }],
+            clearing_failures: Vec::new(),
+        }
+    }
+
+    /// The committed form of a preview, as `POST /removals` answers 200.
+    fn committed_report(previewed: &RemovalReport) -> RemovalReport {
+        RemovalReport {
+            planned: false,
+            persistence: PersistenceOutcome::Saved,
+            ..previewed.clone()
+        }
+    }
+
+    /// Every scripted report body goes through the core serde derive, so the
+    /// wire shape is real by construction.
+    fn wire<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string(value).expect("serialize a core value")
+    }
+
+    /// A `/rows` body in the 21-02 pinned field list. No core type owns this
+    /// shape, so the keys are serialized core keys and the names are pinned.
+    fn rows_body() -> String {
+        serde_json::json!({
+            "repositories": [{
+                "repository_key": repository_key(1),
+                "display_name": "baude",
+                "path": "/src/baude",
+                "health": {"status": "available"},
+                "not_yet_invented": {"nested": [1, 2, 3]},
+                "checkouts": [
+                    {
+                        "checkout_key": checkout_key(10),
+                        "repository_key": repository_key(1),
+                        "display_name": "baude",
+                        "branch": "main",
+                        "path": "/src/baude",
+                        "role": "main",
+                        "managed_by_baude": false,
+                        "archived": false,
+                        "session_id": 7
+                    },
+                    {
+                        "checkout_key": checkout_key(11),
+                        "repository_key": repository_key(1),
+                        "display_name": "topic",
+                        "branch": "feature/topic",
+                        "path": "/src/.baude-worktrees/topic",
+                        "role": "managed_branch",
+                        "managed_by_baude": true,
+                        "archived": false,
+                        "session_id": null
+                    }
+                ]
+            }],
+            "standalone": [{
+                "standalone_key": standalone_key(20),
+                "display_name": "notes",
+                "path": "/src/notes",
+                "archived": false,
+                "session_id": 9
+            }]
+        })
+        .to_string()
+    }
+
+    fn rows_fixture() -> RemoteRows {
+        serde_json::from_str(&rows_body()).expect("the pinned /rows field list parses")
+    }
+
+    /// A poller with no background thread, aimed at the double. The return
+    /// type is spelled out so a missing removal method is named as such.
+    fn idle_poller(double: &Double) -> RemotePoller {
+        RemotePoller::idle(double.base())
+    }
+
+    /// Every test that scripts the double ends here: nothing it did not
+    /// script was asked for, and nothing was sent twice.
+    fn assert_settled(double: &Double, calls: usize) {
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        assert_eq!(double.request_count(), calls, "{:?}", double.requests());
+    }
+
+    #[test]
+    fn removal_preview_returns_the_report_the_daemon_sent() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let report = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let body = wire(&report);
+        // A silent change in core's serde shape is seen here, not in the UI.
+        assert!(
+            body.contains(r#""persistence":{"outcome":"planned"}"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#""rows_removed":[{"checkout":10}]"#),
+            "{body}"
+        );
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::json(200, body)],
+        )]);
+        let poller = idle_poller(&double);
+
+        let reply = poller.preview_removal(&target);
+
+        assert_eq!(reply, RemovalReply::Report(report));
+        let requests = double.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/removals/preview");
+        assert_eq!(requests[0].content_type, "application/json");
+        let sent: RemovalTarget =
+            serde_json::from_str(&requests[0].body).expect("the body is a RemovalTarget");
+        assert_eq!(sent, target);
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_execute_returns_the_committed_report() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let committed = committed_report(&previewed);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(200, wire(&committed))],
+        )]);
+        let poller = idle_poller(&double);
+
+        let reply = poller.execute_removal(&previewed);
+
+        assert_eq!(reply, RemovalReply::Report(committed));
+        let requests = double.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/removals");
+        assert_eq!(requests[0].content_type, "application/json");
+        let sent: RemovalReport =
+            serde_json::from_str(&requests[0].body).expect("the body is the previewed report");
+        assert_eq!(sent, previewed);
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_execute_409_returns_the_fresh_report_as_drift() {
+        let target = RemovalTarget::Repository(repository_key(1));
+        let previewed = planned_report(
+            target,
+            vec![
+                RowKey::Checkout(checkout_key(10)),
+                RowKey::Repository(repository_key(1)),
+            ],
+        );
+        let mut fresh = planned_report(
+            target,
+            vec![
+                RowKey::Checkout(checkout_key(10)),
+                RowKey::Checkout(checkout_key(11)),
+                RowKey::Repository(repository_key(1)),
+            ],
+        );
+        fresh.already_removed = vec![PathBuf::from("/src/.baude-worktrees/topic")];
+        assert_ne!(fresh, previewed);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(409, wire(&fresh))],
+        )]);
+        let poller = idle_poller(&double);
+
+        let reply = poller.execute_removal(&previewed);
+
+        assert_eq!(reply, RemovalReply::Drift(fresh));
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_execute_503_carries_the_daemon_text() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let cases = [
+            (
+                503,
+                "failed to save repository state: No space left on device",
+            ),
+            (500, "failed to terminate exact PTY process group"),
+        ];
+        for (status, text) in cases {
+            let double = serve(vec![route(
+                "POST",
+                "/removals",
+                vec![Reply::text(status, text)],
+            )]);
+            let poller = idle_poller(&double);
+
+            let reply = poller.execute_removal(&previewed);
+
+            assert_eq!(
+                reply,
+                RemovalReply::Refused {
+                    status,
+                    message: text.to_string(),
+                }
+            );
+            assert_settled(&double, 1);
+        }
+    }
+
+    #[test]
+    fn removal_404_is_gone_not_refused() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals/preview",
+                vec![Reply::text(404, "unknown removal target\n")],
+            ),
+            route(
+                "POST",
+                "/removals",
+                vec![Reply::text(404, "unknown removal target\n")],
+            ),
+        ]);
+        let poller = idle_poller(&double);
+
+        let gone = RemovalReply::Gone {
+            message: "unknown removal target".to_string(),
+        };
+        assert_eq!(poller.preview_removal(&target), gone);
+        assert_eq!(poller.execute_removal(&previewed), gone);
+        assert_settled(&double, 2);
+    }
+
+    #[test]
+    fn removal_503_busy_text_is_kept_from_its_first_word() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::text(503, "repository busy: /src/baude")],
+        )]);
+        let poller = idle_poller(&double);
+
+        match poller.execute_removal(&previewed) {
+            RemovalReply::Refused { status, message } => {
+                assert_eq!(status, 503);
+                assert!(message.starts_with("repository busy:"), "{message}");
+                assert_eq!(message, "repository busy: /src/baude");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_409_with_a_non_report_body_is_refused_not_a_panic() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::text(409, "conflict, but not a report")],
+        )]);
+        let poller = idle_poller(&double);
+
+        match poller.execute_removal(&previewed) {
+            RemovalReply::Refused { status, .. } => assert_eq!(status, 409),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_daemon_text_is_sanitized_and_capped() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let hostile = format!("\u{1b}[31mred\nsecond   line\t{}", "x".repeat(5000));
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::text(500, hostile)],
+        )]);
+        let poller = idle_poller(&double);
+
+        match poller.execute_removal(&previewed) {
+            RemovalReply::Refused { status, message } => {
+                assert_eq!(status, 500);
+                assert!(!message.chars().any(char::is_control), "{message:?}");
+                assert!(message.chars().count() <= 512, "{}", message.len());
+                assert!(message.starts_with("[31mred second line x"), "{message}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn removal_oversize_json_body_is_refused() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        // A report that would parse, so only the cap can refuse it.
+        let mut oversize = committed_report(&previewed);
+        oversize.paths_kept = vec![PathBuf::from(format!("/{}", "a".repeat(1_100_000)))];
+        let body = wire(&oversize);
+        assert!(body.len() > 1024 * 1024);
+        let double = serve(vec![route(
+            "POST",
+            "/removals",
+            vec![Reply::json(200, body)],
+        )]);
+        let poller = idle_poller(&double);
+
+        match poller.execute_removal(&previewed) {
+            RemovalReply::Refused { status, message } => {
+                assert_eq!(status, 200);
+                assert!(message.chars().count() <= 512, "{}", message.len());
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_settled(&double, 1);
+    }
+
+    #[test]
+    fn rows_deserialize_from_the_pinned_field_list() {
+        // Keys are bare numbers on the wire.
+        assert_eq!(
+            serde_json::to_value(checkout_key(10)).expect("key"),
+            serde_json::json!(10)
+        );
+        let rows = rows_fixture();
+
+        assert_eq!(rows.repositories.len(), 1);
+        let repository = &rows.repositories[0];
+        assert_eq!(repository.repository_key, repository_key(1));
+        assert_eq!(repository.display_name, "baude");
+        assert_eq!(repository.path, "/src/baude");
+        assert_eq!(repository.checkouts.len(), 2);
+        let live = &repository.checkouts[0];
+        assert_eq!(live.checkout_key, checkout_key(10));
+        assert_eq!(live.repository_key, repository_key(1));
+        assert_eq!(live.branch.as_deref(), Some("main"));
+        assert_eq!(live.session_id, Some(7));
+        assert!(!live.managed_by_baude);
+        let sessionless = &repository.checkouts[1];
+        assert_eq!(sessionless.checkout_key, checkout_key(11));
+        assert_eq!(sessionless.session_id, None);
+        assert!(sessionless.managed_by_baude);
+        assert_eq!(rows.standalone.len(), 1);
+        assert_eq!(rows.standalone[0].standalone_key, standalone_key(20));
+        assert_eq!(rows.standalone[0].display_name, "notes");
+        assert_eq!(rows.standalone[0].session_id, Some(9));
+
+        // A parent with no children, and a daemon variant this client has
+        // never heard of, must not fail the whole parse.
+        let sparse: RemoteRows = serde_json::from_str(
+            r#"{"repositories":[{"repository_key":3,"checkouts":[],
+                "health":{"status":"unavailable","cause":{"kind":"from_the_future"}}}]}"#,
+        )
+        .expect("a sparse /rows body parses");
+        assert!(sparse.repositories[0].checkouts.is_empty());
+        assert!(sparse.standalone.is_empty());
+        assert_eq!(RemoteRows::default(), RemoteRows::default());
+    }
+
+    #[test]
+    fn removal_target_is_found_only_through_the_rows_join() {
+        let rows = rows_fixture();
+
+        assert_eq!(
+            rows.target_for_session(7),
+            Some(RemovalTarget::Checkout(checkout_key(10)))
+        );
+        assert_eq!(
+            rows.target_for_session(9),
+            Some(RemovalTarget::Standalone(standalone_key(20)))
+        );
+        assert_eq!(rows.target_for_session(8), None);
+        assert_eq!(RemoteRows::default().target_for_session(7), None);
+
+        assert_eq!(
+            rows.repository_target_for_session(7),
+            Some(RemovalTarget::Repository(repository_key(1)))
+        );
+        assert_eq!(rows.repository_target_for_session(9), None);
+        assert_eq!(rows.repository_target_for_session(8), None);
+
+        let label = rows
+            .label(&RowKey::Checkout(checkout_key(11)))
+            .expect("a sessionless checkout still has a name");
+        assert_eq!(label.display_name, "topic");
+        assert_eq!(label.branch.as_deref(), Some("feature/topic"));
+        assert_eq!(label.path, "/src/.baude-worktrees/topic");
+        assert_eq!(label.session_id, None);
+        let parent = rows
+            .label(&RowKey::Repository(repository_key(1)))
+            .expect("the parent has a name");
+        assert_eq!(parent.display_name, "baude");
+        assert_eq!(parent.branch, None);
+        let standalone = rows
+            .label(&RowKey::Standalone(standalone_key(20)))
+            .expect("the standalone row has a name");
+        assert_eq!(standalone.display_name, "notes");
+        assert_eq!(standalone.session_id, Some(9));
+        assert_eq!(rows.label(&RowKey::Checkout(checkout_key(99))), None);
+    }
+
+    #[test]
+    fn double_reports_unscripted_requests() {
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let report = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::json(200, wire(&report))],
+        )]);
+        let poller = idle_poller(&double);
+
+        // No route for the execute path: answered 500 and reported.
+        let reply = poller.execute_removal(&report);
+        assert_eq!(
+            reply,
+            RemovalReply::Refused {
+                status: 500,
+                message: "unscripted".to_string(),
+            }
+        );
+        let unscripted = double.unscripted();
+        assert_eq!(unscripted.len(), 1, "{unscripted:?}");
+        assert_eq!(unscripted[0].method, "POST");
+        assert_eq!(unscripted[0].path, "/removals");
+
+        // The scripted reply was not consumed by the stray request.
+        assert_eq!(
+            poller.preview_removal(&target),
+            RemovalReply::Report(report.clone())
+        );
+        // An exhausted route is unscripted too.
+        match poller.preview_removal(&target) {
+            RemovalReply::Refused { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(double.unscripted().len(), 2);
+        assert_eq!(double.request_count(), 3);
+    }
+
+    #[test]
+    fn removal_closed_without_an_answer_is_unreachable_for_preview_and_indeterminate_for_execute() {
+        let started = Instant::now();
+        let target = RemovalTarget::Checkout(checkout_key(10));
+        let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
+        let double = serve(vec![
+            route(
+                "POST",
+                "/removals/preview",
+                vec![Reply::closed_unanswered()],
+            ),
+            route("POST", "/removals", vec![Reply::closed_unanswered()]),
+        ]);
+        let poller = idle_poller(&double);
+
+        let preview = poller.preview_removal(&target);
+        assert!(
+            matches!(preview, RemovalReply::Unreachable { .. }),
+            "{preview:?}"
+        );
+        let execute = poller.execute_removal(&previewed);
+        assert!(
+            matches!(
+                execute,
+                RemovalReply::Indeterminate {
+                    rows_gone: false,
+                    ..
+                }
+            ),
+            "{execute:?}"
+        );
+
+        // Exactly one POST per call, each with its whole body: the HTTP
+        // layer resent neither over the closed connection.
+        let requests = double.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/removals/preview");
+        assert_eq!(
+            serde_json::from_str::<RemovalTarget>(&requests[0].body).expect("whole target body"),
+            target
+        );
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/removals");
+        assert_eq!(
+            serde_json::from_str::<RemovalReport>(&requests[1].body).expect("whole report body"),
+            previewed
+        );
+        assert_settled(&double, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     /// An older daemon that omits `activity` must still deserialize — the
     /// field defaults to an empty Vec (T-03-11 backward-compat). The rest of
