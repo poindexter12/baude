@@ -4,17 +4,17 @@ milestone: v2.8
 milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
-status: executing
-stopped_at: Completed 21-06-PLAN.md
-last_updated: "2026-11-13T20:39:49.620Z"
+status: verifying
+stopped_at: Completed 21-11-PLAN.md
+last_updated: "2026-11-13T23:47:38.963Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: 265572ff6f35880f024855161c807c5d11dbffe9
+state_head: 6cb3941b167266141ec3628bf3c06c276a23bfc8
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 29
+  completed_plans: 30
   percent: 20
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
 Plan: 11 of 11
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-11-11 — Phase 21 execution started
 
 
@@ -127,6 +127,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P05 | 40min | 3 tasks | 7 files |
 | Phase 21 P08 | 96min | 3 tasks | 1 files |
 | Phase 21 P06 | 22h commit span, active time not measured | 3 tasks | 3 files |
+| Phase 21 P11 | 3h | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -318,6 +319,8 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-06: API-01 and API-02 recorded as advanced, not complete; 21-11 still carries both and owns the gate and the live pairing check
 - [Phase 21]: 21-06: the per-name grep in plan verify commands cannot pass on a green run because fixture output splits the test line from its ok; named tests were checked with a script that accepts a bare ok line
 - [Phase 21]: 21-06: removal error text has key tokens replaced by row labels at draw time only; the stored error keeps the daemon's text
+- [Phase 21]: 21-11: node pass floor is 69, the sum of 29 from 21-07 and 40 from 21-05
+- [Phase 21]: 21-11: live checkpoint recorded as verified on the owner's sign-off alone, with no per-step results
 
 ### Pending Todos
 
@@ -400,8 +403,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-13T20:39:45.631Z
-Stopped at: Completed 21-06-PLAN.md
+Last session: 2026-11-13T23:47:38.306Z
+Stopped at: Completed 21-11-PLAN.md
 Resume file: None
 
 ## Operator Next Steps

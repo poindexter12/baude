@@ -52,9 +52,9 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 
 ### Daemon and PWA parity
 
-- [ ] **API-01**: The daemon exposes a REST removal endpoint for repository, checkout, worktree and standalone rows that calls the same `baude-core` operation as the TUI and returns a structured result naming the rows removed, the runtimes killed and the paths deleted
-- [ ] **API-02**: Removal over REST emits SSE events so a connected TUI or PWA drops the rows without a refresh
-- [ ] **API-03**: The PWA offers remove on the same row kinds with a confirmation equivalent to TUI-02, and completes the removal through API-01
+- [x] **API-01**: The daemon exposes a REST removal endpoint for repository, checkout, worktree and standalone rows that calls the same `baude-core` operation as the TUI and returns a structured result naming the rows removed, the runtimes killed and the paths deleted
+- [x] **API-02**: Removal over REST emits SSE events so a connected TUI or PWA drops the rows without a refresh
+- [x] **API-03**: The PWA offers remove on the same row kinds with a confirmation equivalent to TUI-02, and completes the removal through API-01
 
 ### Validation and release
 
@@ -106,9 +106,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TUI-02 | Phase 20 | Pending |
 | TUI-03 | Phase 20 | Pending |
 | TUI-04 | Phase 20 | Pending |
-| API-01 | Phase 21 | Pending |
-| API-02 | Phase 21 | Pending |
-| API-03 | Phase 21 | Pending |
+| API-01 | Phase 21 | Complete |
+| API-02 | Phase 21 | Complete |
+| API-03 | Phase 21 | Complete |
 | REL-01 | Phase 22 | Pending |
 | REL-02 | Phase 22 | Pending |
 

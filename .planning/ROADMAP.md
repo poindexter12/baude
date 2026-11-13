@@ -173,7 +173,7 @@ Plans:
   2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
   3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
 
-**Plans**: 10/11 plans executed
+**Plans**: 11/11 plans executed
 
 Plans:
 - [x] 21-01-PLAN.md — Wave 1. Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout
@@ -186,7 +186,7 @@ Plans:
 - [x] 21-05-PLAN.md — Wave 7. PWA removal controller and report-backed modal on all row kinds, 409 re-render and live row drops on /events
 - [x] 21-08-PLAN.md — Wave 7. TUI remote client: off-thread removal requests, /rows index and /events subscriber in remote.rs
 - [x] 21-06-PLAN.md — Wave 8. TUI D on remote rows through the daemon with the shared modal
-- [ ] 21-11-PLAN.md — Wave 9. Phase gate: host and Linux gates, both node suites and the 17-step manual check
+- [x] 21-11-PLAN.md — Wave 9. Phase gate: host and Linux gates, both node suites and the 17-step manual check
 
 ### Phase 22: Validation and v2.8.0 Release
 
