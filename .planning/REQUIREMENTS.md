@@ -79,7 +79,7 @@ Explicitly excluded. Documented to prevent scope creep.
 | Deleting a main checkout, standalone folder or local branch from disk | Removal forgets baude's knowledge of a project; destroying user data is a different, riskier operation |
 | Detach-and-forget that leaves the runtime running | Decided against during questioning; an orphaned Claude process with no owner is the failure mode this milestone exists to prevent |
 | Archiving as an alternative to removal | Idle archiving already exists; this milestone is about rows the user wants gone |
-| Removing remote daemon sessions from the TUI attach view | The TUI attach path is a raw PTY client; parity is delivered through the daemon's own REST and the PWA |
+| Removing remote rows from the TUI by any path other than the daemon's removal endpoints | Remote removal from the TUI is in scope since Phase 21 per D-12 and goes through the daemon's preview and execute endpoints; the TUI never acts on the daemon host's files or processes itself |
 
 ## Traceability
 
