@@ -22,7 +22,7 @@ use crate::hierarchy::{
     ActionKind, ActionView, LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStandaloneRow,
     LocalStatus,
 };
-use crate::remote::RemoteInfo;
+use crate::remote::{RemoteInfo, REMOVAL_TIMEOUT};
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 42;
@@ -1807,15 +1807,27 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let max_rows = remove_project_modal_max_rows(report, error.as_deref(), area.height);
             let width: u16 = 76;
             let inner_width = usize::from(width.saturating_sub(2));
-            let lines = remove_project_confirmation_lines(
-                report,
-                kind_label,
-                &row_name,
-                error.as_deref(),
-                *scroll,
-                max_rows,
-                inner_width,
-            );
+            let lines = match origin {
+                RemovalOrigin::Local => remove_project_confirmation_lines(
+                    report,
+                    kind_label,
+                    &row_name,
+                    error.as_deref(),
+                    *scroll,
+                    max_rows,
+                    inner_width,
+                ),
+                RemovalOrigin::Remote(confirm) => remote_removal_confirmation_lines(
+                    report,
+                    kind_label,
+                    &row_name,
+                    error.as_deref(),
+                    *scroll,
+                    max_rows,
+                    inner_width,
+                    confirm.unknown_outcome,
+                ),
+            };
             let height = u16::try_from(lines.len() + 2)
                 .unwrap_or(u16::MAX)
                 .min(max_height);
@@ -2535,7 +2547,8 @@ pub(crate) fn remove_project_modal_max_rows(
 
 /// Modal lines while a remote removal round trip is running: the row, what
 /// is being waited for, and the one key that does anything. A preview asks
-/// the daemon to change nothing, so only that wait offers a cancel.
+/// the daemon to change nothing, so only that wait offers a cancel. A sent
+/// removal cannot be recalled, so its wait says so and how long it lasts.
 pub(crate) fn remote_removal_pending_lines(
     label: &str,
     stage: RemoteRemovalStage,
@@ -2553,9 +2566,61 @@ pub(crate) fn remote_removal_pending_lines(
         }
         RemoteRemovalStage::Execute => {
             lines.push(truncate(
-                "Waiting for the daemon to remove this row.",
+                "The removal was sent to the daemon and cannot be recalled.",
                 width,
             ));
+            lines.push(truncate(
+                &format!(
+                    "Waiting up to {} seconds for its answer.",
+                    REMOVAL_TIMEOUT.as_secs()
+                ),
+                width,
+            ));
+        }
+    }
+    lines
+}
+
+/// Modal lines for a remote `D` confirmation. The shared builder does the
+/// work. The one difference is a removal that was sent and never answered:
+/// that is not an error and offers no retry, so its line is headed
+/// `unknown outcome` and Enter is offered as a new preview. The line count
+/// is the shared builder's, so the scroll window needs no second measure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remote_removal_confirmation_lines(
+    report: &baude_core::removal::RemovalReport,
+    kind_label: &str,
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+    error: Option<&str>,
+    scroll: usize,
+    max_rows: usize,
+    width: usize,
+    unknown_outcome: bool,
+) -> Vec<String> {
+    let mut lines = remove_project_confirmation_lines(
+        report, kind_label, row_name, error, scroll, max_rows, width,
+    );
+    if !unknown_outcome {
+        return lines;
+    }
+    // The shared builder ends with the error line, when it has one, and
+    // then the legend. Both are rebuilt from the untruncated text.
+    let error_index = lines.len().checked_sub(2);
+    if let Some(legend) = lines.last_mut() {
+        *legend = truncate("enter preview again · esc close", width);
+    }
+    if let (Some(text), Some(index)) = (error, error_index) {
+        if let Some(line) = lines.get_mut(index) {
+            // `truncate` keeps the end of a long text, so the heading is
+            // kept whole and only the message gives way: a narrow modal
+            // must still say the outcome is unknown.
+            const HEADING: &str = "unknown outcome: ";
+            let room = width.saturating_sub(cell_width(HEADING));
+            *line = if room == 0 {
+                truncate(HEADING.trim_end(), width)
+            } else {
+                format!("{HEADING}{}", truncate(text, room))
+            };
         }
     }
     lines

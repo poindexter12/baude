@@ -542,8 +542,6 @@ pub struct RemoteConfirm {
     pub(crate) label: String,
     /// An execute was sent and never answered. Enter previews again; the
     /// same execute is never resent.
-    // Read once the unknown-outcome path lands with the other daemon answers.
-    #[allow(dead_code)]
     pub(crate) unknown_outcome: bool,
 }
 
@@ -570,15 +568,35 @@ pub enum RemoteRemovalStage {
     Execute,
 }
 
+/// What a remote removal wait is waiting for.
+enum RemoteRemovalWait {
+    /// The daemon's preview. Nothing was asked to change.
+    Preview,
+    /// The daemon's answer to the report the user confirmed. The report is
+    /// held so a refusal or an unknown outcome can put it back in front of
+    /// them; it is boxed to keep the preview wait small.
+    Execute(Box<baude_core::removal::RemovalReport>),
+}
+
+impl RemoteRemovalWait {
+    fn stage(&self) -> RemoteRemovalStage {
+        match self {
+            RemoteRemovalWait::Preview => RemoteRemovalStage::Preview,
+            RemoteRemovalWait::Execute(_) => RemoteRemovalStage::Execute,
+        }
+    }
+}
+
+/// The footer a refreshed confirmation gets when the row set changed between
+/// the preview and the confirm. The local recheck says the same words.
+const REMOVAL_RECHECK_NOTICE: &str =
+    "rows changed since the preview; review the refreshed confirmation";
+
 /// One remote removal round trip in flight; polled from `tick`.
 struct PendingRemoteRemoval {
-    stage: RemoteRemovalStage,
+    wait: RemoteRemovalWait,
     target: baude_core::removal::RemovalTarget,
     label: String,
-    /// The report the user confirmed; `None` while previewing.
-    // Read once a refused or unanswered execute re-installs the confirmation.
-    #[allow(dead_code)]
-    previewed: Option<baude_core::removal::RemovalReport>,
     /// The rows index as it stood when the round trip started.
     rows: RemoteRows,
     ticket: RemovalTicket,
@@ -4091,10 +4109,9 @@ impl App {
             return;
         };
         self.remote_removal = Some(PendingRemoteRemoval {
-            stage: RemoteRemovalStage::Preview,
+            wait: RemoteRemovalWait::Preview,
             target,
             label: label.clone(),
-            previewed: None,
             rows: self.remote_rows.clone(),
             ticket,
             deadline: Self::remote_removal_deadline(),
@@ -4109,36 +4126,53 @@ impl App {
     /// Enter or `y` on a remote confirmation: send the previewed report back
     /// to the daemon on a worker, unchanged and once, and show the waiting
     /// modal. Nothing on this machine is touched.
+    ///
+    /// A confirmation that stands for an unknown outcome is the exception:
+    /// its removal was already sent and may have happened, so Enter asks for
+    /// a new preview and the same removal is never sent again.
     fn confirm_remote_remove(
         &mut self,
         target: baude_core::removal::RemovalTarget,
         report: baude_core::removal::RemovalReport,
         confirm: RemoteConfirm,
     ) {
-        let Some(ticket) = self
-            .remote
-            .as_ref()
-            .map(|poller| poller.spawn_execute_removal(report.clone()))
-        else {
-            self.set_message(format!(
-                "Cannot remove “{}”: no daemon connection. Nothing was changed.",
-                confirm.label
-            ));
+        let RemoteConfirm {
+            rows,
+            label,
+            unknown_outcome,
+        } = confirm;
+        let started = self.remote.as_ref().map(|poller| {
+            if unknown_outcome {
+                (
+                    poller.spawn_preview_removal(target),
+                    RemoteRemovalWait::Preview,
+                )
+            } else {
+                (
+                    poller.spawn_execute_removal(report.clone()),
+                    RemoteRemovalWait::Execute(Box::new(report)),
+                )
+            }
+        });
+        let Some((ticket, wait)) = started else {
+            // "Nothing was changed" would be a guess after an unknown outcome.
+            self.set_message(if unknown_outcome {
+                format!("Cannot preview “{label}” again: no daemon connection.")
+            } else {
+                format!("Cannot remove “{label}”: no daemon connection. Nothing was changed.")
+            });
             return;
         };
+        let stage = wait.stage();
         self.remote_removal = Some(PendingRemoteRemoval {
-            stage: RemoteRemovalStage::Execute,
+            wait,
             target,
-            label: confirm.label.clone(),
-            previewed: Some(report),
-            rows: confirm.rows,
+            label: label.clone(),
+            rows,
             ticket,
             deadline: Self::remote_removal_deadline(),
         });
-        self.modal = Modal::RemoteRemovePending {
-            label: confirm.label,
-            stage: RemoteRemovalStage::Execute,
-        };
+        self.modal = Modal::RemoteRemovePending { label, stage };
         self.dirty = true;
     }
 
@@ -4156,36 +4190,170 @@ impl App {
             return;
         };
         self.dirty = true;
+        // A worker that never answered by the deadline is the same thing as a
+        // request that got no answer, so silence has one outcome per stage.
         let (reply, fresh_rows) = match answer {
-            Some(answer) => (Some(answer.reply), answer.rows),
-            None => (None, None),
+            Some(answer) => (answer.reply, answer.rows),
+            None => (
+                RemovalReply::Unreachable {
+                    message: String::new(),
+                },
+                None,
+            ),
         };
-        match (pending.stage, reply) {
-            (RemoteRemovalStage::Preview, Some(RemovalReply::Report(report))) => {
-                self.modal = Modal::ConfirmRemove {
-                    target: pending.target,
+        let PendingRemoteRemoval {
+            wait,
+            target,
+            label,
+            rows,
+            ..
+        } = pending;
+        let rows = fresh_rows.unwrap_or(rows);
+        match wait {
+            RemoteRemovalWait::Preview => self.settle_remote_preview(target, label, rows, reply),
+            RemoteRemovalWait::Execute(previewed) => {
+                self.settle_remote_execute(target, label, rows, *previewed, reply);
+            }
+        }
+    }
+
+    /// Put a remote confirmation on screen, unscrolled.
+    fn install_remote_confirmation(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        error: Option<String>,
+        confirm: RemoteConfirm,
+    ) {
+        self.modal = Modal::ConfirmRemove {
+            target,
+            report,
+            scroll: 0,
+            error,
+            origin: RemovalOrigin::Remote(Box::new(confirm)),
+        };
+    }
+
+    /// End a remote removal with nothing left on screen but a footer notice.
+    /// The caller already took the pending removal, so no key can resend it.
+    fn close_remote_removal(&mut self, notice: String) {
+        self.modal = Modal::None;
+        self.set_message(notice);
+    }
+
+    fn remote_already_removed_notice(label: &str) -> String {
+        format!("“{label}” was already removed on the daemon.")
+    }
+
+    /// The outcome of a preview, one per daemon answer. A preview asks the
+    /// daemon to change nothing, so every outcome but the confirmation
+    /// closes the modal.
+    fn settle_remote_preview(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        label: String,
+        rows: RemoteRows,
+        reply: RemovalReply,
+    ) {
+        match reply {
+            // A 409 to a preview carries what a 200 does: the current preview.
+            RemovalReply::Report(report) | RemovalReply::Drift(report) => {
+                self.install_remote_confirmation(
+                    target,
                     report,
-                    scroll: 0,
-                    error: None,
-                    origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
-                        rows: fresh_rows.unwrap_or(pending.rows),
-                        label: pending.label,
+                    None,
+                    RemoteConfirm {
+                        rows,
+                        label,
                         unknown_outcome: false,
-                    })),
-                };
+                    },
+                );
             }
-            (RemoteRemovalStage::Execute, Some(RemovalReply::Report(report))) => {
-                self.modal = Modal::None;
-                self.set_message(Self::removal_notice(&report));
+            RemovalReply::Gone { .. } => {
+                self.close_remote_removal(Self::remote_already_removed_notice(&label));
             }
-            _ => {
-                // True for every other answer and for none at all: it claims
-                // no error and sends nothing.
-                self.modal = Modal::None;
-                self.set_message(format!(
-                    "The daemon did not confirm the removal of “{}”. Press D to look again.",
-                    pending.label
-                ));
+            RemovalReply::Refused { message, .. } => self.close_remote_removal(format!(
+                "Cannot remove “{label}”: {message}. Nothing was changed."
+            )),
+            RemovalReply::Unreachable { .. } | RemovalReply::Indeterminate { .. } => self
+                .close_remote_removal(format!(
+                    "No answer from the daemon for “{label}”. Nothing was changed."
+                )),
+        }
+    }
+
+    /// The outcome of a sent removal, one per daemon answer. Nothing here
+    /// sends a request: a refreshed or refused confirmation waits for Enter,
+    /// and a removal that got no answer is an unknown outcome, never a
+    /// failure, because the daemon may have carried it out.
+    fn settle_remote_execute(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        label: String,
+        rows: RemoteRows,
+        previewed: baude_core::removal::RemovalReport,
+        reply: RemovalReply,
+    ) {
+        match reply {
+            RemovalReply::Report(report) => {
+                self.close_remote_removal(Self::removal_notice(&report));
+            }
+            // D-14: the daemon removed nothing and sent its fresh preview.
+            RemovalReply::Drift(fresh) => {
+                self.install_remote_confirmation(
+                    target,
+                    fresh,
+                    None,
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: false,
+                    },
+                );
+                self.set_message(REMOVAL_RECHECK_NOTICE.into());
+            }
+            // D-15: the daemon's own words, and the same report held for a
+            // retry on Enter.
+            RemovalReply::Refused { message, .. } => {
+                self.install_remote_confirmation(
+                    target,
+                    previewed,
+                    Some(message),
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: false,
+                    },
+                );
+            }
+            RemovalReply::Gone { .. } => {
+                self.close_remote_removal(Self::remote_already_removed_notice(&label));
+            }
+            RemovalReply::Indeterminate {
+                rows_gone: true, ..
+            } => self.close_remote_removal(format!(
+                "“{label}” was removed: the daemon no longer lists it."
+            )),
+            // The worker's own message is not shown: it describes a transport
+            // detail, and the one thing the user needs is that the outcome is
+            // not known.
+            RemovalReply::Indeterminate {
+                rows_gone: false, ..
+            }
+            | RemovalReply::Unreachable { .. } => {
+                let error = format!(
+                    "the daemon did not answer; “{label}” may or may not have been removed"
+                );
+                self.install_remote_confirmation(
+                    target,
+                    previewed,
+                    Some(error),
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: true,
+                    },
+                );
             }
         }
     }
@@ -6122,15 +6290,29 @@ impl App {
                 }
                 _ => {}
             },
-            Modal::RemoteRemovePending { stage, .. } => {
-                // Only a preview can be cancelled, and dropping the ticket is
-                // all that takes: a preview asks the daemon to change nothing.
-                let cancels = *stage == RemoteRemovalStage::Preview
-                    && matches!(key.code, KeyCode::Char('n') | KeyCode::Esc);
-                if cancels {
-                    self.remote_removal = None;
-                    self.modal = Modal::None;
-                    self.set_message("Removal preview cancelled. Nothing was changed.".into());
+            Modal::RemoteRemovePending { label, stage } => {
+                // Every other key does nothing in both stages, which is what
+                // makes a second Enter harmless.
+                if matches!(key.code, KeyCode::Char('n') | KeyCode::Esc) {
+                    match *stage {
+                        // Dropping the ticket is all a cancel takes: a
+                        // preview asks the daemon to change nothing.
+                        RemoteRemovalStage::Preview => {
+                            self.remote_removal = None;
+                            self.modal = Modal::None;
+                            self.set_message(
+                                "Removal preview cancelled. Nothing was changed.".into(),
+                            );
+                        }
+                        // A sent removal cannot be taken back, so the wait
+                        // stays and ends by itself.
+                        RemoteRemovalStage::Execute => {
+                            let notice = format!(
+                                "The removal of “{label}” was already sent and cannot be recalled. Waiting for the daemon."
+                            );
+                            self.set_message(notice);
+                        }
+                    }
                 }
             }
             Modal::None => {}
@@ -13595,6 +13777,17 @@ mod tests {
             Some(super::RemoteRemovalStage::Preview),
             "before the deadline the wait goes on"
         );
+        // The double hands out a route's replies in arrival order, so the
+        // held reply has to reach this first preview before the next one is
+        // sent. Without the wait the two workers race for it.
+        let sent = std::time::Instant::now();
+        while recorded(&double, "POST", "/removals/preview").is_empty() {
+            assert!(
+                sent.elapsed() < std::time::Duration::from_secs(5),
+                "the first preview never reached the double"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         app.remote_removal
             .as_mut()
             .expect("a pending preview")
