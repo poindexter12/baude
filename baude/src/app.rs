@@ -13679,6 +13679,119 @@ mod tests {
         end_remote_remove(app, &fx);
     }
 
+    /// Register rule 2 on the footer: a preview refusal that names the target
+    /// in core's `row {key:?}` shape reads as the row's label.
+    #[test]
+    fn remote_remove_preview_refusal_footer_shows_row_label_not_key_text() {
+        use crate::remote::test_double::Reply;
+
+        const DETAIL: &str = "runtime survived the kill stage: still running";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app(
+            "d-remote-preview-refused-key-text",
+            |previewed, _rows_body| {
+                let body = format!("row {:?}: {DETAIL}", previewed.target);
+                assert!(
+                    body.contains("Checkout(CheckoutKey("),
+                    "the daemon's text names the key the way core prints it: {body}"
+                );
+                removal_routes(vec![Reply::text(500, body)], Vec::new(), Vec::new())
+            },
+        );
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains(&format!("active-zeta: {DETAIL}")),
+            "{message}"
+        );
+        assert!(!message.contains("Key("), "{message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// T-21-85: a name from another host cannot put a control character on
+    /// the terminal through a remote confirmation, nor run on without end.
+    #[test]
+    fn remote_remove_row_label_strips_control_characters() {
+        use baude_core::removal::RowKey;
+
+        let repository: baude_core::repository::RepositoryKey =
+            serde_json::from_value(serde_json::json!(1)).expect("repository key");
+        let checkout: CheckoutKey =
+            serde_json::from_value(serde_json::json!(7)).expect("checkout key");
+        let hostile = format!("\u{1b}[31mzeta\u{7}\nnext{}", "x".repeat(285));
+        assert_eq!(hostile.chars().count(), 300);
+        let rows: crate::remote::RemoteRows = serde_json::from_str(&remote_rows_body(
+            repository,
+            &[(checkout, &hostile, "feat/\u{1b}[0mzeta\r", None)],
+        ))
+        .expect("the /rows body parses");
+        let key = RowKey::Checkout(checkout);
+        let indexed = rows.label(&key).expect("the index lists the row");
+        assert_eq!(
+            indexed.display_name, hostile,
+            "the index hands the name over as the daemon sent it"
+        );
+        let confirm = super::RemoteConfirm {
+            rows,
+            label: "zeta".into(),
+            unknown_outcome: false,
+        };
+
+        let label = confirm.row_label(&key);
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        let name = label
+            .strip_suffix(" (feat/[0mzeta)")
+            .unwrap_or_else(|| panic!("the branch follows the name: {label:?}"));
+        assert!(name.starts_with("[31mzetanextxxx"), "{name:?}");
+        assert!(name.ends_with('…'), "a cut name says so: {name:?}");
+        assert!(
+            name.chars().count() <= 80,
+            "{} characters of name",
+            name.chars().count()
+        );
+    }
+
+    /// A key that no local row and no recorded path names reads `unknown
+    /// row`, never as key text.
+    #[test]
+    fn remove_project_unresolvable_key_label_is_unknown_row() {
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("remove-project-unresolvable-key");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-unresolvable");
+        assert_ne!(
+            app.removal_row_label(&RowKey::Checkout(rows.managed)),
+            super::REMOVAL_UNKNOWN_ROW,
+            "the fixture names its own rows"
+        );
+
+        let absent = serde_json::json!(9_000_001);
+        for key in [
+            RowKey::Repository(serde_json::from_value(absent.clone()).expect("repository key")),
+            RowKey::Checkout(serde_json::from_value(absent.clone()).expect("checkout key")),
+            RowKey::Standalone(serde_json::from_value(absent.clone()).expect("standalone key")),
+        ] {
+            assert_eq!(
+                app.removal_row_label(&key),
+                super::REMOVAL_UNKNOWN_ROW,
+                "{key:?}"
+            );
+        }
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// Esc always ends a preview wait, and never pretends to recall a
     /// removal that was already sent.
     #[test]

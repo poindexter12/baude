@@ -2626,6 +2626,18 @@ pub(crate) fn remote_removal_confirmation_lines(
     lines
 }
 
+/// Removal error text as the user reads it: a row key in Rust debug form is
+/// replaced by the row's label.
+// Pass-through until the register lands; the tests below pin what it must do.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn removal_text_for_user(
+    text: &str,
+    _keys: &[baude_core::removal::RowKey],
+    _row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+) -> String {
+    text.to_string()
+}
+
 /// Modal lines for the `D` confirmation. A pure transform over the
 /// `RemovalReport` that `preview_removal` produced: every section is read
 /// from a report field, so the confirmation cannot promise less than the real
@@ -4110,6 +4122,251 @@ mod tests {
         app.focus = Focus::Sidebar;
         app.modal = modal;
         (fixture, app)
+    }
+
+    // ---- removal error-text register (plan 21-06) ------------------------
+
+    /// A daemon rows index, parsed from a `/rows` body in the field list the
+    /// 21-08 client tests send: one repository with key 1 whose checkouts are
+    /// the given ones, each `(key, display name, branch, session id)`.
+    fn daemon_rows(checkouts: &[(u64, &str, &str, Option<u64>)]) -> crate::remote::RemoteRows {
+        let checkouts: Vec<serde_json::Value> = checkouts
+            .iter()
+            .map(|(key, name, branch, session_id)| {
+                serde_json::json!({
+                    "checkout_key": key,
+                    "repository_key": 1,
+                    "display_name": name,
+                    "branch": branch,
+                    "path": format!("/srv/daemon/.baude-worktrees/{name}"),
+                    "role": "managed_branch",
+                    "managed_by_baude": true,
+                    "archived": false,
+                    "session_id": session_id
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "repositories": [{
+                "repository_key": 1,
+                "display_name": "daemon-repo",
+                "path": "/srv/daemon/repo",
+                "health": {"status": "available"},
+                "checkouts": checkouts
+            }],
+            "standalone": []
+        }))
+        .expect("the /rows body parses")
+    }
+
+    /// The part of a rendered screen row that lies inside the modal: the
+    /// sidebar shows through on both sides of it.
+    fn modal_line<'a>(rendered: &'a str, needle: &str) -> &'a str {
+        rendered
+            .lines()
+            .flat_map(|line| line.split('│'))
+            .find(|segment| segment.contains(needle))
+            .unwrap_or_else(|| panic!("no modal line with {needle:?} in:\n{rendered}"))
+    }
+
+    /// Register rule 2: a key the caller can name reads as that row's label,
+    /// and the word `row` core puts before it goes with it.
+    #[test]
+    fn removal_text_replaces_known_key_with_row_label() {
+        use baude_core::removal::RowKey;
+
+        let key = RowKey::Checkout(remove_project::checkout(3));
+        let name = |_: &RowKey| "active-zeta (feat/zeta)".to_string();
+        assert_eq!(
+            super::removal_text_for_user(
+                "row Checkout(CheckoutKey(3)): runtime survived the kill stage: still running",
+                &[key],
+                &name,
+            ),
+            "active-zeta (feat/zeta): runtime survived the kill stage: still running"
+        );
+        assert_eq!(
+            super::removal_text_for_user(
+                "removal target Checkout(CheckoutKey(3)) is not in the saved state",
+                &[key],
+                &name,
+            ),
+            "removal target active-zeta (feat/zeta) is not in the saved state"
+        );
+    }
+
+    /// Register rule 2: a key nothing can name reads `unknown row`, for every
+    /// kind of key, and the namer is never asked about it.
+    #[test]
+    fn removal_text_unknown_key_reads_unknown_row() {
+        use baude_core::removal::RowKey;
+
+        let name = |key: &RowKey| panic!("no key was handed over, yet {key:?} was looked up");
+        assert_eq!(
+            super::removal_text_for_user(
+                "row Checkout(CheckoutKey(3)): runtime survived the kill stage: still running",
+                &[],
+                &name,
+            ),
+            "unknown row: runtime survived the kill stage: still running"
+        );
+        let both = super::removal_text_for_user(
+            "repository is busy: Repository(RepositoryKey(4)) and row Standalone(StandaloneKey(12)) are in use",
+            &[],
+            &name,
+        );
+        assert!(!both.contains("Key("), "{both}");
+        assert_eq!(
+            both,
+            "repository is busy: unknown row and unknown row are in use"
+        );
+    }
+
+    /// Register rule 3: a path in the text is shown exactly as sent, and text
+    /// with no key in it is not touched at all.
+    #[test]
+    fn removal_text_leaves_paths_and_plain_text_alone() {
+        use baude_core::removal::RowKey;
+
+        const PATH: &str = "/home/dev/.baude/worktrees/zeta";
+        let key = RowKey::Checkout(remove_project::checkout(3));
+        let name = |_: &RowKey| "active-zeta".to_string();
+        let shown = super::removal_text_for_user(
+            &format!("row Checkout(CheckoutKey(3)): could not remove {PATH}: Permission denied"),
+            &[key],
+            &name,
+        );
+        assert_eq!(
+            shown,
+            format!("active-zeta: could not remove {PATH}: Permission denied")
+        );
+        assert!(!shown.contains('~'), "{shown}");
+        assert_eq!(
+            super::removal_text_for_user(
+                "repository busy: another removal is running",
+                &[key],
+                &name
+            ),
+            "repository busy: another removal is running"
+        );
+        assert_eq!(super::removal_text_for_user("", &[key], &name), "");
+    }
+
+    /// A local confirmation shows a stored error in core's `row {key:?}`
+    /// shape with the local row's name in place of the key.
+    #[test]
+    fn removal_text_local_modal_error_line_shows_row_label() {
+        let (_fixture, mut app, rows) = confirm_remove_fixture(2, None);
+        let named = rows[1];
+        let label = app.removal_row_label(&named);
+        assert!(
+            label != crate::app::REMOVAL_UNKNOWN_ROW && !label.contains("Key("),
+            "the local hierarchy names the row: {label}"
+        );
+        if let Modal::ConfirmRemove { error, .. } = &mut app.modal {
+            *error = Some(format!("row {named:?}: still running"));
+        }
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert_eq!(
+            modal_line(&rendered, "error: ").trim_end(),
+            format!("error: {label}: still running"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Key("), "{rendered}");
+    }
+
+    /// D-16: a remote confirmation names the key in its error line from the
+    /// daemon's index, although a local row carries the same key number.
+    #[test]
+    fn remote_removal_modal_error_line_shows_row_label_not_key_text() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let (_fixture, mut app, rows) = confirm_remove_fixture(2, None);
+        let named = rows[1];
+        let RowKey::Checkout(checkout) = named else {
+            panic!("the fixture's second row is a checkout, got {named:?}");
+        };
+        let local = app.removal_row_label(&named);
+        assert_ne!(
+            local,
+            crate::app::REMOVAL_UNKNOWN_ROW,
+            "a local row has the key"
+        );
+        let target = RemovalTarget::Checkout(checkout);
+        app.modal = Modal::ConfirmRemove {
+            target,
+            report: remove_project::report(target, vec![named]),
+            scroll: 0,
+            error: Some(format!("row {named:?}: still running")),
+            origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                rows: daemon_rows(&[(checkout.get(), "active-zeta", "feat/zeta", Some(41))]),
+                label: "active-zeta".into(),
+                unknown_outcome: false,
+            })),
+        };
+
+        let (rendered, _) = render(&app, 100, 30);
+        let error_line = modal_line(&rendered, "error: ").trim_end();
+        assert_eq!(
+            error_line, "error: active-zeta (feat/zeta): still running",
+            "{rendered}"
+        );
+        assert!(!error_line.contains(&local), "{rendered}");
+        assert!(!rendered.contains("Key("), "{rendered}");
+    }
+
+    /// D-16 at any size: a remote repository confirmation names every row the
+    /// daemon's index knows, with or without a live session, and says
+    /// `unknown row` for the one it does not.
+    #[test]
+    fn remote_removal_modal_names_every_row_from_the_daemon_index() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let repository = remove_project::repository(1);
+        let target = RemovalTarget::Repository(repository);
+        let mut rows = vec![RowKey::Repository(repository)];
+        rows.extend((2..=5).map(|n| RowKey::Checkout(remove_project::checkout(n))));
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-every-row",
+            Modal::ConfirmRemove {
+                target,
+                report: remove_project::report(target, rows),
+                scroll: 0,
+                error: None,
+                origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                    rows: daemon_rows(&[
+                        (2, "active-zeta", "feat/zeta", Some(41)),
+                        (3, "idle-eta", "feat/eta", None),
+                        (4, "idle-theta", "fix/theta", None),
+                    ]),
+                    label: "active-zeta".into(),
+                    unknown_outcome: false,
+                })),
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 40);
+        for named in [
+            "daemon-repo",
+            "active-zeta (feat/zeta)",
+            "idle-eta (feat/eta)",
+            "idle-theta (fix/theta)",
+        ] {
+            assert!(rendered.contains(named), "{named} is named: {rendered}");
+        }
+        assert_eq!(
+            rendered.matches("unknown row").count(),
+            1,
+            "only the checkout the index does not list: {rendered}"
+        );
+        assert!(
+            rendered.contains(" remove remote repository "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Key("), "{rendered}");
     }
 
     /// The wait for a daemon's preview names the row and can be cancelled.
