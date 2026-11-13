@@ -5,16 +5,16 @@ milestone_name: Project Removal
 current_phase: 21
 current_phase_name: Daemon and PWA Parity
 status: executing
-stopped_at: Completed 21-08-PLAN.md
-last_updated: "2026-11-12T18:01:55.215Z"
+stopped_at: Completed 21-06-PLAN.md
+last_updated: "2026-11-13T20:39:49.620Z"
 last_activity: 2026-11-11
 last_activity_desc: Phase 21 execution started
-state_head: 2eaafcccf15d306e36c784a8ba586f1ae8b8a8e8
+state_head: 265572ff6f35880f024855161c807c5d11dbffe9
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 30
-  completed_plans: 28
+  completed_plans: 29
   percent: 20
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 21 (Daemon and PWA Parity) — EXECUTING
-Plan: 10 of 11
+Plan: 11 of 11
 Status: Ready to execute
 Last activity: 2026-11-11 — Phase 21 execution started
 
@@ -126,6 +126,7 @@ Last activity: 2026-11-11 — Phase 21 execution started
 | Phase 21 P04 | 17min | 3 tasks | 3 files |
 | Phase 21 P05 | 40min | 3 tasks | 7 files |
 | Phase 21 P08 | 96min | 3 tasks | 1 files |
+| Phase 21 P06 | 22h commit span, active time not measured | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -314,6 +315,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 21]: 21-08: remote removals run on a worker under REMOVAL_TIMEOUT of 60 s; an execute with no answer is Indeterminate, reconciled by one GET /rows and never resent
 - [Phase 21]: 21-08: a removed remote row is held out by an Instant-dated tombstone until a poll that started after the removal is applied; then the daemon's read wins
 - [Phase 21]: 21-08: the events reader keeps one connection through timed-out reads; ureq 2.12.1 survived them, silence limit 35 s from the 15 s keep-alive
+- [Phase 21]: 21-06: API-01 and API-02 recorded as advanced, not complete; 21-11 still carries both and owns the gate and the live pairing check
+- [Phase 21]: 21-06: the per-name grep in plan verify commands cannot pass on a green run because fixture output splits the test line from its ok; named tests were checked with a script that accepts a bare ok line
+- [Phase 21]: 21-06: removal error text has key tokens replaced by row labels at draw time only; the stored error keeps the daemon's text
 
 ### Pending Todos
 
@@ -396,8 +400,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-12T18:01:54.346Z
-Stopped at: Completed 21-08-PLAN.md
+Last session: 2026-11-13T20:39:45.631Z
+Stopped at: Completed 21-06-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
