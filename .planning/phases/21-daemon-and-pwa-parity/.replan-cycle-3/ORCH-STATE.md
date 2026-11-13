@@ -198,3 +198,10 @@ Round 3 offenders fixed and committed: 06f6a74, cf17846, 7752640; validation map
 - Decisions taken by the orchestrator: restart on a main checkout follows a branch switch, 409 kept for pinned worktrees; two DELETE failure tests re-fixtured onto a real repository.
 - Executors must be told that CONTEXT WARNING hook lines report the orchestrator session, and must not read whole plans over 60 KB.
 - OPEN flake on macOS: DELETE /sessions on a repository row intermittently returns 500, failed to terminate exact PTY process group. Seen 1 of 3 and 1 of 5 full single-threaded bauded runs after 21-10, 0 of 5 at aebb3e1; ten further baseline runs were lost to a login expiry. Suspect signal_group in baude-core/src/pty.rs tolerating ESRCH but not EPERM for an unreaped group leader. Not fixed, not assigned to a plan.
+
+## 2026-11-13 15:55 PST execution done, phase not closed
+- All 11 plans have a SUMMARY; last plan commit dae8316; verification report ed22510, status human_needed, 1 of 3 criteria verified, shallow pass.
+- Host and Linux gates green on 6cb3941: baude 345, baude-core 560, bauded 176, node 69.
+- 21-11 manual check recorded on owner sign-off; fixture rows were still listed at sign-off.
+- `phase.complete 21` refuses until verification passes; next is /gsd-verify-work 21. Not forced.
+- Nothing pushed.
