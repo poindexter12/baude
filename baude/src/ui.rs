@@ -1804,7 +1804,13 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             // budget is measured against the line generator itself, so a
             // section added there cannot clip the legend here.
             let max_height = remove_project_modal_max_height(area.height);
-            let max_rows = remove_project_modal_max_rows(report, error.as_deref(), area.height);
+            // The stored error stays as it was received; only what is drawn
+            // has its row keys replaced by the names this origin gives them.
+            let shown_error = error
+                .as_deref()
+                .map(|text| removal_text_for_user(text, &removal_report_keys(report), &row_name));
+            let error = shown_error.as_deref();
+            let max_rows = remove_project_modal_max_rows(report, error, area.height);
             let width: u16 = 76;
             let inner_width = usize::from(width.saturating_sub(2));
             let lines = match origin {
@@ -1812,7 +1818,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     report,
                     kind_label,
                     &row_name,
-                    error.as_deref(),
+                    error,
                     *scroll,
                     max_rows,
                     inner_width,
@@ -1821,7 +1827,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                     report,
                     kind_label,
                     &row_name,
-                    error.as_deref(),
+                    error,
                     *scroll,
                     max_rows,
                     inner_width,
@@ -2626,16 +2632,98 @@ pub(crate) fn remote_removal_confirmation_lines(
     lines
 }
 
-/// Removal error text as the user reads it: a row key in Rust debug form is
-/// replaced by the row's label.
-// Pass-through until the register lands; the tests below pin what it must do.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Removal error text as the user reads it. Core and the daemon name a row
+/// by its key in Rust debug form; here each of `keys` reads as `row_name` of
+/// it, and a key-shaped token for any other row reads `unknown row`. The
+/// word `row` core puts before a key goes with the key. Nothing else is
+/// touched: a path stays exactly as it was sent.
+///
+/// The text is read once, left to right, and a label put in is never read
+/// again, so a row whose name looks like a key cannot be rewritten twice.
 pub(crate) fn removal_text_for_user(
     text: &str,
-    _keys: &[baude_core::removal::RowKey],
-    _row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+    keys: &[baude_core::removal::RowKey],
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
 ) -> String {
-    text.to_string()
+    /// How every key-shaped token starts, whatever number it carries.
+    const KEY_OPENINGS: [&str; 3] = [
+        "Repository(RepositoryKey(",
+        "Checkout(CheckoutKey(",
+        "Standalone(StandaloneKey(",
+    ];
+    const KEY_CLOSING: &str = "))";
+    const ROW_WORD: &str = "row ";
+
+    // The needle is the key's own debug text, so this stays right whatever
+    // core's derive prints.
+    let known: Vec<(String, &baude_core::removal::RowKey)> =
+        keys.iter().map(|key| (format!("{key:?}"), key)).collect();
+
+    let mut out = String::with_capacity(text.len());
+    // Where the text copied since the last label starts in `out`.
+    let mut copied_from = 0;
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        let token = known
+            .iter()
+            .find(|(needle, _)| rest.starts_with(needle.as_str()))
+            .map(|(needle, key)| (needle.len(), row_name(key)))
+            .or_else(|| {
+                let opening = KEY_OPENINGS
+                    .iter()
+                    .find(|opening| rest.starts_with(**opening))?;
+                let close = rest[opening.len()..].find(KEY_CLOSING)?;
+                Some((
+                    opening.len() + close + KEY_CLOSING.len(),
+                    crate::app::REMOVAL_UNKNOWN_ROW.to_string(),
+                ))
+            });
+        match token {
+            Some((length, label)) => {
+                let copied = &out[copied_from..];
+                if let Some(before) = copied.strip_suffix(ROW_WORD) {
+                    let whole_word = !before
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if whole_word {
+                        out.truncate(out.len() - ROW_WORD.len());
+                    }
+                }
+                out.push_str(&label);
+                copied_from = out.len();
+                rest = &rest[length..];
+            }
+            None => {
+                out.push(first);
+                rest = &rest[first.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+/// The key a report names as its target, as it appears among its rows.
+pub(crate) fn removal_target_row_key(
+    target: baude_core::removal::RemovalTarget,
+) -> baude_core::removal::RowKey {
+    use baude_core::removal::{RemovalTarget, RowKey};
+    match target {
+        RemovalTarget::Repository(key) => RowKey::Repository(key),
+        RemovalTarget::Checkout(key) => RowKey::Checkout(key),
+        RemovalTarget::Standalone(key) => RowKey::Standalone(key),
+    }
+}
+
+/// Every key a report can name in its error text: the rows it drops, the
+/// rows whose runtime it kills, and its target.
+fn removal_report_keys(
+    report: &baude_core::removal::RemovalReport,
+) -> Vec<baude_core::removal::RowKey> {
+    let mut keys = report.rows_removed.clone();
+    keys.extend(report.runtimes_killed.iter().map(|killed| killed.row));
+    keys.push(removal_target_row_key(report.target));
+    keys
 }
 
 /// Modal lines for the `D` confirmation. A pure transform over the

@@ -550,12 +550,29 @@ impl RemoteConfirm {
     /// the branch in parentheses when the row has one. It reads nothing but
     /// the daemon's index. The local hierarchy hands out the same small key
     /// numbers to different rows, so it is never consulted here (D-16).
+    ///
+    /// The names come from another host and are drawn in a terminal, so no
+    /// control character gets through and a long name is cut.
     pub(crate) fn row_label(&self, key: &baude_core::removal::RowKey) -> String {
+        /// The most characters of a daemon's display name a label shows.
+        const NAME_LIMIT: usize = 80;
+
+        fn printable(text: &str) -> String {
+            text.chars().filter(|c| !c.is_control()).collect()
+        }
+
         match self.rows.label(key) {
-            Some(label) => match label.branch {
-                Some(branch) => format!("{} ({branch})", label.display_name),
-                None => label.display_name,
-            },
+            Some(label) => {
+                let mut name = printable(&label.display_name);
+                if name.chars().count() > NAME_LIMIT {
+                    name = name.chars().take(NAME_LIMIT - 1).collect();
+                    name.push('…');
+                }
+                match label.branch {
+                    Some(branch) => format!("{name} ({})", printable(&branch)),
+                    None => name,
+                }
+            }
             None => REMOVAL_UNKNOWN_ROW.to_string(),
         }
     }
@@ -3931,7 +3948,8 @@ impl App {
 
     /// The sidebar name of a row named in a `RemovalReport`, falling back to
     /// its recorded path so a row the hierarchy no longer projects still
-    /// reads as something concrete.
+    /// reads as something concrete. A key nothing here names reads
+    /// `unknown row`, never as key text.
     pub(crate) fn removal_row_label(&self, key: &baude_core::removal::RowKey) -> String {
         use baude_core::removal::RowKey;
         let from_rows = self
@@ -3973,7 +3991,7 @@ impl App {
                 .map(|standalone| standalone.canonical_path.to_path_buf()),
         };
         path.map(|path| path.display().to_string())
-            .unwrap_or_else(|| format!("{key:?}"))
+            .unwrap_or_else(|| REMOVAL_UNKNOWN_ROW.to_string())
     }
 
     /// The `RemovalTarget` the selected local row names, or `None` for a
@@ -4272,9 +4290,18 @@ impl App {
             RemovalReply::Gone { .. } => {
                 self.close_remote_removal(Self::remote_already_removed_notice(&label));
             }
-            RemovalReply::Refused { message, .. } => self.close_remote_removal(format!(
-                "Cannot remove “{label}”: {message}. Nothing was changed."
-            )),
+            RemovalReply::Refused { message, .. } => {
+                // No report came back, so the target is the one key this
+                // side can name; any other key in the text reads unknown.
+                let message = crate::ui::removal_text_for_user(
+                    &message,
+                    &[crate::ui::removal_target_row_key(target)],
+                    &|_| label.clone(),
+                );
+                self.close_remote_removal(format!(
+                    "Cannot remove “{label}”: {message}. Nothing was changed."
+                ));
+            }
             RemovalReply::Unreachable { .. } | RemovalReply::Indeterminate { .. } => self
                 .close_remote_removal(format!(
                     "No answer from the daemon for “{label}”. Nothing was changed."
