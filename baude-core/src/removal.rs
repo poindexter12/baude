@@ -4392,8 +4392,10 @@ mod tests {
     /// The row kind a matrix cell removes.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MatrixKind {
+        RepositoryParent,
         MainCheckout,
         ManagedWorktree,
+        Standalone,
     }
 
     /// Whether the cell's target has a live runtime when it is removed.
@@ -4408,6 +4410,7 @@ mod tests {
     enum MatrixShape {
         Cloned,
         GitInit,
+        Folder,
     }
 
     /// One cell of the end-state matrix.
@@ -4427,8 +4430,10 @@ mod tests {
         /// assertion message and printed as the cell line.
         fn label(self) -> String {
             let kind = match self.kind {
+                MatrixKind::RepositoryParent => "repository-parent",
                 MatrixKind::MainCheckout => "main-checkout",
                 MatrixKind::ManagedWorktree => "managed-worktree",
+                MatrixKind::Standalone => "standalone",
             };
             let (role, flag) = match self.role {
                 Some((role, true)) => (format!("{role:?}"), "managed"),
@@ -4442,6 +4447,7 @@ mod tests {
             let shape = match self.shape {
                 MatrixShape::Cloned => "cloned",
                 MatrixShape::GitInit => "git-init",
+                MatrixShape::Folder => "folder",
             };
             format!("{kind}/{role}/{flag}/{runtime}/{shape}")
         }
@@ -4477,13 +4483,48 @@ mod tests {
         }
     }
 
-    fn matrix_repository(f: &RemovalFixture, shape: MatrixShape) -> MatrixRepository {
+    /// The git init twin of `outside_worktree`: a linked worktree of the
+    /// fixture repository outside the managed root, on `feature/outside`.
+    fn outside_worktree_of_init(f: &RemovalFixture) -> PathBuf {
+        let path = f.root.join("outside-wt");
+        git_ok(
+            &f.repo(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/outside",
+                path.to_str().expect("utf-8 outside path"),
+            ],
+        );
+        fs::canonicalize(&path).expect("canonicalize outside worktree")
+    }
+
+    /// Build and seed the repository for `shape`. With `with_unmanaged` it
+    /// also gets a linked worktree baude did not create, seeded as a
+    /// `ManagedBranch` row whose `managed_by_baude` is false.
+    fn matrix_repository(
+        f: &RemovalFixture,
+        shape: MatrixShape,
+        with_unmanaged: bool,
+    ) -> MatrixRepository {
         let mut state = RepositoryState::default();
+        let unmanaged = |state: &mut RepositoryState, k: RepositoryKey, path: PathBuf| {
+            let key = checkout(state, k, CheckoutRole::ManagedBranch, false, &path);
+            MatrixChild {
+                key,
+                role: CheckoutRole::ManagedBranch,
+                managed: false,
+                path,
+            }
+        };
         match shape {
+            MatrixShape::Folder => panic!("a folder cell has no repository"),
             MatrixShape::Cloned => {
                 let t = cloned_topology(&f.root);
                 let rows = seed_cloned(&mut state, &t);
-                let children = vec![
+                let mut children = vec![
                     MatrixChild {
                         key: rows.m,
                         role: CheckoutRole::Main,
@@ -4503,6 +4544,10 @@ mod tests {
                         path: t.managed_worktree.clone(),
                     },
                 ];
+                if with_unmanaged {
+                    let outside = outside_worktree(f, &t);
+                    children.push(unmanaged(&mut state, rows.k, outside));
+                }
                 MatrixRepository {
                     state,
                     key: rows.k,
@@ -4517,7 +4562,7 @@ mod tests {
                 let k = seed_repository(&mut state, f);
                 let m = checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
                 let b = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
-                let children = vec![
+                let mut children = vec![
                     MatrixChild {
                         key: m,
                         role: CheckoutRole::Main,
@@ -4531,6 +4576,10 @@ mod tests {
                         path: managed,
                     },
                 ];
+                if with_unmanaged {
+                    let outside = outside_worktree_of_init(f);
+                    children.push(unmanaged(&mut state, k, outside));
+                }
                 MatrixRepository {
                     state,
                     key: k,
@@ -4600,6 +4649,8 @@ mod tests {
         marker_dir: Option<Vec<String>>,
         /// The repository each watched path is suppressed under.
         suppressions: BTreeMap<PathBuf, Option<String>>,
+        /// The suppression store's bytes.
+        suppression_file: Option<Vec<u8>>,
         /// Every row key in the saved state file, in file order.
         saved_rows: Vec<RowKey>,
         /// The agent pid of every runtime the saved state file records.
@@ -4719,6 +4770,7 @@ mod tests {
                 .map(marker_bytes),
             marker_dir: marker_dir.map(listing),
             suppressions,
+            suppression_file: fs::read(suppression::file_path(&crate::persist::config_dir())).ok(),
             saved_rows: saved_rows(&saved),
             saved_agents: saved_agents(&saved),
         }
@@ -4861,7 +4913,7 @@ mod tests {
         let (role, managed) = cell.role.expect("a checkout cell names a role");
         let f = RemovalFixture::new(&format!("matrix-{}", label.replace('/', "-")));
         let config = crate::persist::config_dir();
-        let mut repo = matrix_repository(&f, cell.shape);
+        let mut repo = matrix_repository(&f, cell.shape, false);
         let (target, target_path) = repo.child(role, managed);
         if managed {
             make_unclean(&target_path, repo.tracked);
@@ -4926,6 +4978,9 @@ mod tests {
         let target_directory_goes = match cell.kind {
             MatrixKind::MainCheckout => false,
             MatrixKind::ManagedWorktree => true,
+            MatrixKind::RepositoryParent | MatrixKind::Standalone => {
+                panic!("{label}: not a checkout cell")
+            }
         };
         for child in &repo.children {
             let dir = format!("directory {}", child.path.display());
@@ -5030,7 +5085,333 @@ mod tests {
         println!("CELL:{label}");
     }
 
+    /// One cell whose target is a repository row with its children: the
+    /// main checkout, the managed worktrees and a linked worktree baude did
+    /// not create. A live cell runs one runtime on the main checkout and one
+    /// on the managed branch worktree, so two groups are observed.
+    fn run_repository_cell(cell: MatrixCell) {
+        let label = cell.label();
+        let f = RemovalFixture::new(&format!("matrix-{}", label.replace('/', "-")));
+        let config = crate::persist::config_dir();
+        let mut repo = matrix_repository(&f, cell.shape, true);
+        for child in repo.children.iter().filter(|child| child.managed) {
+            make_unclean(&child.path, repo.tracked);
+        }
+        let digest = digest_of(&repo.common);
+        let marker_dir = owned_repository_dir(&digest, &repo.common);
+        set_physical_key(&mut repo.state, repo.key, &digest);
+        folder_workspace::record(Some(&config), &repo.main, "matrix-ws", 10);
+        let old_child = f.root.join("old-child");
+        suppression::suppress(&config, &old_child, &repo.common, 1)
+            .expect("seed child suppression");
+        let neighbours = seed_neighbours(&f);
+
+        let mut handles = LiveHandles(Vec::new());
+        let mut runtimes = Vec::new();
+        match cell.runtime {
+            MatrixRuntime::Live => {
+                for (role, managed) in [
+                    (CheckoutRole::Main, false),
+                    (CheckoutRole::ManagedBranch, true),
+                ] {
+                    let (key, path) = repo.child(role, managed);
+                    let pty = spawn_trapping_runtime(&path);
+                    let identity = pty.process_identity();
+                    runtimes.push((identity.pid, identity.process_group));
+                    seed_live(&mut repo.state, key, &pty, None);
+                    handles.0.push(handle_for(
+                        RowKey::Checkout(key),
+                        pty,
+                        None,
+                        &path,
+                        &repo.main,
+                    ));
+                }
+            }
+            MatrixRuntime::NoRuntime => {}
+        }
+        repo.state.validate_for_save().expect("seed is save-valid");
+        write_seed(&f, &repo.state);
+
+        let probe = Probe {
+            state_root: f.state_root(),
+            runtimes,
+            git_repo: Some(repo.main.clone()),
+            dirs: repo
+                .children
+                .iter()
+                .map(|child| child.path.clone())
+                .collect(),
+            bound: vec![repo.main.clone(), neighbours.folder.clone()],
+            marker_dir: Some(marker_dir),
+            suppressed: vec![old_child.clone(), neighbours.suppressed.clone()],
+        };
+        let before = read_end_state(&probe);
+        let (save, calls) = counting_save(&f.state_root());
+        if let Err(error) = remove(
+            &mut repo.state,
+            RemovalTarget::Repository(repo.key),
+            &mut handles.0,
+            save,
+        ) {
+            panic!("{label}: the removal failed: {error:?}");
+        }
+        let after = read_end_state(&probe);
+
+        // Process: every child group.
+        expect_processes(&label, cell.runtime, &probe, &before, &after);
+
+        // Worktree: managed directories and their registrations go; the
+        // main checkout and the unmanaged worktree stay, still registered.
+        let mut gone = 0;
+        let mut kept = 0;
+        for child in &repo.children {
+            let dir = format!("directory {}", child.path.display());
+            let registration = format!("git registration of {}", child.path.display());
+            let directory_goes = child.managed;
+            if directory_goes {
+                gone += 1;
+                assert_gone(
+                    &label,
+                    &dir,
+                    &before.dirs[&child.path],
+                    &after.dirs[&child.path],
+                );
+                assert_gone(
+                    &label,
+                    &registration,
+                    &before.registrations[&child.path],
+                    &after.registrations[&child.path],
+                );
+            } else {
+                kept += 1;
+                assert_kept(
+                    &label,
+                    &dir,
+                    &before.dirs[&child.path],
+                    &after.dirs[&child.path],
+                );
+                assert_kept(
+                    &label,
+                    &registration,
+                    &before.registrations[&child.path],
+                    &after.registrations[&child.path],
+                );
+            }
+        }
+        assert!(
+            gone >= 1 && kept == 2,
+            "{label}: the cell must hold a managed child, the main checkout and an unmanaged child"
+        );
+        assert_kept(
+            &label,
+            "the branch snapshot",
+            &before.branches,
+            &after.branches,
+        );
+
+        // Binding.
+        assert_gone(
+            &label,
+            "the repository's binding",
+            &before.bindings[&repo.main],
+            &after.bindings[&repo.main],
+        );
+        assert_kept(
+            &label,
+            "the neighbour's binding",
+            &before.bindings[&neighbours.folder],
+            &after.bindings[&neighbours.folder],
+        );
+
+        // Marker and suppression.
+        assert_gone(&label, "the owned marker", &before.marker, &after.marker);
+        assert_gone(
+            &label,
+            "the repository directory",
+            &before.marker_dir,
+            &after.marker_dir,
+        );
+        assert_gone(
+            &label,
+            "the child's suppression entry",
+            &before.suppressions[&old_child],
+            &after.suppressions[&old_child],
+        );
+        assert_kept(
+            &label,
+            "the neighbour's suppression entry",
+            &before.suppressions[&neighbours.suppressed],
+            &after.suppressions[&neighbours.suppressed],
+        );
+
+        // Saved rows, and the one save that wrote them.
+        let mut removed: Vec<RowKey> = repo
+            .children
+            .iter()
+            .map(|child| RowKey::Checkout(child.key))
+            .collect();
+        removed.push(RowKey::Repository(repo.key));
+        expect_rows_dropped(&label, &before, &after, &removed);
+        assert_eq!(calls.get(), 1, "{label}: the removal must save once");
+
+        println!("CELL:{label}");
+    }
+
+    /// One cell whose target is a standalone folder with a binding of its
+    /// own. It has no repository, so no marker is seeded and the managed
+    /// root is read to show none appears.
+    fn run_standalone_cell(cell: MatrixCell) {
+        let label = cell.label();
+        let f = RemovalFixture::new(&format!("matrix-{}", label.replace('/', "-")));
+        let config = crate::persist::config_dir();
+        let notes = notes_folder(&f);
+        folder_workspace::record(Some(&config), &notes, "matrix-ws", 10);
+        let neighbours = seed_neighbours(&f);
+
+        let mut state = RepositoryState::default();
+        let mut handles = LiveHandles(Vec::new());
+        let mut runtimes = Vec::new();
+        let key = match cell.runtime {
+            MatrixRuntime::Live => {
+                let pty = spawn_trapping_runtime(&notes);
+                let identity = pty.process_identity().clone();
+                runtimes.push((identity.pid, identity.process_group));
+                let key = seed_notes(
+                    &mut state,
+                    &notes,
+                    StandaloneLifecycle::Running(RuntimeGeneration::initial()),
+                    Some(OwnedRuntime {
+                        generation: RuntimeGeneration::initial(),
+                        agent: identity,
+                        shell: ShellOwnership::Closed,
+                    }),
+                );
+                handles.0.push(handle_for(
+                    RowKey::Standalone(key),
+                    pty,
+                    None,
+                    &notes,
+                    &notes,
+                ));
+                key
+            }
+            MatrixRuntime::NoRuntime => {
+                seed_notes(&mut state, &notes, StandaloneLifecycle::Inactive, None)
+            }
+        };
+        state.validate_for_save().expect("seed is save-valid");
+        write_seed(&f, &state);
+
+        let managed_root = f.managed_root();
+        let probe = Probe {
+            state_root: f.state_root(),
+            runtimes,
+            git_repo: None,
+            dirs: vec![notes.clone(), managed_root.clone()],
+            bound: vec![notes.clone(), neighbours.folder.clone()],
+            marker_dir: None,
+            suppressed: vec![notes.clone(), neighbours.suppressed.clone()],
+        };
+        let before = read_end_state(&probe);
+        let (save, calls) = counting_save(&f.state_root());
+        if let Err(error) = remove(
+            &mut state,
+            RemovalTarget::Standalone(key),
+            &mut handles.0,
+            save,
+        ) {
+            panic!("{label}: the removal failed: {error:?}");
+        }
+        let after = read_end_state(&probe);
+
+        // Process.
+        expect_processes(&label, cell.runtime, &probe, &before, &after);
+
+        // Folder: kept with the same entries.
+        assert_kept(
+            &label,
+            &format!("folder {}", notes.display()),
+            &before.dirs[&notes],
+            &after.dirs[&notes],
+        );
+
+        // Binding.
+        assert_gone(
+            &label,
+            "the folder's binding",
+            &before.bindings[&notes],
+            &after.bindings[&notes],
+        );
+        assert_kept(
+            &label,
+            "the neighbour's binding",
+            &before.bindings[&neighbours.folder],
+            &after.bindings[&neighbours.folder],
+        );
+
+        // Marker: none exists and none appears under the managed root.
+        for (when, read) in [("before", &before), ("after", &after)] {
+            assert_eq!(
+                read.dirs[&managed_root],
+                Some(Vec::new()),
+                "{label}: the managed root must hold no repository directory {when} the removal"
+            );
+            assert_eq!(
+                read.suppressions[&notes], None,
+                "{label}: the folder must have no suppression entry {when} the removal"
+            );
+        }
+
+        // Suppression: the store is byte-identical.
+        assert_kept(
+            &label,
+            "the suppression store's bytes",
+            &before.suppression_file,
+            &after.suppression_file,
+        );
+
+        // Saved rows, and the one save that wrote them.
+        expect_rows_dropped(&label, &before, &after, &[RowKey::Standalone(key)]);
+        assert_eq!(calls.get(), 1, "{label}: the removal must save once");
+
+        println!("CELL:{label}");
+    }
+
     const MATRIX_RUNTIMES: [MatrixRuntime; 2] = [MatrixRuntime::Live, MatrixRuntime::NoRuntime];
+
+    /// REL-01, repository row: every child runtime goes, managed directories
+    /// go, the main checkout and an unmanaged worktree stay, the repository's
+    /// binding, owned marker and directory are cleared and its children's
+    /// suppression entries are dropped. Four cells on both shapes.
+    #[test]
+    fn end_state_matrix_repository_parent() {
+        for shape in [MatrixShape::Cloned, MatrixShape::GitInit] {
+            for runtime in MATRIX_RUNTIMES {
+                run_repository_cell(MatrixCell {
+                    kind: MatrixKind::RepositoryParent,
+                    role: None,
+                    runtime,
+                    shape,
+                });
+            }
+        }
+    }
+
+    /// REL-01, standalone row: the runtime and the folder's own binding go;
+    /// the folder stays with the same entries, no marker exists and the
+    /// suppression store is byte-identical. Two cells.
+    #[test]
+    fn end_state_matrix_standalone() {
+        for runtime in MATRIX_RUNTIMES {
+            run_standalone_cell(MatrixCell {
+                kind: MatrixKind::Standalone,
+                role: None,
+                runtime,
+                shape: MatrixShape::Folder,
+            });
+        }
+    }
 
     /// REL-01, managed worktree row: the runtime, the directory, the git
     /// registration and the row's own binding go; the branch and the parent
