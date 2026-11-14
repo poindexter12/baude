@@ -547,7 +547,24 @@
     return html;
   }
 
-  const BaudeRemovalController = { createRemovalController, renderRowsList };
+  // ---- the confirmation's action button ----
+
+  // What the confirmation's action button shows for a modal from getModal():
+  // whether it can be pressed and what it says. It is off while a request is
+  // out, and off when pressing it could do nothing. A preview that failed
+  // holds no report and stays pressable, because confirm() asks for that
+  // preview again; that press is the only retry the user has short of
+  // cancelling and starting over.
+  function confirmControl(modal) {
+    if (!isRecord(modal)) return { disabled: true, label: "remove" };
+    const waiting = modal.phase === "loading" || modal.phase === "executing";
+    return {
+      disabled: waiting || (modal.phase !== "error" && !modal.report),
+      label: modal.phase === "executing" ? "removing…" : modal.phase === "error" ? "retry" : "remove",
+    };
+  }
+
+  const BaudeRemovalController = { createRemovalController, renderRowsList, confirmControl };
 
   globalThis.BaudeRemovalController = BaudeRemovalController;
   if (typeof module !== "undefined" && module.exports) {

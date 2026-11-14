@@ -1114,6 +1114,70 @@ test("double_confirm_sends_one_post", async () => {
   assert.deepEqual(checkoutKeys(h.controller.getRows()), [5]);
 });
 
+// What the page draws on the confirmation's action button for the controller's
+// current modal. app.js sets the button from exactly this.
+function confirmButton(h) {
+  return controllerModule().confirmControl(h.controller.getModal());
+}
+
+// A preview that never produced a report, in the two shapes api() in app.js
+// rejects with: a daemon 500 carrying text and a status, and a request that
+// never got an answer, which fetch rejects as a TypeError with no status
+// (Safari words it `Load failed`).
+async function assertFailedPreviewCanBeRetried(rejection, text) {
+  const h = harness();
+  await h.serveRows(rowsBody());
+  const opening = h.controller.openPreview({ checkout: 7 });
+  assert.deepEqual(confirmButton(h), { disabled: true, label: "remove" }, "nothing to press while loading");
+
+  h.pending("POST", "/removals/preview").reject(rejection);
+  await opening;
+
+  const failed = h.controller.getModal();
+  assert.equal(failed.phase, "error", text);
+  assert.equal(failed.errorText, text);
+  assert.equal(failed.report, null, "a failed preview holds no report");
+  // The button reads retry, so it has to be one the user can press.
+  assert.deepEqual(confirmButton(h), { disabled: false, label: "retry" }, text);
+
+  // Pressing it asks for the same preview again and executes nothing.
+  const retrying = h.controller.confirm();
+  assert.equal(h.count("POST", "/removals/preview"), 2);
+  assert.deepEqual(sentBody(h.pending("POST", "/removals/preview")), { checkout: 7 });
+  assert.equal(h.count("POST", "/removals"), 0);
+  assert.deepEqual(confirmButton(h), { disabled: true, label: "remove" }, "off again while the retry is out");
+
+  await h.reply("POST", "/removals/preview", previewReport());
+  await retrying;
+  assert.equal(h.controller.getModal().phase, "preview");
+  assert.equal(h.controller.getModal().errorText, null);
+  assert.deepEqual(confirmButton(h), { disabled: false, label: "remove" });
+}
+
+test("failed_preview_leaves_retry_pressable_and_retry_asks_for_the_preview_again", async () => {
+  await assertFailedPreviewCanBeRetried(
+    Object.assign(new Error("removal plan failed validation: checkout 7 has no repository"), { status: 500 }),
+    "removal plan failed validation: checkout 7 has no repository",
+  );
+  await assertFailedPreviewCanBeRetried(new TypeError("Load failed"), "Load failed");
+});
+
+test("confirm_button_follows_the_phase_through_an_execute_and_its_retry", async () => {
+  const h = harness();
+  assert.deepEqual(confirmButton(h), { disabled: true, label: "remove" }, "no confirmation open");
+  await preview(h);
+  assert.deepEqual(confirmButton(h), { disabled: false, label: "remove" });
+
+  h.confirming = h.controller.confirm();
+  await settle();
+  assert.deepEqual(confirmButton(h), { disabled: true, label: "removing…" });
+
+  // A failed execute still holds the report, and retry reposts it.
+  await h.fail("POST", "/removals", 503, `repository busy: ${REPO_PATH}`);
+  await h.confirming;
+  assert.deepEqual(confirmButton(h), { disabled: false, label: "retry" });
+});
+
 test("late_preview_response_after_cancel_is_ignored", async () => {
   const h = harness();
   await h.serveRows(rowsBody());

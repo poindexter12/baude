@@ -675,9 +675,10 @@ function renderRemovalModal() {
   error.textContent = m.errorText || "";
   error.hidden = !m.errorText;
   const confirmBtn = div.querySelector("#rmconfirm");
-  confirmBtn.disabled = m.phase === "loading" || m.phase === "executing" || !m.report;
-  confirmBtn.textContent = m.phase === "executing" ? "removing…"
-    : m.phase === "error" ? "retry" : "remove";
+  // Decided by the controller, which owns what a press does in each phase.
+  const control = BaudeRemovalController.confirmControl(m);
+  confirmBtn.disabled = control.disabled;
+  confirmBtn.textContent = control.label;
   removalModalShown = m;
 }
 
