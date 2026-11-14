@@ -212,3 +212,22 @@ Round 3 offenders fixed and committed: 06f6a74, cf17846, 7752640; validation map
 - Phase 21 code review committed `7f31b2b`: 0 critical, 6 warnings WR-01..06, 3 info. NEXT: `/gsd-code-review 21 --fix --auto`, then the `verify:post` security hook `gsd-secure-phase 21`, onError halt.
 - Phase 22 context committed `06b8290`. Owner answers: push and open one PR, stop before merge; re-verify phases 18, 19, 20 before the push; teardown 500 backlogged as BL-11.
 - After the fix pass: UI design contract check, `gsd-plan-phase 22`, `gsd-execute-phase 22 --no-transition`, re-verify 18 to 20, both gates, push, PR, stop.
+
+## 2026-11-14 autonomous run, state after phase 22 planning
+
+Done: 21 review fixes (5 of 6, WR-06 skipped), `21-SECURITY.md` at `f934e64` with T-21-92 and T-21-93 owner-accepted unverified, phase 22 research `e3285ef`, verification reports for 18 to 20 at `fd265d5`, plans 22-01 to 22-05 plus `22-VALIDATION.md` at `4c43db9`.
+
+Owner decisions, 2026-11-13 evening, via question prompts:
+- Fix BOTH verification defects in Phase 22 before release. This reverses the earlier "backlog BL-11" answer.
+  - Defect A, Phase 18 truth 13, BL-11 cause: `signal_group` at `baude-core/src/pty.rs:1073-1087` tolerates ESRCH only; macOS returns EPERM for a zombie-only group. Fix direction: treat EPERM as no signalable member and fall through to `wait_for_group_extinction`. Fixture `await_parked_holder` in `baude-core/src/testing.rs:479-500` reaps first and hides it. Repro in scratchpad `bl11-repro/`.
+  - Defect B, Phase 19 SC2: removed primary checkout returns on relaunch inside a sibling worktree. `baude/src/app.rs:2624-2688` creates a `PrimaryDefault` row without `suppression::is_suppressed`. Probe test in scratchpad `probe_test.rs`.
+- Phase 20: record overrides for the two clauses Phase 21 D-12 reversed, accepted by Joe Seymour; manual visual check at 59x20 and 120+ columns recorded as waived by owner, not performed. Then Phase 20 passes once the gate runs.
+- Release scope unchanged: both gates, push, one `feat` PR, stop before merge.
+
+Remaining order:
+1. Planner writes fix plans 22-06 (defect A) and 22-07 (defect B), which run FIRST; then 22-01 to 22-04; 22-05 last. Line anchors in 01 to 04 need a refresh after the fixes.
+2. Apply the Phase 20 override block from the "Superseded clauses" section of `20-VERIFICATION.md` to its frontmatter, plus the visual waiver.
+3. Plan checker over all seven plans, then execute serially on the main tree, one executor per plan, closed reading lists.
+4. After 22-06 and 22-07 land, re-verify the failed truths of 18 and 19 so their reports reach `passed`; plan 22-05 Task 1 requires `status: passed` on 18, 19 and 20.
+5. Post-execution: code review, verify, validate-phase and secure-phase for 22; phases 18 to 20 still lack SECURITY files and 18 to 21 VALIDATION files are drafts, which the milestone audit will flag.
+6. Bookkeeping behind: ROADMAP checkboxes for 19 and 20, TUI-01 to TUI-04 in REQUIREMENTS, READM-03 and READM-04 are marked complete but are not until 22-07 lands.
