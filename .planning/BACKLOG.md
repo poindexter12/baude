@@ -465,3 +465,9 @@ defunct child. The suite leaked them when its harness died; separate from the
 runtime leak but the same reaping discipline applies to fixtures.
 
 **Status:** ✅ RESOLVED 2026-09-25 via PR #103, released in v2.4.2. Board SQ-3 closed with a verified delivery. The kill tests trap SIGHUP because portable-pty 0.8.1 `Child::kill()` sends SIGHUP first and self-reaps when that alone kills the child, which masked the bug on a plain `sleep` fixture. Running baudes keep their existing zombies until restarted on 2.4.2. The four orphaned fixture shells are still a separate cleanup.
+
+## Captured 2026-11-13
+
+### BL-11 — Intermittent macOS 500 on session teardown: "failed to terminate exact PTY process group"
+
+`DELETE /sessions/{id}` and removal through the daemon occasionally return 500 on macOS. Seen in 1 of 3 and 1 of 5 full single-threaded test runs after plan 21-10, and in 0 of 5 at `aebb3e1`; not seen in the later gate runs. Suspected cause, not confirmed: `signal_group` in `baude-core/src/pty.rs` tolerates ESRCH but not EPERM when the group has already gone. Deferred from v2.8 by owner decision on 2026-11-13; v2.8.0 ships with it known. Any fix touches platform process code and needs `scripts/gate.sh --linux`.
