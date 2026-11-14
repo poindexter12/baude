@@ -421,7 +421,7 @@ impl RemovalCall {
 /// Remove every control character, collapse whitespace runs to one space and
 /// cap the length. Every daemon-supplied string shown to the user passes
 /// through here: the daemon is another machine and its text is untrusted.
-fn sanitize_daemon_text(text: &str) -> String {
+pub(crate) fn sanitize_daemon_text(text: &str) -> String {
     let mut out = String::new();
     let mut kept = 0usize;
     let mut gap = false;

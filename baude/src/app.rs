@@ -4323,7 +4323,20 @@ impl App {
     ) {
         match reply {
             RemovalReply::Report(report) => {
-                self.close_remote_removal(Self::removal_notice(&report));
+                let mut notice = Self::removal_notice(&report);
+                // A local removal raises `persistence_dirty` for this outcome.
+                // The state file here is another machine's, so the footer is
+                // the one place its caveat can be read. The detail is often
+                // a bare OS error, so it is led in by what it is about.
+                if let baude_core::removal::PersistenceOutcome::SavedDegraded { detail } =
+                    &report.persistence
+                {
+                    notice.push_str(&format!(
+                        "; the daemon could not confirm its state save: {}",
+                        crate::remote::sanitize_daemon_text(detail)
+                    ));
+                }
+                self.close_remote_removal(notice);
             }
             // D-14: the daemon removed nothing and sent its fresh preview.
             RemovalReply::Drift(fresh) => {
@@ -13718,6 +13731,97 @@ mod tests {
         assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
         assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
         end_remote_remove(app, &fx);
+    }
+
+    /// Drive a remote removal whose execute the daemon answers 200 with
+    /// `persistence`, and return the footer it leaves. The removal is over
+    /// either way: the modal is closed and Enter sends nothing more.
+    fn footer_after_remote_removal_saved_as(
+        name: &str,
+        persistence: baude_core::removal::PersistenceOutcome,
+    ) -> String {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app(name, |previewed, rows_body| {
+            let mut committed = executed_report(previewed);
+            committed.persistence = persistence;
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, wire(&committed))],
+                vec![rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.starts_with("removed 1 row"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+        message
+    }
+
+    /// The daemon removed the row and replaced its state file, but could not
+    /// confirm the replacement, and says so in its report. The footer is the
+    /// one place a remote removal can show that: this TUI keeps no dirty mark
+    /// for another machine's state file. The PWA shows the same detail.
+    #[test]
+    fn remote_remove_degraded_daemon_save_is_named_in_the_footer() {
+        use baude_core::removal::PersistenceOutcome;
+
+        // What core reports when the rename landed and syncing the directory
+        // did not: the bare OS error, with nothing that says what it is about.
+        const DETAIL: &str = "Input/output error (os error 5)";
+
+        let degraded = footer_after_remote_removal_saved_as(
+            "d-remote-save-degraded",
+            PersistenceOutcome::SavedDegraded {
+                detail: DETAIL.to_string(),
+            },
+        );
+        assert!(degraded.contains(DETAIL), "{degraded}");
+        // The bare error is led in by what it is about.
+        assert!(degraded.contains("daemon"), "{degraded}");
+        // Still a removal that happened, never a failure.
+        assert!(!degraded.contains("failed"), "{degraded}");
+
+        // A clean save has no caveat to show.
+        let saved =
+            footer_after_remote_removal_saved_as("d-remote-save-clean", PersistenceOutcome::Saved);
+        assert!(!saved.contains("daemon"), "{saved}");
+        assert_ne!(saved, degraded);
+    }
+
+    /// The detail is another machine's text drawn in this terminal: no
+    /// control character gets through and a long one is cut.
+    #[test]
+    fn remote_remove_degraded_daemon_save_detail_is_cleaned_for_the_footer() {
+        use baude_core::removal::PersistenceOutcome;
+
+        let hostile = format!("\u{1b}[31mdisk\nfull\t{}", "x".repeat(5000));
+        let message = footer_after_remote_removal_saved_as(
+            "d-remote-save-hostile",
+            PersistenceOutcome::SavedDegraded { detail: hostile },
+        );
+
+        assert!(message.contains("[31mdisk full x"), "{message}");
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(message.chars().count() < 700, "{}", message.chars().count());
     }
 
     /// A preview the daemon refuses, or never answers, closes the modal with
