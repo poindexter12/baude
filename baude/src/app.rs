@@ -11202,6 +11202,7 @@ mod tests {
         let (mut first, removed, primary_path) = remove_primary(&fx);
         let list_before = worktree_list(&fx.repo);
         let seen_before = checkouts_seen(&first);
+        let counter_before = first.repository_state.next_checkout_key;
         let entry_written = is_suppressed(&fx.repo);
 
         let mut restarted = relaunch_app(&fx, fx.linked.clone());
@@ -11213,6 +11214,8 @@ mod tests {
             checkout_row(&restarted, &fx.repo).map(|row| (row.key, row.role, row.first_seen_order));
         let entry_kept = is_suppressed(&fx.repo);
         let folder_kept = fx.repo.is_dir();
+        let sessions_started = restarted.sessions.len();
+        let counter_after = restarted.repository_state.next_checkout_key;
         let valid = restarted
             .repository_state
             .validate()
@@ -11260,6 +11263,11 @@ mod tests {
                 .is_some_and(|message| message.contains(&named)),
             "the message names the folder that brings the checkout back: {message:?}"
         );
+        assert_eq!(sessions_started, 0, "a sibling launch starts no session");
+        assert_eq!(
+            counter_after, counter_before,
+            "the checkout key allocator did not advance"
+        );
     }
 
     #[test]
@@ -11280,12 +11288,15 @@ mod tests {
         let folder_gone = !primary_path.exists();
         let list_before = worktree_list(&fx.repo);
         let seen_before = checkouts_seen(&first);
+        let counter_before = first.repository_state.next_checkout_key;
 
         let mut restarted = relaunch_app(&fx, fx.repo.clone());
         restarted.restore();
 
         let list_after = worktree_list(&fx.repo);
         let seen_after = checkouts_seen(&restarted);
+        let sessions_started = restarted.sessions.len();
+        let counter_after = restarted.repository_state.next_checkout_key;
         let valid = restarted
             .repository_state
             .validate()
@@ -11338,6 +11349,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("remove this repository")),
             "the message says how to bring the checkout back: {message:?}"
+        );
+        assert_eq!(sessions_started, 0, "a sibling launch starts no session");
+        assert_eq!(
+            counter_after, counter_before,
+            "the checkout key allocator did not advance"
         );
     }
 
