@@ -4392,6 +4392,7 @@ mod tests {
     /// The row kind a matrix cell removes.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MatrixKind {
+        MainCheckout,
         ManagedWorktree,
     }
 
@@ -4399,12 +4400,14 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MatrixRuntime {
         Live,
+        NoRuntime,
     }
 
     /// The fixture shape the cell is built on.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MatrixShape {
         Cloned,
+        GitInit,
     }
 
     /// One cell of the end-state matrix.
@@ -4424,6 +4427,7 @@ mod tests {
         /// assertion message and printed as the cell line.
         fn label(self) -> String {
             let kind = match self.kind {
+                MatrixKind::MainCheckout => "main-checkout",
                 MatrixKind::ManagedWorktree => "managed-worktree",
             };
             let (role, flag) = match self.role {
@@ -4433,9 +4437,11 @@ mod tests {
             };
             let runtime = match self.runtime {
                 MatrixRuntime::Live => "live",
+                MatrixRuntime::NoRuntime => "none",
             };
             let shape = match self.shape {
                 MatrixShape::Cloned => "cloned",
+                MatrixShape::GitInit => "git-init",
             };
             format!("{kind}/{role}/{flag}/{runtime}/{shape}")
         }
@@ -4506,6 +4512,34 @@ mod tests {
                     children,
                 }
             }
+            MatrixShape::GitInit => {
+                let managed = f.managed_worktree("wt-a", "feature/a");
+                let k = seed_repository(&mut state, f);
+                let m = checkout(&mut state, k, CheckoutRole::Main, false, &f.repo());
+                let b = checkout(&mut state, k, CheckoutRole::ManagedBranch, true, &managed);
+                let children = vec![
+                    MatrixChild {
+                        key: m,
+                        role: CheckoutRole::Main,
+                        managed: false,
+                        path: f.repo(),
+                    },
+                    MatrixChild {
+                        key: b,
+                        role: CheckoutRole::ManagedBranch,
+                        managed: true,
+                        path: managed,
+                    },
+                ];
+                MatrixRepository {
+                    state,
+                    key: k,
+                    main: f.repo(),
+                    common: f.common_dir(),
+                    tracked: "tracked.txt",
+                    children,
+                }
+            }
         }
     }
 
@@ -4568,6 +4602,8 @@ mod tests {
         suppressions: BTreeMap<PathBuf, Option<String>>,
         /// Every row key in the saved state file, in file order.
         saved_rows: Vec<RowKey>,
+        /// The agent pid of every runtime the saved state file records.
+        saved_agents: Vec<u32>,
     }
 
     fn present(path: &Path) -> bool {
@@ -4582,8 +4618,22 @@ mod tests {
             .find(|lines| lines.first() == Some(&head))
     }
 
-    fn saved_rows(state_root: &Path) -> Vec<RowKey> {
-        let state = load_state(state_root);
+    fn saved_agents(state: &RepositoryState) -> Vec<u32> {
+        let checkouts = state.checkouts.iter().map(SavedCheckout::owned_runtime);
+        let standalone = state
+            .standalone_sessions
+            .iter()
+            .map(SavedStandaloneSession::owned_runtime);
+        let mut pids: Vec<u32> = checkouts
+            .chain(standalone)
+            .flatten()
+            .map(|runtime| runtime.agent.pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    fn saved_rows(state: &RepositoryState) -> Vec<RowKey> {
         state
             .repositories
             .iter()
@@ -4644,6 +4694,7 @@ mod tests {
             })
             .collect();
         let marker_dir = probe.marker_dir.as_deref().filter(|dir| present(dir));
+        let saved = load_state(&probe.state_root);
         let store = suppressions_on_disk();
         let suppressions = probe
             .suppressed
@@ -4668,7 +4719,8 @@ mod tests {
                 .map(marker_bytes),
             marker_dir: marker_dir.map(listing),
             suppressions,
-            saved_rows: saved_rows(&probe.state_root),
+            saved_rows: saved_rows(&saved),
+            saved_agents: saved_agents(&saved),
         }
     }
 
@@ -4728,8 +4780,11 @@ mod tests {
         );
     }
 
-    /// Every runtime the cell started is in the process table before the
-    /// removal and out of it after: the agent pid reaped, the group extinct.
+    /// Every runtime the cell started is in the process table and recorded
+    /// in the saved state before the removal and out of both after: the
+    /// agent pid reaped, the group extinct. A cell with no runtime has no pid
+    /// to observe, so it is held to a fixture that started none and a saved
+    /// state that records none.
     fn expect_processes(
         label: &str,
         runtime: MatrixRuntime,
@@ -4737,10 +4792,25 @@ mod tests {
         before: &EndState,
         after: &EndState,
     ) {
+        let mut started: Vec<u32> = probe.runtimes.iter().map(|(pid, _)| *pid).collect();
+        started.sort_unstable();
+        assert_eq!(
+            before.saved_agents, started,
+            "{label}: the saved state must record exactly the runtimes the fixture started"
+        );
+        assert!(
+            after.saved_agents.is_empty(),
+            "{label}: the saved state must record no runtime after the removal, found {:?}",
+            after.saved_agents
+        );
         match runtime {
+            MatrixRuntime::NoRuntime => assert!(
+                started.is_empty() && before.agents.is_empty() && before.groups.is_empty(),
+                "{label}: the fixture must have started no runtime"
+            ),
             MatrixRuntime::Live => {
                 assert!(
-                    !probe.runtimes.is_empty(),
+                    !started.is_empty(),
                     "{label}: a live cell must start a runtime"
                 );
                 for (index, (pid, pgid)) in probe.runtimes.iter().enumerate() {
@@ -4818,6 +4888,7 @@ mod tests {
                     &repo.main,
                 ));
             }
+            MatrixRuntime::NoRuntime => {}
         }
         repo.state.validate_for_save().expect("seed is save-valid");
         write_seed(&f, &repo.state);
@@ -4853,6 +4924,7 @@ mod tests {
         // Worktree: the target's directory and registration per its kind,
         // every sibling's kept, every branch kept.
         let target_directory_goes = match cell.kind {
+            MatrixKind::MainCheckout => false,
             MatrixKind::ManagedWorktree => true,
         };
         for child in &repo.children {
@@ -4958,17 +5030,47 @@ mod tests {
         println!("CELL:{label}");
     }
 
+    const MATRIX_RUNTIMES: [MatrixRuntime; 2] = [MatrixRuntime::Live, MatrixRuntime::NoRuntime];
+
     /// REL-01, managed worktree row: the runtime, the directory, the git
     /// registration and the row's own binding go; the branch and the parent
-    /// marker stay; the path is suppressed.
+    /// marker stay; the path is suppressed. Six cells: the managed branch
+    /// worktree on both shapes and the default checkout baude created on the
+    /// cloned shape, which is deleted like any managed worktree and leaves
+    /// `main` behind.
     #[test]
     fn end_state_matrix_managed_worktree() {
-        run_checkout_cell(MatrixCell {
-            kind: MatrixKind::ManagedWorktree,
-            role: Some((CheckoutRole::ManagedBranch, true)),
-            runtime: MatrixRuntime::Live,
-            shape: MatrixShape::Cloned,
-        });
+        for (role, shape) in [
+            (CheckoutRole::ManagedBranch, MatrixShape::Cloned),
+            (CheckoutRole::ManagedBranch, MatrixShape::GitInit),
+            (CheckoutRole::PrimaryDefault, MatrixShape::Cloned),
+        ] {
+            for runtime in MATRIX_RUNTIMES {
+                run_checkout_cell(MatrixCell {
+                    kind: MatrixKind::ManagedWorktree,
+                    role: Some((role, true)),
+                    runtime,
+                    shape,
+                });
+            }
+        }
+    }
+
+    /// REL-01, main checkout row as the removal target: the runtime and the
+    /// row's own binding go; the directory, every branch and the parent
+    /// marker stay; the path is suppressed. Four cells on both shapes.
+    #[test]
+    fn end_state_matrix_main_checkout() {
+        for shape in [MatrixShape::Cloned, MatrixShape::GitInit] {
+            for runtime in MATRIX_RUNTIMES {
+                run_checkout_cell(MatrixCell {
+                    kind: MatrixKind::MainCheckout,
+                    role: Some((CheckoutRole::Main, false)),
+                    runtime,
+                    shape,
+                });
+            }
+        }
     }
 
     /// READM-02: the removed repository's owned marker and directory go, and
