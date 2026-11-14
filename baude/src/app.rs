@@ -11064,6 +11064,256 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    fn worktree_list(repo: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list runs");
+        assert!(
+            output.status.success(),
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Remove the clone's primary checkout row from an App that has admitted
+    /// the fixture, handing the removal stage the live session running in
+    /// that checkout. Returns the identity the row carried and its folder.
+    fn remove_primary_of(fx: &RelaunchFixture, app: &mut App) -> (RemovedIdentity, PathBuf) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        let (key, first_seen_order, path) = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.key,
+                    checkout.first_seen_order,
+                    checkout.observed_path.to_path_buf(),
+                )
+            })
+            .expect("the clone has a primary checkout row");
+        let removed = RemovedIdentity {
+            key,
+            first_seen_order,
+            max_key: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .max()
+                .expect("at least the primary row"),
+            max_order: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.first_seen_order)
+                .max()
+                .expect("at least the primary row"),
+        };
+        let runtime = app
+            .sessions
+            .iter()
+            .find(|session| session.cwd == path)
+            .map(|session| session.id)
+            .expect("live session in the primary checkout");
+        let runtimes = vec![row_runtime(app, RowKey::Checkout(key), runtime)];
+        remove_row(fx, app, RemovalTarget::Checkout(key), runtimes);
+        (removed, path)
+    }
+
+    /// App 1 over the fixture: launch-dir admission of the clone, then the
+    /// removal of its primary checkout row with every sibling kept. Returns
+    /// the App, the identity the primary carried and the folder it named.
+    fn remove_primary(fx: &RelaunchFixture) -> (App, RemovedIdentity, PathBuf) {
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        let (removed, path) = remove_primary_of(fx, &mut app);
+        (app, removed, path)
+    }
+
+    /// The checkout rows a sibling relaunch must leave exactly as the removal
+    /// left them: no primary, no new key, every kept row under its own key.
+    #[derive(Debug, PartialEq)]
+    struct CheckoutsSeen {
+        max_key: Option<CheckoutKey>,
+        primaries: Vec<(CheckoutKey, PathBuf)>,
+        kept: Vec<(CheckoutKey, PathBuf)>,
+    }
+
+    fn checkouts_seen(app: &App) -> CheckoutsSeen {
+        let rows = |primary: bool| -> Vec<(CheckoutKey, PathBuf)> {
+            let mut rows: Vec<(CheckoutKey, PathBuf)> = app
+                .repository_state
+                .checkouts
+                .iter()
+                .filter(|checkout| (checkout.role == CheckoutRole::PrimaryDefault) == primary)
+                .map(|checkout| (checkout.key, checkout.observed_path.to_path_buf()))
+                .collect();
+            rows.sort();
+            rows
+        };
+        CheckoutsSeen {
+            max_key: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .max(),
+            primaries: rows(true),
+            kept: rows(false),
+        }
+    }
+
+    #[test]
+    fn removed_primary_stays_removed_on_sibling_relaunch() {
+        let fx = relaunch_fixture("removed-primary-kept");
+        let (mut first, removed, primary_path) = remove_primary(&fx);
+        let list_before = worktree_list(&fx.repo);
+        let seen_before = checkouts_seen(&first);
+        let entry_written = is_suppressed(&fx.repo);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+
+        let list_after = worktree_list(&fx.repo);
+        let seen_after = checkouts_seen(&restarted);
+        let row_at_repo =
+            checkout_row(&restarted, &fx.repo).map(|row| (row.key, row.role, row.first_seen_order));
+        let entry_kept = is_suppressed(&fx.repo);
+        let folder_kept = fx.repo.is_dir();
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&restarted).map(str::to_owned);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert!(
+            row_at_repo.is_none(),
+            "removed primary checkout came back on a sibling relaunch: {row_at_repo:?}"
+        );
+        assert_eq!(primary_path, fx.repo, "the primary was the clone itself");
+        assert!(entry_written, "removal wrote the entry");
+        assert_eq!(
+            list_before, list_after,
+            "git worktree list changed across a sibling relaunch"
+        );
+        assert_eq!(
+            seen_after.primaries,
+            Vec::new(),
+            "no primary derived for the clone"
+        );
+        assert_eq!(
+            seen_after.max_key, seen_before.max_key,
+            "no new checkout key"
+        );
+        assert!(
+            seen_after.max_key <= Some(removed.max_key),
+            "no key above the highest one before the removal"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+        assert!(entry_kept, "a sibling relaunch leaves the entry in place");
+        assert!(folder_kept, "the removed primary's folder is still on disk");
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        let named = fx.repo.display().to_string();
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains(&named)),
+            "the message names the folder that brings the checkout back: {message:?}"
+        );
+    }
+
+    #[test]
+    fn removed_primary_managed_is_not_recreated_on_sibling_relaunch() {
+        let fx = relaunch_fixture("removed-primary-managed");
+        // No worktree holds the default branch, so baude makes its own.
+        git(&fx.repo, &["switch", "-c", "feature/work"]);
+        let mut first = relaunch_app(&fx, fx.repo.clone());
+        first.restore();
+        let primary_managed = first
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| checkout.managed_by_baude);
+        let role_at_repo = checkout_row(&first, &fx.repo).map(|row| row.role);
+        let (removed, primary_path) = remove_primary_of(&fx, &mut first);
+        let folder_gone = !primary_path.exists();
+        let list_before = worktree_list(&fx.repo);
+        let seen_before = checkouts_seen(&first);
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+
+        let list_after = worktree_list(&fx.repo);
+        let seen_after = checkouts_seen(&restarted);
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&restarted).map(str::to_owned);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            list_before, list_after,
+            "git worktree list changed across a sibling relaunch"
+        );
+        assert_eq!(
+            primary_managed,
+            Some(true),
+            "the primary was a worktree baude made"
+        );
+        assert_ne!(
+            primary_path, fx.repo,
+            "the primary was not the clone itself"
+        );
+        assert_eq!(
+            role_at_repo,
+            Some(CheckoutRole::Main),
+            "the clone was a sibling of the primary"
+        );
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert_eq!(
+            seen_after.primaries,
+            Vec::new(),
+            "no primary derived for the clone"
+        );
+        assert_eq!(
+            seen_after.max_key, seen_before.max_key,
+            "no new checkout key"
+        );
+        assert!(
+            seen_after.max_key <= Some(removed.max_key),
+            "no key above the highest one before the removal"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("remove this repository")),
+            "the message says how to bring the checkout back: {message:?}"
+        );
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.
