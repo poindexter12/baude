@@ -15868,6 +15868,130 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// The folder bindings file as it is on disk under `config`, parsed from
+    /// its bytes. A file that does not exist holds no binding.
+    fn bindings_on_disk(config: &Path) -> baude_core::folder_workspace::FolderWorkspaceFile {
+        let path = config.join(baude_core::folder_workspace::FILE_NAME);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).expect("bindings file parses"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+
+    /// REL-01, G7: `D` then Enter on the clone's own checkout row alone. The
+    /// runtime `restore` spawned is killed, the directory and its git dir
+    /// stay, the row leaves the state file while its managed sibling stays,
+    /// its own folder binding is cleared and a suppression entry is written.
+    /// Every after-state value is read from the process table or from a file
+    /// under the fixture, each with a present-before twin.
+    #[test]
+    fn rel01_confirm_remove_main_checkout_reads_binding_and_suppression() {
+        use baude_core::breadcrumbs::folder_key;
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("rel01-confirm-main");
+        let (mut app, rows) = remove_project_app(&fx, "feature/rel01-main");
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        baude_core::folder_workspace::record(Some(&config), &fx.repo, "rel01-main-ws", 10);
+        baude_core::folder_workspace::record(
+            Some(&config),
+            &fx.second_repo,
+            "rel01-neighbour-ws",
+            20,
+        );
+        let repo_key = folder_key(&fx.repo);
+        let neighbour_key = folder_key(&fx.second_repo);
+        let pgid = app
+            .session(app.runtime_checkouts[&rows.main])
+            .expect("the clone's primary runtime is live")
+            .claude
+            .process_identity()
+            .process_group;
+
+        assert!(!group_is_extinct(pgid), "the runtime group is live before");
+        assert!(fx.repo.is_dir(), "the clone exists before");
+        let bindings_before = bindings_on_disk(&config);
+        assert!(
+            bindings_before.folders.contains_key(&repo_key),
+            "the clone's binding is on disk before: {bindings_before:?}"
+        );
+        let neighbour_before = bindings_before.folders[&neighbour_key].clone();
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.repo),
+            "the clone is not suppressed before"
+        );
+        let saved_before = saved_state(&fx);
+        assert!(
+            saved_before
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.main),
+            "the row is in the state file before"
+        );
+        assert!(
+            saved_before
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the managed sibling is in the state file before"
+        );
+
+        app.selected_id = Some(SelId::Checkout(rows.main));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        assert_eq!(target, RemovalTarget::Checkout(rows.main));
+        assert_eq!(
+            previewed.rows_removed,
+            vec![RowKey::Checkout(rows.main)],
+            "the modal names exactly this one row"
+        );
+        app.handle_modal_key(enter_key());
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        wait_until("group extinction", || group_is_extinct(pgid));
+        assert!(fx.repo.is_dir(), "the clone's directory is kept");
+        let head = std::fs::read_to_string(fx.repo.join(".git").join("HEAD"))
+            .expect("the kept clone still has a readable git dir");
+        assert!(head.starts_with("ref: "), "HEAD is intact: {head}");
+        let saved = saved_state(&fx);
+        assert!(
+            !saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.main),
+            "the row left the state file"
+        );
+        assert!(
+            saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the managed sibling stays in the state file"
+        );
+        let bindings = bindings_on_disk(&config);
+        assert!(
+            !bindings.folders.contains_key(&repo_key),
+            "the clone's own binding left the file on disk: {bindings:?}"
+        );
+        assert_eq!(
+            bindings.folders.get(&neighbour_key),
+            Some(&neighbour_before),
+            "only the removed row's own key is cleared"
+        );
+        assert!(
+            baude_core::suppression::is_suppressed(&config, &fx.repo),
+            "a suppression entry was written for the clone"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// D-08: a row set that changed behind the modal refreshes the modal
     /// instead of removing. A child checkout activated after the preview
     /// shows up in the reinstalled report and nothing is removed.
