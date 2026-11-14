@@ -897,6 +897,34 @@ The existing remote `x` close and `r` restart/reopen compatibility actions are
 non-destructive to Git topology; uppercase `X` is never available remotely.
 Shell panes, local worktree lifecycle, and the editor key stay local-only.
 
+`D` works on a remote row. It removes the checkout or standalone row that owns
+that session on the daemon, never a whole repository. The steps are:
+
+1. The TUI asks that row's daemon for a preview in the background and shows a
+   `remote removal` waiting box. A session the daemon lists no removable row
+   for gets a message instead, and no request is sent.
+2. The daemon's preview is shown in the same confirmation a local `D` uses
+   (see [Removing projects](#removing-projects)).
+3. On `y` or `enter` the TUI sends the previewed report back to the daemon,
+   unchanged and once.
+4. The daemon performs the removal on its own machine. A directory listed
+   under `paths deleted` is deleted on the daemon's host. Nothing on the local
+   machine is touched.
+
+A preview that is refused or gets no answer closes with a message, and nothing
+is changed. If the daemon's rows changed after the preview, nothing is removed
+and the daemon's fresh preview replaces the confirmation with the note
+`rows changed since the preview; review the refreshed confirmation`. If the
+daemon refuses the removal, the confirmation stays open with the daemon's
+message and `enter` sends the same report again. If the row is already gone
+on the daemon, the removal closes and a message says so.
+
+A removal that was sent and got no answer is never sent again, because the
+daemon may have carried it out. When the daemon no longer lists the row, the
+TUI reports it removed. Otherwise the confirmation stays open and says the row
+may or may not have been removed, and `enter` asks the daemon for a new
+preview.
+
 ## bauded (experimental)
 
 A headless daemon (shipped in the release tarball, or `cargo run -p bauded`)
@@ -939,6 +967,82 @@ external assets.
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
 | `GET/POST /sessions/{id}/permission` | prompt mode: pending tool-permission request / `{decision}` allow·deny |
 | `GET /push/key` · `POST/DELETE /push/subscribe` | Web Push: VAPID key + subscriptions |
+| `GET /rows` | the row hierarchy: repositories with their checkouts, then standalone folders, each with the key a removal names it by |
+| `POST /removals/preview` | `{checkout: <key>}`, `{repository: <key>}` or `{standalone: <key>}`: a dry run that returns the removal report and changes nothing |
+| `POST /removals` | the previewed report, sent back unchanged: perform the removal and return the committed report |
+| `GET /events` | SSE: one `rows_removed` message per committed removal |
+
+### Removing rows over the API
+
+Removal is two calls. `POST /removals/preview` takes one target and returns a
+report of what removing it would do: the rows dropped, the runtimes killed,
+the paths deleted and the paths kept. `POST /removals` takes that report back
+unchanged and performs the removal. The daemon reads only the report's target
+and compares its rows, runtimes and deleted paths with its own state. Every
+row, runtime and path it acts on comes from the daemon's own state, not from
+the request.
+
+| Status | Meaning |
+|--------|---------|
+| 200 | the preview, or the report of the committed removal |
+| 409 | from `POST /removals`: the rows, runtimes or paths to delete changed since the preview. Nothing was removed, and the body is the fresh preview as JSON |
+| 404 | the target row is unknown |
+| 503 | from `POST /removals`: refused on the daemon's own state. The repository is busy, a save of the daemon's state is blocked or failed, or a runtime handle is missing |
+| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, or a validation failed. From `POST /removals/preview`: any error other than an unknown target |
+
+Every error body is plain text except the 409.
+
+A 200 from `POST /removals` can carry `"outcome": "saved_degraded"` and a
+`detail` text under `persistence`. The removal happened: the row is gone from
+`GET /rows`, its session is gone and its runtime is dead. The save of the
+daemon's state is what was degraded: the daemon's persistence status stays
+dirty and holds the detail as its error.
+
+`GET /events` is a server-sent event stream for the whole daemon. It carries
+one `rows_removed` message per committed `POST /removals`, and the message
+data is the same JSON report that call returned. The stream has no history and
+no replay, so a client that connects late or falls behind reads `GET /rows`
+to catch up.
+
+### Removing rows in the PWA
+
+The PWA's list follows `GET /rows`: each repository as a heading with its
+checkouts beneath it, then a `folders` group. Each repository heading, each
+checkout and each folder has a `✕` remove control. A session that no row
+claims is still listed, after those groups, and has no remove control because
+it has no key to remove it by.
+
+A checkout is tagged `main` or `worktree`. The tag is not a guide to what a
+removal deletes. The page tags a default checkout `main` whether or not baude
+created it, and one that baude created is deleted like any other managed
+worktree. A linked worktree the daemon was pointed at, and did not create, is
+tagged `worktree` and is kept. The confirmation for every checkout is titled
+`Remove this checkout?`, so read its `paths deleted` list before you press
+`remove`.
+
+The control opens a confirmation titled `Remove this repository?`,
+`Remove this checkout?` or `Remove this standalone session?`. It lists
+`rows dropped`, `runtimes killed`, `paths deleted` and `paths kept`, plus
+`already removed` and `cleared` when they apply. `cancel`, Escape or a tap
+outside the box closes it and sends nothing, except while a removal is in
+flight, when the confirmation stays up until the daemon answers. `remove`
+sends the report on screen back to the daemon. When the removal is done the
+rows leave the list and a result line gives the counts, for example
+`removed 1 row, killed 1 runtime, deleted 0 paths`.
+
+When something fails the error is shown in the confirmation and the button
+reads `retry`. After a failed preview, `retry` asks for the preview again.
+After a failed removal, `retry` sends the same report again. If the rows
+changed since the preview, the page reloads the list and shows the daemon's
+fresh preview with the button back at `remove`; nothing is confirmed for you.
+If the row is already gone, the confirmation closes with `already removed`.
+
+The page listens on `GET /events`, so a row removed from another client leaves
+the list, and a confirmation open on that row closes with `removed elsewhere`.
+
+Which directories a removal deletes and which it keeps is the same on the
+daemon as in the TUI: see
+[What is deleted and what is kept](#what-is-deleted-and-what-is-kept).
 
 ### Deploy (compose + Tailscale)
 
