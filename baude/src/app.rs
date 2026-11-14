@@ -11341,6 +11341,206 @@ mod tests {
         );
     }
 
+    fn common_dir_of(repo: &Path) -> PathBuf {
+        baude_core::git::discover_repository(repo)
+            .expect("the fixture repository is discoverable")
+            .common_dir
+    }
+
+    /// The removed-primary fact the store holds for one repository.
+    fn removed_primary_fact(common_dir: &Path) -> Option<PathBuf> {
+        baude_core::suppression::removed_primary(&baude_core::persist::config_dir(), common_dir)
+    }
+
+    /// What an explicit admission of a removed primary leaves behind, read
+    /// from the App that made it and from the store, before any cleanup.
+    struct PrimaryReturn {
+        entry_lifted: bool,
+        fact: Option<PathBuf>,
+        rows_at_path: Vec<(CheckoutKey, CheckoutRole, u64, Option<String>)>,
+        primaries: Vec<(CheckoutKey, PathBuf)>,
+        valid: Result<(), String>,
+    }
+
+    fn primary_return(app: &App, path: &Path, common_dir: &Path) -> PrimaryReturn {
+        let persisted = PersistedPath::from_path(path);
+        PrimaryReturn {
+            entry_lifted: !is_suppressed(path),
+            fact: removed_primary_fact(common_dir),
+            rows_at_path: app
+                .repository_state
+                .checkouts
+                .iter()
+                .filter(|row| row.observed_path == persisted)
+                .map(|row| {
+                    (
+                        row.key,
+                        row.role,
+                        row.first_seen_order,
+                        row.session.resume_id.clone(),
+                    )
+                })
+                .collect(),
+            primaries: checkouts_seen(app).primaries,
+            valid: app
+                .repository_state
+                .validate()
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// READM-04, D-13 for a primary: the admission lifted the entry and the
+    /// fact with it, and the one row at `path` is the repository's only
+    /// primary, sharing nothing with the row that was removed.
+    fn assert_fresh_primary(seen: &PrimaryReturn, removed: &RemovedIdentity, path: &Path) {
+        assert!(seen.entry_lifted, "the admission lifts the entry");
+        assert_eq!(seen.fact, None, "the removed-primary fact ends with it");
+        assert_eq!(
+            seen.rows_at_path.len(),
+            1,
+            "exactly one row at {}: {:?}",
+            path.display(),
+            seen.rows_at_path
+        );
+        let (key, role, first_seen_order, resume_id) = &seen.rows_at_path[0];
+        assert_eq!(
+            *role,
+            CheckoutRole::PrimaryDefault,
+            "the row is the primary"
+        );
+        assert_eq!(
+            seen.primaries,
+            vec![(*key, path.to_path_buf())],
+            "the repository has exactly one primary, at that folder"
+        );
+        assert!(
+            *key > removed.max_key && *key != removed.key,
+            "new CheckoutKey: {key:?}"
+        );
+        assert!(
+            *first_seen_order > removed.max_order && *first_seen_order != removed.first_seen_order,
+            "new first_seen_order: {first_seen_order}"
+        );
+        assert_eq!(*resume_id, None, "nothing resumed from the removed row");
+        assert_eq!(seen.valid, Ok(()), "state valid after the admission");
+    }
+
+    /// READM-04, the launch route: a removed primary whose folder was kept
+    /// comes back when baude is launched inside that folder. The launch-dir
+    /// admission lifts the entry, the fact goes with it, and the derivation
+    /// that a sibling launch skips runs in that same restore.
+    #[test]
+    fn removed_primary_returns_on_relaunch_inside_its_folder() {
+        let fx = relaunch_fixture("removed-primary-launch");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path) = remove_primary(&fx);
+        let entry_written = is_suppressed(&fx.repo);
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(primary_path, fx.repo, "the primary was the clone itself");
+        assert!(entry_written, "removal wrote the entry");
+        assert_eq!(
+            fact_written,
+            Some(fx.repo.clone()),
+            "removal recorded that the entry was the primary"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
+    /// READM-04, the `n` route: after a sibling relaunch left the primary
+    /// removed, opening a sibling changes nothing, and opening the removed
+    /// folder itself brings the primary back.
+    #[test]
+    fn removed_primary_returns_through_open_route() {
+        let fx = relaunch_fixture("removed-primary-open");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, _primary_path) = remove_primary(&fx);
+        let counter_after_removal = first.repository_state.next_checkout_key;
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let primaries_after_launch = checkouts_seen(&restarted).primaries;
+
+        restarted.open_repo_session(fx.unmanaged.clone());
+        let sibling_primaries = checkouts_seen(&restarted).primaries;
+        let sibling_entry_kept = is_suppressed(&fx.repo);
+        let sibling_fact = removed_primary_fact(&common_dir);
+        let sibling_sessions = restarted.sessions.len();
+        let sibling_counter = restarted.repository_state.next_checkout_key;
+
+        restarted.open_repo_session(fx.repo.clone());
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            primaries_after_launch,
+            Vec::new(),
+            "the sibling relaunch derived no primary"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "opening a sibling derives no primary"
+        );
+        assert!(sibling_entry_kept, "opening a sibling leaves the entry");
+        assert_eq!(
+            sibling_fact,
+            Some(fx.repo.clone()),
+            "opening a sibling leaves the fact in place"
+        );
+        assert_eq!(sibling_sessions, 0, "opening a sibling starts no session");
+        assert_eq!(
+            sibling_counter, counter_after_removal,
+            "opening a sibling spends no checkout key"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
+    /// READM-04, the `c` route: a clone finishing into the removed primary's
+    /// folder reaches the same admission through `CloneCompletion` and brings
+    /// the primary back.
+    #[test]
+    fn removed_primary_returns_through_clone_completion_route() {
+        let fx = relaunch_fixture("removed-primary-clone");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, _primary_path) = remove_primary(&fx);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let primaries_after_launch = checkouts_seen(&restarted).primaries;
+        let fact_after_launch = removed_primary_fact(&common_dir);
+
+        restarted.open_repo_session_via(fx.repo.clone(), LocalAdmissionRoute::CloneCompletion);
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            primaries_after_launch,
+            Vec::new(),
+            "the sibling relaunch derived no primary"
+        );
+        assert_eq!(
+            fact_after_launch,
+            Some(fx.repo.clone()),
+            "the sibling relaunch left the fact in place"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.
