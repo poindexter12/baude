@@ -202,7 +202,14 @@ Plans:
   2. README and PWA docs describe the remove action, its confirmation, and what is and is not deleted
   3. `scripts/gate.sh` and `scripts/gate.sh --linux` pass and v2.8.0 is released through release-please
 
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [ ] 22-01-PLAN.md — Wave 1. Core end-state matrix: every row kind with and without a live runtime, on cloned and `git init` fixtures, read from the fixture
+- [ ] 22-02-PLAN.md — Wave 1. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
+- [ ] 22-03-PLAN.md — Wave 1. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
+- [ ] 22-04-PLAN.md — Wave 1. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
+- [ ] 22-05-PLAN.md — Wave 2. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
 
 ## Backlog
 
