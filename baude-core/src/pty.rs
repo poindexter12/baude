@@ -876,17 +876,11 @@ impl Pty {
     /// Never touches the child mutex.
     fn extinguish_group(&self) -> Result<()> {
         let process_group = self.identity.process_group;
-        signal_group(process_group, libc::SIGTERM)
-            .context("failed to terminate exact PTY process group")?;
-        if wait_for_group_extinction(process_group, &self.child) {
-            return Ok(());
-        }
-        signal_group(process_group, libc::SIGKILL)
-            .context("failed to force exact PTY process group")?;
-        if wait_for_group_extinction(process_group, &self.child) {
-            return Ok(());
-        }
-        anyhow::bail!("PTY process group {process_group} remained live after forced termination")
+        extinguish_with(
+            process_group,
+            |signal| signal_group(process_group, signal),
+            || wait_for_group_extinction(process_group, &self.child),
+        )
     }
 
     /// Join the reader thread within a bound. The group is extinct and the
@@ -952,8 +946,9 @@ pub enum GroupDisposition {
 /// into a group of another session. Every member of the recorded session is
 /// therefore a descendant of the recorded leader, and a live group with no
 /// member in that session belongs to a stranger who reused the id. A group
-/// whose members are all zombies has nothing a signal can harm, so it is
-/// signalled and reaped like any extinct-but-unreaped group.
+/// whose members are all zombies has nothing a signal can harm, so it goes to
+/// the signal step. macOS answers that signal with `EPERM`, which the signal
+/// step tolerates, and the extinction wait that follows reaps the zombie.
 pub(crate) fn group_disposition(
     recorded: &ProcessIdentity,
     observed_leader: std::result::Result<Option<&ProcessIdentity>, &str>,
@@ -1080,20 +1075,60 @@ fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
     // PTY leader identity and rechecked immediately before the first signal.
     let result = unsafe { libc::kill(-process_group, signal) };
     if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if signal_step_proceeds(result, error.raw_os_error()) {
         Ok(())
     } else {
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) | Some(libc::EPERM) => Ok(()),
-            _ => Err(error),
-        }
+        Err(error)
     }
+}
+
+/// The errno rule of the signal step, kept pure so it can be table-tested.
+/// `result` is what `kill(-pgid, signal)` returned and `errno` what it set
+/// when it failed. Proceeding means only "go on to the extinction wait".
+fn signal_step_proceeds(result: i32, errno: Option<i32>) -> bool {
+    result == 0 || matches!(errno, Some(libc::ESRCH) | Some(libc::EPERM))
 }
 
 fn process_group_exists(process_group: i32) -> bool {
     // SAFETY: signal zero performs a liveness/permission probe only.
     let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let errno = if result == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+    group_probe_alive(result, errno)
+}
+
+/// The errno rule of the liveness probe, kept pure so it can be table-tested.
+/// `EPERM` is alive: the group has members, this process just may not signal
+/// them. Only a failed probe with any other errno, `ESRCH` in practice, says
+/// the group is gone, and this rule is the only thing that says so.
+fn group_probe_alive(result: i32, errno: Option<i32>) -> bool {
+    result == 0 || errno == Some(libc::EPERM)
+}
+
+/// The TERM, wait, KILL, wait sequence behind `Pty::extinguish_group`, with
+/// its signal step and its extinction check passed in so the sequence can be
+/// tested without a second user. A signal step that proceeds never ends the
+/// sequence on its own: only `extinct` returning true does.
+fn extinguish_with(
+    process_group: i32,
+    mut signal: impl FnMut(i32) -> std::io::Result<()>,
+    mut extinct: impl FnMut() -> bool,
+) -> Result<()> {
+    signal(libc::SIGTERM).context("failed to terminate exact PTY process group")?;
+    if extinct() {
+        return Ok(());
+    }
+    signal(libc::SIGKILL).context("failed to force exact PTY process group")?;
+    if extinct() {
+        return Ok(());
+    }
+    anyhow::bail!("PTY process group {process_group} remained live after forced termination")
 }
 
 /// Poll the recorded group for up to 500 ms. A zombie leader still counts as
@@ -2182,6 +2217,111 @@ mod tests {
         if let Err(error) = pty.kill_and_wait() {
             panic!("second kill_and_wait failed on an extinct group: {error:#}");
         }
+    }
+
+    /// The signal step proceeds on success, on no such group, and on a group
+    /// holding nothing this process may signal. Anything else is an error.
+    #[test]
+    fn signal_step_errno_rule() {
+        assert!(signal_step_proceeds(0, None), "success proceeds");
+        assert!(
+            signal_step_proceeds(-1, Some(libc::ESRCH)),
+            "ESRCH proceeds"
+        );
+        assert!(
+            signal_step_proceeds(-1, Some(libc::EPERM)),
+            "EPERM proceeds"
+        );
+        assert!(
+            !signal_step_proceeds(-1, Some(libc::EINVAL)),
+            "EINVAL is an error"
+        );
+        assert!(
+            !signal_step_proceeds(-1, None),
+            "a failure without errno is an error"
+        );
+    }
+
+    /// T-22-13: the probe is the only thing that reports a group gone, and it
+    /// never does so for `EPERM`. A live group this process cannot signal
+    /// answers `EPERM` and must read alive.
+    #[test]
+    fn group_probe_errno_rule() {
+        assert!(group_probe_alive(0, None), "a zero result is alive");
+        assert!(
+            group_probe_alive(-1, Some(libc::EPERM)),
+            "EPERM is alive: the group has members this process cannot signal"
+        );
+        assert!(!group_probe_alive(-1, Some(libc::ESRCH)), "ESRCH is gone");
+    }
+
+    /// T-22-13: a live group that answers `EPERM` forever, to the signal and
+    /// to the probe alike. Tolerating the signal error must not turn into
+    /// reporting the group gone: TERM, then KILL, then the "remained live"
+    /// error. Both closures run the real rules on that errno.
+    #[test]
+    fn extinction_sequence_reports_unsignalable_live_group_as_live() {
+        let mut sent = Vec::new();
+        let mut probes = 0;
+        let result = extinguish_with(
+            4242,
+            |signal| {
+                sent.push(signal);
+                if signal_step_proceeds(-1, Some(libc::EPERM)) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                }
+            },
+            || {
+                probes += 1;
+                !group_probe_alive(-1, Some(libc::EPERM))
+            },
+        );
+        let error = result.expect_err("a group that stays live must not be reported gone");
+        assert_eq!(
+            format!("{error:#}"),
+            "PTY process group 4242 remained live after forced termination"
+        );
+        assert_eq!(sent, vec![libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(probes, 2, "extinction is checked after each signal");
+    }
+
+    #[test]
+    fn extinction_sequence_stops_after_term_when_extinct() {
+        let mut sent = Vec::new();
+        let result = extinguish_with(
+            4242,
+            |signal| {
+                sent.push(signal);
+                Ok(())
+            },
+            || true,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(sent, vec![libc::SIGTERM], "KILL is never sent");
+    }
+
+    #[test]
+    fn extinction_sequence_surfaces_a_signal_error() {
+        let mut probes = 0;
+        let result = extinguish_with(
+            4242,
+            |_| {
+                assert!(!signal_step_proceeds(-1, Some(libc::EINVAL)));
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            },
+            || {
+                probes += 1;
+                false
+            },
+        );
+        let error = result.expect_err("EINVAL from the signal step is an error");
+        assert!(
+            format!("{error:#}").starts_with("failed to terminate exact PTY process group: "),
+            "{error:#}"
+        );
+        assert_eq!(probes, 0, "nothing is probed after a failed signal");
     }
 
     /// The pure decision table behind `kill_and_wait`: the group id is

@@ -475,7 +475,9 @@ pub fn parked_reader_command(holder_pid_path: &Path) -> String {
 
 /// Wait for the holder behind `pty` to record its pid and for the leader to
 /// exit, then prove from `ps` that the holder sits outside the recorded
-/// group. Returns the guard that kills the holder on drop.
+/// group. Returns the guard that kills the holder on drop. It reaps the
+/// leader through `is_exited`, so a test of the exited, unreaped leader
+/// window must not use it.
 pub fn await_parked_holder(pty: &Pty, holder_pid_path: &Path) -> HolderGuard {
     let pgid = pty.process_identity().process_group;
     let deadline = Instant::now() + Duration::from_secs(5);
