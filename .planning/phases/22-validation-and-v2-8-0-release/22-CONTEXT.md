@@ -17,7 +17,7 @@ Prove removal end to end on realistic fixtures for every row kind with and witho
 - The autonomous run pushes the branch and opens ONE pull request to `main` with a `feat` title, then stops. The owner merges it. Nothing in this phase merges to `main`. — **Reversibility:** one-way — a merge to protected `main` triggers release-please and a published v2.8.0; a pushed branch and an open PR can still be closed.
 - After the owner merges, release-please opens the 2.8.0 release PR and the minor bump auto-merges after its soak. Success criterion 3 is therefore only fully met after the owner's merge; the phase records that as the one open item rather than claiming a release.
 - Phases 18, 19 and 20 are re-verified with the automated verifier before the push. A human-needed result goes back to the owner as a question. — **Reversibility:** costly — releasing unverified phases cannot be recalled once v2.8.0 is published.
-- The intermittent macOS teardown 500 is NOT fixed in this phase. It is recorded as BL-11 in `.planning/BACKLOG.md` and v2.8.0 ships with it known.
+- The intermittent macOS teardown 500 is NOT fixed in this phase. It is recorded as BL-11 in `.planning/BACKLOG.md` and v2.8.0 ships with it known. **Superseded 2026-11-14:** the owner decided to fix it in this phase; plan 22-06 fixes BL-11 and plan 22-07 fixes re-admission of a removed primary checkout. The original decision stays above for the record.
 
 ### Decided autonomously
 - [Tests] Q: 'Where do the REL-01 tests live?' → Selected: 'In-crate test modules, as every existing test does; the repo has no tests directories' — moving a test module is a local edit
@@ -66,7 +66,7 @@ Prove removal end to end on realistic fixtures for every row kind with and witho
 <deferred>
 ## Deferred Ideas
 
-- BL-11: intermittent macOS teardown 500.
+- BL-11: intermittent macOS teardown 500. **Superseded 2026-11-14:** no longer deferred; fixed in this phase by plan 22-06.
 - Standalone removal leaves the daemon-written `.claude` directory; the PWA lists unclaimed sessions without an 'other sessions' heading; older state files serve `managed_branch` for a main checkout; the PWA shows full paths.
 - Browser-level PWA tests.
 
