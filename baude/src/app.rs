@@ -11541,6 +11541,215 @@ mod tests {
         assert_fresh_primary(&seen, &removed, &fx.repo);
     }
 
+    /// The managed shape of the 22-07 test: the clone sits on another branch,
+    /// so the primary is a worktree baude made and its removal deletes the
+    /// folder. Returns the App after the removal, the identity the primary
+    /// carried, its folder, its default branch and whether baude managed it.
+    fn remove_managed_primary(
+        fx: &RelaunchFixture,
+    ) -> (App, RemovedIdentity, PathBuf, Option<String>, Option<bool>) {
+        // No worktree holds the default branch, so baude makes its own.
+        git(&fx.repo, &["switch", "-c", "feature/work"]);
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        let (default_branch, managed) = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.session.branch.clone(),
+                    Some(checkout.managed_by_baude),
+                )
+            })
+            .unwrap_or((None, None));
+        let (removed, path) = remove_primary_of(fx, &mut app);
+        (app, removed, path, default_branch, managed)
+    }
+
+    fn worktree_count(list: &str) -> usize {
+        list.lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count()
+    }
+
+    /// READM-04 when the removal deleted the folder, first way back: no route
+    /// can name a folder that is gone, so "launching inside the folder" means
+    /// the folder exists again. A worktree of the default branch put back at
+    /// the removed path and opened lifts the entry and is the primary.
+    #[test]
+    fn removed_primary_managed_returns_when_its_folder_is_back() {
+        let fx = relaunch_fixture("removed-primary-folder-back");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path, default_branch, managed) =
+            remove_managed_primary(&fx);
+        let folder_gone = !primary_path.exists();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut sibling = relaunch_app(&fx, fx.repo.clone());
+        sibling.restore();
+        let sibling_primaries = checkouts_seen(&sibling).primaries;
+        let fact_after_sibling = removed_primary_fact(&common_dir);
+
+        let default_branch = default_branch.expect("the removed primary recorded its branch");
+        git(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                primary_path.to_str().unwrap(),
+                &default_branch,
+            ],
+        );
+        let folder_back = primary_path.is_dir();
+        let mut returned = relaunch_app(&fx, primary_path.clone());
+        returned.restore();
+        let seen = primary_return(&returned, &primary_path, &common_dir);
+        let message = last_message(&returned).map(str::to_owned);
+
+        returned.kill_all();
+        sibling.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(managed, Some(true), "the primary was a worktree baude made");
+        assert_ne!(
+            primary_path, fx.repo,
+            "the primary was not the clone itself"
+        );
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert!(
+            fact_written.is_some(),
+            "removal recorded the fact for a folder that is gone"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "a launch inside the clone derived no primary"
+        );
+        assert_eq!(
+            fact_after_sibling, fact_written,
+            "a launch inside the clone left the fact in place"
+        );
+        assert!(folder_back, "the worktree was put back at the removed path");
+        assert!(
+            seen.entry_lifted && seen.fact.is_none(),
+            "opening the folder that is back lifts the entry and the fact: {:?}, message {message:?}",
+            seen.fact
+        );
+        assert_fresh_primary(&seen, &removed, &primary_path);
+    }
+
+    /// READM-04 when the removal deleted the folder, second way back: removing
+    /// the repository row drops its entries and the fact with them, and
+    /// admitting the repository again derives a primary as a first admission
+    /// does, a new managed worktree under a fresh key.
+    #[test]
+    fn removed_primary_managed_returns_after_repository_readmission() {
+        use baude_core::removal::RemovalTarget;
+        let fx = relaunch_fixture("removed-primary-readmit");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path, _default_branch, managed) =
+            remove_managed_primary(&fx);
+        let folder_gone = !primary_path.exists();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut sibling = relaunch_app(&fx, fx.repo.clone());
+        sibling.restore();
+        let sibling_primaries = checkouts_seen(&sibling).primaries;
+        let repository_key = sibling
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&common_dir))
+            .map(|row| row.key)
+            .expect("the relaunch kept the repository row");
+        remove_row(
+            &fx,
+            &mut sibling,
+            RemovalTarget::Repository(repository_key),
+            Vec::new(),
+        );
+        let fact_after_repository_removal = removed_primary_fact(&common_dir);
+        let repositories_after_removal = sibling.repository_state.repositories.len();
+        let list_after_removal = worktree_list(&fx.repo);
+
+        let mut returned = relaunch_app(&fx, fx.repo.clone());
+        returned.restore();
+        let list_after_return = worktree_list(&fx.repo);
+        let primaries: Vec<(CheckoutKey, u64, Option<String>, PathBuf)> = returned
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.key,
+                    checkout.first_seen_order,
+                    checkout.session.resume_id.clone(),
+                    checkout.observed_path.to_path_buf(),
+                )
+            })
+            .collect();
+        let primary_on_disk = primaries
+            .first()
+            .is_some_and(|(_, _, _, path)| path.is_dir());
+        let fact_after_return = removed_primary_fact(&common_dir);
+        let repositories_after_return = returned.repository_state.repositories.len();
+        let valid = returned
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&returned).map(str::to_owned);
+
+        returned.kill_all();
+        sibling.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(managed, Some(true), "the primary was a worktree baude made");
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert!(
+            fact_written.is_some(),
+            "removal recorded the fact for a folder that is gone"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "a launch inside the clone derived no primary"
+        );
+        assert_eq!(
+            fact_after_repository_removal, None,
+            "removing the repository row ends the fact"
+        );
+        assert_eq!(repositories_after_removal, 0, "the repository row is gone");
+        assert_eq!(
+            primaries.len(),
+            1,
+            "exactly one primary after the repository is admitted again: {primaries:?}, message {message:?}"
+        );
+        let (key, first_seen_order, resume_id, _path) = &primaries[0];
+        assert!(
+            *key > removed.max_key && *key != removed.key,
+            "new CheckoutKey: {key:?}"
+        );
+        assert!(
+            *first_seen_order > removed.max_order && *first_seen_order != removed.first_seen_order,
+            "new first_seen_order: {first_seen_order}"
+        );
+        assert_eq!(*resume_id, None, "nothing resumed from the removed row");
+        assert!(primary_on_disk, "the new primary has a folder");
+        assert_eq!(
+            worktree_count(&list_after_return),
+            worktree_count(&list_after_removal) + 1,
+            "exactly one worktree more than after the repository removal:\n{list_after_removal}\n{list_after_return}"
+        );
+        assert_eq!(fact_after_return, None, "the admission writes no fact");
+        assert_eq!(repositories_after_return, 1, "one repository row again");
+        assert_eq!(valid, Ok(()), "state valid after the admission");
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.
