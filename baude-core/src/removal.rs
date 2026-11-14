@@ -4385,6 +4385,592 @@ mod tests {
         }
     }
 
+    // ---- end-state matrix (phase 22 plan 01) ----
+
+    use std::collections::BTreeMap;
+
+    /// The row kind a matrix cell removes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MatrixKind {
+        ManagedWorktree,
+    }
+
+    /// Whether the cell's target has a live runtime when it is removed.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MatrixRuntime {
+        Live,
+    }
+
+    /// The fixture shape the cell is built on.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MatrixShape {
+        Cloned,
+    }
+
+    /// One cell of the end-state matrix.
+    #[derive(Clone, Copy)]
+    struct MatrixCell {
+        kind: MatrixKind,
+        /// The target row's role and its `managed_by_baude` flag; `None`
+        /// where the target is not a checkout.
+        role: Option<(CheckoutRole, bool)>,
+        runtime: MatrixRuntime,
+        shape: MatrixShape,
+    }
+
+    impl MatrixCell {
+        /// `<kind>/<role>/<managed|external>/<live|none>/<shape>`, with `-`
+        /// for the role and the flag where the target has none. Used in every
+        /// assertion message and printed as the cell line.
+        fn label(self) -> String {
+            let kind = match self.kind {
+                MatrixKind::ManagedWorktree => "managed-worktree",
+            };
+            let (role, flag) = match self.role {
+                Some((role, true)) => (format!("{role:?}"), "managed"),
+                Some((role, false)) => (format!("{role:?}"), "external"),
+                None => ("-".to_string(), "-"),
+            };
+            let runtime = match self.runtime {
+                MatrixRuntime::Live => "live",
+            };
+            let shape = match self.shape {
+                MatrixShape::Cloned => "cloned",
+            };
+            format!("{kind}/{role}/{flag}/{runtime}/{shape}")
+        }
+    }
+
+    /// One seeded child row of a matrix repository.
+    struct MatrixChild {
+        key: CheckoutKey,
+        role: CheckoutRole,
+        managed: bool,
+        path: PathBuf,
+    }
+
+    /// A repository on one fixture shape: its rows in `state`, the paths git
+    /// reported for it and the name of the file its fixture commits.
+    struct MatrixRepository {
+        state: RepositoryState,
+        key: RepositoryKey,
+        main: PathBuf,
+        common: PathBuf,
+        tracked: &'static str,
+        children: Vec<MatrixChild>,
+    }
+
+    impl MatrixRepository {
+        fn child(&self, role: CheckoutRole, managed: bool) -> (CheckoutKey, PathBuf) {
+            let child = self
+                .children
+                .iter()
+                .find(|child| child.role == role && child.managed == managed)
+                .expect("the shape seeds a child with this role and flag");
+            (child.key, child.path.clone())
+        }
+    }
+
+    fn matrix_repository(f: &RemovalFixture, shape: MatrixShape) -> MatrixRepository {
+        let mut state = RepositoryState::default();
+        match shape {
+            MatrixShape::Cloned => {
+                let t = cloned_topology(&f.root);
+                let rows = seed_cloned(&mut state, &t);
+                let children = vec![
+                    MatrixChild {
+                        key: rows.m,
+                        role: CheckoutRole::Main,
+                        managed: false,
+                        path: t.clone.clone(),
+                    },
+                    MatrixChild {
+                        key: rows.d,
+                        role: CheckoutRole::PrimaryDefault,
+                        managed: true,
+                        path: t.default_worktree.clone(),
+                    },
+                    MatrixChild {
+                        key: rows.b,
+                        role: CheckoutRole::ManagedBranch,
+                        managed: true,
+                        path: t.managed_worktree.clone(),
+                    },
+                ];
+                MatrixRepository {
+                    state,
+                    key: rows.k,
+                    main: t.clone,
+                    common: t.common_dir,
+                    tracked: "tracked",
+                    children,
+                }
+            }
+        }
+    }
+
+    /// What every cell seeds beside its target, so a "cleared" read cannot
+    /// pass on a wiped store: a folder bound to its own workspace and a
+    /// suppression entry that belongs to another repository.
+    struct Neighbours {
+        folder: PathBuf,
+        suppressed: PathBuf,
+    }
+
+    fn seed_neighbours(f: &RemovalFixture) -> Neighbours {
+        let config = crate::persist::config_dir();
+        let folder = f.root.join("neighbour");
+        fs::create_dir_all(&folder).expect("create neighbour folder");
+        folder_workspace::record(Some(&config), &folder, "neighbour-ws", 20);
+        let suppressed = f.root.join("other-child");
+        let other_common = f.root.join("other").join(".git");
+        suppression::suppress(&config, &suppressed, &other_common, 2)
+            .expect("seed neighbour suppression");
+        Neighbours { folder, suppressed }
+    }
+
+    /// Everything a cell asks the fixture about, named by path, process id
+    /// and store key. The reader takes nothing else, so no observation can
+    /// come from what `remove` returned.
+    struct Probe {
+        state_root: PathBuf,
+        /// Agent pid and process group of each runtime the cell started.
+        runtimes: Vec<(u32, i32)>,
+        /// The repository git is asked about; `None` for a plain folder.
+        git_repo: Option<PathBuf>,
+        /// Directories whose entries and git registration are read.
+        dirs: Vec<PathBuf>,
+        /// Folders whose binding entry is read.
+        bound: Vec<PathBuf>,
+        /// The repository's managed directory, where its marker lives.
+        marker_dir: Option<PathBuf>,
+        /// Paths whose suppression entry is read.
+        suppressed: Vec<PathBuf>,
+    }
+
+    /// One read of the fixture. `None` always means "not there".
+    struct EndState {
+        /// `ps` state of each agent pid while it is in the process table.
+        agents: Vec<Option<String>>,
+        /// Each process group while a member of it is alive.
+        groups: Vec<Option<i32>>,
+        /// Sorted entry names of each watched directory.
+        dirs: BTreeMap<PathBuf, Option<Vec<String>>>,
+        /// The `git worktree list --porcelain` stanza of each watched
+        /// directory: its path, HEAD and branch lines.
+        registrations: BTreeMap<PathBuf, Option<Vec<String>>>,
+        branches: Option<Vec<String>>,
+        /// Each watched folder's binding entry, as it serializes.
+        bindings: BTreeMap<PathBuf, Option<String>>,
+        marker: Option<Vec<u8>>,
+        marker_dir: Option<Vec<String>>,
+        /// The repository each watched path is suppressed under.
+        suppressions: BTreeMap<PathBuf, Option<String>>,
+        /// Every row key in the saved state file, in file order.
+        saved_rows: Vec<RowKey>,
+    }
+
+    fn present(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok()
+    }
+
+    /// The porcelain stanza whose `worktree` line names exactly `dir`.
+    fn registration_of(list: &str, dir: &Path) -> Option<Vec<String>> {
+        let head = format!("worktree {}", dir.display());
+        list.split("\n\n")
+            .map(|stanza| stanza.lines().map(str::to_string).collect::<Vec<_>>())
+            .find(|lines| lines.first() == Some(&head))
+    }
+
+    fn saved_rows(state_root: &Path) -> Vec<RowKey> {
+        let state = load_state(state_root);
+        state
+            .repositories
+            .iter()
+            .map(|repository| RowKey::Repository(repository.key))
+            .chain(
+                state
+                    .checkouts
+                    .iter()
+                    .map(|checkout| RowKey::Checkout(checkout.key)),
+            )
+            .chain(
+                state
+                    .standalone_sessions
+                    .iter()
+                    .map(|session| RowKey::Standalone(session.key)),
+            )
+            .collect()
+    }
+
+    /// Read process, worktree, binding, marker, suppression and saved-row
+    /// state from the process table and the fixture's disk. Called once
+    /// before the removal and once after, so both reads are taken the same
+    /// way.
+    fn read_end_state(probe: &Probe) -> EndState {
+        let mut agents = Vec::new();
+        let mut groups = Vec::new();
+        for &(pid, pgid) in &probe.runtimes {
+            assert_reaped_promptly(pid);
+            let stat = proc_state(pid);
+            agents.push((!stat.is_empty()).then_some(stat));
+            groups.push((!group_is_extinct(pgid)).then_some(pgid));
+        }
+        let dirs = probe
+            .dirs
+            .iter()
+            .map(|dir| (dir.clone(), present(dir).then(|| listing(dir))))
+            .collect();
+        let registrations = match &probe.git_repo {
+            Some(repo) => {
+                let list = worktree_list(repo);
+                probe
+                    .dirs
+                    .iter()
+                    .map(|dir| (dir.clone(), registration_of(&list, dir)))
+                    .collect()
+            }
+            None => BTreeMap::new(),
+        };
+        let bindings_file = bindings_on_disk();
+        let bindings = probe
+            .bound
+            .iter()
+            .map(|folder| {
+                let entry = bindings_file.folders.get(&folder_key(folder));
+                let text =
+                    entry.map(|entry| serde_json::to_string(entry).expect("serialize binding"));
+                (folder.clone(), text)
+            })
+            .collect();
+        let marker_dir = probe.marker_dir.as_deref().filter(|dir| present(dir));
+        let store = suppressions_on_disk();
+        let suppressions = probe
+            .suppressed
+            .iter()
+            .map(|path| {
+                let entry = store.entries.get(&folder_key(path));
+                (
+                    path.clone(),
+                    entry.map(|entry| entry.repository_common_dir.clone()),
+                )
+            })
+            .collect();
+        EndState {
+            agents,
+            groups,
+            dirs,
+            registrations,
+            branches: probe.git_repo.as_deref().map(branch_snapshot),
+            bindings,
+            marker: marker_dir
+                .filter(|dir| present(&dir.join(MARKER_FILE_NAME)))
+                .map(marker_bytes),
+            marker_dir: marker_dir.map(listing),
+            suppressions,
+            saved_rows: saved_rows(&probe.state_root),
+        }
+    }
+
+    /// Gone: present before the removal, absent after it.
+    fn assert_gone<T: std::fmt::Debug>(
+        label: &str,
+        what: &str,
+        before: &Option<T>,
+        after: &Option<T>,
+    ) {
+        assert!(
+            before.is_some(),
+            "{label}: {what} must be present before the removal"
+        );
+        assert!(
+            after.is_none(),
+            "{label}: {what} must be gone after the removal, found {after:?}"
+        );
+    }
+
+    /// Added: absent before the removal, present with `expected` after it.
+    fn assert_added<T: PartialEq + std::fmt::Debug>(
+        label: &str,
+        what: &str,
+        before: &Option<T>,
+        after: &Option<T>,
+        expected: &T,
+    ) {
+        assert!(
+            before.is_none(),
+            "{label}: {what} must be absent before the removal, found {before:?}"
+        );
+        assert_eq!(
+            after.as_ref(),
+            Some(expected),
+            "{label}: {what} must be present after the removal"
+        );
+    }
+
+    /// Kept: present and non-empty before the removal, equal after it.
+    fn assert_kept<T: PartialEq + Default + std::fmt::Debug>(
+        label: &str,
+        what: &str,
+        before: &Option<T>,
+        after: &Option<T>,
+    ) {
+        let seen = before
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: {what} must be present before the removal"));
+        assert!(
+            *seen != T::default(),
+            "{label}: {what} must be non-empty before the removal"
+        );
+        assert_eq!(
+            after, before,
+            "{label}: {what} must be unchanged by the removal"
+        );
+    }
+
+    /// Every runtime the cell started is in the process table before the
+    /// removal and out of it after: the agent pid reaped, the group extinct.
+    fn expect_processes(
+        label: &str,
+        runtime: MatrixRuntime,
+        probe: &Probe,
+        before: &EndState,
+        after: &EndState,
+    ) {
+        match runtime {
+            MatrixRuntime::Live => {
+                assert!(
+                    !probe.runtimes.is_empty(),
+                    "{label}: a live cell must start a runtime"
+                );
+                for (index, (pid, pgid)) in probe.runtimes.iter().enumerate() {
+                    assert_gone(
+                        label,
+                        &format!("agent pid {pid} in the process table"),
+                        &before.agents[index],
+                        &after.agents[index],
+                    );
+                    assert_gone(
+                        label,
+                        &format!("process group {pgid}"),
+                        &before.groups[index],
+                        &after.groups[index],
+                    );
+                }
+            }
+        }
+    }
+
+    /// The saved state file loses exactly `removed` and keeps every other
+    /// row it held before, in the same order.
+    fn expect_rows_dropped(label: &str, before: &EndState, after: &EndState, removed: &[RowKey]) {
+        for row in removed {
+            assert!(
+                before.saved_rows.contains(row),
+                "{label}: {row:?} must be in the saved state before the removal"
+            );
+        }
+        let expected: Vec<RowKey> = before
+            .saved_rows
+            .iter()
+            .copied()
+            .filter(|row| !removed.contains(row))
+            .collect();
+        assert_eq!(
+            after.saved_rows, expected,
+            "{label}: the saved state must lose exactly the removed rows"
+        );
+    }
+
+    /// One cell whose target is a checkout row. Seeds a binding for the
+    /// target and a marker for its repository, reads the fixture, removes
+    /// the row, reads the fixture again the same way and holds the two reads
+    /// to the per-kind expectation.
+    fn run_checkout_cell(cell: MatrixCell) {
+        let label = cell.label();
+        let (role, managed) = cell.role.expect("a checkout cell names a role");
+        let f = RemovalFixture::new(&format!("matrix-{}", label.replace('/', "-")));
+        let config = crate::persist::config_dir();
+        let mut repo = matrix_repository(&f, cell.shape);
+        let (target, target_path) = repo.child(role, managed);
+        if managed {
+            make_unclean(&target_path, repo.tracked);
+        }
+        let digest = digest_of(&repo.common);
+        let marker_dir = owned_repository_dir(&digest, &repo.common);
+        set_physical_key(&mut repo.state, repo.key, &digest);
+        folder_workspace::record(Some(&config), &target_path, "matrix-ws", 10);
+        let neighbours = seed_neighbours(&f);
+
+        let mut handles = LiveHandles(Vec::new());
+        let mut runtimes = Vec::new();
+        match cell.runtime {
+            MatrixRuntime::Live => {
+                let pty = spawn_trapping_runtime(&target_path);
+                let identity = pty.process_identity();
+                runtimes.push((identity.pid, identity.process_group));
+                seed_live(&mut repo.state, target, &pty, None);
+                handles.0.push(handle_for(
+                    RowKey::Checkout(target),
+                    pty,
+                    None,
+                    &target_path,
+                    &repo.main,
+                ));
+            }
+        }
+        repo.state.validate_for_save().expect("seed is save-valid");
+        write_seed(&f, &repo.state);
+
+        let probe = Probe {
+            state_root: f.state_root(),
+            runtimes,
+            git_repo: Some(repo.main.clone()),
+            dirs: repo
+                .children
+                .iter()
+                .map(|child| child.path.clone())
+                .collect(),
+            bound: vec![target_path.clone(), neighbours.folder.clone()],
+            marker_dir: Some(marker_dir),
+            suppressed: vec![target_path.clone(), neighbours.suppressed.clone()],
+        };
+        let before = read_end_state(&probe);
+        let (save, calls) = counting_save(&f.state_root());
+        if let Err(error) = remove(
+            &mut repo.state,
+            RemovalTarget::Checkout(target),
+            &mut handles.0,
+            save,
+        ) {
+            panic!("{label}: the removal failed: {error:?}");
+        }
+        let after = read_end_state(&probe);
+
+        // Process.
+        expect_processes(&label, cell.runtime, &probe, &before, &after);
+
+        // Worktree: the target's directory and registration per its kind,
+        // every sibling's kept, every branch kept.
+        let target_directory_goes = match cell.kind {
+            MatrixKind::ManagedWorktree => true,
+        };
+        for child in &repo.children {
+            let dir = format!("directory {}", child.path.display());
+            let registration = format!("git registration of {}", child.path.display());
+            if child.key == target && target_directory_goes {
+                assert_gone(
+                    &label,
+                    &dir,
+                    &before.dirs[&child.path],
+                    &after.dirs[&child.path],
+                );
+                assert_gone(
+                    &label,
+                    &registration,
+                    &before.registrations[&child.path],
+                    &after.registrations[&child.path],
+                );
+            } else {
+                assert_kept(
+                    &label,
+                    &dir,
+                    &before.dirs[&child.path],
+                    &after.dirs[&child.path],
+                );
+                assert_kept(
+                    &label,
+                    &registration,
+                    &before.registrations[&child.path],
+                    &after.registrations[&child.path],
+                );
+            }
+        }
+        let branch = before.registrations[&target_path]
+            .as_ref()
+            .and_then(|stanza| stanza.iter().find_map(|line| line.strip_prefix("branch ")))
+            .unwrap_or_else(|| {
+                panic!("{label}: the target must sit on a branch before the removal")
+            })
+            .to_string();
+        let on_branch = |state: &EndState| {
+            state.branches.as_ref().map(|lines| {
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with(&format!("{branch} ")))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_kept(
+            &label,
+            &format!("the target's branch {branch}"),
+            &on_branch(&before),
+            &on_branch(&after),
+        );
+        assert_kept(
+            &label,
+            "the branch snapshot",
+            &before.branches,
+            &after.branches,
+        );
+
+        // Binding.
+        assert_gone(
+            &label,
+            "the target's binding",
+            &before.bindings[&target_path],
+            &after.bindings[&target_path],
+        );
+        assert_kept(
+            &label,
+            "the neighbour's binding",
+            &before.bindings[&neighbours.folder],
+            &after.bindings[&neighbours.folder],
+        );
+
+        // Marker and suppression.
+        assert_kept(&label, "the parent marker", &before.marker, &after.marker);
+        assert_kept(
+            &label,
+            "the parent's repository directory",
+            &before.marker_dir,
+            &after.marker_dir,
+        );
+        assert_added(
+            &label,
+            "the target's suppression entry",
+            &before.suppressions[&target_path],
+            &after.suppressions[&target_path],
+            &folder_key(&repo.common),
+        );
+        assert_kept(
+            &label,
+            "the neighbour's suppression entry",
+            &before.suppressions[&neighbours.suppressed],
+            &after.suppressions[&neighbours.suppressed],
+        );
+
+        // Saved rows, and the one save that wrote them.
+        expect_rows_dropped(&label, &before, &after, &[RowKey::Checkout(target)]);
+        assert_eq!(calls.get(), 1, "{label}: the removal must save once");
+
+        println!("CELL:{label}");
+    }
+
+    /// REL-01, managed worktree row: the runtime, the directory, the git
+    /// registration and the row's own binding go; the branch and the parent
+    /// marker stay; the path is suppressed.
+    #[test]
+    fn end_state_matrix_managed_worktree() {
+        run_checkout_cell(MatrixCell {
+            kind: MatrixKind::ManagedWorktree,
+            role: Some((CheckoutRole::ManagedBranch, true)),
+            runtime: MatrixRuntime::Live,
+            shape: MatrixShape::Cloned,
+        });
+    }
+
     /// READM-02: the removed repository's owned marker and directory go, and
     /// the next admission of the same repository sees no owner there, reports
     /// no collision and allocates the un-suffixed digest with a fresh marker.
