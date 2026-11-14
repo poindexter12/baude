@@ -1070,6 +1070,11 @@ fn group_members(process_group: i32) -> std::result::Result<Vec<ProcessIdentity>
     ))
 }
 
+/// Signal the recorded group. Two errnos are not failures of the signal step:
+/// `ESRCH` is no such group, and `EPERM` is a group holding nothing this
+/// process may signal, which on macOS includes a group whose only member is
+/// an exited, unreaped leader. Neither says the group is gone: the extinction
+/// wait that follows decides that, and its probe counts `EPERM` as alive.
 fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
     // SAFETY: negative pid selects the process group captured from the exact
     // PTY leader identity and rechecked immediately before the first signal.
@@ -1078,10 +1083,9 @@ fn signal_group(process_group: i32, signal: i32) -> std::io::Result<()> {
         Ok(())
     } else {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
+        match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::EPERM) => Ok(()),
+            _ => Err(error),
         }
     }
 }
