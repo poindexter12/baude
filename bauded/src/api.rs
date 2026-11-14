@@ -6707,6 +6707,449 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// How long one whole request over a real socket may take. A removal
+    /// kills a runtime and waits for it inside the handler, so this sits far
+    /// above any healthy exchange and only bounds a hang.
+    const SOCKET_REQUEST_WAIT: Duration = Duration::from_secs(30);
+
+    /// Write all of `bytes` to `stream`. Readiness plus `try_write` is what
+    /// tokio's `net` feature gives; `bauded` does not enable `io-util`.
+    async fn socket_write_all(stream: &tokio::net::TcpStream, bytes: &[u8]) {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            stream
+                .writable()
+                .await
+                .expect("the socket becomes writable");
+            match stream.try_write(&bytes[sent..]) {
+                Ok(count) => sent += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("socket write failed: {error}"),
+            }
+        }
+    }
+
+    /// One read off `stream`, appended to `into`. Returns the byte count,
+    /// which is 0 once the peer has closed. Unbounded on its own: every
+    /// caller wraps it in a timeout.
+    async fn socket_read_some(stream: &tokio::net::TcpStream, into: &mut Vec<u8>) -> usize {
+        let mut chunk = [0u8; 4096];
+        loop {
+            stream
+                .readable()
+                .await
+                .expect("the socket becomes readable");
+            match stream.try_read(&mut chunk) {
+                Ok(count) => {
+                    into.extend_from_slice(&chunk[..count]);
+                    return count;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("socket read failed: {error}"),
+            }
+        }
+    }
+
+    /// The status line and header block of an HTTP/1.1 response.
+    struct HttpHead {
+        status: StatusCode,
+        /// Names lowercased, values trimmed.
+        headers: Vec<(String, String)>,
+    }
+
+    impl HttpHead {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn is_chunked(&self) -> bool {
+            self.header("transfer-encoding")
+                .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+        }
+    }
+
+    /// Take the header block off the front of `raw`, or `None` while the
+    /// blank line that ends it has not arrived. What follows the block stays
+    /// in `raw`.
+    fn take_http_head(raw: &mut Vec<u8>) -> Option<HttpHead> {
+        let end = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
+        let block: Vec<u8> = raw.drain(..end + 4).collect();
+        let block = String::from_utf8(block).expect("an HTTP header block is UTF-8");
+        let mut lines = block.split("\r\n");
+        let status_line = lines.next().unwrap();
+        let mut parts = status_line.splitn(3, ' ');
+        assert_eq!(parts.next(), Some("HTTP/1.1"), "{status_line:?}");
+        let status = parts
+            .next()
+            .and_then(|code| code.parse::<u16>().ok())
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .unwrap_or_else(|| panic!("not an HTTP status line: {status_line:?}"));
+        let headers = lines
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (name, value) = line
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("not an HTTP header line: {line:?}"));
+                (name.trim().to_ascii_lowercase(), value.trim().to_string())
+            })
+            .collect();
+        Some(HttpHead { status, headers })
+    }
+
+    /// Move the payload of every complete chunk at the front of `raw` to
+    /// `out`, decoding `Transfer-Encoding: chunked`. A chunk that has only
+    /// partly arrived stays in `raw`. Returns true once the zero-size chunk
+    /// that ends the body has been read.
+    fn drain_chunks(raw: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+        loop {
+            let Some(line_end) = raw.windows(2).position(|pair| pair == b"\r\n") else {
+                return false;
+            };
+            let size_line = String::from_utf8_lossy(&raw[..line_end]).into_owned();
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap().trim(), 16)
+                .unwrap_or_else(|_| panic!("not a chunk-size line: {size_line:?}"));
+            if size == 0 {
+                return true;
+            }
+            let start = line_end + 2;
+            let end = start + size;
+            if raw.len() < end + 2 {
+                return false;
+            }
+            out.extend_from_slice(&raw[start..end]);
+            raw.drain(..end + 2);
+        }
+    }
+
+    /// One HTTP/1.1 request to `addr` over a fresh connection, sent with
+    /// `Connection: close` and read to the end of the stream. Returns the
+    /// status and the body, decoded from a `Content-Length` or a chunked
+    /// response. A body that is not JSON, which is what the removal routes
+    /// answer outside 200 and 409, comes back as a JSON string so a failed
+    /// status assertion can still print it.
+    async fn socket_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let payload = body.map(|json| json.to_string()).unwrap_or_default();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
+             Connection: close\r\n"
+        );
+        if body.is_some() {
+            request.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                payload.len()
+            ));
+        }
+        request.push_str("\r\n");
+        request.push_str(&payload);
+
+        let mut raw: Vec<u8> = Vec::new();
+        let exchange = tokio::time::timeout(SOCKET_REQUEST_WAIT, async {
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect to the test listener");
+            socket_write_all(&stream, request.as_bytes()).await;
+            while socket_read_some(&stream, &mut raw).await > 0 {}
+        })
+        .await;
+        assert!(
+            exchange.is_ok(),
+            "{method} {path} over the socket did not finish within {SOCKET_REQUEST_WAIT:?}; \
+             received so far: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+
+        let head = take_http_head(&mut raw).unwrap_or_else(|| {
+            panic!(
+                "{method} {path}: the stream ended without a complete header block: {:?}",
+                String::from_utf8_lossy(&raw)
+            )
+        });
+        let bytes = if head.is_chunked() {
+            let mut decoded = Vec::new();
+            assert!(
+                drain_chunks(&mut raw, &mut decoded),
+                "{method} {path}: the chunked body ended without its last chunk: {:?}",
+                String::from_utf8_lossy(&raw)
+            );
+            decoded
+        } else {
+            if let Some(length) = head.header("content-length") {
+                assert_eq!(
+                    raw.len(),
+                    length.parse::<usize>().unwrap(),
+                    "{method} {path}: the body is not the announced length"
+                );
+            }
+            raw
+        };
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (head.status, body)
+    }
+
+    /// A `GET /events` subscription held open on a real socket.
+    struct SocketEvents {
+        stream: tokio::net::TcpStream,
+        chunked: bool,
+        /// Bytes off the socket the transfer decoding has not consumed.
+        raw: Vec<u8>,
+        /// Decoded SSE bytes no message has consumed yet.
+        pending: Vec<u8>,
+        /// Every body byte the socket delivered, kept for failure messages.
+        delivered: Vec<u8>,
+    }
+
+    /// `GET /events` written by hand over a fresh connection to `addr`,
+    /// pinned to 200 and an SSE content type. The subscription exists once
+    /// this returns: the handler takes its receiver before it builds the
+    /// stream, and the header block is only written after the handler ran.
+    async fn open_socket_events(addr: std::net::SocketAddr) -> SocketEvents {
+        let stream =
+            tokio::time::timeout(SOCKET_REQUEST_WAIT, tokio::net::TcpStream::connect(addr))
+                .await
+                .expect("connecting the subscriber timed out")
+                .expect("connect to the test listener");
+        let request =
+            format!("GET /events HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\r\n");
+        let mut raw: Vec<u8> = Vec::new();
+        let head = tokio::time::timeout(SOCKET_REQUEST_WAIT, async {
+            socket_write_all(&stream, request.as_bytes()).await;
+            loop {
+                if let Some(head) = take_http_head(&mut raw) {
+                    return Some(head);
+                }
+                if socket_read_some(&stream, &mut raw).await == 0 {
+                    return None;
+                }
+            }
+        })
+        .await;
+        let head = match head {
+            Ok(Some(head)) => head,
+            Ok(None) => panic!(
+                "GET /events: the server closed before a header block: {:?}",
+                String::from_utf8_lossy(&raw)
+            ),
+            Err(_) => panic!(
+                "GET /events: no header block within {SOCKET_REQUEST_WAIT:?}: {:?}",
+                String::from_utf8_lossy(&raw)
+            ),
+        };
+        assert_eq!(
+            head.status,
+            StatusCode::OK,
+            "GET /events over a socket must open a stream"
+        );
+        let content_type = head.header("content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "GET /events over a socket: content-type is {content_type:?}"
+        );
+        SocketEvents {
+            chunked: head.is_chunked(),
+            delivered: raw.clone(),
+            stream,
+            raw,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The next SSE message the socket delivers, or `None` when `deadline`
+    /// passes without a complete one. Transfer chunking is decoded first, so
+    /// a message split across chunks or reads is still one message, and a
+    /// message made only of comment lines, a keep-alive, is skipped.
+    ///
+    /// Panics when the server ends the stream: the daemon ends it only at
+    /// shutdown, so an end inside a test is the route dropping its subscriber.
+    async fn next_socket_frame(
+        events: &mut SocketEvents,
+        deadline: tokio::time::Instant,
+    ) -> Option<SseFrame> {
+        loop {
+            let ended = if events.chunked {
+                drain_chunks(&mut events.raw, &mut events.pending)
+            } else {
+                events.pending.append(&mut events.raw);
+                false
+            };
+            while let Some(end) = events
+                .pending
+                .windows(2)
+                .position(|pair| pair == b"\n\n")
+                .map(|start| start + 2)
+            {
+                let raw: Vec<u8> = events.pending.drain(..end).collect();
+                let raw = String::from_utf8(raw).expect("an SSE message is UTF-8");
+                let mut event = String::new();
+                let mut data: Vec<&str> = Vec::new();
+                for line in raw.lines() {
+                    if let Some(value) = line.strip_prefix("event:") {
+                        event = value.strip_prefix(' ').unwrap_or(value).to_string();
+                    } else if let Some(value) = line.strip_prefix("data:") {
+                        data.push(value.strip_prefix(' ').unwrap_or(value));
+                    }
+                }
+                if event.is_empty() && data.is_empty() {
+                    continue;
+                }
+                let data = data.join("\n");
+                return Some(SseFrame { event, data, raw });
+            }
+            assert!(
+                !ended,
+                "the events stream ended its chunked body; the socket delivered {:?}",
+                String::from_utf8_lossy(&events.delivered)
+            );
+            let before = events.raw.len();
+            let read = tokio::time::timeout_at(
+                deadline,
+                socket_read_some(&events.stream, &mut events.raw),
+            )
+            .await;
+            match read {
+                Err(_) => return None,
+                Ok(0) => panic!(
+                    "the server closed the events socket; it delivered {:?}",
+                    String::from_utf8_lossy(&events.delivered)
+                ),
+                Ok(_) => events.delivered.extend_from_slice(&events.raw[before..]),
+            }
+        }
+    }
+
+    /// REL-01, gap G5: every `events_` test above drives the router in
+    /// process. Here the router is served on a loopback socket and both the
+    /// subscriber and the removal are hand-written HTTP/1.1 on that address,
+    /// so what is asserted is what a client's socket delivers. Not a browser
+    /// run and not a stand-in for one.
+    #[tokio::test]
+    async fn rel01_events_rows_removed_reach_a_real_http_subscriber() {
+        // First statement, so the fixture's redirect drops last: the spawned
+        // `axum::serve` task and the runtime it removes run on this same
+        // current-thread runtime and resolve baude paths through it.
+        let (root, fixture, workspace, shared, app, id, key) =
+            removal_fixture("rel01-http-events").await;
+        let repo = fixture.path().canonicalize().unwrap();
+        let row = serde_json::json!({ "checkout": key });
+        let state_file = removal_state_file(&root, &workspace);
+
+        // Loopback only, on a port the kernel picks. `app` moves into the
+        // server, so no request below can reach the router any other way.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut events = open_socket_events(addr).await;
+
+        // Before: the row is listed, its runtime is live, its state is saved.
+        let (status, rows) = socket_request(addr, "GET", "/rows", None).await;
+        assert_eq!(status, StatusCode::OK, "GET /rows: {rows}");
+        assert!(rows_lists(&rows, &row), "{rows}");
+        let listed = rows_checkout_for_session(&rows, id);
+        assert_eq!(listed["checkout_key"], serde_json::json!(key), "{listed}");
+        assert_eq!(listed["path"], repo.to_str().unwrap(), "{listed}");
+        let (status, previewed) =
+            socket_request(addr, "POST", "/removals/preview", Some(&row)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "POST /removals/preview: {previewed}"
+        );
+        let agent_pid = previewed_agent_pid(&previewed, key);
+        assert!(
+            pid_is_alive(agent_pid),
+            "the fixture runtime {agent_pid} must be live before the removal"
+        );
+        let state_before = std::fs::read(&state_file).unwrap();
+
+        // The removal, with the previewed report echoed verbatim.
+        let (status, executed) = socket_request(addr, "POST", "/removals", Some(&previewed)).await;
+        assert_eq!(status, StatusCode::OK, "POST /removals: {executed}");
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+        assert_eq!(
+            executed["persistence"],
+            serde_json::json!({ "outcome": "saved" })
+        );
+
+        // The subscriber's socket delivers the message.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let frame = loop {
+            let frame = next_socket_frame(&mut events, deadline)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "rel01 events over a socket: no rows_removed message within 5 s of a \
+                         committed removal; the socket delivered {:?}",
+                        String::from_utf8_lossy(&events.delivered)
+                    )
+                });
+            if frame.event == "rows_removed" {
+                break frame;
+            }
+        };
+        eprintln!(
+            "22-02 observation: /events over a socket, chunked {}: {:?}",
+            events.chunked, frame.raw
+        );
+        assert!(
+            !frame.data.contains('\n'),
+            "the report must travel on one data line: {frame:?}"
+        );
+        let announced: serde_json::Value = serde_json::from_str(&frame.data)
+            .unwrap_or_else(|error| panic!("the data line is JSON: {error}: {frame:?}"));
+        assert_eq!(
+            announced, executed,
+            "the message carries the JSON the removal returned"
+        );
+        let second = next_socket_frame(
+            &mut events,
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            second.is_none(),
+            "one removal announced a second message: {second:?}"
+        );
+
+        // After: gone from the listing, the process table and the saved state.
+        let (status, rows) = socket_request(addr, "GET", "/rows", None).await;
+        assert_eq!(status, StatusCode::OK, "GET /rows: {rows}");
+        assert!(!rows_lists(&rows, &row), "{rows}");
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process {agent_pid} is still alive"
+        );
+        assert_ne!(
+            std::fs::read(&state_file).unwrap(),
+            state_before,
+            "the removal rewrote the state file"
+        );
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        assert_eq!(restored.restore_at(&root, &workspace), 0);
+        assert!(matches!(
+            restored.preview_removal(RemovalTarget::Checkout(key)),
+            Err(RemovalError::UnknownTarget(_))
+        ));
+
+        drop(events);
+        server.abort();
+        assert!(
+            server.await.unwrap_err().is_cancelled(),
+            "the server task ran until it was aborted"
+        );
+        removal_teardown(&shared, &root);
+    }
+
     /// Characterization: `/stream` had no test for its unknown-session guard.
     #[tokio::test]
     async fn stream_guards_unknown_session() {
