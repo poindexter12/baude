@@ -210,8 +210,16 @@
       if (persistence.outcome === "saved_degraded" && typeof persistence.detail === "string") {
         notice = `${notice}; ${persistence.detail}`;
       }
+      // One notification for one removal. The page shows a single line that
+      // each notification replaces, so a clearing failure sent after the
+      // notice would take the counts and the caveat off screen, and of
+      // several failures only the last would ever be read. The failures are
+      // led in the way the TUI's removal_notice leads them in.
+      const failures = removal.clearingFailures(report, { home: null });
+      if (failures.length > 0) {
+        notice = `${notice}; could not clear ${failures.length}: ${failures.join("; ")}`;
+      }
       say(notice, index);
-      for (const failure of removal.clearingFailures(report, { home: null })) say(failure, index);
       deps.onChange();
     }
 

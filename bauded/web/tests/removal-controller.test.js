@@ -983,12 +983,58 @@ test("notice_text_names_a_row_removed_by_the_same_response", async () => {
   await h.reply("POST", "/removals", report);
   await h.confirming;
 
-  assert.equal(h.notices.length, 2);
-  assert.equal(h.notices[0], "removed 1 row, killed 1 runtime, deleted 1 path");
+  assert.equal(h.notices.length, 1);
+  assert.ok(h.notices[0].startsWith("removed 1 row, killed 1 runtime, deleted 1 path"), h.notices[0]);
   // Only holds if the index was taken before the row was dropped.
-  assert.ok(h.notices[1].includes("zeta (feat/zeta)"), h.notices[1]);
-  assert.ok(h.notices[1].includes(`${WORKTREES}/topic-7`));
+  assert.ok(h.notices[0].includes("zeta (feat/zeta)"), h.notices[0]);
+  assert.ok(h.notices[0].includes(`${WORKTREES}/topic-7`));
   for (const text of h.notices) assert.ok(!text.includes("Key("), text);
+});
+
+// What the page's toast still shows after every notify so far. app.js binds
+// notify to toast(), which holds one line: each call replaces the text and
+// restarts the one timer, so only the last notification is ever readable.
+function toastText(h) {
+  return h.notices.length === 0 ? "" : h.notices[h.notices.length - 1];
+}
+
+test("removal_with_clearing_failures_shows_every_line_in_the_one_toast", async () => {
+  const h = harness();
+  await execute(h);
+  const detail = "state file replaced, but syncing its directory failed: Input/output error (os error 5)";
+  // The daemon removed the row and saved with a caveat, and two of the things
+  // it then tried to forget would not go.
+  const report = executedReport({
+    persistence: { outcome: "saved_degraded", detail },
+    clearing_failures: [
+      { kind: "marker", path: `${WORKTREES}/topic-7`, error: "Permission denied (os error 13)" },
+      {
+        kind: "binding",
+        path: `${HOME}/.config/baude/folder-workspaces.json`,
+        error: "Read-only file system (os error 30)",
+      },
+    ],
+  });
+
+  await h.reply("POST", "/removals", report);
+  await h.confirming;
+
+  assert.equal(h.controller.getModal(), null);
+  assert.deepEqual(checkoutKeys(h.controller.getRows()), [5]);
+  const shown = toastText(h);
+  // The counts and the save caveat are still on screen, not replaced by a
+  // clearing failure that was notified after them.
+  assert.ok(shown.startsWith("removed 1 row, killed 1 runtime, deleted 1 path"), shown);
+  assert.ok(shown.includes(detail), shown);
+  // Both failures, not only the last one, counted and named.
+  assert.ok(
+    shown.endsWith(
+      `; could not clear 2: marker ${WORKTREES}/topic-7: Permission denied (os error 13); `
+        + `binding ${HOME}/.config/baude/folder-workspaces.json: Read-only file system (os error 30)`,
+    ),
+    shown,
+  );
+  assert.equal(h.notices.length, 1, "one removal is one notification");
 });
 
 test("saved_degraded_200_drops_rows_and_shows_a_notice", async () => {
