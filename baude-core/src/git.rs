@@ -319,6 +319,64 @@ pub(crate) fn worktree_inventory(
     Ok(worktrees)
 }
 
+/// Whether git's stderr says the path is not inside any repository.
+///
+/// A folder whose `.git` file points at a repository that no longer exists,
+/// such as a worktree left behind after its repository was deleted, is
+/// reported as `not a git repository` by older git and as `gitfile does not
+/// point to a valid repository` by newer git. Both mean the same thing here.
+pub fn is_not_repository_stderr(stderr: &str) -> bool {
+    stderr.starts_with("fatal: not a git repository")
+        || stderr.starts_with("fatal: gitfile does not point to a valid repository")
+}
+
+#[cfg(test)]
+mod not_repository_tests {
+    use super::{discover_repository, is_not_repository_stderr, RepositoryDiscoveryError};
+
+    #[test]
+    fn both_git_wordings_for_a_stale_gitfile_mean_no_repository() {
+        // Older git, and the wording a plain folder gets from every version.
+        assert!(is_not_repository_stderr(
+            "fatal: not a git repository: /tmp/gone/.git/worktrees/stale\n"
+        ));
+        // Newer git, seen on the ubuntu-22.04 CI runner on 2026-11-14.
+        assert!(is_not_repository_stderr(
+            "fatal: gitfile does not point to a valid repository: /tmp/stale/.git\n"
+        ));
+        assert!(!is_not_repository_stderr(
+            "fatal: invalid gitfile format: /tmp/stale/.git\n"
+        ));
+        assert!(!is_not_repository_stderr(
+            "fatal: detected dubious ownership in repository at '/tmp/x'\n"
+        ));
+    }
+
+    #[test]
+    fn a_folder_whose_gitfile_points_nowhere_is_not_a_repository() {
+        let root =
+            std::env::temp_dir().join(format!("baude-git-stale-gitfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stale = root.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        let gone = root
+            .join("gone")
+            .join(".git")
+            .join("worktrees")
+            .join("stale");
+        std::fs::write(stale.join(".git"), format!("gitdir: {}\n", gone.display())).unwrap();
+
+        let outcome = discover_repository(&stale);
+        let _ = std::fs::remove_dir_all(&root);
+        match outcome {
+            Err(RepositoryDiscoveryError::NotRepository(path)) => {
+                assert!(path.ends_with("stale"), "{}", path.display())
+            }
+            other => panic!("a stale gitfile must read as no repository, got {other:?}"),
+        }
+    }
+}
+
 /// Discover canonical repository membership without reading Git's on-disk layout.
 pub fn discover_repository(
     path: &Path,
@@ -340,7 +398,7 @@ pub fn discover_repository(
         "rev-parse common directory",
     ) {
         Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
-            if stderr.starts_with("fatal: not a git repository") =>
+            if is_not_repository_stderr(&stderr) =>
         {
             return Err(RepositoryDiscoveryError::NotRepository(canonical_input));
         }

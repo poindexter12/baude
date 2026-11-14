@@ -3994,8 +3994,11 @@ mod tests {
             .unwrap();
         let stderr = String::from_utf8_lossy(&probe.stderr);
         assert!(!probe.status.success(), "{stderr}");
+        // Older git says `not a git repository` here and newer git says
+        // `gitfile does not point to a valid repository`; admission must
+        // treat both as no repository.
         assert!(
-            stderr.starts_with("fatal: not a git repository"),
+            baude_core::git::is_not_repository_stderr(&stderr),
             "git refused {} for another reason: {stderr}",
             stale.display()
         );
