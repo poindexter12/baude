@@ -3566,6 +3566,73 @@ mod tests {
         }
     }
 
+    /// A save that fails just after a folder's agent was started. Opening a
+    /// folder saves three times: the row, the started launch, and the mark
+    /// that the launch is running. The first two go through here and the
+    /// third fails, so the daemon stops what it started. The row must then
+    /// record no runtime, in memory and in the state file: nothing may claim
+    /// a process the daemon itself ended.
+    #[tokio::test]
+    async fn standalone_open_whose_running_save_fails_leaves_no_recorded_runtime() {
+        use baude_core::persist::{self, AtomicFailure};
+
+        for (label, failure, failing_saves) in [
+            // One save is lost and the disk is fine again.
+            ("standalone-release-rename", AtomicFailure::Rename, 1),
+            // Every save from then on replaces the file and cannot confirm
+            // it is durable.
+            (
+                "standalone-release-sync",
+                AtomicFailure::DirectorySync,
+                usize::MAX,
+            ),
+        ] {
+            let (root, _owner, folder, workspace, shared, app) = folder_fixture(label);
+            crate::manager::lock(&shared).fail_saves_after_for_test(2, failing_saves, failure);
+
+            let (status, body) = open_folder(&app, folder.to_str().unwrap(), None).await;
+            assert_ne!(status, StatusCode::CREATED, "{failure:?}: {body}");
+            assert_eq!(
+                session_ids(&app).await,
+                Vec::<u64>::new(),
+                "{failure:?}: the open failed, so no session is listed"
+            );
+
+            // The folder keeps its row, closed.
+            let entry = only_standalone_row(&app).await;
+            let key = standalone_key_of(&entry);
+            let row = serde_json::json!({ "standalone": key });
+            assert_eq!(entry["session_id"], serde_json::Value::Null, "{entry}");
+            let preview = preview_target(&app, &row).await;
+            assert_eq!(
+                preview["runtimes_killed"],
+                serde_json::json!([]),
+                "{failure:?}: the daemon ended the launch it started, so removing the row has \
+                 nothing left to kill: {preview}"
+            );
+            let retained = persist::load_current_at(&root, &workspace.state_file("daemon-state"))
+                .unwrap()
+                .state;
+            assert_eq!(retained.standalone_sessions.len(), 1, "{failure:?}");
+            assert_eq!(
+                retained.standalone_sessions[0].owned_runtime(),
+                None,
+                "{failure:?}: the state file still records the ended launch"
+            );
+
+            // With the disk healthy again the folder opens under the same row.
+            crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, None);
+            let id = opened_folder_id(&app, &folder).await;
+            let entry = only_standalone_row(&app).await;
+            assert_eq!(standalone_key_of(&entry), key);
+            assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+            let reopened = preview_target(&app, &row).await;
+            assert!(pid_is_alive(only_runtime_pid(&reopened)), "{reopened}");
+
+            removal_teardown(&shared, &root);
+        }
+    }
+
     /// The paths of the `kind` items an executed report cleared.
     fn cleared_paths(
         report: &baude_core::removal::RemovalReport,

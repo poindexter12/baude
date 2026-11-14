@@ -287,6 +287,12 @@ pub struct Manager {
     persistence_target_for_test: Option<(PathBuf, String)>,
     #[cfg(test)]
     atomic_failure_for_test: Option<persist::AtomicFailure>,
+    /// Test-only: how many saves still go through before
+    /// `atomic_failure_for_test` applies, and how many saves it then applies
+    /// to. `(0, usize::MAX)` is a failure that is there from the first save
+    /// and stays.
+    #[cfg(test)]
+    atomic_failure_window_for_test: (usize, usize),
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
     /// Startup timing stages (config load, state load, listener bound, etc.)
@@ -713,6 +719,8 @@ impl Manager {
             #[cfg(test)]
             atomic_failure_for_test: None,
             #[cfg(test)]
+            atomic_failure_window_for_test: (0, usize::MAX),
+            #[cfg(test)]
             spawn_error_for_test: None,
             startup_timing: crate::timing::StartupTiming::new(0),
         }
@@ -949,8 +957,10 @@ impl Manager {
         }
         let state = StateFile::new(self.state_for_save());
         #[cfg(test)]
+        let failure = self.scheduled_atomic_failure_for_test();
+        #[cfg(test)]
         let saved = if let Some((root, file)) = &self.persistence_target_for_test {
-            persist::save_current_at_test(root, file, &state, self.atomic_failure_for_test, None)
+            persist::save_current_at_test(root, file, &state, failure, None)
         } else {
             persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state)
         };
@@ -2592,9 +2602,28 @@ impl Manager {
         };
         if let Some(owner) = owner {
             if let Err(error) = self.release_runtime(owner) {
-                let _ = claude.kill_and_wait();
+                let mut stopped = claude.kill_and_wait().is_ok();
                 if let Some(shell) = &mut registered_shell {
-                    let _ = shell.kill_and_wait();
+                    stopped &= shell.kill_and_wait().is_ok();
+                }
+                // The launch that was just stopped is still on the standalone
+                // row: `Launching` when the save replaced nothing, `Running`
+                // when it replaced the file and could not confirm it. Return
+                // the row to `Active` with no owned runtime, as the failed
+                // launch above does. A stop that could not be confirmed keeps
+                // the record, which is what lets a later reopen end that
+                // runtime by its identity. The save failure stays the error
+                // the caller gets; a cleanup that cannot be saved either
+                // leaves the record for that same reopen.
+                if let (true, RuntimeOwner::Standalone(key)) = (stopped, owner) {
+                    if let Err(recovery) =
+                        self.recover_standalone_ownership(key, StandaloneLifecycle::Active)
+                    {
+                        eprintln!(
+                            "standalone {}: could not persist launch cleanup: {recovery}",
+                            key.get()
+                        );
+                    }
                 }
                 return Err(error);
             }
@@ -3870,6 +3899,41 @@ impl Manager {
         self.persistence_target_for_test =
             Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
         self.atomic_failure_for_test = failure;
+        self.atomic_failure_window_for_test = (0, usize::MAX);
+    }
+
+    /// Test-only: let the next `healthy` saves through, fail the `failing`
+    /// saves after them with `failure`, and let every later save through.
+    /// `usize::MAX` failing saves is a disk that went bad and stayed bad.
+    /// This is how a test reaches a save in the middle of one request, such
+    /// as the one that marks a started launch as running.
+    #[cfg(test)]
+    pub(crate) fn fail_saves_after_for_test(
+        &mut self,
+        healthy: usize,
+        failing: usize,
+        failure: persist::AtomicFailure,
+    ) {
+        self.atomic_failure_for_test = Some(failure);
+        self.atomic_failure_window_for_test = (healthy, failing);
+    }
+
+    /// The failure the save about to run is given, counted against the
+    /// window `fail_saves_after_for_test` set.
+    #[cfg(test)]
+    fn scheduled_atomic_failure_for_test(&mut self) -> Option<persist::AtomicFailure> {
+        let (healthy, failing) = &mut self.atomic_failure_window_for_test;
+        if *healthy > 0 {
+            *healthy -= 1;
+            return None;
+        }
+        if *failing == 0 {
+            return None;
+        }
+        if *failing != usize::MAX {
+            *failing -= 1;
+        }
+        self.atomic_failure_for_test
     }
 
     /// Test-only: make the next confirmed stop of session `id`'s agent PTY
