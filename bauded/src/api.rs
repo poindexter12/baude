@@ -7150,6 +7150,258 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// The file `baude_core::marker` writes into a managed repository
+    /// directory. The name is private there, so it is spelled out here the
+    /// way the core removal tests spell it.
+    const REPOSITORY_MARKER_FILE: &str = ".baude-marker.json";
+
+    /// Every file or directory named like the ownership marker anywhere
+    /// under `root`, found by walking the tree. Symlinks are not followed.
+    fn marker_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_name() == REPOSITORY_MARKER_FILE {
+                    found.push(path.clone());
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The workspace-agnostic bindings file under `config`, read off disk
+    /// with `serde_json` rather than through core's own loader, so a file
+    /// core would quietly treat as empty fails here instead. `None` when the
+    /// file does not exist.
+    fn bindings_on_disk(
+        config: &Path,
+    ) -> Option<baude_core::folder_workspace::FolderWorkspaceFile> {
+        let path = config.join(baude_core::folder_workspace::FILE_NAME);
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display())),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+
+    /// The local branch names git lists in `repo`.
+    fn local_branches(repo: &Path) -> Vec<String> {
+        git_read(
+            repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )
+        .expect("git lists the local branches")
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// REL-01, gap G6: a repository parent removed through the daemon on a
+    /// true `git clone`, with both children live. The end state is read from
+    /// the fixture, the process table or git, and each gone assertion has a
+    /// present-before twin.
+    ///
+    /// The daemon never writes an ownership marker: it allocates the
+    /// repository directory itself, and only the TUI path goes through
+    /// `lifecycle::ensure_repository`. So the marker is pinned absent, on
+    /// disk before and after and in the report's `cleared` list, which is the
+    /// one thing read from the report. Suppression is pinned by
+    /// `suppression_parent_removal_drops_the_child_entry` and is not repeated.
+    #[tokio::test]
+    async fn rel01_cloned_parent_removal_clears_binding_and_repository_dir_on_disk() {
+        let root = removal_root("rel01-cloned-parent");
+        // Bound before the daemon and held to the end: this owner carries the
+        // redirect every handler resolves its paths through.
+        let (upstream, clone) = cloned_repo(&root);
+        let (_workspace, shared, app) = removal_daemon(&root);
+        let contained_root = root.canonicalize().unwrap();
+        // The fixture is a clone: git recorded where it came from and which
+        // branch the remote serves, which a `git init` repository lacks.
+        assert_eq!(
+            git_read(&clone, &["remote", "get-url", "origin"])
+                .map(|url| PathBuf::from(url).canonicalize().unwrap()),
+            Some(upstream.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            git_read(&clone, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+
+        let (main_id, main_key, _) = admit_removal_session(&shared, &app, &clone, None).await;
+        let (worktree_id, worktree_key, worktree_info) =
+            admit_removal_session(&shared, &app, &clone, Some("topic")).await;
+        assert_ne!(main_key, worktree_key);
+        let worktree_path = PathBuf::from(worktree_info["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_ne!(worktree_path, clone);
+
+        // T-22-03: the binding is seeded under the redirected config dir, and
+        // that directory sits inside this fixture's root. A neighbour bound
+        // to the same workspace keeps the file on disk after the removal.
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&root) || config.starts_with(&contained_root),
+            "the config dir {} resolved outside the fixture root {}",
+            config.display(),
+            root.display()
+        );
+        let neighbour = root.join("neighbour");
+        std::fs::create_dir_all(&neighbour).unwrap();
+        baude_core::folder_workspace::record(Some(&config), &clone, "claude", 10);
+        baude_core::folder_workspace::record(Some(&config), &neighbour, "claude", 20);
+        let clone_binding = baude_core::breadcrumbs::folder_key(&clone);
+        let neighbour_binding = baude_core::breadcrumbs::folder_key(&neighbour);
+        assert_ne!(clone_binding, neighbour_binding);
+
+        // Before: both runtimes live.
+        let mut agent_pids: Vec<u64> = Vec::new();
+        for key in [main_key, worktree_key] {
+            let report = preview_report(&app, key).await;
+            let agent_pid = previewed_agent_pid(&report, key);
+            assert!(
+                pid_is_alive(agent_pid),
+                "runtime {agent_pid} must be live before the removal"
+            );
+            agent_pids.push(agent_pid);
+        }
+        assert_ne!(agent_pids[0], agent_pids[1]);
+        // Before: the managed worktree and its branch.
+        assert!(worktree_path.is_dir(), "{}", worktree_path.display());
+        let worktree_branch = git_read(&worktree_path, &["symbolic-ref", "--short", "-q", "HEAD"])
+            .expect("the managed worktree sits on a branch");
+        assert_eq!(worktree_branch, "topic");
+        assert!(
+            local_branches(&clone).contains(&worktree_branch),
+            "{:?}",
+            local_branches(&clone)
+        );
+        // Before: the binding entry in the file on disk.
+        let bindings_before = bindings_on_disk(&config).expect("the seeded bindings file exists");
+        assert!(
+            bindings_before.folders.contains_key(&clone_binding),
+            "{bindings_before:?}"
+        );
+        let neighbour_before = bindings_before.folders[&neighbour_binding].clone();
+        // Before: the repository directory, which the daemon allocates as
+        // the managed worktree's parent, inside the fixture root.
+        let repository_dir = worktree_path.parent().unwrap().to_path_buf();
+        assert!(
+            repository_dir != contained_root && repository_dir.starts_with(&contained_root),
+            "{}",
+            repository_dir.display()
+        );
+        assert!(repository_dir.is_dir(), "{}", repository_dir.display());
+        // Before: no ownership marker anywhere in the fixture. If one shows
+        // up the daemon has started writing it, and this test owes it a
+        // present-before and a gone-after read instead.
+        let markers_before = marker_files_under(&contained_root);
+        assert!(
+            markers_before.is_empty(),
+            "the daemon wrote an ownership marker: {markers_before:?}"
+        );
+        // Before: one repository parent with both checkouts under it.
+        let rows = rows_body(&app).await;
+        let repositories = rows["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{rows}");
+        let main_row = rows_checkout_for_session(&rows, main_id);
+        let worktree_row = rows_checkout_for_session(&rows, worktree_id);
+        assert_eq!(main_row["path"], clone.to_str().unwrap(), "{main_row}");
+        assert_eq!(main_row["role"], "main", "{main_row}");
+        assert_eq!(worktree_row["managed_by_baude"], true, "{worktree_row}");
+        let target = serde_json::json!({ "repository": repositories[0]["repository_key"] });
+        assert_eq!(main_row["repository_key"], target["repository"]);
+        assert_eq!(worktree_row["repository_key"], target["repository"]);
+
+        let preview = preview_target(&app, &target).await;
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(status, StatusCode::OK, "POST /removals {target}: {body}");
+
+        // After, per kind: every child group extinct.
+        for agent_pid in agent_pids {
+            assert!(
+                wait_for_pid_gone(agent_pid),
+                "agent {agent_pid} outlived the repository removal"
+            );
+        }
+        // The managed directory gone; the clone, its git dir, its tracked
+        // file and the worktree's branch kept.
+        assert!(
+            !worktree_path.exists(),
+            "the managed worktree {} survived",
+            worktree_path.display()
+        );
+        assert!(
+            clone.is_dir(),
+            "the clone directory {} must be kept",
+            clone.display()
+        );
+        assert!(clone.join("file").is_file());
+        assert!(git_read(&clone, &["rev-parse", "--git-dir"]).is_some());
+        assert!(
+            local_branches(&clone).contains(&worktree_branch),
+            "branch {worktree_branch} must survive: {:?}",
+            local_branches(&clone)
+        );
+        // The repository binding cleared from the file on disk, and only it.
+        let bindings_after =
+            bindings_on_disk(&config).expect("the neighbour's entry keeps the file on disk");
+        assert!(
+            !bindings_after.folders.contains_key(&clone_binding),
+            "the removed repository's binding is still on disk: {bindings_after:?}"
+        );
+        assert_eq!(
+            bindings_after.folders.get(&neighbour_binding),
+            Some(&neighbour_before),
+            "a neighbour bound to the same workspace keeps its entry unchanged"
+        );
+        // The repository directory cleared, with still no marker anywhere and
+        // none claimed as cleared by the report.
+        assert!(!repository_dir.exists(), "{}", repository_dir.display());
+        let markers_after = marker_files_under(&contained_root);
+        assert!(
+            markers_after.is_empty(),
+            "an ownership marker appeared during the removal: {markers_after:?}"
+        );
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut cleared_kinds: Vec<&str> = executed["cleared"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the report lists what it cleared: {body}"))
+            .iter()
+            .map(|entry| {
+                entry["kind"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a cleared entry names its kind: {entry}"))
+            })
+            .collect();
+        cleared_kinds.sort_unstable();
+        assert_eq!(
+            cleared_kinds,
+            ["binding", "repository_dir"],
+            "the report clears the binding and the directory and claims no marker: {body}"
+        );
+        // No repository parent left in the listing.
+        let after_rows = rows_body(&app).await;
+        assert_eq!(
+            after_rows["repositories"],
+            serde_json::json!([]),
+            "{after_rows}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
     /// Characterization: `/stream` had no test for its unknown-session guard.
     #[tokio::test]
     async fn stream_guards_unknown_session() {
