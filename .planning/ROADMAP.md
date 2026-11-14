@@ -202,14 +202,16 @@ Plans:
   2. README and PWA docs describe the remove action, its confirmation, and what is and is not deleted
   3. `scripts/gate.sh` and `scripts/gate.sh --linux` pass and v2.8.0 is released through release-please
 
-**Plans**: 5 plans
+**Plans**: 7 plans
 
-Plans:
-- [ ] 22-01-PLAN.md — Wave 1. Core end-state matrix: every row kind with and without a live runtime, on cloned and `git init` fixtures, read from the fixture
-- [ ] 22-02-PLAN.md — Wave 1. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
-- [ ] 22-03-PLAN.md — Wave 1. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
-- [ ] 22-04-PLAN.md — Wave 1. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
-- [ ] 22-05-PLAN.md — Wave 2. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
+Plans, in execution order. 22-06 and 22-07 are gap closure, added 2026-11-14: verifying phases 18 and 19 reproduced two product defects, and both are fixed before the validation tests run.
+- [ ] 22-06-PLAN.md — Wave 1. Gap closure, Phase 18 truth 13: `Pty::kill_and_wait` succeeds on macOS when the group's only member is an exited, unreaped leader; BL-11 marked resolved
+- [ ] 22-07-PLAN.md — Wave 1. Gap closure, Phase 19 SC2: a removed main checkout stays removed when baude launches inside a sibling worktree; launching inside it, `n` and `c` still re-admit
+- [ ] 22-01-PLAN.md — Wave 2. Core end-state matrix: every row kind with and without a live runtime, on cloned and `git init` fixtures, read from the fixture
+- [ ] 22-02-PLAN.md — Wave 2. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
+- [ ] 22-03-PLAN.md — Wave 2. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
+- [ ] 22-04-PLAN.md — Wave 2. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
+- [ ] 22-05-PLAN.md — Wave 3. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
 
 ## Backlog
 

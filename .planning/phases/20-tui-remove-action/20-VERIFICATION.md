@@ -3,7 +3,7 @@ phase: 20-tui-remove-action
 verified: 2026-11-13T21:56:02-08:00
 head: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
 status: human_needed
-score: 16/19 must-haves verified
+score: 18/19 must-haves verified
 covered_files:
   - ".planning/phases/20-tui-remove-action/20-01-PLAN.md"
   - ".planning/phases/20-tui-remove-action/20-01-SUMMARY.md"
@@ -20,7 +20,16 @@ covered_files:
   - "baude/src/ui.rs"
 covered_digest: "v4:sha256:3995b467c2f965f2939186429d687bd3970664885052c0f3cc9090582591c673"
 behavior_unverified: 0
-overrides_applied: 0
+overrides_applied: 2
+overrides:
+  - must_have: "D on a remote row yields a footer refusal naming Phase 21"
+    reason: "Superseded by Phase 21 D-12: D on a remote row previews and removes through the owning daemon"
+    accepted_by: "Joe Seymour"
+    accepted_at: "2026-11-13"
+  - must_have: "remote-row footers do not list D remove*"
+    reason: "Superseded by Phase 21 D-12: the remote footer lists D remove* because the action now exists there"
+    accepted_by: "Joe Seymour"
+    accepted_at: "2026-11-13"
 re_verification:
   previous_status: passed
   previous_score: 19/19
@@ -41,15 +50,17 @@ superseded:
     superseded_by: "Phase 21 decision D-12"
     evidence: "baude/src/ui.rs:1470-1472 remote footer is 'enter attach · r restart · x close · D remove* · ? help'; pinned by ui::tests::hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints"
 human_verification:
-  - test: "Decide whether to accept the Phase 21 supersession of the two remote-row clauses. If accepted, add the overrides block from the 'Superseded clauses' section to this file's frontmatter"
-    expected: "Both clauses recorded as PASSED (override); score becomes 18/19 before the gate item"
-    why_human: "An override needs a named human acceptor. The clauses are literally false at HEAD by a locked Phase 21 decision, so reporting them as gaps would ask a planner to revert Phase 21"
   - test: "Run scripts/gate.sh and scripts/gate.sh --linux at HEAD f934e64 and read each exit code directly"
     expected: "Both exit 0 with 'gate: all steps passed'"
     why_human: "The verifier was instructed not to run the full gate. The prior evidence is for f1f6d64, and app.rs, ui.rs and remote.rs have changed by about 6,100 lines since"
+human_verification_waived:
   - test: "Run baude at 59x20 and at 120+ columns, select a repository with several worktrees, press D, scroll with j/k, press Esc; then view the footer on each row kind"
     expected: "The red-bordered 'remove repository' modal stays within 80% of the screen height, '+N more' reads cleanly at the narrow width, the footer shows 'D rm' (narrow) or 'D remove*' (wide) beside x, w and X without truncation hiding the D hint"
-    why_human: "Render tests pin text and row counts at both sizes but cannot judge legibility. 20-VALIDATION.md:62 lists this as the phase's manual-only check. Carried forward from the prior report, where it was never recorded as done"
+    disposition: "waived by the owner and NOT performed"
+    waived_by: "Joe Seymour"
+    waived_at: "2026-11-13"
+    note: "Nobody ran this check. Legibility at either size is unconfirmed by a person; the render tests that pin text and row counts at both sizes are the only evidence"
+    source: ".planning/phases/21-daemon-and-pwa-parity/.replan-cycle-3/ORCH-STATE.md at commit 2460601"
 ---
 
 # Phase 20: TUI Remove Action Verification Report
@@ -83,40 +94,40 @@ All tests below ran in one invocation, exit code read directly from the unpiped 
 | 6 | 20-01: Repository parent lists every child; j/k scroll; hidden remainder renders `+N more` (D-07, TUI-03) | ✓ VERIFIED | T + R | ui.rs:2757-2767; `remove_project_lines_repository_parent_lists_every_child_and_scrolls` (ui.rs:3893, unchanged) |
 | 7 | 20-01: A path never appears under deleted unless `report.paths_deleted` lists it | ✓ VERIFIED | T + R | ui.rs:2781-2787 iterates only `report.paths_deleted`; test of truth 5 |
 | 8 | 20-01: Legend `enter retry · esc cancel` with error, `y/enter remove · n/esc cancel` without | ✓ VERIFIED | T + R | ui.rs:2846-2851; `remove_project_lines_error_switches_legend_to_retry` (ui.rs:3929, unchanged) |
-| 9 | 20-02: `D` on every local kind yields `RemoveProject`; `D` on a remote row yields a footer refusal naming Phase 21 (D-02, TUI-01) | ⚠ LOCAL CLAUSE VERIFIED, REMOTE CLAUSE SUPERSEDED | T + R | Local clause: truth 1 evidence. Remote clause is false at HEAD: app.rs:344-353 returns `RemoveProject` for `ActionKind::Remote`, `SidebarRefusal::RemoteRemove` and its text are gone, tests `sidebar_action_d_refuses_remote_rows` and `d_on_remote_row_sets_footer_notice` were deleted and replaced by `sidebar_action_d_yields_remove_project_on_remote_rows` (app.rs:12882) and `d_on_remote_row_previews_then_removes_through_the_daemon` (app.rs:13087), both passing. Deliberate: Phase 21 D-12. See "Superseded clauses" |
+| 9 | 20-02: `D` on every local kind yields `RemoveProject`; `D` on a remote row yields a footer refusal naming Phase 21 (D-02, TUI-01) | PASSED (override): local clause verified, remote clause superseded by Phase 21 D-12, accepted by Joe Seymour on 2026-11-13 | T + R | Local clause: truth 1 evidence. Remote clause is false at HEAD: app.rs:344-353 returns `RemoveProject` for `ActionKind::Remote`, `SidebarRefusal::RemoteRemove` and its text are gone, tests `sidebar_action_d_refuses_remote_rows` and `d_on_remote_row_sets_footer_notice` were deleted and replaced by `sidebar_action_d_yields_remove_project_on_remote_rows` (app.rs:12882) and `d_on_remote_row_previews_then_removes_through_the_daemon` (app.rs:13087), both passing. Deliberate: Phase 21 D-12. See "Superseded clauses" |
 | 10 | 20-02: `D` opens `Modal::ConfirmRemove` with `preview_removal`'s report, including a row with a live runtime (D-03, D-05) | ✓ VERIFIED | T + R | app.rs:4044-4081; the remote branch at app.rs:4046-4049 returns before the local path and is taken only for `SelId::Remote`. Tests of truth 2 |
 | 11 | 20-02: Enter/y runs `removal::remove` with the atomic save; rows leave hierarchy and state file in one save; footer reports counts (D-08, D-11) | ✓ VERIFIED | T + R | app.rs:4494-4510 save closure, `removal_notice` app.rs:4549-4580, handler app.rs:6267-6271; tests of truth 3 |
 | 12 | 20-02: On Err every `RowRuntime` handle returns to the registry, rows stay visible, modal reinstalled with error (D-09) | ✓ VERIFIED | T + R | `restore_row_runtimes` app.rs:4439-4453; kill-failure test asserts handle count and process identity |
 | 13 | 20-02: Esc/n closes without mutation; j/k adjust scroll (D-06, D-07) | ✓ VERIFIED | T + R | app.rs:6301-6330; `esc_on_confirm_remove_is_non_mutating` (app.rs:14562, unchanged); scroll driven through `handle_modal_key` by `confirm_remove_modal_scroll_past_end_then_up_moves_one_row` (ui.rs:4143, added by WR-02) |
 | 14 | 20-03: ConfirmRemove modal draws at most 80% of screen height with current scroll (D-07) | ✓ VERIFIED | T + R | `remove_project_modal_max_height` ui.rs:2516-2520, used at ui.rs:1806 and 1837-1839. `confirm_remove_modal_renders_report_lines_within_80_percent_height` (ui.rs:4101) was tightened by WR-03 from `<= 24` to `== 24` of 30 rows |
-| 15 | 20-03: Every local footer line and `?` help list `D` beside x, w, X; remote-row footers do not (D-04) | ⚠ LOCAL CLAUSE VERIFIED, REMOTE CLAUSE SUPERSEDED | T + R | Local clause: truth 1 evidence. Remote clause is false at HEAD: ui.rs:1470-1472 returns `enter attach · r restart · x close · D remove* · ? help`, and the test that asserted the absence now asserts that exact string at widths 100 and 59. Deliberate: Phase 21 D-12 |
+| 15 | 20-03: Every local footer line and `?` help list `D` beside x, w, X; remote-row footers do not (D-04) | PASSED (override): local clause verified, remote clause superseded by Phase 21 D-12, accepted by Joe Seymour on 2026-11-13 | T + R | Local clause: truth 1 evidence. Remote clause is false at HEAD: ui.rs:1470-1472 returns `enter attach · r restart · x close · D remove* · ? help`, and the test that asserted the absence now asserts that exact string at widths 100 and 59. Deliberate: Phase 21 D-12 |
 | 16 | 20-04: Forced kill failure returns Err before any row drops; surviving pids shown; every handle back; retry succeeds after group dies | ✓ VERIFIED | T + R | `spawn_unkillable_runtime` / `arm_unkillable_runtime` baude-core/src/testing.rs:532, 546 (unchanged); kill test of truth 4 |
 | 17 | 20-04: Forced save failure leaves rows visible with save error and retry legend; clearing injection and Enter removes | ✓ VERIFIED | T + R | app.rs:4511-4516 clears `atomic_failure_for_test` after one attempt; save test of truth 4 |
 | 18 | 20-04: Clearing failures after the committed save do not fail removal; footer notice (D-10) | ✓ VERIFIED | T + R | app.rs:4560-4578; `remove_project_clearing_failure_is_a_footer_notice_not_an_error` (app.rs:15031, unchanged) |
 | 19 | 20-04: `scripts/gate.sh` and `scripts/gate.sh --linux` are green | ? UNCERTAIN | N | Not run: the verification brief excluded the full gate. The prior pass was for f1f6d64 and does not carry to HEAD. No gate result for f934e64 was found in the phase 20 or 21 artifacts |
 
-**Score:** 16/19 truths verified (0 present, behavior-unverified). Two truths have a superseded clause awaiting an override decision; one was not re-run.
+**Score:** 18/19 truths verified, 2 of them by override (0 present, behavior-unverified). Truths 9 and 15 each carry a superseded clause, accepted as an override by Joe Seymour on 2026-11-13; truth 19, the gate, was not re-run. The verifier's own count before the overrides was 16/19.
 
 All four roadmap success criteria (truths 1 to 4) hold. Nothing in the roadmap contract or in TUI-01 to TUI-04 mentions remote rows, so both superseded clauses are plan-level detail.
 
 ### Superseded clauses
 
-Truths 9 and 15 each carry a second clause that Phase 20 wrote as a holding position: remote rows refuse `D` "naming Phase 21". Phase 21 then made that refusal a real action by locked decision D-12 (`.planning/phases/21-daemon-and-pwa-parity/21-CONTEXT.md:33`). The clauses are therefore false at HEAD on purpose, and restoring them would revert Phase 21. They are reported as superseded, not as gaps, and are not counted in the score.
+Truths 9 and 15 each carry a second clause that Phase 20 wrote as a holding position: remote rows refuse `D` "naming Phase 21". Phase 21 then made that refusal a real action by locked decision D-12 (`.planning/phases/21-daemon-and-pwa-parity/21-CONTEXT.md:33`). The clauses are therefore false at HEAD on purpose, and restoring them would revert Phase 21. They are reported as superseded, not as gaps. The verifier left them out of its 16/19 count; with the overrides below accepted, each counts as PASSED (override).
 
 The plan artifact `SidebarRefusal::RemoteRemove` (20-02) is gone for the same reason.
 
-To accept, add to this file's frontmatter:
+Accepted by Joe Seymour on 2026-11-13. This block is now in this file's frontmatter, with `overrides_applied: 2`:
 
 ```yaml
 overrides:
   - must_have: "D on a remote row yields a footer refusal naming Phase 21"
     reason: "Superseded by Phase 21 D-12: D on a remote row previews and removes through the owning daemon"
-    accepted_by: "{name}"
-    accepted_at: "{ISO timestamp}"
+    accepted_by: "Joe Seymour"
+    accepted_at: "2026-11-13"
   - must_have: "remote-row footers do not list D remove*"
     reason: "Superseded by Phase 21 D-12: the remote footer lists D remove* because the action now exists there"
-    accepted_by: "{name}"
-    accepted_at: "{ISO timestamp}"
+    accepted_by: "Joe Seymour"
+    accepted_at: "2026-11-13"
 ```
 
 ### Moved and renamed tests (specific risk checked)
@@ -226,8 +237,11 @@ No orphaned requirements. Note: `.planning/REQUIREMENTS.md:48-51` and `:105-108`
 
 ### Human Verification Required
 
+One item remains: the gate (item 2). Items 1 and 3 were closed by owner decision after this report was written, and are kept here with their outcome.
+
 #### 1. Accept or reject the Phase 21 supersession
 
+**Outcome:** Accepted by Joe Seymour on 2026-11-13. Both clauses are recorded as PASSED (override) in the frontmatter `overrides` block.
 **Test:** Decide whether the two remote-row clauses (truths 9 and 15) are accepted as superseded by Phase 21 D-12; if so, add the overrides block above to this file's frontmatter.
 **Expected:** Both recorded as PASSED (override).
 **Why human:** An override needs a named acceptor.
@@ -240,15 +254,19 @@ No orphaned requirements. Note: `.planning/REQUIREMENTS.md:48-51` and `:105-108`
 
 #### 3. Narrow and wide terminal visual check
 
+**Outcome:** Waived by the owner and NOT performed. Joe Seymour waived this check on 2026-11-13. Nobody ran baude at 59x20 or at 120+ columns for it, so legibility at either size is unconfirmed by a person. The render tests that pin text and row counts at both sizes are the only evidence.
 **Test:** Run baude at 59x20 and at 120+ columns, select a repository with several worktrees, press `D`, scroll with `j`/`k`, press `Esc`; then view the footer on each row kind.
 **Expected:** Modal within 80% height, `+N more` legible, footer shows `D rm` (narrow) or `D remove*` (wide) beside `x`, `w`, `X`.
 **Why human:** Render tests pin text and row counts but cannot judge legibility; `20-VALIDATION.md:62` names this as manual-only.
 
 ### Gaps Summary
 
-No code gap. Every roadmap success criterion and every plan truth that still applies is implemented, wired and pinned by a test that passed at HEAD, and local removal behaviour is unchanged by the remote-removal work. Three items stop this short of `passed`: two plan clauses that Phase 21 replaced on purpose and that need a recorded override, the gate that was not re-run at HEAD, and the manual visual check the phase scheduled and never recorded.
+No code gap. Every roadmap success criterion and every plan truth that still applies is implemented, wired and pinned by a test that passed at HEAD, and local removal behaviour is unchanged by the remote-removal work. The verifier listed three items that stopped this short of `passed`: two plan clauses that Phase 21 replaced on purpose and that needed a recorded override, the gate that was not re-run at HEAD, and the manual visual check the phase scheduled and never recorded.
+
+One remains: the gate. The two clauses are now recorded as overrides accepted by Joe Seymour on 2026-11-13. The manual visual check was waived by the owner and NOT performed.
 
 ---
 
 _Verified: 2026-11-13 at HEAD f934e64_
 _Verifier: Claude (gsd-verifier)_
+_Owner decisions recorded 2026-11-14 by the Phase 22 planner: two overrides and one waiver, source `.planning/phases/21-daemon-and-pwa-parity/.replan-cycle-3/ORCH-STATE.md` at commit 2460601. Nothing was re-verified for this edit._
