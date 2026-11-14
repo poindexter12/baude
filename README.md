@@ -20,8 +20,10 @@ also names the session that blocked.
 A non-Git folder is admitted as a durable standalone session at the top level.
 It supports the same coding-agent, shell, editor, resume, archive, close, info,
 activity, and GSD flows without inventing repository identity. Branch creation
-and managed-worktree removal stay unavailable. Canonical paths deduplicate
-aliases, and schema-v3 state retains standalone sessions across restarts.
+and managed-worktree removal with `X` stay unavailable. `D` removes the row and
+leaves the folder untouched (see [Removing projects](#removing-projects)).
+Canonical paths deduplicate aliases, and schema-v3 state retains standalone
+sessions across restarts.
 
 Each session surfaces live metadata — model, token counts, cost, GSD project
 state, and (Claude Code) context usage and permission mode.
@@ -148,6 +150,7 @@ through to Claude.
 | `f` | sidebar | show all sessions / scope back to the launch folder's context (see "Folder context") |
 | `x` | running child | close the runtime and retain its checkout for reopening |
 | `X` | managed worktree child | after a fresh clean-state check and distinct confirmation, remove the worktree while retaining its branch |
+| `D` | any sidebar row | after a confirmation that lists what will go, remove the row and kill its runtime; the directory is deleted only when it is a baude-managed worktree (see [Removing projects](#removing-projects)) |
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
 
@@ -390,6 +393,130 @@ operation. A successful `X` removes only that worktree and child; its local
 branch, repository parent, and siblings remain. After a state file reset, the
 same repository is found again by computing its digest from the canonical git
 common directory; no scan is required for recovery.
+
+## Removing projects
+
+`D` in the sidebar removes the selected row from baude. It is offered on every
+row kind: a repository parent, any checkout under it, a standalone folder, an
+unavailable row, and a remote row, which that row's daemon removes (see
+[Remote sessions in the TUI](#remote-sessions-in-the-tui)).
+
+`D` is a different action from the two older keys. Lowercase `x` only closes
+the runtime and keeps the row. Uppercase `X` removes one baude-managed linked
+worktree and is blocked unless that worktree is verified clean. `D` runs no
+clean-state check: it kills the runtime, drops the row, and deletes the
+directory when the directory is a worktree baude created. On a repository
+parent it removes every checkout row under the parent as well.
+
+### The confirmation
+
+Nothing is removed until you confirm. `D` opens a confirmation headed
+`Remove this <kind>?`, where the kind is `repository`, `main checkout`,
+`managed worktree`, `unmanaged checkout`, `unavailable worktree`, `checkout` or
+`standalone session`. Under the heading are four lists, each with a count:
+`rows dropped`, `runtimes killed` with the process id of each runtime,
+`paths deleted` and `paths kept`. An `already removed` list and a `cleared`
+line counting baude's own records appear when they apply. The footer reads
+`y/enter remove · n/esc cancel`, and `j`/`k` or the arrow keys scroll a long
+row list.
+
+Read `paths deleted` before you confirm. It names the directories the removal
+will delete, whatever the row is called in the sidebar or in the heading.
+
+baude checks the rows again when you confirm. If the rows, the runtimes to
+kill or the paths to delete differ from what the confirmation showed, nothing
+is removed and a refreshed confirmation replaces the old one. If the removal
+itself fails, the confirmation stays open with the error and the footer becomes
+`enter retry · esc cancel`.
+
+### What is deleted and what is kept
+
+| Row | Directory on disk |
+|-----|-------------------|
+| Repository parent | has no directory of its own; every checkout row under it is removed too, each by its own rule below |
+| The repository's own main checkout: your clone or `git init` folder | kept |
+| Default checkout that baude created | deleted, uncommitted work included |
+| Any other managed worktree, such as one made with `w` | deleted, uncommitted work included |
+| Linked worktree you made yourself | kept |
+| Standalone folder | kept; the folder and everything in it are left untouched |
+
+The rule behind the table is short. A directory is deleted only when its row
+is a baude-managed worktree and is not the repository's main checkout. Every
+other directory is kept.
+
+A default checkout that baude created falls on the deleted side. When a
+repository is opened and neither its main checkout nor an existing linked
+worktree is on the default branch, baude creates a worktree of the default
+branch in its managed path and uses that as the default checkout. That
+directory is a managed worktree, not the repository's main checkout, so `D` on
+its row or on its repository parent deletes it, uncommitted work included. The
+confirmation lists the directory under `paths deleted`, and for an available
+local row it is headed `Remove this managed worktree?`.
+
+baude deletes a managed worktree by running
+`git worktree remove --force --force -- <path>` against the repository, and
+deletes the directory itself if that command fails. Uncommitted changes,
+untracked files and a session whose working directory is inside the worktree
+do not stop it. Commit or move anything you want to keep before you confirm.
+
+Local branches are never deleted. The branch a removed worktree had checked
+out stays in the repository with every commit made on it.
+
+A managed worktree whose directory is already gone is listed under
+`already removed`. Its row is dropped and Git's record of that worktree is
+removed.
+
+The runtime is killed first. If a runtime survives the kill, the removal stops
+there: no directory is deleted and the rows stay.
+
+### What baude forgets
+
+Removal also clears baude's own records, so a removed row does not come back
+by itself.
+
+- Every row kind: the folder-to-workspace binding for the row's folder, when
+  one exists.
+- Repository parent: baude's ownership marker and the repository's
+  `repository-<key>` directory under the managed worktrees path, when they
+  exist. The directory is removed only when it is empty. The suppression
+  entries of that repository's checkouts are dropped.
+- A checkout removed while its repository row stays: the marker and the
+  repository directory are left alone, and a suppression entry for the
+  checkout's path is added to `suppressed-admissions-<workspace>.json` in the
+  config dir. The entry stops the worktree sweep on the next open of that
+  repository from bringing the row back. This holds for every checkout,
+  whatever its role and whether baude manages it or not. The entry is lifted
+  when you open that exact folder again, and dropped when the repository row
+  is removed.
+- Standalone folder: there is no marker and no suppression entry is written.
+
+### After removing the default checkout
+
+The default checkout is the checkout of the repository's default branch. It is
+your own clone when the clone is on that branch, which is the usual case.
+
+A default checkout removed with `D` stays removed. Launching baude inside
+another worktree of the same repository, or opening one with `n`, starts no
+session and creates no new default checkout. The repository's other rows are
+kept, and a message says how to bring the checkout back.
+
+If the removal kept the folder, which is the case when the default checkout is
+your own clone or a worktree you made, the message reads
+`default checkout <path> was removed; open that folder to bring it back`.
+Launch baude inside that folder or open it with `n`.
+
+If the removal deleted the folder, which is the case when the default checkout
+was a worktree baude created, the message reads
+`default checkout was removed with its folder; remove this repository and open it again to bring it back`.
+There are two ways back. Remove the repository row with `D` and open the
+repository again, which gives it a new default checkout the way a first open
+does. Or put a worktree of the default branch back at the removed path with
+`git worktree add <path> <default-branch>` and launch baude inside that
+folder. The message does not show the removed path; it is the one the
+confirmation listed under `paths deleted`.
+
+Either way the checkout returns as a new row, and nothing is resumed from the
+row that was removed.
 
 ## Usage panel
 
