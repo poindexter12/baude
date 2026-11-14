@@ -72,7 +72,7 @@ Known gaps: see MILESTONES.md.
 - [x] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans) (completed 2026-11-03)
 - [ ] Phase 19: Re-admission Suppression (0/? plans)
 - [ ] Phase 20: TUI Remove Action (0/? plans)
-- [ ] Phase 21: Daemon and PWA Parity (0/? plans)
+- [x] Phase 21: Daemon and PWA Parity (0/? plans) (completed 2026-11-13)
 - [ ] Phase 22: Validation and v2.8.0 Release (0/? plans)
 
 ### Phase 18: Shared Kill-Then-Remove Lifecycle
@@ -173,7 +173,7 @@ Plans:
   2. A connected TUI or PWA drops the removed rows on the SSE event without a refresh
   3. The PWA offers remove on the same row kinds with a confirmation equivalent to the TUI's and completes it through the REST endpoint
 
-**Plans**: 11/11 plans executed
+**Plans**: 11/11 plans complete
 
 Plans:
 - [x] 21-01-PLAN.md — Wave 1. Tracer: Manager preview and remove over core with runtime custody, wired to POST /removals/preview and POST /removals for one checkout

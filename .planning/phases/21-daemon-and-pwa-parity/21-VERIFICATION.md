@@ -1,7 +1,8 @@
 ---
 phase: 21-daemon-and-pwa-parity
 verified: 2026-11-13T23:50:43Z
-status: human_needed
+status: passed
+status_basis: "owner sign-off 2026-11-13 without live checks; the human_verification items below were not performed"
 score: 1/3 must-haves verified
 covered_files: [".github/workflows/ci.yml",".planning/phases/21-daemon-and-pwa-parity/21-01-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-01-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-02-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-02-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-03-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-03-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-04-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-04-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-05-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-05-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-06-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-06-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-07-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-07-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-08-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-08-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-09-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-09-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-10-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-10-SUMMARY.md",".planning/phases/21-daemon-and-pwa-parity/21-11-PLAN.md",".planning/phases/21-daemon-and-pwa-parity/21-11-SUMMARY.md","baude/src/app.rs","baude/src/remote.rs","baude/src/ui.rs","bauded/src/api.rs","bauded/src/manager.rs","bauded/src/web.rs","bauded/web/app.js","bauded/web/removal-controller.js","bauded/web/removal.js","bauded/web/sw.js","scripts/check-web-suites.sh","scripts/gate.sh"]
 covered_digest: "v4:sha256:8264ce4de28fb4eb3fc8582c1e3b9a66aab6937f45718704dfca943e705ad6c5"
