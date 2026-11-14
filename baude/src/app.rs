@@ -13664,6 +13664,62 @@ mod tests {
         end_remote_remove(app, &fx);
     }
 
+    /// The daemon runs on another machine and can be newer than this TUI. It
+    /// commits the removal and answers 200 with a report that names a save
+    /// outcome this build does not know. The removal happened: the user is
+    /// told so, and is never shown a refusal whose Enter sends it again.
+    #[test]
+    fn remote_remove_committed_answer_from_a_newer_daemon_is_not_offered_as_a_retry() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-newer-daemon", |previewed, rows_body| {
+            let mut committed = serde_json::to_value(executed_report(previewed))
+                .expect("serialize the executed report");
+            committed["persistence"] = serde_json::json!({ "outcome": "saved_to_replica" });
+            let committed = committed.to_string();
+            assert!(
+                serde_json::from_str::<baude_core::removal::RemovalReport>(&committed).is_err(),
+                "this build reads the newer daemon's report after all: {committed}"
+            );
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, committed)],
+                // Listed after the preview, gone once the daemon removed it.
+                vec![rows_body, EMPTY_ROWS_BODY],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the confirmation is still up; footer: {:?}",
+            last_message(&app)
+        );
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("was removed"),
+            "{message}"
+        );
+        assert!(!message.contains("failed"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
     /// A preview the daemon refuses, or never answers, closes the modal with
     /// a notice: nothing was asked to change.
     #[test]

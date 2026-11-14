@@ -488,18 +488,25 @@ fn read_reply(result: Result<ureq::Response, ureq::Error>, call: RemovalCall) ->
     match result {
         Ok(response) => {
             let status = response.status();
+            // A success status over a body this build cannot use. A preview
+            // asked for nothing to change, so the reason is all there is to
+            // say. For an execute the status says the daemon committed: that
+            // is no refusal, and a refusal would offer the same execute
+            // again. It is an answer that did not arrive, which the worker
+            // settles against a fresh rows read.
+            let unusable = |message: &str| match call {
+                RemovalCall::Preview => RemovalReply::Refused {
+                    status,
+                    message: message.to_string(),
+                },
+                RemovalCall::Execute => call.unanswered(message.to_string()),
+            };
             match read_capped(response, MAX_REPORT_BYTES) {
                 Ok(Some(bytes)) => match serde_json::from_slice::<RemovalReport>(&bytes) {
                     Ok(report) => RemovalReply::Report(report),
-                    Err(_) => RemovalReply::Refused {
-                        status,
-                        message: "the daemon's answer was not a removal report".to_string(),
-                    },
+                    Err(_) => unusable("the daemon's answer was not a removal report"),
                 },
-                Ok(None) => RemovalReply::Refused {
-                    status,
-                    message: "the daemon's answer was too large to read".to_string(),
-                },
+                Ok(None) => unusable("the daemon's answer was too large to read"),
                 // The status arrived and the body did not: for an execute the
                 // outcome is not known to be a failure, so it is not called one.
                 Err(error) => call.unanswered(sanitize_daemon_text(&error.to_string())),
@@ -2167,11 +2174,14 @@ mod tests {
         assert_settled(&double, 1);
     }
 
+    /// The cap still holds: nothing past it is read or shown. The 200 says
+    /// the daemon committed, so the unread answer is an unknown outcome and
+    /// never a refusal that would offer the same execute again.
     #[test]
-    fn removal_oversize_json_body_is_refused() {
+    fn removal_oversize_json_body_on_an_execute_200_is_an_unknown_outcome() {
         let target = RemovalTarget::Checkout(checkout_key(10));
         let previewed = planned_report(target, vec![RowKey::Checkout(checkout_key(10))]);
-        // A report that would parse, so only the cap can refuse it.
+        // A report that would parse, so only the cap can turn it away.
         let mut oversize = committed_report(&previewed);
         oversize.paths_kept = vec![PathBuf::from(format!("/{}", "a".repeat(1_100_000)))];
         let body = wire(&oversize);
@@ -2184,11 +2194,12 @@ mod tests {
         let poller = idle_poller(&double);
 
         match poller.execute_removal(&previewed) {
-            RemovalReply::Refused { status, message } => {
-                assert_eq!(status, 200);
+            RemovalReply::Indeterminate { message, rows_gone } => {
+                // This call reads no rows, so it cannot say the row is gone.
+                assert!(!rows_gone);
                 assert!(message.chars().count() <= 512, "{}", message.len());
             }
-            other => panic!("expected Refused, got {other:?}"),
+            other => panic!("expected Indeterminate, got {other:?}"),
         }
         assert_settled(&double, 1);
     }
@@ -2702,6 +2713,144 @@ mod tests {
             vec![pair("POST", "/removals"), pair("GET", "/rows")]
         );
         assert_settled(&double, 2);
+    }
+
+    /// The committed report for `previewed` as a daemon newer than this build
+    /// sends it: every field this build knows, and a save outcome it has no
+    /// name for.
+    fn committed_body_from_a_newer_daemon(previewed: &RemovalReport) -> String {
+        let mut body = serde_json::to_value(previewed).expect("serialize a report");
+        body["planned"] = serde_json::json!(false);
+        body["persistence"] = serde_json::json!({ "outcome": "saved_to_replica" });
+        let body = body.to_string();
+        assert!(
+            serde_json::from_str::<RemovalReport>(&body).is_err(),
+            "this build reads the newer daemon's report after all: {body}"
+        );
+        body
+    }
+
+    /// The committed report for `previewed` after a removal that deleted so
+    /// many paths that the report runs past what this client reads.
+    fn committed_body_past_the_cap(previewed: &RemovalReport) -> String {
+        let mut report = previewed.clone();
+        report.planned = false;
+        report.persistence = PersistenceOutcome::Saved;
+        report.paths_deleted = (0..12_000)
+            .map(|n| {
+                PathBuf::from(format!(
+                    "/srv/daemon/.baude-worktrees/a-long-branch-name-for-a-generated-worktree-{n:05}/checkout"
+                ))
+            })
+            .collect();
+        let body = serde_json::to_string(&report).expect("serialize a report");
+        assert!(body.len() as u64 > MAX_REPORT_BYTES, "{} bytes", body.len());
+        body
+    }
+
+    /// A 200 to an execute says the daemon committed. A body this build
+    /// cannot use does not turn that into a refusal the user could resend:
+    /// the outcome is settled by a fresh rows read, as for no answer at all.
+    #[test]
+    fn ticket_execute_200_with_a_body_this_build_cannot_use_reconciles_through_rows() {
+        let (_, previewed) = checkout_10();
+        for (shape, body, rows, gone) in [
+            (
+                "newer daemon, row gone",
+                committed_body_from_a_newer_daemon(&previewed),
+                rows_body_without(10),
+                true,
+            ),
+            (
+                "past the cap, row gone",
+                committed_body_past_the_cap(&previewed),
+                rows_body_without(10),
+                true,
+            ),
+            // Nothing but a rows read that no longer lists the row says gone.
+            (
+                "newer daemon, row still listed",
+                committed_body_from_a_newer_daemon(&previewed),
+                rows_body(),
+                false,
+            ),
+        ] {
+            let double = serve(vec![
+                route("POST", "/removals", vec![Reply::json(200, body)]),
+                route("GET", "/rows", vec![Reply::json(200, rows)]),
+            ]);
+            let poller = RemotePoller::idle(double.base());
+            seed_rows(&poller, rows_fixture());
+
+            let ticket = poller.spawn_execute_removal(previewed.clone());
+            let answer = wait_for(&ticket, Duration::from_secs(3));
+
+            match &answer.reply {
+                RemovalReply::Indeterminate { rows_gone, .. } => {
+                    assert_eq!(*rows_gone, gone, "{shape}");
+                }
+                other => panic!("{shape}: {other:?}"),
+            }
+            assert_eq!(
+                poller
+                    .rows()
+                    .label(&RowKey::Checkout(checkout_key(10)))
+                    .is_none(),
+                gone,
+                "{shape}"
+            );
+            assert!(
+                poller
+                    .rows()
+                    .label(&RowKey::Checkout(checkout_key(11)))
+                    .is_some(),
+                "{shape}"
+            );
+            // One POST, then the fresh read. The execute was never resent.
+            assert_eq!(
+                method_and_path(&double),
+                vec![pair("POST", "/removals"), pair("GET", "/rows")],
+                "{shape}"
+            );
+            assert_settled(&double, 2);
+        }
+    }
+
+    /// A preview asks for nothing to change, so a 200 this build cannot read
+    /// stays a refusal that names the reason, and no rows are read for it.
+    #[test]
+    fn ticket_preview_200_with_a_body_this_build_cannot_use_is_a_refusal() {
+        let (target, previewed) = checkout_10();
+        let double = serve(vec![route(
+            "POST",
+            "/removals/preview",
+            vec![Reply::json(
+                200,
+                committed_body_from_a_newer_daemon(&previewed),
+            )],
+        )]);
+        let poller = RemotePoller::idle(double.base());
+        seed_rows(&poller, rows_fixture());
+
+        let ticket = poller.spawn_preview_removal(target);
+        let answer = wait_for(&ticket, Duration::from_secs(3));
+
+        assert_eq!(
+            answer.reply,
+            RemovalReply::Refused {
+                status: 200,
+                message: "the daemon's answer was not a removal report".to_string(),
+            }
+        );
+        assert!(poller
+            .rows()
+            .label(&RowKey::Checkout(checkout_key(10)))
+            .is_some());
+        assert_eq!(
+            method_and_path(&double),
+            vec![pair("POST", "/removals/preview")]
+        );
+        assert_settled(&double, 1);
     }
 
     #[test]
