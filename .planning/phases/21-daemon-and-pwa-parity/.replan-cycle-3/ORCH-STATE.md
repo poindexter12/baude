@@ -231,3 +231,18 @@ Remaining order:
 4. After 22-06 and 22-07 land, re-verify the failed truths of 18 and 19 so their reports reach `passed`; plan 22-05 Task 1 requires `status: passed` on 18, 19 and 20.
 5. Post-execution: code review, verify, validate-phase and secure-phase for 22; phases 18 to 20 still lack SECURITY files and 18 to 21 VALIDATION files are drafts, which the milestone audit will flag.
 6. Bookkeeping behind: ROADMAP checkboxes for 19 and 20, TUI-01 to TUI-04 in REQUIREMENTS, READM-03 and READM-04 are marked complete but are not until 22-07 lands.
+
+## 2026-11-14: Phase 22 waves 1 and 2 executed
+
+All on the main tree, one executor per plan, isolation forced to none before each dispatch.
+
+- 22-06 BL-11 fixed at `44c2267`: `signal_group` treats EPERM like ESRCH. Both gates exit 0 at `d2411a1`.
+- 22-07 fix at `754665e`: suppression entry carries a `primary` flag and `admit_repository` consults it. 22-08 pins the ways back, tests only.
+- 22-01 `fba38bd`..`1392335`: 16 cell end-state matrix in `baude-core`, 10 of 10 stable.
+- 22-02 `3e5ba36`..`98fa39b`: real socket `/events` test and cloned parent removal. Plan amended at `5887fea` because the daemon writes no ownership marker; `marker::clear_owned` treats a missing marker as missing and removes the directory non-recursively.
+- 22-03 `7215c7d`..`6c3d33c`: TUI single-target confirms for main checkout and standalone.
+- 22-04 `6b61bf7`..`ca82238`: README removal docs. Eight plan versus code disagreements listed in `22-04-SUMMARY.md`.
+
+Next: verifiers rewrite `18-VERIFICATION.md` and `19-VERIFICATION.md`; 20 reads passed with the gate deferred to 22-05. One bookkeeping commit, then 22-05: both gates on the final HEAD, guarded push, one `feat` PR, stop before merge. No commit may land between the gates and the push.
+
+Open, owned by no plan: daemon repository directories carry no ownership marker; four older PTY and signal tests leave a `sleep 30` behind for up to 30 seconds; about 1590 stale `baude-*` fixture directories in the temp root; neither PWA tag says whether a directory will be deleted; WR-06 locking redesign; the default ships for a main checkout whose folder was deleted, with the lighter `n` or `c` rule not planned.

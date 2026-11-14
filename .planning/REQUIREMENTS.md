@@ -45,10 +45,10 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 
 ### TUI removal action
 
-- [ ] **TUI-01**: The remove action is available on repository, main checkout, managed worktree, unmanaged checkout and standalone rows, and the sidebar footer or help lists it alongside `x`, `w` and `X`
-- [ ] **TUI-02**: Before removing, the TUI shows a confirmation naming the row kind, the exact rows that will be dropped, whether a live runtime will be killed, and which paths will be deleted from disk versus left in place
-- [ ] **TUI-03**: Removing a repository parent lists every child that will be removed in the confirmation and removes them all on confirm
-- [ ] **TUI-04**: Removal failure at any stage leaves the affected rows visible with an error notice rather than a half-removed sidebar, and the user can retry
+- [x] **TUI-01**: The remove action is available on repository, main checkout, managed worktree, unmanaged checkout and standalone rows, and the sidebar footer or help lists it alongside `x`, `w` and `X`
+- [x] **TUI-02**: Before removing, the TUI shows a confirmation naming the row kind, the exact rows that will be dropped, whether a live runtime will be killed, and which paths will be deleted from disk versus left in place
+- [x] **TUI-03**: Removing a repository parent lists every child that will be removed in the confirmation and removes them all on confirm
+- [x] **TUI-04**: Removal failure at any stage leaves the affected rows visible with an error notice rather than a half-removed sidebar, and the user can retry
 
 ### Daemon and PWA parity
 
@@ -58,7 +58,7 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 
 ### Validation and release
 
-- [ ] **REL-01**: Integration tests cover each row kind with a live runtime and with no runtime, using fixtures shaped like real cloned and `git init` repositories, and assert on fixture output that process, worktree, binding and marker state are gone
+- [x] **REL-01**: Integration tests cover each row kind with a live runtime and with no runtime, using fixtures shaped like real cloned and `git init` repositories, and assert on fixture output that process, worktree, binding and marker state are gone
 - [ ] **REL-02**: v2.8.0 ships through release-please with README and PWA docs describing the remove action, its confirmation, and what is and is not deleted
 
 ## Future Requirements
@@ -102,14 +102,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | READM-03 | Phase 19 | Complete |
 | READM-04 | Phase 19 | Complete |
 | READM-05 | Phase 19 | Complete |
-| TUI-01 | Phase 20 | Pending |
-| TUI-02 | Phase 20 | Pending |
-| TUI-03 | Phase 20 | Pending |
-| TUI-04 | Phase 20 | Pending |
+| TUI-01 | Phase 20 | Complete |
+| TUI-02 | Phase 20 | Complete |
+| TUI-03 | Phase 20 | Complete |
+| TUI-04 | Phase 20 | Complete |
 | API-01 | Phase 21 | Complete |
 | API-02 | Phase 21 | Complete |
 | API-03 | Phase 21 | Complete |
-| REL-01 | Phase 22 | Pending |
+| REL-01 | Phase 22 | Complete |
 | REL-02 | Phase 22 | Pending |
 
 **Coverage:**

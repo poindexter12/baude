@@ -70,8 +70,8 @@ Known gaps: see MILESTONES.md.
 **Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
 
 - [x] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans) (completed 2026-11-03)
-- [ ] Phase 19: Re-admission Suppression (0/? plans)
-- [ ] Phase 20: TUI Remove Action (0/? plans)
+- [x] Phase 19: Re-admission Suppression (0/? plans) (completed 2026-11-14)
+- [x] Phase 20: TUI Remove Action (0/? plans) (completed 2026-11-14)
 - [x] Phase 21: Daemon and PWA Parity (0/? plans) (completed 2026-11-13)
 - [ ] Phase 22: Validation and v2.8.0 Release (0/? plans)
 
@@ -205,13 +205,13 @@ Plans:
 **Plans**: 8 plans
 
 Plans, in execution order. 22-06, 22-07 and 22-08 are gap closure, added 2026-11-14: verifying phases 18 and 19 reproduced two product defects, and both are fixed before the validation tests run. Wave 1 runs one plan at a time, in the order listed.
-- [ ] 22-06-PLAN.md — Wave 1. Gap closure, Phase 18 truth 13: `Pty::kill_and_wait` succeeds on macOS when the group's only member is an exited, unreaped leader; BL-11 marked resolved
-- [ ] 22-07-PLAN.md — Wave 1. Gap closure, Phase 19 SC2: a removed primary checkout stays removed when baude launches inside a sibling worktree, whether its folder was kept or deleted by the removal; `git worktree list` is unchanged
-- [ ] 22-08-PLAN.md — Wave 1, after 22-07. Gap closure, Phase 19 READM-04: launching inside the removed folder, `n` and `c` re-admit it; the ways back when the folder was deleted; older suppression files still load
-- [ ] 22-01-PLAN.md — Wave 2. Core end-state matrix: every row kind with and without a live runtime, on cloned and `git init` fixtures, read from the fixture
-- [ ] 22-02-PLAN.md — Wave 2. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
-- [ ] 22-03-PLAN.md — Wave 2. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
-- [ ] 22-04-PLAN.md — Wave 2. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
+- [x] 22-06-PLAN.md — Wave 1. Gap closure, Phase 18 truth 13: `Pty::kill_and_wait` succeeds on macOS when the group's only member is an exited, unreaped leader; BL-11 marked resolved
+- [x] 22-07-PLAN.md — Wave 1. Gap closure, Phase 19 SC2: a removed primary checkout stays removed when baude launches inside a sibling worktree, whether its folder was kept or deleted by the removal; `git worktree list` is unchanged
+- [x] 22-08-PLAN.md — Wave 1, after 22-07. Gap closure, Phase 19 READM-04: launching inside the removed folder, `n` and `c` re-admit it; the ways back when the folder was deleted; older suppression files still load
+- [x] 22-01-PLAN.md — Wave 2. Core end-state matrix: every row kind with and without a live runtime, on cloned and `git init` fixtures, read from the fixture
+- [x] 22-02-PLAN.md — Wave 2. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
+- [x] 22-03-PLAN.md — Wave 2. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
+- [x] 22-04-PLAN.md — Wave 2. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
 - [ ] 22-05-PLAN.md — Wave 3. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
 
 ## Backlog

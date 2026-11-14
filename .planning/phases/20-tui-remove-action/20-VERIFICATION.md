@@ -2,7 +2,7 @@
 phase: 20-tui-remove-action
 verified: 2026-11-13T21:56:02-08:00
 head: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
-status: human_needed
+status: passed
 score: 18/19 must-haves verified
 covered_files:
   - ".planning/phases/20-tui-remove-action/20-01-PLAN.md"
@@ -49,10 +49,11 @@ superseded:
   - truth: "Remote-row footers do not list D (20-03 truth 2, second clause)"
     superseded_by: "Phase 21 decision D-12"
     evidence: "baude/src/ui.rs:1470-1472 remote footer is 'enter attach · r restart · x close · D remove* · ? help'; pinned by ui::tests::hierarchy_copy_contract_matches_ui_spec_for_empty_pending_success_and_hints"
-human_verification:
-  - test: "Run scripts/gate.sh and scripts/gate.sh --linux at HEAD f934e64 and read each exit code directly"
-    expected: "Both exit 0 with 'gate: all steps passed'"
-    why_human: "The verifier was instructed not to run the full gate. The prior evidence is for f1f6d64, and app.rs, ui.rs and remote.rs have changed by about 6,100 lines since"
+deferred:
+  - truth: "20-04 truth 4: scripts/gate.sh and scripts/gate.sh --linux are green"
+    deferred_to: "Phase 22 plan 22-05"
+    recorded_at: "2026-11-14"
+    note: "Not verified here. Plan 22-05 runs both gates on the exact commit that is pushed and keeps the result files; that run discharges this truth. If either gate fails there, this report is wrong to read passed"
 human_verification_waived:
   - test: "Run baude at 59x20 and at 120+ columns, select a repository with several worktrees, press D, scroll with j/k, press Esc; then view the footer on each row kind"
     expected: "The red-bordered 'remove repository' modal stays within 80% of the screen height, '+N more' reads cleanly at the narrow width, the footer shows 'D rm' (narrow) or 'D remove*' (wide) beside x, w and X without truncation hiding the D hint"
@@ -237,7 +238,7 @@ No orphaned requirements. Note: `.planning/REQUIREMENTS.md:48-51` and `:105-108`
 
 ### Human Verification Required
 
-One item remains: the gate (item 2). Items 1 and 3 were closed by owner decision after this report was written, and are kept here with their outcome.
+No item remains for a person. Items 1 and 3 were closed by owner decision after this report was written, and item 2, the gate, is deferred to Phase 22 plan 22-05. All three are kept here with their outcome.
 
 #### 1. Accept or reject the Phase 21 supersession
 
@@ -248,6 +249,7 @@ One item remains: the gate (item 2). Items 1 and 3 were closed by owner decision
 
 #### 2. Gate at HEAD
 
+**Outcome:** Deferred on 2026-11-14 to Phase 22 plan 22-05, which runs both gates on the exact commit that is pushed and keeps the result files. Not run for this report.
 **Test:** Run `scripts/gate.sh` and `scripts/gate.sh --linux` at f934e64, reading each exit code directly.
 **Expected:** Both exit 0 with `gate: all steps passed`.
 **Why human:** Excluded from this verification; the last recorded pass is for f1f6d64.
@@ -263,7 +265,7 @@ One item remains: the gate (item 2). Items 1 and 3 were closed by owner decision
 
 No code gap. Every roadmap success criterion and every plan truth that still applies is implemented, wired and pinned by a test that passed at HEAD, and local removal behaviour is unchanged by the remote-removal work. The verifier listed three items that stopped this short of `passed`: two plan clauses that Phase 21 replaced on purpose and that needed a recorded override, the gate that was not re-run at HEAD, and the manual visual check the phase scheduled and never recorded.
 
-One remains: the gate. The two clauses are now recorded as overrides accepted by Joe Seymour on 2026-11-13. The manual visual check was waived by the owner and NOT performed.
+The gate is deferred to Phase 22 plan 22-05 and is not verified by this report; status reads `passed` on that condition, set 2026-11-14. The two clauses are now recorded as overrides accepted by Joe Seymour on 2026-11-13. The manual visual check was waived by the owner and NOT performed.
 
 ---
 

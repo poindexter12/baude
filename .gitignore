@@ -20,3 +20,6 @@ opencode.json
 
 # GSD per-machine dispatch state
 .gsd/
+
+# Raw cross-AI review dumps, kept local.
+.planning/phases/*/.review-diagnostics/

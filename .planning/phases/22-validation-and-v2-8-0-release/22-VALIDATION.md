@@ -73,7 +73,7 @@ The command column gives the core of each command. The full form, with the list-
 
 Task 22-06-01 can only show red on macOS: Linux signals a zombie-only group without error. The Linux gate in task 22-06-03 therefore shows the fix breaks nothing there; it does not show the fix.
 
-BL-11, a failure with the text "failed to terminate exact PTY process group" on macOS session teardown, was this phase's known flaky signature. Plan 22-06 fixes its cause in wave 1. From wave 2 on that text is a defect: the executor stops and returns, and plan 22-02 says so. Inside wave 1 only, plan 22-07 may meet the text before the `fix(22-06)` commit lands, and waits for that commit. No test gains a retry.
+BL-11, a failure with the text "failed to terminate exact PTY process group" on macOS session teardown, was this phase's known flaky signature. Plan 22-06 fixes its cause in wave 1. From wave 2 on that text is a defect: the executor stops and returns, and plan 22-02 says so. Wave 1 is complete and the fix is at `44c2267`, so no plan may wait on or rerun past that text. No test gains a retry.
 
 Plan 22-05 allows no rerun of the host gate and lists BL-11 as fixed in the pull request body. Its Task 1 verify and its push guard each count exactly three of `18-`, `19-` and `20-VERIFICATION.md` reading `status: passed`; the gate truths of those phases are discharged by 22-05's own gate result files.
 

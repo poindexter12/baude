@@ -1,9 +1,9 @@
 ---
 phase: 18-shared-kill-then-remove-lifecycle
-verified: 2026-11-13
-verified_at_commit: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
-status: gaps_found
-score: 11/13 must-haves verified
+verified: 2026-11-14
+verified_at_commit: ca822383ad0e40b84ea9833b4c404b27cfd7c688
+status: passed
+score: 12/13 must-haves verified (1 deferred to plan 22-05)
 covered_files:
   - ".planning/phases/18-shared-kill-then-remove-lifecycle/18-01-PLAN.md"
   - ".planning/phases/18-shared-kill-then-remove-lifecycle/18-01-SUMMARY.md"
@@ -28,170 +28,160 @@ covered_files:
   - "baude-core/src/repository.rs"
   - "baude-core/src/session.rs"
   - "baude-core/src/testing.rs"
-covered_digest: "v4:sha256:1a6d472416da840a5bbb6fbf069940f0a833b570d5b25dfc0de3e2923f46a09b"
+covered_digest: "v4:sha256:044859d8ffbfc3b3e5a7b4361e84abd3b784c481b2d057415fcff32c43f1abfb"
 behavior_unverified: 0
 overrides_applied: 0
-re_verification: true
-re_verification_detail:
-  previous_status: passed
-  previous_score: 13/13
-  previous_commit: abba527
-  gaps_closed: []
+re_verification:
+  date: 2026-11-14
+  head: ca822383ad0e40b84ea9833b4c404b27cfd7c688
+  note: "Re-verified on 2026-11-14 at HEAD ca822383ad0e40b84ea9833b4c404b27cfd7c688 after gap closure by plan 22-06 (c4cdd47, 44c2267, d2411a1)."
+  previous_status: gaps_found
+  previous_score: 11/13
+  previous_commit: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
+  gaps_closed:
+    - "Truth 13: Pty::kill_and_wait reaches process-group extinction even when the PTY leader has already exited, and is idempotent on an extinct group (BL-11, macOS EPERM on a zombie-only group)"
   gaps_remaining: []
-  regressions:
-    - "Plan 08: Pty::kill_and_wait on an exited, not yet reaped leader fails on macOS with EPERM (BL-11). Not a regression introduced after abba527: baude-core/src/pty.rs is byte-identical since that commit. The prior report did not exercise this state."
-gaps:
-  - truth: "Pty::kill_and_wait reaches process-group extinction even when the PTY leader has already exited, and is idempotent on an extinct group (plan 18-08; feeds KILL-01, KILL-02, KILL-03)"
-    status: partial
-    reason: "On macOS, kill(-pgid, SIGTERM) returns EPERM when the recorded group holds only an exited leader that nobody has reaped yet. signal_group tolerates ESRCH only, so kill_and_wait returns 'failed to terminate exact PTY process group: Operation not permitted (os error 1)' for a runtime that is already dead. removal::remove wraps that as RemovalError::RuntimeSurvived and leaves the row in place. Fails closed (nothing deleted, nothing leaked, a retry 200 ms later succeeds), but removal and session teardown fail intermittently for a row whose agent has just exited. This is BL-11. Reproduced through the real Pty::kill_and_wait: 77 of 90 calls made inside the window failed with that exact message."
-    artifacts:
-      - path: "baude-core/src/pty.rs"
-        issue: "signal_group (1073-1087) returns Err for every errno except ESRCH. Line 1081 is the ESRCH-only tolerance. The error surfaces at 879-880 in extinguish_group."
-      - path: "baude-core/src/pty.rs"
-        issue: "process_group_exists (1089-1093) counts EPERM as 'group alive', and group_disposition routes an exited or zombie-only group to Signal (968, 978). The doc comment at 955-956 says such a group 'is signalled and reaped like any extinct-but-unreaped group', which is false on macOS."
-      - path: "baude-core/src/pty.rs"
-        issue: "Plan 18-08 (213e26e) removed the up-front child.try_wait() that reaped an exited leader and returned Ok before any signal, so an unreaped zombie leader now reaches signal_group. kill_and_wait reaps only after extinguish_group returns Ok (848-868)."
-      - path: "baude-core/src/testing.rs"
-        issue: "await_parked_holder (479-500) polls pty.is_exited(), which reaps the leader before the test calls remove or kill_and_wait. Every in-tree exited-leader test therefore starts from a reaped leader (group already ESRCH) or a group with a live descendant. No test calls kill_and_wait on an exited, unreaped, leader-only group."
-    missing:
-      - "In signal_group or extinguish_group, treat EPERM from kill(-pgid, sig) as 'no signalable member' and fall through to wait_for_group_extinction, which already reaps through try_lock and proves extinction by ESRCH before Ok is returned. Reaping first is not sufficient on its own: in one reproduction run EPERM persisted across an is_exited() call, so the leader can be mid-exit and not yet waitable."
-      - "A pty::tests case that spawns a leader which exits by itself, does not call is_exited(), and asserts kill_and_wait returns Ok with the group extinct and the leader reaped. Per CLAUDE.md Tests: the fixture must model the unreaped state production produces."
-      - "scripts/gate.sh --linux on the fix commit, since it touches platform process code."
-not_reverified:
-  - truth: "scripts/gate.sh green on macOS and --linux on the same tree (plan 18-07)"
-    reason: "Full gate not run in this pass, by instruction. Last proof is abba527. gate.sh itself changed since (PWA suites added)."
-    test: "Run scripts/gate.sh and scripts/gate.sh --linux at HEAD, reading each exit code directly"
-    expected: "Both exit 0"
-    why_human: "Out of scope for this pass; Phase 22 owns the release gate"
+  regressions: []
+deferred:
+  - truth: "Truth 12: scripts/gate.sh green on macOS and --linux on the same tree (plan 18-07)"
+    addressed_in: "Phase 22, plan 22-05"
+    evidence: "22-05-PLAN.md must-have: 'scripts/gate.sh and the Linux gate both exited 0 on one commit, and that commit is the one on the remote branch'; the plan keeps 05-mac.result and 05-linux.result. Not run in this pass, by instruction. No 22-05-SUMMARY.md exists yet, so the truth is open, not proven."
 coincidental_reliance_items:
-  - truth: "Plan 04 readers_parked reporting and plan 08 parked-reader join (removal::tests::reader_parked_on_out_of_group_slave_holder_is_reported, pty::tests::group_extinction_leaves_reader_parked_for_out_of_group_slave_holder)"
+  - truth: "Plan 04 readers_parked reporting (removal::tests::reader_parked_on_out_of_group_slave_holder_is_reported, pty::tests::group_extinction_leaves_reader_parked_for_out_of_group_slave_holder)"
     reason: fixture-only
-    harden: "The fixture reaps the leader through is_exited() before the call under test. Add a variant that leaves the leader unreaped, which is what the gap above needs anyway."
-deferred_resolved:
-  - truth: "The TUI and the daemon both call the shared removal path (RMV-05)"
-    was_deferred_to: "Phases 20 and 21"
-    evidence: "Now wired at HEAD: baude/src/app.rs:4510 and bauded/src/manager.rs:1189 call removal::remove; previews at baude/src/app.rs:4064, 4480 and bauded/src/manager.rs:1115."
+    harden: "testing::await_parked_holder still reaps the leader through is_exited() before the call under test, and its doc comment now says so. The unreaped state is covered at the Pty layer by kill_and_wait_reaps_unreaped_leader_group, not at the removal layer."
 advisory:
-  - finding: "BL-11 is recorded in .planning/BACKLOG.md as deferred from v2.8 by owner decision on 2026-11-13. This report confirms its cause; it does not overrule that decision."
+  - finding: "The in-tree BL-11 test proves the wait-until-reapable path. The production-shaped path, child mutex free and the first try_lock reaping the zombie, is proven only by an out-of-tree run in this pass, 94 of 94 in-window calls Ok."
     category: other
-    reason: "If the deferral stands, accept it with the override block in the Gaps Summary so this phase reads passed with one override."
-    evidence_status: "reproduced, deterministic artifact in scratchpad"
+    reason: "The production window is a scheduling race and cannot be pinned deterministically in-tree. Recorded so the next reader knows which evidence covers which path."
+    evidence_status: "reproduced, logs under target/gsd-22/verify-18/"
+  - finding: "The red test c4cdd47 is red on macOS only. On Linux a zombie-only group accepts the signal, so the test passes before and after the fix. Linux proof of the fix commit rides on the deferred gate, plan 22-05."
+    category: other
+    reason: "The fix touches platform process code and CLAUDE.md requires scripts/gate.sh --linux for that."
+    evidence_status: "code read; Linux not run in this pass"
 ---
 
 # Phase 18: Shared Kill-Then-Remove Lifecycle Verification Report
 
 **Phase Goal:** `baude-core` can remove any row kind in one operation that kills the owned runtime first, removes managed worktrees from disk, never deletes a main checkout, standalone folder or local branch, and persists atomically, so the TUI and daemon share one removal path.
-**Verified:** 2026-11-13
-**Status:** gaps_found
-**Re-verification:** Yes. The prior report (`passed`, 13/13, HEAD `abba527`, 2026-11-03) was stale after phases 19, 20, 21 and a review-fix pass.
-**Code verified at:** HEAD `f934e6474e54f7e195919e7fe4cf9d5779d5d66b` on `gsd/phase-18-shared-kill-then-remove-lifecycle`. No source file was modified by this pass.
+**Verified:** 2026-11-14
+**Status:** passed, 12 of 13 verified, truth 12 deferred to plan 22-05
+**Re-verification:** Yes, after gap closure. Prior report: `gaps_found`, 11/13, HEAD `f934e64`, 2026-11-13.
+**Code verified at:** HEAD `ca822383ad0e40b84ea9833b4c404b27cfd7c688` on `gsd/phase-18-shared-kill-then-remove-lifecycle`. No source file was modified by this pass. 33 commits landed since `f934e64`.
 
-## What changed under the phase since `abba527`
-
-`git diff --stat abba527..HEAD` over the covered files:
+## What changed under the phase since `f934e64`
 
 | File | Change | Consequence for this report |
 |------|--------|-----------------------------|
-| `baude-core/src/pty.rs`, `git.rs`, `session.rs`, `repository.rs`, `lifecycle.rs`, `persist.rs` | byte-identical | Code evidence stands; tests re-run at HEAD |
-| `baude-core/src/removal.rs` | +1429 / -75 | Phase 19 added `planned_clearings` and a fourth `clear_stage`. The 75 removed lines are doc text, imports, the `report_from_set` signature and test helpers moved to `testing.rs`. Stage order re-read below |
-| `baude-core/src/testing.rs` | +135 | Parked-reader and unkillable-runtime doubles moved here (phase 20) |
-| `scripts/gate.sh` | +15 | PWA suites run first; cargo steps unchanged |
+| `baude-core/src/pty.rs` | +277 / -24 (plan 22-06) | The truth 13 fix and its six tests. Read in full below |
+| `baude-core/src/testing.rs` | +4 / -2 | Doc comment on `await_parked_holder` only |
+| `baude-core/src/removal.rs` | +1078 | One production hunk (`update_suppression`, `:793-804`, plan 22-07): a removed primary is written with `suppress_primary`. It sits in the clear stage, after the save. The rest is plan 22-01 tests |
+| `git.rs`, `repository.rs`, `session.rs`, `lib.rs`, `lifecycle.rs`, `persist.rs`, `bauded/src/manager.rs` | byte-identical | Code evidence stands; tests re-run at HEAD |
+| `baude/src/app.rs` | +1027 | Call sites moved; wiring re-located below |
 
 ## Goal Achievement
 
 ### Observable Truths
 
-Evidence key: **T** = pinned by a test I ran at HEAD, **C** = verified by reading code at HEAD, **N** = not verified in this pass.
+Evidence key: **T** = test passed in the one `cargo test -p baude-core` run of this pass, **C** = code read at HEAD, **R** = out-of-tree reproduction run in this pass.
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | SC1: removing a row with a live runtime terminates the owned group SIGTERM then SIGKILL on macOS and Linux, no zombie or orphan | ✓ VERIFIED (macOS T; Linux C) | T: `removal::tests::live_runtime_group_is_extinct_after_remove`, `agent_and_shell_are_both_extinct_after_remove`, `pty::tests::group_extinction_after_leader_exit`, `kill_and_wait_confirms_child_exit` green. C: `extinguish_group` (`pty.rs:877-890`) is TERM, 500 ms poll, KILL, 500 ms poll, error. Linux: not run here; the `/proc` arm (`pty.rs:1019-1035`) is byte-identical to the tree the Linux gate passed at `abba527`. Scope note: the truth is about a live runtime. The exited-leader case is truth 13 |
-| 2 | SC2: a runtime that survives escalation leaves the row in place with an error | ✓ VERIFIED (T, C) | T: `surviving_runtime_leaves_row_and_disk`, `parent_kill_failure_aborts_before_disk_and_state`. C: `kill_stage` (`removal.rs:916-947`) returns `RuntimeSurvived` before `disk_stage` (`:455`) and `persist_stage` (`:456`). See truth 13 for a false `RuntimeSurvived` on macOS |
-| 3 | SC3: managed worktree child deleted even when unclean or cwd-held; main checkout and standalone keep directory and every branch; cloned and `git init` fixtures | ✓ VERIFIED (T, C) | T: `managed_worktree_unclean_and_cwd_held_is_deleted`, `git_init_unclean_cwd_held_managed_is_deleted_and_main_kept`, `main_checkout_keeps_directory_and_branches`, `standalone_keeps_folder`, `unmanaged_checkout_keeps_directory`, `live_main_checkout_runtime_is_killed_and_directory_kept`, `live_standalone_runtime_is_killed_and_folder_kept`, `live_unmanaged_checkout_runtime_is_killed_and_directory_kept`. C: `disk_action_for` (`removal.rs:1088-1093`); standalone rows are `KeepDirectory` (`:348`). Phase 19's `clear_markers` (`:699-750`) only ever targets `worktrees_base()/<workspace>/repository-<key>` through the non-recursive `marker::clear_owned`, so it cannot reach a main checkout or standalone folder |
-| 4 | SC4: removing a repository parent removes each child by the per-child rules then the parent, in one operation composed from existing stages | ✓ VERIFIED (T, C) | T: `repository_removes_children_then_parent`, `select_rows_repository_target_fans_out_children_first_parent_last`. C: `select_rows` (`removal.rs:306-356`), `remove` (`:436-469`). Close-protocol symbol count in `removal.rs` is 0 |
-| 5 | SC5: a crash mid-removal leaves the prior state or the fully removed state | ✓ VERIFIED (T, C) | T: `crash_before_save_reconciles_missing`, `repository_crash_mid_fan_out_keeps_parent_and_children_in_file`, `repository_disk_failure_mid_fan_out_leaves_state_and_file_untouched`, `save_closure_is_called_exactly_once_for_parent_with_children`. C: `persist_stage` (`removal.rs:1028-1064`) calls `save` once and assigns `*state` only on `Ok` or `replacement_committed()`. `clear_stage` runs after the save and never touches the state file (`:457`, `:662-676`) |
-| 6 | Plan 01: side-effect-free `preview_removal`, per-kind classification, serde round-trip, typed `UnknownTarget` | ✓ VERIFIED (T, C) | T: `preview_has_no_side_effects_and_report_round_trips_serde`, `remove_report_matches_preview_rows`, six `select_rows_*` tests. C: phase 19 added reads to the preview (`planned_clearings`, `removal.rs:501-609`): `symlink_metadata` and `breadcrumbs::load_json` (`breadcrumbs.rs:229-238`, read-only). No write, no git, no signal |
-| 7 | Plan 02: forced managed-worktree removal with containment, identity re-proof, marker retry, bare, foreign and submodule guards | ✓ VERIFIED (T) | All 30 `git::tests::forced_removal::*` green. `git.rs` unchanged since `abba527`. `"prune"` appears only in two argv-denylist test literals (`git.rs:5338`, `:6388`) |
-| 8 | Plan 03: `RepositoryState::remove_rows` batch removal; parent-only rejected; unknown keys no-ops; counters untouched | ✓ VERIFIED (T) | All 4 `repository::tests::remove_rows_*` green. `RemovedRows` `repository.rs:523`, `remove_rows` `:896`. File unchanged since `abba527` |
-| 9 | Plan 04: preflight identity match before any signal, candidate `validate_for_save` before any irreversible effect, one save, handles consumed only on success, `readers_parked` reported | ✓ VERIFIED (coincidental-reliance) (T, C) | C: `remove` order at `removal.rs:442-457` is `select_rows`, `planned_clearings` (read-only), `preflight`, clone, `remove_rows`, `validate_for_save`, `kill_stage`, `disk_stage`, `persist_stage`, `clear_stage`. T: `missing_runtime_handle_is_typed_error_before_any_kill`, `mismatched_runtime_identity_is_refused_before_any_kill`, `validation_failure_is_detected_before_any_kill_or_delete`, `vanished_owner_common_dir_is_refused_before_the_kill`, `reader_parked_on_out_of_group_slave_holder_is_reported`. The last one relies on the fixture reaping the leader first; see `coincidental_reliance_items` |
-| 10 | Plan 05: every persistence failure mode | ✓ VERIFIED (T) | `rename_failure_keeps_prior_state_then_retry_reports_already_removed`, `sync_failure_keeps_prior_state_and_file_bytes`, `directory_sync_failure_commits_state_and_reports_degraded`, `refused_row_failure_names_row_and_keeps_prior_state` green. `SavedDegraded` is the only committing error branch (`removal.rs:1041`) |
-| 11 | Plan 06: keep rules with and without live runtimes, unmanaged and already-removed rows, parent fan-out on both fixture kinds | ✓ VERIFIED (T) | All 11 plan-06 tests present and green, plus `already_removed_managed_row_prunes_git_registration`, `cloned_topology_places_worktrees_under_managed_root`. `testing.rs`: `git_in` `:314`, `ClonedTopology` `:337`, `cloned_topology` `:356`. `lifecycle.rs` diff since `73fa674` is empty |
-| 12 | Plan 07: `scripts/gate.sh` green on macOS and `--linux` on the same tree | ? UNCERTAIN (N) | Not run, by instruction. Last proof is `abba527`. Checked at HEAD only: `#[ignore]` count 0 in `removal.rs`, `pty.rs`, `session.rs`; `grace` count 0 in `pty.rs`; the four filtered suites below exit 0 |
-| 13 | Plan 08: `Pty::kill_and_wait` reaches group extinction after leader exit, pid-reuse `ForeignOwner`, reader join or parked report, lock-free error arm | ✗ FAILED (partial) | T, green: all 24 `pty::tests::*` and `session::tests::group_extinction_*`. Those cover an exited leader with a live descendant, a reaped leader, pid reuse, reader join and the lock-free error arm. Not covered, and failing on macOS: an exited leader that is the only group member and has not been reaped. `kill_and_wait` returns `failed to terminate exact PTY process group: Operation not permitted (os error 1)`. See BL-11 Root Cause |
+| 1 | SC1: removing a row with a live runtime terminates the owned group SIGTERM then SIGKILL on macOS and Linux, no zombie or orphan | ✓ VERIFIED (macOS T; Linux C) | T: `live_runtime_group_is_extinct_after_remove`, `agent_and_shell_are_both_extinct_after_remove`, `group_extinction_after_leader_exit`, `kill_and_wait_confirms_child_exit`. C: `extinguish_group` (`pty.rs:877`) now delegates to `extinguish_with`, which is TERM, extinction wait, KILL, extinction wait, error; the sequence is unchanged. Linux not run here |
+| 2 | SC2: a runtime that survives escalation leaves the row in place with an error | ✓ VERIFIED (T, C) | T: `surviving_runtime_leaves_row_and_disk`, `parent_kill_failure_aborts_before_disk_and_state`, `extinction_sequence_reports_unsignalable_live_group_as_live`. C: `kill_stage` (`removal.rs:923`) runs before `disk_stage` and `persist_stage`. The false `RuntimeSurvived` the prior report noted is gone with truth 13 |
+| 3 | SC3: managed worktree child deleted even when unclean or cwd-held; main checkout and standalone keep directory and every branch; cloned and `git init` fixtures | ✓ VERIFIED (T, C) | T: all eight tests the prior report named, green. C: `disk_action_for` (`removal.rs:1095`). The new `suppress_primary` call writes a suppression record under the config dir and deletes nothing |
+| 4 | SC4: removing a repository parent removes each child by the per-child rules then the parent, in one operation | ✓ VERIFIED (T, C) | T: `repository_removes_children_then_parent`, `select_rows_repository_target_fans_out_children_first_parent_last`. C: `select_rows` (`removal.rs:306`), `remove` (`:436`) |
+| 5 | SC5: a crash mid-removal leaves the prior state or the fully removed state | ✓ VERIFIED (T, C) | T: `crash_before_save_reconciles_missing`, `repository_crash_mid_fan_out_keeps_parent_and_children_in_file`, `repository_disk_failure_mid_fan_out_leaves_state_and_file_untouched`, `save_closure_is_called_exactly_once_for_parent_with_children`. C: `persist_stage` (`removal.rs:1035`) |
+| 6 | Plan 01: side-effect-free `preview_removal`, per-kind classification, serde round-trip, typed `UnknownTarget` | ✓ VERIFIED (T) | `preview_has_no_side_effects_and_report_round_trips_serde`, `remove_report_matches_preview_rows`, six `select_rows_*` tests |
+| 7 | Plan 02: forced managed-worktree removal with containment, identity re-proof, marker retry, bare, foreign and submodule guards | ✓ VERIFIED (T) | All 30 `git::tests::forced_removal::*` green. `git.rs` unchanged |
+| 8 | Plan 03: `RepositoryState::remove_rows` batch removal | ✓ VERIFIED (T) | All 4 `remove_rows_*` green. `repository.rs` unchanged |
+| 9 | Plan 04: preflight before any signal, candidate `validate_for_save` before any irreversible effect, one save, `readers_parked` reported | ✓ VERIFIED (coincidental-reliance) (T, C) | C: `remove` order at `removal.rs:442-457` re-read: `select_rows`, `planned_clearings`, `preflight`, clone, `remove_rows`, `validate_for_save`, `kill_stage`, `disk_stage`, `persist_stage`, `clear_stage`. T: the five tests the prior report named. See `coincidental_reliance_items` |
+| 10 | Plan 05: every persistence failure mode | ✓ VERIFIED (T) | The four persistence-failure tests green. `replacement_committed` is still the only committing error branch (`removal.rs:1048`) |
+| 11 | Plan 06: keep rules with and without live runtimes, unmanaged and already-removed rows, parent fan-out on both fixture kinds | ✓ VERIFIED (T) | Plan-06 tests green, plus `already_removed_managed_row_prunes_git_registration`, `cloned_topology_places_worktrees_under_managed_root`. `lifecycle.rs` diff since `73fa674` is empty |
+| 12 | Plan 07: `scripts/gate.sh` green on macOS and `--linux` on the same tree | DEFERRED to plan 22-05 | Not run, by instruction. Not verified and not failed. See Deferred Items |
+| 13 | Plan 08: `Pty::kill_and_wait` reaches group extinction after leader exit, including an exited, unreaped, leader-only group; pid-reuse `ForeignOwner`; reader join or parked report; lock-free error arm | ✓ VERIFIED (macOS T, R, C; Linux C) | Gap closed. See Truth 13 below |
 
-**Score:** 11/13 truths verified (1 failed, 1 not re-verified in this pass)
+**Score:** 12/13 truths verified, 0 failed, 1 deferred to plan 22-05 (0 present, behavior-unverified)
 
-### BL-11 Root Cause
+### Truth 13: the BL-11 gap is closed
 
-The orchestrator asked whether BL-11 ("failed to terminate exact PTY process group" on macOS teardown) has its cause in this phase's code. It does.
+**The fix (`44c2267`), read in code.** `signal_group` in `baude-core/src/pty.rs` now asks the pure rule `signal_step_proceeds`, which returns true for a zero result, `ESRCH` or `EPERM`. Every other errno is still an error under the same context string. Proceeding means only "go on to the extinction wait". `wait_for_group_extinction` (`pty.rs:1137`) is unchanged: each 10 ms round reaps through `try_lock` plus `try_wait` and returns true only when the probe stops reporting the group, and the probe rule `group_probe_alive` still counts `EPERM` as alive. So tolerating `EPERM` at the signal step cannot turn into reporting a live group gone: a group that answers `EPERM` forever gets TERM, a 500 ms wait, KILL, a 500 ms wait, then `PTY process group N remained live after forced termination`. The fail-closed property the prior report recorded is kept. This is the remedy the prior report asked for, including its warning that reaping first is not enough: a leader that is mid-exit and not yet waitable is retried each round. The stale comment on `group_disposition` is corrected.
 
-1. **Only one site can produce the message.** `grep` finds the string in production code at `baude-core/src/pty.rs:880` only (`baude/src/remote.rs:2064` is a test literal). It wraps `signal_group(process_group, libc::SIGTERM)`.
-2. **Only one errno can reach it.** `signal_group` (`pty.rs:1073-1087`) maps `ESRCH` to `Ok` at `:1081` and returns every other error. `kill(2)` with a valid signal can only fail with `ESRCH` or `EPERM`, so the BL-11 failure is `EPERM` by elimination.
-3. **macOS returns `EPERM` for a zombie-only group.** Measured on this host (Darwin 27.3.0) with a forked child that calls `setsid` and exits unreaped: `kill(-pgid, 0)` and `kill(-pgid, SIGTERM)` both fail with `EPERM`; after `waitpid` both fail with `ESRCH`. Linux signals a zombie-only group successfully, which is why this is macOS-only.
-4. **The code routes exactly that state to a signal.** `process_group_exists` (`pty.rs:1089-1093`) treats `EPERM` as alive. `group_disposition` then returns `Signal` for an exited leader whether the leader is still inspectable (`:968`) or its group has no live member (`:978`). The comment at `:955-956` states the intent: a zombie-only group "is signalled and reaped like any extinct-but-unreaped group". On macOS the signal call is the thing that fails, and the reap block (`:848-868`) is never reached.
-5. **Phase 18 opened the path.** Before plan 18-08 (`213e26e`), `kill_and_wait` began with `child.try_wait()` and returned `Ok` for an already exited leader before any signal. 18-08 removed that so SIGTERM is sent before the child mutex is taken. `signal_group`'s `ESRCH`-only tolerance is older (`6d9ebb4`, phase 06), but only since 18-08 does an unreaped exited leader reach it.
-6. **Reproduced through the real code.** An out-of-tree binary depending on `baude-core` by path (production cfg, not `test-support`) spawned `Pty::spawn(Some("sleep 0.05"), ..)` 100 times, waited for `kill(-pgid, 0)` to report `EPERM`, and called `kill_and_wait` without calling `is_exited()`:
+**The tests, read in code and run.** Six new `pty::tests`, all green:
 
-   ```text
-   rounds 100: zombie-only window observed 90, kill_and_wait Err in window 77, Ok in window 13, window missed 10
-   first error: failed to terminate exact PTY process group: Operation not permitted (os error 1)
-   retry 200 ms later succeeded: 77 of 77
-   ```
+- `kill_and_wait_reaps_unreaped_leader_group` drives the real `Pty::kill_and_wait` with no double on the signal path. It asserts the leader is a zombie, asserts `EPERM` from the group on macOS before the call, and never calls `is_exited` or `await_parked_holder`. After the call it asserts `Ok`, that the call returned no earlier than the mutex release, `ESRCH` from the group, no `ps` row, and a second call `Ok`.
+- `signal_step_errno_rule`, `group_probe_errno_rule` table-test the two rules, including `EINVAL` and a missing errno as errors.
+- `extinction_sequence_reports_unsignalable_live_group_as_live`, `extinction_sequence_stops_after_term_when_extinct`, `extinction_sequence_surfaces_a_signal_error` pin the sequence through `extinguish_with`, which production also calls.
 
-7. **Why the suite is green.** `testing::await_parked_holder` (`testing.rs:479-500`) polls `pty.is_exited()`, which reaps the leader, before any test calls `remove` or `kill_and_wait`. Production reaches the call in the window between the leader's exit and the next exit poll or reader reap. This is the fixture-realism failure mode `CLAUDE.md` names.
+**Is the mutex-held fixture a fair reproduction? Yes, with one limit.** The test holds the child mutex so neither the reader thread nor the kill path can reap, which keeps the zombie for 150 ms instead of a few hundred microseconds.
 
-Blast radius: fail-closed. `kill_stage` aborts before the disk and persist stages, so no row, file or directory changes and nothing is leaked. The user sees a `RuntimeSurvived` error for a runtime that had already exited, and a retry succeeds. Through the daemon it is a 500.
+- Fair: the state under test is the kernel state, and it is the real one. A real leader exits by itself, is a real unreaped zombie, and the real group answers `EPERM`; both are asserted, not assumed. Holding a mutex does not reap and does not change what `kill(2)` returns. Before the fix the call returns the BL-11 error on its first line of work, so the test is red on macOS for the right reason.
+- Stricter than production in one way: reaping is impossible for 150 ms, so an `Ok` cannot come from finding the group already gone. The `returned_at >= released_at` assertion pins that. This also covers the mid-exit, not-yet-waitable case.
+- The limit: in production the mutex is free during the window, so the first `try_lock` in the wait reaps the zombie. The fixture never takes that path, since after release the blocked reader may be the one that reaps. That path is not pinned in-tree.
 
-Reproduction artifacts (session scratchpad, not in the repo):
-`/private/tmp/claude-503/-Users-joese-Code-github-com-poindexter12-baude/a2f6da22-a53d-4447-9fb2-62cf58c24430/scratchpad/bl11-repro/src/main.rs`,
-`/private/tmp/claude-503/-Users-joese-Code-github-com-poindexter12-baude/a2f6da22-a53d-4447-9fb2-62cf58c24430/scratchpad/bl11-repro/race.log`,
-`/private/tmp/claude-503/-Users-joese-Code-github-com-poindexter12-baude/a2f6da22-a53d-4447-9fb2-62cf58c24430/scratchpad/py/zombie_group.py`.
+**The limit is covered by a run of the real race (R).** The prior report's out-of-tree binary (depends on `baude-core` by path, production cfg, `sleep 0.05` leader, no `is_exited`, no mutex) was rebuilt against HEAD and run again:
 
-### Deferred Items Now Resolved
+```text
+prior, f934e64:  rounds 100: zombie-only window observed 90, kill_and_wait Err in window 77, Ok in window 13, window missed 10
+now,   ca82238:  rounds 100: zombie-only window observed 94, kill_and_wait Err in window 0, Ok in window 94, window missed 6
+now, runs 2 and 3: observed 96 and 95, Err in window 0 and 0, Ok in window 96 and 95 (285 of 285 Ok across the three runs)
+```
 
-| # | Item | Was deferred to | Evidence at HEAD |
-|---|------|-----------------|------------------|
-| 1 | TUI and daemon both call the shared removal path (RMV-05) | Phases 20, 21 | `baude/src/app.rs:4510` and `bauded/src/manager.rs:1189` call `removal::remove`; previews at `baude/src/app.rs:4064`, `:4480`, `bauded/src/manager.rs:1115` |
-| 2 | Clearing bindings and marker ownership on removal | Phase 19 | `clear_stage` (`removal.rs:662-676`) runs after `persist_stage` |
+**Linux.** By code read only. On Linux a zombie-only group accepts the signal, so the new tolerance is not reached on this path and the mutex-held test passes with or without the fix. The Linux gate on the fix commit is part of the deferred truth 12.
+
+### Deferred Items
+
+Not yet met, explicitly owned by a later plan. Informational; does not affect status.
+
+| # | Item | Addressed In | Evidence |
+|---|------|--------------|----------|
+| 1 | Truth 12: `scripts/gate.sh` and `scripts/gate.sh --linux` green on the same tree | Phase 22, plan 22-05 | `22-05-PLAN.md` must-have: "scripts/gate.sh and the Linux gate both exited 0 on one commit, and that commit is the one on the remote branch", with result files kept. Plan 22-05 has no SUMMARY yet. This truth is open until those result files exist; this report does not vouch for it |
+
+### Advisory (New Scope, Unevidenced)
+
+| # | Finding | Category | Why Advisory |
+|---|---------|----------|--------------|
+| 1 | The production-shaped path of truth 13 (mutex free, first `try_lock` reaps) is proven out-of-tree only | other | A scheduling race cannot be pinned deterministically in-tree; evidence kept under `target/gsd-22/verify-18/` |
+| 2 | The red test is red on macOS only; Linux proof rides on plan 22-05 | other | Platform fact, not a defect |
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `baude-core/src/removal.rs` | Vocabulary, `select_rows`, `preview_removal`, `remove`, `RowRuntime`, stages | ✓ VERIFIED | 4861 lines, production to `:1167`. `select_rows` `:306`, `preview_removal` `:359`, `remove` `:436`, `preflight` `:840`, `kill_stage` `:916`, `disk_stage` `:964`, `persist_stage` `:1028` |
-| `baude-core/src/lib.rs` | `pub mod removal;` | ✓ VERIFIED | `:21` |
-| `baude-core/src/git.rs` | `remove_managed_worktree_forced` and guards | ✓ VERIFIED | `forced_remove_arguments` `:2889`, `managed_root_contains` `:3004`, `submodule_guard` `:3250`, `remove_managed_worktree_forced` `:3418`. Unchanged since `abba527` |
-| `baude-core/src/repository.rs` | `RemovedRows`, `remove_rows` | ✓ VERIFIED | `:523`, `:896` |
-| `baude-core/src/pty.rs` | `GroupDisposition`, `group_disposition`, `group_members`, `reader_finished` | ⚠️ PRESENT, DEFECT | `:926`, `:957`, `:1020`/`:1040`/`:1067`, `:601`. `signal_group` `:1073-1087` is the gap |
-| `baude-core/src/session.rs` | `kill_and_wait` contract | ✓ VERIFIED | `:495`. Unchanged since `abba527` |
-| `baude-core/src/testing.rs` | `git_in`, `ClonedTopology`, `cloned_topology` | ✓ VERIFIED | `:314`, `:337`, `:356` |
+| `baude-core/src/removal.rs` | Vocabulary, `select_rows`, `preview_removal`, `remove`, stages | ✓ VERIFIED | 5937 lines, production to `:1175`. `select_rows` `:306`, `preview_removal` `:359`, `remove` `:436`, `preflight` `:847`, `kill_stage` `:923`, `disk_stage` `:971`, `persist_stage` `:1035` |
+| `baude-core/src/lib.rs` | `pub mod removal;` | ✓ VERIFIED | Unchanged |
+| `baude-core/src/git.rs` | `remove_managed_worktree_forced` and guards | ✓ VERIFIED | Unchanged; 30 tests green |
+| `baude-core/src/repository.rs` | `RemovedRows`, `remove_rows` | ✓ VERIFIED | Unchanged; 4 tests green |
+| `baude-core/src/pty.rs` | `GroupDisposition`, `group_disposition`, `group_members`, `reader_finished`, group signal and extinction | ✓ VERIFIED | Prior defect fixed. `kill_and_wait` `:810`, `extinguish_group` `:877`, `group_disposition` `:952`, `wait_for_group_extinction` `:1137` |
+| `baude-core/src/session.rs` | `kill_and_wait` contract | ✓ VERIFIED | Unchanged; 27 tests green |
+| `baude-core/src/testing.rs` | `git_in`, `ClonedTopology`, `cloned_topology` | ✓ VERIFIED | Doc comment change only |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `removal::remove` | `Session::kill_and_wait` | kill stage | ✓ WIRED | `removal.rs:929-935` |
-| `removal::remove` | `git::remove_managed_worktree_forced` | disk stage, owner common dir | ✓ WIRED | `removal.rs:977-978` |
-| `removal::remove` | `remove_rows` + `validate_for_save` + caller save | clone, mutate, validate before kill, save once | ✓ WIRED | `removal.rs:445-456` |
-| `removal::persist_stage` | `SaveError::replacement_committed` | only committing degraded branch | ✓ WIRED | `removal.rs:1041` |
-| `pty::kill_and_wait` | `signal_group` + `wait_for_group_extinction` | `Signal` arm only | ⚠️ WIRED, DEFECT | `pty.rs:840`, `:877-890`; `EPERM` not handled at `:1081` |
-| `session::kill_and_wait` | `Pty::process_identity` | lock-free error arm | ✓ WIRED | `session::tests::group_extinction_error_path_does_not_take_child_lock` green |
-| TUI | `removal::remove` | `baude/src/app.rs:4510` | ✓ WIRED | Phase 20 |
-| Daemon | `removal::remove` | `bauded/src/manager.rs:1189` | ✓ WIRED | Phase 21 |
+| `removal::remove` | `Session::kill_and_wait` | kill stage | ✓ WIRED | `removal.rs:938` |
+| `removal::remove` | `git::remove_managed_worktree_forced` | disk stage | ✓ WIRED | `removal.rs:985` |
+| `removal::remove` | `remove_rows` + `validate_for_save` + caller save | clone, mutate, validate before kill, save once | ✓ WIRED | `removal.rs:442-457` |
+| `removal::persist_stage` | `SaveError::replacement_committed` | only committing degraded branch | ✓ WIRED | `removal.rs:1048` |
+| `pty::kill_and_wait` | `signal_group` + `wait_for_group_extinction` | `Signal` arm, through `extinguish_with` | ✓ WIRED | `pty.rs:840`, `:877`; `EPERM` now handled |
+| `session::kill_and_wait` | `Pty::process_identity` | lock-free error arm | ✓ WIRED | `group_extinction_error_path_does_not_take_child_lock` green |
+| TUI | `removal::remove` | `baude/src/app.rs:4537` | ✓ WIRED | Previews at `:4091`, `:4507` |
+| Daemon | `removal::remove` | `bauded/src/manager.rs:1189` | ✓ WIRED | Preview at `:1115` |
 
 ### Behavioral Spot-Checks
 
-Each command ran under the same isolated environment `scripts/gate.sh` builds (`HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR` redirected), single-threaded, with the exit code written to a file by the runner and read from that file, never through a pipe.
+Every exit code was written to a file by the command itself and read from that file, never through a pipe. Outputs are under `target/gsd-22/verify-18/`.
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Tests exist | `cargo test -p baude-core --lib -- --list` | exit 0; 561 tests; 49 `removal::`, 30 `forced_removal::`, 24 `pty::`, 4 `remove_rows`, 2 `session::tests::group_extinction_*` | ✓ PASS |
-| Removal and forced removal | `cargo test -p baude-core --lib removal:: -- --test-threads=1` | exit 0; `79 passed; 0 failed; 0 ignored` | ✓ PASS |
-| PTY kill path | `cargo test -p baude-core --lib pty:: -- --test-threads=1` | exit 0; `24 passed; 0 failed; 0 ignored` | ✓ PASS |
-| Batch row removal | `cargo test -p baude-core --lib remove_rows -- --test-threads=1` | exit 0; `4 passed; 0 failed` | ✓ PASS |
-| Session teardown | `cargo test -p baude-core --lib session::tests:: -- --test-threads=1` | exit 0; `27 passed; 0 failed` | ✓ PASS |
-| Teardown of an exited, unreaped leader | out-of-tree `bl11-repro`, 100 rounds | 77 of 90 in-window calls returned `Err` | ✗ FAIL |
-| Full gate, macOS and Linux | `scripts/gate.sh`, `scripts/gate.sh --linux` | not run, by instruction | ? SKIP |
+| Whole `baude-core` suite, run once | `cargo test -p baude-core` | exit 0; `572 passed; 0 failed; 1 ignored` in 209.35 s; doc-tests 0 | ✓ PASS |
+| Phase suites, counted from that one log | none (grep of the saved log) | `removal::tests::` 53 ok, `forced_removal::` 30 ok, `pty::tests::` 30 ok, `remove_rows_` 4 ok, `session::tests::` 27 ok; 0 not ok | ✓ PASS |
+| The 47 tests this report names | none (grep of the saved log) | 47 of 47 `... ok` | ✓ PASS |
+| Teardown of an exited, unreaped leader, real race | out-of-tree `bl11-repro`, 100 rounds, built exit 0, run exit 0 | 94 in window, 0 `Err`, 94 `Ok` | ✓ PASS |
+| Full gate, macOS and Linux | `scripts/gate.sh`, `scripts/gate.sh --linux` | not run, by instruction | DEFERRED to plan 22-05 |
+
+Notes on the suite run. The one ignored test is `meta::tests::pane_claude_stand_in` (`meta.rs:2225`), a stand-in process launched by other tests, outside this phase's files. Three plan 22-01 tests (`removal::tests::end_state_matrix_*`) ran longer than 60 s each and passed; a second verifier was using the same tree at the time.
 
 ### Probe Execution
 
@@ -201,68 +191,36 @@ No `scripts/*/tests/probe-*.sh` exists and no plan declares one.
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| KILL-01 | ⚠️ PARTIAL | A live runtime is TERM-then-KILL extinguished before any row or file drops (truth 1, T on macOS). An already exited, unreaped runtime fails teardown on macOS (truth 13). Linux not re-run |
-| KILL-02 | ⚠️ PARTIAL | Reader join and `readers_parked` proven by test. In the truth 13 failure `kill_and_wait` returns before the reap block, so the zombie leader persists until the next exit poll |
-| KILL-03 | ✓ SATISFIED | A survivor leaves the row with a typed error (truth 2). Caveat: truth 13 raises the same error for a runtime that did exit |
-| RMV-01 | ✓ SATISFIED | Truth 3, truth 7 |
+| KILL-01 | ✓ SATISFIED (macOS; Linux pending plan 22-05) | Truths 1 and 13 |
+| KILL-02 | ✓ SATISFIED | Reader join and `readers_parked` by test; the zombie leader is now reaped inside the call (truth 13) |
+| KILL-03 | ✓ SATISFIED | Truth 2; the false survivor error is gone |
+| RMV-01 | ✓ SATISFIED | Truths 3, 7 |
 | RMV-02 | ✓ SATISFIED | Truth 3 |
 | RMV-03 | ✓ SATISFIED | Truth 3 |
-| RMV-04 | ✓ SATISFIED | Truth 4, truth 8 |
-| RMV-05 | ✓ SATISFIED | One `removal::remove`; both callers now wired (see Deferred Items Now Resolved) |
-| RMV-06 | ✓ SATISFIED | Truth 5, truth 10 |
+| RMV-04 | ✓ SATISFIED | Truths 4, 8 |
+| RMV-05 | ✓ SATISFIED | One `removal::remove`; TUI and daemon both call it |
+| RMV-06 | ✓ SATISFIED | Truths 5, 10 |
 | RMV-07 | ✓ SATISFIED | `forced_arguments_never_touch_branches`, `main_worktree_inside_root_is_refused`, keep tests on both fixture kinds |
 
-No orphaned requirements: all ten IDs mapped to Phase 18 in REQUIREMENTS.md are claimed by a plan.
+No orphaned requirements.
 
 ### Prohibitions
 
-| Prohibition | Check at HEAD | Result |
-|-------------|---------------|--------|
-| `preview_removal` never signals, runs git or writes | read `planned_clearings` and `load_json`; `preview_has_no_side_effects_and_report_round_trips_serde` | kept |
-| `select_rows` never classifies Main, unmanaged or standalone as `RemoveManagedWorktree` | `select_rows_classifies_disk_action_by_role_and_management` | kept |
-| `remove_dir_all` never on a path that failed a guard | `forced_removal` refusal tests | kept |
-| Forced argv has no branch verb; no `refs/heads` entry deleted | `forced_arguments_never_touch_branches`; `git.rs:2889` | kept |
-| `remove_rows` never touches `next_*` counters | `remove_rows_unknown_keys_are_no_ops_and_counters_unchanged` | kept |
-| `remove` never routes through the close or tombstone protocols | symbol count in `removal.rs` = 0 | kept |
-| Save closure at most once, never after an earlier stage error | `save_closure_is_called_exactly_once_for_parent_with_children` and error-path tests | kept |
-| No signal before preflight and validation | three `*_before_any_kill*` tests | kept |
-| No new grace or timeout knob | `grep -c 'grace\|GRACE' pty.rs` = 0 | kept |
-| A foreign process group is never signalled | `group_extinction_disposition_never_signals_foreign_owner` | kept |
-| No test ignored to pass a gate | `#[ignore]` count 0, 0, 0 | kept |
-| `lifecycle.rs` helpers not modified | `git diff --stat 73fa674..HEAD -- lifecycle.rs` empty | kept |
-| Gate steps never judged through a pipe | this pass read every exit code from a file | kept |
+All thirteen prohibitions of the prior report were re-checked and are kept. The pinning tests are among the 47 confirmed green. Counts re-read at HEAD: `grace|GRACE` in `pty.rs` = 0; `#[ignore]` in `removal.rs`, `pty.rs`, `session.rs` = 0, 0, 0; `lifecycle.rs` diff since `73fa674` empty. "A foreign process group is never signalled" still holds after the fix: `group_disposition` decides before any signal and is unchanged in logic, and `group_extinction_disposition_never_signals_foreign_owner` is green. "Gate steps never judged through a pipe": kept in this pass.
 
 ### Anti-Patterns Found
 
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| `baude-core/src/pty.rs` | 1081 | `ESRCH`-only tolerance on a group signal | 🛑 Blocker | Truth 13, BL-11 |
-| `baude-core/src/pty.rs` | 955-956 | Comment asserts behavior that is false on macOS | ⚠️ Warning | Misleads the next reader of the kill path |
-| `baude-core/src/testing.rs` | 479-500 | Fixture reaps the leader before the call under test | ⚠️ Warning | Hides the gap from every exited-leader test |
-
-No `TBD`, `FIXME`, `XXX`, `TODO`, `HACK`, `PLACEHOLDER`, `todo!(` or `unimplemented!` in the seven covered source files.
+None. The three findings of the prior report are resolved: the `ESRCH`-only tolerance is fixed, the `group_disposition` comment is corrected, and `await_parked_holder` now documents that it reaps. No `TBD`, `FIXME`, `XXX`, `TODO`, `HACK`, `PLACEHOLDER`, `todo!(` or `unimplemented!` in the seven covered source files.
 
 ### Human Verification Required
 
-1. **Gate at HEAD.** Run `scripts/gate.sh` and `scripts/gate.sh --linux`, reading each exit code directly. Expected: both exit 0. Not run here by instruction; Phase 22 owns it.
+None for this phase. The gate is not a human item here: it is deferred to plan 22-05, which runs it on the pushed commit and keeps the result files.
 
 ### Gaps Summary
 
-One gap. Twelve of the thirteen must-haves still hold at HEAD or were not in scope to re-run: the removal pipeline's stage order, keep rules, forced worktree removal, batch row removal, single-save atomicity and every plan prohibition were re-located in code and re-proven by 134 tests run in this pass. Phase 19's additions to `removal.rs` did not disturb them: the preview stayed read-only, and the new clearing stage runs after the save and cannot reach a kept directory.
-
-The gap is BL-11, and its cause is in this phase's code. `Pty::kill_and_wait` fails on macOS when the leader has exited and is the only, unreaped member of its group, because `signal_group` (`baude-core/src/pty.rs:1073-1087`) treats the `EPERM` macOS returns for a zombie-only group as a failure, and plan 18-08 removed the early reap that used to keep that state away from it. It fails closed and a retry succeeds, so nothing is deleted or leaked, but removal and session teardown fail intermittently for a row whose agent has just exited.
-
-**The deferral looks intentional.** BL-11 was deferred from v2.8 by owner decision on 2026-11-13. To accept that for this phase, add to this file's frontmatter:
-
-```yaml
-overrides:
-  - must_have: "Pty::kill_and_wait reaches process-group extinction even when the PTY leader has already exited, and is idempotent on an extinct group"
-    reason: "BL-11: macOS EPERM on a zombie-only group. Fails closed, retry succeeds. Deferred from v2.8 by owner decision 2026-11-13."
-    accepted_by: "{name}"
-    accepted_at: "{ISO timestamp}"
-```
+No gaps. The one failed truth of the prior report, BL-11, is closed: the signal step tolerates the `EPERM` macOS returns for a zombie-only group, the extinction wait still decides alone whether the group is gone, and a group that stays live still ends in an error. That is proven by an in-tree test on the real kill path and by a re-run of the real race, 0 failures in 94 in-window calls against 77 in 90 before. The other eleven truths were re-located in code and re-proven by the suite at HEAD with no regression. Truth 12, the gates, is neither verified nor failed here and stays open until plan 22-05 records both exit codes.
 
 ---
 
-_Verified: 2026-11-13_
+_Verified: 2026-11-14_
 _Verifier: Claude (gsd-verifier)_

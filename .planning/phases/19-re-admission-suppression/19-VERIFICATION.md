@@ -1,9 +1,9 @@
 ---
 phase: 19-re-admission-suppression
-verified: 2026-11-13T22:09:57-08:00
-head: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
-status: gaps_found
-score: 39/43 must-haves verified
+verified: 2026-11-14T09:43:23-08:00
+head: ca822383ad0e40b84ea9833b4c404b27cfd7c688
+status: passed
+score: 40/43 must-haves verified, 3 gate truths deferred to plan 22-05
 covered_files:
   - .planning/phases/19-re-admission-suppression/19-01-PLAN.md
   - .planning/phases/19-re-admission-suppression/19-01-SUMMARY.md
@@ -27,38 +27,54 @@ covered_files:
   - baude-core/src/suppression.rs
   - baude/src/app.rs
   - bauded/src/manager.rs
-covered_digest: "v4:sha256:993c4f9c61b377017fd277b5e2ad20bd3944fba3cbbedb2de13e4d5ccac8c571"
+covered_digest: "v4:sha256:5c13debb55cd9dbef9f2e5ce521fc57670d4d55beefe6c14be6015d5b3043290"
 behavior_unverified: 0
 overrides_applied: 0
-gaps:
-  - truth: "The session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row across a TUI relaunch (ROADMAP SC2, READM-03; also the 'only by n, c, or launching inside the folder' half of READM-04)"
-    status: partial
-    reason: "Holds for a removed repository, managed worktree, unmanaged checkout and standalone row. Fails for a removed primary (main) checkout whose repository row survives: any later admission of that repository from a sibling path re-derives the primary as a new PrimaryDefault row at the removed path. The suppression entry removal wrote for that path is never consulted on this route and is left behind as a stale entry. Reproduced with a failing probe test on the cloned relaunch fixture."
-    artifacts:
-      - path: "baude/src/app.rs"
-        issue: "admit_repository lines 2585-2593 look for an existing PrimaryDefault row; when none exists, lines 2624-2688 allocate a new key and push a new PrimaryDefault row from git::ensure_default_worktree with no suppression::is_suppressed check. The only consult is inside admit_existing_worktrees at line 2737, and the primary derivation is not part of that sweep."
-      - path: "baude-core/src/removal.rs"
-        issue: "plan_suppression lines 589-606 write a SuppressionAdded entry for every checkout removed while its repository survives, the primary included, so the entry exists but has no reader on the route that brings the row back."
-      - path: ".planning/phases/19-re-admission-suppression/19-RESEARCH.md"
-        issue: "Line 60 states the inventory sweep is the only path that re-admits a removed row. The primary derivation in admit_repository is a second path, so the design covered one of two."
-    missing:
-      - "Consult the suppression store before re-deriving the primary in App::admit_repository when the repository row exists and has no PrimaryDefault row, after the lift at line 2518 so an explicit admission of that exact path still brings it back"
-      - "A relaunch test on the cloned fixture that removes the primary checkout row with a sibling row kept, relaunches inside the sibling worktree, and asserts the primary row is absent and its entry still present"
-      - "A decision on the same route in bauded admission; no PrimaryDefault derivation was found in bauded/src/manager.rs but that file was not read whole"
+re_verification:
+  date: 2026-11-14
+  head: ca822383ad0e40b84ea9833b4c404b27cfd7c688
+  previous_status: gaps_found
+  previous_score: 39/43
+  previous_head: f934e6474e54f7e195919e7fe4cf9d5779d5d66b
+  gaps_closed:
+    - "The session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row across a TUI relaunch (ROADMAP SC2, READM-03, READM-04)"
+  gaps_remaining: []
+  regressions: []
+deferred:
+  - truth: "scripts/gate.sh exits 0 on macOS on the final tree"
+    addressed_in: "Phase 22, plan 22-05"
+    evidence: "Plan 22-05 runs scripts/gate.sh and scripts/gate.sh --linux on the exact pushed commit and keeps the result files. Not run here by instruction. Neither verified nor failed."
+  - truth: "scripts/gate.sh --linux exits 0 on the same tree"
+    addressed_in: "Phase 22, plan 22-05"
+    evidence: "Plan 22-05 runs scripts/gate.sh and scripts/gate.sh --linux on the exact pushed commit and keeps the result files. Not run here by instruction. Neither verified nor failed."
+  - truth: "No fixture directory leaks into the real worktrees root or config dir"
+    addressed_in: "Phase 22, plan 22-05"
+    evidence: "Plan 22-05 runs scripts/gate.sh and scripts/gate.sh --linux on the exact pushed commit and keeps the result files. Not run here by instruction. Neither verified nor failed."
+advisory:
+  - finding: "A removed baude-made default checkout whose folder was deleted has no one-gesture way back: n, c or a launch on the repository does not derive it again. It returns after a worktree is put back at the old path and that folder is opened, or after the repository row is removed and admitted again."
+    category: other
+    reason: "READM-04 holds as written, see Requirements Coverage. Recorded so the product owner can confirm the two-step route is intended."
+    evidence_status: "tested: removed_primary_managed_returns_when_its_folder_is_back, removed_primary_managed_returns_after_repository_readmission"
+  - finding: "While a removed-primary entry stands, launching baude inside a sibling worktree, or inside the clone itself when the removed primary was a baude-made worktree, starts no session and shows a message instead."
+    category: other
+    reason: "Outside READM-03 and READM-04. It is the shipped behaviour and is asserted by the tests; noted because a launch that starts nothing is a visible cost."
+    evidence_status: "tested: removed_primary_stays_removed_on_sibling_relaunch asserts zero sessions"
 ---
 
 # Phase 19: Re-admission Suppression Verification Report
 
 **Phase Goal:** A removed project stays gone across reconcile and relaunch because removal clears its folder-workspace binding and marker ownership, and every rediscovery path respects that, while `n`, `c` and launching inside the folder still admit it fresh.
 **Verified:** 2026-11-13 at HEAD `f934e6474e54f7e195919e7fe4cf9d5779d5d66b` (branch `gsd/phase-18-shared-kill-then-remove-lifecycle`, with Phases 20 and 21 and the Phase 21 review-fix pass on top)
-**Status:** gaps_found
-**Re-verification:** No, initial verification
+**Status:** passed
+**Re-verification:** Yes, after gap closure, 2026-11-14
 
 ## Verdict
 
-The clearing machinery is real, wired and tested: the fourth removal stage clears bindings, markers and managed directories and maintains the suppression store, the TUI sweep consults the store, and the three explicit routes lift an entry. 31 named tests pinning this were run and passed with exit code 0.
+Re-verified 2026-11-14 at `ca822383ad0e40b84ea9833b4c404b27cfd7c688` after gap closure by plans 22-07 and 22-08. Status: **passed**. 40 of 43 truths verified; the 3 gate truths are deferred to plan 22-05, see Deferred Items.
 
-"Every rediscovery path respects that" is not true. One rediscovery path was never covered: `App::admit_repository` re-derives a missing primary checkout on every admission of a known repository, and that derivation does not consult the suppression store. A user who removes the main checkout row of a repository that still has another row, then launches baude inside a sibling worktree, gets the removed row back. This is one BLOCKER against success criterion 2.
+Gap 1 is closed in code, not only in the summaries. `removal::plan_suppression` now writes a removed primary's entry through `suppression::suppress_primary`, which sets a `primary` flag on the entry. `App::admit_repository` (`baude/src/app.rs:2632-2650`) asks `suppression::removed_primary` for the repository's common dir whenever no `PrimaryDefault` row exists, and when an entry answers it sweeps the other worktrees, saves, sets a message and returns `Ok(None)` before any checkout key is allocated and before `git::ensure_default_worktree` runs. The lift at `app.rs:2520` runs first, so an admission of exactly the removed path still derives the primary in the same pass.
+
+No regression: every test the previous report cited by name passed in this run, with the full `baude` suite at exit 0.
 
 Evidence labels used below: **test** means a named test I ran at HEAD and read the exit code of directly, **code** means read at HEAD with file and line, **not verified** means neither.
 
@@ -69,11 +85,43 @@ Evidence labels used below: **test** means a named test I ran at HEAD and read t
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
 | SC1 | After removal, the launch-dir binding walk no longer resolves the removed folder to a workspace and marker recovery does not restore the row | VERIFIED | **test** `removal::tests::clear_stage_removes_repository_binding_and_reports_it` asserts `folder_workspace::find_binding` returns `None` for the removed repo after `removal::remove`. **code** `folder_workspace::clear` at `baude-core/src/folder_workspace.rs:210`, called from `clear_bindings` at `baude-core/src/removal.rs:683`; stage order at `removal.rs:455-456` (`persist_stage` then `clear_stage`). Marker half: **code** no marker reader admits a row. The readers are `lifecycle.rs:1807`, `1931`, `2038` (collision and directory ownership) and `worktree_scan.rs:862` (the CLI scan in `baude/src/main.rs`), none of which pushes a row. |
-| SC2 | The session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row across a TUI relaunch | FAILED (BLOCKER) | Holds for four row kinds: **test** `app::tests::removed_rows_stay_removed_across_relaunch`. Fails for a removed primary checkout with its repository row kept. See Gap 1. |
+| SC2 | The session-start sweep, worktree scan, marker recovery and reconcile do not re-admit the removed repository, checkout, worktree or standalone row across a TUI relaunch | VERIFIED | Four row kinds as before: **test** `app::tests::removed_rows_stay_removed_across_relaunch`. Removed primary, the former gap: **test** `removed_primary_stays_removed_on_sibling_relaunch` (cloned fixture, relaunch inside the sibling worktree: no row at the removed path, no `PrimaryDefault` row, `git worktree list` unchanged, entry kept, key allocator unmoved, zero sessions, message names the folder) and `removed_primary_managed_is_not_recreated_on_sibling_relaunch` (baude-made default worktree, folder deleted by the removal, no `git worktree add` on relaunch). **code** `app.rs:2632-2650`, `suppression.rs` `removed_primary`, `removal.rs` `suppress_primary` call. |
 | SC3 | `n`, `c`, or launching baude inside the folder admits the project again as a fresh row with no stale identity | VERIFIED | **test** `relaunch_inside_removed_checkout_readmits_it_fresh` (launch dir, entry written by a real removal), `launch_dir_and_clone_completion_routes_lift_suppression` (launch dir and `c`, real `git clone`), `admitting_suppressed_path_lifts_entry_and_admits_fresh_identity`. **code** all three routes reach `admit_repository` through `open_repo_session_via`: `LaunchDirectory` at `baude/src/app.rs:1663`, `Open` at `6541`, `CloneCompletion` at `6618`, admission at `6573`, lift at `2518` before both sweep sites (`2618`, `2689`). The `n` route itself is covered by **code** only: the test calls `admit_repository` directly, not the modal. |
 | SC4 | Other rows' bindings, markers and worktrees are unchanged by a removal, including repositories sharing the same workspace | VERIFIED | **test** `removal::tests::removal_leaves_neighbour_bindings_markers_worktrees_and_suppressions_byte_identical`, plus `clear_stage_removes_repository_binding_and_reports_it` (neighbour sharing the workspace value survives) and `folder_workspace::tests::clear_removes_only_the_named_key`. **code** every clear is keyed by an exact `folder_key`, by the removed row's stored `physical_key` (`removal.rs:627-638`), or by the removed repository's common dir (`removal.rs:763`). |
 
-### Gap 1 (BLOCKER): a removed primary checkout returns on a relaunch inside a sibling worktree
+### Deferred Items
+
+Three gate truths of plan 19-07 are deferred to Phase 22 plan 22-05. They are not counted as verified and not counted as failed. `scripts/gate.sh` was not run in this verification, by instruction.
+
+| # | Item | Addressed In | Evidence |
+|---|------|--------------|----------|
+| 1 | `scripts/gate.sh` exits 0 on macOS on the final tree | Phase 22, plan 22-05 | 22-05-PLAN.md runs the host gate and then the Linux gate on the exact commit that is pushed and keeps `05-mac.result` and `05-linux.result` |
+| 2 | `scripts/gate.sh --linux` exits 0 on the same tree | Phase 22, plan 22-05 | 22-05-PLAN.md runs the host gate and then the Linux gate on the exact commit that is pushed and keeps `05-mac.result` and `05-linux.result` |
+| 3 | No fixture directory leaks into the real worktrees root or config dir | Phase 22, plan 22-05 | 22-05-PLAN.md runs the host gate and then the Linux gate on the exact commit that is pushed and keeps `05-mac.result` and `05-linux.result` |
+
+### Advisory (New Scope, Unevidenced as Defects)
+
+Reported, not blocking. Both are tested, intended behaviour; they are listed because they bound how READM-04 is read.
+
+| # | Finding | Category | Why Advisory |
+|---|---------|----------|--------------|
+| 1 | A removed baude-made default checkout whose folder was deleted has no one-gesture way back. It returns when a worktree is put back at the old path and that folder is opened, or when the repository row is removed and the repository admitted again | other | READM-04 holds as written; the two-step route is a product choice to confirm |
+| 2 | While a removed-primary entry stands, a launch inside a sibling worktree starts no session and shows a message | other | Outside READM-03 and READM-04; asserted by the tests as shipped behaviour |
+
+### Gap 1 (CLOSED 2026-11-14): a removed primary checkout returned on a relaunch inside a sibling worktree
+
+**Closed by** `754665e` (fix), with red tests in `7a1b0e6` and the ways back pinned in `0413f7e`, `084af67`, `1058fc4`, `e3e7cd2`. Read at `ca822383ad0e40b84ea9833b4c404b27cfd7c688` and run:
+
+- **Stays removed.** `removed_primary_stays_removed_on_sibling_relaunch`, `removed_primary_managed_is_not_recreated_on_sibling_relaunch`, `removed_primary_returns_through_open_route` (its first half: opening a sibling through `n` derives no primary and spends no key).
+- **Comes back only by its own path (D-12).** `removed_primary_returns_on_relaunch_inside_its_folder`, `removed_primary_returns_through_open_route`, `removed_primary_returns_through_clone_completion_route`. The lift key is `git::repo_root` of the admitted path, so a sibling or the parent root lifts nothing; `admitting_parent_root_does_not_lift_child_entry` still passes.
+- **Folder deleted.** `removed_primary_managed_returns_when_its_folder_is_back` and `removed_primary_managed_returns_after_repository_readmission`. Removing the repository row drops its entries, the existing garbage collection, and the next admission derives a primary with a new `CheckoutKey` and `first_seen_order`.
+- **Store compatibility.** `primary_fact_follows_its_entry`, `entries_without_the_primary_member_load`, `removed_primary_store_without_the_fact_still_loads`: the flag is omitted when false and an entry without it loads and does not answer.
+- **Daemon.** `bauded/src/manager.rs` has no `PrimaryDefault` derivation (grep at HEAD: no `PrimaryDefault`, no `ensure_default_worktree`), so the route does not exist there.
+
+**D-12 exact-path lift: honoured.** The consult can only stop a derivation; the entry leaves only by an explicit admission of exactly that path or by removal of the repository row.
+
+The text below is the 2026-11-13 finding at `f934e6474e54f7e195919e7fe4cf9d5779d5d66b`, kept for the record. Its line numbers and its override suggestion are superseded.
+
 
 - **Where:** `baude/src/app.rs:2585-2593` finds no `PrimaryDefault` row for the repository; `baude/src/app.rs:2624-2688` then allocates a new `CheckoutKey` and pushes a new `PrimaryDefault` row at the path `git::ensure_default_worktree` returns, and `ensure_primary` at `2691` launches it. Nothing on that route calls `suppression::is_suppressed`. The only consult is at `baude/src/app.rs:2737` inside `admit_existing_worktrees`.
 - **Why the entry exists but does nothing:** `plan_suppression` at `baude-core/src/removal.rs:589-606` writes an entry for every checkout removed while its parent survives, whatever its role.
@@ -142,10 +190,10 @@ All 39 plan truths were checked. Rows are grouped where one test pins several.
 | 06 | Relaunching inside the removed unmanaged checkout admits it fresh in that restore | VERIFIED | **test** `relaunch_inside_removed_checkout_readmits_it_fresh` |
 | 06 | `FolderContext::flush` drops the removed path's crumb; no eager clear in the removal stage | VERIFIED | **test** `breadcrumbs::tests::flush_drops_crumb_of_removed_path`; **code** the TUI flushes in `App::save` at `baude/src/app.rs:2070-2072`; `removal.rs` has no `FolderContext` reference |
 | 06 | Fixtures are cloned and `git init` shapes, assertions on fixture output and state files | VERIFIED | **code** `relaunch_fixture` at `app.rs:10703` builds on `admission_repo_cloned` and adds a `git init` second repository (`10733-10740`) and a non-git standalone; assertions read rows and files. See fixture notes for the limits. |
-| 07 | `scripts/gate.sh` exits 0 on macOS on the final tree | NOT VERIFIED | Not run, by instruction |
-| 07 | `scripts/gate.sh --linux` exits 0 on the same tree | NOT VERIFIED | Not run, by instruction |
+| 07 | `scripts/gate.sh` exits 0 on macOS on the final tree | DEFERRED (plan 22-05) | Not run, by instruction. Phase 22 plan 22-05 runs it on the pushed commit and keeps the result files. Neither verified nor failed. |
+| 07 | `scripts/gate.sh --linux` exits 0 on the same tree | DEFERRED (plan 22-05) | Not run, by instruction. Phase 22 plan 22-05 runs it on the pushed commit and keeps the result files. Neither verified nor failed. |
 | 07 | Every phase commit passes `scripts/check-commit-message.sh` | VERIFIED | **test** `scripts/check-commit-message.sh --range origin/main..HEAD` exit code 0 |
-| 07 | No fixture directory leaks into the real worktrees root or config dir | NOT VERIFIED | The leak check is a gate step and was not run |
+| 07 | No fixture directory leaks into the real worktrees root or config dir | DEFERRED (plan 22-05) | Not run, by instruction. Phase 22 plan 22-05 runs it on the pushed commit and keeps the result files. Neither verified nor failed. |
 
 **Score:** 39/43 truths verified. 1 failed (SC2). 3 not verified, all gate runs excluded from this verification by instruction. 0 present but behavior-unverified.
 
@@ -216,7 +264,12 @@ Not applicable in the rendering sense. The equivalent trace is "does the entry r
 |----------|---------|--------|--------|
 | Core clearing, marker, suppression, binding and crumb tests | `cargo test -p baude-core` with the 23 Phase 19 test names as filters | exit 0, 23 passed, 0 failed | PASS |
 | TUI sweep, lift, relaunch and clearing-failure tests | `cargo test -p baude -- suppressed_worktree_is_skipped_by_admission_sweep admitting_suppressed_path_lifts_entry_and_admits_fresh_identity removed_rows_stay_removed_across_relaunch relaunch_inside_removed_checkout_readmits_it_fresh admitting_parent_root_does_not_lift_child_entry launch_dir_and_clone_completion_routes_lift_suppression lift_failure_is_a_message_not_an_admission_error remove_project_clearing_failure_is_a_footer_notice_not_an_error` | exit 0, 8 passed, 0 failed | PASS |
-| Removed primary stays removed on a relaunch inside a sibling worktree | probe test in a scratch copy of the tree | exit 101, row came back as `CheckoutKey(4)` `PrimaryDefault` | FAIL |
+| 2026-11-13: removed primary probe in a scratch copy | probe test | exit 101 at `f934e64`, superseded by the rows below | SUPERSEDED |
+| Full TUI suite, once | `cargo test -p baude -- --test-threads=1 > target/gsd-22/verify-19/baude-test.log 2>&1; echo exit=$?` | exit=0, 361 passed (360 in the `baude` unit binary, 1 in a second test binary), 0 failed, 0 ignored | PASS |
+| Core suppression and removal modules | `cargo test -p baude-core --lib -- suppression:: removal::` | exit=0, 90 passed, 0 failed | PASS |
+| Core breadcrumbs, marker and folder-workspace modules | `cargo test -p baude-core --lib -- breadcrumbs:: marker:: folder_workspace::` | exit=0, 35 passed, 0 failed | PASS |
+| Removed primary stays removed on a relaunch inside a sibling worktree | in the full run above: the 8 `removed_primary_*` tests in `app::tests` | all 8 ran, suite exit 0 with 0 failed | PASS |
+| Regression: every test named in the 2026-11-13 report | the 31 test names that report cites, matched against the three logs above; a name counts when the test ran in a suite that exited 0 with 0 failed | 31 of 31 ran and passed | PASS |
 | Commit messages parse for release-please | `scripts/check-commit-message.sh --range origin/main..HEAD` | exit 0 | PASS |
 
 ### Probe Execution
@@ -231,11 +284,11 @@ No orphaned requirements: REQUIREMENTS.md maps READM-01 to READM-05 to Phase 19 
 |-------------|-------------|-------------|--------|----------|
 | READM-01 | 01, 07 | Removal clears the folder-workspace binding | SATISFIED | SC1 |
 | READM-02 | 03, 04, 07 | Removal clears marker ownership so marker recovery does not restore the row | SATISFIED | SC1, plans 03 and 04. See fixture note 2. |
-| READM-03 | 02, 04, 05, 06, 07 | No rediscovery path re-admits the removed row across a relaunch | BLOCKED | Gap 1: fails for a removed primary checkout |
-| READM-04 | 02, 05, 06, 07 | Re-admission only by `n`, `c` or launching inside the folder, as a fresh row | PARTIAL | Fresh-row half satisfied (SC3). The "only" half is broken by Gap 1: launching inside a sibling worktree also brings a removed primary back. |
+| READM-03 | 02, 04, 05, 06, 07; closed by 22-07 | No rediscovery path re-admits the removed row across a relaunch | SATISFIED | SC2. Satisfied as written: both rediscovery routes, the inventory sweep and the primary derivation, consult the store, proven across a real relaunch on a cloned fixture. |
+| READM-04 | 02, 05, 06, 07; closed by 22-07, 22-08 | Re-admission only by `n`, `c` or launching inside the folder, as a fresh row | SATISFIED | SC3 and Gap 1 closure. The "only" half holds as written: a sibling launch no longer brings a removed primary back. The "can be admitted again" half holds as written when the removed folder exists: `n`, `c` and a launch inside it each bring it back fresh. When the removal deleted the folder (a baude-made default worktree) it holds through a composed route only: put a worktree back at the old path and open it, or remove the repository row and admit the repository again. Each ends in `n`, `c` or a launch, so the wording is met, but no single gesture does it. See Advisory 1. |
 | READM-05 | 01, 04, 07 | Removal does not alter other rows' bindings, markers or worktrees | SATISFIED | SC4 |
 
-REQUIREMENTS.md marks READM-03 and READM-04 `[x]` Complete. That is not supported at HEAD.
+REQUIREMENTS.md marks READM-03 and READM-04 `[x]` Complete. That is supported at `ca82238`.
 
 ### Fixture realism
 
@@ -260,16 +313,13 @@ No `TBD`, `FIXME` or `XXX` in the seven implementation files. No `TODO`, `HACK`,
 
 ### Human Verification Required
 
-Status is `gaps_found`, so these do not gate on their own, but they remain open:
-
-1. **Gate on the final tree.** Run `scripts/gate.sh` and `scripts/gate.sh --linux` at the commit that closes Gap 1. Expected: both exit 0, including the real-roots leak check. I did not run either. A status file left in the session scratchpad by another agent today reads `gate_exit=0` and `gate_linux_exit=0`, but I cannot tie it to a commit, so it is not evidence here.
-2. **Decision on Gap 1.** Either fix it or record the override above and reconcile it with Phase 20's remove action on the main checkout row.
+None. The gate runs are deferred to plan 22-05, see Deferred Items; they are not human-verification items of this phase. The two advisory notes ask for no test.
 
 ### Gaps Summary
 
-One gap, one root cause. The phase's research concluded that the inventory sweep was the only route by which a removed row could return, and built consult and lift around that sweep. `App::admit_repository` has a second route: when a known repository has no `PrimaryDefault` row it creates one. Removing the main checkout row while a sibling row keeps the repository alive produces exactly that state, and the next admission of the repository from any sibling path brings the row back with a new key and a live runtime, leaving its suppression entry in place and unread. Everything else the phase set out to build is present, wired and passing.
+No open gaps. The one gap of 2026-11-13, the primary derivation in `App::admit_repository` that never consulted the suppression store, is closed by `754665e` and pinned by ten tests that passed in this run. Three gate truths remain deferred to plan 22-05 and must be read from that plan's result files, not from this report.
 
 ---
 
-_Verified: 2026-11-13 at f934e6474e54f7e195919e7fe4cf9d5779d5d66b_
+_Verified: 2026-11-13 at f934e6474e54f7e195919e7fe4cf9d5779d5d66b; re-verified 2026-11-14 at ca822383ad0e40b84ea9833b4c404b27cfd7c688_
 _Verifier: Claude (gsd-verifier)_
