@@ -11750,6 +11750,78 @@ mod tests {
         assert_eq!(valid, Ok(()), "state valid after the admission");
     }
 
+    /// T-22-18: a store written before the fact existed must not stop a
+    /// launch. The real removal's file, with the `primary` member dropped
+    /// from every entry as the previous format wrote it, loads on a sibling
+    /// relaunch, keeps suppressing the removed folder and answers no fact.
+    /// Whether a primary is derived is the earlier behaviour and not asserted.
+    #[test]
+    fn removed_primary_store_without_the_fact_still_loads() {
+        let fx = relaunch_fixture("removed-primary-old-store");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, _removed, _primary_path) = remove_primary(&fx);
+        let seen_before = checkouts_seen(&first);
+        let repositories_before = first.repository_state.repositories.len();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let store = baude_core::suppression::file_path(&baude_core::persist::config_dir());
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        let mut dropped = 0;
+        for entry in file["entries"]
+            .as_object_mut()
+            .expect("the store has an entries object")
+            .values_mut()
+        {
+            let members = entry.as_object_mut().expect("an entry is an object");
+            if members.remove("primary").is_some() {
+                dropped += 1;
+            }
+        }
+        std::fs::write(&store, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        let fact_after_rewrite = removed_primary_fact(&common_dir);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let seen_after = checkouts_seen(&restarted);
+        let repositories_after = restarted.repository_state.repositories.len();
+        let entry_kept = is_suppressed(&fx.repo);
+        let fact_after_relaunch = removed_primary_fact(&common_dir);
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            fact_written,
+            Some(fx.repo.clone()),
+            "the real removal wrote the fact"
+        );
+        assert_eq!(dropped, 1, "the rewrite dropped the one primary member");
+        assert_eq!(
+            fact_after_rewrite, None,
+            "the rewritten file carries no fact"
+        );
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        assert_eq!(
+            repositories_after, repositories_before,
+            "the same repositories after the relaunch"
+        );
+        assert!(entry_kept, "the entry still suppresses the removed folder");
+        assert_eq!(
+            fact_after_relaunch, None,
+            "the relaunch writes no fact of its own"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+    }
+
     /// D-12: the lift key is the admitted path's own repo root. Admitting the
     /// parent repository, from its root or a subfolder, is the sweep the entry
     /// exists to suppress and must leave the child's entry in place.

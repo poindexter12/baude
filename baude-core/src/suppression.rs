@@ -335,6 +335,160 @@ mod tests {
         assert!(is_suppressed(&dir, &path));
     }
 
+    /// The file as untyped JSON, so a member's presence can be told apart
+    /// from a member that deserialized to its default.
+    fn read_raw(root: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(file_path(root)).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The removed-primary fact lives and dies with the entry that carries
+    /// it: answered per repository, untouched by a lift of any other path,
+    /// ended by a lift of its own path or by dropping the repository's
+    /// entries, and never written for an ordinary entry.
+    #[test]
+    fn primary_fact_follows_its_entry() {
+        let _guards = identity("primary-fact");
+        let dir = scratch("primary-fact");
+        let common_a = folder(&dir, "a.git");
+        let common_b = folder(&dir, "b.git");
+        let a_primary = folder(&dir, "a-primary");
+        let a_child = folder(&dir, "a-child");
+        let b_primary = folder(&dir, "b-primary");
+        let a_fact = Some(PathBuf::from(folder_key(&a_primary)));
+        let b_fact = Some(PathBuf::from(folder_key(&b_primary)));
+
+        assert_eq!(removed_primary(&dir, &common_a), None);
+        suppress(&dir, &a_child, &common_a, 1).unwrap();
+        assert_eq!(
+            removed_primary(&dir, &common_a),
+            None,
+            "an ordinary entry carries no fact"
+        );
+
+        suppress_primary(&dir, &a_primary, &common_a, 2).unwrap();
+        assert_eq!(removed_primary(&dir, &common_a), a_fact);
+        assert_eq!(
+            removed_primary(&dir, &common_b),
+            None,
+            "the fact answers for its own repository only"
+        );
+        suppress_primary(&dir, &b_primary, &common_b, 3).unwrap();
+        assert_eq!(removed_primary(&dir, &common_a), a_fact);
+        assert_eq!(removed_primary(&dir, &common_b), b_fact);
+        assert!(is_suppressed(&dir, &a_primary) && is_suppressed(&dir, &b_primary));
+
+        // On disk: only the flagged entries carry the member.
+        let raw = read_raw(&dir);
+        let entries = raw["entries"].as_object().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[&folder_key(&a_child)].get("primary"),
+            None,
+            "suppress writes no primary member"
+        );
+        assert_eq!(
+            entries[&folder_key(&a_primary)].get("primary"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            entries[&folder_key(&b_primary)].get("primary"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        // A lift of another path of the same repository leaves the fact.
+        assert!(lift(&dir, &a_child).unwrap());
+        assert_eq!(removed_primary(&dir, &common_a), a_fact);
+
+        // A lift of the flagged path ends it, for that repository only.
+        assert!(lift(&dir, &a_primary).unwrap());
+        assert_eq!(removed_primary(&dir, &common_a), None);
+        assert_eq!(removed_primary(&dir, &common_b), b_fact);
+
+        // Dropping the repository's entries ends it too.
+        assert_eq!(drop_children(&dir, &common_b).unwrap(), 1);
+        assert_eq!(removed_primary(&dir, &common_b), None);
+        assert!(read(&dir).entries.is_empty());
+    }
+
+    /// T-22-18: a file in the format written before the flag existed, with
+    /// and without `suppressed_ms`, loads through every public function,
+    /// still suppresses its paths, carries no removed-primary fact, and
+    /// keeps its entries as they were when a flagged entry is written later.
+    #[test]
+    fn entries_without_the_primary_member_load() {
+        let _guards = identity("previous-format");
+        let dir = scratch("previous-format");
+        let common = folder(&dir, "repo.git");
+        let timed = folder(&dir, "timed");
+        let untimed = folder(&dir, "untimed");
+        let later = folder(&dir, "later");
+        let quoted = |text: &str| serde_json::to_string(text).unwrap();
+        let literal = format!(
+            r#"{{
+  "schema_version": 1,
+  "entries": {{
+    {timed}: {{
+      "repository_common_dir": {common},
+      "suppressed_ms": 7
+    }},
+    {untimed}: {{
+      "repository_common_dir": {common}
+    }}
+  }}
+}}
+"#,
+            timed = quoted(&folder_key(&timed)),
+            untimed = quoted(&folder_key(&untimed)),
+            common = quoted(&folder_key(&common)),
+        );
+        assert!(
+            !literal.contains("primary"),
+            "the literal predates the flag"
+        );
+        std::fs::write(file_path(&dir), literal).unwrap();
+
+        assert!(is_suppressed(&dir, &timed));
+        assert!(is_suppressed(&dir, &untimed));
+        assert_eq!(removed_primary(&dir, &common), None);
+        let timed_entry = SuppressionEntry {
+            repository_common_dir: folder_key(&common),
+            suppressed_ms: 7,
+            primary: false,
+        };
+        let untimed_entry = SuppressionEntry {
+            repository_common_dir: folder_key(&common),
+            suppressed_ms: 0,
+            primary: false,
+        };
+        let loaded = read(&dir);
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[&folder_key(&timed)], timed_entry);
+        assert_eq!(loaded.entries[&folder_key(&untimed)], untimed_entry);
+
+        suppress_primary(&dir, &later, &common, 9).unwrap();
+
+        let rewritten = read(&dir);
+        assert_eq!(rewritten.entries.len(), 3);
+        assert_eq!(rewritten.entries[&folder_key(&timed)], timed_entry);
+        assert_eq!(rewritten.entries[&folder_key(&untimed)], untimed_entry);
+        let raw = read_raw(&dir);
+        let entries = raw["entries"].as_object().unwrap();
+        assert_eq!(entries[&folder_key(&timed)].get("primary"), None);
+        assert_eq!(entries[&folder_key(&untimed)].get("primary"), None);
+        assert_eq!(
+            entries[&folder_key(&timed)].get("suppressed_ms"),
+            Some(&serde_json::json!(7))
+        );
+        assert!(is_suppressed(&dir, &timed) && is_suppressed(&dir, &untimed));
+        assert_eq!(
+            removed_primary(&dir, &common),
+            Some(PathBuf::from(folder_key(&later))),
+            "only the entry written with the flag answers"
+        );
+    }
+
     #[test]
     fn file_is_named_per_workspace_beside_breadcrumbs() {
         let _guards = identity("naming");
