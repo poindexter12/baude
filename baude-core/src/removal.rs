@@ -792,7 +792,14 @@ fn update_suppression(
             continue;
         };
         let common_dir = parent.observed_common_dir.to_path_buf();
-        match crate::suppression::suppress(config_dir, &path, &common_dir, now_ms) {
+        // A removed primary is remembered as such, so the next admission of
+        // this repository through a sibling derives no new one.
+        let written = if checkout.role == CheckoutRole::PrimaryDefault {
+            crate::suppression::suppress_primary(config_dir, &path, &common_dir, now_ms)
+        } else {
+            crate::suppression::suppress(config_dir, &path, &common_dir, now_ms)
+        };
+        match written {
             Ok(()) => results.cleared.push(ClearedItem {
                 kind: ClearingKind::SuppressionAdded,
                 path,

@@ -5,7 +5,9 @@
 //! repository does not bring the row back. Advisory, per-workspace, additive
 //! schema; a corrupt or absent file reads as empty and never fails a launch.
 //! Entries are kept until lifted by an explicit admission of that exact path
-//! or garbage-collected when the parent repository row is removed.
+//! or garbage-collected when the parent repository row is removed. An entry
+//! written for a removed primary checkout also carries that fact, so the
+//! repository derives no new primary while the entry stands.
 //!
 //! The store lives beside the breadcrumbs file under the config dir as
 //! `suppressed-admissions-<workspace>.json`, keyed by
@@ -53,6 +55,15 @@ pub struct SuppressionEntry {
     pub repository_common_dir: String,
     #[serde(default)]
     pub suppressed_ms: u64,
+    /// The removed row was the repository's primary checkout. Absent in a
+    /// file written before the flag existed and left out when false, so a
+    /// file with no removed primary is written exactly as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub primary: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// The per-workspace file name, like the breadcrumbs file.
@@ -93,13 +104,50 @@ pub fn lift(root: &Path, path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// The path of the removed primary checkout of the repository at
+/// `common_dir`, if an entry of that repository carries the fact. A query by
+/// repository, so it holds when the removed folder is gone from disk. Never
+/// errors: an absent or corrupt file reads as empty, and an entry written
+/// before the flag existed does not answer.
+pub fn removed_primary(root: &Path, common_dir: &Path) -> Option<PathBuf> {
+    let common = folder_key(common_dir);
+    current(root)
+        .entries
+        .into_iter()
+        .find(|(_, entry)| entry.primary && entry.repository_common_dir == common)
+        .map(|(path, _)| PathBuf::from(path))
+}
+
 /// Record that `path` was removed while the repository at `common_dir`
 /// survived. A later entry for the same path replaces the earlier one.
 pub fn suppress(root: &Path, path: &Path, common_dir: &Path, now_ms: u64) -> io::Result<()> {
+    write_entry(root, path, common_dir, now_ms, false)
+}
+
+/// Like [`suppress`], for the repository's primary checkout: the entry also
+/// records that the user removed the primary, which [`removed_primary`]
+/// reports until the entry is lifted or dropped.
+pub fn suppress_primary(
+    root: &Path,
+    path: &Path,
+    common_dir: &Path,
+    now_ms: u64,
+) -> io::Result<()> {
+    write_entry(root, path, common_dir, now_ms, true)
+}
+
+fn write_entry(
+    root: &Path,
+    path: &Path,
+    common_dir: &Path,
+    now_ms: u64,
+    primary: bool,
+) -> io::Result<()> {
     let key = folder_key(path);
     let entry = SuppressionEntry {
         repository_common_dir: folder_key(common_dir),
         suppressed_ms: now_ms,
+        primary,
     };
     locked_merge_write(root, &file_name(), |merged: &mut SuppressionFile| {
         merged.schema_version = SCHEMA_VERSION;
@@ -190,6 +238,7 @@ mod tests {
             Some(&SuppressionEntry {
                 repository_common_dir: folder_key(&common),
                 suppressed_ms: 10,
+                primary: false,
             })
         );
 
@@ -280,6 +329,7 @@ mod tests {
             SuppressionEntry {
                 repository_common_dir: folder_key(&common),
                 suppressed_ms: 5,
+                primary: false,
             }
         );
         assert!(is_suppressed(&dir, &path));

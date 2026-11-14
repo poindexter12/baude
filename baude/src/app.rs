@@ -2514,7 +2514,9 @@ impl App {
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
         let snapshot = git::discover_repository(path)?;
         // Lift before either sweep site below so an explicit admission of a
-        // removed checkout brings it back in this same pass.
+        // removed checkout brings it back in this same pass. The lift also
+        // comes before the removed-primary consult ahead of derivation, so
+        // naming a removed primary's own folder derives it again here.
         self.lift_suppression(path);
         // Admission is the reconciliation seam: resolve origin once here and
         // retain only its browser-addressable identity for gesture-time hints.
@@ -2620,6 +2622,31 @@ impl App {
                     return self.ensure_primary(existing_key);
                 }
             }
+        }
+        // The suppression store is advisory and can only stop this
+        // derivation, never cause one. A primary the user removed stays
+        // removed while its entry stands: no key is allocated and no
+        // `git worktree add` runs for an admission that named a sibling. The
+        // entry goes away only when an explicit admission of exactly that
+        // path lifts it, above, or when the repository row is removed (D-12).
+        let removed_primary = match existing_key {
+            Some(_) => None,
+            None => suppression::removed_primary(&persist::config_dir(), &snapshot.common_dir),
+        };
+        if let Some(removed) = removed_primary {
+            self.admit_existing_worktrees(repository_key, &snapshot)?;
+            self.repository_state.validate()?;
+            self.save_durable()?;
+            self.set_message(if removed.is_dir() {
+                format!(
+                    "default checkout {} was removed; open that folder to bring it back",
+                    removed.display()
+                )
+            } else {
+                "default checkout was removed with its folder; remove this repository and open it again to bring it back"
+                    .to_string()
+            });
+            return Ok(None);
         }
         let checkout_key = match existing_key {
             Some(key) => key,
