@@ -2087,6 +2087,99 @@ mod tests {
         assert_reaped_promptly(pid);
     }
 
+    /// BL-11: the leader has exited and nobody has reaped it, so the recorded
+    /// group holds one zombie. On macOS that group answers `EPERM` to every
+    /// signal, and `kill_and_wait` must still reach extinction.
+    ///
+    /// In production this is a race a few hundred microseconds wide, between
+    /// the leader's exit and the reader thread's reap. The test stretches that
+    /// race instead of chasing it: it holds the child mutex without ever
+    /// waiting on it, so the reader blocks before its `child.wait()` and the
+    /// zombie stays. Holding the mutex does not reap. `is_exited` and
+    /// `await_parked_holder` do, which is why nothing here calls them.
+    ///
+    /// The mutex is released 150 ms into the call. Before that the group
+    /// cannot go extinct, so an `Ok` proves the call tolerated the signal
+    /// error and waited for the reap rather than finding the group gone.
+    #[test]
+    fn kill_and_wait_reaps_unreaped_leader_group() {
+        let fixture = PtyFixture::new("unreaped-leader");
+        // The leader waits for the gate file, so the mutex below is held
+        // before it can exit however slowly this thread is scheduled.
+        let gate = fixture.cwd().join("go");
+        let cmd = "set +m; while [ ! -e go ]; do sleep 0.02; done; exit 0";
+        let mut pty = Pty::spawn(Some(cmd), fixture.cwd(), 5, 40).unwrap();
+        let pid = pty.process_identity().pid;
+        let pgid = pty.process_identity().process_group;
+        let _guard = GroupGuard {
+            pgid,
+            child: Arc::clone(&pty.child),
+            holder_pid_file: None,
+        };
+        let child = Arc::clone(&pty.child);
+        let held = child.lock().unwrap();
+        std::fs::write(&gate, b"").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !is_zombie(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "leader {pid} never became an unreaped zombie, ps stat: {:?}",
+                ps_stat(pid)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            is_zombie(pid),
+            "leader {pid} must be an unreaped zombie immediately before the call, ps stat: {:?}",
+            ps_stat(pid)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            group_errno(pgid),
+            Some(libc::EPERM),
+            "a zombie-only group {pgid} answers EPERM on macOS"
+        );
+
+        let (calling_tx, calling_rx) = std::sync::mpsc::channel();
+        let (result, returned_at, released_at) = std::thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                calling_tx.send(()).unwrap();
+                let result = pty.kill_and_wait();
+                (result, Instant::now())
+            });
+            calling_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let released_at = Instant::now();
+            drop(held);
+            let (result, returned_at) = call.join().unwrap();
+            (result, returned_at, released_at)
+        });
+
+        if let Err(error) = result {
+            panic!("kill_and_wait failed on an exited, unreaped leader: {error:#}");
+        }
+        assert!(
+            returned_at >= released_at,
+            "kill_and_wait returned Ok while the leader could not yet be reaped"
+        );
+        assert_eq!(
+            group_errno(pgid),
+            Some(libc::ESRCH),
+            "group {pgid} survived kill_and_wait"
+        );
+        assert_reaped_promptly(pid);
+        assert!(
+            ps_stat(pid).is_empty(),
+            "leader {pid} still has a ps row after kill_and_wait: {:?}",
+            ps_stat(pid)
+        );
+        if let Err(error) = pty.kill_and_wait() {
+            panic!("second kill_and_wait failed on an extinct group: {error:#}");
+        }
+    }
+
     /// The pure decision table behind `kill_and_wait`: the group id is
     /// compared explicitly, an inspection error is a refusal, and a foreign
     /// process inside the recorded group is never signalled.
