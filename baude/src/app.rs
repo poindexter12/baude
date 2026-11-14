@@ -15992,6 +15992,133 @@ mod tests {
         std::fs::remove_dir_all(&fx.root).unwrap();
     }
 
+    /// The entry names directly under `dir`, sorted.
+    fn sorted_listing(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("folder is listable")
+            .map(|entry| entry.expect("folder entry").file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// REL-01, G7: `D` then Enter on a standalone row alone. Its runtime is
+    /// killed, the folder and its contents stay, the row leaves the state
+    /// file, its own folder binding is cleared and no suppression entry is
+    /// written: the store is byte-identical to before, or still absent.
+    /// Every after-state value is read from the process table or from a file
+    /// under the fixture, each with a present-before twin.
+    #[test]
+    fn rel01_confirm_remove_standalone_reads_binding_and_suppression() {
+        use baude_core::breadcrumbs::folder_key;
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("rel01-confirm-standalone");
+        let (mut app, rows) = remove_project_app(&fx, "feature/rel01-standalone");
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        let note = fx.standalone.join("todo.md");
+        std::fs::write(&note, b"- keep this folder\n").unwrap();
+        baude_core::folder_workspace::record(
+            Some(&config),
+            &fx.standalone,
+            "rel01-standalone-ws",
+            10,
+        );
+        baude_core::folder_workspace::record(Some(&config), &fx.repo, "rel01-neighbour-ws", 20);
+        let folder = folder_key(&fx.standalone);
+        let neighbour_key = folder_key(&fx.repo);
+        let suppression_store = baude_core::suppression::file_path(&config);
+        let pgid = app
+            .session(app.runtime_standalones[&rows.standalone])
+            .expect("the standalone runtime is live")
+            .claude
+            .process_identity()
+            .process_group;
+
+        assert!(!group_is_extinct(pgid), "the runtime group is live before");
+        let listing_before = sorted_listing(&fx.standalone);
+        assert!(
+            listing_before.contains(&std::ffi::OsString::from("todo.md")),
+            "the folder holds the note before: {listing_before:?}"
+        );
+        let store_before = std::fs::read(&suppression_store).ok();
+        let bindings_before = bindings_on_disk(&config);
+        assert!(
+            bindings_before.folders.contains_key(&folder),
+            "the folder's binding is on disk before: {bindings_before:?}"
+        );
+        let neighbour_before = bindings_before.folders[&neighbour_key].clone();
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.standalone),
+            "the folder is not suppressed before"
+        );
+        assert!(
+            saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row is in the state file before"
+        );
+
+        app.selected_id = Some(SelId::Standalone(rows.standalone));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        assert_eq!(target, RemovalTarget::Standalone(rows.standalone));
+        assert_eq!(
+            previewed.rows_removed,
+            vec![RowKey::Standalone(rows.standalone)],
+            "the modal names exactly this one row"
+        );
+        app.handle_modal_key(enter_key());
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        wait_until("group extinction", || group_is_extinct(pgid));
+        assert!(fx.standalone.is_dir(), "the folder is kept");
+        assert_eq!(
+            sorted_listing(&fx.standalone),
+            listing_before,
+            "the folder's listing is unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&note).expect("the note is still readable"),
+            b"- keep this folder\n",
+            "the folder's contents are unchanged"
+        );
+        assert!(
+            !saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row left the state file"
+        );
+        let bindings = bindings_on_disk(&config);
+        assert!(
+            !bindings.folders.contains_key(&folder),
+            "the folder's own binding left the file on disk: {bindings:?}"
+        );
+        assert_eq!(
+            bindings.folders.get(&neighbour_key),
+            Some(&neighbour_before),
+            "only the removed row's own key is cleared"
+        );
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.standalone),
+            "a standalone removal writes no suppression entry"
+        );
+        assert_eq!(
+            std::fs::read(&suppression_store).ok(),
+            store_before,
+            "the suppression store is byte-identical to before, or still absent"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// D-08: a row set that changed behind the modal refreshes the modal
     /// instead of removing. A child checkout activated after the preview
     /// shows up in the reinstalled report and nothing is removed.
