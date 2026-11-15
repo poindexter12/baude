@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase: 19
-current_phase_name: Re-admission Suppression
-status: verifying
-stopped_at: Phase 21 complete, ready to verify Phase 19
-last_updated: "2026-11-14T00:04:42.802Z"
-last_activity: 2026-11-13
-last_activity_desc: Phase 21 complete, transitioned to Phase 19
-state_head: f6e026531197788c6af38ac40aef3b05db8195e7
+current_phase: 22.1
+current_phase_name: v2.8 Cleanup
+status: planning
+stopped_at: phase 22.1 inserted after the v2.8 audit, not yet planned (2026-11-15)
+last_updated: "2026-11-15T22:17:23.649Z"
+last_activity: 2026-11-15
+last_activity_desc: v2.8.0 released; milestone audit tech_debt; Phase 22.1 inserted
+state_head: 30089e4b5ef4dcb21442de9d7a4aa8409b12f000
 progress:
-  total_phases: 5
+  total_phases: 6
   completed_phases: 1
-  total_plans: 30
-  completed_plans: 30
-  percent: 20
+  total_plans: 38
+  completed_plans: 38
+  percent: 17
 ---
 
 # Project State
@@ -25,14 +25,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-11-03)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 21 — Daemon and PWA Parity
+**Current focus:** Phase 22.1 — v2.8 Cleanup
 
 ## Current Position
 
-Phase: 19 — Re-admission Suppression
-Plan: 7
-Status: Phase complete — ready for verification
-Last activity: 2026-11-13 — Phase 21 complete, transitioned to Phase 19
+Phase: 22.1 — v2.8 Cleanup
+Plan: none yet
+Status: Inserted, ready to plan with /gsd-plan-phase 22.1
+Last activity: 2026-11-15 — v2.8.0 released by PR 130; milestone audit tech_debt; Phase 22.1 inserted
 
 
 ## Performance Metrics
@@ -345,6 +345,10 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - ui::tests::ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are committed #[ignore]d: they build an App whose UsagePoller is uncontained until 08-08. Plan 08-08 task 1 must remove the attribute and run them.
 - 08-08 left the full workspace test suite unrun (plan forbids broad runs before 08-06 task 1 completes manager ownership). Real pass/fail numbers for the whole suite are owed by 08-06 task 2.
 
+### Roadmap Evolution
+
+- Phase 22.1 inserted after Phase 22: v2.8 Cleanup: suppression sync, test hygiene, PWA polish, WR-06, from the v2.8 milestone audit
+
 ## Deferred Items
 
 Items carried forward from the v0.7 close (code-complete; human-only verification):
@@ -404,8 +408,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-11-13T23:47:38.306Z
-Stopped at: Phase 21 complete, ready to verify Phase 19
+Last session: 2026-11-14T17:30:07.794Z
+Stopped at: context exhaustion at 76% (2026-11-14)
 Resume file: None
 
 ## Operator Next Steps
