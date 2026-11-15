@@ -13,7 +13,7 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [macos-14, ubuntu-22.04]
+        os: [macos-15, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       # PR commit checks compare against origin/main, so checkout needs the
@@ -111,9 +111,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
