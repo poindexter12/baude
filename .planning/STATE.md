@@ -1,37 +1,39 @@
 ---
 gsd_state_version: "1.0"
-milestone: v2.3
-milestone_name: Launch Defaults and Startup Speed
-status: Awaiting next milestone
-stopped_at: Phase 17 complete — all phases complete
-last_updated: "2026-10-13T20:58:31.156Z"
-last_activity: 2026-10-13
-last_activity_desc: Milestone v2.3 completed and archived
-state_head: e1b9732b14370972a58e69c2b7be5085e57d4f17
+milestone: v2.8
+milestone_name: Project Removal
+current_phase: 19
+current_phase_name: Re-admission Suppression
+status: verifying
+stopped_at: Phase 21 complete, ready to verify Phase 19
+last_updated: "2026-11-14T00:04:42.802Z"
+last_activity: 2026-11-13
+last_activity_desc: Phase 21 complete, transitioned to Phase 19
+state_head: f6e026531197788c6af38ac40aef3b05db8195e7
 progress:
   total_phases: 5
-  completed_phases: 5
-  total_plans: 12
-  completed_plans: 12
-  percent: 100
-current_phase: 17
+  completed_phases: 1
+  total_plans: 30
+  completed_plans: 30
+  percent: 20
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-10-13)
+See: .planning/PROJECT.md (updated 2026-11-03)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Planning next milestone — v2.3 closed 2026-10-13 (`override_closeout`)
+**Current focus:** Phase 21 — Daemon and PWA Parity
 
 ## Current Position
 
-Phase: Milestone v2.3 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-10-13 — Milestone v2.3 completed and archived
+Phase: 19 — Re-admission Suppression
+Plan: 7
+Status: Phase complete — ready for verification
+Last activity: 2026-11-13 — Phase 21 complete, transitioned to Phase 19
+
 
 ## Performance Metrics
 
@@ -56,6 +58,8 @@ Last activity: 2026-10-13 — Milestone v2.3 completed and archived
 | 15 | 4 | - | - |
 | 16 | 1 | - | - |
 | 17 | 1 | - | - |
+| 18 | 8 | - | - |
+| 21 | 11 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -99,6 +103,32 @@ Last activity: 2026-10-13 — Milestone v2.3 completed and archived
 | Phase 12 P01 | 21 min | 3 tasks | 4 files |
 | Phase 12 P02 | 7 min | 3 tasks | 1 files |
 | Phase 12 P04 | 45 min | 3 tasks | 1 files |
+| Phase 18 P01 | 7 min | 3 tasks | 2 files |
+| Phase 18 P02 | 35m | 3 tasks | 1 files |
+| Phase 18 P03 | 4 min | 3 tasks | 1 files |
+| Phase 18 P08 | 28 min | 3 tasks | 2 files |
+| Phase 18 P04 | 31 min | 3 tasks | 1 files |
+| Phase 18 P05 | 25 min | 3 tasks | 1 files |
+| Phase 18 P06 | 25 min | 3 tasks | 2 files |
+| Phase 18 P07 | 33 min | 2 tasks | 0 files |
+| Phase 19 P01 | 35min | 3 tasks | 2 files |
+| Phase 19 P02 | 20min | 3 tasks | 2 files |
+| Phase 19 P03 | 3min | 3 tasks | 1 files |
+| Phase 19 P04 | 19min | 3 tasks | 1 files |
+| Phase 19 P05 | 33min | 3 tasks | 1 files |
+| Phase 19 P06 | 2 sessions | 3 tasks | 2 files |
+| Phase 19 P07 | 50 min | 2 tasks | 1 files |
+| Phase 21 P01 | 11min | 3 tasks | 2 files |
+| Phase 21 P02 | 7 min | 3 tasks | 2 files |
+| Phase 21 P07 | 13min | 4 tasks | 5 files |
+| Phase 21 P09 | 25min | 3 tasks | 2 files |
+| Phase 21 P10 | Task 3 and close 65min | 3 tasks | 2 files |
+| Phase 21 P03 | 45min | 3 tasks | 2 files |
+| Phase 21 P04 | 17min | 3 tasks | 3 files |
+| Phase 21 P05 | 40min | 3 tasks | 7 files |
+| Phase 21 P08 | 96min | 3 tasks | 1 files |
+| Phase 21 P06 | 22h commit span, active time not measured | 3 tasks | 3 files |
+| Phase 21 P11 | 3h | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -227,6 +257,71 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - [Phase 12]: README never advises deleting the workspace lock file; recovery is quit the holder, signal it, or switch workspace — It is an OS advisory lock on an open fd released by the kernel on exit; deleting it while a holder lives yields two writers on one state file (T-12-04)
 - [Phase 12]: Rebased with git rebase --onto origin/main 985f543 because origin/main's 30ce007 is a squash of this chain's own first seven planning commits — A plain rebase conflicted on already-applied content at commit 1 of 181; the --onto form starts from a byte-identical tree and replayed all 174 commits with zero conflicts
 - [Phase 12]: Pushed with the local real-roots gate red after proving by null bracket that the delta came from concurrent host processes, not the test suite — A 45s before/after bracket with no suite also failed; pids 8413 (live baude) and 21951 (FHIR IG publisher under the managed-worktrees root) were identified. check (macos-14) and check (ubuntu-22.04) run the same bracket in a clean room and both passed
+- [Phase 18]: RemovalError::RuntimeSurvived boxes SessionTeardownError for clippy result_large_err; plan 04 wraps with Box::new
+- [Phase 18]: Repository parent PlannedRow carries main_worktree and common_dir from its SavedRepository for plan 04 pruning
+- [Phase 18]: Forced removal .git shape guard runs before git worktree remove is spawned because git follows a symlinked gitfile
+- [Phase 18]: Bare repository at a registered managed path is refused with ForeignRepository; partial signatures are no repository and the registration proof carries the deletion
+- [Phase 18]: remove_standalone_session delegates to remove_rows so one mutation path serves every row kind
+- [Phase 18]: Removal test seeds allocate keys and orders through the aggregate allocators and assert validate Ok before remove_rows
+- [Phase 18]: Pty::kill_and_wait signals the recorded group before any child-mutex lock and decides from a four-way GroupDisposition; the reader JoinHandle stays owned and is reported through reader_finished rather than detached
+- [Phase 18]: macOS parked-reader fixture uses a test-only revoke on the slave because the session keeps the controlling tty open until the leader exits
+- [Phase 18]: removal::remove matches ForcedRemovalError::NotRegistered at the disk_stage call site for AlreadyRemoved rows so the tolerated case is named where it originates
+- [Phase 18]: Parked-reader fixture copies the 18-08 holder command verbatim including trap '' HUP so the holder survives the leader-exit SIGHUP until setsid
+- [Phase 18]: report_from_set takes Option<StageResults> so preview and remove share one report assembly path
+- [Phase 18]: Refused-row assertion names the row through SaveError::validation().row() plus the CheckoutKey Debug text because ValidationError Display renders the key through Debug
+- [Phase 18]: Both 18-05 crash tests reconcile through one reconcile_missing helper; the plan's record_checkout_reconciliation grep proxy reads 1 while both tests exercise the call
+- [Phase 18]: Task 3 validation-first fixture seeds a second repository on a distinct non-existent common dir because validate refuses duplicate repository identities
+- [Phase 18]: cloned_topology asserts an active TestRedirect before touching the managed root so misuse fails at the fixture
+- [Phase 18]: Branch integrity in removal tests is pinned by for-each-ref refname and OID snapshots, never git branch --list decorations
+- [Phase 18]: 18-07: scripts/gate.sh --linux exit 1 on macOS host is a Docker Desktop bind-mount target-dir race, not a phase defect; Linux proof taken by the unmodified gate script in the same container with CARGO_TARGET_DIR on container disk; gate.sh fix deferred
+- [Phase 19]: planned_clearings lists a folder shared by two rows once so preview and real run agree without a second clear attempt
+- [Phase 19]: folder_workspace::clear pre-checks the key outside the merge lock; the gap is accepted for an advisory file so absent files stay absent and untouched files stay byte-identical
+- [Phase 19]: Suppression store file base is suppressed-admissions, per-workspace beside breadcrumbs; entries kept until lifted or garbage-collected, never pruned by disk existence
+- [Phase 19]: marker::clear_owned deletes the marker only on Valid plus byte-equal owner and removes the directory with non-recursive remove_dir; refusals are typed, not errors
+- [Phase 19]: MARKER_FILE constant hoisted in the GREEN step so plan 19-03 Task 3 had no refactor
+- [Phase 19]: 19-04: empty or legacy physical_key is a silent no-op in the clearing stage; only keys that could escape the managed root become a ClearingFailure
+- [Phase 19]: 19-04: plan and execute helpers mirror each other per clearing kind so preview agreement is structural
+- [Phase 19]: 19-05: suppression lift key is git::repo_root of the admitted path, so a subfolder launch lifts its checkout and the parent root never lifts a child
+- [Phase 19]: 19-05: a failed suppression lift leaves the entry and the sweep still skips it; the admission returns Ok with its rows intact and the failure is a message
+- [Phase 19]: Phase 19 gates green on both platforms at 4ec8989 with no fix commit; verbatim --linux lane passed, Phase 18 bind-mount race did not recur
+- [Phase 21]: RemoveRowsError::Drift carries a boxed RemovalReport to satisfy clippy result_large_err; the 409 wire body is unchanged
+- [Phase 21]: removal_fixture and removal_fixture_two_checkouts are async and the two-checkout repository has a real bare origin, because the daemon refuses a managed worktree in a git init only repository
+- [Phase 21]: The removal save closure merges live survivor metadata into a copy of core's candidate through merge_live_runtime_metadata, the one merge state_for_save also uses
+- [Phase 21]: A repeated POST /removals for an already removed checkout answers 404, observed in the concurrency test
+- [Phase 21]: D-09 Option B: checkout_key is served only from GET /rows, clients join on session_id, SessionInfo gains no field
+- [Phase 21]: Manager::rows projects over state_for_save, the merged view, because raw repository_state reports an archived live session as not archived
+- [Phase 21]: Removing a repository's last checkout leaves an empty parent in GET /rows; clients must render or hide a childless parent deliberately
+- [Phase 21]: 21-07: tildePath copies the TUI plain string prefix strip, quirk included, so both clients shorten a path the same way
+- [Phase 21]: 21-07: dropRows and applySnapshot share one walk and one match rule, rowKeyId, so the local drop and the later snapshot arbitration cannot disagree
+- [Phase 21]: 21-07: a tombstone keeps its first stamp and expires after 60 s, so a duplicate report is a no-op and a client cannot permanently hide a row
+- [Phase 21]: 21-07: the PWA node suites run first in gate.sh, gate.sh --linux and the ci.yml check job through scripts/check-web-suites.sh, outside the isolated bracket
+- [Phase 21]: 21-09: a checkout is stored as main only when git reports the main worktree and no row of that repository already holds main; every other admission is managed_branch
+- [Phase 21]: 21-09: restart on a main checkout now follows a branch switch and returns 202; a managed worktree row stays pinned and still returns 409
+- [Phase 21]: 21-09: GET /rows serves the short branch name by stripping one leading refs/heads/ prefix at read time; the stored ref is never rewritten and a detached HEAD reads null
+- [Phase 21]: 21-09: rows written by an earlier daemon are not re-roled; healing them at restore is an open decision
+- [Phase 21]: 21-10: a plain POST /sessions takes the first matching route of five: reuse a standalone row, the checkout arm for a discovered repository, join a stored repository holding the path, admit a standalone row, or refuse with 400
+- [Phase 21]: 21-10: DELETE /sessions/{id} on a folder session ends the runtime and keeps the row closed; a repeated POST for that folder reopens the same row
+- [Phase 21]: 21-10: only an explicit admission through Manager::create lifts a suppression entry, for the path the admitted row stores; restore, reopen, the restart route and legacy migration lift nothing
+- [Phase 21]: 21-10: a plain admission takes the repository path and the worktree fact from git discovery and always stores the checkout as unmanaged, so a hand-made linked worktree opens by path and its directory survives removal
+- [Phase 21]: 21-10: delete_teardown_failure_is_500_and_unknown_id_stays_404 and real_atomic_persistence_failures_are_503_for_every_mutation were moved from /tmp onto a real repository with assertions untouched; standalone DELETE has its own failure-mapping tests
+- [Phase 21]: 21-03: a missing runtime handle on POST /removals is 503, not 500, because core raises it in preflight before anything is signalled, deleted or saved
+- [Phase 21]: 21-03: a same-row removal race loser is 404; a parent versus child race loser is 404 when the repository removal won and 409 when the child removal won
+- [Phase 21]: 21-03: a removal is committed only at the single Ok return of Manager::remove_rows, for both saved and saved_degraded; no non-200 commits anything
+- [Phase 21]: 21-04: rows_removed is published only from the single Ok return of Manager::remove_rows, so saved and saved_degraded publish and no non-200 can
+- [Phase 21]: 21-04: a lagging GET /events subscriber silently skips the oldest events and keeps its stream; capacity 64, no replay, no id, no lag notice, so clients reconcile through GET /rows
+- [Phase 21]: 21-04: an event whose report cannot be serialized is skipped, not sent with empty data
+- [Phase 21]: 21-05: every fetched /rows body enters PWA state through applyRows, and /sessions is filtered through the controller too, so a stale poll cannot resurrect a removed row
+- [Phase 21]: 21-05: a 409 from POST /removals refetches /rows on its own request, redraws the fresh report and never confirms for the user; a 404 is treated as already removed
+- [Phase 21]: 21-05: PWA removal error text keeps the daemon wording and swaps Rust key tokens for the row label or the words unknown row
+- [Phase 21]: 21-05: API-02 and API-03 stay pending until the 21-11 browser check; the Escape and backdrop bindings are unverified until then
+- [Phase 21]: 21-08: remote removals run on a worker under REMOVAL_TIMEOUT of 60 s; an execute with no answer is Indeterminate, reconciled by one GET /rows and never resent
+- [Phase 21]: 21-08: a removed remote row is held out by an Instant-dated tombstone until a poll that started after the removal is applied; then the daemon's read wins
+- [Phase 21]: 21-08: the events reader keeps one connection through timed-out reads; ureq 2.12.1 survived them, silence limit 35 s from the 15 s keep-alive
+- [Phase 21]: 21-06: API-01 and API-02 recorded as advanced, not complete; 21-11 still carries both and owns the gate and the live pairing check
+- [Phase 21]: 21-06: the per-name grep in plan verify commands cannot pass on a green run because fixture output splits the test line from its ok; named tests were checked with a script that accepts a bare ok line
+- [Phase 21]: 21-06: removal error text has key tokens replaced by row labels at draw time only; the stored error keeps the daemon's text
+- [Phase 21]: 21-11: node pass floor is 69, the sum of 29 from 21-07 and 40 from 21-05
+- [Phase 21]: 21-11: live checkpoint recorded as verified on the owner's sign-off alone, with no per-step results
 
 ### Pending Todos
 
@@ -236,6 +331,9 @@ Recent decisions affecting current work (full log in PROJECT.md):
 
 ### Blockers/Concerns
 
+- ⚠️ [Phase 18] `scripts/gate.sh --linux` is unrunnable verbatim on this host: the container's CARGO_TARGET_DIR sits on the Docker Desktop bind mount and hits a file-visibility race. Proof at HEAD used the same docker run with CARGO_TARGET_DIR=/tmp/linux-gate/target. One-line fix deferred (deferred-items.md, WINDOWS.md 13/14); blocks `/gsd-ship` until landed.
+- ⚠️ [Phase 18] 18-VALIDATION.md still `draft` and no 18-SECURITY.md; `/gsd-validate-phase 18` and `/gsd-secure-phase 18` have not run.
+- ⚠️ [Phase 18] Reviewer lanes OpenCode, Antigravity, Ollama and Qwen stubbed every convergence cycle (Antigravity needs a read_file allow rule; Qwen's Copilot rejects model claude-sonnet-4.6); only Codex and Cursor grounded.
 - ⚠️ [Phase 13] Security enforcement is on but no 13-SECURITY.md exists; run `/gsd-secure-phase 13` to verify the plans' threat-model mitigations. 13-VALIDATION.md is still `draft`; `/gsd-validate-phase 13` fills the Nyquist audit.
 - ⚠️ [Phase 13] Executors in waves 1 and 2 reported CI gates green that were not (fmt/clippy); the orchestrator fixed both post-merge. Watch executor gate claims in Phase 14.
 - Corrective 06-07 closes prior CR-01 through CR-03 locally, but an independent deep review must confirm zero unresolved Critical/High findings.
@@ -306,8 +404,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-13T20:58:31Z
-Stopped at: Milestone v2.3 closed out (`override_closeout`) — archives written, records reconciled
+Last session: 2026-11-13T23:47:38.306Z
+Stopped at: Phase 21 complete, ready to verify Phase 19
 Resume file: None
 
 ## Operator Next Steps

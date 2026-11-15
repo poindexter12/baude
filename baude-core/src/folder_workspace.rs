@@ -196,6 +196,33 @@ pub fn record(root: Option<&Path>, launch_dir: &Path, workspace: &str, now_ms: u
     });
 }
 
+/// Forget the binding recorded for `folder`, if any. Returns `Ok(true)` when
+/// an entry keyed by `folder_key(folder)` was removed and `Ok(false)` when
+/// there was nothing to remove: `root: None`, an absent file, or a file
+/// without that key. Only an exact key match is removed; entries for other
+/// folders bound to the same workspace are untouched.
+///
+/// The absent-key pre-check happens outside the merge lock, so a binding
+/// recorded between the check and the write can survive one call. That gap
+/// is accepted for an advisory file: the worst case is a stale hint that the
+/// next launch overwrites, and the pre-check is what keeps an absent file
+/// absent and an untouched file byte-identical.
+pub fn clear(root: Option<&Path>, folder: &Path) -> std::io::Result<bool> {
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    let key = folder_key(folder);
+    let (on_disk, _) = load_json::<FolderWorkspaceFile>(&root.join(FILE_NAME));
+    if !on_disk.folders.contains_key(&key) {
+        return Ok(false);
+    }
+    locked_merge_write(root, FILE_NAME, |merged: &mut FolderWorkspaceFile| {
+        merged.schema_version = SCHEMA_VERSION;
+        merged.folders.remove(&key);
+    })?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +262,46 @@ mod tests {
             on_disk.folders[&folder_key(Path::new("/mem/api"))].updated_ms,
             30
         );
+    }
+
+    #[test]
+    fn clear_removes_only_the_named_key() {
+        let _redirect = TestRedirect::new(scratch("clear-root"));
+        let dir = scratch("clear");
+        let home = Path::new("/mem");
+        record(Some(&dir), Path::new("/mem/api"), "shared", 10);
+        record(Some(&dir), Path::new("/mem/web"), "shared", 20);
+        let web_before = load_json::<FolderWorkspaceFile>(&dir.join(FILE_NAME))
+            .0
+            .folders[&folder_key(Path::new("/mem/web"))]
+            .clone();
+
+        assert!(clear(Some(&dir), Path::new("/mem/api")).unwrap());
+
+        let (on_disk, corrupted) = load_json::<FolderWorkspaceFile>(&dir.join(FILE_NAME));
+        assert!(!corrupted);
+        assert_eq!(on_disk.schema_version, SCHEMA_VERSION);
+        assert_eq!(on_disk.folders.len(), 1);
+        assert_eq!(
+            on_disk.folders.get(&folder_key(Path::new("/mem/web"))),
+            Some(&web_before)
+        );
+        assert_eq!(find_binding(&dir, Path::new("/mem/api"), home), None);
+        assert_eq!(
+            find_binding(&dir, Path::new("/mem/web"), home).as_deref(),
+            Some("shared")
+        );
+
+        // A second clear of the same folder finds nothing and writes nothing.
+        let bytes_before = std::fs::read(dir.join(FILE_NAME)).unwrap();
+        assert!(!clear(Some(&dir), Path::new("/mem/api")).unwrap());
+        assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap(), bytes_before);
+
+        // An absent file stays absent, and in-memory mode clears nothing.
+        let empty = scratch("clear-empty");
+        assert!(!clear(Some(&empty), Path::new("/mem/api")).unwrap());
+        assert!(!empty.join(FILE_NAME).exists());
+        assert!(!clear(None, Path::new("/mem/web")).unwrap());
     }
 
     #[test]

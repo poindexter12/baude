@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use baude_core::backend;
 use baude_core::git;
@@ -17,12 +17,17 @@ use baude_core::lifecycle::{self, CollisionReport, LifecycleOutcome, RepositoryR
 use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
+use baude_core::removal::{
+    self, PersistenceOutcome, RemovalError, RemovalReport, RemovalTarget, RowKey, RowRuntime,
+};
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
-    RepositoryHealth, RepositoryState, RetainedSessionState, RuntimeGeneration, SavedCheckout,
-    SavedRepository, ShellOwnership, UnavailableCause,
+    RepositoryHealth, RepositoryKey, RepositoryState, RetainedSessionState,
+    RetainedStandaloneSessionState, RuntimeGeneration, SavedCheckout, SavedRepository,
+    SavedStandaloneSession, ShellOwnership, StandaloneKey, StandaloneLifecycle, UnavailableCause,
 };
 use baude_core::session::{Session, StateSource, Status};
+use baude_core::suppression;
 
 /// Headless PTY geometry. Nothing renders it; it only needs to be big enough
 /// that Claude Code's TUI lays out sanely in the transcript-driving sense.
@@ -101,6 +106,144 @@ impl From<persist::SaveError> for MutationError {
 
 type MutationResult<T> = std::result::Result<T, MutationError>;
 
+/// The row that owns a runtime: a checkout or a standalone folder session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeOwner {
+    Checkout(CheckoutKey),
+    Standalone(StandaloneKey),
+}
+
+/// Where a plain `POST /sessions` for a canonical path is admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlainAdmission {
+    ReuseStandalone(StandaloneKey),
+    Discovered,
+    JoinStored(RepositoryKey),
+    Standalone,
+    Refuse(String),
+}
+
+/// Route a plain admission. It reads its arguments and nothing else, and
+/// returns the first route that matches, in this order.
+///
+/// First, a standalone row that already stores `canonical` is reused, since
+/// core allows one standalone row per canonical path. Second, a path git
+/// discovers as a repository takes the checkout arm. Third, a path git says
+/// is not a repository, but which a stored checkout's `observed_path` or a
+/// stored repository's `observed_main_worktree` already holds, joins that
+/// stored repository: core's `StandaloneCheckoutPathConflict` rule rejects a
+/// state in which a standalone path equals either of those, and a rejected
+/// state fails every later save, so a folder an earlier daemon stored as a
+/// repository stays on that shape until its repository row is removed.
+/// Fourth, a path git says is not a repository and no stored row holds is a
+/// standalone admission. Fifth, any other discovery error is refused: the
+/// daemon does not know what the folder is, and a guess in either direction
+/// stores a row of the wrong kind.
+fn route_plain_admission(
+    state: &RepositoryState,
+    canonical: &Path,
+    discovery: &std::result::Result<git::RepositorySnapshot, git::RepositoryDiscoveryError>,
+) -> PlainAdmission {
+    let path = PersistedPath::from_path(canonical);
+    if let Some(row) = state.standalone_session_by_path(&path) {
+        return PlainAdmission::ReuseStandalone(row.key);
+    }
+    match discovery {
+        Ok(_) => PlainAdmission::Discovered,
+        Err(git::RepositoryDiscoveryError::NotRepository(_)) => state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.observed_path == path)
+            .map(|checkout| checkout.repository_key)
+            .or_else(|| {
+                state
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.observed_main_worktree == path)
+                    .map(|repository| repository.key)
+            })
+            .map_or(PlainAdmission::Standalone, PlainAdmission::JoinStored),
+        Err(error) => PlainAdmission::Refuse(format!("repository discovery failed: {error}")),
+    }
+}
+
+/// How many events a `GET /events` subscriber may fall behind before it
+/// starts losing the oldest ones. The stream itself survives the loss.
+pub const EVENTS_CAPACITY: usize = 64;
+
+/// A daemon-wide event, published to every `GET /events` subscriber.
+#[derive(Clone, Debug)]
+pub enum DaemonEvent {
+    /// One committed `POST /removals`, carrying the report that call returned.
+    RowsRemoved(RemovalReport),
+}
+
+impl DaemonEvent {
+    /// The SSE `event:` name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DaemonEvent::RowsRemoved(_) => "rows_removed",
+        }
+    }
+
+    /// The SSE `data:` payload: the same serde derive as the REST body.
+    pub fn data(&self) -> serde_json::Result<String> {
+        match self {
+            DaemonEvent::RowsRemoved(report) => serde_json::to_string(report),
+        }
+    }
+}
+
+/// Why `Manager::remove_rows` did not remove anything.
+#[derive(Debug)]
+pub enum RemoveRowsError {
+    /// The row set, runtimes or deleted paths changed since the preview; the
+    /// payload is the fresh report the caller re-shows. Boxed so the error
+    /// stays small next to the report it replaces.
+    Drift(Box<RemovalReport>),
+    Removal(RemovalError),
+    Blocked(persist::SaveError),
+    Busy(RepositoryKey),
+}
+
+impl std::fmt::Display for RemoveRowsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Drift(_) => f.write_str("the removal changed since it was previewed"),
+            Self::Removal(error) => write!(f, "{error}"),
+            Self::Blocked(error) => write!(f, "{error}"),
+            Self::Busy(repository) => write!(f, "repository busy: {repository:?}"),
+        }
+    }
+}
+
+/// Overwrite the retained session metadata of every checkout still present in
+/// `state` with its live value. The single merge implementation: both the
+/// ordinary save and the removal save go through it, so the two cannot drift.
+fn merge_live_runtime_metadata(
+    state: &mut RepositoryState,
+    overrides: &[(CheckoutKey, RetainedSessionState)],
+    standalone_overrides: &[(StandaloneKey, RetainedStandaloneSessionState)],
+) {
+    for checkout in &mut state.checkouts {
+        if let Some((_, live)) = overrides.iter().find(|(key, _)| *key == checkout.key) {
+            checkout.session = live.clone();
+        }
+    }
+    for row in &mut state.standalone_sessions {
+        if let Some((_, live)) = standalone_overrides.iter().find(|(key, _)| *key == row.key) {
+            // The five fields a live session owns. `ever_launched`, the
+            // lifecycle and the owned runtime change only on the custody
+            // transitions, never in a metadata merge.
+            row.session.name = live.name.clone();
+            row.session.shell_open = live.shell_open;
+            row.session.archived = live.archived;
+            row.session.archived_by_user = live.archived_by_user;
+            row.session.resume_id = live.resume_id.clone();
+        }
+    }
+}
+
 /// Lock the manager, recovering from poisoning (a panicked handler must not
 /// take the whole daemon's session list with it).
 pub fn lock(shared: &Shared) -> MutexGuard<'_, Manager> {
@@ -124,8 +267,14 @@ pub struct Manager {
     /// permission never stalls other sessions (Pitfall 4 — "decide under the
     /// lock, act outside it"). `resolve_pending` fires `notify_waiters()`.
     permission_notify: HashMap<u64, Arc<Notify>>,
+    /// The sender behind `GET /events`. Nothing is retained for a subscriber
+    /// that is not connected: `GET /rows` stays the record of what exists.
+    events: broadcast::Sender<DaemonEvent>,
     repository_state: RepositoryState,
     runtime_checkouts: HashMap<CheckoutKey, u64>,
+    /// The live session of each standalone row. A session id is in at most one
+    /// of this registry and `runtime_checkouts`.
+    runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
@@ -138,6 +287,12 @@ pub struct Manager {
     persistence_target_for_test: Option<(PathBuf, String)>,
     #[cfg(test)]
     atomic_failure_for_test: Option<persist::AtomicFailure>,
+    /// Test-only: how many saves still go through before
+    /// `atomic_failure_for_test` applies, and how many saves it then applies
+    /// to. `(0, usize::MAX)` is a failure that is there from the first save
+    /// and stays.
+    #[cfg(test)]
+    atomic_failure_window_for_test: (usize, usize),
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
     /// Startup timing stages (config load, state load, listener bound, etc.)
@@ -177,7 +332,83 @@ fn reconcile_legacy_session(saved: &persist::SavedSession) -> LegacyReconciliati
     }
 }
 
+/// The body of `GET /rows`: the daemon's hierarchy, and the authoritative
+/// index from a durable row key to a display name, a path and a live session
+/// id. An object with two arrays and never a bare array, so a third root kind
+/// is additive. The field names are a wire contract read by the PWA and the
+/// TUI remote client; renaming one means touching every caller.
+///
+/// Deliberately absent: any conversation identifier, the owned runtime, the
+/// lifecycle, and any `removable` flag. Removal eligibility is core's, through
+/// the preview report, and a second daemon-computed answer could disagree.
+#[derive(Serialize, Clone)]
+pub struct RowsView {
+    pub repositories: Vec<RepositoryRowView>,
+    pub standalone: Vec<StandaloneRowView>,
+}
+
+/// A repository parent entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct RepositoryRowView {
+    pub repository_key: u64,
+    pub display_name: String,
+    pub path: String,
+    pub health: RepositoryHealth,
+    pub checkouts: Vec<CheckoutRowView>,
+}
+
+/// A checkout child entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct CheckoutRowView {
+    pub checkout_key: u64,
+    /// The parent key repeated, so a flattened client list still finds it.
+    pub repository_key: u64,
+    pub display_name: String,
+    /// The short branch name, `None` for a detached HEAD. The stored
+    /// `observed_branch` is git's full ref and is never rewritten: core
+    /// compares and re-observes full refs, so the short form exists in this
+    /// projection only.
+    pub branch: Option<String>,
+    pub path: String,
+    pub role: CheckoutRole,
+    pub managed_by_baude: bool,
+    pub archived: bool,
+    /// The live daemon session id, `None` when the row has no runtime. Equal
+    /// to `SessionInfo::id`, which is the join column to `GET /sessions`.
+    pub session_id: Option<u64>,
+}
+
+/// The branch name `GET /rows` serves for a stored `observed_branch`.
+///
+/// A value beginning `refs/heads/` loses that one leading prefix and keeps
+/// the rest verbatim, so a slash-bearing branch is never split. Any other
+/// value is served as stored: the daemon does not guess at a ref it does not
+/// recognize. No stored value is `None`, with no fallback to a default
+/// branch.
+fn short_branch_name(observed: Option<&str>) -> Option<String> {
+    observed.map(|full| full.strip_prefix("refs/heads/").unwrap_or(full).to_string())
+}
+
+/// A standalone root entry of `GET /rows`.
+#[derive(Serialize, Clone)]
+pub struct StandaloneRowView {
+    pub standalone_key: u64,
+    pub display_name: String,
+    pub path: String,
+    pub archived: bool,
+    pub session_id: Option<u64>,
+}
+
 /// One row of `GET /sessions`.
+///
+/// `checkout_key` is deliberately NOT a field here. D-09 was resolved to
+/// Option B by the user on 2026-11-11: durable keys are served only from
+/// `GET /rows`, and a client joins a `/rows` checkout entry to a `/sessions`
+/// row on `session_id`, which equals `id` below. `/sessions` stays the flat
+/// compatibility projection Phase 7 locked. The enforcement point is the test
+/// `flat_session_api_remains_a_non_hierarchical_compatibility_projection` in
+/// `api.rs`, which forbids `checkout_key` and seven sibling names on every
+/// entry. Do not add the field on the strength of D-09's original wording.
 #[derive(Serialize, Clone)]
 pub struct SessionInfo {
     pub id: u64,
@@ -474,8 +705,10 @@ impl Manager {
             auto_archive_ms: default_auto_archive_ms(),
             idle_child_policy: default_idle_child_policy(),
             permission_notify: HashMap::new(),
+            events: broadcast::channel(EVENTS_CAPACITY).0,
             repository_state: RepositoryState::default(),
             runtime_checkouts: HashMap::new(),
+            runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
             persistence_blocked: false,
             persistence_dirty: false,
@@ -485,6 +718,8 @@ impl Manager {
             persistence_target_for_test: None,
             #[cfg(test)]
             atomic_failure_for_test: None,
+            #[cfg(test)]
+            atomic_failure_window_for_test: (0, usize::MAX),
             #[cfg(test)]
             spawn_error_for_test: None,
             startup_timing: crate::timing::StartupTiming::new(0),
@@ -508,7 +743,11 @@ impl Manager {
     }
 
     #[cfg(test)]
-    fn restore_at(&mut self, root: &Path, workspace: &baude_core::workspace::Workspace) -> usize {
+    pub(crate) fn restore_at(
+        &mut self,
+        root: &Path,
+        workspace: &baude_core::workspace::Workspace,
+    ) -> usize {
         if !self.persist {
             return 0;
         }
@@ -567,7 +806,7 @@ impl Manager {
                 Err(e) => eprintln!("restore {}: {e}", checkout.session.name),
             }
         }
-        restored
+        restored + self.restore_standalones()
     }
 
     fn reconcile_activation_recoveries(&mut self) -> MutationResult<()> {
@@ -718,8 +957,10 @@ impl Manager {
         }
         let state = StateFile::new(self.state_for_save());
         #[cfg(test)]
+        let failure = self.scheduled_atomic_failure_for_test();
+        #[cfg(test)]
         let saved = if let Some((root, file)) = &self.persistence_target_for_test {
-            persist::save_current_at_test(root, file, &state, self.atomic_failure_for_test, None)
+            persist::save_current_at_test(root, file, &state, failure, None)
         } else {
             persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &state)
         };
@@ -778,7 +1019,59 @@ impl Manager {
 
     fn state_for_save(&self) -> RepositoryState {
         let mut state = self.repository_state.clone();
-        for checkout in &mut state.checkouts {
+        merge_live_runtime_metadata(
+            &mut state,
+            &self.survivor_runtime_overrides(),
+            &self.standalone_runtime_overrides(),
+        );
+        state
+    }
+
+    /// The live metadata of every standalone row that owns a runtime, the
+    /// standalone counterpart of [`Self::survivor_runtime_overrides`].
+    fn standalone_runtime_overrides(&self) -> Vec<(StandaloneKey, RetainedStandaloneSessionState)> {
+        let mut overrides = Vec::new();
+        for row in &self.repository_state.standalone_sessions {
+            let Some(runtime_id) = self.runtime_standalones.get(&row.key) else {
+                continue;
+            };
+            let Some(session) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == *runtime_id)
+            else {
+                continue;
+            };
+            overrides.push((row.key, Self::standalone_snapshot(session, row)));
+        }
+        overrides
+    }
+
+    /// What a standalone row retains of its live session.
+    fn standalone_snapshot(
+        session: &Session,
+        row: &SavedStandaloneSession,
+    ) -> RetainedStandaloneSessionState {
+        RetainedStandaloneSessionState {
+            name: session.name.clone(),
+            shell_open: session.shell_open,
+            archived: session.archived,
+            archived_by_user: session.archived_by_user,
+            resume_id: session
+                .meta
+                .session_id
+                .clone()
+                .or_else(|| row.session.resume_id.clone()),
+            ever_launched: row.session.ever_launched,
+        }
+    }
+
+    /// The live metadata of every checkout that owns a runtime, in the shape
+    /// the state file retains it. Taken as an owned snapshot so the removal
+    /// save closure can apply it while core holds `&mut self.repository_state`.
+    fn survivor_runtime_overrides(&self) -> Vec<(CheckoutKey, RetainedSessionState)> {
+        let mut overrides = Vec::new();
+        for checkout in &self.repository_state.checkouts {
             let Some(runtime_id) = self.runtime_checkouts.get(&checkout.key) else {
                 continue;
             };
@@ -789,28 +1082,534 @@ impl Manager {
             else {
                 continue;
             };
-            checkout.session = RetainedSessionState {
-                name: session.name.clone(),
-                cwd: PersistedPath::from_path(&session.cwd),
-                repo_root: PersistedPath::from_path(&session.repo_root),
-                branch: session.branch.clone(),
-                is_worktree: session.is_worktree,
-                shell_open: session.shell_open,
-                archived: session.archived,
-                archived_by_user: session.archived_by_user,
-                resume_id: session
-                    .meta
-                    .session_id
-                    .clone()
-                    .or_else(|| checkout.session.resume_id.clone()),
-            };
+            overrides.push((
+                checkout.key,
+                RetainedSessionState {
+                    name: session.name.clone(),
+                    cwd: PersistedPath::from_path(&session.cwd),
+                    repo_root: PersistedPath::from_path(&session.repo_root),
+                    branch: session.branch.clone(),
+                    is_worktree: session.is_worktree,
+                    shell_open: session.shell_open,
+                    archived: session.archived,
+                    archived_by_user: session.archived_by_user,
+                    resume_id: session
+                        .meta
+                        .session_id
+                        .clone()
+                        .or_else(|| checkout.session.resume_id.clone()),
+                },
+            ));
         }
-        state
+        overrides
+    }
+
+    /// `POST /removals/preview`: what removing `target` would do.
+    pub fn preview_removal(
+        &self,
+        target: RemovalTarget,
+    ) -> std::result::Result<RemovalReport, RemovalError> {
+        // No reservation: the caller holds the global manager mutex, which
+        // already serializes this read against every mutation, and core's
+        // own `remove` re-selects its rows rather than trusting a preview.
+        removal::preview_removal(&self.repository_state, target)
+    }
+
+    /// `POST /removals`: kill, delete and drop the previewed rows in one save.
+    ///
+    /// The Phase 18 force path, not the close protocol: nothing here routes
+    /// through `Manager::remove` or `teardown_retained_runtime`.
+    pub fn remove_rows(
+        &mut self,
+        previewed: &RemovalReport,
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+        if self.persistence_blocked {
+            return Err(RemoveRowsError::Blocked(
+                persist::SaveError::before_replacement(anyhow!(
+                    "persistence is blocked after a state load failure"
+                )),
+            ));
+        }
+        let target = previewed.target;
+        let _reservation = match self.removal_target_repository(target) {
+            Some(repository) => Some(
+                self.repository_reservations
+                    .reserve(repository)
+                    .map_err(|_| RemoveRowsError::Busy(repository))?,
+            ),
+            None => None,
+        };
+        // The report is recomputed under the caller's lock. Only what the run
+        // would do is compared; `cleared` and `already_removed` are filesystem
+        // probes that would make the recheck flap on advisory state.
+        let fresh = self
+            .preview_removal(target)
+            .map_err(RemoveRowsError::Removal)?;
+        if fresh.rows_removed != previewed.rows_removed
+            || fresh.runtimes_killed != previewed.runtimes_killed
+            || fresh.paths_deleted != previewed.paths_deleted
+        {
+            return Err(RemoveRowsError::Drift(Box::new(fresh)));
+        }
+        // Snapshot before the core call: the closure cannot borrow `self`
+        // while `remove` holds `&mut self.repository_state`. The removed rows'
+        // sessions are still registered here, and the merge skips them because
+        // their checkouts are gone from the candidate.
+        let overrides = self.survivor_runtime_overrides();
+        let standalone_overrides = self.standalone_runtime_overrides();
+        let mut runtimes = self.collect_row_runtimes(&fresh);
+        let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        let persist_enabled = self.persist;
+        #[cfg(test)]
+        let test_target = self.persistence_target_for_test.clone();
+        #[cfg(test)]
+        let atomic_failure = self.atomic_failure_for_test;
+        let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            if !persist_enabled {
+                return Ok(());
+            }
+            // `file` is core's candidate and must stay untouched: core assigns
+            // it to the live state after this returns. The merge is applied to
+            // a copy, so only the bytes on disk carry the live metadata.
+            let mut merged = file.state.clone();
+            merge_live_runtime_metadata(&mut merged, &overrides, &standalone_overrides);
+            let merged = StateFile::new(merged);
+            #[cfg(test)]
+            if let Some((root, file_name)) = &test_target {
+                return persist::save_current_at_test(
+                    root,
+                    file_name,
+                    &merged,
+                    atomic_failure,
+                    None,
+                );
+            }
+            persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &merged)
+        };
+        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                // Core left `repository_state` untouched and every handle in
+                // the Vec, so the rows and their registry entries all stand.
+                self.restore_row_runtimes(runtimes);
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                if matches!(error, RemovalError::Persist { .. }) {
+                    self.persistence_dirty = true;
+                    self.persistence_error = Some(error.to_string());
+                }
+                return Err(RemoveRowsError::Removal(error));
+            }
+        };
+        for row in &report.rows_removed {
+            match row {
+                RowKey::Checkout(key) => {
+                    self.runtime_checkouts.remove(key);
+                }
+                RowKey::Standalone(key) => {
+                    self.runtime_standalones.remove(key);
+                }
+                RowKey::Repository(_) => {}
+            }
+        }
+        // Handles the core did not consume stay registered.
+        let restored: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        self.restore_row_runtimes(runtimes);
+        for id in consumed.iter().filter(|id| !restored.contains(id)) {
+            // Wake before forgetting, so no long-poll hangs on a row that no
+            // longer exists.
+            if let Some(notify) = self.permission_notify.remove(id) {
+                notify.notify_waiters();
+            }
+        }
+        match &report.persistence {
+            PersistenceOutcome::Saved => {
+                self.persistence_dirty = false;
+                self.persistence_error = None;
+            }
+            PersistenceOutcome::SavedDegraded { detail } => {
+                self.persistence_dirty = true;
+                self.persistence_error = Some(detail.clone());
+            }
+            // A real run never reports a planned outcome.
+            PersistenceOutcome::Planned => {}
+        }
+        // The caller holds the manager mutex for this whole method, so no
+        // reader can see the row after the event is queued. That is a
+        // property of this code position, not something a test observes.
+        // Core's durable save has returned, which covers `SavedDegraded`: the
+        // replacement committed. No other exit of this method publishes.
+        self.publish(DaemonEvent::RowsRemoved(report.clone()));
+        Ok(report)
+    }
+
+    /// A receiver for every event published from now on. Nothing published
+    /// earlier is replayed.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, event: DaemonEvent) {
+        // The only send error is "no receiver", which is the normal state of
+        // a daemon nobody is watching.
+        let _ = self.events.send(event);
+    }
+
+    /// Send `event` on the real sender, so a test can overflow a receiver the
+    /// `GET /events` handler owns without sixty-five live removals.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: DaemonEvent) {
+        self.publish(event);
+    }
+
+    /// The repository whose reservation a removal of `target` holds.
+    fn removal_target_repository(&self, target: RemovalTarget) -> Option<RepositoryKey> {
+        match target {
+            RemovalTarget::Repository(key) => Some(key),
+            RemovalTarget::Checkout(key) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .map(|checkout| checkout.repository_key),
+            RemovalTarget::Standalone(_) => None,
+        }
+    }
+
+    /// Move the live `Session` of every checkout and standalone row in
+    /// `report` out of the registry into the shape core demands. The
+    /// `runtime_checkouts` and `runtime_standalones` entries stay until core
+    /// returns `Ok`, so a handle can be put straight back. A repository row
+    /// carries no runtime of its own.
+    fn collect_row_runtimes(&mut self, report: &RemovalReport) -> Vec<RowRuntime> {
+        let mut runtimes = Vec::new();
+        for row in &report.rows_removed {
+            let registered = match row {
+                RowKey::Checkout(key) => self.runtime_checkouts.get(key).copied(),
+                RowKey::Standalone(key) => self.runtime_standalones.get(key).copied(),
+                RowKey::Repository(_) => None,
+            };
+            let Some(runtime_id) = registered else {
+                continue;
+            };
+            let Some(index) = self
+                .sessions
+                .iter()
+                .position(|session| session.id == runtime_id)
+            else {
+                continue;
+            };
+            runtimes.push(RowRuntime {
+                row: *row,
+                session: self.sessions.remove(index),
+            });
+        }
+        runtimes
+    }
+
+    /// Return every handle core did not consume to the registry, in id order.
+    fn restore_row_runtimes(&mut self, runtimes: Vec<RowRuntime>) {
+        for runtime in runtimes {
+            let session = runtime.session;
+            let index = self
+                .sessions
+                .iter()
+                .position(|existing| existing.id > session.id)
+                .unwrap_or(self.sessions.len());
+            self.sessions.insert(index, session);
+        }
+    }
+
+    /// The observed main worktree of a repository, for a busy refusal's body.
+    pub fn repository_path(&self, repository: RepositoryKey) -> Option<PathBuf> {
+        self.repository_state
+            .repositories
+            .iter()
+            .find(|saved| saved.key == repository)
+            .map(|saved| saved.observed_main_worktree.to_path_buf())
+    }
+
+    /// `GET /rows` — the hierarchy projection. A pure read: it admits nothing,
+    /// allocates no key and saves nothing.
+    pub fn rows(&self) -> RowsView {
+        // The durable rows with live session metadata merged in, the same view
+        // every save writes. `repository_state` alone is stale for a row that
+        // owns a runtime: archiving or renaming a live session reaches it only
+        // at the next save, and an archived row must never read as active.
+        let state = &self.state_for_save();
+        let mut repositories: Vec<&SavedRepository> = state.repositories.iter().collect();
+        repositories.sort_by_key(|repository| repository.first_seen_order);
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| {
+                let mut checkouts: Vec<&SavedCheckout> = state
+                    .checkouts
+                    .iter()
+                    .filter(|checkout| checkout.repository_key == repository.key)
+                    .collect();
+                checkouts.sort_by_key(|checkout| checkout.first_seen_order);
+                let path = repository.observed_main_worktree.to_path_buf();
+                RepositoryRowView {
+                    repository_key: repository.key.get(),
+                    // A root path has no file name; its full form is the name.
+                    display_name: path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    ),
+                    path: path.display().to_string(),
+                    health: repository.health.clone(),
+                    checkouts: checkouts
+                        .into_iter()
+                        .map(|checkout| CheckoutRowView {
+                            checkout_key: checkout.key.get(),
+                            repository_key: checkout.repository_key.get(),
+                            display_name: checkout.session.name.clone(),
+                            branch: short_branch_name(checkout.observed_branch.as_deref()),
+                            path: checkout.observed_path.to_path_buf().display().to_string(),
+                            role: checkout.role,
+                            managed_by_baude: checkout.managed_by_baude,
+                            archived: checkout.session.archived,
+                            session_id: self.session_id_for_checkout(checkout.key),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let mut standalone: Vec<_> = state.standalone_sessions.iter().collect();
+        standalone.sort_by_key(|session| session.first_seen_order);
+        let standalone = standalone
+            .into_iter()
+            .map(|session| StandaloneRowView {
+                standalone_key: session.key.get(),
+                display_name: session.session.name.clone(),
+                path: session.canonical_path.to_path_buf().display().to_string(),
+                archived: session.session.archived,
+                session_id: self.session_id_for_standalone(session.key),
+            })
+            .collect();
+        RowsView {
+            repositories,
+            standalone,
+        }
+    }
+
+    /// The live daemon session id of a checkout row, from the same registry
+    /// `POST /removals` resolves runtime handles through.
+    fn session_id_for_checkout(&self, key: CheckoutKey) -> Option<u64> {
+        self.runtime_checkouts.get(&key).copied()
+    }
+
+    /// The live daemon session id of a standalone row, by the same rule.
+    fn session_id_for_standalone(&self, key: StandaloneKey) -> Option<u64> {
+        self.runtime_standalones.get(&key).copied()
+    }
+
+    /// The stored `observed_branch` of the checkout with `key`, the full ref
+    /// the state file is written from, so a test can assert it without
+    /// parsing the state file's layout.
+    #[cfg(test)]
+    pub(crate) fn stored_observed_branch_for_test(&self, key: CheckoutKey) -> Option<String> {
+        self.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .and_then(|checkout| checkout.observed_branch.clone())
+    }
+
+    /// Overwrite the stored role of the checkout with `key`, to reproduce
+    /// the stored shape an earlier daemon wrote: before 21-09 every admitted
+    /// row, the main checkout included, was stored as `ManagedBranch`. Not a
+    /// general mutator. It does not save, and it touches neither the managed
+    /// flag nor any runtime.
+    #[cfg(test)]
+    pub(crate) fn set_checkout_role_for_test(&mut self, key: CheckoutKey, role: CheckoutRole) {
+        if let Some(checkout) = self
+            .repository_state
+            .checkouts
+            .iter_mut()
+            .find(|checkout| checkout.key == key)
+        {
+            checkout.role = role;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_key_for_runtime_for_test(&self, id: u64) -> Option<CheckoutKey> {
+        self.runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))
+    }
+
+    /// Drop the registry entry that maps `key` to its live session, and
+    /// nothing else. Reproduces the stale runtime row a daemon is left with
+    /// when restore could not reopen a checkout that still records an owned
+    /// runtime: the row keeps its runtime, the daemon holds no handle for it.
+    /// The process keeps running, the `Session` stays in `self.sessions`,
+    /// `repository_state` is untouched and nothing is saved.
+    #[cfg(test)]
+    pub(crate) fn forget_runtime_handle_for_test(&mut self, key: CheckoutKey) {
+        self.runtime_checkouts.remove(&key);
+    }
+
+    /// Take the real reservation of repository `key`, so a test can hold it
+    /// across a request and drive `RemoveRowsError::Busy` by its cause. The
+    /// guard owns its share of the reservation table and outlives the manager
+    /// lock; this adds no second locking mechanism.
+    #[cfg(test)]
+    pub(crate) fn reserve_repository_for_test(
+        &self,
+        key: RepositoryKey,
+    ) -> lifecycle::RepositoryReservation {
+        self.repository_reservations
+            .reserve(key)
+            .unwrap_or_else(|_| panic!("repository {key:?} is already reserved"))
+    }
+
+    /// Store and launch what a daemon before 21-10 stored and launched for a
+    /// folder git does not report as a repository, so a test can stand on
+    /// that shape. The allocation is the one `record_checkout_intent` made
+    /// before 21-10 removed it: a repository row whose common directory and
+    /// main worktree are the folder and whose health is unavailable for the
+    /// not-a-repository cause, holding one unmanaged `ManagedBranch` checkout
+    /// at the folder. No route reaches this.
+    #[cfg(test)]
+    pub(crate) fn create_pre_plan_folder_session_for_test(
+        &mut self,
+        folder: &Path,
+        name: Option<&str>,
+    ) -> MutationResult<u64> {
+        let state_before = self.repository_state.clone();
+        let base = name.map(str::to_owned).unwrap_or_else(|| {
+            folder
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_else(|| folder.display().to_string())
+        });
+        let session_name = self.unique_name(&base);
+        let allocated = (|| -> Result<CheckoutKey> {
+            let key = self.repository_state.allocate_repository_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.repositories.push(SavedRepository {
+                key,
+                observed_common_dir: PersistedPath::from_path(folder),
+                observed_main_worktree: PersistedPath::from_path(folder),
+                first_seen_order,
+                health: RepositoryHealth::Unavailable(UnavailableCause::NotRepository),
+                physical_key: key.get().to_string(),
+            });
+            let checkout_key = self.repository_state.allocate_checkout_key()?;
+            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+            self.repository_state.checkouts.push(SavedCheckout::new(
+                checkout_key,
+                key,
+                CheckoutRole::ManagedBranch,
+                false,
+                PersistedPath::from_path(folder),
+                None,
+                first_seen_order,
+                CheckoutLifecycle::Active,
+                RetainedSessionState {
+                    name: session_name.clone(),
+                    cwd: PersistedPath::from_path(folder),
+                    repo_root: PersistedPath::from_path(folder),
+                    branch: None,
+                    is_worktree: false,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            Ok(checkout_key)
+        })();
+        let checkout_key = match allocated {
+            Ok(key) => key,
+            Err(error) => {
+                self.repository_state = state_before;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        let id = self.spawn_retained_with_mode(
+            checkout_key,
+            folder.to_path_buf(),
+            folder.to_path_buf(),
+            None,
+            false,
+            Some(&session_name),
+            backend::SpawnMode::Fresh,
+            false,
+        )?;
+        self.runtime_checkouts.insert(checkout_key, id);
+        Ok(id)
     }
 
     /// `POST /sessions` — spawn a fresh session in `repo`, optionally in a
     /// managed worktree for `worktree` (branch name).
+    ///
+    /// An explicit admission is the one thing that lifts a suppression
+    /// entry (D-11). Every arm of `admit` that returns a session has stored
+    /// its row durably and launched it by then, so the lift runs here, once,
+    /// with the path that row stores: core keyed the entry on the stored
+    /// path of the row it removed, never on a request string. An arm that
+    /// returns an error lifts nothing, and a non-persisting manager stores
+    /// no row and lifts nothing. Restore, reopen, the restart route and the
+    /// legacy migration never come through here.
     pub fn create(
+        &mut self,
+        repo: &str,
+        worktree: Option<&str>,
+        name: Option<&str>,
+    ) -> MutationResult<SessionInfo> {
+        let info = self.admit(repo, worktree, name)?;
+        if self.persist {
+            if let Some(admitted) = self.stored_row_path(info.id) {
+                self.lift_admission_suppression(&admitted);
+            }
+        }
+        Ok(info)
+    }
+
+    /// The path stored on the row that owns live session `id`: a standalone
+    /// row's `canonical_path` or a checkout row's `observed_path`.
+    fn stored_row_path(&self, id: u64) -> Option<PathBuf> {
+        if let Some(key) = self.standalone_owner(id) {
+            return self
+                .repository_state
+                .standalone_sessions
+                .iter()
+                .find(|row| row.key == key)
+                .map(|row| row.canonical_path.to_path_buf());
+        }
+        let key = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key))?;
+        self.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .map(|checkout| checkout.observed_path.to_path_buf())
+    }
+
+    /// Forget the suppression entry for exactly `admitted`. Advisory: a
+    /// store error is logged with the path and never fails the admission
+    /// that asked for it. It reads no row and writes no state of its own.
+    fn lift_admission_suppression(&self, admitted: &Path) {
+        if let Err(error) = suppression::lift(&persist::config_dir(), admitted) {
+            eprintln!("lift suppression {}: {error}", admitted.display());
+        }
+    }
+
+    fn admit(
         &mut self,
         repo: &str,
         worktree: Option<&str>,
@@ -862,9 +1661,41 @@ impl Manager {
             }
         };
         if self.persist {
-            self.ensure_runtime_capacity(&cwd, &repo_root)?;
-        }
-        if self.persist {
+            let discovery = git::discover_repository(&cwd);
+            let route = route_plain_admission(&self.repository_state, &cwd, &discovery);
+            // What core validation holds a checkout's retained session to:
+            // its repository path is the repository's main worktree, and it
+            // is a worktree exactly when it is not that main worktree. Both
+            // come from discovery. `git rev-parse --show-toplevel` answers
+            // with the linked worktree itself, which core rejects, so a
+            // worktree the user made by hand could not be opened by path.
+            let (repo_root, is_worktree) = match &discovery {
+                Ok(snapshot) => (
+                    snapshot.main_worktree.clone(),
+                    snapshot.selected_worktree.path != snapshot.main_worktree,
+                ),
+                Err(_) => (repo_root, is_worktree),
+            };
+            let join = match &route {
+                PlainAdmission::ReuseStandalone(key) => {
+                    // One row per folder. A live row is the same session; a
+                    // closed one is reopened under its key. Either way the
+                    // request's name is not applied.
+                    let id = self.reopen_standalone(*key)?;
+                    return Ok(self.info(id).expect("reopened standalone session"));
+                }
+                PlainAdmission::Refuse(text) => {
+                    return Err(MutationError::Domain(anyhow!("{text}")));
+                }
+                PlainAdmission::Standalone => {
+                    self.ensure_runtime_capacity(&cwd, &repo_root, &route)?;
+                    let id = self.admit_standalone(&cwd, name)?;
+                    return Ok(self.info(id).expect("session just spawned"));
+                }
+                PlainAdmission::Discovered => None,
+                PlainAdmission::JoinStored(key) => Some(*key),
+            };
+            self.ensure_runtime_capacity(&cwd, &repo_root, &route)?;
             let state_before = self.repository_state.clone();
             let dir_name = |path: &Path| {
                 path.file_name()
@@ -882,6 +1713,7 @@ impl Manager {
                 branch.clone(),
                 is_worktree,
                 session_name.clone(),
+                join,
             )?;
             if let Err(error) = self.save_checked() {
                 if !error.replacement_committed() {
@@ -1062,6 +1894,34 @@ impl Manager {
         Ok(activation.outcome(Some(id)))
     }
 
+    /// The role a newly admitted checkout row is stored with.
+    ///
+    /// `Main` when all three hold: git discovery succeeded for the session's
+    /// working directory, the discovered worktree is the repository's main
+    /// worktree, and no checkout row of that repository already holds
+    /// `Main`. `ManagedBranch` in every other case, including a directory
+    /// git discovery returned nothing for. The third condition is required,
+    /// not cosmetic: `RepositoryState::validate` rejects a second `Main` in
+    /// one repository, so a second plain session on the same main checkout
+    /// would otherwise fail every later save. `PrimaryDefault` is never
+    /// assigned here.
+    fn admitted_checkout_role(
+        &self,
+        repository_key: RepositoryKey,
+        snapshot: Option<&git::RepositorySnapshot>,
+    ) -> CheckoutRole {
+        let is_main_worktree = snapshot
+            .is_some_and(|snapshot| snapshot.selected_worktree.path == snapshot.main_worktree);
+        let main_role_taken = self.repository_state.checkouts.iter().any(|checkout| {
+            checkout.repository_key == repository_key && checkout.role == CheckoutRole::Main
+        });
+        if is_main_worktree && !main_role_taken {
+            CheckoutRole::Main
+        } else {
+            CheckoutRole::ManagedBranch
+        }
+    }
+
     fn record_checkout_intent(
         &mut self,
         cwd: &Path,
@@ -1069,49 +1929,55 @@ impl Manager {
         branch: Option<String>,
         is_worktree: bool,
         name: String,
+        join: Option<RepositoryKey>,
     ) -> Result<CheckoutKey> {
         let snapshot = git::discover_repository(cwd).ok();
-        let common = snapshot
-            .as_ref()
-            .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
-            .unwrap_or_else(|| PersistedPath::from_path(repo_root));
-        let repository_key = if let Some(key) = self
-            .repository_state
-            .repositories
-            .iter()
-            .find(|repository| repository.observed_common_dir == common)
-            .map(|repository| repository.key)
-        {
+        let repository_key = if let Some(key) = join {
+            // The router matched a stored row that already holds this path;
+            // the checkout joins that repository with no lookup.
             key
         } else {
-            let key = self.repository_state.allocate_repository_key()?;
-            let first_seen_order = self.repository_state.allocate_first_seen_order()?;
-            self.repository_state.repositories.push(SavedRepository {
-                key,
-                observed_common_dir: common,
-                observed_main_worktree: PersistedPath::from_path(
-                    snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.main_worktree.as_path())
-                        .unwrap_or(repo_root),
-                ),
-                first_seen_order,
-                health: if snapshot.is_some() {
-                    RepositoryHealth::Available
-                } else {
-                    RepositoryHealth::Unavailable(UnavailableCause::NotRepository)
-                },
-                physical_key: key.get().to_string(),
-            });
-            key
+            // A folder that stopped being a repository between routing and
+            // recording is refused: this function never stores a repository
+            // row for a path git does not report as one.
+            let Some(discovered) = snapshot.as_ref() else {
+                bail!("{} is no longer a git repository", cwd.display());
+            };
+            let common = PersistedPath::from_path(&discovered.common_dir);
+            if let Some(key) = self
+                .repository_state
+                .repositories
+                .iter()
+                .find(|repository| repository.observed_common_dir == common)
+                .map(|repository| repository.key)
+            {
+                key
+            } else {
+                let key = self.repository_state.allocate_repository_key()?;
+                let first_seen_order = self.repository_state.allocate_first_seen_order()?;
+                self.repository_state.repositories.push(SavedRepository {
+                    key,
+                    observed_common_dir: common,
+                    observed_main_worktree: PersistedPath::from_path(&discovered.main_worktree),
+                    first_seen_order,
+                    health: RepositoryHealth::Available,
+                    physical_key: key.get().to_string(),
+                });
+                key
+            }
         };
+        let role = self.admitted_checkout_role(repository_key, snapshot.as_ref());
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
         self.repository_state.checkouts.push(SavedCheckout::new(
             checkout_key,
             repository_key,
-            CheckoutRole::ManagedBranch,
-            is_worktree,
+            role,
+            // Never managed: a plain admission opens a directory the user
+            // already has, so removing its row must keep that directory.
+            // Whether the directory is a linked worktree is a separate
+            // fact, recorded on the retained session below.
+            false,
             PersistedPath::from_path(cwd),
             snapshot
                 .as_ref()
@@ -1131,6 +1997,433 @@ impl Manager {
             },
         ));
         Ok(checkout_key)
+    }
+
+    /// A standalone key and a first-seen order, allocated together.
+    fn allocate_standalone_slot(state: &mut RepositoryState) -> Result<(StandaloneKey, u64)> {
+        let key = state.allocate_standalone_key()?;
+        let first_seen_order = state.allocate_first_seen_order()?;
+        Ok((key, first_seen_order))
+    }
+
+    /// Admit `canonical`, a folder git does not report as a repository, as
+    /// one standalone row and launch its session. The row is saved before
+    /// anything is spawned and rolled back when that save commits nothing.
+    fn admit_standalone(&mut self, canonical: &Path, name: Option<&str>) -> MutationResult<u64> {
+        let state_before = self.repository_state.clone();
+        let base = name.map(str::to_owned).unwrap_or_else(|| {
+            canonical
+                .file_name()
+                .map(|part| part.to_string_lossy().into_owned())
+                .unwrap_or_else(|| canonical.display().to_string())
+        });
+        let session_name = self.unique_name(&base);
+        let (key, first_seen_order) =
+            match Self::allocate_standalone_slot(&mut self.repository_state) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    self.repository_state = state_before;
+                    return Err(error.into());
+                }
+            };
+        self.repository_state
+            .standalone_sessions
+            .push(SavedStandaloneSession::new(
+                key,
+                PersistedPath::from_path(canonical),
+                first_seen_order,
+                StandaloneLifecycle::Active,
+                None,
+                RetainedStandaloneSessionState {
+                    name: session_name.clone(),
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                    ever_launched: false,
+                },
+            ));
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = state_before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        let id = self.spawn_with_mode_internal(
+            Some(RuntimeOwner::Standalone(key)),
+            canonical.to_path_buf(),
+            canonical.to_path_buf(),
+            None,
+            false,
+            Some(&session_name),
+            backend::SpawnMode::Fresh,
+            false,
+        )?;
+        self.runtime_standalones.insert(key, id);
+        Ok(id)
+    }
+
+    /// The standalone row that owns live session `id`, if one does.
+    fn standalone_owner(&self, id: u64) -> Option<StandaloneKey> {
+        self.runtime_standalones
+            .iter()
+            .find_map(|(key, runtime_id)| (*runtime_id == id).then_some(*key))
+    }
+
+    /// Save a standalone transition. A save that never replaced the file
+    /// rolls the in-memory rows back to `before`, so memory and disk agree.
+    fn save_standalone_change(&mut self, before: RepositoryState) -> MutationResult<()> {
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(MutationError::Persistence(error));
+        }
+        Ok(())
+    }
+
+    /// Record that a standalone row's runtime could not be confirmed
+    /// stopped. Best effort: the teardown error is the one the caller
+    /// reports, and a row left `Stopping` is recovered the same way.
+    fn protect_standalone_teardown(&mut self, key: StandaloneKey, generation: RuntimeGeneration) {
+        let before = self.repository_state.clone();
+        if let Some(row) = self.repository_state.standalone_session_mut(key) {
+            row.set_lifecycle(StandaloneLifecycle::ProtectedTeardown(generation));
+        }
+        if let Err(error) = self.save_standalone_change(before) {
+            eprintln!(
+                "standalone {}: could not persist protected teardown: {error}",
+                key.get()
+            );
+        }
+    }
+
+    /// Close the live session `id` of standalone row `key`. The runtime is
+    /// ended and the row stays, `Inactive` with no owned runtime. A session
+    /// that has already exited takes the same path: nothing is left to end,
+    /// and its ownership is cleared.
+    fn close_standalone(&mut self, key: StandaloneKey, id: u64) -> MutationResult<()> {
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| anyhow!("no session {id}"))?;
+        let row = self
+            .repository_state
+            .standalone_session(key)
+            .ok_or_else(|| anyhow!("standalone {} is missing", key.get()))?;
+        let owned = row
+            .owned_runtime()
+            .cloned()
+            .ok_or_else(|| anyhow!("standalone runtime has no durable ownership"))?;
+        let session = &self.sessions[index];
+        let snapshot = Self::standalone_snapshot(session, row);
+        let shell_matches = match (&owned.shell, &session.shell) {
+            (ShellOwnership::Closed, None) => true,
+            (ShellOwnership::Owned(expected), Some(shell)) => shell.process_identity() == expected,
+            _ => false,
+        };
+        if session.claude.process_identity() != &owned.agent || !shell_matches {
+            self.protect_standalone_teardown(key, owned.generation);
+            return Err(MutationError::Teardown(anyhow!(
+                "standalone runtime identity no longer matches durable ownership"
+            )));
+        }
+
+        // Intent first: a daemon that dies between here and the final save
+        // restores a `Stopping` row, ends the recorded runtime and does not
+        // relaunch it.
+        let before = self.repository_state.clone();
+        let row = self
+            .repository_state
+            .standalone_session_mut(key)
+            .expect("standalone resolved above");
+        row.session = snapshot;
+        row.set_lifecycle(StandaloneLifecycle::Stopping(owned.generation));
+        if let Err(error) = self.save_checked() {
+            // A save that replaced the file but could not confirm durability
+            // is committed: the close goes on and reports it at the end, as
+            // a checkout's close does.
+            if !error.replacement_committed() {
+                self.repository_state = before;
+                return Err(MutationError::Persistence(error));
+            }
+        }
+
+        if let Err(error) = self.sessions[index].kill_and_wait() {
+            self.protect_standalone_teardown(key, owned.generation);
+            return Err(MutationError::Teardown(anyhow::Error::new(error)));
+        }
+
+        let before = self.repository_state.clone();
+        self.repository_state
+            .standalone_session_mut(key)
+            .expect("standalone resolved above")
+            .set_runtime_state(StandaloneLifecycle::Inactive, None);
+        let saved = self.save_checked();
+        if let Err(error) = &saved {
+            if !error.replacement_committed() {
+                // Disk still says `Stopping`, so memory does too. The stopped
+                // session stays registered and the close is retryable.
+                self.repository_state = before;
+                return Err(MutationError::Persistence(saved.unwrap_err()));
+            }
+        }
+        self.sessions.retain(|session| session.id != id);
+        self.runtime_standalones.remove(&key);
+        if let Some(notify) = self.permission_notify.remove(&id) {
+            notify.notify_waiters();
+        }
+        saved.map_err(MutationError::Persistence)
+    }
+
+    /// End the runtime a standalone row still records and the daemon holds
+    /// no handle for, which is the state a restart finds, then leave the row
+    /// in `successor` with no owned runtime. The runtime is ended by its
+    /// recorded process identity, never by a bare pid. A row that records no
+    /// runtime only takes the transition.
+    fn end_recorded_standalone_runtime(
+        &mut self,
+        key: StandaloneKey,
+        successor: StandaloneLifecycle,
+    ) -> MutationResult<()> {
+        let recorded = self
+            .repository_state
+            .standalone_session(key)
+            .ok_or_else(|| anyhow!("standalone {} is missing", key.get()))?
+            .owned_runtime()
+            .cloned();
+        if let Some(runtime) = recorded {
+            let generation = runtime.generation;
+            let shell = match runtime.shell {
+                ShellOwnership::Closed => None,
+                ShellOwnership::Owned(identity) => Some(identity),
+            };
+            if let Err(error) = baude_core::session::finish_recorded_teardown(
+                Some(runtime.agent.pid),
+                shell.as_ref().map(|identity| identity.pid),
+                Some(runtime.agent),
+                shell,
+                false,
+                false,
+            ) {
+                self.protect_standalone_teardown(key, generation);
+                return Err(MutationError::Teardown(anyhow::Error::new(error)));
+            }
+        }
+        let before = self.repository_state.clone();
+        self.repository_state
+            .standalone_session_mut(key)
+            .expect("standalone resolved above")
+            .set_runtime_state(successor, None);
+        self.save_standalone_change(before)
+    }
+
+    /// Bring standalone row `key` to a live session and return its id. A row
+    /// whose session is live returns that session and changes nothing. Every
+    /// other row has whatever runtime it still records ended first, so no
+    /// path leaves a row recording a runtime the daemon does not hold.
+    fn reopen_standalone(&mut self, key: StandaloneKey) -> MutationResult<u64> {
+        if let Some(id) = self.runtime_standalones.get(&key).copied() {
+            match self.sessions.iter().find(|session| session.id == id) {
+                Some(session) if !session.claude.is_exited() => return Ok(id),
+                Some(_) => self.close_standalone(key, id)?,
+                None => {
+                    self.runtime_standalones.remove(&key);
+                }
+            }
+        }
+        let saved = self
+            .repository_state
+            .standalone_session(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("standalone {} is missing", key.get()))?;
+        if saved.owned_runtime().is_some() {
+            self.end_recorded_standalone_runtime(key, StandaloneLifecycle::Active)?;
+        }
+        let path = saved.canonical_path.to_path_buf();
+        let canonical = match path.canonicalize() {
+            Ok(canonical) if canonical.is_dir() && canonical == path => canonical,
+            _ => {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone cloned above")
+                    .set_runtime_state(StandaloneLifecycle::Missing, None);
+                self.save_standalone_change(before)?;
+                return Err(anyhow!("folder is missing: {}", path.display()).into());
+            }
+        };
+        let before = self.repository_state.clone();
+        let row = self
+            .repository_state
+            .standalone_session_mut(key)
+            .expect("standalone cloned above");
+        row.set_runtime_state(StandaloneLifecycle::Active, None);
+        // The resume rule. A row that was never launched starts fresh. A
+        // launched one resumes its retained conversation when the backend
+        // still has it in the canonical folder and continues otherwise; a
+        // stored id with nothing behind it is cleared in the same save that
+        // marks the row active.
+        let mode = if row.session.ever_launched {
+            lifecycle::resume_mode(&mut row.session.resume_id, |id| {
+                backend::active().resume_target_exists(&canonical, id)
+            })
+        } else {
+            backend::SpawnMode::Fresh
+        };
+        self.save_standalone_change(before)?;
+        let id = self
+            .spawn_with_mode_internal(
+                Some(RuntimeOwner::Standalone(key)),
+                canonical.clone(),
+                canonical,
+                None,
+                false,
+                Some(&saved.session.name),
+                mode,
+                saved.session.shell_open,
+            )
+            .map_err(MutationError::from_lifecycle)?;
+        if let Ok(session) = self.session_mut(id) {
+            session.name = saved.session.name;
+            session.archived = saved.session.archived;
+            session.archived_by_user = saved.session.archived_by_user;
+        }
+        self.runtime_standalones.insert(key, id);
+        Ok(id)
+    }
+
+    /// Bring the stored standalone rows back after a daemon start and return
+    /// how many were relaunched. Rows that were live are reopened, which ends
+    /// any recorded runtime first. Rows caught mid-close have their recorded
+    /// runtime ended and stay closed. Closed, missing and unreadable rows are
+    /// not touched. One row's failure does not stop the others. This never
+    /// creates a row and never lifts a suppression.
+    fn restore_standalones(&mut self) -> usize {
+        let mut rows: Vec<_> = self
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .map(|row| {
+                (
+                    row.first_seen_order,
+                    row.key,
+                    row.lifecycle().clone(),
+                    row.session.name.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(order, ..)| *order);
+        let mut restored = 0;
+        for (_, key, lifecycle, name) in rows {
+            match lifecycle {
+                StandaloneLifecycle::Active
+                | StandaloneLifecycle::Launching(_)
+                | StandaloneLifecycle::Running(_) => match self.reopen_standalone(key) {
+                    Ok(_) => restored += 1,
+                    Err(error) => eprintln!("restore {name}: {error}"),
+                },
+                StandaloneLifecycle::Stopping(_) | StandaloneLifecycle::ProtectedTeardown(_) => {
+                    if let Err(error) =
+                        self.end_recorded_standalone_runtime(key, StandaloneLifecycle::Inactive)
+                    {
+                        eprintln!("restore {name}: {error}");
+                    }
+                }
+                StandaloneLifecycle::Inactive
+                | StandaloneLifecycle::Missing
+                | StandaloneLifecycle::Io(_) => {}
+            }
+        }
+        restored
+    }
+
+    /// Record a registered launch on the row that owns it, durably, before
+    /// the launch is released.
+    fn register_runtime(&mut self, owner: RuntimeOwner, runtime: OwnedRuntime) -> Result<()> {
+        match owner {
+            RuntimeOwner::Checkout(checkout) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::LaunchRegistered(runtime),
+                    |_, _| Ok(()),
+                )?;
+            }
+            RuntimeOwner::Standalone(key) => {
+                let before = self.repository_state.clone();
+                self.repository_state
+                    .standalone_session_mut(key)
+                    .ok_or_else(|| anyhow!("standalone {} is missing", key.get()))?
+                    .set_runtime_state(
+                        StandaloneLifecycle::Launching(runtime.generation),
+                        Some(runtime),
+                    );
+                if let Err(error) = self.save_checked() {
+                    if !error.replacement_committed() {
+                        self.repository_state = before;
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a released launch on the row that owns it, durably.
+    fn release_runtime(&mut self, owner: RuntimeOwner) -> Result<()> {
+        match owner {
+            RuntimeOwner::Checkout(checkout) => {
+                self.drive_lifecycle_effect(
+                    checkout,
+                    lifecycle::LifecycleEvent::LaunchReleased,
+                    |_, _| Ok(()),
+                )?;
+            }
+            RuntimeOwner::Standalone(key) => {
+                let before = self.repository_state.clone();
+                let generation = self
+                    .repository_state
+                    .standalone_session(key)
+                    .and_then(SavedStandaloneSession::owned_runtime)
+                    .map(|runtime| runtime.generation)
+                    .ok_or_else(|| anyhow!("standalone launch has no owned runtime"))?;
+                let row = self
+                    .repository_state
+                    .standalone_session_mut(key)
+                    .expect("standalone checked above");
+                row.set_lifecycle(StandaloneLifecycle::Running(generation));
+                row.session.ever_launched = true;
+                if let Err(error) = self.save_checked() {
+                    if !error.replacement_committed() {
+                        self.repository_state = before;
+                    }
+                    return Err(anyhow::Error::new(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a standalone row whose launch failed to `lifecycle` with no
+    /// owned runtime, durably. A row that is already gone is left alone.
+    fn recover_standalone_ownership(
+        &mut self,
+        key: StandaloneKey,
+        lifecycle: StandaloneLifecycle,
+    ) -> Result<()> {
+        let before = self.repository_state.clone();
+        let Some(row) = self.repository_state.standalone_session_mut(key) else {
+            return Ok(());
+        };
+        row.set_runtime_state(lifecycle, None);
+        if let Err(error) = self.save_checked() {
+            if !error.replacement_committed() {
+                self.repository_state = before;
+            }
+            return Err(anyhow::Error::new(error));
+        }
+        Ok(())
     }
 
     fn spawn(
@@ -1163,7 +2456,7 @@ impl Manager {
         shell_open: bool,
     ) -> Result<u64> {
         self.spawn_with_mode_internal(
-            Some(checkout),
+            Some(RuntimeOwner::Checkout(checkout)),
             cwd,
             repo_root,
             branch,
@@ -1177,7 +2470,7 @@ impl Manager {
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_mode_internal(
         &mut self,
-        checkout: Option<CheckoutKey>,
+        owner: Option<RuntimeOwner>,
         cwd: PathBuf,
         repo_root: PathBuf,
         branch: Option<String>,
@@ -1238,59 +2531,99 @@ impl Manager {
 
         let targeted_resume = matches!(&mode, backend::SpawnMode::ResumeId(_));
         let plan = be.spawn_plan(&resolved.cmd, Some(&event_url(id)), mode);
-        let generation = checkout
-            .and_then(|key| {
-                self.repository_state
-                    .checkouts
-                    .iter()
-                    .find(|saved| saved.key == key)
-                    .and_then(SavedCheckout::owned_runtime)
-                    .and_then(|runtime| runtime.generation.successor())
+        let generation = owner
+            .and_then(|owner| {
+                let owned = match owner {
+                    RuntimeOwner::Checkout(key) => self
+                        .repository_state
+                        .checkouts
+                        .iter()
+                        .find(|saved| saved.key == key)
+                        .and_then(SavedCheckout::owned_runtime),
+                    RuntimeOwner::Standalone(key) => self
+                        .repository_state
+                        .standalone_session(key)
+                        .and_then(SavedStandaloneSession::owned_runtime),
+                };
+                owned.and_then(|runtime| runtime.generation.successor())
             })
             .unwrap_or(RuntimeGeneration::initial());
         let mut registered_shell = None;
-        let mut claude = if let Some(checkout) = checkout {
+        let launched = if let Some(owner) = owner {
             Pty::spawn_registered_with(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS, |agent| {
                 if shell_open {
                     let shell =
                         Pty::spawn_registered_with(None, &[], &cwd, ROWS, COLS, |identity| {
-                            self.drive_lifecycle_effect(
-                                checkout,
-                                lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                            self.register_runtime(
+                                owner,
+                                OwnedRuntime {
                                     generation,
                                     agent: agent.clone(),
                                     shell: ShellOwnership::Owned(identity.clone()),
-                                }),
-                                |_, _| Ok(()),
+                                },
                             )?;
                             Ok(())
                         })?;
                     registered_shell = Some(shell);
                 } else {
-                    self.drive_lifecycle_effect(
-                        checkout,
-                        lifecycle::LifecycleEvent::LaunchRegistered(OwnedRuntime {
+                    self.register_runtime(
+                        owner,
+                        OwnedRuntime {
                             generation,
                             agent: agent.clone(),
                             shell: ShellOwnership::Closed,
-                        }),
-                        |_, _| Ok(()),
+                        },
                     )?;
                 }
                 Ok(())
-            })?
+            })
         } else {
-            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)?
+            Pty::spawn_with_env(Some(&plan.cmd), &plan.env, &cwd, ROWS, COLS)
         };
-        if let Some(checkout) = checkout {
-            if let Err(error) = self.drive_lifecycle_effect(
-                checkout,
-                lifecycle::LifecycleEvent::LaunchReleased,
-                |_, _| Ok(()),
-            ) {
-                let _ = claude.kill_and_wait();
+        let mut claude = match launched {
+            Ok(claude) => claude,
+            Err(error) => {
+                // A failed launch returns a standalone row to `Active` with
+                // no owned runtime. A checkout's failed launch is unchanged.
+                if let Some(RuntimeOwner::Standalone(key)) = owner {
+                    if let Some(shell) = &mut registered_shell {
+                        let _ = shell.kill_and_wait();
+                    }
+                    if let Err(recovery) =
+                        self.recover_standalone_ownership(key, StandaloneLifecycle::Active)
+                    {
+                        return Err(anyhow!(
+                            "{error}; standalone launch cleanup failed: {recovery}"
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Some(owner) = owner {
+            if let Err(error) = self.release_runtime(owner) {
+                let mut stopped = claude.kill_and_wait().is_ok();
                 if let Some(shell) = &mut registered_shell {
-                    let _ = shell.kill_and_wait();
+                    stopped &= shell.kill_and_wait().is_ok();
+                }
+                // The launch that was just stopped is still on the standalone
+                // row: `Launching` when the save replaced nothing, `Running`
+                // when it replaced the file and could not confirm it. Return
+                // the row to `Active` with no owned runtime, as the failed
+                // launch above does. A stop that could not be confirmed keeps
+                // the record, which is what lets a later reopen end that
+                // runtime by its identity. The save failure stays the error
+                // the caller gets; a cleanup that cannot be saved either
+                // leaves the record for that same reopen.
+                if let (true, RuntimeOwner::Standalone(key)) = (stopped, owner) {
+                    if let Err(recovery) =
+                        self.recover_standalone_ownership(key, StandaloneLifecycle::Active)
+                    {
+                        eprintln!(
+                            "standalone {}: could not persist launch cleanup: {recovery}",
+                            key.get()
+                        );
+                    }
                 }
                 return Err(error);
             }
@@ -1380,12 +2713,13 @@ impl Manager {
                 key
             }
         };
+        let role = self.admitted_checkout_role(repository_key, snapshot.as_ref());
         let checkout_key = self.repository_state.allocate_checkout_key()?;
         let first_seen_order = self.repository_state.allocate_first_seen_order()?;
         self.repository_state.checkouts.push(SavedCheckout::new(
             checkout_key,
             repository_key,
-            CheckoutRole::ManagedBranch,
+            role,
             session.is_worktree,
             PersistedPath::from_path(&session.cwd),
             snapshot
@@ -1413,17 +2747,31 @@ impl Manager {
         Ok(())
     }
 
-    fn ensure_runtime_capacity(&self, cwd: &Path, repo_root: &Path) -> Result<()> {
+    /// Refuse an admission whose durable counters are exhausted, before
+    /// anything is stored or spawned. Allocation happens on a clone, so the
+    /// live state is never advanced here.
+    fn ensure_runtime_capacity(
+        &self,
+        cwd: &Path,
+        repo_root: &Path,
+        route: &PlainAdmission,
+    ) -> Result<()> {
         let mut state = self.repository_state.clone();
+        if matches!(route, PlainAdmission::Standalone) {
+            Self::allocate_standalone_slot(&mut state)?;
+            return Ok(());
+        }
         let snapshot = git::discover_repository(cwd).ok();
         let common = snapshot
             .as_ref()
             .map(|snapshot| PersistedPath::from_path(&snapshot.common_dir))
             .unwrap_or_else(|| PersistedPath::from_path(repo_root));
-        if !state
-            .repositories
-            .iter()
-            .any(|repository| repository.observed_common_dir == common)
+        // A joined admission adds no repository row.
+        if !matches!(route, PlainAdmission::JoinStored(_))
+            && !state
+                .repositories
+                .iter()
+                .any(|repository| repository.observed_common_dir == common)
         {
             state.allocate_repository_key()?;
             state.allocate_first_seen_order()?;
@@ -1777,6 +3125,12 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> MutationResult<()> {
+        self.session(id)?;
+        // A folder session is closed, never dropped: its row stays and must
+        // stop recording the runtime.
+        if let Some(key) = self.standalone_owner(id) {
+            return self.close_standalone(key, id);
+        }
         let session = self.session(id)?;
         let checkout_key = self
             .runtime_checkouts
@@ -2167,6 +3521,13 @@ impl Manager {
             self.reopen_checkout(checkout_key)?;
             return Ok(());
         }
+        // A folder session never reaches `restart_with_mode`: that path
+        // launches without an owner and would leave the row recording the
+        // exited runtime.
+        if let Some(key) = self.standalone_owner(id) {
+            self.reopen_standalone(key)?;
+            return Ok(());
+        }
         let targeted = self
             .runtime_checkouts
             .iter()
@@ -2409,21 +3770,39 @@ impl Manager {
                 session
                     .early_targeted_resume_exit()
                     .then(|| {
-                        self.runtime_checkouts.iter().find_map(|(key, runtime)| {
-                            (*runtime == session.id).then_some((*key, session.id))
-                        })
+                        self.runtime_checkouts
+                            .iter()
+                            .find_map(|(key, runtime)| {
+                                (*runtime == session.id).then_some(RuntimeOwner::Checkout(*key))
+                            })
+                            .or_else(|| {
+                                self.runtime_standalones.iter().find_map(|(key, runtime)| {
+                                    (*runtime == session.id)
+                                        .then_some(RuntimeOwner::Standalone(*key))
+                                })
+                            })
+                            .map(|owner| (owner, session.id))
                     })
                     .flatten()
             })
             .collect();
-        for (checkout, id) in exited {
-            if let Some(saved) = self
-                .repository_state
-                .checkouts
-                .iter_mut()
-                .find(|saved| saved.key == checkout)
-            {
-                saved.session.resume_id = None;
+        for (owner, id) in exited {
+            match owner {
+                RuntimeOwner::Checkout(checkout) => {
+                    if let Some(saved) = self
+                        .repository_state
+                        .checkouts
+                        .iter_mut()
+                        .find(|saved| saved.key == checkout)
+                    {
+                        saved.session.resume_id = None;
+                    }
+                }
+                RuntimeOwner::Standalone(key) => {
+                    if let Some(row) = self.repository_state.standalone_session_mut(key) {
+                        row.session.resume_id = None;
+                    }
+                }
             }
             if let Err(error) = self.remove(id) {
                 eprintln!("failed to reconcile early targeted resume: {error}");
@@ -2520,6 +3899,41 @@ impl Manager {
         self.persistence_target_for_test =
             Some((root.to_path_buf(), workspace.state_file(STATE_BASE)));
         self.atomic_failure_for_test = failure;
+        self.atomic_failure_window_for_test = (0, usize::MAX);
+    }
+
+    /// Test-only: let the next `healthy` saves through, fail the `failing`
+    /// saves after them with `failure`, and let every later save through.
+    /// `usize::MAX` failing saves is a disk that went bad and stayed bad.
+    /// This is how a test reaches a save in the middle of one request, such
+    /// as the one that marks a started launch as running.
+    #[cfg(test)]
+    pub(crate) fn fail_saves_after_for_test(
+        &mut self,
+        healthy: usize,
+        failing: usize,
+        failure: persist::AtomicFailure,
+    ) {
+        self.atomic_failure_for_test = Some(failure);
+        self.atomic_failure_window_for_test = (healthy, failing);
+    }
+
+    /// The failure the save about to run is given, counted against the
+    /// window `fail_saves_after_for_test` set.
+    #[cfg(test)]
+    fn scheduled_atomic_failure_for_test(&mut self) -> Option<persist::AtomicFailure> {
+        let (healthy, failing) = &mut self.atomic_failure_window_for_test;
+        if *healthy > 0 {
+            *healthy -= 1;
+            return None;
+        }
+        if *failing == 0 {
+            return None;
+        }
+        if *failing != usize::MAX {
+            *failing -= 1;
+        }
+        self.atomic_failure_for_test
     }
 
     /// Test-only: make the next confirmed stop of session `id`'s agent PTY
@@ -2689,6 +4103,91 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The plain admission router over values, with no process: each of the
+    /// four routings the daemon can reach without a discovered repository.
+    #[test]
+    fn plain_admission_routes_by_what_git_reports() {
+        type Discovery =
+            std::result::Result<git::RepositorySnapshot, git::RepositoryDiscoveryError>;
+        let path = Path::new("/tmp/baude-21-10-router/notes");
+        let not_repository = || -> Discovery {
+            Err(git::RepositoryDiscoveryError::NotRepository(
+                path.to_path_buf(),
+            ))
+        };
+
+        let empty = RepositoryState::default();
+        assert_eq!(
+            route_plain_admission(&empty, path, &not_repository()),
+            PlainAdmission::Standalone
+        );
+
+        let mut with_standalone = RepositoryState::default();
+        let (standalone, order) = Manager::allocate_standalone_slot(&mut with_standalone).unwrap();
+        with_standalone
+            .standalone_sessions
+            .push(SavedStandaloneSession::new(
+                standalone,
+                PersistedPath::from_path(path),
+                order,
+                StandaloneLifecycle::Inactive,
+                None,
+                RetainedStandaloneSessionState {
+                    name: "notes".into(),
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                    ever_launched: false,
+                },
+            ));
+        assert_eq!(
+            route_plain_admission(&with_standalone, path, &not_repository()),
+            PlainAdmission::ReuseStandalone(standalone)
+        );
+
+        let mut with_checkout = RepositoryState::default();
+        let repository = with_checkout.allocate_repository_key().unwrap();
+        let checkout = with_checkout.allocate_checkout_key().unwrap();
+        let order = with_checkout.allocate_first_seen_order().unwrap();
+        with_checkout.checkouts.push(SavedCheckout::new(
+            checkout,
+            repository,
+            CheckoutRole::ManagedBranch,
+            false,
+            PersistedPath::from_path(path),
+            None,
+            order,
+            CheckoutLifecycle::Active,
+            RetainedSessionState {
+                name: "notes".into(),
+                cwd: PersistedPath::from_path(path),
+                repo_root: PersistedPath::from_path(path),
+                branch: None,
+                is_worktree: false,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        ));
+        assert_eq!(
+            route_plain_admission(&with_checkout, path, &not_repository()),
+            PlainAdmission::JoinStored(repository)
+        );
+
+        let malformed = git::RepositoryDiscoveryError::MalformedTopology(
+            "worktree list named no main worktree".into(),
+        );
+        let display = malformed.to_string();
+        let refused: Discovery = Err(malformed);
+        let PlainAdmission::Refuse(refusal) = route_plain_admission(&empty, path, &refused) else {
+            panic!("a discovery error that is not a missing repository must be refused");
+        };
+        assert_eq!(refusal, format!("repository discovery failed: {display}"));
+        assert!(refusal.contains(&display), "{refusal}");
+    }
 
     #[test]
     fn lifecycle_protocol_contract_manager_vectors() {
@@ -3084,16 +4583,18 @@ mod tests {
     fn exhausted_durable_counter_rejects_create_before_spawn() {
         let _fixture = ManagerFixture::new("exhausted-durable-counter-rejects-create-before-spawn");
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
-        manager.repository_state.next_repository_key = u64::MAX - 1;
+        manager.repository_state.next_standalone_key = u64::MAX - 1;
 
         let error = match manager.create("/tmp", None, None) {
             Ok(_) => panic!("counter exhaustion unexpectedly spawned a session"),
             Err(error) => error.to_string(),
         };
 
-        assert!(error.contains("RepositoryKeysExhausted"), "got: {error}");
+        assert!(error.contains("StandaloneKeysExhausted"), "got: {error}");
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.runtime_standalones.is_empty());
+        assert!(manager.repository_state.standalone_sessions.is_empty());
         assert_eq!(manager.next_id, 1);
     }
 
@@ -3166,6 +4667,20 @@ mod tests {
             .observed_path
             .to_path_buf();
         (manager, state_root, fixture, repo, checkout, runtime, path)
+    }
+
+    /// A real repository with one commit under `root`, for tests whose subject
+    /// is checkout lifecycle and so need a path git reports as a repository.
+    fn committed_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        repo
     }
 
     fn persisted_at(root: &Path, workspace: &baude_core::workspace::Workspace) -> RepositoryState {
@@ -3253,7 +4768,7 @@ mod tests {
         manager.persist_at_for_test(&root, workspace, Some(persist::AtomicFailure::Rename));
 
         assert!(manager.create("/tmp", None, Some("pre")).is_err());
-        assert!(manager.repository_state.checkouts.is_empty());
+        assert!(manager.repository_state.standalone_sessions.is_empty());
         assert!(manager.sessions.is_empty());
         assert!(!root.join(workspace.state_file(STATE_BASE)).exists());
 
@@ -3263,9 +4778,10 @@ mod tests {
             Some(persist::AtomicFailure::DirectorySync),
         );
         assert!(manager.create("/tmp", None, Some("post")).is_err());
-        assert_eq!(manager.repository_state.checkouts.len(), 1);
+        assert_eq!(manager.repository_state.standalone_sessions.len(), 1);
         assert!(manager.sessions.is_empty());
         assert!(manager.runtime_checkouts.is_empty());
+        assert!(manager.runtime_standalones.is_empty());
         assert_eq!(persisted_at(&root, workspace), manager.repository_state);
     }
 
@@ -3576,7 +5092,11 @@ mod tests {
             let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, workspace, None);
-            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            let repo = committed_repo(&root);
+            let id = manager
+                .create(repo.to_str().unwrap(), None, Some(label))
+                .unwrap()
+                .id;
             manager.session_id_for_test(id, &format!("opaque-{label}"));
             manager.session_mut(id).unwrap().open_shell(5, 40).unwrap();
             let before = manager.repository_state.clone();
@@ -3656,8 +5176,9 @@ mod tests {
         let workspace = fixture.workspace();
         let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
         manager.persist_at_for_test(&root, workspace, None);
+        let repo = committed_repo(&root);
         let id = manager
-            .create("/tmp", None, Some("retained daemon"))
+            .create(repo.to_str().unwrap(), None, Some("retained daemon"))
             .unwrap()
             .id;
         manager.repository_state.checkouts[0].session.resume_id =
@@ -3796,6 +5317,68 @@ mod tests {
             Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
         );
         assert!(!manager.runtime_checkouts.contains_key(&checkout));
+    }
+
+    /// The folder counterpart of the test above: the same command double and
+    /// the same polling entry, with a plain folder admitted through `create`
+    /// in place of the repository. The row is kept, closed, with no resume id.
+    #[test]
+    fn poll_clears_an_immediately_dead_targeted_resume_for_a_folder_session() {
+        let fixture = persistence_fixture("early-targeted-resume-folder");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let folder = root.join("notes");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("todo.txt"), b"water the ferns\n").unwrap();
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(folder.to_str().unwrap(), None, Some("early folder resume"))
+            .unwrap()
+            .id;
+        let key = manager
+            .runtime_standalones
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .expect("a plain folder is admitted as a standalone row");
+        let resume_id = "resume-daemon-early-folder";
+        manager.session_id_for_test(runtime, resume_id);
+        manager.remove(runtime).unwrap();
+        let closed = persisted_at(&root, workspace);
+        assert_eq!(
+            closed.standalone_sessions[0].session.resume_id.as_deref(),
+            Some(resume_id),
+            "a close retains the conversation the session reported"
+        );
+        let transcript_cwd = closed.standalone_sessions[0].canonical_path.to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = manager.reopen_standalone(key).unwrap();
+        assert_ne!(reopened, runtime);
+        assert!(
+            manager.session(reopened).unwrap().targeted_resume,
+            "real transcript uses --resume"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        manager.poll();
+
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.standalone_sessions.len(), 1);
+        let row = &persisted.standalone_sessions[0];
+        assert_eq!(row.key, key);
+        assert_eq!(row.session.resume_id, None);
+        assert_eq!(row.lifecycle(), &StandaloneLifecycle::Inactive);
+        assert_eq!(row.owned_runtime(), None);
+        assert!(manager.list().is_empty());
+        assert!(!manager.runtime_standalones.contains_key(&key));
     }
 
     #[test]
@@ -4021,7 +5604,11 @@ mod tests {
             let workspace = fixture.workspace();
             let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
             manager.persist_at_for_test(&root, workspace, None);
-            let id = manager.create("/tmp", None, Some(label)).unwrap().id;
+            let repo = committed_repo(&root);
+            let id = manager
+                .create(repo.to_str().unwrap(), None, Some(label))
+                .unwrap()
+                .id;
             manager.persist_at_for_test(&root, workspace, Some(failure));
 
             assert!(manager.set_archived(id, true).is_err());

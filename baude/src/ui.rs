@@ -14,12 +14,15 @@ use baude_core::repository::{
 use baude_core::session::{human_duration, Session, StateSource, Status};
 use baude_core::vt100;
 
-use crate::app::{inner, pane_rects, App, Focus, Modal, SelId};
+use crate::app::{
+    inner, pane_rects, remote_removal_kind_label, App, Focus, Modal, RemoteRemovalStage,
+    RemovalOrigin, SelId,
+};
 use crate::hierarchy::{
     ActionKind, ActionView, LocalCheckoutRow, LocalRepositoryRow, LocalRow, LocalStandaloneRow,
     LocalStatus,
 };
-use crate::remote::RemoteInfo;
+use crate::remote::{RemoteInfo, REMOVAL_TIMEOUT};
 use crate::usage::human_cost;
 
 pub const SIDEBAR_WIDTH: u16 = 42;
@@ -1465,57 +1468,57 @@ fn action_status_hint(focus: Focus, view: Option<ActionView>, width: usize) -> &
                 return "n open · c clone · ? help";
             };
             if view.kind == ActionKind::Remote {
-                return "enter attach · r restart · x close · ? help";
+                return "enter attach · r restart · x close · D remove* · ? help";
             }
             if width < 80 {
                 return match view.kind {
-                    ActionKind::Repository => "enter open · w branch · ? more",
+                    ActionKind::Repository => "enter open · w branch · D rm · ? more",
                     ActionKind::Unavailable => match view.capability {
                         Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
-                            "i details · r reopen · ? more"
+                            "i details · r reopen · D rm · ? more"
                         }
                         Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
-                            "i details · r recovery · ? more"
+                            "i details · r recovery · D rm · ? more"
                         }
-                        None => "i details · ? help",
+                        None => "i details · D remove* · ? help",
                     },
                     ActionKind::Standalone => {
                         if view.has_runtime {
-                            "enter attach · x close · ? more"
+                            "enter attach · x close · D rm · ? more"
                         } else {
-                            "enter reopen · e edit · ? more"
+                            "enter reopen · e edit · D rm · ? more"
                         }
                     }
-                    _ if view.has_runtime => "enter attach · x close · ? more",
-                    _ if view.can_remove => "enter reopen · X remove · ? more",
-                    _ => "enter reopen · e edit · ? more",
+                    _ if view.has_runtime => "enter attach · x close · D rm · ? more",
+                    _ if view.can_remove => "enter reopen · X remove · D rm · ? more",
+                    _ => "enter reopen · e edit · D rm · ? more",
                 };
             }
             match view.kind {
                 ActionKind::Repository => {
-                    "enter open default · w branch · e edit · i info · ? help"
+                    "enter open default · w branch · e edit · i info · D remove* · ? help"
                 }
                 ActionKind::Unavailable => match view.capability {
                     Some(baude_core::lifecycle::LifecycleCapability::RetryReopen) => {
-                        "i details · r recheck and reopen · ? help"
+                        "i details · r recheck and reopen · D remove* · ? help"
                     }
                     Some(baude_core::lifecycle::LifecycleCapability::RetryRecovery) => {
-                        "i details · r continue recovery · ? help"
+                        "i details · r continue recovery · D remove* · ? help"
                     }
-                    None => "i details · ? help",
+                    None => "i details · D remove* · ? help",
                 },
                 ActionKind::Standalone if view.has_runtime => {
-                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · D remove* · t shell · e edit · a archive · ? help"
                 }
-                ActionKind::Standalone => "enter reopen · e edit · i info · g gsd · ? help",
+                ActionKind::Standalone => "enter reopen · e edit · i info · g gsd · D remove* · ? help",
                 _ if view.has_runtime && view.can_remove => {
-                    "enter attach · x close · X remove* · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · X remove* · D remove* · t shell · e edit · a archive · ? help"
                 }
                 _ if view.has_runtime => {
-                    "enter attach · x close · t shell · e edit · a archive · ? help"
+                    "enter attach · x close · D remove* · t shell · e edit · a archive · ? help"
                 }
-                _ if view.can_remove => "enter reopen · X remove* · e edit · i info · ? help",
-                _ => "enter reopen · e edit · i info · ? help",
+                _ if view.can_remove => "enter reopen · X remove* · D remove* · e edit · i info · ? help",
+                _ => "enter reopen · e edit · i info · D remove* · ? help",
             }
         }
     }
@@ -1770,6 +1773,96 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::Red))
                         .title(" remove managed worktree "),
+                );
+            frame.render_widget(p, rect);
+        }
+        Modal::ConfirmRemove {
+            target,
+            report,
+            scroll,
+            error,
+            origin,
+        } => {
+            // A remote confirmation is named from the daemon's own index and
+            // nothing else: the local hierarchy gives the same key numbers
+            // to different rows (D-16).
+            let kind_label = match origin {
+                RemovalOrigin::Local => app.removal_kind_label(*target),
+                RemovalOrigin::Remote(_) => remote_removal_kind_label(*target),
+            };
+            let row_name = |key: &baude_core::removal::RowKey| match origin {
+                RemovalOrigin::Local => app.removal_row_label(key),
+                RemovalOrigin::Remote(confirm) => confirm.row_label(key),
+            };
+            let title = match origin {
+                RemovalOrigin::Local => format!(" remove {kind_label} "),
+                RemovalOrigin::Remote(_) => format!(" remove remote {kind_label} "),
+            };
+            // D-07: the modal grows to at most 80% of the screen; the
+            // dropped-row list gets whatever that leaves after the fixed
+            // sections, and the hidden remainder renders as "+N more". The
+            // budget is measured against the line generator itself, so a
+            // section added there cannot clip the legend here.
+            let max_height = remove_project_modal_max_height(area.height);
+            // The stored error stays as it was received; only what is drawn
+            // has its row keys replaced by the names this origin gives them.
+            let shown_error = error
+                .as_deref()
+                .map(|text| removal_text_for_user(text, &removal_report_keys(report), &row_name));
+            let error = shown_error.as_deref();
+            let max_rows = remove_project_modal_max_rows(report, error, area.height);
+            let width: u16 = 76;
+            let inner_width = usize::from(width.saturating_sub(2));
+            let lines = match origin {
+                RemovalOrigin::Local => remove_project_confirmation_lines(
+                    report,
+                    kind_label,
+                    &row_name,
+                    error,
+                    *scroll,
+                    max_rows,
+                    inner_width,
+                ),
+                RemovalOrigin::Remote(confirm) => remote_removal_confirmation_lines(
+                    report,
+                    kind_label,
+                    &row_name,
+                    error,
+                    *scroll,
+                    max_rows,
+                    inner_width,
+                    confirm.unknown_outcome,
+                ),
+            };
+            let height = u16::try_from(lines.len() + 2)
+                .unwrap_or(u16::MAX)
+                .min(max_height);
+            let rect = centered(area, width, height);
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(title),
+                );
+            frame.render_widget(p, rect);
+        }
+        Modal::RemoteRemovePending { label, stage } => {
+            let width: u16 = 76;
+            let inner_width = usize::from(width.saturating_sub(2));
+            let lines = remote_removal_pending_lines(label, *stage, inner_width);
+            let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+            let rect = centered(area, width, height);
+            frame.render_widget(Clear, rect);
+            let p = Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<Line<'_>>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(" remote removal "),
                 );
             frame.render_widget(p, rect);
         }
@@ -2313,10 +2406,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(p, rect);
         }
         Modal::Help => {
-            // 41 paragraph lines + 2 border rows; keep in sync when adding
+            // 43 paragraph lines + 2 border rows; keep in sync when adding
             // rows or `help_overlay_lists_shift_enter`'s closing-line assert
             // fails on the clip.
-            let rect = centered(area, 60, 43);
+            let rect = centered(area, 60, 45);
             frame.render_widget(Clear, rect);
             let dim = Style::default().fg(Color::DarkGray);
             let p = Paragraph::new(vec![
@@ -2329,6 +2422,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 Line::raw("  x           close session; keep checkout"),
                 Line::raw("  X removes verified clean managed worktree"),
                 Line::raw("              local branch is retained"),
+                Line::raw("  D removes row, kills runtime, deletes managed worktrees"),
+                Line::raw("              repository parents remove every child"),
                 Line::raw("  t           open shell pane (focuses it)"),
                 Line::raw("  e           open folder in editor"),
                 Line::raw("  i           session info (model, tokens, context)"),
@@ -2416,6 +2511,347 @@ fn remove_confirmation_lines(
     ]
 }
 
+/// D-07: the tallest the `D` confirmation may grow on a screen of
+/// `area_height` rows, borders included: 80% of the screen, never under six.
+fn remove_project_modal_max_height(area_height: u16) -> u16 {
+    u16::try_from(u32::from(area_height) * 80 / 100)
+        .unwrap_or(u16::MAX)
+        .max(6)
+}
+
+/// D-07: how many dropped rows the confirmation window shows on a screen of
+/// `area_height` rows. The fixed sections are measured by asking
+/// `remove_project_confirmation_lines` for the whole list (nothing hidden, so
+/// no `+N more` line), which keeps this budget true to whatever the generator
+/// emits; when the list overflows, one line is reserved for `+N more`. The key
+/// handler and the renderer both clamp the scroll offset with this value.
+pub(crate) fn remove_project_modal_max_rows(
+    report: &baude_core::removal::RemovalReport,
+    error: Option<&str>,
+    area_height: u16,
+) -> usize {
+    let inner_height = usize::from(remove_project_modal_max_height(area_height)).saturating_sub(2);
+    // Labels never wrap, so the count does not depend on their text.
+    let unwindowed = remove_project_confirmation_lines(
+        report,
+        "",
+        &|_| String::new(),
+        error,
+        0,
+        usize::MAX,
+        usize::MAX,
+    );
+    let rows = report.rows_removed.len();
+    let fixed = unwindowed.len().saturating_sub(rows);
+    let available = inner_height.saturating_sub(fixed);
+    if rows <= available {
+        available.max(1)
+    } else {
+        available.saturating_sub(1).max(1)
+    }
+}
+
+/// Modal lines while a remote removal round trip is running: the row, what
+/// is being waited for, and the one key that does anything. A preview asks
+/// the daemon to change nothing, so only that wait offers a cancel. A sent
+/// removal cannot be recalled, so its wait says so and how long it lasts.
+pub(crate) fn remote_removal_pending_lines(
+    label: &str,
+    stage: RemoteRemovalStage,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![truncate(&format!("“{label}”"), width), String::new()];
+    match stage {
+        RemoteRemovalStage::Preview => {
+            lines.push(truncate(
+                "Asking the daemon what removing this row would do.",
+                width,
+            ));
+            lines.push(String::new());
+            lines.push(truncate("esc cancel", width));
+        }
+        RemoteRemovalStage::Execute => {
+            lines.push(truncate(
+                "The removal was sent to the daemon and cannot be recalled.",
+                width,
+            ));
+            lines.push(truncate(
+                &format!(
+                    "Waiting up to {} seconds for its answer.",
+                    REMOVAL_TIMEOUT.as_secs()
+                ),
+                width,
+            ));
+        }
+    }
+    lines
+}
+
+/// Modal lines for a remote `D` confirmation. The shared builder does the
+/// work. The one difference is a removal that was sent and never answered:
+/// that is not an error and offers no retry, so its line is headed
+/// `unknown outcome` and Enter is offered as a new preview. The line count
+/// is the shared builder's, so the scroll window needs no second measure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remote_removal_confirmation_lines(
+    report: &baude_core::removal::RemovalReport,
+    kind_label: &str,
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+    error: Option<&str>,
+    scroll: usize,
+    max_rows: usize,
+    width: usize,
+    unknown_outcome: bool,
+) -> Vec<String> {
+    let mut lines = remove_project_confirmation_lines(
+        report, kind_label, row_name, error, scroll, max_rows, width,
+    );
+    if !unknown_outcome {
+        return lines;
+    }
+    // The shared builder ends with the error line, when it has one, and
+    // then the legend. Both are rebuilt from the untruncated text.
+    let error_index = lines.len().checked_sub(2);
+    if let Some(legend) = lines.last_mut() {
+        *legend = truncate("enter preview again · esc close", width);
+    }
+    if let (Some(text), Some(index)) = (error, error_index) {
+        if let Some(line) = lines.get_mut(index) {
+            // `truncate` keeps the end of a long text, so the heading is
+            // kept whole and only the message gives way: a narrow modal
+            // must still say the outcome is unknown.
+            const HEADING: &str = "unknown outcome: ";
+            let room = width.saturating_sub(cell_width(HEADING));
+            *line = if room == 0 {
+                truncate(HEADING.trim_end(), width)
+            } else {
+                format!("{HEADING}{}", truncate(text, room))
+            };
+        }
+    }
+    lines
+}
+
+/// Removal error text as the user reads it. Core and the daemon name a row
+/// by its key in Rust debug form; here each of `keys` reads as `row_name` of
+/// it, and a key-shaped token for any other row reads `unknown row`. The
+/// word `row` core puts before a key goes with the key. Nothing else is
+/// touched: a path stays exactly as it was sent.
+///
+/// The text is read once, left to right, and a label put in is never read
+/// again, so a row whose name looks like a key cannot be rewritten twice.
+pub(crate) fn removal_text_for_user(
+    text: &str,
+    keys: &[baude_core::removal::RowKey],
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+) -> String {
+    /// How every key-shaped token starts, whatever number it carries.
+    const KEY_OPENINGS: [&str; 3] = [
+        "Repository(RepositoryKey(",
+        "Checkout(CheckoutKey(",
+        "Standalone(StandaloneKey(",
+    ];
+    const KEY_CLOSING: &str = "))";
+    const ROW_WORD: &str = "row ";
+
+    // The needle is the key's own debug text, so this stays right whatever
+    // core's derive prints.
+    let known: Vec<(String, &baude_core::removal::RowKey)> =
+        keys.iter().map(|key| (format!("{key:?}"), key)).collect();
+
+    let mut out = String::with_capacity(text.len());
+    // Where the text copied since the last label starts in `out`.
+    let mut copied_from = 0;
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        let token = known
+            .iter()
+            .find(|(needle, _)| rest.starts_with(needle.as_str()))
+            .map(|(needle, key)| (needle.len(), row_name(key)))
+            .or_else(|| {
+                let opening = KEY_OPENINGS
+                    .iter()
+                    .find(|opening| rest.starts_with(**opening))?;
+                let close = rest[opening.len()..].find(KEY_CLOSING)?;
+                Some((
+                    opening.len() + close + KEY_CLOSING.len(),
+                    crate::app::REMOVAL_UNKNOWN_ROW.to_string(),
+                ))
+            });
+        match token {
+            Some((length, label)) => {
+                let copied = &out[copied_from..];
+                if let Some(before) = copied.strip_suffix(ROW_WORD) {
+                    let whole_word = !before
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if whole_word {
+                        out.truncate(out.len() - ROW_WORD.len());
+                    }
+                }
+                out.push_str(&label);
+                copied_from = out.len();
+                rest = &rest[length..];
+            }
+            None => {
+                out.push(first);
+                rest = &rest[first.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+/// The key a report names as its target, as it appears among its rows.
+pub(crate) fn removal_target_row_key(
+    target: baude_core::removal::RemovalTarget,
+) -> baude_core::removal::RowKey {
+    use baude_core::removal::{RemovalTarget, RowKey};
+    match target {
+        RemovalTarget::Repository(key) => RowKey::Repository(key),
+        RemovalTarget::Checkout(key) => RowKey::Checkout(key),
+        RemovalTarget::Standalone(key) => RowKey::Standalone(key),
+    }
+}
+
+/// Every key a report can name in its error text: the rows it drops, the
+/// rows whose runtime it kills, and its target.
+fn removal_report_keys(
+    report: &baude_core::removal::RemovalReport,
+) -> Vec<baude_core::removal::RowKey> {
+    let mut keys = report.rows_removed.clone();
+    keys.extend(report.runtimes_killed.iter().map(|killed| killed.row));
+    keys.push(removal_target_row_key(report.target));
+    keys
+}
+
+/// Modal lines for the `D` confirmation. A pure transform over the
+/// `RemovalReport` that `preview_removal` produced: every section is read
+/// from a report field, so the confirmation cannot promise less than the real
+/// run performs (D-05). `scroll`/`max_rows` window the dropped-row list; the
+/// hidden remainder renders as `+N more` (D-07). An `error` switches the
+/// legend to retry (D-06).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_project_confirmation_lines(
+    report: &baude_core::removal::RemovalReport,
+    kind_label: &str,
+    row_name: &dyn Fn(&baude_core::removal::RowKey) -> String,
+    error: Option<&str>,
+    scroll: usize,
+    max_rows: usize,
+    width: usize,
+) -> Vec<String> {
+    use baude_core::removal::ClearingKind;
+
+    let mut lines: Vec<String> = Vec::new();
+    let heading = |lines: &mut Vec<String>, label: &str, count: usize| {
+        lines.push(truncate(&format!("{label} ({count})"), width));
+    };
+    let entry = |text: &str| truncate(&format!("  {text}"), width);
+
+    lines.push(truncate(&format!("Remove this {kind_label}?"), width));
+
+    // rows dropped: the whole list is counted in the heading; the window is
+    // what fits, and the remainder is named so a long list cannot hide a row.
+    let rows = &report.rows_removed;
+    heading(&mut lines, "rows dropped", rows.len());
+    let scroll = scroll.min(rows.len().saturating_sub(max_rows));
+    let shown = rows.iter().skip(scroll).take(max_rows);
+    for key in shown {
+        lines.push(entry(&row_name(key)));
+    }
+    let hidden = rows.len().saturating_sub(scroll + max_rows);
+    if hidden > 0 {
+        lines.push(entry(&format!("+{hidden} more")));
+    }
+
+    heading(&mut lines, "runtimes killed", report.runtimes_killed.len());
+    if report.runtimes_killed.is_empty() {
+        lines.push(entry("none"));
+    }
+    for killed in &report.runtimes_killed {
+        let pids = match killed.shell_pid {
+            Some(shell) => format!("pid {} shell {shell}", killed.agent_pid),
+            None => format!("pid {}", killed.agent_pid),
+        };
+        lines.push(entry(&format!("{} ({pids})", row_name(&killed.row))));
+    }
+
+    heading(&mut lines, "paths deleted", report.paths_deleted.len());
+    if report.paths_deleted.is_empty() {
+        lines.push(entry("none"));
+    }
+    for path in &report.paths_deleted {
+        lines.push(entry(&path.display().to_string()));
+    }
+
+    heading(&mut lines, "paths kept", report.paths_kept.len());
+    if report.paths_kept.is_empty() {
+        lines.push(entry("none"));
+    }
+    for path in &report.paths_kept {
+        lines.push(entry(&path.display().to_string()));
+    }
+
+    if !report.already_removed.is_empty() {
+        heading(&mut lines, "already removed", report.already_removed.len());
+        for path in &report.already_removed {
+            lines.push(entry(&path.display().to_string()));
+        }
+    }
+
+    if !report.cleared.is_empty() {
+        let count = |kinds: &[ClearingKind]| {
+            report
+                .cleared
+                .iter()
+                .filter(|item| kinds.contains(&item.kind))
+                .count()
+        };
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("{n} {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        let mut parts: Vec<String> = Vec::new();
+        let bindings = count(&[ClearingKind::Binding]);
+        if bindings > 0 {
+            parts.push(plural(bindings, "binding", "bindings"));
+        }
+        let markers = count(&[ClearingKind::Marker, ClearingKind::RepositoryDir]);
+        if markers > 0 {
+            parts.push(plural(markers, "marker", "markers"));
+        }
+        let suppression = count(&[
+            ClearingKind::SuppressionAdded,
+            ClearingKind::SuppressionDropped,
+        ]);
+        if suppression > 0 {
+            parts.push(plural(
+                suppression,
+                "suppression entry",
+                "suppression entries",
+            ));
+        }
+        lines.push(truncate(&format!("cleared: {}", parts.join(", ")), width));
+    }
+
+    if let Some(text) = error {
+        lines.push(truncate(&format!("error: {text}"), width));
+    }
+
+    let legend = if error.is_some() {
+        "enter retry · esc cancel"
+    } else {
+        "y/enter remove · n/esc cancel"
+    };
+    lines.push(truncate(legend, width));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2432,7 +2868,10 @@ mod tests {
 
     use crate::app::{App, Focus, Modal, SelId};
 
-    use super::{close_confirmation_lines, rate_5h_chip, remove_confirmation_lines, tilde_path};
+    use super::{
+        close_confirmation_lines, rate_5h_chip, remove_confirmation_lines,
+        remove_project_confirmation_lines, tilde_path,
+    };
 
     fn persisted_path(value: &str) -> PersistedPath {
         PersistedPath::from_path(Path::new(value))
@@ -2704,6 +3143,7 @@ mod tests {
         let (rendered, _) = render(&app, 40, 12);
         assert!(rendered.contains("repository or checkout"), "{rendered}");
         assert!(rendered.contains("X removes"), "{rendered}");
+        assert!(rendered.contains("D removes"), "{rendered}");
     }
 
     /// D-12/TKEY-03: the help overlay's global section documents the
@@ -2906,7 +3346,7 @@ mod tests {
         app.selected_id = Some(SelId::Repository(repository));
         assert_eq!(
             super::status_hint(&app, 160),
-            "enter open default · w branch · e edit · i info · ? help"
+            "enter open default · w branch · e edit · i info · D remove* · ? help"
         );
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child) if child.managed_by_baude => {
@@ -2916,11 +3356,11 @@ mod tests {
         });
         assert_eq!(
             super::status_hint(&app, 160),
-            "enter reopen · X remove* · e edit · i info · ? help"
+            "enter reopen · X remove* · D remove* · e edit · i info · ? help"
         );
         assert_eq!(
             super::status_hint(&app, 59),
-            "enter reopen · X remove · ? more"
+            "enter reopen · X remove · D rm · ? more"
         );
         app.selected_id = app.hierarchy_rows().into_iter().find_map(|row| match row {
             crate::hierarchy::LocalRow::Checkout(child) if !child.managed_by_baude => {
@@ -2930,7 +3370,7 @@ mod tests {
         });
         assert_eq!(
             super::status_hint(&app, 59),
-            "enter reopen · e edit · ? more"
+            "enter reopen · e edit · D rm · ? more"
         );
         app.focus = Focus::Claude;
         assert_eq!(
@@ -2991,33 +3431,46 @@ mod tests {
             false,
             None,
         );
+        // D-12: a remote row lists D like every local row; the daemon that
+        // owns the row previews and performs the removal. One hint at every
+        // width.
+        let remote = action_view(ActionSelection::Remote, true, None);
+        let remote_hint = super::action_status_hint(Focus::Sidebar, Some(remote), 160);
+        assert_eq!(
+            remote_hint,
+            "enter attach · r restart · x close · D remove* · ? help"
+        );
+        assert_eq!(
+            super::action_status_hint(Focus::Sidebar, Some(remote), 59),
+            "enter attach · r restart · x close · D remove* · ? help"
+        );
         for (focus, view, expected) in [
             (
                 Focus::Sidebar,
                 Some(repository),
-                "enter open default · w branch · e edit · i info · ? help",
+                "enter open default · w branch · e edit · i info · D remove* · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(live),
-                "enter attach · x close · X remove* · t shell · e edit · a archive · ? help",
+                "enter attach · x close · X remove* · D remove* · t shell · e edit · a archive · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retained),
-                "enter reopen · X remove* · e edit · i info · ? help",
+                "enter reopen · X remove* · D remove* · e edit · i info · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retry_reopen),
-                "i details · r recheck and reopen · ? help",
+                "i details · r recheck and reopen · D remove* · ? help",
             ),
             (
                 Focus::Sidebar,
                 Some(retry_recovery),
-                "i details · r continue recovery · ? help",
+                "i details · r continue recovery · D remove* · ? help",
             ),
-            (Focus::Sidebar, Some(unavailable), "i details · ? help"),
+            (Focus::Sidebar, Some(unavailable), "i details · D remove* · ? help"),
             (
                 Focus::Claude,
                 None,
@@ -3033,7 +3486,7 @@ mod tests {
         }
         assert_eq!(
             super::action_status_hint(Focus::Sidebar, Some(retained), 59),
-            "enter reopen · X remove · ? more"
+            "enter reopen · X remove · D rm · ? more"
         );
         let retained_main = action_view(
             ActionSelection::Checkout {
@@ -3046,7 +3499,7 @@ mod tests {
         );
         assert_eq!(
             super::action_status_hint(Focus::Sidebar, Some(retained_main), 59),
-            "enter reopen · e edit · ? more"
+            "enter reopen · e edit · D rm · ? more"
         );
 
         let source = include_str!("app.rs");
@@ -3310,6 +3763,774 @@ mod tests {
             .any(|line| line.contains("refs/heads/feature/safe-remove")));
         assert!(lines.iter().any(|line| line.contains("/tmp/repo worktree")));
         assert!(lines.iter().any(|line| line.contains("branch is retained")));
+    }
+
+    // ---- remove_project_confirmation_lines (plan 20-01) -------------------
+
+    mod remove_project {
+        use std::path::PathBuf;
+
+        use baude_core::removal::{
+            ClearedItem, ClearingKind, KilledRuntime, PersistenceOutcome, RemovalReport,
+            RemovalTarget, RowKey,
+        };
+        use baude_core::repository::{CheckoutKey, RepositoryKey};
+
+        /// The key newtypes keep their field private; serde is the one public
+        /// road to a value without building a repository graph on disk.
+        pub(super) fn checkout(n: u64) -> CheckoutKey {
+            serde_json::from_value(serde_json::json!(n)).expect("checkout key")
+        }
+
+        pub(super) fn repository(n: u64) -> RepositoryKey {
+            serde_json::from_value(serde_json::json!(n)).expect("repository key")
+        }
+
+        pub(super) fn report(target: RemovalTarget, rows: Vec<RowKey>) -> RemovalReport {
+            RemovalReport {
+                target,
+                planned: true,
+                rows_removed: rows,
+                runtimes_killed: Vec::new(),
+                paths_deleted: Vec::new(),
+                paths_kept: Vec::new(),
+                already_removed: Vec::new(),
+                readers_parked: Vec::new(),
+                persistence: PersistenceOutcome::Planned,
+                cleared: Vec::new(),
+                clearing_failures: Vec::new(),
+            }
+        }
+
+        pub(super) fn killed(row: RowKey, agent_pid: u32) -> KilledRuntime {
+            KilledRuntime {
+                row,
+                agent_pid,
+                shell_pid: None,
+            }
+        }
+
+        pub(super) fn cleared(kind: ClearingKind, path: &str) -> ClearedItem {
+            ClearedItem {
+                kind,
+                path: PathBuf::from(path),
+            }
+        }
+
+        /// Names rows the way the hierarchy would: `repo:child-<n>` for a
+        /// checkout, `repo` for the parent.
+        pub(super) fn name(key: &RowKey) -> String {
+            match key {
+                RowKey::Repository(_) => "repo".to_string(),
+                RowKey::Checkout(key) => format!("repo:child-{}", key.get()),
+                RowKey::Standalone(key) => format!("folder-{}", key.get()),
+            }
+        }
+
+        /// The entry lines under a heading: everything indented that follows
+        /// the first line starting with `heading`, up to the next unindented
+        /// line. Empty when the heading is absent.
+        pub(super) fn section<'a>(lines: &'a [String], heading: &str) -> Vec<&'a str> {
+            let Some(start) = lines.iter().position(|l| l.starts_with(heading)) else {
+                return Vec::new();
+            };
+            lines[start + 1..]
+                .iter()
+                .take_while(|l| l.starts_with(' '))
+                .map(|l| l.trim())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn remove_project_lines_sections_come_from_report_fields() {
+        use baude_core::removal::{ClearingKind, RemovalTarget, RowKey};
+        use remove_project::{cleared, killed, name, report, section};
+
+        let child = RowKey::Checkout(remove_project::checkout(7));
+        let mut r = report(
+            RemovalTarget::Checkout(remove_project::checkout(7)),
+            vec![child],
+        );
+        r.runtimes_killed = vec![killed(child, 4242)];
+        r.paths_deleted = vec!["/tmp/wt/feature".into()];
+        r.paths_kept = vec!["/tmp/wt/main".into()];
+        r.cleared = vec![cleared(ClearingKind::Binding, "/tmp/wt/feature")];
+
+        let lines =
+            remove_project_confirmation_lines(&r, "managed worktree", &name, None, 0, 10, 100);
+
+        assert!(
+            lines[0].contains("managed worktree"),
+            "title names the kind: {:?}",
+            lines[0]
+        );
+        assert!(lines.iter().any(|l| l.starts_with("rows dropped (1)")));
+        assert_eq!(section(&lines, "rows dropped"), vec!["repo:child-7"]);
+        assert!(lines.iter().any(|l| l.starts_with("runtimes killed (1)")));
+        assert!(section(&lines, "runtimes killed")
+            .iter()
+            .any(|l| l.contains("repo:child-7")));
+        let deleted = section(&lines, "paths deleted");
+        assert!(deleted.iter().any(|l| l.contains("/tmp/wt/feature")));
+        assert!(
+            !deleted.iter().any(|l| l.contains("/tmp/wt/main")),
+            "a kept path must never be promised as deleted: {deleted:?}"
+        );
+        assert!(section(&lines, "paths kept")
+            .iter()
+            .any(|l| l.contains("/tmp/wt/main")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("cleared") && l.contains("binding")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("y/enter remove · n/esc cancel")
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_repository_parent_lists_every_child_and_scrolls() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report, section};
+
+        let rows: Vec<RowKey> = (1..=6)
+            .map(|n| RowKey::Checkout(remove_project::checkout(n)))
+            .collect();
+        let r = report(
+            RemovalTarget::Repository(remove_project::repository(1)),
+            rows,
+        );
+
+        let top = remove_project_confirmation_lines(&r, "repository", &name, None, 0, 3, 100);
+        assert!(top.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&top, "rows dropped"),
+            vec!["repo:child-1", "repo:child-2", "repo:child-3", "+3 more"]
+        );
+
+        let mid = remove_project_confirmation_lines(&r, "repository", &name, None, 2, 3, 100);
+        assert!(mid.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&mid, "rows dropped"),
+            vec!["repo:child-3", "repo:child-4", "repo:child-5", "+1 more"]
+        );
+
+        let past = remove_project_confirmation_lines(&r, "repository", &name, None, 99, 3, 100);
+        assert!(past.iter().any(|l| l.starts_with("rows dropped (6)")));
+        assert_eq!(
+            section(&past, "rows dropped"),
+            vec!["repo:child-4", "repo:child-5", "repo:child-6"],
+            "scroll past the end clamps so the last child stays visible"
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_error_switches_legend_to_retry() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report};
+
+        let child = RowKey::Checkout(remove_project::checkout(3));
+        let r = report(
+            RemovalTarget::Checkout(remove_project::checkout(3)),
+            vec![child],
+        );
+
+        let failed = remove_project_confirmation_lines(
+            &r,
+            "managed worktree",
+            &name,
+            Some("runtime survived: pid 123"),
+            0,
+            10,
+            100,
+        );
+        assert!(failed
+            .iter()
+            .any(|l| l.contains("runtime survived: pid 123")));
+        assert_eq!(
+            failed.last().map(String::as_str),
+            Some("enter retry · esc cancel")
+        );
+
+        let clean =
+            remove_project_confirmation_lines(&r, "managed worktree", &name, None, 0, 10, 100);
+        assert!(
+            !clean.iter().any(|l| l.contains("retry")),
+            "no retry legend without an error: {clean:?}"
+        );
+        assert_eq!(
+            clean.last().map(String::as_str),
+            Some("y/enter remove · n/esc cancel")
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_already_removed_and_empty_sections() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report, section};
+
+        let child = RowKey::Checkout(remove_project::checkout(5));
+        let mut r = report(
+            RemovalTarget::Checkout(remove_project::checkout(5)),
+            vec![child],
+        );
+        r.already_removed = vec!["/tmp/wt/gone".into()];
+
+        let lines =
+            remove_project_confirmation_lines(&r, "unavailable worktree", &name, None, 0, 10, 100);
+
+        assert!(section(&lines, "already removed")
+            .iter()
+            .any(|l| l.contains("/tmp/wt/gone")));
+        let deleted = section(&lines, "paths deleted");
+        assert!(
+            !deleted.iter().any(|l| l.contains('/')),
+            "nothing may be listed as deleted when the report deletes nothing: {deleted:?}"
+        );
+    }
+
+    // ---- D confirmation modal render ------------------------------------
+
+    /// A repository with `children` managed worktrees, selected on the parent
+    /// and sitting in `Modal::ConfirmRemove` for the whole repository. Returns
+    /// the row keys the report lists so tests can name the row at any scroll.
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn confirm_remove_fixture(
+        children: u64,
+        error: Option<&str>,
+    ) -> (UiFixture, App, Vec<baude_core::removal::RowKey>) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let mut state = RepositoryState::default();
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: persisted_path("/tmp/removal/repository/.git"),
+            observed_main_worktree: persisted_path("/tmp/removal/repository"),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+            physical_key: repository.get().to_string(),
+        });
+        let mut rows = vec![RowKey::Repository(repository)];
+        for index in 0..children {
+            let key = state.allocate_checkout_key().unwrap();
+            let order = state.allocate_first_seen_order().unwrap();
+            let branch = format!("child-{index:02}");
+            let path = format!("/tmp/removal/repository worktrees/{branch}");
+            state.checkouts.push(SavedCheckout::new(
+                key,
+                repository,
+                CheckoutRole::ManagedBranch,
+                true,
+                persisted_path(&path),
+                Some(format!("refs/heads/{branch}")),
+                order,
+                CheckoutLifecycle::Inactive,
+                RetainedSessionState {
+                    name: format!("repository:{branch}"),
+                    cwd: persisted_path(&path),
+                    repo_root: persisted_path("/tmp/removal/repository"),
+                    branch: Some(branch),
+                    is_worktree: true,
+                    shell_open: false,
+                    archived: false,
+                    archived_by_user: false,
+                    resume_id: None,
+                },
+            ));
+            rows.push(RowKey::Checkout(key));
+        }
+        let fixture = UiFixture::new("confirm-remove");
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.install_hierarchy_state_for_test(state, HashMap::new());
+        app.selected_id = Some(SelId::Repository(repository));
+        app.focus = Focus::Sidebar;
+        let target = RemovalTarget::Repository(repository);
+        app.modal = Modal::ConfirmRemove {
+            target,
+            report: remove_project::report(target, rows.clone()),
+            scroll: 0,
+            error: error.map(str::to_string),
+            origin: crate::app::RemovalOrigin::Local,
+        };
+        (fixture, app, rows)
+    }
+
+    /// Rows of the rendered screen that the 76-wide centred modal occupies:
+    /// those whose cells at the modal's left and right border columns are
+    /// both box-drawing glyphs. The sidebar and panes draw their borders at
+    /// other columns, so this isolates the modal's height.
+    fn modal_rows(buffer: &ratatui::buffer::Buffer) -> Vec<u16> {
+        let left = (buffer.area.width - 76) / 2;
+        let right = left + 75;
+        let is_border =
+            |x: u16, y: u16| matches!(buffer[(x, y)].symbol(), "│" | "╭" | "╮" | "╰" | "╯");
+        (0..buffer.area.height)
+            .filter(|&y| is_border(left, y) && is_border(right, y))
+            .collect()
+    }
+
+    /// The trimmed text of the line directly under the `rows dropped` heading.
+    fn first_dropped_row(rendered: &str) -> String {
+        let lines: Vec<&str> = rendered.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|l| l.contains("rows dropped ("))
+            .unwrap_or_else(|| panic!("no rows dropped heading in:\n{rendered}"));
+        // Columns inside the 76-wide centred modal on a 100-column screen; the
+        // sidebar text left of the border is not part of the modal.
+        lines[heading + 1]
+            .chars()
+            .skip(13)
+            .take(74)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// D-07: a repository with twenty children on a 30-row screen fills the
+    /// 24-row budget (80%) exactly, names the hidden remainder as `+N more`,
+    /// and scrolling moves the window without changing the heading count
+    /// that keeps the full row set visible. The fixed sections are nine
+    /// lines (prompt, four headings, three `none` entries, legend), so with
+    /// the `+N more` line the window shows twelve of twenty-one rows.
+    #[test]
+    fn confirm_remove_modal_renders_report_lines_within_80_percent_height() {
+        let (_fixture, mut app, rows) = confirm_remove_fixture(20, None);
+
+        let (rendered, buffer) = render(&app, 100, 30);
+        assert!(rendered.contains(" remove repository "), "{rendered}");
+        assert!(rendered.contains("Remove this repository?"), "{rendered}");
+        assert!(rendered.contains("rows dropped (21)"), "{rendered}");
+        assert!(
+            rendered.contains("y/enter remove · n/esc cancel"),
+            "{rendered}"
+        );
+        let occupied = modal_rows(&buffer);
+        assert_eq!(
+            occupied.len(),
+            24,
+            "modal fills its 80% budget of 30 rows: {rendered}"
+        );
+        let more = rendered
+            .lines()
+            .find(|l| l.contains(" more"))
+            .unwrap_or_else(|| panic!("no +N more line in:\n{rendered}"));
+        assert!(more.contains("+9 more"), "{more}");
+        let first_at_top = first_dropped_row(&rendered);
+        assert_eq!(first_at_top, app.removal_row_label(&rows[0]));
+
+        if let Modal::ConfirmRemove { scroll, .. } = &mut app.modal {
+            *scroll = 5;
+        } else {
+            panic!("fixture did not leave the app in ConfirmRemove");
+        }
+        let (scrolled, buffer) = render(&app, 100, 30);
+        assert!(scrolled.contains("rows dropped (21)"), "{scrolled}");
+        assert!(scrolled.contains("+4 more"), "{scrolled}");
+        let first_scrolled = first_dropped_row(&scrolled);
+        assert_eq!(first_scrolled, app.removal_row_label(&rows[5]));
+        assert_ne!(first_scrolled, first_at_top);
+        assert_eq!(modal_rows(&buffer).len(), occupied.len());
+    }
+
+    /// D-07: `j` held past the end of the list cannot bank an invisible
+    /// surplus; one `k` afterwards moves the window up by exactly one row.
+    #[test]
+    fn confirm_remove_modal_scroll_past_end_then_up_moves_one_row() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (_fixture, mut app, rows) = confirm_remove_fixture(20, None);
+        // The main loop lays the frame out before any key arrives.
+        app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+
+        for _ in 0..(rows.len() * 3) {
+            app.handle_modal_key(key(KeyCode::Char('j')));
+        }
+        let (at_end, _) = render(&app, 100, 30);
+        let last_page_top = first_dropped_row(&at_end);
+        assert!(
+            !at_end.contains(" more"),
+            "the last page hides nothing: {at_end}"
+        );
+
+        app.handle_modal_key(key(KeyCode::Char('k')));
+        let (after_k, _) = render(&app, 100, 30);
+        let moved_top = first_dropped_row(&after_k);
+        assert_ne!(
+            moved_top, last_page_top,
+            "one k after over-scrolling moves the window: {after_k}"
+        );
+        let last_index = rows
+            .iter()
+            .position(|key| app.removal_row_label(key) == last_page_top)
+            .expect("last page top is a report row");
+        assert_eq!(moved_top, app.removal_row_label(&rows[last_index - 1]));
+        assert!(after_k.contains("+1 more"), "{after_k}");
+    }
+
+    /// D-06: a failed run leaves the modal open with the error text and the
+    /// retry legend in place of the remove legend.
+    #[test]
+    fn confirm_remove_modal_renders_error_and_retry_legend() {
+        let (_fixture, app, _rows) = confirm_remove_fixture(2, Some("state file is locked"));
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(
+            rendered.contains("error: state file is locked"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("enter retry · esc cancel"), "{rendered}");
+        assert!(!rendered.contains("y/enter remove"), "{rendered}");
+
+        // Narrow screen with a longer list: the modal shrinks to the
+        // 59-column width and the 80% cap of 16 rows (14 inside the border,
+        // ten of them fixed once the error line is counted) still leaves the
+        // prompt, the error, the legend and the hidden-row count visible.
+        let (_tall, tall_app, _) = confirm_remove_fixture(6, Some("state file is locked"));
+        let (narrow, _) = render(&tall_app, 59, 20);
+        assert!(narrow.contains("Remove this repository?"), "{narrow}");
+        assert!(narrow.contains("error: state file is locked"), "{narrow}");
+        assert!(narrow.contains("enter retry · esc cancel"), "{narrow}");
+        assert!(narrow.contains("+4 more"), "{narrow}");
+    }
+
+    // ---- remote removal modals (plan 21-06) -----------------------------
+
+    /// An App with nothing in it but the modal under test.
+    #[must_use = "the leading UiFixture owns this case's root and identity; bind it to a named \
+                  local that outlives the App's final render"]
+    fn modal_only_fixture(name: &str, modal: Modal) -> (UiFixture, App) {
+        let fixture = UiFixture::new(name);
+        let mut app = App::new(Path::new("/tmp/not-a-repository").to_path_buf());
+        app.focus = Focus::Sidebar;
+        app.modal = modal;
+        (fixture, app)
+    }
+
+    // ---- removal error-text register (plan 21-06) ------------------------
+
+    /// A daemon rows index, parsed from a `/rows` body in the field list the
+    /// 21-08 client tests send: one repository with key 1 whose checkouts are
+    /// the given ones, each `(key, display name, branch, session id)`.
+    fn daemon_rows(checkouts: &[(u64, &str, &str, Option<u64>)]) -> crate::remote::RemoteRows {
+        let checkouts: Vec<serde_json::Value> = checkouts
+            .iter()
+            .map(|(key, name, branch, session_id)| {
+                serde_json::json!({
+                    "checkout_key": key,
+                    "repository_key": 1,
+                    "display_name": name,
+                    "branch": branch,
+                    "path": format!("/srv/daemon/.baude-worktrees/{name}"),
+                    "role": "managed_branch",
+                    "managed_by_baude": true,
+                    "archived": false,
+                    "session_id": session_id
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "repositories": [{
+                "repository_key": 1,
+                "display_name": "daemon-repo",
+                "path": "/srv/daemon/repo",
+                "health": {"status": "available"},
+                "checkouts": checkouts
+            }],
+            "standalone": []
+        }))
+        .expect("the /rows body parses")
+    }
+
+    /// The part of a rendered screen row that lies inside the modal: the
+    /// sidebar shows through on both sides of it.
+    fn modal_line<'a>(rendered: &'a str, needle: &str) -> &'a str {
+        rendered
+            .lines()
+            .flat_map(|line| line.split('│'))
+            .find(|segment| segment.contains(needle))
+            .unwrap_or_else(|| panic!("no modal line with {needle:?} in:\n{rendered}"))
+    }
+
+    /// Register rule 2: a key the caller can name reads as that row's label,
+    /// and the word `row` core puts before it goes with it.
+    #[test]
+    fn removal_text_replaces_known_key_with_row_label() {
+        use baude_core::removal::RowKey;
+
+        let key = RowKey::Checkout(remove_project::checkout(3));
+        let name = |_: &RowKey| "active-zeta (feat/zeta)".to_string();
+        assert_eq!(
+            super::removal_text_for_user(
+                "row Checkout(CheckoutKey(3)): runtime survived the kill stage: still running",
+                &[key],
+                &name,
+            ),
+            "active-zeta (feat/zeta): runtime survived the kill stage: still running"
+        );
+        assert_eq!(
+            super::removal_text_for_user(
+                "removal target Checkout(CheckoutKey(3)) is not in the saved state",
+                &[key],
+                &name,
+            ),
+            "removal target active-zeta (feat/zeta) is not in the saved state"
+        );
+    }
+
+    /// Register rule 2: a key nothing can name reads `unknown row`, for every
+    /// kind of key, and the namer is never asked about it.
+    #[test]
+    fn removal_text_unknown_key_reads_unknown_row() {
+        use baude_core::removal::RowKey;
+
+        let name = |key: &RowKey| panic!("no key was handed over, yet {key:?} was looked up");
+        assert_eq!(
+            super::removal_text_for_user(
+                "row Checkout(CheckoutKey(3)): runtime survived the kill stage: still running",
+                &[],
+                &name,
+            ),
+            "unknown row: runtime survived the kill stage: still running"
+        );
+        let both = super::removal_text_for_user(
+            "repository is busy: Repository(RepositoryKey(4)) and row Standalone(StandaloneKey(12)) are in use",
+            &[],
+            &name,
+        );
+        assert!(!both.contains("Key("), "{both}");
+        assert_eq!(
+            both,
+            "repository is busy: unknown row and unknown row are in use"
+        );
+    }
+
+    /// Register rule 3: a path in the text is shown exactly as sent, and text
+    /// with no key in it is not touched at all.
+    #[test]
+    fn removal_text_leaves_paths_and_plain_text_alone() {
+        use baude_core::removal::RowKey;
+
+        const PATH: &str = "/home/dev/.baude/worktrees/zeta";
+        let key = RowKey::Checkout(remove_project::checkout(3));
+        let name = |_: &RowKey| "active-zeta".to_string();
+        let shown = super::removal_text_for_user(
+            &format!("row Checkout(CheckoutKey(3)): could not remove {PATH}: Permission denied"),
+            &[key],
+            &name,
+        );
+        assert_eq!(
+            shown,
+            format!("active-zeta: could not remove {PATH}: Permission denied")
+        );
+        assert!(!shown.contains('~'), "{shown}");
+        assert_eq!(
+            super::removal_text_for_user(
+                "repository busy: another removal is running",
+                &[key],
+                &name
+            ),
+            "repository busy: another removal is running"
+        );
+        assert_eq!(super::removal_text_for_user("", &[key], &name), "");
+    }
+
+    /// A local confirmation shows a stored error in core's `row {key:?}`
+    /// shape with the local row's name in place of the key.
+    #[test]
+    fn removal_text_local_modal_error_line_shows_row_label() {
+        let (_fixture, mut app, rows) = confirm_remove_fixture(2, None);
+        let named = rows[1];
+        let label = app.removal_row_label(&named);
+        assert!(
+            label != crate::app::REMOVAL_UNKNOWN_ROW && !label.contains("Key("),
+            "the local hierarchy names the row: {label}"
+        );
+        if let Modal::ConfirmRemove { error, .. } = &mut app.modal {
+            *error = Some(format!("row {named:?}: still running"));
+        }
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert_eq!(
+            modal_line(&rendered, "error: ").trim_end(),
+            format!("error: {label}: still running"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Key("), "{rendered}");
+    }
+
+    /// D-16: a remote confirmation names the key in its error line from the
+    /// daemon's index, although a local row carries the same key number.
+    #[test]
+    fn remote_removal_modal_error_line_shows_row_label_not_key_text() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let (_fixture, mut app, rows) = confirm_remove_fixture(2, None);
+        let named = rows[1];
+        let RowKey::Checkout(checkout) = named else {
+            panic!("the fixture's second row is a checkout, got {named:?}");
+        };
+        let local = app.removal_row_label(&named);
+        assert_ne!(
+            local,
+            crate::app::REMOVAL_UNKNOWN_ROW,
+            "a local row has the key"
+        );
+        let target = RemovalTarget::Checkout(checkout);
+        app.modal = Modal::ConfirmRemove {
+            target,
+            report: remove_project::report(target, vec![named]),
+            scroll: 0,
+            error: Some(format!("row {named:?}: still running")),
+            origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                rows: daemon_rows(&[(checkout.get(), "active-zeta", "feat/zeta", Some(41))]),
+                label: "active-zeta".into(),
+                unknown_outcome: false,
+            })),
+        };
+
+        let (rendered, _) = render(&app, 100, 30);
+        let error_line = modal_line(&rendered, "error: ").trim_end();
+        assert_eq!(
+            error_line, "error: active-zeta (feat/zeta): still running",
+            "{rendered}"
+        );
+        assert!(!error_line.contains(&local), "{rendered}");
+        assert!(!rendered.contains("Key("), "{rendered}");
+    }
+
+    /// D-16 at any size: a remote repository confirmation names every row the
+    /// daemon's index knows, with or without a live session, and says
+    /// `unknown row` for the one it does not.
+    #[test]
+    fn remote_removal_modal_names_every_row_from_the_daemon_index() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let repository = remove_project::repository(1);
+        let target = RemovalTarget::Repository(repository);
+        let mut rows = vec![RowKey::Repository(repository)];
+        rows.extend((2..=5).map(|n| RowKey::Checkout(remove_project::checkout(n))));
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-every-row",
+            Modal::ConfirmRemove {
+                target,
+                report: remove_project::report(target, rows),
+                scroll: 0,
+                error: None,
+                origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                    rows: daemon_rows(&[
+                        (2, "active-zeta", "feat/zeta", Some(41)),
+                        (3, "idle-eta", "feat/eta", None),
+                        (4, "idle-theta", "fix/theta", None),
+                    ]),
+                    label: "active-zeta".into(),
+                    unknown_outcome: false,
+                })),
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 40);
+        for named in [
+            "daemon-repo",
+            "active-zeta (feat/zeta)",
+            "idle-eta (feat/eta)",
+            "idle-theta (fix/theta)",
+        ] {
+            assert!(rendered.contains(named), "{named} is named: {rendered}");
+        }
+        assert_eq!(
+            rendered.matches("unknown row").count(),
+            1,
+            "only the checkout the index does not list: {rendered}"
+        );
+        assert!(
+            rendered.contains(" remove remote repository "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Key("), "{rendered}");
+    }
+
+    /// The wait for a daemon's preview names the row and can be cancelled.
+    #[test]
+    fn remote_removal_modal_pending_renders_row_name() {
+        use crate::app::RemoteRemovalStage;
+
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-pending-preview",
+            Modal::RemoteRemovePending {
+                label: "active-zeta".into(),
+                stage: RemoteRemovalStage::Preview,
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("active-zeta"), "{rendered}");
+        assert!(rendered.contains("esc cancel"), "{rendered}");
+    }
+
+    /// A removal that was sent and never answered is shown as an unknown
+    /// outcome with a way to look again. It is never called a failure and
+    /// never offers to send the same removal again.
+    #[test]
+    fn remote_removal_modal_unknown_outcome_never_says_failed() {
+        use crate::app::{RemoteConfirm, RemovalOrigin};
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let checkout: baude_core::repository::CheckoutKey =
+            serde_json::from_value(serde_json::json!(7)).expect("checkout key");
+        let target = RemovalTarget::Checkout(checkout);
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-unknown-outcome",
+            Modal::ConfirmRemove {
+                target,
+                report: remove_project::report(target, vec![RowKey::Checkout(checkout)]),
+                scroll: 0,
+                error: Some(
+                    "the daemon did not answer; “active-zeta” may or may not have been removed"
+                        .into(),
+                ),
+                origin: RemovalOrigin::Remote(Box::new(RemoteConfirm {
+                    rows: crate::remote::RemoteRows::default(),
+                    label: "active-zeta".into(),
+                    unknown_outcome: true,
+                })),
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("unknown outcome"), "{rendered}");
+        assert!(rendered.contains("enter preview again"), "{rendered}");
+        assert!(!rendered.contains("failed"), "{rendered}");
+        assert!(!rendered.contains("retry"), "{rendered}");
+    }
+
+    /// The wait for a sent removal says it cannot be recalled and how long
+    /// the TUI waits, and offers no cancel.
+    #[test]
+    fn remote_removal_modal_pending_execute_says_cannot_be_recalled() {
+        use crate::app::RemoteRemovalStage;
+
+        let (_fixture, app) = modal_only_fixture(
+            "remote-remove-pending-execute",
+            Modal::RemoteRemovePending {
+                label: "active-zeta".into(),
+                stage: RemoteRemovalStage::Execute,
+            },
+        );
+
+        let (rendered, _) = render(&app, 100, 30);
+        assert!(rendered.contains("active-zeta"), "{rendered}");
+        assert!(rendered.contains("cannot be recalled"), "{rendered}");
+        let seconds = crate::remote::REMOVAL_TIMEOUT.as_secs().to_string();
+        assert!(rendered.contains(&seconds), "{seconds}: {rendered}");
+        assert!(!rendered.contains("esc cancel"), "{rendered}");
     }
 
     // ---- UI fixture ownership regressions -------------------------------

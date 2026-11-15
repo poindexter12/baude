@@ -14,14 +14,19 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current State (v2.6.0; last GSD milestone v2.3 shipped 2026-09-22)
+## Current State (v2.7.3; last GSD milestone v2.3 shipped 2026-09-22)
 
-v2.6.0 is the current release. The latest GSD-completed milestone is v2.3 through Phase 17 (phases 13-17, archived under `milestones/v2.3-*`, closed out 2026-10-13). v2.3.1 through v2.6.0 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them. The codebase is about 62.3k lines of Rust across `baude-core`, `baude`, and `bauded`.
+v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 through Phase 17 (phases 13-17, archived under `milestones/v2.3-*`, closed out 2026-10-13). v2.3.1 through v2.7.3 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them. The codebase is about 62.3k lines of Rust across `baude-core`, `baude`, and `bauded`.
 
-## Current Milestone: none
+## Current Milestone: v2.8 Project Removal
 
-v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milestone` to open one.
+**Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path.
 
+**Target features:**
+- A remove action that works on repository parents (with all children), single checkout or worktree children, and standalone folder rows, including rows with a live runtime
+- Owned runtime is killed before the rows drop; baude-managed worktrees are removed from disk; main checkouts, standalone folders and local branches are never deleted
+- Removal clears the folder-workspace binding and marker ownership so the startup sweep and reconcile do not re-admit the project; it comes back only through `n`, `c`, or launching baude inside the folder
+- Daemon parity: the same removal over the REST API and from the PWA
 ## Requirements
 
 ### Validated
@@ -29,6 +34,7 @@ v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milesto
 <!-- Shipped and confirmed valuable. -->
 
 - ✓ Multi-session TUI with stable sidebar order, in-place waiting flash, and live status (waiting/working/exited) — v0.1–v0.2
+- ✓ One shared baude-core removal operation: kills the owned process group SIGTERM then SIGKILL before any row or file drops, removes managed worktrees from disk, never deletes a main checkout, standalone folder or local branch, and persists in a single atomic save with a serializable report — Phase 18 (gates green on macOS and Linux at abba527)
 - ✓ Git-worktree sessions for parallel work in one repo; keep/remove on close — v0.1
 - ✓ Per-session shell pane and "open folder in editor" — v0.2
 - ✓ Live Claude metadata from disk (model, context %, permission mode, tokens, GSD state) — v0.3
@@ -69,7 +75,13 @@ v2.3 is closed. The next milestone has not been scoped — run `/gsd-new-milesto
 
 <!-- Current milestone scope. -->
 
-No milestone is open. Candidates carried out of v2.3:
+v2.8 Project Removal:
+
+- [ ] User can remove a repository parent with every child, a single checkout or worktree child, or a standalone row from the sidebar in one confirmed action, even while a runtime is live
+- [ ] Removed projects stay gone across reconcile and relaunch until re-added by `n`, `c`, or launching inside the folder
+- [ ] The daemon exposes the same removal over REST and the PWA offers it
+
+Carried out of v2.3, not in this milestone:
 
 - [ ] Reduce first-frame latency. v2.3 made startup *measurable* and idle *quiet*, which it set out to do, but the measured `first_frame` is 5,537 ms of a 6,859 ms total on a release binary with an empty state. Cutting that was never in v2.3's scope and is still open.
 - [x] Replace `timing_disabled_when_env_unset` with a test that exercises the production `BAUDE_TIMING` gate rather than re-reading the environment variable. Done (SQ-12): the gate is now `timing_requested`, called by `main` and tested over env values crossed with the flag.
@@ -139,6 +151,8 @@ No milestone is open. Candidates carried out of v2.3:
 | Close v2.3 as `override_closeout` on stale verification rather than re-verifying 5 phases (2026-10-13) | Every phase passed in September; the staleness is digest drift from main advancing through v2.6. Re-running the verifier would check v2.3 goals against three milestones of later rework and report drift as failure | — Pending — honest for a late closeout, but it is the second milestone in a row to close by override |
 | Leave Phase 13 and 14 `VALIDATION.md` as unfilled templates rather than back-filling them at closeout (2026-10-13) | A validation contract invented after the fact never governed the execution it claims to describe; a visible gap is worth more than a fabricated record | ✓ Good — recorded in MILESTONES.md Known Gaps |
 | GSD must not create tags: `git.create_tag: false` (2026-10-13) | release-please owns the `vX.Y.Z` namespace; GSD's closeout would mint a bare `v2.3`, colliding with it | ✓ Good — no bare GSD tag exists for v2.3 |
+| Removal is one ordered pipeline in baude-core: select, preflight, clone, remove rows, validate, kill, disk, single save; forced worktree removal runs against the common dir, proves group membership by session, and refuses worktrees holding submodule gitdirs (2026-11-03) | The TUI and daemon must share one path so parity is structural, and every destructive step must be gated by evidence from the live tree rather than from the saved row | ✓ Good — Phase 18, four cross-AI review cycles then one code review; all Critical and Warning findings fixed |
+| Prove the Linux gate at HEAD with the unmodified gate.sh in rust:1-bookworm and CARGO_TARGET_DIR off the bind mount, rather than editing gate.sh --linux inside the phase (2026-11-03) | The --linux lane fails on this host from a Docker Desktop bind-mount visibility race, not from phase code; the one-line fix is out of plan 07's allowlist and is deferred to the roadmap, so the proof had to come from an equivalent invocation | — Pending — fix tracked in deferred-items and WINDOWS.md; blocks /gsd-ship until landed |
 
 ## Evolution
 
@@ -158,4 +172,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-13 after v2.3 milestone closeout*
+*Last updated: 2026-11-03 after Phase 18*

@@ -517,6 +517,15 @@ pub struct RepositoryState {
     pub standalone_sessions: Vec<SavedStandaloneSession>,
 }
 
+/// Rows removed from a [`RepositoryState`] by [`RepositoryState::remove_rows`],
+/// in state order within each kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemovedRows {
+    pub repositories: Vec<SavedRepository>,
+    pub checkouts: Vec<SavedCheckout>,
+    pub standalone_sessions: Vec<SavedStandaloneSession>,
+}
+
 impl Default for RepositoryState {
     fn default() -> Self {
         Self {
@@ -871,11 +880,45 @@ impl RepositoryState {
         &mut self,
         key: StandaloneKey,
     ) -> Option<SavedStandaloneSession> {
-        let index = self
-            .standalone_sessions
-            .iter()
-            .position(|session| session.key == key)?;
-        Some(self.standalone_sessions.remove(index))
+        self.remove_rows(&[], &[], &[key]).standalone_sessions.pop()
+    }
+
+    /// Removes any combination of repository, checkout and standalone rows by
+    /// key in one mutation and returns the removed rows in state order.
+    ///
+    /// This is the one mutation removal uses for every row kind. The result is
+    /// not safe to persist until the caller has run `validate()` on the mutated
+    /// aggregate, or `validate_for_save()` when the next step is a save, because
+    /// `remove_rows` performs no validation of its own. `validate()` rejects a
+    /// dangling child but not a childless parent, which is why callers remove
+    /// the full parent-plus-children set in one call and validate the whole
+    /// aggregate afterwards.
+    pub fn remove_rows(
+        &mut self,
+        repositories: &[RepositoryKey],
+        checkouts: &[CheckoutKey],
+        standalone: &[StandaloneKey],
+    ) -> RemovedRows {
+        let (removed_repositories, kept_repositories): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.repositories)
+                .into_iter()
+                .partition(|row| repositories.contains(&row.key));
+        self.repositories = kept_repositories;
+        let (removed_checkouts, kept_checkouts): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.checkouts)
+                .into_iter()
+                .partition(|row| checkouts.contains(&row.key));
+        self.checkouts = kept_checkouts;
+        let (removed_standalone, kept_standalone): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.standalone_sessions)
+                .into_iter()
+                .partition(|row| standalone.contains(&row.key));
+        self.standalone_sessions = kept_standalone;
+        RemovedRows {
+            repositories: removed_repositories,
+            checkouts: removed_checkouts,
+            standalone_sessions: removed_standalone,
+        }
     }
 
     pub fn allocate_first_seen_order(&mut self) -> Result<u64, AllocationError> {
@@ -1199,6 +1242,228 @@ mod tests {
                 ever_launched: false,
             },
         )
+    }
+
+    fn repository_at(
+        key: RepositoryKey,
+        order: u64,
+        common_dir: &str,
+        main_worktree: &str,
+    ) -> SavedRepository {
+        SavedRepository {
+            observed_common_dir: path(common_dir),
+            observed_main_worktree: path(main_worktree),
+            ..repository(key, order)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkout_at(
+        key: CheckoutKey,
+        repository_key: RepositoryKey,
+        order: u64,
+        role: CheckoutRole,
+        checkout_path: &str,
+        repo_root: &str,
+        branch: &str,
+    ) -> SavedCheckout {
+        let mut row = checkout(key, repository_key, order);
+        row.role = role;
+        row.observed_path = path(checkout_path);
+        row.observed_branch = Some(branch.into());
+        row.session.cwd = path(checkout_path);
+        row.session.repo_root = path(repo_root);
+        row.session.branch = Some(branch.into());
+        row.session.is_worktree = checkout_path != repo_root;
+        row
+    }
+
+    struct RemovalFixture {
+        state: RepositoryState,
+        k: RepositoryKey,
+        j: RepositoryKey,
+        c1: CheckoutKey,
+        c2: CheckoutKey,
+        c3: CheckoutKey,
+        s: StandaloneKey,
+    }
+
+    /// Repository k with checkouts c1 and c2, repository j with checkout c3,
+    /// and standalone s; every key and order comes from the allocators so the
+    /// seed validates before any test mutates it.
+    fn removal_fixture() -> RemovalFixture {
+        let mut state = RepositoryState::default();
+        let k = state.allocate_repository_key().unwrap();
+        let j = state.allocate_repository_key().unwrap();
+        let c1 = state.allocate_checkout_key().unwrap();
+        let c2 = state.allocate_checkout_key().unwrap();
+        let c3 = state.allocate_checkout_key().unwrap();
+        let s = state.allocate_standalone_key().unwrap();
+        let mut order = || state.allocate_first_seen_order().unwrap();
+        let orders: Vec<u64> = (0..6).map(|_| order()).collect();
+        state
+            .repositories
+            .push(repository_at(k, orders[0], "/k/.git", "/k"));
+        state
+            .repositories
+            .push(repository_at(j, orders[1], "/j/.git", "/j"));
+        state.checkouts.push(checkout_at(
+            c1,
+            k,
+            orders[2],
+            CheckoutRole::PrimaryDefault,
+            "/k-default",
+            "/k",
+            "main",
+        ));
+        state.checkouts.push(checkout_at(
+            c2,
+            k,
+            orders[3],
+            CheckoutRole::ManagedBranch,
+            "/k-feature",
+            "/k",
+            "feature/x",
+        ));
+        state.checkouts.push(checkout_at(
+            c3,
+            j,
+            orders[4],
+            CheckoutRole::PrimaryDefault,
+            "/j-default",
+            "/j",
+            "main",
+        ));
+        state
+            .standalone_sessions
+            .push(standalone(s, "/notes", orders[5]));
+        assert_eq!(state.validate(), Ok(()));
+        RemovalFixture {
+            state,
+            k,
+            j,
+            c1,
+            c2,
+            c3,
+            s,
+        }
+    }
+
+    fn counters(state: &RepositoryState) -> (u64, u64, u64, u64) {
+        (
+            state.next_repository_key,
+            state.next_checkout_key,
+            state.next_standalone_key,
+            state.next_first_seen_order,
+        )
+    }
+
+    #[test]
+    fn remove_rows_repository_with_children_leaves_no_row_with_that_key_and_validates() {
+        let RemovalFixture {
+            mut state,
+            k,
+            j,
+            c1,
+            c2,
+            c3,
+            ..
+        } = removal_fixture();
+        let before = state.clone();
+        assert_eq!(before.validate(), Ok(()));
+        let expected = RemovedRows {
+            repositories: vec![before.repositories[0].clone()],
+            checkouts: vec![before.checkouts[0].clone(), before.checkouts[1].clone()],
+            standalone_sessions: Vec::new(),
+        };
+
+        let removed = state.remove_rows(&[k], &[c1, c2], &[]);
+
+        assert_eq!(removed, expected);
+        assert_eq!(
+            state
+                .repositories
+                .iter()
+                .map(|repository| repository.key)
+                .collect::<Vec<_>>(),
+            vec![j]
+        );
+        assert_eq!(
+            state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .collect::<Vec<_>>(),
+            vec![c3]
+        );
+        assert!(!state
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.repository_key == k));
+        assert_eq!(state.standalone_sessions, before.standalone_sessions);
+        assert_eq!(state.validate(), Ok(()));
+        assert_eq!(counters(&state), counters(&before));
+    }
+
+    #[test]
+    fn remove_rows_parent_only_is_rejected_by_validate_as_dangling() {
+        let RemovalFixture {
+            mut state,
+            k,
+            c1,
+            c2,
+            ..
+        } = removal_fixture();
+        let before = state.clone();
+        assert_eq!(before.validate(), Ok(()));
+
+        let removed = state.remove_rows(&[k], &[], &[]);
+
+        assert_eq!(removed.repositories, vec![before.repositories[0].clone()]);
+        assert!(removed.checkouts.is_empty());
+        assert!(removed.standalone_sessions.is_empty());
+        assert!(state.checkouts.iter().any(|checkout| checkout.key == c1));
+        assert!(state.checkouts.iter().any(|checkout| checkout.key == c2));
+        assert_eq!(
+            state.validate(),
+            Err(ValidationError::DanglingRepositoryKey(k))
+        );
+        assert_eq!(counters(&state), counters(&before));
+    }
+
+    #[test]
+    fn remove_rows_unknown_keys_are_no_ops_and_counters_unchanged() {
+        let RemovalFixture { mut state, .. } = removal_fixture();
+        let before = state.clone();
+        assert_eq!(before.validate(), Ok(()));
+
+        let removed = state.remove_rows(
+            &[RepositoryKey(999)],
+            &[CheckoutKey(999)],
+            &[StandaloneKey(999)],
+        );
+
+        assert_eq!(removed, RemovedRows::default());
+        assert_eq!(state, before);
+        assert_eq!(counters(&state), counters(&before));
+    }
+
+    #[test]
+    fn remove_rows_removes_standalone_and_returns_it() {
+        let RemovalFixture { mut state, s, .. } = removal_fixture();
+        let before = state.clone();
+        assert_eq!(before.validate(), Ok(()));
+
+        let removed = state.remove_rows(&[], &[], &[s]);
+
+        assert_eq!(removed.standalone_sessions, before.standalone_sessions);
+        assert!(removed.repositories.is_empty());
+        assert!(removed.checkouts.is_empty());
+        assert!(state.standalone_sessions.is_empty());
+        assert_eq!(state.repositories, before.repositories);
+        assert_eq!(state.checkouts, before.checkouts);
+        assert_eq!(state.validate(), Ok(()));
+        assert_eq!(counters(&state), counters(&before));
     }
 
     #[test]

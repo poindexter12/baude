@@ -505,4 +505,147 @@ mod tests {
         context.flush(&state, 5_000);
         assert!(!context.is_unpopulated());
     }
+
+    /// A real `git init` repository under `root`, with the author config and
+    /// one commit a user's clone would carry.
+    fn init_repository(root: &Path, name: &str) -> PathBuf {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} in {}: {}",
+                cwd.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(root, &["init", "-q", "-b", "main", name]);
+        let repo = root.join(name);
+        git(&repo, &["config", "user.name", "Baude Test"]);
+        git(&repo, &["config", "user.email", "baude@example.invalid"]);
+        std::fs::write(repo.join("tracked.txt"), b"fixture\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-q", "-m", "fixture"]);
+        std::fs::canonicalize(repo).unwrap()
+    }
+
+    /// Seed a repository row and its inactive main checkout for a real
+    /// repository on disk, the shape the removal stage validates against.
+    fn seed_repository(
+        state: &mut RepositoryState,
+        repo: &Path,
+    ) -> crate::repository::RepositoryKey {
+        let common_dir = crate::git::discover_repository(repo)
+            .expect("discover repository")
+            .common_dir;
+        let repository = state.allocate_repository_key().unwrap();
+        let repository_order = state.allocate_first_seen_order().unwrap();
+        state.repositories.push(SavedRepository {
+            key: repository,
+            observed_common_dir: PersistedPath::from_path(&common_dir),
+            observed_main_worktree: PersistedPath::from_path(repo),
+            first_seen_order: repository_order,
+            health: RepositoryHealth::Available,
+            physical_key: String::new(),
+        });
+        let key = state.allocate_checkout_key().unwrap();
+        let order = state.allocate_first_seen_order().unwrap();
+        state.checkouts.push(SavedCheckout::new(
+            key,
+            repository,
+            CheckoutRole::Main,
+            false,
+            PersistedPath::from_path(repo),
+            Some("main".into()),
+            order,
+            CheckoutLifecycle::Inactive,
+            RetainedSessionState {
+                name: "main".into(),
+                cwd: PersistedPath::from_path(repo),
+                repo_root: PersistedPath::from_path(repo),
+                branch: Some("main".into()),
+                is_worktree: false,
+                shell_open: false,
+                archived: false,
+                archived_by_user: false,
+                resume_id: None,
+            },
+        ));
+        repository
+    }
+
+    #[test]
+    fn flush_drops_crumb_of_removed_path() {
+        let root = std::fs::canonicalize(scratch("removed-path")).unwrap();
+        // Redirect first, identity second: locals drop in reverse order, so
+        // the identity is restored before the root it was resolved against.
+        let _redirect = crate::testing::TestRedirect::new(&root);
+        let _identity = crate::workspace::override_for_test(
+            &crate::persist::Config {
+                workspace: Some("crumbtest-removal".to_string()),
+                ..crate::persist::Config::default()
+            },
+            None,
+        );
+        std::fs::create_dir_all(crate::git::worktrees_base()).unwrap();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let ws = workspace();
+
+        let removed_repo = init_repository(&root, "removed");
+        let surviving_repo = init_repository(&root, "survivor");
+        let removed_path = PersistedPath::from_path(&removed_repo);
+        let surviving_path = PersistedPath::from_path(&surviving_repo);
+        let mut state = RepositoryState::default();
+        let removed_key = seed_repository(&mut state, &removed_repo);
+        seed_repository(&mut state, &surviving_repo);
+        state.validate_for_save().expect("seed is save-valid");
+
+        let launch_dir = root.join("launch");
+        let mut context = FolderContext::load(Some(root.clone()), &ws, &launch_dir, 0);
+        context.record_checkout(&removed_path, 1);
+        context.flush(&state, 1);
+        let (on_disk, corrupted) = load_file(&root.join(ws.state_file(FILE_BASE)));
+        assert!(!corrupted);
+        let entry = on_disk
+            .folders
+            .get(context.folder_key())
+            .expect("folder entry");
+        assert!(entry.contains_checkout(&removed_path));
+
+        let mut handles = Vec::new();
+        crate::removal::remove(
+            &mut state,
+            crate::removal::RemovalTarget::Repository(removed_key),
+            &mut handles,
+            |file| {
+                crate::persist::save_current_at_test(&state_root, "state.json", file, None, None)
+            },
+        )
+        .expect("remove repository");
+        assert!(!state
+            .checkouts
+            .iter()
+            .any(|checkout| checkout.observed_path == removed_path));
+
+        // Mirrors the TUI recording the surviving selection before its post-removal flush.
+        context.record_checkout(&surviving_path, 2);
+        context.flush(&state, 2);
+
+        let (on_disk, corrupted) = load_file(&root.join(ws.state_file(FILE_BASE)));
+        assert!(!corrupted);
+        let entry = on_disk
+            .folders
+            .get(context.folder_key())
+            .expect("folder entry");
+        assert!(!entry.contains_checkout(&removed_path));
+        assert!(entry.contains_checkout(&surviving_path));
+        let reloaded = FolderContext::load(Some(root.clone()), &ws, &launch_dir, 3);
+        assert!(!reloaded.entry().contains_checkout(&removed_path));
+        assert!(reloaded.entry().contains_checkout(&surviving_path));
+    }
 }

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::repository::SavedCheckout;
 
@@ -318,6 +319,64 @@ pub(crate) fn worktree_inventory(
     Ok(worktrees)
 }
 
+/// Whether git's stderr says the path is not inside any repository.
+///
+/// A folder whose `.git` file points at a repository that no longer exists,
+/// such as a worktree left behind after its repository was deleted, is
+/// reported as `not a git repository` by older git and as `gitfile does not
+/// point to a valid repository` by newer git. Both mean the same thing here.
+pub fn is_not_repository_stderr(stderr: &str) -> bool {
+    stderr.starts_with("fatal: not a git repository")
+        || stderr.starts_with("fatal: gitfile does not point to a valid repository")
+}
+
+#[cfg(test)]
+mod not_repository_tests {
+    use super::{discover_repository, is_not_repository_stderr, RepositoryDiscoveryError};
+
+    #[test]
+    fn both_git_wordings_for_a_stale_gitfile_mean_no_repository() {
+        // Older git, and the wording a plain folder gets from every version.
+        assert!(is_not_repository_stderr(
+            "fatal: not a git repository: /tmp/gone/.git/worktrees/stale\n"
+        ));
+        // Newer git, seen on the ubuntu-22.04 CI runner on 2026-11-14.
+        assert!(is_not_repository_stderr(
+            "fatal: gitfile does not point to a valid repository: /tmp/stale/.git\n"
+        ));
+        assert!(!is_not_repository_stderr(
+            "fatal: invalid gitfile format: /tmp/stale/.git\n"
+        ));
+        assert!(!is_not_repository_stderr(
+            "fatal: detected dubious ownership in repository at '/tmp/x'\n"
+        ));
+    }
+
+    #[test]
+    fn a_folder_whose_gitfile_points_nowhere_is_not_a_repository() {
+        let root =
+            std::env::temp_dir().join(format!("baude-git-stale-gitfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stale = root.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        let gone = root
+            .join("gone")
+            .join(".git")
+            .join("worktrees")
+            .join("stale");
+        std::fs::write(stale.join(".git"), format!("gitdir: {}\n", gone.display())).unwrap();
+
+        let outcome = discover_repository(&stale);
+        let _ = std::fs::remove_dir_all(&root);
+        match outcome {
+            Err(RepositoryDiscoveryError::NotRepository(path)) => {
+                assert!(path.ends_with("stale"), "{}", path.display())
+            }
+            other => panic!("a stale gitfile must read as no repository, got {other:?}"),
+        }
+    }
+}
+
 /// Discover canonical repository membership without reading Git's on-disk layout.
 pub fn discover_repository(
     path: &Path,
@@ -339,7 +398,7 @@ pub fn discover_repository(
         "rev-parse common directory",
     ) {
         Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
-            if stderr.starts_with("fatal: not a git repository") =>
+            if is_not_repository_stderr(&stderr) =>
         {
             return Err(RepositoryDiscoveryError::NotRepository(canonical_input));
         }
@@ -2687,13 +2746,11 @@ fn remove_verified_worktree_with_post_remove_hook(
     // non-force removal below stays the fail-closed authority for the rest.
     remove_seed_artifacts(&target.path);
     let arguments = verified_remove_arguments();
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&target.main_worktree)
-        .args(arguments)
-        .arg(&target.path)
-        .output()
-        .map_err(RemoveVerifiedError::CommandStart)?;
+    let output = run_worktree_command(
+        &target.main_worktree,
+        arguments.into_iter().chain([target.path.as_os_str()]),
+    )
+    .map_err(RemoveVerifiedError::CommandStart)?;
     if !output.status.success() {
         return Err(RemoveVerifiedError::GitRefused {
             status: output.status.code(),
@@ -2713,6 +2770,835 @@ pub fn remove_verified_worktree(
     remove_verified_worktree_with_post_remove_hook(target, || {})
 }
 
+/// How a forced managed-worktree removal reached its postcondition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForcedRemovalMethod {
+    /// `git worktree remove --force --force` succeeded.
+    GitRemove,
+    /// Git refused or the directory was already gone; the directory was
+    /// deleted directly and the administrative entry removed per entry. No
+    /// repository-wide `git worktree prune` ever runs: other registered
+    /// worktrees whose directories are temporarily absent keep their entries.
+    DeleteFallback,
+    /// Nothing was registered and nothing was on disk: no command ran and
+    /// nothing was deleted.
+    AlreadyAbsent,
+}
+
+/// A proven forced removal: the canonical path is gone from disk and from the
+/// inventory. `deleted_directory` is whether a directory existed at the path
+/// when the call began and was deleted by it, so the caller's report can
+/// tell a deletion from a path that was already gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForcedRemoval {
+    pub path: PathBuf,
+    pub method: ForcedRemovalMethod,
+    pub deleted_directory: bool,
+}
+
+/// Typed refusals and failures of [`remove_managed_worktree_forced`]. Every
+/// arm except `Fallback` and `Postcondition` is raised before anything on
+/// disk or in Git has changed.
+#[derive(Debug)]
+pub enum ForcedRemovalError {
+    OutsideManagedRoot {
+        path: PathBuf,
+        managed_root: PathBuf,
+    },
+    Symlink {
+        path: PathBuf,
+    },
+    IdentityMismatch {
+        path: PathBuf,
+        expected_common_dir: PathBuf,
+        observed_common_dir: PathBuf,
+    },
+    MainWorktree {
+        path: PathBuf,
+    },
+    NotRegistered {
+        path: PathBuf,
+    },
+    ForeignRepository {
+        path: PathBuf,
+        observed_common_dir: PathBuf,
+    },
+    /// The worktree's administrative directory holds absorbed submodule
+    /// gitdirs under `modules/`; a forced removal would delete them and any
+    /// unpushed submodule commits with them.
+    Submodules {
+        path: PathBuf,
+        modules: PathBuf,
+    },
+    CommandStart(std::io::Error),
+    Fallback {
+        path: PathBuf,
+        git_stderr: String,
+        error: std::io::Error,
+    },
+    Uninspectable {
+        path: PathBuf,
+        detail: String,
+    },
+    Marker {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Postcondition {
+        path: PathBuf,
+        detail: String,
+    },
+}
+
+impl fmt::Display for ForcedRemovalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutsideManagedRoot { path, managed_root } => write!(
+                f,
+                "refusing forced removal of {} outside the managed worktree root {}",
+                path.display(),
+                managed_root.display()
+            ),
+            Self::Symlink { path } => write!(
+                f,
+                "refusing forced removal of {}: path is a symlink",
+                path.display()
+            ),
+            Self::IdentityMismatch {
+                path,
+                expected_common_dir,
+                observed_common_dir,
+            } => write!(
+                f,
+                "refusing forced removal of {}: repository identity changed from {} to {}",
+                path.display(),
+                expected_common_dir.display(),
+                observed_common_dir.display()
+            ),
+            Self::MainWorktree { path } => write!(
+                f,
+                "refusing forced removal of {}: it is the main worktree",
+                path.display()
+            ),
+            Self::NotRegistered { path } => write!(
+                f,
+                "refusing forced removal of {}: not a registered linked worktree",
+                path.display()
+            ),
+            Self::ForeignRepository {
+                path,
+                observed_common_dir,
+            } => write!(
+                f,
+                "refusing forced removal of {}: directory holds another repository at {}",
+                path.display(),
+                observed_common_dir.display()
+            ),
+            Self::Submodules { path, modules } => write!(
+                f,
+                "refusing forced removal of {}: submodule gitdirs live under {}",
+                path.display(),
+                modules.display()
+            ),
+            Self::CommandStart(error) => write!(f, "start Git worktree command: {error}"),
+            Self::Fallback {
+                path,
+                git_stderr,
+                error,
+            } => write!(
+                f,
+                "forced removal of {} failed after Git refused ({git_stderr}): {error}",
+                path.display()
+            ),
+            Self::Uninspectable { path, detail } => write!(
+                f,
+                "refusing forced removal of {}: git identity could not be inspected: {detail}",
+                path.display()
+            ),
+            Self::Marker { path, error } => write!(
+                f,
+                "forced removal of {} aborted: removal marker: {error}",
+                path.display()
+            ),
+            Self::Postcondition { path, detail } => write!(
+                f,
+                "forced removal postcondition failed for {}: {detail}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForcedRemovalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandStart(error) => Some(error),
+            Self::Fallback { error, .. } | Self::Marker { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The single source of the forced removal argument vector. The second
+/// `--force` is the locked-worktree decision (RESEARCH Open Question 1): a
+/// lock inside baude's own root does not outrank an explicit user removal.
+/// `--` precedes the path so a stored path beginning with `-` is never read as
+/// an option. No branch verb ever appears here.
+fn forced_remove_arguments() -> [&'static OsStr; 5] {
+    [
+        OsStr::new("worktree"),
+        OsStr::new("remove"),
+        OsStr::new("--force"),
+        OsStr::new("--force"),
+        OsStr::new("--"),
+    ]
+}
+
+/// Canonicalize a path that may no longer exist: a symlink at the path itself
+/// or at the nearest existing ancestor is refused before anything resolves,
+/// a missing path canonicalizes its nearest existing ancestor and re-joins the
+/// remainder (which must be plain components, so a `..` after a missing
+/// ancestor cannot escape the managed root), and any other inspection failure
+/// is `Uninspectable`. One helper serves the root, the target and the gitdir.
+fn canonicalize_through_missing(path: &Path) -> std::result::Result<PathBuf, ForcedRemovalError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ForcedRemovalError::Symlink {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(_) => {
+            return path
+                .canonicalize()
+                .map_err(|error| ForcedRemovalError::Uninspectable {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ForcedRemovalError::Uninspectable {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            });
+        }
+    }
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ForcedRemovalError::Symlink {
+                    path: ancestor.to_path_buf(),
+                });
+            }
+            Ok(_) => {
+                let canonical =
+                    ancestor
+                        .canonicalize()
+                        .map_err(|error| ForcedRemovalError::Uninspectable {
+                            path: path.to_path_buf(),
+                            detail: error.to_string(),
+                        })?;
+                let remainder = path
+                    .strip_prefix(ancestor)
+                    .expect("ancestor is a prefix of its path");
+                if remainder
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(ForcedRemovalError::OutsideManagedRoot {
+                        path: path.to_path_buf(),
+                        managed_root: worktrees_base(),
+                    });
+                }
+                return Ok(canonical.join(remainder));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ForcedRemovalError::Uninspectable {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
+    Err(ForcedRemovalError::Uninspectable {
+        path: path.to_path_buf(),
+        detail: String::from("no existing ancestor"),
+    })
+}
+
+/// Resolve the managed root itself. Unlike a target, the root may be a
+/// symlink: relocating `$XDG_DATA_HOME/baude/worktrees` to another disk is
+/// routine, creation and discovery follow the link, and the containment
+/// check below compares both sides after they resolve, so refusing the link
+/// would protect nothing. A missing root resolves through its nearest
+/// existing ancestor like any other path.
+fn resolve_managed_root(root: &Path) -> std::result::Result<PathBuf, ForcedRemovalError> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => root
+            .canonicalize()
+            .map_err(|error| ForcedRemovalError::Uninspectable {
+                path: root.to_path_buf(),
+                detail: error.to_string(),
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            canonicalize_through_missing(root)
+        }
+        Err(error) => Err(ForcedRemovalError::Uninspectable {
+            path: root.to_path_buf(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// Prove `path` lies strictly inside baude's managed worktree root. The root
+/// itself is not inside itself; the target resolves through the
+/// nearest-existing-ancestor walk so a vanished workspace directory or a wiped
+/// data directory still resolves and its stale entry can be dropped. The
+/// symlink refusal applies to the target and its ancestors below the root: a
+/// missing target spelled through the root link is re-rooted first so its
+/// ancestor walk never meets the link, while a present one resolves as
+/// spelled and is itself refused when it is a link.
+fn managed_root_contains(path: &Path) -> std::result::Result<PathBuf, ForcedRemovalError> {
+    let base = worktrees_base();
+    let root = resolve_managed_root(&base)?;
+    let missing = matches!(
+        std::fs::symlink_metadata(path),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let rerooted = match path.strip_prefix(&base) {
+        Ok(rest)
+            if missing
+                && rest
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))) =>
+        {
+            root.join(rest)
+        }
+        _ => path.to_path_buf(),
+    };
+    let canonical = canonicalize_through_missing(&rerooted)?;
+    if canonical != root && canonical.starts_with(&root) {
+        Ok(canonical)
+    } else {
+        Err(ForcedRemovalError::OutsideManagedRoot {
+            path: canonical,
+            managed_root: root,
+        })
+    }
+}
+
+fn discovery_to_forced(path: &Path, error: RepositoryDiscoveryError) -> ForcedRemovalError {
+    match error {
+        RepositoryDiscoveryError::CommandStart { source, .. } => {
+            ForcedRemovalError::CommandStart(source)
+        }
+        other => ForcedRemovalError::Uninspectable {
+            path: path.to_path_buf(),
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// The inventory's identity for a record: canonical when the directory exists,
+/// otherwise resolved through the nearest existing ancestor (macOS reports a
+/// vanished `/var` path while the live tree canonicalizes to `/private/var`).
+fn record_identity(record: &WorktreeRecord) -> PathBuf {
+    canonicalize_through_missing(&record.path).unwrap_or_else(|_| record.path.clone())
+}
+
+/// Re-prove on the live tree that `expected_common_dir` is the common
+/// directory of a repository (git run from inside it must report it back),
+/// that `canonical` is not that repository's main worktree, and return the
+/// registered linked-worktree record equal to `canonical`, if any. Every
+/// command runs against the common dir rather than the main checkout, so a
+/// main checkout deleted outside baude does not block cleanup of its
+/// children inside the managed root.
+fn registered_linked_worktree(
+    expected_common_dir: &Path,
+    canonical: &Path,
+) -> std::result::Result<Option<WorktreeRecord>, ForcedRemovalError> {
+    let common_output = git_bytes(
+        expected_common_dir,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+        ],
+        "rev-parse common directory",
+    )
+    .map_err(|error| discovery_to_forced(canonical, error))?;
+    let observed_common_dir =
+        path_from_git_stdout(common_output.stdout, "rev-parse common directory")
+            .map_err(|error| discovery_to_forced(canonical, error))?;
+    let observed_common_dir = canonicalize_through_missing(&observed_common_dir)?;
+    if observed_common_dir != expected_common_dir {
+        return Err(ForcedRemovalError::IdentityMismatch {
+            path: canonical.to_path_buf(),
+            expected_common_dir: expected_common_dir.to_path_buf(),
+            observed_common_dir,
+        });
+    }
+    let inventory = worktree_inventory(expected_common_dir)
+        .map_err(|error| discovery_to_forced(canonical, error))?;
+    if let Some(main) = inventory.first() {
+        if record_identity(main) == canonical {
+            return Err(ForcedRemovalError::MainWorktree {
+                path: canonical.to_path_buf(),
+            });
+        }
+    }
+    Ok(inventory
+        .into_iter()
+        .find(|record| record_identity(record) == canonical))
+}
+
+/// Probe the bare-repository signature of a directory with no `.git` entry.
+/// A regular `HEAD` beside `objects/` and `refs/`, or a `config` line
+/// `bare = true` (git's spelling of `core.bare`), is a foreign repository. A
+/// symlinked or unreadable entry is `Uninspectable`. Every other successfully
+/// inspected shape is no repository and passes: the deletion then rests on the
+/// registration or marker proof that already named this path.
+fn bare_signature_guard(canonical: &Path) -> std::result::Result<(), ForcedRemovalError> {
+    let probe = |name: &str| -> std::result::Result<Option<std::fs::FileType>, ForcedRemovalError> {
+        match std::fs::symlink_metadata(canonical.join(name)) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(ForcedRemovalError::Uninspectable {
+                    path: canonical.to_path_buf(),
+                    detail: format!("{name} is a symlink"),
+                })
+            }
+            Ok(metadata) => Ok(Some(metadata.file_type())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ForcedRemovalError::Uninspectable {
+                path: canonical.to_path_buf(),
+                detail: format!("{name}: {error}"),
+            }),
+        }
+    };
+    let head = probe("HEAD")?;
+    let objects = probe("objects")?;
+    let refs = probe("refs")?;
+    let config = probe("config")?;
+    let bare_layout = head.is_some_and(|kind| kind.is_file())
+        && objects.is_some_and(|kind| kind.is_dir())
+        && refs.is_some_and(|kind| kind.is_dir());
+    if bare_layout {
+        return Err(ForcedRemovalError::ForeignRepository {
+            path: canonical.to_path_buf(),
+            observed_common_dir: canonical.to_path_buf(),
+        });
+    }
+    if config.is_some_and(|kind| kind.is_file()) {
+        let text = std::fs::read_to_string(canonical.join("config")).map_err(|error| {
+            ForcedRemovalError::Uninspectable {
+                path: canonical.to_path_buf(),
+                detail: format!("config: {error}"),
+            }
+        })?;
+        if text.lines().any(|line| line.trim() == "bare = true") {
+            return Err(ForcedRemovalError::ForeignRepository {
+                path: canonical.to_path_buf(),
+                observed_common_dir: canonical.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to delete a directory that holds a repository other than a linked
+/// worktree of `expected_common_dir`. Filesystem inspection only, never a
+/// subprocess: every outcome is typed, and a failure to inspect can only
+/// refuse. A linked worktree of ours always carries a `.git` file naming a
+/// gitdir under `<common>/worktrees`; a `.git` directory is a repository of
+/// its own; a missing `.git` is checked for the bare-repository signature.
+fn foreign_repository_guard(
+    canonical: &Path,
+    expected_common_dir: &Path,
+) -> std::result::Result<(), ForcedRemovalError> {
+    let uninspectable = |detail: String| ForcedRemovalError::Uninspectable {
+        path: canonical.to_path_buf(),
+        detail,
+    };
+    let gitfile = canonical.join(".git");
+    let metadata = match std::fs::symlink_metadata(&gitfile) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return bare_signature_guard(canonical);
+        }
+        Err(error) => return Err(uninspectable(error.to_string())),
+    };
+    let kind = metadata.file_type();
+    if kind.is_symlink() {
+        return Err(uninspectable(String::from(".git is a symlink")));
+    }
+    if kind.is_dir() {
+        return Err(ForcedRemovalError::ForeignRepository {
+            path: canonical.to_path_buf(),
+            observed_common_dir: gitfile,
+        });
+    }
+    let content =
+        std::fs::read_to_string(&gitfile).map_err(|error| uninspectable(error.to_string()))?;
+    let Some(target) = content.strip_prefix("gitdir: ") else {
+        let head: String = content.chars().take(64).collect();
+        return Err(uninspectable(format!(".git is not a gitfile: {head:?}")));
+    };
+    let target = PathBuf::from(target.trim_end_matches(['\r', '\n']));
+    let gitdir = if target.is_absolute() {
+        target
+    } else {
+        canonical.join(target)
+    };
+    let resolved = canonicalize_through_missing(&gitdir)
+        .map_err(|error| uninspectable(format!("gitdir {}: {error}", gitdir.display())))?;
+    if resolved.starts_with(expected_common_dir.join("worktrees")) {
+        Ok(())
+    } else {
+        Err(ForcedRemovalError::ForeignRepository {
+            path: canonical.to_path_buf(),
+            observed_common_dir: resolved,
+        })
+    }
+}
+
+/// The administrative directory `<common>/worktrees/<id>` whose `gitdir`
+/// file names `<canonical>/.git`. Filesystem inspection alone, so it is
+/// available when the worktree's own `.git` file or directory is gone. An
+/// unreadable `worktrees/` directory is `Uninspectable`; a missing one means
+/// no entry.
+fn admin_dir_for(
+    expected_common_dir: &Path,
+    canonical: &Path,
+) -> std::result::Result<Option<PathBuf>, ForcedRemovalError> {
+    let entries = match std::fs::read_dir(expected_common_dir.join("worktrees")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ForcedRemovalError::Uninspectable {
+                path: canonical.to_path_buf(),
+                detail: format!("worktrees admin dir: {error}"),
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| ForcedRemovalError::Uninspectable {
+            path: canonical.to_path_buf(),
+            detail: format!("worktrees admin dir: {error}"),
+        })?;
+        let Ok(text) = std::fs::read_to_string(entry.path().join("gitdir")) else {
+            continue;
+        };
+        let named = PathBuf::from(text.trim_end_matches(['\r', '\n']));
+        let Some(worktree) = named.parent() else {
+            continue;
+        };
+        if canonicalize_through_missing(worktree).ok().as_deref() == Some(canonical) {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+/// Refuse when the entry's `modules/` holds absorbed submodule gitdirs:
+/// `git worktree remove --force --force` deletes them with the entry, and so
+/// would the fallback, losing unpushed submodule commits with no typed
+/// refusal. Explicit removal waives a dirty tree, a lock and a held cwd,
+/// not another repository's history.
+fn submodule_guard(
+    expected_common_dir: &Path,
+    canonical: &Path,
+) -> std::result::Result<(), ForcedRemovalError> {
+    let Some(admin) = admin_dir_for(expected_common_dir, canonical)? else {
+        return Ok(());
+    };
+    let modules = admin.join("modules");
+    match std::fs::read_dir(&modules) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(ForcedRemovalError::Submodules {
+                    path: canonical.to_path_buf(),
+                    modules,
+                });
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ForcedRemovalError::Uninspectable {
+            path: canonical.to_path_buf(),
+            detail: format!("{}: {error}", modules.display()),
+        }),
+    }
+}
+
+/// Path of the removal marker written beside a managed worktree before the
+/// forced Git command runs: `<parent>/.<name>.baude-removal`.
+pub(crate) fn removal_marker_path(canonical: &Path) -> PathBuf {
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    canonical
+        .parent()
+        .unwrap_or(canonical)
+        .join(format!(".{name}.baude-removal"))
+}
+
+/// Persist proof that `canonical` was a registered linked worktree of
+/// `expected_common_dir` when removal began. Git drops the administrative
+/// entry even when deleting the working tree fails, so a retry would
+/// otherwise see an unregistered directory. Follows `marker::write_marker`:
+/// a symlink at the marker path is refused before anything is opened, a stale
+/// regular marker is replaced, and the file is created with `create_new`.
+fn write_removal_marker(
+    canonical: &Path,
+    expected_common_dir: &Path,
+) -> std::result::Result<(), ForcedRemovalError> {
+    use std::io::Write;
+
+    let marker = removal_marker_path(canonical);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ForcedRemovalError::Marker {
+                path: marker,
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "removal marker is a symlink",
+                ),
+            });
+        }
+        Ok(_) => match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ForcedRemovalError::Marker {
+                    path: marker,
+                    error,
+                });
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ForcedRemovalError::Marker {
+                path: marker,
+                error,
+            });
+        }
+    }
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create_new(&marker)?;
+        writeln!(file, "path={}", canonical.display())?;
+        writeln!(file, "common_dir={}", expected_common_dir.display())?;
+        file.sync_all()
+    };
+    write().map_err(|error| ForcedRemovalError::Marker {
+        path: marker.clone(),
+        error,
+    })
+}
+
+/// Whether a regular, small removal marker beside `canonical` names exactly
+/// this path and this common dir. Never reads through a symlink.
+fn removal_marker_matches(canonical: &Path, expected_common_dir: &Path) -> bool {
+    let marker = removal_marker_path(canonical);
+    let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 4096 {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    lines.next() == Some(format!("path={}", canonical.display()).as_str())
+        && lines.next() == Some(format!("common_dir={}", expected_common_dir.display()).as_str())
+}
+
+/// Run `git -C <repository> <args>` and capture its output, where
+/// `repository` is a worktree for the verified path and the common dir for
+/// the forced path. Shared so neither builds its own `Command`.
+fn run_worktree_command(
+    repository: &Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> std::io::Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+}
+
+/// `git worktree remove --force --force -- <canonical>`: the one command that
+/// drops a single administrative entry, whether or not the directory is still
+/// on disk. Never `git worktree prune`, which is repository-wide and would
+/// also drop every other registered worktree whose directory is temporarily
+/// absent (an unmounted volume the startup reconcile keeps as unavailable).
+fn remove_worktree_entry(
+    common_dir: &Path,
+    canonical: &Path,
+) -> std::result::Result<Output, ForcedRemovalError> {
+    run_worktree_command(
+        common_dir,
+        forced_remove_arguments()
+            .into_iter()
+            .chain([canonical.as_os_str()]),
+    )
+    .map_err(ForcedRemovalError::CommandStart)
+}
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
+}
+
+enum ForcedStep {
+    GitRemoved,
+    Nothing,
+    Fallback(String),
+}
+
+/// Force-remove a managed worktree directory inside baude's managed root.
+///
+/// Callers must classify upstream (`removal::select_rows`) and never pass a
+/// Main, unmanaged or standalone path. Explicit user removal bypasses only the
+/// clean-tree and lock checks that `inspect_removal` / `topology_blockers`
+/// enforce for the verified path; common-dir identity, main-worktree exclusion
+/// and registration are re-proven here on the live tree. Every git command
+/// runs against `expected_common_dir`, never the main checkout, so a main
+/// checkout that vanished outside baude does not strand its children.
+/// Containment in the managed root is checked before any effect. No branch
+/// command is ever issued. A registered path whose directory is already gone is accepted so
+/// its own administrative entry is dropped; a directory that Git half-removed is
+/// reclaimed only through the removal marker written before the Git command;
+/// a target whose Git identity cannot be inspected is refused; the `.git`
+/// shape is inspected before the Git command is spawned as well as before the
+/// fallback, and a bare repository occupying the path is a foreign repository.
+pub fn remove_managed_worktree_forced(
+    expected_common_dir: &Path,
+    path: &Path,
+) -> std::result::Result<ForcedRemoval, ForcedRemovalError> {
+    let canonical = managed_root_contains(path)?;
+    let expected_common_dir = canonicalize_through_missing(expected_common_dir)?;
+    let record = registered_linked_worktree(&expected_common_dir, &canonical)?;
+    let present = match std::fs::symlink_metadata(&canonical) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(ForcedRemovalError::Uninspectable {
+                path: canonical,
+                detail: error.to_string(),
+            });
+        }
+    };
+
+    let step = match (record, present) {
+        (None, false) => ForcedStep::Nothing,
+        (None, true) => {
+            let claimed_beneath = worktree_inventory(&expected_common_dir)
+                .map_err(|error| discovery_to_forced(&canonical, error))?
+                .iter()
+                .any(|record| record_identity(record).starts_with(&canonical));
+            if claimed_beneath || !removal_marker_matches(&canonical, &expected_common_dir) {
+                return Err(ForcedRemovalError::NotRegistered { path: canonical });
+            }
+            foreign_repository_guard(&canonical, &expected_common_dir)?;
+            ForcedStep::Fallback(String::new())
+        }
+        // Registered, directory gone: git drops a missing worktree per entry.
+        (Some(_), false) => {
+            submodule_guard(&expected_common_dir, &canonical)?;
+            let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
+            if output.status.success() {
+                ForcedStep::GitRemoved
+            } else {
+                ForcedStep::Fallback(stderr_of(&output))
+            }
+        }
+        (Some(_), true) => {
+            foreign_repository_guard(&canonical, &expected_common_dir)?;
+            submodule_guard(&expected_common_dir, &canonical)?;
+            write_removal_marker(&canonical, &expected_common_dir)?;
+            let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
+            if output.status.success() {
+                ForcedStep::GitRemoved
+            } else {
+                let git_stderr = stderr_of(&output);
+                foreign_repository_guard(&canonical, &expected_common_dir)?;
+                ForcedStep::Fallback(git_stderr)
+            }
+        }
+    };
+
+    let method = match step {
+        ForcedStep::GitRemoved if present => ForcedRemovalMethod::GitRemove,
+        ForcedStep::GitRemoved => ForcedRemovalMethod::DeleteFallback,
+        ForcedStep::Nothing => ForcedRemovalMethod::AlreadyAbsent,
+        ForcedStep::Fallback(git_stderr) => {
+            match std::fs::remove_dir_all(&canonical) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ForcedRemovalError::Fallback {
+                        path: canonical,
+                        git_stderr,
+                        error,
+                    });
+                }
+            }
+            // With the directory gone git drops the entry per path; the
+            // postcondition below surfaces an entry that still survives
+            // rather than reaching for a repository-wide prune.
+            let _ = remove_worktree_entry(&expected_common_dir, &canonical)?;
+            ForcedRemovalMethod::DeleteFallback
+        }
+    };
+
+    match std::fs::symlink_metadata(&canonical) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(ForcedRemovalError::Postcondition {
+                path: canonical,
+                detail: String::from("path still present"),
+            });
+        }
+        Err(error) => {
+            return Err(ForcedRemovalError::Postcondition {
+                path: canonical,
+                detail: error.to_string(),
+            });
+        }
+    }
+    let inventory = worktree_inventory(&expected_common_dir).map_err(|error| {
+        ForcedRemovalError::Postcondition {
+            path: canonical.clone(),
+            detail: error.to_string(),
+        }
+    })?;
+    if inventory
+        .iter()
+        .any(|record| record_identity(record) == canonical)
+    {
+        return Err(ForcedRemovalError::Postcondition {
+            path: canonical,
+            detail: String::from("inventory still lists the path"),
+        });
+    }
+    match std::fs::remove_file(removal_marker_path(&canonical)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ForcedRemovalError::Postcondition {
+                path: canonical,
+                detail: format!("removal marker: {error}"),
+            });
+        }
+    }
+    Ok(ForcedRemoval {
+        path: canonical,
+        method,
+        deleted_directory: present,
+    })
+}
 /// Compensation-only removal for a worktree that the current uncommitted
 /// activation just added. Safe user-requested removal must instead consume a
 /// `VerifiedRemovalTarget` through `remove_verified_worktree`.
@@ -4529,6 +5415,1046 @@ mod tests {
                     Err(super::super::super::RepositoryDiscoveryError::MalformedTopology(_))
                 ));
             }
+        }
+    }
+
+    mod forced_removal {
+        use super::*;
+        use crate::git::{
+            forced_remove_arguments, removal_marker_path, remove_managed_worktree_forced,
+            worktree_inventory, worktrees_base, ForcedRemoval, ForcedRemovalError,
+            ForcedRemovalMethod,
+        };
+
+        const MANAGED: &str = "data/baude/worktrees/ws/repo";
+
+        /// Sorted `refs/heads` names and OIDs. Never the decorated branch listing:
+        /// its `+` marker legitimately changes when a linked worktree goes.
+        fn branch_snapshot(repo: &Path) -> Vec<String> {
+            let output = git_ok(
+                repo,
+                &[
+                    OsStr::new("for-each-ref"),
+                    OsStr::new("--format=%(refname) %(objectname)"),
+                    OsStr::new("refs/heads"),
+                ],
+            );
+            let mut lines: Vec<String> = String::from_utf8_lossy(&output)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            lines.sort();
+            assert!(!lines.is_empty(), "fixture repository has branches");
+            lines
+        }
+
+        fn common_dir(repo: &Path) -> PathBuf {
+            let output = git_ok(
+                repo,
+                &[
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--path-format=absolute"),
+                    OsStr::new("--git-common-dir"),
+                ],
+            );
+            PathBuf::from(String::from_utf8_lossy(&output).trim())
+                .canonicalize()
+                .expect("canonicalize common dir")
+        }
+
+        /// Canonical form of a path that may no longer exist: the nearest
+        /// existing ancestor is canonicalized and the remainder re-joined
+        /// (macOS `/var` vs `/private/var`).
+        fn canonical_through_missing(path: &Path) -> PathBuf {
+            if let Ok(canonical) = path.canonicalize() {
+                return canonical;
+            }
+            let mut remainder = Vec::new();
+            let mut cursor = path;
+            loop {
+                if let Ok(canonical) = cursor.canonicalize() {
+                    let mut rebuilt = canonical;
+                    for part in remainder.iter().rev() {
+                        rebuilt.push(part);
+                    }
+                    return rebuilt;
+                }
+                remainder.push(cursor.file_name().expect("component").to_owned());
+                cursor = cursor.parent().expect("ancestor exists");
+            }
+        }
+
+        fn inventory_lists(repo: &Path, path: &Path) -> bool {
+            let target = canonical_through_missing(path);
+            worktree_inventory(repo)
+                .expect("worktree inventory")
+                .iter()
+                .any(|record| canonical_through_missing(&record.path) == target)
+        }
+
+        fn managed_worktree(fixture: &GitFixture, repo: &Path, name: &str) -> PathBuf {
+            let wt = fixture.linked_worktree(
+                repo,
+                format!("{MANAGED}/{name}"),
+                &format!("feature/{name}"),
+            );
+            let root = worktrees_base()
+                .canonicalize()
+                .expect("managed root exists");
+            assert!(
+                wt.canonicalize().unwrap().starts_with(&root),
+                "{} is inside {}",
+                wt.display(),
+                root.display()
+            );
+            wt
+        }
+
+        fn make_unclean(wt: &Path) {
+            std::fs::write(wt.join("untracked.txt"), b"scratch\n").unwrap();
+            std::fs::write(wt.join("tracked.txt"), b"modified\n").unwrap();
+        }
+
+        struct ModeGuard {
+            path: PathBuf,
+        }
+
+        impl ModeGuard {
+            fn new(path: &Path, mode: u32) -> Self {
+                set_mode(path, mode);
+                Self {
+                    path: path.to_path_buf(),
+                }
+            }
+        }
+
+        impl Drop for ModeGuard {
+            fn drop(&mut self) {
+                set_mode(&self.path, 0o755);
+            }
+        }
+
+        fn set_mode(path: &Path, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("set fixture mode");
+        }
+
+        fn assert_untouched(repo: &Path, wt: &Path, before: &[String]) {
+            assert!(wt.exists(), "{} survives", wt.display());
+            assert!(inventory_lists(repo, wt), "{} still listed", wt.display());
+            assert_eq!(branch_snapshot(repo), before);
+        }
+
+        #[test]
+        fn inside_root_unclean_tree_is_removed_and_branch_kept() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            make_unclean(&wt);
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("unclean managed worktree is force-removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert_eq!(
+                removal.path,
+                wt.canonicalize().unwrap_or(removal.path.clone())
+            );
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn locked_worktree_inside_root_is_removed() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("lock"),
+                    OsStr::new("--"),
+                    wt.as_os_str(),
+                ],
+            );
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("locked managed worktree is force-removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn git_refusal_inside_root_falls_back_to_prune_and_delete() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_file(wt.join(".git")).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("git refusal inside root falls back");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn missing_directory_inside_root_prunes_admin_entry() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_dir_all(&wt).unwrap();
+            assert!(inventory_lists(&repo, &wt), "stale entry is listed before");
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("missing registered directory is pruned");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn outside_root_is_refused_and_untouched() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            std::fs::create_dir_all(worktrees_base()).unwrap();
+            let wt = fixture.linked_worktree(&repo, "outside/wt-b", "feature/b");
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("outside-root path is refused");
+
+            match error {
+                ForcedRemovalError::OutsideManagedRoot { path, managed_root } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                    assert_eq!(managed_root, worktrees_base().canonicalize().unwrap());
+                }
+                other => panic!("expected OutsideManagedRoot, got {other:?}"),
+            }
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn managed_root_itself_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let root = worktrees_base();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &root)
+                .expect_err("the managed root is not inside itself");
+
+            assert!(
+                matches!(error, ForcedRemovalError::OutsideManagedRoot { .. }),
+                "expected OutsideManagedRoot, got {error:?}"
+            );
+            assert!(root.exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn ancestor_directory_inside_root_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            for ancestor in [
+                fixture.root.join("data/baude/worktrees/ws"),
+                fixture.root.join(MANAGED),
+            ] {
+                let error = remove_managed_worktree_forced(&common, &ancestor)
+                    .expect_err("an ancestor directory is refused");
+                match error {
+                    ForcedRemovalError::NotRegistered { path } => {
+                        assert_eq!(path, ancestor.canonicalize().unwrap());
+                    }
+                    other => panic!("expected NotRegistered, got {other:?}"),
+                }
+                assert!(ancestor.exists());
+                assert_untouched(&repo, &wt, &before);
+            }
+        }
+
+        #[test]
+        fn symlinked_path_inside_root_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let link = fixture.root.join(MANAGED).join("link");
+            std::os::unix::fs::symlink(&wt, &link).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &link)
+                .expect_err("a symlink inside the root is refused");
+
+            match error {
+                ForcedRemovalError::Symlink { path } => assert_eq!(path, link),
+                other => panic!("expected Symlink, got {other:?}"),
+            }
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        /// A managed root relocated to another disk through a symlink is
+        /// followed: the target is compared after both sides resolve, so the
+        /// link at the root protects nothing and must not refuse every row.
+        #[test]
+        fn symlinked_managed_root_is_followed() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let store = fixture.root.join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            let base = worktrees_base();
+            std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&store, &base).unwrap();
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
+                .expect("a present target under a symlinked root is removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert_eq!(
+                removal.path,
+                store.canonicalize().unwrap().join("ws/repo/wt-a")
+            );
+            assert!(!wt_a.exists());
+            assert!(!inventory_lists(&repo, &wt_a));
+
+            let removal = remove_managed_worktree_forced(&common, &wt_b)
+                .expect("a missing target spelled through the root link is removed");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!inventory_lists(&repo, &wt_b));
+            assert!(std::fs::symlink_metadata(&base)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(store.exists());
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        /// A main checkout deleted outside baude, with its common dir kept
+        /// apart, must not strand the managed children: every command runs
+        /// against the common dir.
+        #[test]
+        fn vanished_main_checkout_still_removes_managed_child() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let store = fixture.root.join("store.git");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("init"),
+                    OsStr::new("-q"),
+                    OsStr::new("--separate-git-dir"),
+                    store.as_os_str(),
+                ],
+            );
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let common = common_dir(&repo);
+            assert_eq!(common, store.canonicalize().unwrap());
+            let before = branch_snapshot(&repo);
+            std::fs::remove_dir_all(&repo).unwrap();
+            assert!(!repo.exists());
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("a child is removable after its main checkout vanished");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::GitRemove);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&common, &wt));
+            assert_eq!(branch_snapshot(&common), before);
+        }
+
+        /// Another repository's common dir does not register `wt`, so the
+        /// removal is refused as unregistered and the directory survives.
+        #[test]
+        fn other_repository_common_dir_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let other = fixture.repo("other");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common_dir(&other), &wt)
+                .expect_err("another repository's common dir is refused");
+
+            match error {
+                ForcedRemovalError::NotRegistered { path } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                }
+                other => panic!("expected NotRegistered, got {other:?}"),
+            }
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        /// A linked worktree with an absorbed submodule keeps the submodule's
+        /// gitdir under its own admin entry; git deletes it with `--force
+        /// --force`, so the removal must be refused before anything runs.
+        #[test]
+        fn worktree_with_submodule_gitdirs_is_refused_untouched() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let sub = fixture.repo("sub");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            git_ok(
+                &wt,
+                &[
+                    OsStr::new("-c"),
+                    OsStr::new("protocol.file.allow=always"),
+                    OsStr::new("submodule"),
+                    OsStr::new("add"),
+                    OsStr::new("-q"),
+                    sub.as_os_str(),
+                    OsStr::new("subdir"),
+                ],
+            );
+            git_ok(
+                &wt,
+                &[
+                    OsStr::new("commit"),
+                    OsStr::new("-q"),
+                    OsStr::new("-m"),
+                    OsStr::new("add submodule"),
+                ],
+            );
+            let common = common_dir(&repo);
+            let modules = common.join("worktrees").join("wt-a").join("modules");
+            assert!(
+                modules.join("subdir").is_dir(),
+                "submodule gitdir is absorbed"
+            );
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("submodule gitdirs refuse the forced removal");
+
+            match error {
+                ForcedRemovalError::Submodules {
+                    path,
+                    modules: found,
+                } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                    assert_eq!(found, modules);
+                }
+                other => panic!("expected Submodules, got {other:?}"),
+            }
+            assert!(modules.join("subdir").join("HEAD").is_file());
+            assert!(wt.join("subdir").is_dir());
+            assert!(
+                !removal_marker_path(&wt.canonicalize().unwrap()).exists(),
+                "refused before the marker is written"
+            );
+            assert_untouched(&repo, &wt, &before);
+
+            std::fs::remove_dir_all(&wt).unwrap();
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a vanished directory still refuses while gitdirs remain");
+            assert!(matches!(error, ForcedRemovalError::Submodules { .. }));
+            assert!(modules.join("subdir").join("HEAD").is_file());
+            assert!(inventory_lists(&repo, &wt));
+        }
+
+        #[test]
+        fn common_dir_mismatch_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let _wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            let observed = common_dir(&repo);
+            let expected = observed.join("worktrees").join("wt-b");
+            assert!(
+                expected.join("HEAD").is_file(),
+                "wt-b private gitdir exists"
+            );
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&expected, &wt)
+                .expect_err("a linked worktree's private gitdir is not the common dir");
+
+            match error {
+                ForcedRemovalError::IdentityMismatch {
+                    path,
+                    expected_common_dir,
+                    observed_common_dir,
+                } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                    assert_eq!(expected_common_dir, expected);
+                    assert_eq!(observed_common_dir, observed);
+                }
+                other => panic!("expected IdentityMismatch, got {other:?}"),
+            }
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn main_worktree_inside_root_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let main = fixture.repo("data/baude/worktrees/ws/other/main");
+            let root = worktrees_base().canonicalize().unwrap();
+            assert!(main.canonicalize().unwrap().starts_with(&root));
+            let common = common_dir(&main);
+            let before = branch_snapshot(&main);
+
+            let error = remove_managed_worktree_forced(&common, &main)
+                .expect_err("the main worktree is refused even inside the root");
+
+            match error {
+                ForcedRemovalError::MainWorktree { path } => {
+                    assert_eq!(path, main.canonicalize().unwrap());
+                }
+                other => panic!("expected MainWorktree, got {other:?}"),
+            }
+            assert!(main.join("tracked.txt").exists());
+            assert_untouched(&main, &main, &before);
+        }
+
+        #[test]
+        fn unregistered_directory_inside_root_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let plain = fixture.root.join(MANAGED).join("plain");
+            std::fs::create_dir_all(&plain).unwrap();
+            std::fs::write(plain.join("keep.txt"), b"keep\n").unwrap();
+            let stray = fixture.repo(format!("{MANAGED}/stray"));
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            for target in [&plain, &stray] {
+                let error = remove_managed_worktree_forced(&common, target)
+                    .expect_err("an unregistered directory is refused");
+                match error {
+                    ForcedRemovalError::NotRegistered { path } => {
+                        assert_eq!(path, target.canonicalize().unwrap());
+                    }
+                    other => panic!("expected NotRegistered, got {other:?}"),
+                }
+            }
+            assert!(plain.join("keep.txt").exists());
+            assert!(stray.join("tracked.txt").exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn replacement_repository_at_registered_path_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_dir_all(&wt).unwrap();
+            let replacement = fixture.repo(format!("{MANAGED}/wt-a"));
+            assert_eq!(replacement, wt);
+            assert!(wt.join(".git").is_dir());
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a replacement repository is refused");
+
+            match error {
+                ForcedRemovalError::ForeignRepository {
+                    path,
+                    observed_common_dir,
+                } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                    assert_eq!(observed_common_dir, wt.canonicalize().unwrap().join(".git"));
+                }
+                other => panic!("expected ForeignRepository, got {other:?}"),
+            }
+            assert!(wt.join(".git").is_dir());
+            assert!(wt.join("tracked.txt").exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn replacement_bare_repository_at_registered_path_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_dir_all(&wt).unwrap();
+            git_ok(
+                &fixture.root,
+                &[
+                    OsStr::new("init"),
+                    OsStr::new("--bare"),
+                    OsStr::new("--"),
+                    wt.as_os_str(),
+                ],
+            );
+            for entry in ["HEAD", "objects", "refs"] {
+                assert!(wt.join(entry).exists(), "bare repository has {entry}");
+            }
+            assert!(!wt.join(".git").exists());
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+            let canonical = wt.canonicalize().unwrap();
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a bare replacement repository is refused");
+
+            match error {
+                ForcedRemovalError::ForeignRepository {
+                    path,
+                    observed_common_dir,
+                } => {
+                    assert_eq!(path, canonical);
+                    assert_eq!(observed_common_dir, canonical);
+                }
+                other => panic!("expected ForeignRepository, got {other:?}"),
+            }
+            for entry in ["HEAD", "objects", "refs"] {
+                assert!(wt.join(entry).exists(), "bare repository keeps {entry}");
+            }
+            assert!(!removal_marker_path(&canonical).exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn symlinked_gitfile_at_registered_path_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let elsewhere = fixture.root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let copy = elsewhere.join("gitfile");
+            std::fs::copy(wt.join(".git"), &copy).unwrap();
+            std::fs::remove_file(wt.join(".git")).unwrap();
+            std::os::unix::fs::symlink(&copy, wt.join(".git")).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+            let canonical = wt.canonicalize().unwrap();
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a symlinked gitfile is refused before git runs");
+
+            match error {
+                ForcedRemovalError::Uninspectable { path, detail } => {
+                    assert_eq!(path, canonical);
+                    assert!(
+                        detail.contains("symlink"),
+                        "detail names the symlink: {detail}"
+                    );
+                }
+                other => panic!("expected Uninspectable, got {other:?}"),
+            }
+            assert!(wt.join("tracked.txt").exists());
+            assert!(std::fs::symlink_metadata(wt.join(".git"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!removal_marker_path(&canonical).exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn partial_git_removal_leaves_retryable_orphan() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let pin = wt.join("pin");
+            std::fs::create_dir(&pin).unwrap();
+            std::fs::write(pin.join("held"), b"held\n").unwrap();
+            let guard = ModeGuard::new(&pin, 0o555);
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+            let canonical = wt.canonicalize().unwrap();
+            let marker = removal_marker_path(&canonical);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("git drops the entry but the directory cannot be deleted");
+
+            match error {
+                ForcedRemovalError::Fallback { path, error, .. } => {
+                    assert_eq!(path, canonical);
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+                other => panic!("expected Fallback, got {other:?}"),
+            }
+            assert!(wt.exists(), "orphaned directory survives the first call");
+            assert!(
+                !inventory_lists(&repo, &wt),
+                "git already dropped the administrative entry (fixture output)"
+            );
+            assert!(marker.exists(), "removal marker persists for the retry");
+            assert_eq!(branch_snapshot(&repo), before);
+
+            drop(guard);
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("orphan is reclaimed through the removal marker");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!marker.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn unregistered_directory_with_foreign_marker_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let plain = fixture.root.join(MANAGED).join("plain");
+            std::fs::create_dir_all(&plain).unwrap();
+            std::fs::write(plain.join("keep.txt"), b"keep\n").unwrap();
+            let canonical = plain.canonicalize().unwrap();
+            let marker = removal_marker_path(&canonical);
+            std::fs::write(
+                &marker,
+                format!("path={}\ncommon_dir=/nowhere/common\n", canonical.display()),
+            )
+            .unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &plain)
+                .expect_err("a marker naming another common dir is no proof");
+
+            match error {
+                ForcedRemovalError::NotRegistered { path } => assert_eq!(path, canonical),
+                other => panic!("expected NotRegistered, got {other:?}"),
+            }
+            assert!(plain.join("keep.txt").exists());
+            assert!(marker.exists());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn uninspectable_git_identity_is_refused() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::write(wt.join(".git"), b"not a gitfile\n").unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a malformed gitfile is refused");
+
+            match error {
+                ForcedRemovalError::Uninspectable { path, .. } => {
+                    assert_eq!(path, wt.canonicalize().unwrap());
+                }
+                other => panic!("expected Uninspectable, got {other:?}"),
+            }
+            assert!(wt.join("tracked.txt").exists());
+            assert_eq!(std::fs::read(wt.join(".git")).unwrap(), b"not a gitfile\n");
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        #[test]
+        fn missing_directory_and_repository_dir_inside_root_prunes_admin_entry() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt =
+                fixture.linked_worktree(&repo, "data/baude/worktrees/ws/solo/wt-s", "feature/solo");
+            let root = worktrees_base().canonicalize().unwrap();
+            assert!(wt.canonicalize().unwrap().starts_with(&root));
+            std::fs::remove_dir_all(fixture.root.join("data/baude/worktrees/ws/solo")).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("vanished repository directory still prunes");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn lone_head_file_at_registered_path_is_not_a_bare_signature() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_file(wt.join(".git")).unwrap();
+            std::fs::write(wt.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("a lone HEAD file is no repository");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn non_bare_config_file_at_registered_path_is_not_a_bare_signature() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            std::fs::remove_file(wt.join(".git")).unwrap();
+            std::fs::write(
+                wt.join("config"),
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+            )
+            .unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("a config without bare = true is no repository");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!wt.exists());
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn wiped_managed_root_still_prunes_admin_entry() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt =
+                fixture.linked_worktree(&repo, "data/baude/worktrees/ws/solo/wt-s", "feature/solo");
+            let root = worktrees_base();
+            assert!(wt
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap()));
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists());
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt)
+                .expect("a wiped managed root still prunes");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!inventory_lists(&repo, &wt));
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn symlinked_removal_marker_is_refused_before_git_runs() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let canonical = wt.canonicalize().unwrap();
+            let victim = fixture.root.join("victim");
+            let victim_bytes = b"do not overwrite\n";
+            std::fs::write(&victim, victim_bytes).unwrap();
+            let marker = removal_marker_path(&canonical);
+            std::os::unix::fs::symlink(&victim, &marker).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let error = remove_managed_worktree_forced(&common, &wt)
+                .expect_err("a symlinked marker is refused");
+
+            match error {
+                ForcedRemovalError::Marker { path, .. } => assert_eq!(path, marker),
+                other => panic!("expected Marker, got {other:?}"),
+            }
+            assert_eq!(std::fs::read(&victim).unwrap(), victim_bytes);
+            assert!(std::fs::symlink_metadata(&marker)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_untouched(&repo, &wt, &before);
+        }
+
+        /// Names of the administrative directories under `<common>/worktrees`.
+        fn admin_entries(common: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(common.join("worktrees"))
+                .expect("read admin dir")
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Whether some administrative entry's `gitdir` file still names `wt`,
+        /// which is what lets git re-attach the worktree when its volume
+        /// returns.
+        fn admin_entry_names(common: &Path, wt: &Path) -> bool {
+            let expected = format!("{}/.git", canonical_through_missing(wt).display());
+            std::fs::read_dir(common.join("worktrees"))
+                .expect("read admin dir")
+                .map(|entry| entry.unwrap().path().join("gitdir"))
+                .filter_map(|gitdir| std::fs::read_to_string(gitdir).ok())
+                .any(|text| text.trim_end() == expected)
+        }
+
+        /// A sibling worktree on an unmounted volume is an "unavailable" row
+        /// at startup, not garbage: removing another row's vanished directory
+        /// must drop only that row's administrative entry.
+        #[test]
+        fn missing_target_removal_keeps_sibling_whose_directory_is_absent() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_dir_all(&wt_a).unwrap();
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            assert_eq!(admin_entries(&common).len(), 2);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
+                .expect("missing registered directory is removed per entry");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(!removal.deleted_directory);
+            assert!(!inventory_lists(&repo, &wt_a));
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert_eq!(admin_entries(&common).len(), 1);
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn git_refusal_fallback_keeps_sibling_whose_directory_is_absent() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            std::fs::remove_file(wt_a.join(".git")).unwrap();
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
+                .expect("git refusal inside root falls back");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::DeleteFallback);
+            assert!(removal.deleted_directory);
+            assert!(!wt_a.exists());
+            assert!(!inventory_lists(&repo, &wt_a));
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn unregistered_missing_target_is_already_absent_and_touches_nothing() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let wt_a = managed_worktree(&fixture, &repo, "wt-a");
+            let wt_b = managed_worktree(&fixture, &repo, "wt-b");
+            git_ok(
+                &repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    OsStr::new("--"),
+                    wt_a.as_os_str(),
+                ],
+            );
+            std::fs::remove_dir_all(&wt_b).unwrap();
+            let common = common_dir(&repo);
+            let before = branch_snapshot(&repo);
+
+            let removal = remove_managed_worktree_forced(&common, &wt_a)
+                .expect("an unregistered missing path is already absent");
+
+            assert_eq!(removal.method, ForcedRemovalMethod::AlreadyAbsent);
+            assert!(!removal.deleted_directory);
+            assert!(inventory_lists(&repo, &wt_b), "sibling stays registered");
+            assert!(
+                admin_entry_names(&common, &wt_b),
+                "sibling admin entry survives"
+            );
+            assert_eq!(branch_snapshot(&repo), before);
+        }
+
+        #[test]
+        fn forced_arguments_never_touch_branches() {
+            let arguments = forced_remove_arguments();
+            assert_eq!(
+                arguments,
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("remove"),
+                    OsStr::new("--force"),
+                    OsStr::new("--force"),
+                    OsStr::new("--"),
+                ]
+            );
+            for forbidden in [
+                "branch", "-d", "-D", "delete", "push", "fetch", "reset", "clean", "prune",
+            ] {
+                assert!(
+                    !arguments.contains(&OsStr::new(forbidden)),
+                    "{forbidden} must never appear in the forced vector"
+                );
+            }
+            let _ = ForcedRemoval {
+                path: PathBuf::new(),
+                method: ForcedRemovalMethod::GitRemove,
+                deleted_directory: true,
+            };
         }
     }
 

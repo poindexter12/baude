@@ -465,3 +465,11 @@ defunct child. The suite leaked them when its harness died; separate from the
 runtime leak but the same reaping discipline applies to fixtures.
 
 **Status:** ✅ RESOLVED 2026-09-25 via PR #103, released in v2.4.2. Board SQ-3 closed with a verified delivery. The kill tests trap SIGHUP because portable-pty 0.8.1 `Child::kill()` sends SIGHUP first and self-reaps when that alone kills the child, which masked the bug on a plain `sleep` fixture. Running baudes keep their existing zombies until restarted on 2.4.2. The four orphaned fixture shells are still a separate cleanup.
+
+## Captured 2026-11-13
+
+### BL-11 — Intermittent macOS 500 on session teardown: "failed to terminate exact PTY process group"
+
+`DELETE /sessions/{id}` and removal through the daemon occasionally return 500 on macOS. Seen in 1 of 3 and 1 of 5 full single-threaded test runs after plan 21-10, and in 0 of 5 at `aebb3e1`; not seen in the later gate runs. Confirmed cause: on macOS `kill(-pgid, SIGTERM)` answers EPERM for a group whose only member is an exited leader nobody has reaped yet, and `signal_group` in `baude-core/src/pty.rs` tolerated ESRCH only, so `Pty::kill_and_wait` failed before the extinction wait that reaps the leader could run. The window is the few hundred microseconds between the leader's exit and the reader thread's reap. The owner first deferred this from v2.8 and reversed that on 2026-11-13: it is fixed in Phase 22 before the validation tests. Any fix touches platform process code and needs `scripts/gate.sh --linux`.
+
+**Status:** ✅ RESOLVED 2026-11-14 via plan 22-06, fix commit `44c2267`, ships in v2.8.0. `signal_group` now tolerates EPERM as it did ESRCH; only the liveness probe decides extinction and it still counts EPERM as alive, so a live group this process cannot signal is never reported gone. Proven by `pty::tests::kill_and_wait_reaps_unreaped_leader_group`, which holds the child mutex so the reader cannot reap and the window stays open. The fixture `await_parked_holder` hid the defect by reaping first: it polls `is_exited`, so every earlier exited-leader test started from a reaped leader. `scripts/gate.sh --linux` exited 0 on the fix.

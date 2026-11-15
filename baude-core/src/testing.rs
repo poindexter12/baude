@@ -42,6 +42,9 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use crate::pty::Pty;
 
 /// Every path/identity a fixture redirects, held as one value so a guard can
 /// restore the whole set wholesale.
@@ -303,6 +306,251 @@ pub(crate) fn assert_contained(resolved: &Path, what: &str) {
             root.display()
         ),
     }
+}
+
+/// Run `git` with `args` in `dir`. Panics with git's stderr on a non-zero
+/// status and returns trimmed stdout, so a fixture step that fails names the
+/// command and the directory instead of leaving a half-built topology.
+pub fn git_in(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?} in {}: {error}", dir.display()));
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The topology real users have: an upstream, a clone whose main checkout
+/// sits on a working branch, a managed default worktree on `main` and a
+/// managed branch worktree, the two managed worktrees allocated under the
+/// redirected managed root so the forced removal path accepts them.
+///
+/// Every path is the one [`crate::git::discover_repository`] reports, so a
+/// test can compare it with what removal records without canonicalizing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClonedTopology {
+    /// The repository the clone was made from.
+    pub upstream: PathBuf,
+    /// The clone's main checkout, switched to `chore/workspace`.
+    pub clone: PathBuf,
+    /// `<managed root>/default`, a linked worktree on `main`.
+    pub default_worktree: PathBuf,
+    /// `<managed root>/managed`, a linked worktree on `feature/kept`.
+    pub managed_worktree: PathBuf,
+    /// The clone's common dir, as discovery reports it.
+    pub common_dir: PathBuf,
+}
+
+/// Build a [`ClonedTopology`] under `root`.
+///
+/// Requires an active [`TestRedirect`] on this thread and panics otherwise:
+/// the managed worktrees are created under [`crate::git::worktrees_base`],
+/// and without a redirect that would be the developer's real managed root,
+/// which is the leak this module exists to prevent.
+pub fn cloned_topology(root: &Path) -> ClonedTopology {
+    assert!(
+        worktrees_base_override().is_some(),
+        "cloned_topology requires an active TestRedirect on this thread; without one the \
+         managed worktrees would be created under the real managed root"
+    );
+    let upstream = root.join("upstream");
+    std::fs::create_dir_all(&upstream).expect("create upstream");
+    git_in(&upstream, &["init", "-q", "-b", "main"]);
+    git_in(&upstream, &["config", "user.email", "test@example.com"]);
+    git_in(&upstream, &["config", "user.name", "Test"]);
+    std::fs::write(upstream.join("tracked"), b"one\n").expect("write tracked file");
+    git_in(&upstream, &["add", "tracked"]);
+    git_in(&upstream, &["commit", "-q", "-m", "initial"]);
+    let clone = root.join("clone");
+    git_in(
+        root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().expect("utf-8 upstream path"),
+            clone.to_str().expect("utf-8 clone path"),
+        ],
+    );
+    git_in(&clone, &["switch", "-q", "-c", "chore/workspace"]);
+    let base = crate::git::worktrees_base();
+    std::fs::create_dir_all(&base).expect("create managed root");
+    let default = base.join("default");
+    git_in(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            default.to_str().expect("utf-8 default path"),
+            "main",
+        ],
+    );
+    let managed = base.join("managed");
+    git_in(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/kept",
+            managed.to_str().expect("utf-8 managed path"),
+        ],
+    );
+    let reported = |path: &Path| {
+        crate::git::discover_repository(path)
+            .expect("discover worktree")
+            .selected_worktree
+            .path
+    };
+    let snapshot = crate::git::discover_repository(&clone).expect("discover clone");
+    ClonedTopology {
+        upstream,
+        clone: snapshot.main_worktree,
+        default_worktree: reported(&default),
+        managed_worktree: reported(&managed),
+        common_dir: snapshot.common_dir,
+    }
+}
+
+// ---- live-runtime doubles (phase 18 plan 08, shared with the TUI since phase 20) ----
+
+/// Kills the out-of-group slave holder on drop so an assertion panic never
+/// leaks a 30 s perl process.
+pub struct HolderGuard(i32);
+
+impl HolderGuard {
+    /// The holder's pid, for a test that proves it exited after release.
+    pub fn pid(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pid was written by this fixture's own holder.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// The holder's process group as `ps` reports it, `None` once it has exited.
+pub fn holder_pgid(holder: i32) -> Option<i32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &holder.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The shell command behind [`spawn_parked_reader_runtime`], exposed so a
+/// caller that spawns its runtimes through its own path (the App's
+/// `opencode_cmd`) produces the same shape: the leader backgrounds a perl
+/// process that leaves the session with setsid, records its pid at
+/// `holder_pid_path` and sleeps holding the inherited slave terminal, then
+/// the leader exits.
+///
+/// The script is written beside the pid file and the command is `sh <script>`
+/// rather than the script text itself, because a backend composes its spawn
+/// as `exec <command> --port N ...`: an executable plus arguments survives
+/// that, a bare `set +m; ...; exit 0` fragment does not.
+pub fn parked_reader_command(holder_pid_path: &Path) -> String {
+    let script_path = holder_pid_path.with_extension("sh");
+    let script = format!(
+        "set +m\ntrap '' HUP\nperl -MPOSIX -e 'my $sid = POSIX::setsid(); \
+         exit 3 unless defined $sid && $sid != -1; \
+         open(my $f, \">\", \"{}\"); print $f $$; close $f; sleep 30' &\nexit 0\n",
+        holder_pid_path.display()
+    );
+    std::fs::write(&script_path, script).expect("write holder script");
+    format!("sh {}", script_path.display())
+}
+
+/// Wait for the holder behind `pty` to record its pid and for the leader to
+/// exit, then prove from `ps` that the holder sits outside the recorded
+/// group. Returns the guard that kills the holder on drop. It reaps the
+/// leader through `is_exited`, so a test of the exited, unreaped leader
+/// window must not use it.
+pub fn await_parked_holder(pty: &Pty, holder_pid_path: &Path) -> HolderGuard {
+    let pgid = pty.process_identity().process_group;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let holder: i32 = loop {
+        let written = std::fs::read_to_string(holder_pid_path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok());
+        if let Some(holder) = written {
+            if pty.is_exited() {
+                break holder;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder.pid was not written or the leader did not exit \
+             (pid file written: {}, leader exited: {}, pty output: {:?})",
+            written.is_some(),
+            pty.is_exited(),
+            String::from_utf8_lossy(&pty.subscribe().0)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let guard = HolderGuard(holder);
+    let observed = holder_pgid(holder).expect("holder pgid");
+    assert_ne!(
+        observed, pgid,
+        "setsid did not move the holder out of the recorded group"
+    );
+    guard
+}
+
+/// The plan 08 holder shape, spawned directly: see [`parked_reader_command`].
+/// Returns once the holder is proven outside the recorded group and the
+/// leader has exited.
+pub fn spawn_parked_reader_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, HolderGuard) {
+    let _ = std::fs::remove_file(holder_pid_path);
+    let command = parked_reader_command(holder_pid_path);
+    let pty = Pty::spawn(Some(&command), cwd, 5, 40).expect("spawn parked-reader runtime");
+    let guard = await_parked_holder(&pty, holder_pid_path);
+    (pty, guard)
+}
+
+/// Arm a real parked-reader runtime so its next teardown fails the way a
+/// group that outlived SIGKILL does, naming the surviving leader pid.
+///
+/// Nothing portable survives SIGKILL for real: every live member of the
+/// group dies to it, and a zombie left in the group counts as a member on
+/// Linux but is skipped by macOS's `killpg`, so a real survivor would read as
+/// extinct on one platform and live on the other. The failure is therefore
+/// the Phase 18 injection over a real process group: the first
+/// `kill_and_wait` returns `Err` before any signal, and the retry after the
+/// holder is released drives the real kill path over the same group.
+#[cfg(debug_assertions)]
+pub fn arm_unkillable_runtime(pty: &Pty, holder_pid_path: &Path) -> HolderGuard {
+    let guard = await_parked_holder(pty, holder_pid_path);
+    let identity = pty.process_identity();
+    pty.fail_next_teardown_for_test(format!(
+        "process group {} survived SIGKILL; leader pid {} still live",
+        identity.process_group, identity.pid
+    ));
+    guard
+}
+
+/// A runtime whose first teardown fails naming its surviving pid, over a
+/// real process group with a real out-of-group slave holder: see
+/// [`arm_unkillable_runtime`] for why the survivor is injected.
+#[cfg(debug_assertions)]
+pub fn spawn_unkillable_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, HolderGuard) {
+    let _ = std::fs::remove_file(holder_pid_path);
+    let command = parked_reader_command(holder_pid_path);
+    let pty = Pty::spawn(Some(&command), cwd, 5, 40).expect("spawn unkillable runtime");
+    let guard = arm_unkillable_runtime(&pty, holder_pid_path);
+    (pty, guard)
 }
 
 #[cfg(test)]

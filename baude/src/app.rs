@@ -23,13 +23,17 @@ use baude_core::repository::{
     ValidationRow,
 };
 use baude_core::session::{Session, Status};
+use baude_core::suppression;
 
 use crate::hierarchy::{
     self, ActionKind, ActionView, CheckoutDecoration, LocalRow, LocalRowId, SelectionTarget,
 };
 use crate::keys::{encode_key, EncodeCtx};
 use crate::notify_desktop::{self, DesktopNotifier, Row};
-use crate::remote::{RemoteAttach, RemoteInfo, RemotePoller, RemoteSnapshot};
+use crate::remote::{
+    RemoteAttach, RemoteInfo, RemotePoller, RemoteRows, RemoteSnapshot, RemovalReply,
+    RemovalTicket, REMOVAL_TIMEOUT,
+};
 use crate::usage::{UsageCosts, UsagePoller};
 
 const MESSAGE_TTL_MS: u64 = 5000;
@@ -324,10 +328,31 @@ enum SidebarAction {
     RemoteClose,
     RemoteRestart,
     RemoteArchive,
+    /// `D`: the Phase 18 kill-then-remove path over `removal::remove`, offered
+    /// on every local row kind (D-01, D-02).
+    RemoveProject,
     Refuse(SidebarRefusal),
 }
 
 fn sidebar_action(view: ActionView, key: KeyEvent) -> SidebarAction {
+    let remove_project_key = matches!(key.code, KeyCode::Char('D'))
+        || matches!(key.code, KeyCode::Char('d')) && key.modifiers.contains(KeyModifiers::SHIFT);
+    if remove_project_key {
+        // No `can_remove` or `RetryRecovery` gate: recovery state does not
+        // block the force path, and a missing worktree is the already-removed
+        // case the core reports (D-02).
+        // A remote row takes the same action: the daemon that owns the row
+        // previews and performs the removal (D-12).
+        return match view.kind {
+            ActionKind::Remote
+            | ActionKind::Repository
+            | ActionKind::Main
+            | ActionKind::Managed
+            | ActionKind::External
+            | ActionKind::Standalone
+            | ActionKind::Unavailable => SidebarAction::RemoveProject,
+        };
+    }
     let remove_key = matches!(key.code, KeyCode::Char('X'))
         || matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::SHIFT);
     if remove_key {
@@ -472,6 +497,176 @@ pub enum Modal {
     ConfirmRemoveWorktree {
         confirmation: lifecycle::RemovalConfirmation,
     },
+    /// `D`: the report `preview_removal` produced for `target`, shown before
+    /// the Phase 18 kill-then-remove path runs (D-05). `scroll` windows the
+    /// dropped-row list (D-07); `error` is the typed failure of the last
+    /// confirm, which keeps the modal open for retry (D-09).
+    ConfirmRemove {
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        scroll: usize,
+        error: Option<String>,
+        /// Who previewed the report and who will act on a confirm.
+        origin: RemovalOrigin,
+    },
+    /// A remote removal round trip is running on a worker; the answer is
+    /// collected by `poll_remote_removal` from `tick`.
+    RemoteRemovePending {
+        label: String,
+        stage: RemoteRemovalStage,
+    },
+}
+
+/// The words a confirmation shows for a row key no index can name.
+pub(crate) const REMOVAL_UNKNOWN_ROW: &str = "unknown row";
+
+/// How long past `REMOVAL_TIMEOUT` a wait gives its worker before it stops
+/// waiting. It covers the one rows read the worker makes after an unanswered
+/// execute, plus slack. Passing the deadline never reads as a failure.
+const REMOTE_REMOVAL_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where a removal confirmation came from, and so who acts on a confirm.
+pub enum RemovalOrigin {
+    /// This process: `preview_removal` and `confirm_remove_project`.
+    Local,
+    /// A daemon: its preview, its rows index, its execute. Boxed so a local
+    /// confirmation does not carry the size of a rows index it never has.
+    Remote(Box<RemoteConfirm>),
+}
+
+/// What a remote confirmation carries besides the report.
+pub struct RemoteConfirm {
+    /// The daemon's rows index, the only namer of a key in its report.
+    pub(crate) rows: RemoteRows,
+    /// The sidebar name of the row `D` was pressed on.
+    pub(crate) label: String,
+    /// An execute was sent and never answered. Enter previews again; the
+    /// same execute is never resent.
+    pub(crate) unknown_outcome: bool,
+}
+
+impl RemoteConfirm {
+    /// The daemon's own name for a row of its report: display name, then
+    /// the branch in parentheses when the row has one. It reads nothing but
+    /// the daemon's index. The local hierarchy hands out the same small key
+    /// numbers to different rows, so it is never consulted here (D-16).
+    ///
+    /// The names come from another host and are drawn in a terminal, so no
+    /// control character gets through and a long name is cut.
+    pub(crate) fn row_label(&self, key: &baude_core::removal::RowKey) -> String {
+        /// The most characters of a daemon's display name a label shows.
+        const NAME_LIMIT: usize = 80;
+
+        fn printable(text: &str) -> String {
+            text.chars().filter(|c| !c.is_control()).collect()
+        }
+
+        match self.rows.label(key) {
+            Some(label) => {
+                let mut name = printable(&label.display_name);
+                if name.chars().count() > NAME_LIMIT {
+                    name = name.chars().take(NAME_LIMIT - 1).collect();
+                    name.push('…');
+                }
+                match label.branch {
+                    Some(branch) => format!("{name} ({})", printable(&branch)),
+                    None => name,
+                }
+            }
+            None => REMOVAL_UNKNOWN_ROW.to_string(),
+        }
+    }
+}
+
+/// Which round trip a remote removal is waiting on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteRemovalStage {
+    Preview,
+    Execute,
+}
+
+/// What a remote removal wait is waiting for.
+enum RemoteRemovalWait {
+    /// The daemon's preview. Nothing was asked to change.
+    Preview,
+    /// The daemon's answer to the report the user confirmed. The report is
+    /// held so a refusal or an unknown outcome can put it back in front of
+    /// them; it is boxed to keep the preview wait small.
+    Execute(Box<baude_core::removal::RemovalReport>),
+}
+
+impl RemoteRemovalWait {
+    fn stage(&self) -> RemoteRemovalStage {
+        match self {
+            RemoteRemovalWait::Preview => RemoteRemovalStage::Preview,
+            RemoteRemovalWait::Execute(_) => RemoteRemovalStage::Execute,
+        }
+    }
+}
+
+/// The footer a refreshed confirmation gets when the row set changed between
+/// the preview and the confirm. The local recheck says the same words.
+const REMOVAL_RECHECK_NOTICE: &str =
+    "rows changed since the preview; review the refreshed confirmation";
+
+/// One remote removal round trip in flight; polled from `tick`.
+struct PendingRemoteRemoval {
+    wait: RemoteRemovalWait,
+    target: baude_core::removal::RemovalTarget,
+    label: String,
+    /// The rows index as it stood when the round trip started.
+    rows: RemoteRows,
+    ticket: RemovalTicket,
+    /// When the wait stops whether or not the worker ever answers.
+    deadline: std::time::Instant,
+}
+
+/// The row-kind noun a remote confirmation uses. The daemon's index carries
+/// no role this client may rely on, so the noun comes from the target alone.
+pub(crate) fn remote_removal_kind_label(
+    target: baude_core::removal::RemovalTarget,
+) -> &'static str {
+    use baude_core::removal::RemovalTarget;
+    match target {
+        RemovalTarget::Repository(_) => "repository",
+        RemovalTarget::Checkout(_) => "checkout",
+        RemovalTarget::Standalone(_) => "standalone session",
+    }
+}
+
+/// What `confirm_remove_project` did with a confirmed modal.
+#[derive(Debug)]
+pub(crate) enum RemoveProjectOutcome {
+    /// `removal::remove` returned `Ok`: rows are gone and the state is saved.
+    Removed(baude_core::removal::RemovalReport),
+    /// The row set differs from the previewed report; the modal is refreshed
+    /// with this report and asks again instead of removing (D-08).
+    Recheck(baude_core::removal::RemovalReport),
+}
+
+/// Why `confirm_remove_project` did not remove.
+#[derive(Debug)]
+pub(crate) enum RemoveProjectError {
+    /// The repository is reserved by another lifecycle operation.
+    Reservation(String),
+    /// The core refused or failed before any row dropped; every handle is
+    /// back in the registry.
+    Removal(baude_core::removal::RemovalError),
+}
+
+impl std::fmt::Display for RemoveProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reservation(detail) => write!(f, "repository is busy: {detail}"),
+            Self::Removal(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<baude_core::removal::RemovalError> for RemoveProjectError {
+    fn from(error: baude_core::removal::RemovalError) -> Self {
+        Self::Removal(error)
+    }
 }
 
 /// Active text selection within a content pane (claude or shell).
@@ -541,6 +736,11 @@ pub struct App {
     pub remote_snap: RemoteSnapshot,
     /// Previous snapshot to detect changes (for dirty flag gating).
     remote_snap_prev: RemoteSnapshot,
+    /// The daemon's rows index: the only source of a remote removal key and
+    /// of every row name in a remote confirmation.
+    pub remote_rows: RemoteRows,
+    /// At most one remote removal round trip in flight.
+    remote_removal: Option<PendingRemoteRemoval>,
     /// At most one live raw attach to a remote session.
     pub attach: Option<RemoteAttach>,
     /// Scrollback offset for the selected session's claude pane.
@@ -619,6 +819,10 @@ pub struct App {
     /// fsync and no gated child is released before its record is durable.
     deferring_saves: bool,
     deferred_save_pending: std::cell::Cell<bool>,
+    /// The screen the last frame was laid out for, recorded by `sync_sizes`
+    /// so key handlers can reproduce a draw-time window (the `D` modal's
+    /// scroll clamp) without the renderer writing state back.
+    terminal_area: Rect,
     /// Restore Phase B: gated sessions still awaiting release, released one per
     /// loop iteration by `restore_step`.
     restore_total: usize,
@@ -816,11 +1020,12 @@ impl App {
             .or_else(|| config.daemon_url.clone())
             .filter(|u| !u.trim().is_empty())
             .map(RemotePoller::start);
-        // The selection EXPRESSION is what is disabled, not its result. A
-        // detached `RemotePoller` worker outlives the handle, so assigning
-        // `app.remote = None` after construction does not stop one — by then it
-        // has already been started against whatever daemon the developer's
-        // environment named. Tests that want a remote attach their own
+        // The selection EXPRESSION is what is disabled, not its result.
+        // Dropping or stopping a `RemotePoller` does stop its poll and events
+        // threads, but only after the fact: a poller started here has already
+        // sent its first requests to whatever daemon the developer's
+        // environment named, and a removal already in flight still finishes.
+        // So none is started. Tests that want a remote attach their own
         // synthetic loopback poller after construction.
         #[cfg(test)]
         let remote: Option<RemotePoller> = None;
@@ -860,6 +1065,8 @@ impl App {
             remote,
             remote_snap: RemoteSnapshot::default(),
             remote_snap_prev: RemoteSnapshot::default(),
+            remote_rows: RemoteRows::default(),
+            remote_removal: None,
             attach: None,
             claude_scroll: 0,
             shell_scroll: 0,
@@ -903,6 +1110,7 @@ impl App {
             contradict_restore_for_test: None,
             deferring_saves: false,
             deferred_save_pending: std::cell::Cell::new(false),
+            terminal_area: Rect::default(),
             restore_total: 0,
             restore_released: 0,
             restore_releasing: false,
@@ -2009,6 +2217,7 @@ impl App {
         if !canonical.is_dir() {
             anyhow::bail!("not a directory: {}", canonical.display());
         }
+        self.lift_suppression(&canonical);
         let persisted = PersistedPath::from_path(&canonical);
         let (key, fresh) =
             if let Some(saved) = self.repository_state.standalone_session_by_path(&persisted) {
@@ -2289,8 +2498,26 @@ impl App {
         Ok(())
     }
 
+    /// Forget the suppression entry for the repository root of `path`, if any,
+    /// so an explicit admission of a removed checkout re-admits it. The key is
+    /// the admitted path's own `repo_root`, never the main worktree and never a
+    /// child, so admitting the parent root leaves a child's entry alone (D-12).
+    /// The store is advisory: a write failure is a message, never an error out
+    /// of an admission or a launch (D-09).
+    fn lift_suppression(&mut self, path: &Path) {
+        let key_path = git::repo_root(path).unwrap_or_else(|| path.to_path_buf());
+        if let Err(error) = suppression::lift(&persist::config_dir(), &key_path) {
+            self.set_message(format!("suppression lift failed: {error}"));
+        }
+    }
+
     pub fn admit_repository(&mut self, path: &Path) -> Result<Option<u64>> {
         let snapshot = git::discover_repository(path)?;
+        // Lift before either sweep site below so an explicit admission of a
+        // removed checkout brings it back in this same pass. The lift also
+        // comes before the removed-primary consult ahead of derivation, so
+        // naming a removed primary's own folder derives it again here.
+        self.lift_suppression(path);
         // Admission is the reconciliation seam: resolve origin once here and
         // retain only its browser-addressable identity for gesture-time hints.
         let origin = git::origin_target(&snapshot.main_worktree).map(|target| RepositoryOrigin {
@@ -2395,6 +2622,31 @@ impl App {
                     return self.ensure_primary(existing_key);
                 }
             }
+        }
+        // The suppression store is advisory and can only stop this
+        // derivation, never cause one. A primary the user removed stays
+        // removed while its entry stands: no key is allocated and no
+        // `git worktree add` runs for an admission that named a sibling. The
+        // entry goes away only when an explicit admission of exactly that
+        // path lifts it, above, or when the repository row is removed (D-12).
+        let removed_primary = match existing_key {
+            Some(_) => None,
+            None => suppression::removed_primary(&persist::config_dir(), &snapshot.common_dir),
+        };
+        if let Some(removed) = removed_primary {
+            self.admit_existing_worktrees(repository_key, &snapshot)?;
+            self.repository_state.validate()?;
+            self.save_durable()?;
+            self.set_message(if removed.is_dir() {
+                format!(
+                    "default checkout {} was removed; open that folder to bring it back",
+                    removed.display()
+                )
+            } else {
+                "default checkout was removed with its folder; remove this repository and open it again to bring it back"
+                    .to_string()
+            });
+            return Ok(None);
         }
         let checkout_key = match existing_key {
             Some(key) => key,
@@ -2503,6 +2755,13 @@ impl App {
                     .iter()
                     .any(|standalone| standalone.canonical_path == path);
             if owned {
+                continue;
+            }
+            // The suppression store is advisory and can only take a candidate
+            // out of this sweep, never admit one. An entry goes away only when
+            // an explicit admission of exactly that path lifts it or when the
+            // parent repository row is removed (D-11, D-12).
+            if suppression::is_suppressed(&persist::config_dir(), &record.path) {
                 continue;
             }
             let main_role_taken = self.repository_state.checkouts.iter().any(|checkout| {
@@ -3686,6 +3945,732 @@ impl App {
         Err(failure)
     }
 
+    /// The row-kind noun the `D` modal title and prompt use for `target`.
+    pub(crate) fn removal_kind_label(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> &'static str {
+        use baude_core::removal::RemovalTarget;
+        match target {
+            RemovalTarget::Repository(_) => "repository",
+            RemovalTarget::Standalone(_) => "standalone session",
+            RemovalTarget::Checkout(key) => self
+                .hierarchy_rows()
+                .into_iter()
+                .find_map(|row| match row {
+                    LocalRow::Checkout(child) if child.key == key => {
+                        Some(match child.actions.kind {
+                            ActionKind::Main => "main checkout",
+                            ActionKind::Managed => "managed worktree",
+                            ActionKind::External => "unmanaged checkout",
+                            ActionKind::Unavailable => "unavailable worktree",
+                            _ => "checkout",
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or("checkout"),
+        }
+    }
+
+    /// The sidebar name of a row named in a `RemovalReport`, falling back to
+    /// its recorded path so a row the hierarchy no longer projects still
+    /// reads as something concrete. A key nothing here names reads
+    /// `unknown row`, never as key text.
+    pub(crate) fn removal_row_label(&self, key: &baude_core::removal::RowKey) -> String {
+        use baude_core::removal::RowKey;
+        let from_rows = self
+            .hierarchy_rows()
+            .into_iter()
+            .find_map(|row| match (row, key) {
+                (LocalRow::Repository(parent), RowKey::Repository(k)) if parent.key == *k => {
+                    Some(parent.name)
+                }
+                (LocalRow::Checkout(child), RowKey::Checkout(k)) if child.key == *k => {
+                    Some(child.name)
+                }
+                (LocalRow::Standalone(standalone), RowKey::Standalone(k))
+                    if standalone.key == *k =>
+                {
+                    Some(standalone.name)
+                }
+                _ => None,
+            });
+        if let Some(name) = from_rows {
+            return name;
+        }
+        let path = match key {
+            RowKey::Repository(k) => self
+                .repository_state
+                .repositories
+                .iter()
+                .find(|repository| repository.key == *k)
+                .map(|repository| repository.observed_main_worktree.to_path_buf()),
+            RowKey::Checkout(k) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == *k)
+                .map(|checkout| checkout.observed_path.to_path_buf()),
+            RowKey::Standalone(k) => self
+                .repository_state
+                .standalone_session(*k)
+                .map(|standalone| standalone.canonical_path.to_path_buf()),
+        };
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| REMOVAL_UNKNOWN_ROW.to_string())
+    }
+
+    /// The `RemovalTarget` the selected local row names, or `None` for a
+    /// remote row or an empty selection.
+    fn removal_target_for_selection(&self) -> Option<baude_core::removal::RemovalTarget> {
+        use baude_core::removal::RemovalTarget;
+        match self.selected_id? {
+            SelId::Repository(key) => Some(RemovalTarget::Repository(key)),
+            SelId::Checkout(key) => Some(RemovalTarget::Checkout(key)),
+            SelId::Standalone(key) => Some(RemovalTarget::Standalone(key)),
+            SelId::Remote(_) => None,
+        }
+    }
+
+    /// The repository a removal target reserves; standalone rows have none.
+    fn removal_target_repository(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> Option<RepositoryKey> {
+        use baude_core::removal::RemovalTarget;
+        match target {
+            RemovalTarget::Repository(key) => Some(key),
+            RemovalTarget::Checkout(key) => self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.key == key)
+                .map(|checkout| checkout.repository_key),
+            RemovalTarget::Standalone(_) => None,
+        }
+    }
+
+    /// Hold the target's repository the way `prepare_remove_worktree` does,
+    /// so a concurrent reopen cannot interleave with preview or removal.
+    fn reserve_removal_target(
+        &self,
+        target: baude_core::removal::RemovalTarget,
+    ) -> std::result::Result<Option<lifecycle::RepositoryReservation>, RemoveProjectError> {
+        let Some(repository) = self.removal_target_repository(target) else {
+            return Ok(None);
+        };
+        self.repository_reservations
+            .reserve(repository)
+            .map(Some)
+            .map_err(|outcome| RemoveProjectError::Reservation(format!("{outcome:?}")))
+    }
+
+    /// `D`: build `Modal::ConfirmRemove` from `preview_removal` for the
+    /// selected row (D-03, D-05). A `RemovalError` becomes a footer notice.
+    fn open_remove_project_modal(&mut self) {
+        // A remote row is previewed and removed by its daemon, never here.
+        if let Some(SelId::Remote(id)) = self.selected_id {
+            self.open_remote_remove(id);
+            return;
+        }
+        let Some(target) = self.removal_target_for_selection() else {
+            self.set_message("Cannot remove: select a local row first.".into());
+            return;
+        };
+        let label = self.selected_target_label();
+        let reservation = match self.reserve_removal_target(target) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.set_message(format!(
+                    "Cannot remove “{label}”: {error}. Nothing was changed."
+                ));
+                return;
+            }
+        };
+        let preview = baude_core::removal::preview_removal(&self.repository_state, target);
+        drop(reservation);
+        match preview {
+            Ok(report) => {
+                self.modal = Modal::ConfirmRemove {
+                    target,
+                    report,
+                    scroll: 0,
+                    error: None,
+                    origin: RemovalOrigin::Local,
+                };
+                self.dirty = true;
+            }
+            Err(error) => self.set_message(format!(
+                "Cannot remove “{label}”: {error}. Nothing was removed."
+            )),
+        }
+    }
+
+    /// Install the remote view a poll produced. A changed session list or a
+    /// changed rows index marks the view for redraw; nothing else does.
+    pub(crate) fn apply_remote_view(&mut self, snap: RemoteSnapshot, rows: RemoteRows) {
+        // Mark dirty only if meaningful fields changed (not just fetched_ms timestamp)
+        // Use same_view() to compare sessions, ok, daemon_workspace, and collision_count,
+        // ignoring the time-based fetched_ms field which changes every poll.
+        if !snap.same_view(&self.remote_snap_prev) {
+            self.dirty = true;
+        }
+        self.remote_snap_prev = snap.clone();
+        self.remote_snap = snap;
+        if rows != self.remote_rows {
+            self.dirty = true;
+        }
+        self.remote_rows = rows;
+    }
+
+    /// When a remote removal wait stops by itself.
+    fn remote_removal_deadline() -> std::time::Instant {
+        std::time::Instant::now() + REMOVAL_TIMEOUT + REMOTE_REMOVAL_GRACE
+    }
+
+    /// `D` on a remote row: ask that row's daemon for a preview on a worker
+    /// and show the waiting modal. Nothing here waits on the network, and a
+    /// row the daemon's index gives no key gets no request at all (D-10).
+    fn open_remote_remove(&mut self, session_id: u64) {
+        let label = self.selected_target_label();
+        if self.remote.is_none() {
+            self.set_message(format!(
+                "Cannot remove “{label}”: no daemon connection. Nothing was changed."
+            ));
+            return;
+        }
+        let Some(target) = self.remote_rows.target_for_session(session_id) else {
+            self.set_message(format!(
+                "Cannot remove “{label}”: the daemon lists no removable row for it. Nothing was changed."
+            ));
+            return;
+        };
+        let Some(ticket) = self
+            .remote
+            .as_ref()
+            .map(|poller| poller.spawn_preview_removal(target))
+        else {
+            return;
+        };
+        self.remote_removal = Some(PendingRemoteRemoval {
+            wait: RemoteRemovalWait::Preview,
+            target,
+            label: label.clone(),
+            rows: self.remote_rows.clone(),
+            ticket,
+            deadline: Self::remote_removal_deadline(),
+        });
+        self.modal = Modal::RemoteRemovePending {
+            label,
+            stage: RemoteRemovalStage::Preview,
+        };
+        self.dirty = true;
+    }
+
+    /// Enter or `y` on a remote confirmation: send the previewed report back
+    /// to the daemon on a worker, unchanged and once, and show the waiting
+    /// modal. Nothing on this machine is touched.
+    ///
+    /// A confirmation that stands for an unknown outcome is the exception:
+    /// its removal was already sent and may have happened, so Enter asks for
+    /// a new preview and the same removal is never sent again.
+    fn confirm_remote_remove(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        confirm: RemoteConfirm,
+    ) {
+        let RemoteConfirm {
+            rows,
+            label,
+            unknown_outcome,
+        } = confirm;
+        let started = self.remote.as_ref().map(|poller| {
+            if unknown_outcome {
+                (
+                    poller.spawn_preview_removal(target),
+                    RemoteRemovalWait::Preview,
+                )
+            } else {
+                (
+                    poller.spawn_execute_removal(report.clone()),
+                    RemoteRemovalWait::Execute(Box::new(report)),
+                )
+            }
+        });
+        let Some((ticket, wait)) = started else {
+            // "Nothing was changed" would be a guess after an unknown outcome.
+            self.set_message(if unknown_outcome {
+                format!("Cannot preview “{label}” again: no daemon connection.")
+            } else {
+                format!("Cannot remove “{label}”: no daemon connection. Nothing was changed.")
+            });
+            return;
+        };
+        let stage = wait.stage();
+        self.remote_removal = Some(PendingRemoteRemoval {
+            wait,
+            target,
+            label: label.clone(),
+            rows,
+            ticket,
+            deadline: Self::remote_removal_deadline(),
+        });
+        self.modal = Modal::RemoteRemovePending { label, stage };
+        self.dirty = true;
+    }
+
+    /// Collect the answer of the remote removal in flight, if it has one.
+    /// Called from `tick`; it never waits.
+    pub(crate) fn poll_remote_removal(&mut self) {
+        let Some(pending) = self.remote_removal.as_ref() else {
+            return;
+        };
+        let answer = pending.ticket.try_take();
+        if answer.is_none() && std::time::Instant::now() < pending.deadline {
+            return;
+        }
+        let Some(pending) = self.remote_removal.take() else {
+            return;
+        };
+        self.dirty = true;
+        // A worker that never answered by the deadline is the same thing as a
+        // request that got no answer, so silence has one outcome per stage.
+        let (reply, fresh_rows) = match answer {
+            Some(answer) => (answer.reply, answer.rows),
+            None => (
+                RemovalReply::Unreachable {
+                    message: String::new(),
+                },
+                None,
+            ),
+        };
+        let PendingRemoteRemoval {
+            wait,
+            target,
+            label,
+            rows,
+            ..
+        } = pending;
+        let rows = fresh_rows.unwrap_or(rows);
+        match wait {
+            RemoteRemovalWait::Preview => self.settle_remote_preview(target, label, rows, reply),
+            RemoteRemovalWait::Execute(previewed) => {
+                self.settle_remote_execute(target, label, rows, *previewed, reply);
+            }
+        }
+    }
+
+    /// Put a remote confirmation on screen, unscrolled.
+    fn install_remote_confirmation(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        report: baude_core::removal::RemovalReport,
+        error: Option<String>,
+        confirm: RemoteConfirm,
+    ) {
+        self.modal = Modal::ConfirmRemove {
+            target,
+            report,
+            scroll: 0,
+            error,
+            origin: RemovalOrigin::Remote(Box::new(confirm)),
+        };
+    }
+
+    /// End a remote removal with nothing left on screen but a footer notice.
+    /// The caller already took the pending removal, so no key can resend it.
+    fn close_remote_removal(&mut self, notice: String) {
+        self.modal = Modal::None;
+        self.set_message(notice);
+    }
+
+    fn remote_already_removed_notice(label: &str) -> String {
+        format!("“{label}” was already removed on the daemon.")
+    }
+
+    /// The outcome of a preview, one per daemon answer. A preview asks the
+    /// daemon to change nothing, so every outcome but the confirmation
+    /// closes the modal.
+    fn settle_remote_preview(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        label: String,
+        rows: RemoteRows,
+        reply: RemovalReply,
+    ) {
+        match reply {
+            // A 409 to a preview carries what a 200 does: the current preview.
+            RemovalReply::Report(report) | RemovalReply::Drift(report) => {
+                self.install_remote_confirmation(
+                    target,
+                    report,
+                    None,
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: false,
+                    },
+                );
+            }
+            RemovalReply::Gone { .. } => {
+                self.close_remote_removal(Self::remote_already_removed_notice(&label));
+            }
+            RemovalReply::Refused { message, .. } => {
+                // No report came back, so the target is the one key this
+                // side can name; any other key in the text reads unknown.
+                let message = crate::ui::removal_text_for_user(
+                    &message,
+                    &[crate::ui::removal_target_row_key(target)],
+                    &|_| label.clone(),
+                );
+                self.close_remote_removal(format!(
+                    "Cannot remove “{label}”: {message}. Nothing was changed."
+                ));
+            }
+            RemovalReply::Unreachable { .. } | RemovalReply::Indeterminate { .. } => self
+                .close_remote_removal(format!(
+                    "No answer from the daemon for “{label}”. Nothing was changed."
+                )),
+        }
+    }
+
+    /// The outcome of a sent removal, one per daemon answer. Nothing here
+    /// sends a request: a refreshed or refused confirmation waits for Enter,
+    /// and a removal that got no answer is an unknown outcome, never a
+    /// failure, because the daemon may have carried it out.
+    fn settle_remote_execute(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        label: String,
+        rows: RemoteRows,
+        previewed: baude_core::removal::RemovalReport,
+        reply: RemovalReply,
+    ) {
+        match reply {
+            RemovalReply::Report(report) => {
+                let mut notice = Self::removal_notice(&report);
+                // A local removal raises `persistence_dirty` for this outcome.
+                // The state file here is another machine's, so the footer is
+                // the one place its caveat can be read. The detail is often
+                // a bare OS error, so it is led in by what it is about.
+                if let baude_core::removal::PersistenceOutcome::SavedDegraded { detail } =
+                    &report.persistence
+                {
+                    notice.push_str(&format!(
+                        "; the daemon could not confirm its state save: {}",
+                        crate::remote::sanitize_daemon_text(detail)
+                    ));
+                }
+                self.close_remote_removal(notice);
+            }
+            // D-14: the daemon removed nothing and sent its fresh preview.
+            RemovalReply::Drift(fresh) => {
+                self.install_remote_confirmation(
+                    target,
+                    fresh,
+                    None,
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: false,
+                    },
+                );
+                self.set_message(REMOVAL_RECHECK_NOTICE.into());
+            }
+            // D-15: the daemon's own words, and the same report held for a
+            // retry on Enter.
+            RemovalReply::Refused { message, .. } => {
+                self.install_remote_confirmation(
+                    target,
+                    previewed,
+                    Some(message),
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: false,
+                    },
+                );
+            }
+            RemovalReply::Gone { .. } => {
+                self.close_remote_removal(Self::remote_already_removed_notice(&label));
+            }
+            RemovalReply::Indeterminate {
+                rows_gone: true, ..
+            } => self.close_remote_removal(format!(
+                "“{label}” was removed: the daemon no longer lists it."
+            )),
+            // The worker's own message is not shown: it describes a transport
+            // detail, and the one thing the user needs is that the outcome is
+            // not known.
+            RemovalReply::Indeterminate {
+                rows_gone: false, ..
+            }
+            | RemovalReply::Unreachable { .. } => {
+                let error = format!(
+                    "the daemon did not answer; “{label}” may or may not have been removed"
+                );
+                self.install_remote_confirmation(
+                    target,
+                    previewed,
+                    Some(error),
+                    RemoteConfirm {
+                        rows,
+                        label,
+                        unknown_outcome: true,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Move the live `Session` handles for the report's rows out of the App
+    /// registry into the shape `removal::remove` demands. The
+    /// `runtime_checkouts` / `runtime_standalones` entries stay until the
+    /// core returns `Ok`, so `restore_row_runtimes` can put a handle back
+    /// without rebuilding the mapping.
+    fn collect_row_runtimes(
+        &mut self,
+        report: &baude_core::removal::RemovalReport,
+    ) -> Vec<baude_core::removal::RowRuntime> {
+        use baude_core::removal::{RowKey, RowRuntime};
+        let mut runtimes = Vec::new();
+        for row in &report.rows_removed {
+            let runtime_id = match row {
+                RowKey::Checkout(key) => self.runtime_checkouts.get(key).copied(),
+                RowKey::Standalone(key) => self.runtime_standalones.get(key).copied(),
+                RowKey::Repository(_) => None,
+            };
+            let Some(runtime_id) = runtime_id else {
+                continue;
+            };
+            let Some(index) = self
+                .sessions
+                .iter()
+                .position(|session| session.id == runtime_id)
+            else {
+                continue;
+            };
+            runtimes.push(RowRuntime {
+                row: *row,
+                session: self.sessions.remove(index),
+            });
+        }
+        runtimes
+    }
+
+    /// Return every handle the core did not consume to the registry. On
+    /// `Err` that is all of them; after a kill-stage abort some may already
+    /// be dead, which the existing exit detection and close path reconcile.
+    fn restore_row_runtimes(&mut self, runtimes: Vec<baude_core::removal::RowRuntime>) {
+        for runtime in runtimes {
+            // The `runtime_checkouts` / `runtime_standalones` entry was never
+            // dropped, so the handle slots straight back under its row; the
+            // registry keeps id order so the sidebar's runtime decorations
+            // and `ordered_ids` are stable.
+            let session = runtime.session;
+            let index = self
+                .sessions
+                .iter()
+                .position(|existing| existing.id > session.id)
+                .unwrap_or(self.sessions.len());
+            self.sessions.insert(index, session);
+        }
+    }
+
+    /// Enter or `y` on `Modal::ConfirmRemove`: re-reserve, recheck the row
+    /// set against the previewed report (D-08), then run `removal::remove`
+    /// with the atomic save. On `Err` every handle is back in the registry
+    /// and the rows are untouched (D-09). On `Ok` the removed rows leave the
+    /// registry, selection moves to the parent or next repository (D-11),
+    /// clearing failures are a footer notice (D-10) and the footer confirms
+    /// with counts.
+    pub(crate) fn confirm_remove_project(
+        &mut self,
+        target: baude_core::removal::RemovalTarget,
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> std::result::Result<RemoveProjectOutcome, RemoveProjectError> {
+        use baude_core::removal::{self, PersistenceOutcome, RemovalTarget, RowKey};
+        let rows_before = self.visible_hierarchy_rows();
+        let parent = match target {
+            RemovalTarget::Checkout(_) => self.removal_target_repository(target),
+            RemovalTarget::Repository(_) | RemovalTarget::Standalone(_) => None,
+        };
+        let _reservation = self.reserve_removal_target(target)?;
+        // D-08: the report is recomputed at confirm time; a difference in
+        // what the run would do (the rows, the runtimes it kills, the paths
+        // it deletes) refreshes the modal instead of removing, so the
+        // confirmation never promises less than the run performs (D-05).
+        // `cleared` and `already_removed` are filesystem probes that would
+        // make the recheck flap on advisory state, so they are not compared.
+        let fresh = removal::preview_removal(&self.repository_state, target)?;
+        let action_changed = fresh.rows_removed != previewed.rows_removed
+            || fresh.runtimes_killed != previewed.runtimes_killed
+            || fresh.paths_deleted != previewed.paths_deleted;
+        if action_changed {
+            return Ok(RemoveProjectOutcome::Recheck(fresh));
+        }
+        let mut runtimes = self.collect_row_runtimes(&fresh);
+        #[cfg(test)]
+        let save_failure = self.atomic_failure_for_test;
+        #[cfg(test)]
+        let save_root = self.persistence_root_for_test.clone();
+        #[cfg(test)]
+        let save_attempts = &self.save_attempts_for_test;
+        let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            #[cfg(test)]
+            {
+                save_attempts.set(save_attempts.get() + 1);
+                if let Some(root) = &save_root {
+                    return persist::save_current_at_test(
+                        root,
+                        &baude_core::workspace::active().state_file("state"),
+                        file,
+                        save_failure,
+                        None,
+                    );
+                }
+            }
+            persist::save_for_workspace_status("state", baude_core::workspace::active(), file)
+        };
+        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        #[cfg(test)]
+        {
+            // Failure injection models one atomic boundary, so a retry
+            // exercises the recovered path.
+            self.atomic_failure_for_test = None;
+        }
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                // D-09: `*state` is untouched and every handle is still in
+                // the Vec; put them all back before the modal is reinstalled.
+                self.restore_row_runtimes(runtimes);
+                return Err(error.into());
+            }
+        };
+        for row in &report.rows_removed {
+            match row {
+                RowKey::Checkout(key) => {
+                    self.runtime_checkouts.remove(key);
+                }
+                RowKey::Standalone(key) => {
+                    self.runtime_standalones.remove(key);
+                }
+                RowKey::Repository(_) => {}
+            }
+        }
+        // Handles the core did not consume stay in the registry.
+        self.restore_row_runtimes(runtimes);
+        self.persistence_dirty =
+            matches!(report.persistence, PersistenceOutcome::SavedDegraded { .. });
+        self.select_after_removal(&rows_before, target, parent);
+        self.focus = Focus::Sidebar;
+        Ok(RemoveProjectOutcome::Removed(report))
+    }
+
+    /// The footer line for a completed removal: counts of what the committed
+    /// report says happened, plus any clearing failure by name (D-10: those
+    /// come after the save and do not fail the removal).
+    fn removal_notice(report: &baude_core::removal::RemovalReport) -> String {
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let rows = report.rows_removed.len();
+        let killed = report.runtimes_killed.len();
+        let deleted = report.paths_deleted.len();
+        let mut message = format!(
+            "removed {rows} row{}, killed {killed} runtime{}, deleted {deleted} path{}",
+            plural(rows),
+            plural(killed),
+            plural(deleted)
+        );
+        if !report.clearing_failures.is_empty() {
+            let failures: Vec<String> = report
+                .clearing_failures
+                .iter()
+                .map(|failure| {
+                    format!(
+                        "{:?} {}: {}",
+                        failure.kind,
+                        failure.path.display(),
+                        failure.error
+                    )
+                })
+                .collect();
+            message.push_str(&format!(
+                "; could not clear {}: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        message
+    }
+
+    /// D-11: after a removal the selection lands on the parent repository of
+    /// a removed child, else the next repository in the pre-removal order,
+    /// else the first selectable surviving row.
+    fn select_after_removal(
+        &mut self,
+        rows_before: &[LocalRow],
+        target: baude_core::removal::RemovalTarget,
+        parent: Option<RepositoryKey>,
+    ) {
+        use baude_core::removal::RemovalTarget;
+        let exists = |key: RepositoryKey| {
+            self.repository_state
+                .repositories
+                .iter()
+                .any(|repository| repository.key == key)
+        };
+        if let Some(parent) = parent.filter(|key| exists(*key)) {
+            self.selected_id = Some(SelId::Repository(parent));
+            return;
+        }
+        let repositories: Vec<RepositoryKey> = rows_before
+            .iter()
+            .filter_map(|row| match row {
+                LocalRow::Repository(repository) => Some(repository.key),
+                _ => None,
+            })
+            .collect();
+        let removed_at = match target {
+            RemovalTarget::Repository(key) => repositories.iter().position(|k| *k == key),
+            _ => None,
+        };
+        let next = match removed_at {
+            Some(at) => repositories
+                .iter()
+                .skip(at + 1)
+                .copied()
+                .find(|key| exists(*key))
+                .or_else(|| {
+                    repositories[..at]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|key| exists(*key))
+                }),
+            None => repositories.iter().copied().find(|key| exists(*key)),
+        };
+        if let Some(key) = next {
+            self.selected_id = Some(SelId::Repository(key));
+            return;
+        }
+        self.selected_id = hierarchy::selectable_local_ids(&self.visible_hierarchy_rows())
+            .first()
+            .map(|id| match id {
+                LocalRowId::Repository(key) => SelId::Repository(*key),
+                LocalRowId::Checkout(key) => SelId::Checkout(*key),
+                LocalRowId::Standalone(key) => SelId::Standalone(*key),
+            })
+            .or_else(|| {
+                self.remote_snap
+                    .sessions
+                    .first()
+                    .map(|remote| SelId::Remote(remote.id))
+            });
+    }
+
     pub fn prepare_remove_worktree(
         &self,
         checkout: CheckoutKey,
@@ -4386,16 +5371,11 @@ impl App {
         }
 
         if let Some(r) = &self.remote {
-            let new_snap = r.snapshot();
-            // Mark dirty only if meaningful fields changed (not just fetched_ms timestamp)
-            // Use same_view() to compare sessions, ok, daemon_workspace, and collision_count,
-            // ignoring the time-based fetched_ms field which changes every poll.
-            if !new_snap.same_view(&self.remote_snap_prev) {
-                self.dirty = true;
-            }
-            self.remote_snap_prev = new_snap.clone();
-            self.remote_snap = new_snap;
+            let snap = r.snapshot();
+            let rows = r.rows();
+            self.apply_remote_view(snap, rows);
         }
+        self.poll_remote_removal();
         if let Some(context) = self.folder_context.as_mut() {
             context.maybe_flush(&self.repository_state, now_ms());
         }
@@ -4466,6 +5446,7 @@ impl App {
 
     /// Resize every session's PTYs to match the geometry they would render at.
     pub fn sync_sizes(&mut self, area: Rect) {
+        self.terminal_area = area;
         if area.height < 13 && self.focus == Focus::Shell {
             let live_agent = self
                 .selected()
@@ -5131,6 +6112,7 @@ impl App {
                     SidebarAction::RetryReopen => self.open_local_target(),
                     SidebarAction::RetryRecovery => self.retry_selected_recovery(),
                     SidebarAction::Remove => self.prepare_selected_removal(),
+                    SidebarAction::RemoveProject => self.open_remove_project_modal(),
                     SidebarAction::Shell => self.toggle_shell(true),
                     SidebarAction::Editor => self.open_editor_for_selection(),
                     SidebarAction::Info => self.modal = Modal::Info,
@@ -5159,7 +6141,7 @@ impl App {
         }
     }
 
-    fn handle_modal_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_modal_key(&mut self, key: KeyEvent) {
         match &mut self.modal {
             Modal::Help | Modal::Info | Modal::Gsd | Modal::Activity => {
                 self.modal = Modal::None;
@@ -5290,6 +6272,116 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
                 _ => {}
             },
+            Modal::ConfirmRemove { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let modal = std::mem::replace(&mut self.modal, Modal::None);
+                    let Modal::ConfirmRemove {
+                        target,
+                        report,
+                        scroll,
+                        origin,
+                        ..
+                    } = modal
+                    else {
+                        unreachable!();
+                    };
+                    match origin {
+                        // The daemon acts on its own rows; the local removal
+                        // below is never reached for a remote confirmation.
+                        RemovalOrigin::Remote(confirm) => {
+                            self.confirm_remote_remove(target, report, *confirm);
+                        }
+                        RemovalOrigin::Local => {
+                            match self.confirm_remove_project(target, &report) {
+                                Ok(RemoveProjectOutcome::Removed(report)) => {
+                                    self.set_message(Self::removal_notice(&report));
+                                }
+                                Ok(RemoveProjectOutcome::Recheck(fresh)) => {
+                                    self.modal = Modal::ConfirmRemove {
+                                        target,
+                                        report: fresh,
+                                        scroll: 0,
+                                        error: None,
+                                        origin: RemovalOrigin::Local,
+                                    };
+                                    self.set_message(
+                                    "rows changed since the preview; review the refreshed confirmation"
+                                        .into(),
+                                );
+                                }
+                                Err(error) => {
+                                    // D-09: rows and handles are intact; keep the
+                                    // modal open with the typed error for retry.
+                                    self.modal = Modal::ConfirmRemove {
+                                        target,
+                                        report,
+                                        scroll,
+                                        error: Some(error.to_string()),
+                                        origin: RemovalOrigin::Local,
+                                    };
+                                    self.dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    // Clamp with the same window the renderer draws, so `j`
+                    // past the end cannot bank an invisible surplus that
+                    // makes the next `k` presses appear dead. The renderer's
+                    // own clamp is display-only and never written back.
+                    let height = self.terminal_area.height;
+                    if let Modal::ConfirmRemove {
+                        scroll,
+                        report,
+                        error,
+                        ..
+                    } = &mut self.modal
+                    {
+                        let window = crate::ui::remove_project_modal_max_rows(
+                            report,
+                            error.as_deref(),
+                            height,
+                        );
+                        let last = report.rows_removed.len().saturating_sub(window);
+                        *scroll = scroll.saturating_add(1).min(last);
+                        self.dirty = true;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Modal::ConfirmRemove { scroll, .. } = &mut self.modal {
+                        *scroll = scroll.saturating_sub(1);
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            },
+            Modal::RemoteRemovePending { label, stage } => {
+                // Every other key does nothing in both stages, which is what
+                // makes a second Enter harmless.
+                if matches!(key.code, KeyCode::Char('n') | KeyCode::Esc) {
+                    match *stage {
+                        // Dropping the ticket is all a cancel takes: a
+                        // preview asks the daemon to change nothing.
+                        RemoteRemovalStage::Preview => {
+                            self.remote_removal = None;
+                            self.modal = Modal::None;
+                            self.set_message(
+                                "Removal preview cancelled. Nothing was changed.".into(),
+                            );
+                        }
+                        // A sent removal cannot be taken back, so the wait
+                        // stays and ends by itself.
+                        RemoteRemovalStage::Execute => {
+                            let notice = format!(
+                                "The removal of “{label}” was already sent and cannot be recalled. Waiting for the daemon."
+                            );
+                            self.set_message(notice);
+                        }
+                    }
+                }
+            }
             Modal::None => {}
         }
     }
@@ -9436,6 +10528,1470 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A pushed fixture with two linked branch worktrees beside the managed
+    /// root, the shape a user who ran `git worktree add` twice leaves behind.
+    /// Worktree paths are canonicalised up front so they compare equal to what
+    /// the sweep records from `git worktree list` under the macOS temp symlink.
+    struct SuppressionFixture {
+        _fixture: AdmissionRepo,
+        repo: PathBuf,
+        root: PathBuf,
+        state_root: PathBuf,
+        kept: PathBuf,
+        suppressed: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    fn suppression_fixture(name: &str) -> SuppressionFixture {
+        let fixture = admission_repo(name);
+        let repo = fixture.path().to_path_buf();
+        let root = repo.parent().unwrap().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let kept = root.join("wt-kept");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/kept",
+                kept.to_str().unwrap(),
+            ],
+        );
+        let suppressed = root.join("wt-suppressed");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/suppressed",
+                suppressed.to_str().unwrap(),
+            ],
+        );
+        let common_dir = baude_core::git::discover_repository(&repo)
+            .unwrap()
+            .common_dir;
+        SuppressionFixture {
+            _fixture: fixture,
+            repo,
+            root,
+            state_root,
+            kept: kept.canonicalize().unwrap(),
+            suppressed: suppressed.canonicalize().unwrap(),
+            common_dir,
+        }
+    }
+
+    /// An `App` over the fixture's state root with the same stand-in command
+    /// every admission test in this file uses, so the primary spawns and
+    /// stays alive for the assertions.
+    fn suppression_app(fx: &SuppressionFixture, launch: PathBuf) -> App {
+        let mut app = App::new(launch);
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(fx.state_root.clone());
+        app
+    }
+
+    /// Seed one entry the way plan 04's clearing stage writes it: keyed by the
+    /// checkout path, tagged with the surviving parent's common dir.
+    fn seed_suppression(path: &Path, common_dir: &Path) {
+        let config = baude_core::persist::config_dir();
+        baude_core::suppression::suppress(&config, path, common_dir, 1).unwrap();
+        assert!(baude_core::suppression::is_suppressed(&config, path));
+    }
+
+    fn is_suppressed(path: &Path) -> bool {
+        baude_core::suppression::is_suppressed(&baude_core::persist::config_dir(), path)
+    }
+
+    fn checkout_row<'a>(app: &'a App, path: &Path) -> Option<&'a SavedCheckout> {
+        let persisted = PersistedPath::from_path(path);
+        app.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.observed_path == persisted)
+    }
+
+    fn last_message(app: &App) -> Option<&str> {
+        app.message.as_ref().map(|(message, _)| message.as_str())
+    }
+
+    /// READM-03 read side, D-09 and D-11: an entry for a linked worktree keeps
+    /// the inventory sweep from admitting it while its siblings still come in.
+    #[test]
+    fn suppressed_worktree_is_skipped_by_admission_sweep() {
+        let fx = suppression_fixture("suppression-sweep-skip");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+
+        let main = fx.repo.canonicalize().unwrap();
+        assert!(checkout_row(&app, &main).is_some(), "primary admitted");
+        let kept = checkout_row(&app, &fx.kept).expect("unsuppressed sibling admitted");
+        assert_eq!(kept.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert!(
+            checkout_row(&app, &fx.suppressed).is_none(),
+            "suppressed worktree must not be swept back in: {:?}",
+            app.repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.observed_path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert!(is_suppressed(&fx.suppressed), "the sweep never lifts");
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// READM-04, D-12 and D-13: `n` with the checkout's own path lifts the
+    /// entry before the sweep, so the same pass admits it as a fresh row with
+    /// new keys and nothing carried from the removed one.
+    #[test]
+    fn admitting_suppressed_path_lifts_entry_and_admits_fresh_identity() {
+        let fx = suppression_fixture("suppression-lift-open");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert!(checkout_row(&app, &fx.suppressed).is_none());
+        let max_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .max()
+            .unwrap();
+        let max_order = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.first_seen_order)
+            .max()
+            .unwrap();
+
+        app.admit_repository(&fx.suppressed)
+            .expect("explicit admission of the suppressed path");
+
+        assert!(!is_suppressed(&fx.suppressed), "explicit admission lifts");
+        let row = checkout_row(&app, &fx.suppressed).expect("fresh row admitted in the same pass");
+        assert!(
+            row.key > max_key,
+            "new CheckoutKey: {:?} vs {max_key:?}",
+            row.key
+        );
+        assert!(
+            row.first_seen_order > max_order,
+            "new first_seen_order: {} vs {max_order}",
+            row.first_seen_order
+        );
+        assert_eq!(row.session.resume_id, None);
+        assert!(row.owned_runtime().is_none());
+        assert_eq!(row.lifecycle(), &CheckoutLifecycle::Inactive);
+        assert_eq!(row.role, CheckoutRole::ManagedBranch);
+        assert!(!row.managed_by_baude);
+        assert_eq!(
+            row.observed_branch.as_deref(),
+            Some("refs/heads/feature/suppressed")
+        );
+        assert_eq!(app.repository_state.checkouts.len(), 3);
+        assert!(!checkout_row(&app, &fx.kept).unwrap().active_intent());
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// The cloned shape plus two linked worktrees outside the managed root,
+    /// a standalone folder and a second repository: everything the removal
+    /// stage can forget, laid out so a relaunch can prove it stays forgotten.
+    struct RelaunchFixture {
+        _fixture: AdmissionRepo,
+        repo: PathBuf,
+        root: PathBuf,
+        state_root: PathBuf,
+        linked: PathBuf,
+        unmanaged: PathBuf,
+        standalone: PathBuf,
+        second_repo: PathBuf,
+        second_common_dir: PathBuf,
+    }
+
+    fn relaunch_fixture(name: &str) -> RelaunchFixture {
+        let fixture = admission_repo_cloned(name);
+        let repo = fixture.path().to_path_buf();
+        let root = fixture.root().to_path_buf();
+        let state_root = root.join("state");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let linked = root.join("wt-linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let unmanaged = root.join("wt-unmanaged");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/unmanaged",
+                unmanaged.to_str().unwrap(),
+            ],
+        );
+        let standalone = root.join("notes");
+        std::fs::create_dir_all(&standalone).unwrap();
+        let second_repo = root.join("second");
+        std::fs::create_dir_all(&second_repo).unwrap();
+        git(&second_repo, &["init", "-b", "main"]);
+        git(&second_repo, &["config", "user.email", "test@example.com"]);
+        git(&second_repo, &["config", "user.name", "Test"]);
+        std::fs::write(second_repo.join("file"), b"two").unwrap();
+        git(&second_repo, &["add", "file"]);
+        git(&second_repo, &["commit", "-m", "initial"]);
+        let second_common_dir = baude_core::git::discover_repository(&second_repo)
+            .unwrap()
+            .common_dir;
+        RelaunchFixture {
+            _fixture: fixture,
+            repo: repo.canonicalize().unwrap(),
+            root,
+            state_root,
+            linked: linked.canonicalize().unwrap(),
+            unmanaged: unmanaged.canonicalize().unwrap(),
+            standalone: standalone.canonicalize().unwrap(),
+            second_repo: second_repo.canonicalize().unwrap(),
+            second_common_dir,
+        }
+    }
+
+    fn relaunch_app(fx: &RelaunchFixture, launch: PathBuf) -> App {
+        let mut app = App::new(launch);
+        app.remote = None;
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.persistence_root_for_test = Some(fx.state_root.clone());
+        app
+    }
+
+    /// Hand the App's live session for `runtime` to the removal stage the way
+    /// the TUI does, so preflight sees the handle it demands for a row whose
+    /// persisted runtime is set.
+    fn row_runtime(
+        app: &mut App,
+        row: baude_core::removal::RowKey,
+        runtime: u64,
+    ) -> baude_core::removal::RowRuntime {
+        let index = app
+            .sessions
+            .iter()
+            .position(|session| session.id == runtime)
+            .expect("live session for the row being removed");
+        baude_core::removal::RowRuntime {
+            row,
+            session: app.sessions.remove(index),
+        }
+    }
+
+    fn remove_row(
+        fx: &RelaunchFixture,
+        app: &mut App,
+        target: baude_core::removal::RemovalTarget,
+        mut runtimes: Vec<baude_core::removal::RowRuntime>,
+    ) {
+        let state_root = fx.state_root.clone();
+        let report =
+            baude_core::removal::remove(&mut app.repository_state, target, &mut runtimes, |file| {
+                persist::save_current_at_test(
+                    &state_root,
+                    &baude_core::workspace::active().state_file("state"),
+                    file,
+                    None,
+                    None,
+                )
+            })
+            .expect("removal succeeds");
+        assert_eq!(
+            report.persistence,
+            baude_core::removal::PersistenceOutcome::Saved,
+            "{target:?} persisted"
+        );
+    }
+
+    /// The identity a removed row carried, recorded before the relaunch so the
+    /// fresh admission can be shown to share none of it (D-13).
+    struct RemovedIdentity {
+        key: CheckoutKey,
+        first_seen_order: u64,
+        max_key: CheckoutKey,
+        max_order: u64,
+    }
+
+    /// App 1 over the fixture: launch-dir admission of the clone, then the
+    /// standalone and the second repository, then the four removals. Returns
+    /// the App still holding the clone's primary runtime, alive so the
+    /// relaunch adopts it instead of recovering it.
+    fn remove_four_rows(fx: &RelaunchFixture) -> (App, RemovedIdentity) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        assert!(checkout_row(&app, &fx.repo).is_some(), "clone admitted");
+        assert!(checkout_row(&app, &fx.linked).is_some(), "linked swept in");
+        assert!(
+            checkout_row(&app, &fx.unmanaged).is_some(),
+            "unmanaged swept in"
+        );
+        let standalone_runtime = app
+            .admit_standalone(&fx.standalone)
+            .unwrap()
+            .expect("standalone runtime");
+        let second_runtime = app.admit_repository(&fx.second_repo).unwrap();
+        app.repository_state.validate().unwrap();
+
+        let linked_key = checkout_row(&app, &fx.linked).unwrap().key;
+        let unmanaged_row = checkout_row(&app, &fx.unmanaged).unwrap();
+        let removed_key = unmanaged_row.key;
+        let removed_order = unmanaged_row.first_seen_order;
+        let standalone_key = app
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .find(|row| row.canonical_path == PersistedPath::from_path(&fx.standalone))
+            .expect("standalone row")
+            .key;
+        let second_key = app
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&fx.second_common_dir))
+            .expect("second repository row")
+            .key;
+        let second_primary = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|row| row.repository_key == second_key && row.owned_runtime().is_some())
+            .map(|row| row.key);
+
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Checkout(linked_key),
+            Vec::new(),
+        );
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Checkout(removed_key),
+            Vec::new(),
+        );
+        let handle = row_runtime(
+            &mut app,
+            RowKey::Standalone(standalone_key),
+            standalone_runtime,
+        );
+        remove_row(
+            fx,
+            &mut app,
+            RemovalTarget::Standalone(standalone_key),
+            vec![handle],
+        );
+        let handles = match (second_primary, second_runtime) {
+            (Some(primary), Some(runtime)) => {
+                vec![row_runtime(&mut app, RowKey::Checkout(primary), runtime)]
+            }
+            _ => Vec::new(),
+        };
+        remove_row(fx, &mut app, RemovalTarget::Repository(second_key), handles);
+
+        let max_key = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.key)
+            .max()
+            .unwrap();
+        let max_order = app
+            .repository_state
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.first_seen_order)
+            .max()
+            .unwrap();
+        (
+            app,
+            RemovedIdentity {
+                key: removed_key,
+                first_seen_order: removed_order,
+                max_key,
+                max_order,
+            },
+        )
+    }
+
+    fn row_keys(
+        app: &App,
+    ) -> (
+        Vec<baude_core::repository::RepositoryKey>,
+        Vec<CheckoutKey>,
+        Vec<StandaloneKey>,
+    ) {
+        (
+            app.repository_state
+                .repositories
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+            app.repository_state
+                .checkouts
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+            app.repository_state
+                .standalone_sessions
+                .iter()
+                .map(|row| row.key)
+                .collect(),
+        )
+    }
+
+    /// READM-03, D-16: a second App over the same state file shows none of the
+    /// four removed rows, recovers nothing for them, and the sweep leaves the
+    /// unmanaged worktree alone even though its directory is still there.
+    #[test]
+    fn removed_rows_stay_removed_across_relaunch() {
+        let fx = relaunch_fixture("relaunch-removed-rows");
+        let (mut first, _removed) = remove_four_rows(&fx);
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+
+        assert!(
+            fx.unmanaged.is_dir(),
+            "the removed worktree's directory survives"
+        );
+        assert!(fx.linked.is_dir());
+        for path in [&fx.linked, &fx.unmanaged] {
+            assert!(
+                checkout_row(&restarted, path).is_none(),
+                "removed checkout swept back in on relaunch: {}",
+                path.display()
+            );
+        }
+        assert!(
+            restarted
+                .repository_state
+                .standalone_sessions
+                .iter()
+                .all(|row| row.canonical_path != PersistedPath::from_path(&fx.standalone)),
+            "removed standalone came back"
+        );
+        assert!(
+            restarted.repository_state.repositories.iter().all(|row| {
+                row.observed_common_dir != PersistedPath::from_path(&fx.second_common_dir)
+            }),
+            "removed repository came back"
+        );
+        assert!(
+            checkout_row(&restarted, &fx.repo).is_some(),
+            "launch repository restored"
+        );
+        assert_eq!(restarted.repository_state.repositories.len(), 1);
+        assert_eq!(restarted.repository_state.checkouts.len(), 1);
+        assert!(restarted.repository_state.standalone_sessions.is_empty());
+
+        assert!(
+            baude_core::lifecycle::startup_recovery_program(&restarted.repository_state).is_empty(),
+            "nothing to recover for a restarted state with the removed rows gone"
+        );
+        let before = row_keys(&restarted);
+        restarted.reconcile_teardown_recoveries().unwrap();
+        restarted.reconcile_activation_recoveries().unwrap();
+        assert_eq!(
+            row_keys(&restarted),
+            before,
+            "reconciliation touched no row"
+        );
+        restarted.repository_state.validate().unwrap();
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// READM-04, D-13: relaunching inside the removed unmanaged checkout lifts
+    /// its entry through the `LaunchDirectory` route and admits it in that same
+    /// restore as a row sharing nothing with the one that was removed.
+    #[test]
+    fn relaunch_inside_removed_checkout_readmits_it_fresh() {
+        let fx = relaunch_fixture("relaunch-inside-removed");
+        let (mut first, removed) = remove_four_rows(&fx);
+        assert!(is_suppressed(&fx.unmanaged), "removal wrote the entry");
+
+        let mut restarted = relaunch_app(&fx, fx.unmanaged.clone());
+        restarted.restore();
+
+        assert!(
+            !is_suppressed(&fx.unmanaged),
+            "the launch-dir admission lifts"
+        );
+        let rows: Vec<&SavedCheckout> = restarted
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|row| row.observed_path == PersistedPath::from_path(&fx.unmanaged))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row for the relaunched checkout");
+        let row = rows[0];
+        assert!(
+            row.key > removed.max_key && row.key != removed.key,
+            "new CheckoutKey"
+        );
+        assert!(
+            row.first_seen_order > removed.max_order
+                && row.first_seen_order != removed.first_seen_order,
+            "new first_seen_order"
+        );
+        assert_eq!(row.session.resume_id, None);
+        match row.owned_runtime() {
+            None => {}
+            Some(runtime) => {
+                let session = restarted
+                    .sessions
+                    .iter()
+                    .find(|session| session.claude.process_identity() == &runtime.agent)
+                    .expect("the spawned runtime is a live session of this App");
+                assert_eq!(session.cwd, fx.unmanaged, "runtime belongs to the new row");
+            }
+        }
+        assert!(
+            checkout_row(&restarted, &fx.linked).is_none(),
+            "sibling stays removed"
+        );
+        assert_eq!(restarted.repository_state.repositories.len(), 1);
+        restarted.repository_state.validate().unwrap();
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    fn worktree_list(repo: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list runs");
+        assert!(
+            output.status.success(),
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Remove the clone's primary checkout row from an App that has admitted
+    /// the fixture, handing the removal stage the live session running in
+    /// that checkout. Returns the identity the row carried and its folder.
+    fn remove_primary_of(fx: &RelaunchFixture, app: &mut App) -> (RemovedIdentity, PathBuf) {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        let (key, first_seen_order, path) = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.key,
+                    checkout.first_seen_order,
+                    checkout.observed_path.to_path_buf(),
+                )
+            })
+            .expect("the clone has a primary checkout row");
+        let removed = RemovedIdentity {
+            key,
+            first_seen_order,
+            max_key: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .max()
+                .expect("at least the primary row"),
+            max_order: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.first_seen_order)
+                .max()
+                .expect("at least the primary row"),
+        };
+        let runtime = app
+            .sessions
+            .iter()
+            .find(|session| session.cwd == path)
+            .map(|session| session.id)
+            .expect("live session in the primary checkout");
+        let runtimes = vec![row_runtime(app, RowKey::Checkout(key), runtime)];
+        remove_row(fx, app, RemovalTarget::Checkout(key), runtimes);
+        (removed, path)
+    }
+
+    /// App 1 over the fixture: launch-dir admission of the clone, then the
+    /// removal of its primary checkout row with every sibling kept. Returns
+    /// the App, the identity the primary carried and the folder it named.
+    fn remove_primary(fx: &RelaunchFixture) -> (App, RemovedIdentity, PathBuf) {
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        let (removed, path) = remove_primary_of(fx, &mut app);
+        (app, removed, path)
+    }
+
+    /// The checkout rows a sibling relaunch must leave exactly as the removal
+    /// left them: no primary, no new key, every kept row under its own key.
+    #[derive(Debug, PartialEq)]
+    struct CheckoutsSeen {
+        max_key: Option<CheckoutKey>,
+        primaries: Vec<(CheckoutKey, PathBuf)>,
+        kept: Vec<(CheckoutKey, PathBuf)>,
+    }
+
+    fn checkouts_seen(app: &App) -> CheckoutsSeen {
+        let rows = |primary: bool| -> Vec<(CheckoutKey, PathBuf)> {
+            let mut rows: Vec<(CheckoutKey, PathBuf)> = app
+                .repository_state
+                .checkouts
+                .iter()
+                .filter(|checkout| (checkout.role == CheckoutRole::PrimaryDefault) == primary)
+                .map(|checkout| (checkout.key, checkout.observed_path.to_path_buf()))
+                .collect();
+            rows.sort();
+            rows
+        };
+        CheckoutsSeen {
+            max_key: app
+                .repository_state
+                .checkouts
+                .iter()
+                .map(|checkout| checkout.key)
+                .max(),
+            primaries: rows(true),
+            kept: rows(false),
+        }
+    }
+
+    #[test]
+    fn removed_primary_stays_removed_on_sibling_relaunch() {
+        let fx = relaunch_fixture("removed-primary-kept");
+        let (mut first, removed, primary_path) = remove_primary(&fx);
+        let list_before = worktree_list(&fx.repo);
+        let seen_before = checkouts_seen(&first);
+        let counter_before = first.repository_state.next_checkout_key;
+        let entry_written = is_suppressed(&fx.repo);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+
+        let list_after = worktree_list(&fx.repo);
+        let seen_after = checkouts_seen(&restarted);
+        let row_at_repo =
+            checkout_row(&restarted, &fx.repo).map(|row| (row.key, row.role, row.first_seen_order));
+        let entry_kept = is_suppressed(&fx.repo);
+        let folder_kept = fx.repo.is_dir();
+        let sessions_started = restarted.sessions.len();
+        let counter_after = restarted.repository_state.next_checkout_key;
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&restarted).map(str::to_owned);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert!(
+            row_at_repo.is_none(),
+            "removed primary checkout came back on a sibling relaunch: {row_at_repo:?}"
+        );
+        assert_eq!(primary_path, fx.repo, "the primary was the clone itself");
+        assert!(entry_written, "removal wrote the entry");
+        assert_eq!(
+            list_before, list_after,
+            "git worktree list changed across a sibling relaunch"
+        );
+        assert_eq!(
+            seen_after.primaries,
+            Vec::new(),
+            "no primary derived for the clone"
+        );
+        assert_eq!(
+            seen_after.max_key, seen_before.max_key,
+            "no new checkout key"
+        );
+        assert!(
+            seen_after.max_key <= Some(removed.max_key),
+            "no key above the highest one before the removal"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+        assert!(entry_kept, "a sibling relaunch leaves the entry in place");
+        assert!(folder_kept, "the removed primary's folder is still on disk");
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        let named = fx.repo.display().to_string();
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains(&named)),
+            "the message names the folder that brings the checkout back: {message:?}"
+        );
+        assert_eq!(sessions_started, 0, "a sibling launch starts no session");
+        assert_eq!(
+            counter_after, counter_before,
+            "the checkout key allocator did not advance"
+        );
+    }
+
+    #[test]
+    fn removed_primary_managed_is_not_recreated_on_sibling_relaunch() {
+        let fx = relaunch_fixture("removed-primary-managed");
+        // No worktree holds the default branch, so baude makes its own.
+        git(&fx.repo, &["switch", "-c", "feature/work"]);
+        let mut first = relaunch_app(&fx, fx.repo.clone());
+        first.restore();
+        let primary_managed = first
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| checkout.managed_by_baude);
+        let role_at_repo = checkout_row(&first, &fx.repo).map(|row| row.role);
+        let (removed, primary_path) = remove_primary_of(&fx, &mut first);
+        let folder_gone = !primary_path.exists();
+        let list_before = worktree_list(&fx.repo);
+        let seen_before = checkouts_seen(&first);
+        let counter_before = first.repository_state.next_checkout_key;
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+
+        let list_after = worktree_list(&fx.repo);
+        let seen_after = checkouts_seen(&restarted);
+        let sessions_started = restarted.sessions.len();
+        let counter_after = restarted.repository_state.next_checkout_key;
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&restarted).map(str::to_owned);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            list_before, list_after,
+            "git worktree list changed across a sibling relaunch"
+        );
+        assert_eq!(
+            primary_managed,
+            Some(true),
+            "the primary was a worktree baude made"
+        );
+        assert_ne!(
+            primary_path, fx.repo,
+            "the primary was not the clone itself"
+        );
+        assert_eq!(
+            role_at_repo,
+            Some(CheckoutRole::Main),
+            "the clone was a sibling of the primary"
+        );
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert_eq!(
+            seen_after.primaries,
+            Vec::new(),
+            "no primary derived for the clone"
+        );
+        assert_eq!(
+            seen_after.max_key, seen_before.max_key,
+            "no new checkout key"
+        );
+        assert!(
+            seen_after.max_key <= Some(removed.max_key),
+            "no key above the highest one before the removal"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("remove this repository")),
+            "the message says how to bring the checkout back: {message:?}"
+        );
+        assert_eq!(sessions_started, 0, "a sibling launch starts no session");
+        assert_eq!(
+            counter_after, counter_before,
+            "the checkout key allocator did not advance"
+        );
+    }
+
+    fn common_dir_of(repo: &Path) -> PathBuf {
+        baude_core::git::discover_repository(repo)
+            .expect("the fixture repository is discoverable")
+            .common_dir
+    }
+
+    /// The removed-primary fact the store holds for one repository.
+    fn removed_primary_fact(common_dir: &Path) -> Option<PathBuf> {
+        baude_core::suppression::removed_primary(&baude_core::persist::config_dir(), common_dir)
+    }
+
+    /// What an explicit admission of a removed primary leaves behind, read
+    /// from the App that made it and from the store, before any cleanup.
+    struct PrimaryReturn {
+        entry_lifted: bool,
+        fact: Option<PathBuf>,
+        rows_at_path: Vec<(CheckoutKey, CheckoutRole, u64, Option<String>)>,
+        primaries: Vec<(CheckoutKey, PathBuf)>,
+        valid: Result<(), String>,
+    }
+
+    fn primary_return(app: &App, path: &Path, common_dir: &Path) -> PrimaryReturn {
+        let persisted = PersistedPath::from_path(path);
+        PrimaryReturn {
+            entry_lifted: !is_suppressed(path),
+            fact: removed_primary_fact(common_dir),
+            rows_at_path: app
+                .repository_state
+                .checkouts
+                .iter()
+                .filter(|row| row.observed_path == persisted)
+                .map(|row| {
+                    (
+                        row.key,
+                        row.role,
+                        row.first_seen_order,
+                        row.session.resume_id.clone(),
+                    )
+                })
+                .collect(),
+            primaries: checkouts_seen(app).primaries,
+            valid: app
+                .repository_state
+                .validate()
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// READM-04, D-13 for a primary: the admission lifted the entry and the
+    /// fact with it, and the one row at `path` is the repository's only
+    /// primary, sharing nothing with the row that was removed.
+    fn assert_fresh_primary(seen: &PrimaryReturn, removed: &RemovedIdentity, path: &Path) {
+        assert!(seen.entry_lifted, "the admission lifts the entry");
+        assert_eq!(seen.fact, None, "the removed-primary fact ends with it");
+        assert_eq!(
+            seen.rows_at_path.len(),
+            1,
+            "exactly one row at {}: {:?}",
+            path.display(),
+            seen.rows_at_path
+        );
+        let (key, role, first_seen_order, resume_id) = &seen.rows_at_path[0];
+        assert_eq!(
+            *role,
+            CheckoutRole::PrimaryDefault,
+            "the row is the primary"
+        );
+        assert_eq!(
+            seen.primaries,
+            vec![(*key, path.to_path_buf())],
+            "the repository has exactly one primary, at that folder"
+        );
+        assert!(
+            *key > removed.max_key && *key != removed.key,
+            "new CheckoutKey: {key:?}"
+        );
+        assert!(
+            *first_seen_order > removed.max_order && *first_seen_order != removed.first_seen_order,
+            "new first_seen_order: {first_seen_order}"
+        );
+        assert_eq!(*resume_id, None, "nothing resumed from the removed row");
+        assert_eq!(seen.valid, Ok(()), "state valid after the admission");
+    }
+
+    /// READM-04, the launch route: a removed primary whose folder was kept
+    /// comes back when baude is launched inside that folder. The launch-dir
+    /// admission lifts the entry, the fact goes with it, and the derivation
+    /// that a sibling launch skips runs in that same restore.
+    #[test]
+    fn removed_primary_returns_on_relaunch_inside_its_folder() {
+        let fx = relaunch_fixture("removed-primary-launch");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path) = remove_primary(&fx);
+        let entry_written = is_suppressed(&fx.repo);
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut restarted = relaunch_app(&fx, fx.repo.clone());
+        restarted.restore();
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(primary_path, fx.repo, "the primary was the clone itself");
+        assert!(entry_written, "removal wrote the entry");
+        assert_eq!(
+            fact_written,
+            Some(fx.repo.clone()),
+            "removal recorded that the entry was the primary"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
+    /// READM-04, the `n` route: after a sibling relaunch left the primary
+    /// removed, opening a sibling changes nothing, and opening the removed
+    /// folder itself brings the primary back.
+    #[test]
+    fn removed_primary_returns_through_open_route() {
+        let fx = relaunch_fixture("removed-primary-open");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, _primary_path) = remove_primary(&fx);
+        let counter_after_removal = first.repository_state.next_checkout_key;
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let primaries_after_launch = checkouts_seen(&restarted).primaries;
+
+        restarted.open_repo_session(fx.unmanaged.clone());
+        let sibling_primaries = checkouts_seen(&restarted).primaries;
+        let sibling_entry_kept = is_suppressed(&fx.repo);
+        let sibling_fact = removed_primary_fact(&common_dir);
+        let sibling_sessions = restarted.sessions.len();
+        let sibling_counter = restarted.repository_state.next_checkout_key;
+
+        restarted.open_repo_session(fx.repo.clone());
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            primaries_after_launch,
+            Vec::new(),
+            "the sibling relaunch derived no primary"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "opening a sibling derives no primary"
+        );
+        assert!(sibling_entry_kept, "opening a sibling leaves the entry");
+        assert_eq!(
+            sibling_fact,
+            Some(fx.repo.clone()),
+            "opening a sibling leaves the fact in place"
+        );
+        assert_eq!(sibling_sessions, 0, "opening a sibling starts no session");
+        assert_eq!(
+            sibling_counter, counter_after_removal,
+            "opening a sibling spends no checkout key"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
+    /// READM-04, the `c` route: a clone finishing into the removed primary's
+    /// folder reaches the same admission through `CloneCompletion` and brings
+    /// the primary back.
+    #[test]
+    fn removed_primary_returns_through_clone_completion_route() {
+        let fx = relaunch_fixture("removed-primary-clone");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, _primary_path) = remove_primary(&fx);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let primaries_after_launch = checkouts_seen(&restarted).primaries;
+        let fact_after_launch = removed_primary_fact(&common_dir);
+
+        restarted.open_repo_session_via(fx.repo.clone(), LocalAdmissionRoute::CloneCompletion);
+        let seen = primary_return(&restarted, &fx.repo, &common_dir);
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            primaries_after_launch,
+            Vec::new(),
+            "the sibling relaunch derived no primary"
+        );
+        assert_eq!(
+            fact_after_launch,
+            Some(fx.repo.clone()),
+            "the sibling relaunch left the fact in place"
+        );
+        assert_fresh_primary(&seen, &removed, &fx.repo);
+    }
+
+    /// The managed shape of the 22-07 test: the clone sits on another branch,
+    /// so the primary is a worktree baude made and its removal deletes the
+    /// folder. Returns the App after the removal, the identity the primary
+    /// carried, its folder, its default branch and whether baude managed it.
+    fn remove_managed_primary(
+        fx: &RelaunchFixture,
+    ) -> (App, RemovedIdentity, PathBuf, Option<String>, Option<bool>) {
+        // No worktree holds the default branch, so baude makes its own.
+        git(&fx.repo, &["switch", "-c", "feature/work"]);
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.restore();
+        let (default_branch, managed) = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.session.branch.clone(),
+                    Some(checkout.managed_by_baude),
+                )
+            })
+            .unwrap_or((None, None));
+        let (removed, path) = remove_primary_of(fx, &mut app);
+        (app, removed, path, default_branch, managed)
+    }
+
+    fn worktree_count(list: &str) -> usize {
+        list.lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count()
+    }
+
+    /// READM-04 when the removal deleted the folder, first way back: no route
+    /// can name a folder that is gone, so "launching inside the folder" means
+    /// the folder exists again. A worktree of the default branch put back at
+    /// the removed path and opened lifts the entry and is the primary.
+    #[test]
+    fn removed_primary_managed_returns_when_its_folder_is_back() {
+        let fx = relaunch_fixture("removed-primary-folder-back");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path, default_branch, managed) =
+            remove_managed_primary(&fx);
+        let folder_gone = !primary_path.exists();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut sibling = relaunch_app(&fx, fx.repo.clone());
+        sibling.restore();
+        let sibling_primaries = checkouts_seen(&sibling).primaries;
+        let fact_after_sibling = removed_primary_fact(&common_dir);
+
+        let default_branch = default_branch.expect("the removed primary recorded its branch");
+        git(
+            &fx.repo,
+            &[
+                "worktree",
+                "add",
+                primary_path.to_str().unwrap(),
+                &default_branch,
+            ],
+        );
+        let folder_back = primary_path.is_dir();
+        let mut returned = relaunch_app(&fx, primary_path.clone());
+        returned.restore();
+        let seen = primary_return(&returned, &primary_path, &common_dir);
+        let message = last_message(&returned).map(str::to_owned);
+
+        returned.kill_all();
+        sibling.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(managed, Some(true), "the primary was a worktree baude made");
+        assert_ne!(
+            primary_path, fx.repo,
+            "the primary was not the clone itself"
+        );
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert!(
+            fact_written.is_some(),
+            "removal recorded the fact for a folder that is gone"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "a launch inside the clone derived no primary"
+        );
+        assert_eq!(
+            fact_after_sibling, fact_written,
+            "a launch inside the clone left the fact in place"
+        );
+        assert!(folder_back, "the worktree was put back at the removed path");
+        assert!(
+            seen.entry_lifted && seen.fact.is_none(),
+            "opening the folder that is back lifts the entry and the fact: {:?}, message {message:?}",
+            seen.fact
+        );
+        assert_fresh_primary(&seen, &removed, &primary_path);
+    }
+
+    /// READM-04 when the removal deleted the folder, second way back: removing
+    /// the repository row drops its entries and the fact with them, and
+    /// admitting the repository again derives a primary as a first admission
+    /// does, a new managed worktree under a fresh key.
+    #[test]
+    fn removed_primary_managed_returns_after_repository_readmission() {
+        use baude_core::removal::RemovalTarget;
+        let fx = relaunch_fixture("removed-primary-readmit");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, removed, primary_path, _default_branch, managed) =
+            remove_managed_primary(&fx);
+        let folder_gone = !primary_path.exists();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let mut sibling = relaunch_app(&fx, fx.repo.clone());
+        sibling.restore();
+        let sibling_primaries = checkouts_seen(&sibling).primaries;
+        let repository_key = sibling
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&common_dir))
+            .map(|row| row.key)
+            .expect("the relaunch kept the repository row");
+        remove_row(
+            &fx,
+            &mut sibling,
+            RemovalTarget::Repository(repository_key),
+            Vec::new(),
+        );
+        let fact_after_repository_removal = removed_primary_fact(&common_dir);
+        let repositories_after_removal = sibling.repository_state.repositories.len();
+        let list_after_removal = worktree_list(&fx.repo);
+
+        let mut returned = relaunch_app(&fx, fx.repo.clone());
+        returned.restore();
+        let list_after_return = worktree_list(&fx.repo);
+        let primaries: Vec<(CheckoutKey, u64, Option<String>, PathBuf)> = returned
+            .repository_state
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.role == CheckoutRole::PrimaryDefault)
+            .map(|checkout| {
+                (
+                    checkout.key,
+                    checkout.first_seen_order,
+                    checkout.session.resume_id.clone(),
+                    checkout.observed_path.to_path_buf(),
+                )
+            })
+            .collect();
+        let primary_on_disk = primaries
+            .first()
+            .is_some_and(|(_, _, _, path)| path.is_dir());
+        let fact_after_return = removed_primary_fact(&common_dir);
+        let repositories_after_return = returned.repository_state.repositories.len();
+        let valid = returned
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+        let message = last_message(&returned).map(str::to_owned);
+
+        returned.kill_all();
+        sibling.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(managed, Some(true), "the primary was a worktree baude made");
+        assert!(folder_gone, "the removal deleted the managed worktree");
+        assert!(
+            fact_written.is_some(),
+            "removal recorded the fact for a folder that is gone"
+        );
+        assert_eq!(
+            sibling_primaries,
+            Vec::new(),
+            "a launch inside the clone derived no primary"
+        );
+        assert_eq!(
+            fact_after_repository_removal, None,
+            "removing the repository row ends the fact"
+        );
+        assert_eq!(repositories_after_removal, 0, "the repository row is gone");
+        assert_eq!(
+            primaries.len(),
+            1,
+            "exactly one primary after the repository is admitted again: {primaries:?}, message {message:?}"
+        );
+        let (key, first_seen_order, resume_id, _path) = &primaries[0];
+        assert!(
+            *key > removed.max_key && *key != removed.key,
+            "new CheckoutKey: {key:?}"
+        );
+        assert!(
+            *first_seen_order > removed.max_order && *first_seen_order != removed.first_seen_order,
+            "new first_seen_order: {first_seen_order}"
+        );
+        assert_eq!(*resume_id, None, "nothing resumed from the removed row");
+        assert!(primary_on_disk, "the new primary has a folder");
+        assert_eq!(
+            worktree_count(&list_after_return),
+            worktree_count(&list_after_removal) + 1,
+            "exactly one worktree more than after the repository removal:\n{list_after_removal}\n{list_after_return}"
+        );
+        assert_eq!(fact_after_return, None, "the admission writes no fact");
+        assert_eq!(repositories_after_return, 1, "one repository row again");
+        assert_eq!(valid, Ok(()), "state valid after the admission");
+    }
+
+    /// T-22-18: a store written before the fact existed must not stop a
+    /// launch. The real removal's file, with the `primary` member dropped
+    /// from every entry as the previous format wrote it, loads on a sibling
+    /// relaunch, keeps suppressing the removed folder and answers no fact.
+    /// Whether a primary is derived is the earlier behaviour and not asserted.
+    #[test]
+    fn removed_primary_store_without_the_fact_still_loads() {
+        let fx = relaunch_fixture("removed-primary-old-store");
+        let common_dir = common_dir_of(&fx.repo);
+        let (mut first, _removed, _primary_path) = remove_primary(&fx);
+        let seen_before = checkouts_seen(&first);
+        let repositories_before = first.repository_state.repositories.len();
+        let fact_written = removed_primary_fact(&common_dir);
+
+        let store = baude_core::suppression::file_path(&baude_core::persist::config_dir());
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        let mut dropped = 0;
+        for entry in file["entries"]
+            .as_object_mut()
+            .expect("the store has an entries object")
+            .values_mut()
+        {
+            let members = entry.as_object_mut().expect("an entry is an object");
+            if members.remove("primary").is_some() {
+                dropped += 1;
+            }
+        }
+        std::fs::write(&store, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        let fact_after_rewrite = removed_primary_fact(&common_dir);
+
+        let mut restarted = relaunch_app(&fx, fx.linked.clone());
+        restarted.restore();
+        let seen_after = checkouts_seen(&restarted);
+        let repositories_after = restarted.repository_state.repositories.len();
+        let entry_kept = is_suppressed(&fx.repo);
+        let fact_after_relaunch = removed_primary_fact(&common_dir);
+        let valid = restarted
+            .repository_state
+            .validate()
+            .map_err(|error| error.to_string());
+
+        restarted.kill_all();
+        first.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+
+        assert_eq!(
+            fact_written,
+            Some(fx.repo.clone()),
+            "the real removal wrote the fact"
+        );
+        assert_eq!(dropped, 1, "the rewrite dropped the one primary member");
+        assert_eq!(
+            fact_after_rewrite, None,
+            "the rewritten file carries no fact"
+        );
+        assert_eq!(valid, Ok(()), "state valid after the relaunch");
+        assert_eq!(
+            repositories_after, repositories_before,
+            "the same repositories after the relaunch"
+        );
+        assert!(entry_kept, "the entry still suppresses the removed folder");
+        assert_eq!(
+            fact_after_relaunch, None,
+            "the relaunch writes no fact of its own"
+        );
+        assert_eq!(
+            seen_after.kept, seen_before.kept,
+            "kept rows keep their keys"
+        );
+    }
+
+    /// D-12: the lift key is the admitted path's own repo root. Admitting the
+    /// parent repository, from its root or a subfolder, is the sweep the entry
+    /// exists to suppress and must leave the child's entry in place.
+    #[test]
+    fn admitting_parent_root_does_not_lift_child_entry() {
+        let fx = suppression_fixture("suppression-parent-root");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        app.admit_repository(&fx.repo).unwrap();
+        let subfolder = fx.repo.join("src");
+        std::fs::create_dir_all(&subfolder).unwrap();
+        app.admit_repository(&subfolder).unwrap();
+
+        assert!(
+            is_suppressed(&fx.suppressed),
+            "parent admissions must not lift a child entry"
+        );
+        assert!(checkout_row(&app, &fx.suppressed).is_none());
+        assert!(checkout_row(&app, &fx.kept).is_some());
+        assert_eq!(app.repository_state.checkouts.len(), 2);
+        assert_eq!(app.repository_state.repositories.len(), 1);
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-12, the other two routes: a relaunch inside the removed checkout
+    /// reaches `admit_repository` through `LaunchDirectory` and lifts because
+    /// `repo_root` of the launch dir is the checkout; a clone finishing into a
+    /// suppressed destination lifts through `CloneCompletion`.
+    #[test]
+    fn launch_dir_and_clone_completion_routes_lift_suppression() {
+        let fx = suppression_fixture("suppression-launch-clone");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut first = suppression_app(&fx, fx.repo.clone());
+        first
+            .admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        assert!(checkout_row(&first, &fx.suppressed).is_none());
+        first.kill_all();
+
+        // Relaunch from a subfolder inside the removed checkout, over the same
+        // state file: the launch-dir admission in `restore` is the route.
+        let inside = fx.suppressed.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+        let mut relaunched = suppression_app(&fx, inside);
+        relaunched.restore();
+
+        assert!(
+            !is_suppressed(&fx.suppressed),
+            "launch dir inside the checkout lifts its entry"
+        );
+        let row = checkout_row(&relaunched, &fx.suppressed)
+            .expect("checkout admitted on the relaunch that lifted it");
+        assert_eq!(row.session.resume_id, None);
+        assert!(checkout_row(&relaunched, &fx.kept).is_some());
+        assert_eq!(
+            relaunched.repository_state.repositories.len(),
+            1,
+            "the launch dir resolves to the same repository"
+        );
+
+        // Clone completion into a suppressed destination.
+        let origin = fx.root.join("origin.git");
+        let dest = fx.root.join("clone-dest");
+        git(
+            &fx.root,
+            &["clone", origin.to_str().unwrap(), dest.to_str().unwrap()],
+        );
+        let dest = dest.canonicalize().unwrap();
+        let dest_common = baude_core::git::discover_repository(&dest)
+            .unwrap()
+            .common_dir;
+        seed_suppression(&dest, &dest_common);
+
+        relaunched.open_repo_session_via(dest.clone(), LocalAdmissionRoute::CloneCompletion);
+
+        assert!(
+            !is_suppressed(&dest),
+            "clone completion lifts the destination's entry; message: {:?}",
+            last_message(&relaunched)
+        );
+        assert!(checkout_row(&relaunched, &dest).is_some());
+        assert!(
+            !is_suppressed(&fx.kept) && checkout_row(&relaunched, &fx.kept).is_some(),
+            "neighbour untouched"
+        );
+        relaunched.repository_state.validate().unwrap();
+
+        relaunched.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-09: the store is advisory. When the lift cannot write, the admission
+    /// still returns Ok with the repository's rows intact and the failure is a
+    /// message, never an error out of `admit_repository`.
+    #[test]
+    fn lift_failure_is_a_message_not_an_admission_error() {
+        let fx = suppression_fixture("suppression-lift-failure");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&fx.repo)
+            .unwrap()
+            .expect("initial runtime");
+        let rows_before = app.repository_state.checkouts.len();
+
+        // A directory where the merge lock file goes makes the lock open fail,
+        // the same injection plan 01 used against the binding clear.
+        let config = baude_core::persist::config_dir();
+        let store = baude_core::suppression::file_path(&config);
+        let lock = config.join(format!(
+            ".{}.lock",
+            store.file_name().unwrap().to_string_lossy()
+        ));
+        // The seed write above left the real lock file behind; swap it for a
+        // directory so the next lock open fails.
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir_all(&lock).unwrap();
+        app.message = None;
+
+        let admitted = app.admit_repository(&fx.suppressed);
+
+        assert!(
+            admitted.is_ok(),
+            "lift failure must not fail the admission: {admitted:?}"
+        );
+        assert!(
+            admitted.unwrap().is_some(),
+            "the repository's primary runtime is still handed back"
+        );
+        assert_eq!(app.repository_state.checkouts.len(), rows_before);
+        assert!(checkout_row(&app, &fx.kept).is_some());
+        assert!(
+            is_suppressed(&fx.suppressed),
+            "the entry stays because the write never happened"
+        );
+        let message = last_message(&app).expect("lift failure is surfaced as a message");
+        assert!(
+            message.contains("suppression lift failed"),
+            "got: {message}"
+        );
+        app.repository_state.validate().unwrap();
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
     /// SQ-5, end to end: the user runs `git switch` in their own primary
     /// checkout and reopens the repository. Before, re-admission marked the
     /// repository "identity changed" and refused its topology; now the
@@ -11031,6 +13587,2674 @@ mod tests {
             ],
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- D remove action (plan 20-02) ---------------------------------------
+
+    fn d_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)
+    }
+
+    /// TUI-01, D-01, D-02: `D` resolves to `RemoveProject` on every local row
+    /// kind, with no `can_remove` or recovery gate, for both key encodings.
+    #[test]
+    fn sidebar_action_d_yields_remove_project_on_every_local_kind() {
+        use super::{sidebar_action, SidebarAction};
+        use crate::hierarchy::{ActionKind, ActionView};
+        use baude_core::lifecycle::LifecycleCapability;
+
+        let view = |kind: ActionKind, can_remove: bool, capability| ActionView {
+            kind,
+            has_runtime: false,
+            capability,
+            can_activate_branch: false,
+            can_close: false,
+            can_remove,
+        };
+        let views = [
+            view(ActionKind::Repository, false, None),
+            view(ActionKind::Main, false, None),
+            view(ActionKind::Managed, false, None),
+            view(ActionKind::Managed, true, None),
+            view(ActionKind::External, false, None),
+            view(ActionKind::Standalone, false, None),
+            view(ActionKind::Unavailable, false, None),
+            view(
+                ActionKind::Unavailable,
+                false,
+                Some(LifecycleCapability::RetryRecovery),
+            ),
+        ];
+        let keys = [
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT),
+        ];
+        for view in views {
+            for key in keys {
+                assert_eq!(
+                    sidebar_action(view, key),
+                    SidebarAction::RemoveProject,
+                    "{view:?} with {key:?}"
+                );
+            }
+        }
+        // Plain `d` is unbound: only the shifted key is destructive.
+        assert_eq!(
+            sidebar_action(
+                views[0],
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            ),
+            SidebarAction::None
+        );
+    }
+
+    /// D-12: `D` on a remote row resolves to `RemoveProject`, with or without
+    /// a runtime and for both key encodings. The daemon decides what the row
+    /// is; the sidebar only routes the key.
+    #[test]
+    fn sidebar_action_d_yields_remove_project_on_remote_rows() {
+        use super::{sidebar_action, SidebarAction};
+        use crate::hierarchy::{action_view, ActionSelection};
+
+        for has_runtime in [false, true] {
+            let view = action_view(ActionSelection::Remote, has_runtime, None);
+            for key in [
+                KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT),
+            ] {
+                assert_eq!(
+                    sidebar_action(view, key),
+                    SidebarAction::RemoveProject,
+                    "remote has_runtime={has_runtime} with {key:?}"
+                );
+            }
+        }
+    }
+
+    // ---- D on a remote row (plan 21-06) -----------------------------------
+
+    /// The daemon session id of the remote row every remote removal test
+    /// presses `D` on.
+    const REMOTE_ROW_SESSION: u64 = 41;
+
+    /// One remote session as `GET /sessions` lists it.
+    fn remote_session(id: u64, name: &str, branch: &str) -> crate::remote::RemoteInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "title": null,
+            "status": "busy",
+            "waiting_for_ms": null,
+            "model": null,
+            "permission_mode": null,
+            "context_used_pct": null,
+            "branch": branch,
+            "session_cost_usd": null,
+            "archived": false
+        }))
+        .expect("a /sessions row parses")
+    }
+
+    fn remote_snapshot(sessions: Vec<crate::remote::RemoteInfo>) -> crate::remote::RemoteSnapshot {
+        crate::remote::RemoteSnapshot {
+            sessions,
+            fetched_ms: 1,
+            ok: true,
+            daemon_workspace: None,
+            daemon_workspace_source: None,
+            daemon_collision_count: 0,
+        }
+    }
+
+    /// A `/rows` body in the field list the 21-08 client tests send: one
+    /// repository whose checkouts are the given ones, each
+    /// `(key, display name, branch, session id)`.
+    fn remote_rows_body(
+        repository: baude_core::repository::RepositoryKey,
+        checkouts: &[(CheckoutKey, &str, &str, Option<u64>)],
+    ) -> String {
+        let checkouts: Vec<serde_json::Value> = checkouts
+            .iter()
+            .map(|(key, name, branch, session_id)| {
+                serde_json::json!({
+                    "checkout_key": key,
+                    "repository_key": repository,
+                    "display_name": name,
+                    "branch": branch,
+                    "path": format!("/srv/daemon/.baude-worktrees/{name}"),
+                    "role": "managed_branch",
+                    "managed_by_baude": true,
+                    "archived": false,
+                    "session_id": session_id
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "repositories": [{
+                "repository_key": repository,
+                "display_name": "daemon-repo",
+                "path": "/srv/daemon/repo",
+                "health": {"status": "available"},
+                "checkouts": checkouts
+            }],
+            "standalone": []
+        })
+        .to_string()
+    }
+
+    /// A core value as the daemon puts it on the wire.
+    fn wire<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string(value).expect("serialize a core value")
+    }
+
+    /// The 200 body of `POST /removals` for a preview. Derived, not produced
+    /// by a real execution: no test here runs the real daemon router.
+    fn executed_report(
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> baude_core::removal::RemovalReport {
+        baude_core::removal::RemovalReport {
+            planned: false,
+            persistence: baude_core::removal::PersistenceOutcome::Saved,
+            ..previewed.clone()
+        }
+    }
+
+    /// Every request the double read for one method and path, in order.
+    fn recorded(
+        double: &crate::remote::test_double::Double,
+        method: &str,
+        path: &str,
+    ) -> Vec<crate::remote::test_double::Recorded> {
+        double
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == method && request.path == path)
+            .collect()
+    }
+
+    /// A TUI over a real local repository, attached to a scripted daemon
+    /// whose one checkout row carries the same key number as the local
+    /// managed worktree. Two machines hand out small integers independently,
+    /// so that collision is the ordinary case.
+    struct RemoteRemove {
+        fx: RelaunchFixture,
+        app: App,
+        double: crate::remote::test_double::Double,
+        /// A real preview from core over the local git fixture; the double
+        /// serves it as the daemon's preview.
+        previewed: baude_core::removal::RemovalReport,
+        /// The daemon's key for the remote row.
+        target: baude_core::removal::RemovalTarget,
+        rows: RemoveProjectRows,
+    }
+
+    /// `routes` gets the previewed report and the `/rows` body that lists the
+    /// remote row, and returns the whole script: a request to anything else
+    /// shows up in `Double::unscripted`.
+    fn remote_remove_app(
+        name: &str,
+        routes: impl FnOnce(
+            &baude_core::removal::RemovalReport,
+            &str,
+        ) -> Vec<crate::remote::test_double::Route>,
+    ) -> RemoteRemove {
+        let fx = relaunch_fixture(name);
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-remote-local");
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+
+        let rows_body = remote_rows_body(
+            rows.repository,
+            &[(
+                rows.managed,
+                "active-zeta",
+                "feat/zeta",
+                Some(REMOTE_ROW_SESSION),
+            )],
+        );
+        let double = crate::remote::test_double::serve(routes(&previewed, &rows_body));
+        app.remote = Some(crate::remote::RemotePoller::idle(double.base()));
+        app.apply_remote_view(
+            remote_snapshot(vec![remote_session(
+                REMOTE_ROW_SESSION,
+                "active-zeta",
+                "feat/zeta",
+            )]),
+            serde_json::from_str(&rows_body).expect("the /rows body parses"),
+        );
+        app.selected_id = Some(SelId::Remote(REMOTE_ROW_SESSION));
+        RemoteRemove {
+            fx,
+            app,
+            double,
+            previewed,
+            target,
+            rows,
+        }
+    }
+
+    /// Poll the pending remote removal the way `tick` does until it is
+    /// answered.
+    fn settle_remote_removal(app: &mut App) {
+        let started = std::time::Instant::now();
+        while app.remote_removal.is_some() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the remote removal never settled"
+            );
+            app.poll_remote_removal();
+            if app.remote_removal.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// D-12, D-04, D-16: `D` then Enter on a remote row previews and removes
+    /// through the daemon, sends the previewed report back unchanged and
+    /// once, names the row from the daemon's index, and leaves the local row
+    /// that carries the same key number exactly as it was.
+    #[test]
+    fn d_on_remote_row_previews_then_removes_through_the_daemon() {
+        use super::{RemoteRemovalStage, RemovalOrigin};
+        use crate::remote::test_double::{route, Reply};
+        use baude_core::removal::{RemovalReport, RowKey};
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            target,
+            rows,
+        } = remote_remove_app("d-remote-tracer", |previewed, rows_body| {
+            vec![
+                route(
+                    "POST",
+                    "/removals/preview",
+                    vec![Reply::json(200, wire(previewed))],
+                ),
+                route("GET", "/rows", vec![Reply::json(200, rows_body)]),
+                route(
+                    "POST",
+                    "/removals",
+                    vec![Reply::json(200, wire(&executed_report(previewed)))],
+                ),
+            ]
+        });
+        let executed = executed_report(&previewed);
+        let local_key = RowKey::Checkout(rows.managed);
+        let local_name = app.removal_row_label(&local_key);
+        let local_dir = app
+            .repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == rows.managed)
+            .expect("local managed worktree row")
+            .observed_path
+            .to_path_buf();
+        assert!(local_dir.is_dir(), "the local worktree exists on disk");
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let runtimes_before = app.runtime_checkouts.clone();
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+
+        app.handle_sidebar_key(d_key());
+        assert!(matches!(
+            app.modal,
+            Modal::RemoteRemovePending {
+                stage: RemoteRemovalStage::Preview,
+                ..
+            }
+        ));
+        settle_remote_removal(&mut app);
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target: shown,
+                report,
+                scroll,
+                error,
+                origin: RemovalOrigin::Remote(confirm),
+            } => {
+                assert_eq!(*shown, target, "the daemon's key is the target");
+                assert_eq!(
+                    Some(*shown),
+                    app.remote_rows.target_for_session(REMOTE_ROW_SESSION)
+                );
+                assert_eq!(report, &previewed);
+                assert_eq!(*scroll, 0);
+                assert!(error.is_none());
+                let label = confirm.row_label(&local_key);
+                assert!(
+                    label.contains("active-zeta") && label.contains("feat/zeta"),
+                    "named from the daemon's index: {label}"
+                );
+                assert!(
+                    !label.contains(&local_name),
+                    "the local row {local_name} shares the key number and is never named: {label}"
+                );
+            }
+            _ => panic!("expected a remote confirmation after the preview settled"),
+        }
+
+        app.handle_modal_key(enter_key());
+        assert!(matches!(
+            app.modal,
+            Modal::RemoteRemovePending {
+                stage: RemoteRemovalStage::Execute,
+                ..
+            }
+        ));
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed).as_str())
+        );
+
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 1);
+        let removals = recorded(&double, "POST", "/removals");
+        assert_eq!(removals.len(), 1, "{removals:?}");
+        let sent: RemovalReport =
+            serde_json::from_str(&removals[0].body).expect("the execute body is a report");
+        assert_eq!(sent, previewed, "the previewed report goes back unchanged");
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+
+        // The local row with the same key number is untouched: state, state
+        // file, runtime registry, process, and the worktree on disk.
+        assert_eq!(app.repository_state, state_before);
+        assert_eq!(state_file_bytes(&fx), file_before);
+        assert_eq!(app.runtime_checkouts, runtimes_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.removal_row_label(&local_key), local_name);
+        assert!(local_dir.is_dir(), "the local worktree is still on disk");
+        assert!(pid_is_live(live_pid));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-10: a remote session the daemon's rows index gives no key gets a
+    /// footer notice, and no request leaves the machine.
+    #[test]
+    fn d_on_remote_row_without_daemon_key_sends_nothing() {
+        let _scope = isolation_scope("d-remote-no-key");
+        let double = crate::remote::test_double::serve(Vec::new());
+        // The index lists a row, but it belongs to another session.
+        let other_rows = remote_rows_body(
+            serde_json::from_value(serde_json::json!(1)).expect("repository key"),
+            &[(
+                serde_json::from_value(serde_json::json!(10)).expect("checkout key"),
+                "other",
+                "main",
+                Some(7),
+            )],
+        );
+        let mut app = App::new(PathBuf::from("/not-a-repository"));
+        app.remote = Some(crate::remote::RemotePoller::idle(double.base()));
+        app.apply_remote_view(
+            remote_snapshot(vec![remote_session(
+                REMOTE_ROW_SESSION,
+                "active-zeta",
+                "feat/zeta",
+            )]),
+            serde_json::from_str(&other_rows).expect("the /rows body parses"),
+        );
+        app.selected_id = Some(SelId::Remote(REMOTE_ROW_SESSION));
+
+        app.handle_sidebar_key(d_key());
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
+        let message = last_message(&app).expect("footer notice");
+        assert!(message.contains("active-zeta"), "names the row: {message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+        // Long enough for a worker, had one been started, to reach the double.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(double.request_count(), 0, "{:?}", double.requests());
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+    }
+
+    // ---- every other daemon answer to a remote removal (plan 21-06) ------
+
+    /// The footer the local recheck sets; a remote 409 reuses it word for word.
+    const RECHECK_NOTICE: &str =
+        "rows changed since the preview; review the refreshed confirmation";
+
+    /// A `/rows` body that lists nothing.
+    const EMPTY_ROWS_BODY: &str = r#"{"repositories":[],"standalone":[]}"#;
+
+    /// The script of a scripted daemon: the given answers to each removal
+    /// call in order, and the given `/rows` bodies in order. A worker reads
+    /// `/rows` once after a 200 preview, a 409, and an unanswered execute.
+    fn removal_routes(
+        previews: Vec<crate::remote::test_double::Reply>,
+        removals: Vec<crate::remote::test_double::Reply>,
+        rows: Vec<&str>,
+    ) -> Vec<crate::remote::test_double::Route> {
+        use crate::remote::test_double::{route, Reply};
+        vec![
+            route("POST", "/removals/preview", previews),
+            route("POST", "/removals", removals),
+            route(
+                "GET",
+                "/rows",
+                rows.into_iter()
+                    .map(|body| Reply::json(200, body))
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The daemon's fresh preview after drift: the worktree directory went
+    /// away between the preview and the execute.
+    fn drifted_report(
+        previewed: &baude_core::removal::RemovalReport,
+    ) -> baude_core::removal::RemovalReport {
+        let mut fresh = previewed.clone();
+        let moved = std::mem::take(&mut fresh.paths_deleted);
+        assert!(!moved.is_empty(), "the preview deletes the worktree path");
+        fresh.already_removed.extend(moved);
+        fresh
+    }
+
+    /// The open remote confirmation: its report, its error text, and whether
+    /// it stands for an unknown outcome.
+    fn remote_confirmation(app: &App) -> (&baude_core::removal::RemovalReport, Option<&str>, bool) {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                report,
+                scroll,
+                error,
+                origin: super::RemovalOrigin::Remote(confirm),
+                ..
+            } => {
+                assert_eq!(*scroll, 0, "a re-installed confirmation starts unscrolled");
+                (report, error.as_deref(), confirm.unknown_outcome)
+            }
+            _ => panic!(
+                "expected an open remote confirmation; pending: {:?}, footer: {:?}",
+                pending_stage(app),
+                last_message(app)
+            ),
+        }
+    }
+
+    /// Which wait the pending modal shows, if it is up.
+    fn pending_stage(app: &App) -> Option<super::RemoteRemovalStage> {
+        match &app.modal {
+            Modal::RemoteRemovePending { stage, .. } => Some(*stage),
+            _ => None,
+        }
+    }
+
+    /// `D` on the remote row, then wait for the daemon's preview.
+    fn open_remote_confirmation(app: &mut App) {
+        app.handle_sidebar_key(d_key());
+        settle_remote_removal(app);
+    }
+
+    /// Enter on the open confirmation, then wait for the daemon's answer.
+    fn confirm_and_settle(app: &mut App) {
+        app.handle_modal_key(enter_key());
+        settle_remote_removal(app);
+    }
+
+    /// The bodies of every `POST /removals` the double read, parsed.
+    fn sent_removals(
+        double: &crate::remote::test_double::Double,
+    ) -> Vec<baude_core::removal::RemovalReport> {
+        recorded(double, "POST", "/removals")
+            .iter()
+            .map(|request| {
+                serde_json::from_str(&request.body).expect("the execute body is a report")
+            })
+            .collect()
+    }
+
+    /// Long enough for a worker, had one been started, to reach the double.
+    fn let_a_stray_request_land() {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    fn end_remote_remove(mut app: App, fx: &RelaunchFixture) {
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-12: `D` hands the preview to a worker and returns; the draw thread
+    /// never waits out a slow daemon.
+    #[test]
+    fn d_on_remote_row_returns_before_a_slow_daemon_answers() {
+        use crate::remote::test_double::Reply;
+
+        // The double is bound for the whole test: dropping it stops the daemon.
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-slow", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed)).delayed(std::time::Duration::from_secs(1))],
+                Vec::new(),
+                vec![rows_body],
+            )
+        });
+
+        let started = std::time::Instant::now();
+        app.handle_sidebar_key(d_key());
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the key handler waited on the daemon: {took:?}"
+        );
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview)
+        );
+
+        settle_remote_removal(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, None);
+        assert!(!unknown);
+        end_remote_remove(app, &fx);
+    }
+
+    /// D-14: a 409 puts the daemon's fresh report in front of the user and
+    /// sends nothing until Enter is pressed on it.
+    #[test]
+    fn remote_remove_drift_reinstalls_fresh_report_and_sends_nothing_until_confirmed() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-drift", |previewed, rows_body| {
+            let fresh = drifted_report(previewed);
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![
+                    Reply::json(409, wire(&fresh)),
+                    Reply::json(200, wire(&executed_report(&fresh))),
+                ],
+                vec![rows_body, rows_body],
+            )
+        });
+        let fresh = drifted_report(&previewed);
+        assert_ne!(fresh, previewed);
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &fresh, "the daemon's fresh report is shown");
+        assert_eq!(error, None);
+        assert!(!unknown);
+        assert_eq!(last_message(&app), Some(RECHECK_NOTICE));
+        assert!(app.remote_removal.is_none());
+        let_a_stray_request_land();
+        assert_eq!(
+            sent_removals(&double),
+            vec![previewed.clone()],
+            "a 409 leads to no request the user did not press Enter for"
+        );
+
+        confirm_and_settle(&mut app);
+        assert_eq!(sent_removals(&double), vec![previewed, fresh.clone()]);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed_report(&fresh)).as_str())
+        );
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// D-15: a 500 and a 503 keep the confirmation open with the daemon's
+    /// own words, and Enter sends the same held report again.
+    #[test]
+    fn remote_remove_refused_keeps_modal_with_daemon_text_and_enter_retries_same_report() {
+        use crate::remote::test_double::Reply;
+
+        const BUSY: &str = "repository busy: another removal holds the lock";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-refused", |previewed, rows_body| {
+            let survived = format!(
+                "row {:?}: runtime survived the kill stage: still running",
+                previewed.rows_removed[0]
+            );
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![
+                    Reply::text(500, survived),
+                    Reply::text(503, BUSY),
+                    Reply::json(200, wire(&executed_report(previewed))),
+                ],
+                vec![rows_body],
+            )
+        });
+        let survived = format!(
+            "row {:?}: runtime survived the kill stage: still running",
+            previewed.rows_removed[0]
+        );
+        assert!(
+            survived.starts_with("row Checkout(CheckoutKey("),
+            "core's shape: {survived}"
+        );
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed, "the held report stays");
+        assert_eq!(error, Some(survived.as_str()));
+        assert!(!unknown);
+        assert_eq!(sent_removals(&double).len(), 1);
+
+        confirm_and_settle(&mut app);
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, Some(BUSY));
+        assert!(!unknown);
+        let sent = sent_removals(&double);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], sent[0], "Enter retries with an equal body");
+        assert_eq!(sent[0], previewed);
+
+        confirm_and_settle(&mut app);
+        let sent = sent_removals(&double);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2], sent[0]);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            recorded(&double, "POST", "/removals/preview").len(),
+            1,
+            "a refusal is retried without a new preview"
+        );
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// A 404 means the row is already gone: the modal closes, says so, and
+    /// holds nothing a key could resend.
+    #[test]
+    fn remote_remove_gone_closes_with_already_removed_notice_and_offers_no_retry() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-gone", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::text(404, "unknown target"),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::text(404, "unknown target")],
+                vec![rows_body],
+            )
+        });
+
+        // A 404 to the preview.
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("already removed"),
+            "{message}"
+        );
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+
+        // A 404 to the removal.
+        app.message = None;
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        confirm_and_settle(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("already removed"),
+            "{message}"
+        );
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+
+        app.handle_modal_key(enter_key());
+        assert!(app.remote_removal.is_none());
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 2);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// An execute that was sent and never answered is an unknown outcome,
+    /// never a failure, and it is never sent again: Enter previews.
+    #[test]
+    fn remote_remove_unanswered_execute_is_unknown_outcome_and_enter_previews_again() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-unknown", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::json(200, wire(previewed)),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::closed_unanswered()],
+                // After the preview, after the unanswered execute, after the
+                // second preview: the row is listed every time.
+                vec![rows_body, rows_body, rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed, "the held report stays");
+        assert!(unknown, "an unanswered execute is an unknown outcome");
+        let error = error.expect("the unknown outcome is explained").to_string();
+        assert!(
+            error.contains("may or may not have been removed"),
+            "{error}"
+        );
+        assert!(!error.contains("failed"), "{error}");
+        let footer = last_message(&app).unwrap_or_default().to_string();
+        assert!(!footer.contains("failed"), "{footer}");
+
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "Enter on an unknown outcome previews again"
+        );
+        settle_remote_removal(&mut app);
+        let (_, error, unknown) = remote_confirmation(&app);
+        assert_eq!(error, None);
+        assert!(!unknown, "a fresh preview is an ordinary confirmation");
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(recorded(&double, "POST", "/removals/preview").len(), 2);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// An unanswered execute whose row the daemon no longer lists did
+    /// happen: the modal closes and says the row was removed.
+    #[test]
+    fn remote_remove_unanswered_execute_with_rows_gone_reports_removed() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-rows-gone", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::closed_unanswered()],
+                // Listed after the preview, gone after the execute.
+                vec![rows_body, EMPTY_ROWS_BODY],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        confirm_and_settle(&mut app);
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("was removed"),
+            "{message}"
+        );
+        assert!(!message.contains("failed"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// The daemon runs on another machine and can be newer than this TUI. It
+    /// commits the removal and answers 200 with a report that names a save
+    /// outcome this build does not know. The removal happened: the user is
+    /// told so, and is never shown a refusal whose Enter sends it again.
+    #[test]
+    fn remote_remove_committed_answer_from_a_newer_daemon_is_not_offered_as_a_retry() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-newer-daemon", |previewed, rows_body| {
+            let mut committed = serde_json::to_value(executed_report(previewed))
+                .expect("serialize the executed report");
+            committed["persistence"] = serde_json::json!({ "outcome": "saved_to_replica" });
+            let committed = committed.to_string();
+            assert!(
+                serde_json::from_str::<baude_core::removal::RemovalReport>(&committed).is_err(),
+                "this build reads the newer daemon's report after all: {committed}"
+            );
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, committed)],
+                // Listed after the preview, gone once the daemon removed it.
+                vec![rows_body, EMPTY_ROWS_BODY],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the confirmation is still up; footer: {:?}",
+            last_message(&app)
+        );
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains("active-zeta") && message.contains("was removed"),
+            "{message}"
+        );
+        assert!(!message.contains("failed"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// Drive a remote removal whose execute the daemon answers 200 with
+    /// `persistence`, and return the footer it leaves. The removal is over
+    /// either way: the modal is closed and Enter sends nothing more.
+    fn footer_after_remote_removal_saved_as(
+        name: &str,
+        persistence: baude_core::removal::PersistenceOutcome,
+    ) -> String {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app(name, |previewed, rows_body| {
+            let mut committed = executed_report(previewed);
+            committed.persistence = persistence;
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, wire(&committed))],
+                vec![rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.message = None;
+        confirm_and_settle(&mut app);
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.starts_with("removed 1 row"), "{message}");
+
+        let requests = double.request_count();
+        app.handle_modal_key(enter_key());
+        let_a_stray_request_land();
+        assert_eq!(double.request_count(), requests, "no further request");
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+        message
+    }
+
+    /// The daemon removed the row and replaced its state file, but could not
+    /// confirm the replacement, and says so in its report. The footer is the
+    /// one place a remote removal can show that: this TUI keeps no dirty mark
+    /// for another machine's state file. The PWA shows the same detail.
+    #[test]
+    fn remote_remove_degraded_daemon_save_is_named_in_the_footer() {
+        use baude_core::removal::PersistenceOutcome;
+
+        // What core reports when the rename landed and syncing the directory
+        // did not: the bare OS error, with nothing that says what it is about.
+        const DETAIL: &str = "Input/output error (os error 5)";
+
+        let degraded = footer_after_remote_removal_saved_as(
+            "d-remote-save-degraded",
+            PersistenceOutcome::SavedDegraded {
+                detail: DETAIL.to_string(),
+            },
+        );
+        assert!(degraded.contains(DETAIL), "{degraded}");
+        // The bare error is led in by what it is about.
+        assert!(degraded.contains("daemon"), "{degraded}");
+        // Still a removal that happened, never a failure.
+        assert!(!degraded.contains("failed"), "{degraded}");
+
+        // A clean save has no caveat to show.
+        let saved =
+            footer_after_remote_removal_saved_as("d-remote-save-clean", PersistenceOutcome::Saved);
+        assert!(!saved.contains("daemon"), "{saved}");
+        assert_ne!(saved, degraded);
+    }
+
+    /// The detail is another machine's text drawn in this terminal: no
+    /// control character gets through and a long one is cut.
+    #[test]
+    fn remote_remove_degraded_daemon_save_detail_is_cleaned_for_the_footer() {
+        use baude_core::removal::PersistenceOutcome;
+
+        let hostile = format!("\u{1b}[31mdisk\nfull\t{}", "x".repeat(5000));
+        let message = footer_after_remote_removal_saved_as(
+            "d-remote-save-hostile",
+            PersistenceOutcome::SavedDegraded { detail: hostile },
+        );
+
+        assert!(message.contains("[31mdisk full x"), "{message}");
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(message.chars().count() < 700, "{}", message.chars().count());
+    }
+
+    /// A preview the daemon refuses, or never answers, closes the modal with
+    /// a notice: nothing was asked to change.
+    #[test]
+    fn remote_remove_preview_refused_or_unanswered_closes_with_notice() {
+        use crate::remote::test_double::Reply;
+
+        const BUSY: &str = "repository busy: another removal holds the lock";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-preview-refused", |_previewed, _rows_body| {
+            removal_routes(
+                vec![Reply::text(503, BUSY), Reply::closed_unanswered()],
+                Vec::new(),
+                Vec::new(),
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.contains(BUSY), "the daemon's text: {message}");
+        assert!(message.contains("active-zeta"), "{message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.starts_with("No answer from the daemon"),
+            "{message}"
+        );
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        assert!(app.remote_removal.is_none());
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// Register rule 2 on the footer: a preview refusal that names the target
+    /// in core's `row {key:?}` shape reads as the row's label.
+    #[test]
+    fn remote_remove_preview_refusal_footer_shows_row_label_not_key_text() {
+        use crate::remote::test_double::Reply;
+
+        const DETAIL: &str = "runtime survived the kill stage: still running";
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app(
+            "d-remote-preview-refused-key-text",
+            |previewed, _rows_body| {
+                let body = format!("row {:?}: {DETAIL}", previewed.target);
+                assert!(
+                    body.contains("Checkout(CheckoutKey("),
+                    "the daemon's text names the key the way core prints it: {body}"
+                );
+                removal_routes(vec![Reply::text(500, body)], Vec::new(), Vec::new())
+            },
+        );
+
+        open_remote_confirmation(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.contains(&format!("active-zeta: {DETAIL}")),
+            "{message}"
+        );
+        assert!(!message.contains("Key("), "{message}");
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 0);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// T-21-85: a name from another host cannot put a control character on
+    /// the terminal through a remote confirmation, nor run on without end.
+    #[test]
+    fn remote_remove_row_label_strips_control_characters() {
+        use baude_core::removal::RowKey;
+
+        let repository: baude_core::repository::RepositoryKey =
+            serde_json::from_value(serde_json::json!(1)).expect("repository key");
+        let checkout: CheckoutKey =
+            serde_json::from_value(serde_json::json!(7)).expect("checkout key");
+        let hostile = format!("\u{1b}[31mzeta\u{7}\nnext{}", "x".repeat(285));
+        assert_eq!(hostile.chars().count(), 300);
+        let rows: crate::remote::RemoteRows = serde_json::from_str(&remote_rows_body(
+            repository,
+            &[(checkout, &hostile, "feat/\u{1b}[0mzeta\r", None)],
+        ))
+        .expect("the /rows body parses");
+        let key = RowKey::Checkout(checkout);
+        let indexed = rows.label(&key).expect("the index lists the row");
+        assert_eq!(
+            indexed.display_name, hostile,
+            "the index hands the name over as the daemon sent it"
+        );
+        let confirm = super::RemoteConfirm {
+            rows,
+            label: "zeta".into(),
+            unknown_outcome: false,
+        };
+
+        let label = confirm.row_label(&key);
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        let name = label
+            .strip_suffix(" (feat/[0mzeta)")
+            .unwrap_or_else(|| panic!("the branch follows the name: {label:?}"));
+        assert!(name.starts_with("[31mzetanextxxx"), "{name:?}");
+        assert!(name.ends_with('…'), "a cut name says so: {name:?}");
+        assert!(
+            name.chars().count() <= 80,
+            "{} characters of name",
+            name.chars().count()
+        );
+    }
+
+    /// A key that no local row and no recorded path names reads `unknown
+    /// row`, never as key text.
+    #[test]
+    fn remove_project_unresolvable_key_label_is_unknown_row() {
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("remove-project-unresolvable-key");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-unresolvable");
+        assert_ne!(
+            app.removal_row_label(&RowKey::Checkout(rows.managed)),
+            super::REMOVAL_UNKNOWN_ROW,
+            "the fixture names its own rows"
+        );
+
+        let absent = serde_json::json!(9_000_001);
+        for key in [
+            RowKey::Repository(serde_json::from_value(absent.clone()).expect("repository key")),
+            RowKey::Checkout(serde_json::from_value(absent.clone()).expect("checkout key")),
+            RowKey::Standalone(serde_json::from_value(absent.clone()).expect("standalone key")),
+        ] {
+            assert_eq!(
+                app.removal_row_label(&key),
+                super::REMOVAL_UNKNOWN_ROW,
+                "{key:?}"
+            );
+        }
+
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// Esc always ends a preview wait, and never pretends to recall a
+    /// removal that was already sent.
+    #[test]
+    fn remote_remove_esc_cancels_a_preview_wait_and_stays_during_an_execute_wait() {
+        use crate::remote::test_double::Reply;
+
+        let slow = std::time::Duration::from_millis(400);
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-esc", |previewed, rows_body| {
+            removal_routes(
+                vec![
+                    Reply::json(200, wire(previewed)).delayed(slow),
+                    Reply::json(200, wire(previewed)),
+                ],
+                vec![Reply::json(200, wire(&executed_report(previewed))).delayed(slow)],
+                vec![rows_body, rows_body],
+            )
+        });
+        let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.handle_sidebar_key(d_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview)
+        );
+        app.handle_modal_key(esc());
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none(), "nothing is pending");
+        // The late answer arrives and finds no one waiting for it.
+        std::thread::sleep(slow * 2);
+        app.poll_remote_removal();
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a late answer opens nothing"
+        );
+
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        app.handle_modal_key(esc());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute),
+            "a sent removal keeps its wait"
+        );
+        assert!(app.remote_removal.is_some(), "the removal is still pending");
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(message.contains("cannot be recalled"), "{message}");
+
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            last_message(&app),
+            Some(App::removal_notice(&executed_report(&previewed)).as_str())
+        );
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// A worker that never answers does not hold the modal forever: at the
+    /// deadline a preview wait ends as no answer and a removal wait as an
+    /// unknown outcome.
+    #[test]
+    fn remote_remove_silent_worker_resolves_at_the_deadline() {
+        use crate::remote::test_double::Reply;
+
+        let forever = std::time::Duration::from_secs(120);
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-deadline", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::held(forever), Reply::json(200, wire(previewed))],
+                vec![Reply::held(forever)],
+                vec![rows_body],
+            )
+        });
+
+        app.handle_sidebar_key(d_key());
+        app.poll_remote_removal();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "before the deadline the wait goes on"
+        );
+        // The double hands out a route's replies in arrival order, so the
+        // held reply has to reach this first preview before the next one is
+        // sent. Without the wait the two workers race for it.
+        let sent = std::time::Instant::now();
+        while recorded(&double, "POST", "/removals/preview").is_empty() {
+            assert!(
+                sent.elapsed() < std::time::Duration::from_secs(5),
+                "the first preview never reached the double"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.remote_removal
+            .as_mut()
+            .expect("a pending preview")
+            .deadline = std::time::Instant::now();
+        app.poll_remote_removal();
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.remote_removal.is_none());
+        let message = last_message(&app).expect("footer notice").to_string();
+        assert!(
+            message.starts_with("No answer from the daemon"),
+            "{message}"
+        );
+        assert!(message.ends_with("Nothing was changed."), "{message}");
+
+        open_remote_confirmation(&mut app);
+        remote_confirmation(&app);
+        app.handle_modal_key(enter_key());
+        app.poll_remote_removal();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        app.remote_removal
+            .as_mut()
+            .expect("a pending removal")
+            .deadline = std::time::Instant::now();
+        app.poll_remote_removal();
+        assert!(app.remote_removal.is_none());
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert!(unknown, "a silent removal is an unknown outcome");
+        let error = error.expect("the unknown outcome is explained");
+        assert!(
+            error.contains("may or may not have been removed"),
+            "{error}"
+        );
+        assert!(!error.contains("failed"), "{error}");
+        drop(double);
+        end_remote_remove(app, &fx);
+    }
+
+    /// A second Enter while the removal is on its way sends nothing.
+    #[test]
+    fn remote_remove_double_enter_sends_one_execute() {
+        use crate::remote::test_double::Reply;
+
+        let RemoteRemove {
+            fx,
+            mut app,
+            double,
+            ..
+        } = remote_remove_app("d-remote-double-enter", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))],
+                vec![Reply::json(200, wire(&executed_report(previewed)))
+                    .delayed(std::time::Duration::from_millis(300))],
+                vec![rows_body],
+            )
+        });
+
+        open_remote_confirmation(&mut app);
+        app.handle_modal_key(enter_key());
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Execute)
+        );
+        settle_remote_removal(&mut app);
+        assert!(matches!(app.modal, Modal::None));
+        let_a_stray_request_land();
+        assert_eq!(recorded(&double, "POST", "/removals").len(), 1);
+        assert_eq!(double.unscripted(), Vec::new(), "unscripted requests");
+        end_remote_remove(app, &fx);
+    }
+
+    /// `tick` is what collects the answer in the running app. The idle
+    /// poller hands `tick` a remote view that lists nothing, so this also
+    /// pins that a daemon listing nothing for a moment does not end the wait.
+    #[test]
+    fn remote_remove_tick_polls_the_pending_removal() {
+        use crate::remote::test_double::Reply;
+
+        // The double is bound for the whole test: dropping it stops the daemon.
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            previewed,
+            ..
+        } = remote_remove_app("d-remote-tick", |previewed, rows_body| {
+            removal_routes(
+                vec![Reply::json(200, wire(previewed))
+                    .delayed(std::time::Duration::from_millis(200))],
+                Vec::new(),
+                vec![rows_body],
+            )
+        });
+
+        app.handle_sidebar_key(d_key());
+        app.tick();
+        assert_eq!(
+            pending_stage(&app),
+            Some(super::RemoteRemovalStage::Preview),
+            "an empty remote view does not dismiss the wait"
+        );
+        let started = std::time::Instant::now();
+        while app.remote_removal.is_some() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "tick never collected the answer"
+            );
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (report, error, unknown) = remote_confirmation(&app);
+        assert_eq!(report, &previewed);
+        assert_eq!(error, None);
+        assert!(!unknown);
+        end_remote_remove(app, &fx);
+    }
+
+    /// A changed rows index is a reason to redraw; an unchanged one is not.
+    #[test]
+    fn remote_remove_rows_index_change_marks_dirty() {
+        let RemoteRemove {
+            fx,
+            mut app,
+            double: _double,
+            ..
+        } = remote_remove_app("d-remote-rows-dirty", |_previewed, _rows_body| Vec::new());
+        let snap = app.remote_snap.clone();
+        let rows = app.remote_rows.clone();
+
+        app.dirty = false;
+        app.apply_remote_view(snap.clone(), rows.clone());
+        assert!(
+            !app.dirty,
+            "the same view and the same index change nothing"
+        );
+
+        let other: crate::remote::RemoteRows =
+            serde_json::from_str(EMPTY_ROWS_BODY).expect("the /rows body parses");
+        assert!(other != rows);
+        app.apply_remote_view(snap, other);
+        assert!(
+            app.dirty,
+            "a different rows index marks the view for redraw"
+        );
+        end_remote_remove(app, &fx);
+    }
+
+    /// Every local row kind `D` reaches over `relaunch_fixture`: the clone's
+    /// primary checkout with the runtime `restore` spawned, which is
+    /// `PrimaryDefault` and so an `External` row, a managed worktree with its
+    /// own runtime, the unmanaged linked worktree, a standalone folder with a
+    /// runtime, and a second repository. The `Main` role needs the pushed
+    /// shape and is reached by the `sidebar_action_d` dispatch test instead.
+    struct RemoveProjectRows {
+        repository: baude_core::repository::RepositoryKey,
+        main: CheckoutKey,
+        managed: CheckoutKey,
+        managed_runtime: u64,
+        unmanaged: CheckoutKey,
+        standalone: StandaloneKey,
+        second: baude_core::repository::RepositoryKey,
+    }
+
+    fn remove_project_app(fx: &RelaunchFixture, branch: &str) -> (App, RemoveProjectRows) {
+        let mut app = relaunch_app(fx, fx.repo.clone());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
+        app.restore();
+        let main_row = checkout_row(&app, &fx.repo).expect("clone admitted");
+        assert_eq!(
+            main_row.role,
+            CheckoutRole::PrimaryDefault,
+            "cloned shape primary"
+        );
+        let main = main_row.key;
+        let repository = main_row.repository_key;
+        assert!(
+            app.runtime_checkouts.contains_key(&main),
+            "restore spawned the clone's primary runtime"
+        );
+        let (managed, managed_runtime) =
+            match app.activate_branch_worktree(&fx.repo, branch).unwrap() {
+                LifecycleOutcome::Created {
+                    checkout,
+                    runtime: Some(runtime),
+                } => (checkout, runtime),
+                other => panic!("unexpected activation outcome: {other:?}"),
+            };
+        let unmanaged = checkout_row(&app, &fx.unmanaged)
+            .expect("unmanaged swept in")
+            .key;
+        app.admit_standalone(&fx.standalone)
+            .unwrap()
+            .expect("standalone runtime");
+        let standalone = app
+            .repository_state
+            .standalone_sessions
+            .iter()
+            .find(|row| row.canonical_path == PersistedPath::from_path(&fx.standalone))
+            .expect("standalone row")
+            .key;
+        app.admit_repository(&fx.second_repo).unwrap();
+        let second = app
+            .repository_state
+            .repositories
+            .iter()
+            .find(|row| row.observed_common_dir == PersistedPath::from_path(&fx.second_common_dir))
+            .expect("second repository row")
+            .key;
+        app.repository_state.validate().unwrap();
+        app.modal = Modal::None;
+        (
+            app,
+            RemoveProjectRows {
+                repository,
+                main,
+                managed,
+                managed_runtime,
+                unmanaged,
+                standalone,
+                second,
+            },
+        )
+    }
+
+    fn saved_state(fx: &RelaunchFixture) -> RepositoryState {
+        persist::load_current_at(
+            &fx.state_root,
+            &baude_core::workspace::active().state_file("state"),
+        )
+        .expect("state file loads")
+        .state
+    }
+
+    fn state_file_bytes(fx: &RelaunchFixture) -> Vec<u8> {
+        std::fs::read(
+            fx.state_root
+                .join(baude_core::workspace::active().state_file("state")),
+        )
+        .expect("state file exists")
+    }
+
+    fn confirm_remove_modal(
+        app: &App,
+    ) -> (
+        baude_core::removal::RemovalTarget,
+        baude_core::removal::RemovalReport,
+    ) {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target,
+                report,
+                scroll,
+                error,
+                ..
+            } => {
+                assert_eq!(*scroll, 0, "a fresh modal starts unscrolled");
+                assert!(error.is_none(), "a fresh modal carries no error");
+                (*target, report.clone())
+            }
+            Modal::None => panic!("expected Modal::ConfirmRemove, got Modal::None"),
+            _ => panic!("expected Modal::ConfirmRemove, got another modal"),
+        }
+    }
+
+    /// TUI-02, D-03, D-05: `D` on each row kind opens `Modal::ConfirmRemove`
+    /// carrying exactly `preview_removal`'s report for that row, including an
+    /// Unavailable row whose directory was deleted before a relaunch.
+    #[test]
+    fn d_opens_confirm_remove_modal_with_preview_report_on_each_row_kind() {
+        use crate::hierarchy::ActionKind;
+        use baude_core::removal::{preview_removal, RemovalTarget};
+
+        let fx = relaunch_fixture("d-modal-each-kind");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-modal");
+        let cases = [
+            (
+                SelId::Repository(rows.repository),
+                ActionKind::Repository,
+                RemovalTarget::Repository(rows.repository),
+            ),
+            (
+                SelId::Checkout(rows.main),
+                ActionKind::External,
+                RemovalTarget::Checkout(rows.main),
+            ),
+            (
+                SelId::Checkout(rows.managed),
+                ActionKind::Managed,
+                RemovalTarget::Checkout(rows.managed),
+            ),
+            (
+                SelId::Checkout(rows.unmanaged),
+                ActionKind::External,
+                RemovalTarget::Checkout(rows.unmanaged),
+            ),
+            (
+                SelId::Standalone(rows.standalone),
+                ActionKind::Standalone,
+                RemovalTarget::Standalone(rows.standalone),
+            ),
+        ];
+        for (selected, kind, target) in cases {
+            app.selected_id = Some(selected);
+            assert_eq!(
+                app.selected_action_view().map(|view| view.kind),
+                Some(kind),
+                "fixture row kind for {selected:?}"
+            );
+            let before = app.repository_state.clone();
+            app.handle_sidebar_key(d_key());
+            let (modal_target, report) = confirm_remove_modal(&app);
+            assert_eq!(modal_target, target);
+            assert_eq!(
+                report,
+                preview_removal(&app.repository_state, target).unwrap()
+            );
+            assert_eq!(
+                app.repository_state, before,
+                "opening the modal mutates nothing"
+            );
+            app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(matches!(app.modal, Modal::None));
+        }
+        // The already-removed case, the way a user produces it: a session ran
+        // in the unmanaged worktree, baude exited, the directory vanished
+        // outside baude, and the relaunch reconciles the row to Unavailable;
+        // `D` is still offered.
+        app.reopen_checkout(rows.unmanaged).unwrap();
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.unmanaged).unwrap();
+        let mut relaunched = relaunch_app(&fx, fx.repo.clone());
+        relaunched.restore();
+        let linked = checkout_row(&relaunched, &fx.unmanaged)
+            .expect("unmanaged row survives the relaunch")
+            .key;
+        relaunched.selected_id = Some(SelId::Checkout(linked));
+        assert_eq!(
+            relaunched.selected_action_view().map(|view| view.kind),
+            Some(ActionKind::Unavailable),
+            "deleted directory projects as Unavailable"
+        );
+        relaunched.handle_sidebar_key(d_key());
+        let (modal_target, report) = confirm_remove_modal(&relaunched);
+        assert_eq!(modal_target, RemovalTarget::Checkout(linked));
+        assert_eq!(
+            report,
+            preview_removal(
+                &relaunched.repository_state,
+                RemovalTarget::Checkout(linked)
+            )
+            .unwrap()
+        );
+        relaunched.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        relaunched.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-02, D-03: a row with a live runtime is not refused; the report
+    /// names the runtime that will be killed, with the pid of the process the
+    /// fixture actually spawned.
+    #[test]
+    fn d_on_row_with_live_runtime_reports_runtime_killed() {
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("d-live-runtime");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-live");
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .expect("managed runtime is live")
+            .claude
+            .process_identity()
+            .pid;
+        assert!(pid_is_live(live_pid), "fixture spawned a live agent");
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (_, report) = confirm_remove_modal(&app);
+        let killed: Vec<_> = report
+            .runtimes_killed
+            .iter()
+            .filter(|killed| killed.row == RowKey::Checkout(rows.managed))
+            .collect();
+        assert_eq!(killed.len(), 1, "one runtime named for the row: {report:?}");
+        assert_eq!(killed[0].agent_pid, live_pid);
+        assert!(
+            pid_is_live(live_pid),
+            "preview kills nothing; the agent is still live"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-03, D-08, D-11: Enter removes the managed worktree row from the
+    /// hierarchy and the state file in exactly one save, kills its runtime,
+    /// moves selection to the parent repository and confirms with counts.
+    #[test]
+    fn confirm_remove_managed_worktree_drops_row_in_one_save() {
+        use crate::hierarchy::LocalRowId;
+
+        let fx = relaunch_fixture("d-confirm-managed");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-confirm");
+        let managed_path = checkout_row_by_key(&app, rows.managed)
+            .observed_path
+            .to_path_buf();
+        assert!(managed_path.is_dir(), "managed worktree exists on disk");
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        let sessions_before = app.sessions.len();
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        confirm_remove_modal(&app);
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(rows.managed)),
+            "row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "row left the state file"
+        );
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            saves_before + 1,
+            "exactly one save"
+        );
+        assert!(!app.persistence_dirty);
+        assert!(!app.runtime_checkouts.contains_key(&rows.managed));
+        assert!(app.session(rows.managed_runtime).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        assert!(!pid_is_live(live_pid), "the agent was killed");
+        assert!(!managed_path.exists(), "the managed directory was deleted");
+        assert_eq!(app.selected_id, Some(SelId::Repository(rows.repository)));
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row")
+                && message.contains("1 runtime")
+                && message.contains("1 path"),
+            "footer reports counts: {message}"
+        );
+        assert!(
+            app.repository_state
+                .repositories
+                .iter()
+                .any(|row| row.key == rows.second),
+            "removal is scoped: the other repository is untouched"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// T-20-03, D-06: Esc closes the modal and nothing moved: state, state
+    /// file, runtime registry and process are as before.
+    #[test]
+    fn esc_on_confirm_remove_is_non_mutating() {
+        let fx = relaunch_fixture("d-esc");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-esc");
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let runtimes_before = app.runtime_checkouts.clone();
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+        let live_pid = app
+            .session(rows.managed_runtime)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        confirm_remove_modal(&app);
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.repository_state, state_before);
+        assert_eq!(state_file_bytes(&fx), file_before);
+        assert_eq!(app.runtime_checkouts, runtimes_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert!(pid_is_live(live_pid));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-03, D-05, D-11: `D` on a repository row previews the parent and
+    /// every child, Enter drops them all from the hierarchy and the state
+    /// file in one save, kills each child's runtime, and selection moves to
+    /// the next repository.
+    #[test]
+    fn confirm_remove_repository_parent_drops_every_child_in_one_save() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::removal::RowKey;
+
+        let fx = relaunch_fixture("d-confirm-parent");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-parent-one");
+        let (second_managed, second_runtime) = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-parent-two")
+            .unwrap()
+        {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = Modal::None;
+        let main_runtime = app.runtime_checkouts[&rows.main];
+        let linked = checkout_row(&app, &fx.linked)
+            .expect("linked worktree swept in")
+            .key;
+        let children = [
+            rows.main,
+            linked,
+            rows.managed,
+            second_managed,
+            rows.unmanaged,
+        ];
+        let runtimes = [main_runtime, rows.managed_runtime, second_runtime];
+        let pids: Vec<u32> = runtimes
+            .iter()
+            .map(|id| app.session(*id).unwrap().claude.process_identity().pid)
+            .collect();
+        assert!(
+            pids.iter().all(|pid| pid_is_live(*pid)),
+            "fixture agents are live"
+        );
+        let paths: Vec<PathBuf> = [rows.managed, second_managed]
+            .iter()
+            .map(|key| checkout_row_by_key(&app, *key).observed_path.to_path_buf())
+            .collect();
+        assert!(paths.iter().all(|path| path.is_dir()));
+        let sessions_before = app.sessions.len();
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (target, report) = confirm_remove_modal(&app);
+        assert_eq!(
+            target,
+            baude_core::removal::RemovalTarget::Repository(rows.repository)
+        );
+        let mut expected: Vec<RowKey> = children.iter().map(|key| RowKey::Checkout(*key)).collect();
+        expected.push(RowKey::Repository(rows.repository));
+        assert_eq!(
+            report.rows_removed.len(),
+            expected.len(),
+            "report lists the parent and every child: {:?}",
+            report.rows_removed
+        );
+        for row in &expected {
+            assert!(
+                report.rows_removed.contains(row),
+                "report names {row:?}: {:?}",
+                report.rows_removed
+            );
+        }
+        assert_eq!(report.runtimes_killed.len(), runtimes.len());
+
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        let visible = app.visible_hierarchy_rows();
+        assert!(
+            !visible
+                .iter()
+                .any(|row| row.id() == LocalRowId::Repository(rows.repository)),
+            "parent left the hierarchy"
+        );
+        for child in children {
+            assert!(
+                !visible
+                    .iter()
+                    .any(|row| row.id() == LocalRowId::Checkout(child)),
+                "child {child:?} left the hierarchy"
+            );
+            assert!(!app.runtime_checkouts.contains_key(&child));
+        }
+        let saved = saved_state(&fx);
+        assert!(
+            !saved
+                .repositories
+                .iter()
+                .any(|row| row.key == rows.repository),
+            "parent left the state file"
+        );
+        assert!(
+            !saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.repository_key == rows.repository),
+            "every child left the state file"
+        );
+        assert!(
+            saved.repositories.iter().any(|row| row.key == rows.second),
+            "the other repository stays"
+        );
+        assert_eq!(
+            app.save_attempts_for_test.get(),
+            saves_before + 1,
+            "exactly one save"
+        );
+        assert!(!app.persistence_dirty);
+        for id in runtimes {
+            assert!(
+                app.session(id).is_none(),
+                "runtime {id} left the session list"
+            );
+        }
+        assert_eq!(app.sessions.len(), sessions_before - runtimes.len());
+        assert!(
+            pids.iter().all(|pid| !pid_is_live(*pid)),
+            "every child agent was killed"
+        );
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "managed directories were deleted"
+        );
+        assert_eq!(
+            app.selected_id,
+            Some(SelId::Repository(rows.second)),
+            "selection moves to the next repository"
+        );
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("6 rows") && message.contains("3 runtimes"),
+            "footer reports counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// Signal zero to the group: `true` once no member is left to probe.
+    fn group_is_extinct(pgid: i32) -> bool {
+        // SAFETY: signal zero performs a liveness probe only.
+        unsafe { libc::kill(-pgid, 0) != 0 }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not happen within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    /// The modal after a failed confirm: still `ConfirmRemove` for `target`,
+    /// now carrying the typed error.
+    fn confirm_remove_error(app: &App, target: baude_core::removal::RemovalTarget) -> String {
+        match &app.modal {
+            Modal::ConfirmRemove {
+                target: kept,
+                error: Some(error),
+                ..
+            } => {
+                assert_eq!(*kept, target, "the modal keeps its target");
+                error.clone()
+            }
+            Modal::ConfirmRemove { error: None, .. } => {
+                panic!("expected ConfirmRemove carrying an error, got none")
+            }
+            Modal::None => panic!("expected Modal::ConfirmRemove, got Modal::None"),
+            _ => panic!("expected Modal::ConfirmRemove, got another modal"),
+        }
+    }
+
+    /// TUI-04, D-09, T-20-09: a kill failure returns before any row drops.
+    /// The runtime is the real parked-reader shape spawned through the App's
+    /// own `opencode_cmd` path, armed so its first teardown fails naming the
+    /// surviving pid; the row stays in the hierarchy and the state file, no
+    /// save ran, the disk is untouched and the handle is back in the registry
+    /// under its row. Releasing the holder and pressing Enter again removes
+    /// the row and leaves the real process group extinct.
+    #[test]
+    fn remove_project_failure_kill_keeps_rows_and_handles_then_retry_succeeds() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::removal::RemovalTarget;
+        use baude_core::testing::{arm_unkillable_runtime, holder_pgid, parked_reader_command};
+
+        let fx = relaunch_fixture("d-kill-failure");
+        let (mut app, _rows) = remove_project_app(&fx, "feature/d-kill-sleeper");
+        let holder_pid_path = fx.root.join("holder.pid");
+        let parked = parked_reader_command(&holder_pid_path);
+        app.config.claude_cmd = Some(parked.clone());
+        app.config.opencode_cmd = Some(parked);
+        let (target_row, runtime_id) = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-unkillable")
+            .unwrap()
+        {
+            LifecycleOutcome::Created {
+                checkout,
+                runtime: Some(runtime),
+            } => (checkout, runtime),
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = Modal::None;
+        let holder = arm_unkillable_runtime(
+            &app.session(runtime_id).expect("armed runtime").claude,
+            &holder_pid_path,
+        );
+        let identity = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .clone();
+        let managed_path = checkout_row_by_key(&app, target_row)
+            .observed_path
+            .to_path_buf();
+        assert!(managed_path.is_dir());
+        let sessions_before = app.sessions.len();
+        let file_before = state_file_bytes(&fx);
+        let saves_before = app.save_attempts_for_test.get();
+        let target = RemovalTarget::Checkout(target_row);
+
+        app.selected_id = Some(SelId::Checkout(target_row));
+        app.handle_sidebar_key(d_key());
+        assert_eq!(confirm_remove_modal(&app).0, target);
+        app.handle_modal_key(enter_key());
+
+        let error = confirm_remove_error(&app, target);
+        assert!(
+            error.contains(&identity.pid.to_string()),
+            "the error names the surviving pid {}: {error}",
+            identity.pid
+        );
+        assert!(
+            error.contains("survived the kill stage"),
+            "the error is the typed kill failure: {error}"
+        );
+        assert!(
+            app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(target_row)),
+            "the row is still in the hierarchy"
+        );
+        assert!(
+            saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == target_row),
+            "the row is still in the state file"
+        );
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert!(managed_path.is_dir(), "the disk stage never ran");
+        assert_eq!(
+            app.runtime_checkouts.get(&target_row),
+            Some(&runtime_id),
+            "the row still maps to its runtime"
+        );
+        let restored = app
+            .session(runtime_id)
+            .expect("the Session handle is back in the registry");
+        assert_eq!(restored.claude.process_identity(), &identity);
+        assert_eq!(app.sessions.len(), sessions_before, "no handle lost");
+
+        // The user reads the error and retries seconds later; the main loop
+        // keeps ticking over the restored handle in between, and the retry
+        // must still find the runtime and its row in agreement.
+        app.tick();
+        let holder_pid = holder.pid();
+        drop(holder);
+        wait_until("holder exit", || holder_pgid(holder_pid).is_none());
+        app.tick();
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the retry closes the modal"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(target_row)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == target_row),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert!(!app.runtime_checkouts.contains_key(&target_row));
+        assert!(app.session(runtime_id).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        assert!(!managed_path.exists(), "the managed directory was deleted");
+        wait_until("group extinction", || {
+            group_is_extinct(identity.process_group)
+        });
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row") && message.contains("1 runtime"),
+            "footer reports the retry's counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// TUI-04, D-09, T-20-10: a save failure after the kill stage leaves the
+    /// row in the hierarchy and the state file with the typed error, the
+    /// handle back in the registry; clearing the failure and pressing Enter
+    /// removes the row.
+    #[test]
+    fn remove_project_failure_save_keeps_rows_then_retry_succeeds() {
+        use crate::hierarchy::LocalRowId;
+        use baude_core::persist::AtomicFailure;
+        use baude_core::removal::RemovalTarget;
+
+        let fx = relaunch_fixture("d-save-failure");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-save");
+        let runtime_id = app.runtime_standalones[&rows.standalone];
+        let live_pid = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        assert!(pid_is_live(live_pid));
+        let sessions_before = app.sessions.len();
+        let file_before = state_file_bytes(&fx);
+        let saves_before = app.save_attempts_for_test.get();
+        let target = RemovalTarget::Standalone(rows.standalone);
+
+        app.selected_id = Some(SelId::Standalone(rows.standalone));
+        app.handle_sidebar_key(d_key());
+        assert_eq!(confirm_remove_modal(&app).0, target);
+        app.atomic_failure_for_test = Some(AtomicFailure::Rename);
+        app.handle_modal_key(enter_key());
+
+        let error = confirm_remove_error(&app, target);
+        assert!(
+            error.contains("could not persist") && error.contains("rename"),
+            "the error is the typed save failure: {error}"
+        );
+        assert!(
+            app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Standalone(rows.standalone)),
+            "the row is still in the hierarchy"
+        );
+        assert!(
+            saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row is still in the state file"
+        );
+        assert_eq!(
+            state_file_bytes(&fx),
+            file_before,
+            "the failed save committed nothing"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert_eq!(
+            app.runtime_standalones.get(&rows.standalone),
+            Some(&runtime_id)
+        );
+        assert!(
+            app.session(runtime_id).is_some(),
+            "the Session handle is back in the registry"
+        );
+        assert_eq!(app.sessions.len(), sessions_before, "no handle lost");
+        assert!(
+            !pid_is_live(live_pid),
+            "the kill stage ran before the save failed; the retry copes with a dead group"
+        );
+        assert!(
+            app.atomic_failure_for_test.is_none(),
+            "the injected failure models one atomic boundary"
+        );
+
+        // The kill stage already ran, so the restored handle is dead when
+        // the main loop ticks over it before the user retries; the retry
+        // must still match that handle to the row's persisted runtime.
+        app.tick();
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "the retry closes the modal"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Standalone(rows.standalone)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 2);
+        assert!(!app.runtime_standalones.contains_key(&rows.standalone));
+        assert!(app.session(runtime_id).is_none());
+        assert_eq!(app.sessions.len(), sessions_before - 1);
+        let message = last_message(&app).expect("footer confirmation");
+        assert!(
+            message.contains("1 row") && message.contains("1 runtime"),
+            "footer reports the retry's counts: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-10, T-20-11: a clearing failure after the committed save does not
+    /// fail the removal. The suppression merge lock path is occupied by a
+    /// directory, so recording the removed managed worktree fails after the
+    /// state save; the rows are gone, the modal is closed and the footer
+    /// names what could not be cleared.
+    #[test]
+    fn remove_project_clearing_failure_is_a_footer_notice_not_an_error() {
+        use crate::hierarchy::LocalRowId;
+
+        let fx = relaunch_fixture("d-clearing-failure");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-clearing");
+        let managed_path = checkout_row_by_key(&app, rows.managed)
+            .observed_path
+            .to_path_buf();
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        let suppression_file = baude_core::suppression::file_path(&config);
+        let lock_path = config.join(format!(
+            ".{}.lock",
+            suppression_file.file_name().unwrap().to_string_lossy()
+        ));
+
+        app.selected_id = Some(SelId::Checkout(rows.managed));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        assert!(previewed.clearing_failures.is_empty());
+        std::fs::create_dir_all(&lock_path).expect("occupy the lock path with a directory");
+        let saves_before = app.save_attempts_for_test.get();
+        app.handle_modal_key(enter_key());
+
+        assert!(
+            matches!(app.modal, Modal::None),
+            "a clearing failure is not an error"
+        );
+        assert!(
+            !app.visible_hierarchy_rows()
+                .iter()
+                .any(|row| row.id() == LocalRowId::Checkout(rows.managed)),
+            "the row left the hierarchy"
+        );
+        assert!(
+            !saved_state(&fx)
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the row left the state file"
+        );
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 1);
+        assert!(!managed_path.exists());
+        assert!(app.session(rows.managed_runtime).is_none());
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &managed_path),
+            "the suppression entry could not be written"
+        );
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("removed 1 row") && message.contains("could not clear 1"),
+            "the footer reports the removal and the clearing failure: {message}"
+        );
+        assert!(
+            message.contains("SuppressionAdded")
+                && message.contains(&managed_path.display().to_string()),
+            "the footer names what could not be cleared: {message}"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// The folder bindings file as it is on disk under `config`, parsed from
+    /// its bytes. A file that does not exist holds no binding.
+    fn bindings_on_disk(config: &Path) -> baude_core::folder_workspace::FolderWorkspaceFile {
+        let path = config.join(baude_core::folder_workspace::FILE_NAME);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).expect("bindings file parses"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+
+    /// REL-01, G7: `D` then Enter on the clone's own checkout row alone. The
+    /// runtime `restore` spawned is killed, the directory and its git dir
+    /// stay, the row leaves the state file while its managed sibling stays,
+    /// its own folder binding is cleared and a suppression entry is written.
+    /// Every after-state value is read from the process table or from a file
+    /// under the fixture, each with a present-before twin.
+    #[test]
+    fn rel01_confirm_remove_main_checkout_reads_binding_and_suppression() {
+        use baude_core::breadcrumbs::folder_key;
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("rel01-confirm-main");
+        let (mut app, rows) = remove_project_app(&fx, "feature/rel01-main");
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        baude_core::folder_workspace::record(Some(&config), &fx.repo, "rel01-main-ws", 10);
+        baude_core::folder_workspace::record(
+            Some(&config),
+            &fx.second_repo,
+            "rel01-neighbour-ws",
+            20,
+        );
+        let repo_key = folder_key(&fx.repo);
+        let neighbour_key = folder_key(&fx.second_repo);
+        let pgid = app
+            .session(app.runtime_checkouts[&rows.main])
+            .expect("the clone's primary runtime is live")
+            .claude
+            .process_identity()
+            .process_group;
+
+        assert!(!group_is_extinct(pgid), "the runtime group is live before");
+        assert!(fx.repo.is_dir(), "the clone exists before");
+        let bindings_before = bindings_on_disk(&config);
+        assert!(
+            bindings_before.folders.contains_key(&repo_key),
+            "the clone's binding is on disk before: {bindings_before:?}"
+        );
+        let neighbour_before = bindings_before.folders[&neighbour_key].clone();
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.repo),
+            "the clone is not suppressed before"
+        );
+        let saved_before = saved_state(&fx);
+        assert!(
+            saved_before
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.main),
+            "the row is in the state file before"
+        );
+        assert!(
+            saved_before
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the managed sibling is in the state file before"
+        );
+
+        app.selected_id = Some(SelId::Checkout(rows.main));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        assert_eq!(target, RemovalTarget::Checkout(rows.main));
+        assert_eq!(
+            previewed.rows_removed,
+            vec![RowKey::Checkout(rows.main)],
+            "the modal names exactly this one row"
+        );
+        app.handle_modal_key(enter_key());
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        wait_until("group extinction", || group_is_extinct(pgid));
+        assert!(fx.repo.is_dir(), "the clone's directory is kept");
+        let head = std::fs::read_to_string(fx.repo.join(".git").join("HEAD"))
+            .expect("the kept clone still has a readable git dir");
+        assert!(head.starts_with("ref: "), "HEAD is intact: {head}");
+        let saved = saved_state(&fx);
+        assert!(
+            !saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.main),
+            "the row left the state file"
+        );
+        assert!(
+            saved
+                .checkouts
+                .iter()
+                .any(|checkout| checkout.key == rows.managed),
+            "the managed sibling stays in the state file"
+        );
+        let bindings = bindings_on_disk(&config);
+        assert!(
+            !bindings.folders.contains_key(&repo_key),
+            "the clone's own binding left the file on disk: {bindings:?}"
+        );
+        assert_eq!(
+            bindings.folders.get(&neighbour_key),
+            Some(&neighbour_before),
+            "only the removed row's own key is cleared"
+        );
+        assert!(
+            baude_core::suppression::is_suppressed(&config, &fx.repo),
+            "a suppression entry was written for the clone"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// The entry names directly under `dir`, sorted.
+    fn sorted_listing(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("folder is listable")
+            .map(|entry| entry.expect("folder entry").file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// REL-01, G7: `D` then Enter on a standalone row alone. Its runtime is
+    /// killed, the folder and its contents stay, the row leaves the state
+    /// file, its own folder binding is cleared and no suppression entry is
+    /// written: the store is byte-identical to before, or still absent.
+    /// Every after-state value is read from the process table or from a file
+    /// under the fixture, each with a present-before twin.
+    #[test]
+    fn rel01_confirm_remove_standalone_reads_binding_and_suppression() {
+        use baude_core::breadcrumbs::folder_key;
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("rel01-confirm-standalone");
+        let (mut app, rows) = remove_project_app(&fx, "feature/rel01-standalone");
+        let config = baude_core::persist::config_dir();
+        assert!(
+            config.starts_with(&fx.root),
+            "the fixture redirects the config dir under its own root: {}",
+            config.display()
+        );
+        let note = fx.standalone.join("todo.md");
+        std::fs::write(&note, b"- keep this folder\n").unwrap();
+        baude_core::folder_workspace::record(
+            Some(&config),
+            &fx.standalone,
+            "rel01-standalone-ws",
+            10,
+        );
+        baude_core::folder_workspace::record(Some(&config), &fx.repo, "rel01-neighbour-ws", 20);
+        let folder = folder_key(&fx.standalone);
+        let neighbour_key = folder_key(&fx.repo);
+        let suppression_store = baude_core::suppression::file_path(&config);
+        let pgid = app
+            .session(app.runtime_standalones[&rows.standalone])
+            .expect("the standalone runtime is live")
+            .claude
+            .process_identity()
+            .process_group;
+
+        assert!(!group_is_extinct(pgid), "the runtime group is live before");
+        let listing_before = sorted_listing(&fx.standalone);
+        assert!(
+            listing_before.contains(&std::ffi::OsString::from("todo.md")),
+            "the folder holds the note before: {listing_before:?}"
+        );
+        let store_before = std::fs::read(&suppression_store).ok();
+        let bindings_before = bindings_on_disk(&config);
+        assert!(
+            bindings_before.folders.contains_key(&folder),
+            "the folder's binding is on disk before: {bindings_before:?}"
+        );
+        let neighbour_before = bindings_before.folders[&neighbour_key].clone();
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.standalone),
+            "the folder is not suppressed before"
+        );
+        assert!(
+            saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row is in the state file before"
+        );
+
+        app.selected_id = Some(SelId::Standalone(rows.standalone));
+        app.handle_sidebar_key(d_key());
+        let (target, previewed) = confirm_remove_modal(&app);
+        assert_eq!(target, RemovalTarget::Standalone(rows.standalone));
+        assert_eq!(
+            previewed.rows_removed,
+            vec![RowKey::Standalone(rows.standalone)],
+            "the modal names exactly this one row"
+        );
+        app.handle_modal_key(enter_key());
+
+        assert!(matches!(app.modal, Modal::None), "modal closes on success");
+        wait_until("group extinction", || group_is_extinct(pgid));
+        assert!(fx.standalone.is_dir(), "the folder is kept");
+        assert_eq!(
+            sorted_listing(&fx.standalone),
+            listing_before,
+            "the folder's listing is unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&note).expect("the note is still readable"),
+            b"- keep this folder\n",
+            "the folder's contents are unchanged"
+        );
+        assert!(
+            !saved_state(&fx)
+                .standalone_sessions
+                .iter()
+                .any(|row| row.key == rows.standalone),
+            "the row left the state file"
+        );
+        let bindings = bindings_on_disk(&config);
+        assert!(
+            !bindings.folders.contains_key(&folder),
+            "the folder's own binding left the file on disk: {bindings:?}"
+        );
+        assert_eq!(
+            bindings.folders.get(&neighbour_key),
+            Some(&neighbour_before),
+            "only the removed row's own key is cleared"
+        );
+        assert!(
+            !baude_core::suppression::is_suppressed(&config, &fx.standalone),
+            "a standalone removal writes no suppression entry"
+        );
+        assert_eq!(
+            std::fs::read(&suppression_store).ok(),
+            store_before,
+            "the suppression store is byte-identical to before, or still absent"
+        );
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-08: a row set that changed behind the modal refreshes the modal
+    /// instead of removing. A child checkout activated after the preview
+    /// shows up in the reinstalled report and nothing is removed.
+    #[test]
+    fn remove_project_recheck_refreshes_modal_when_row_set_changes() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("d-recheck");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-recheck-one");
+        let target = RemovalTarget::Repository(rows.repository);
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        let modal = std::mem::replace(&mut app.modal, Modal::None);
+        let behind = match app
+            .activate_branch_worktree(&fx.repo, "feature/d-recheck-two")
+            .unwrap()
+        {
+            LifecycleOutcome::Created { checkout, .. } => checkout,
+            other => panic!("unexpected activation outcome: {other:?}"),
+        };
+        app.modal = modal;
+        assert!(!previewed.rows_removed.contains(&RowKey::Checkout(behind)));
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+
+        app.handle_modal_key(enter_key());
+
+        let (kept, fresh) = confirm_remove_modal(&app);
+        assert_eq!(kept, target);
+        assert!(
+            fresh.rows_removed.contains(&RowKey::Checkout(behind)),
+            "the refreshed report lists the new child: {fresh:?}"
+        );
+        assert!(previewed
+            .rows_removed
+            .iter()
+            .all(|row| fresh.rows_removed.contains(row)));
+        assert_eq!(app.repository_state, state_before, "no row was removed");
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("rows changed since the preview"),
+            "footer explains the refresh: {message}"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    /// D-05, D-08: a runtime admitted for a row already in the set after
+    /// the preview changes what the run would do without changing the row
+    /// set. Enter refreshes the modal with the runtime listed instead of
+    /// killing a process the confirmation never named.
+    #[test]
+    fn remove_project_recheck_refreshes_modal_when_runtime_set_changes() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+
+        let fx = relaunch_fixture("d-recheck-runtime");
+        let (mut app, rows) = remove_project_app(&fx, "feature/d-recheck-runtime");
+        let target = RemovalTarget::Repository(rows.repository);
+        assert!(
+            !app.runtime_checkouts.contains_key(&rows.unmanaged),
+            "the swept-in checkout starts without a runtime"
+        );
+
+        app.selected_id = Some(SelId::Repository(rows.repository));
+        app.handle_sidebar_key(d_key());
+        let (_, previewed) = confirm_remove_modal(&app);
+        assert!(previewed
+            .rows_removed
+            .contains(&RowKey::Checkout(rows.unmanaged)));
+        assert!(
+            !previewed
+                .runtimes_killed
+                .iter()
+                .any(|killed| killed.row == RowKey::Checkout(rows.unmanaged)),
+            "the preview lists no runtime for the dormant row: {previewed:?}"
+        );
+        let modal = std::mem::replace(&mut app.modal, Modal::None);
+        let runtime_id = match app.reopen_checkout(rows.unmanaged).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let live_pid = app
+            .session(runtime_id)
+            .unwrap()
+            .claude
+            .process_identity()
+            .pid;
+        app.modal = modal;
+        let state_before = app.repository_state.clone();
+        let file_before = state_file_bytes(&fx);
+        let sessions_before = app.sessions.len();
+        let saves_before = app.save_attempts_for_test.get();
+
+        app.handle_modal_key(enter_key());
+
+        let (kept, fresh) = confirm_remove_modal(&app);
+        assert_eq!(kept, target);
+        assert_eq!(
+            fresh.rows_removed, previewed.rows_removed,
+            "the row set itself did not change"
+        );
+        assert!(
+            fresh.runtimes_killed.iter().any(|killed| {
+                killed.row == RowKey::Checkout(rows.unmanaged) && killed.agent_pid == live_pid
+            }),
+            "the refreshed report names the new runtime: {fresh:?}"
+        );
+        assert!(pid_is_live(live_pid), "nothing was killed");
+        assert_eq!(app.repository_state, state_before, "no row was removed");
+        assert_eq!(state_file_bytes(&fx), file_before, "no save ran");
+        assert_eq!(app.save_attempts_for_test.get(), saves_before);
+        assert_eq!(app.sessions.len(), sessions_before);
+        let message = last_message(&app).expect("footer notice");
+        assert!(
+            message.contains("rows changed since the preview"),
+            "footer explains the refresh: {message}"
+        );
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.kill_all();
+        std::fs::remove_dir_all(&fx.root).unwrap();
+    }
+
+    fn checkout_row_by_key(app: &App, key: CheckoutKey) -> &SavedCheckout {
+        app.repository_state
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.key == key)
+            .expect("checkout row by key")
     }
 
     #[test]
@@ -13511,7 +18735,9 @@ mod tests {
         app.admit_repository(&repo).unwrap().expect("runtime");
         app.message = None;
         app.focus = super::Focus::Sidebar;
-        let backend = ratatui::backend::TestBackend::new(220, 30);
+        // Wide enough that the right-side chips survive the full-width
+        // hint plus the fixture's long tmp path; the bar drops them first.
+        let backend = ratatui::backend::TestBackend::new(260, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
         let buffer = terminal.backend().buffer();

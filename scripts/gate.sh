@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run the `check` job of .github/workflows/ci.yml locally, in the same order,
-# so a push is not the first time the gate runs.
+# so a push is not the first time the gate runs. It starts with the PWA's
+# node:test suites, then the cargo steps.
 #
 #   gate.sh           run the gate on this machine
 #   gate.sh --linux   run it in rust:1-bookworm as uid 1000, which is how the
@@ -32,8 +33,10 @@ if [[ "${1:-}" == "--linux" ]]; then
   git_common="$(cd "$(git rev-parse --git-common-dir)" && pwd)" || exit 2
   # The stock image lacks rustfmt and clippy, and uid 1000 cannot add them to
   # its root-owned toolchain, so they are baked into a local image; docker's
-  # layer cache makes every build after the first a no-op.
-  printf 'FROM rust:1-bookworm\nRUN rustup component add rustfmt clippy\n' |
+  # layer cache makes every build after the first a no-op. It lacks node as
+  # well, which the PWA suites need, so the binary is copied in from the node
+  # image. Its major must stay equal to node-version in ci.yml.
+  printf 'FROM rust:1-bookworm\nRUN rustup component add rustfmt clippy\nCOPY --from=node:26-bookworm /usr/local/bin/node /usr/local/bin/node\n' |
     docker build -q -t baude-gate - >/dev/null || exit 2
   exec docker run --rm -u 1000:1000 \
     -v "$ROOT":/work -w /work \
@@ -60,6 +63,12 @@ step() {
   return $status
 }
 
+# The PWA suites go first: they are the cheapest step and need nothing built.
+# They do not run under `isolated` below. node may be a version-manager shim
+# that finds its toolchain through HOME, the hazard described there for cargo
+# and python3, and the suites are pure functions that write nothing, so they
+# have no place inside the real-roots bracket.
+step bash scripts/check-web-suites.sh || exit 1
 step cargo fmt --check || exit 1
 step cargo clippy --all-targets -- -D warnings || exit 1
 step bash scripts/check-commit-message.sh --self-test || exit 1

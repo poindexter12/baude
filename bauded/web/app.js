@@ -28,6 +28,14 @@ const state = {
   pendingPermission: null, // GET /permission view while waiting_reason === "permission" (else null)
 };
 
+// The removal controller from removal-controller.js, built in the boot section.
+// It owns the /rows body, its tombstones and the confirmation modal; this file
+// only renders what it holds. Null when either removal script failed to load,
+// in which case the list is the flat session list with no remove controls.
+let removalController = null;
+let removalEvents = null; // the one EventSource on /events, opened by the controller
+let removalModalShown = null; // the controller modal object last drawn
+
 // ---- helpers ----
 
 function esc(s) {
@@ -135,8 +143,14 @@ window.addEventListener("hashchange", route);
 // ---- data ----
 
 async function refresh() {
+  // The row list has one way in: the controller filters every /rows body
+  // through its tombstones, so a fetched body is never assigned in this file.
+  if (removalController) removalController.loadRows().catch(() => {});
   try {
-    state.sessions = await api("/sessions");
+    // A /sessions body that left before a removal can still list the removed
+    // row's session, so every fetched list goes through the controller.
+    const sessions = await api("/sessions");
+    state.sessions = removalController ? removalController.filterSessions(sessions) : sessions;
     state.fetchedAt = Date.now();
     if (state.sid !== null) {
       state.queue = await api(`/sessions/${state.sid}/queue`).catch(() => []);
@@ -591,6 +605,81 @@ function closeModal() {
 function render() {
   if (state.sid === null) renderList();
   else renderChat();
+  renderRemovalModal();
+}
+
+// A row or modal change from the removal controller. The chat view shows no
+// rows, so only the list is redrawn for it.
+function onRemovalChange() {
+  if (state.sid === null) renderList();
+  renderRemovalModal();
+}
+
+// A tap on a remove control. The control carries its row key as data; both
+// halves are checked before a RowKey is built from them.
+function onListClick(e) {
+  if (!removalController || !(e.target instanceof Element)) return;
+  const el = e.target.closest("[data-kind]");
+  if (!el) return;
+  const kind = el.dataset.kind;
+  const raw = el.dataset.key || "";
+  const key = Number(raw);
+  if (!["repository", "checkout", "standalone"].includes(kind)) return;
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(key)) return;
+  removalController.openPreview({ [kind]: key });
+}
+
+// Draw the controller's confirmation, or take it down when there is none.
+// Cancel, the backdrop and Escape all call controller.cancel() and nothing
+// else: none of them removes the element. Only this pass does, once getModal()
+// is null, so a removal that is executing keeps its confirmation on screen.
+function renderRemovalModal() {
+  const m = removalController ? removalController.getModal() : null;
+  const existing = document.getElementById("modal");
+  const ours = !!existing && existing.dataset.removal === "1";
+  if (!m) {
+    if (ours) closeModal();
+    removalModalShown = null;
+    return;
+  }
+  if (ours && removalModalShown === m) return;
+  let div = ours ? existing : null;
+  const created = !div;
+  if (created) {
+    closeModal();
+    div = document.createElement("div");
+    div.id = "modal";
+    div.dataset.removal = "1";
+    div.innerHTML = `
+      <div class="box wide" role="dialog" aria-modal="true" aria-label="confirm removal">
+        <div class="rmbody"></div>
+        <div class="rmerror" hidden></div>
+        <div class="actions">
+          <button type="button" class="ghost" id="rmcancel">cancel</button>
+          <button type="button" class="primary danger" id="rmconfirm">remove</button>
+        </div>
+      </div>`;
+    document.body.appendChild(div);
+    div.addEventListener("click", (e) => { if (e.target === div) removalController.cancel(); });
+    div.querySelector("#rmcancel").onclick = () => { removalController.cancel(); };
+    div.querySelector("#rmconfirm").onclick = () => { removalController.confirm(); };
+  }
+  const body = div.querySelector(".rmbody");
+  if (created || !removalModalShown || removalModalShown.html !== m.html) {
+    // controller html is built by BaudeRemoval.renderConfirmation, which
+    // escapes every daemon value; nothing else is ever written as HTML here.
+    if (m.html) body.innerHTML = m.html;
+    else body.textContent = m.phase === "loading" ? "loading…" : "";
+  }
+  const error = div.querySelector(".rmerror");
+  error.textContent = m.errorText || "";
+  error.hidden = !m.errorText;
+  const confirmBtn = div.querySelector("#rmconfirm");
+  // Decided by the controller, which owns what a press does in each phase.
+  const control = BaudeRemovalController.confirmControl(m);
+  confirmBtn.disabled = control.disabled;
+  confirmBtn.textContent = control.label;
+  removalModalShown = m;
 }
 
 function renderList() {
@@ -618,10 +707,31 @@ function renderList() {
   };
   const active = state.sessions.filter((s) => !s.archived);
   const archived = state.sessions.filter((s) => s.archived);
-  const rows = active.map(rowHtml).join("")
-    + (archived.length
-      ? `<div class="secthead">archived</div>${archived.map(rowHtml).join("")}`
-      : "");
+  let rows;
+  if (removalController) {
+    // The hierarchy comes from the controller's /rows body, joined to
+    // /sessions on session id. A session no row claims is still listed, as a
+    // card with no remove control: it has no durable key to remove by.
+    const claimed = new Set();
+    const tree = BaudeRemovalController.renderRowsList(removalController.getRows(), {
+      removal: BaudeRemoval,
+      card: (sid) => {
+        const s = session(sid);
+        if (!s) return null;
+        claimed.add(s.id);
+        return rowHtml(s);
+      },
+    });
+    const rest = (list) => list.filter((s) => !claimed.has(s.id)).map(rowHtml).join("");
+    const restArchived = rest(archived);
+    rows = tree + rest(active)
+      + (restArchived ? `<div class="secthead">archived</div>${restArchived}` : "");
+  } else {
+    rows = active.map(rowHtml).join("")
+      + (archived.length
+        ? `<div class="secthead">archived</div>${archived.map(rowHtml).join("")}`
+        : "");
+  }
   const waiting = active.filter((s) => s.status === "waiting").length;
   const bell = pushSupported()
     ? `<button class="iconbtn${state.pushOn ? " active" : ""}" id="bellbtn"
@@ -638,9 +748,11 @@ function renderList() {
   const bellBtn = document.getElementById("bellbtn");
   if (bellBtn) bellBtn.onclick = togglePush;
   document.getElementById("newbtn").onclick = openModal;
-  for (const el of document.querySelectorAll(".row")) {
+  for (const el of document.querySelectorAll("button.row[data-sid]")) {
     el.onclick = () => { location.hash = `#/s/${el.dataset.sid}`; };
   }
+  // One delegated listener for every remove control in the list.
+  document.getElementById("list").addEventListener("click", onListClick);
 }
 
 function msgHtml(m) {
@@ -811,8 +923,18 @@ function stopTimers() {
   clearInterval(state.tickTimer);
 }
 
+// The daemon-wide removal stream. The browser reconnects it on its own until
+// it gives up and reports CLOSED; only then is a new one opened. subscribe()
+// closes the source it replaces, so there is never more than one.
+function ensureRemovalEvents() {
+  if (!removalController) return;
+  if (removalEvents && removalEvents.readyState !== EventSource.CLOSED) return;
+  removalEvents = removalController.subscribe();
+}
+
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
+    ensureRemovalEvents();
     refresh();
     if (state.sid !== null && !state.es) openChat(state.sid);
     if (state.sid !== null && !state.aes) openActivity(state.sid);
@@ -823,6 +945,25 @@ document.addEventListener("visibilitychange", () => {
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").then(refreshPushState).catch(() => {});
+}
+// Without both removal scripts the page still works as it did before them:
+// the controller stays null and no remove control is rendered.
+if (typeof BaudeRemoval !== "undefined" && typeof BaudeRemovalController !== "undefined") {
+  removalController = BaudeRemovalController.createRemovalController({
+    removal: BaudeRemoval,
+    request: api,
+    openEvents: (url) => new EventSource(url),
+    now: () => Date.now(),
+    onChange: onRemovalChange,
+    notify: toast,
+    onSessionGone: (sid) => { if (sid === state.sid) location.hash = "#/"; },
+  });
+  // Escape cancels the removal confirmation and does nothing anywhere else,
+  // so the chat textarea and the new-session form keep their own behaviour.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && removalController.getModal() !== null) removalController.cancel();
+  });
+  ensureRemovalEvents();
 }
 startTimers();
 route();

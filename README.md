@@ -20,8 +20,10 @@ also names the session that blocked.
 A non-Git folder is admitted as a durable standalone session at the top level.
 It supports the same coding-agent, shell, editor, resume, archive, close, info,
 activity, and GSD flows without inventing repository identity. Branch creation
-and managed-worktree removal stay unavailable. Canonical paths deduplicate
-aliases, and schema-v3 state retains standalone sessions across restarts.
+and managed-worktree removal with `X` stay unavailable. `D` removes the row and
+leaves the folder untouched (see [Removing projects](#removing-projects)).
+Canonical paths deduplicate aliases, and schema-v3 state retains standalone
+sessions across restarts.
 
 Each session surfaces live metadata — model, token counts, cost, GSD project
 state, and (Claude Code) context usage and permission mode.
@@ -148,6 +150,7 @@ through to Claude.
 | `f` | sidebar | show all sessions / scope back to the launch folder's context (see "Folder context") |
 | `x` | running child | close the runtime and retain its checkout for reopening |
 | `X` | managed worktree child | after a fresh clean-state check and distinct confirmation, remove the worktree while retaining its branch |
+| `D` | any sidebar row | after a confirmation that lists what will go, remove the row and kill its runtime; the directory is deleted only when it is a baude-managed worktree (see [Removing projects](#removing-projects)) |
 | `?` | sidebar | help |
 | `q` | sidebar | quit |
 
@@ -390,6 +393,130 @@ operation. A successful `X` removes only that worktree and child; its local
 branch, repository parent, and siblings remain. After a state file reset, the
 same repository is found again by computing its digest from the canonical git
 common directory; no scan is required for recovery.
+
+## Removing projects
+
+`D` in the sidebar removes the selected row from baude. It is offered on every
+row kind: a repository parent, any checkout under it, a standalone folder, an
+unavailable row, and a remote row, which that row's daemon removes (see
+[Remote sessions in the TUI](#remote-sessions-in-the-tui)).
+
+`D` is a different action from the two older keys. Lowercase `x` only closes
+the runtime and keeps the row. Uppercase `X` removes one baude-managed linked
+worktree and is blocked unless that worktree is verified clean. `D` runs no
+clean-state check: it kills the runtime, drops the row, and deletes the
+directory when the directory is a worktree baude created. On a repository
+parent it removes every checkout row under the parent as well.
+
+### The confirmation
+
+Nothing is removed until you confirm. `D` opens a confirmation headed
+`Remove this <kind>?`, where the kind is `repository`, `main checkout`,
+`managed worktree`, `unmanaged checkout`, `unavailable worktree`, `checkout` or
+`standalone session`. Under the heading are four lists, each with a count:
+`rows dropped`, `runtimes killed` with the process id of each runtime,
+`paths deleted` and `paths kept`. An `already removed` list and a `cleared`
+line counting baude's own records appear when they apply. The footer reads
+`y/enter remove · n/esc cancel`, and `j`/`k` or the arrow keys scroll a long
+row list.
+
+Read `paths deleted` before you confirm. It names the directories the removal
+will delete, whatever the row is called in the sidebar or in the heading.
+
+baude checks the rows again when you confirm. If the rows, the runtimes to
+kill or the paths to delete differ from what the confirmation showed, nothing
+is removed and a refreshed confirmation replaces the old one. If the removal
+itself fails, the confirmation stays open with the error and the footer becomes
+`enter retry · esc cancel`.
+
+### What is deleted and what is kept
+
+| Row | Directory on disk |
+|-----|-------------------|
+| Repository parent | has no directory of its own; every checkout row under it is removed too, each by its own rule below |
+| The repository's own main checkout: your clone or `git init` folder | kept |
+| Default checkout that baude created | deleted, uncommitted work included |
+| Any other managed worktree, such as one made with `w` | deleted, uncommitted work included |
+| Linked worktree you made yourself | kept |
+| Standalone folder | kept; the folder and everything in it are left untouched |
+
+The rule behind the table is short. A directory is deleted only when its row
+is a baude-managed worktree and is not the repository's main checkout. Every
+other directory is kept.
+
+A default checkout that baude created falls on the deleted side. When a
+repository is opened and neither its main checkout nor an existing linked
+worktree is on the default branch, baude creates a worktree of the default
+branch in its managed path and uses that as the default checkout. That
+directory is a managed worktree, not the repository's main checkout, so `D` on
+its row or on its repository parent deletes it, uncommitted work included. The
+confirmation lists the directory under `paths deleted`, and for an available
+local row it is headed `Remove this managed worktree?`.
+
+baude deletes a managed worktree by running
+`git worktree remove --force --force -- <path>` against the repository, and
+deletes the directory itself if that command fails. Uncommitted changes,
+untracked files and a session whose working directory is inside the worktree
+do not stop it. Commit or move anything you want to keep before you confirm.
+
+Local branches are never deleted. The branch a removed worktree had checked
+out stays in the repository with every commit made on it.
+
+A managed worktree whose directory is already gone is listed under
+`already removed`. Its row is dropped and Git's record of that worktree is
+removed.
+
+The runtime is killed first. If a runtime survives the kill, the removal stops
+there: no directory is deleted and the rows stay.
+
+### What baude forgets
+
+Removal also clears baude's own records, so a removed row does not come back
+by itself.
+
+- Every row kind: the folder-to-workspace binding for the row's folder, when
+  one exists.
+- Repository parent: baude's ownership marker and the repository's
+  `repository-<key>` directory under the managed worktrees path, when they
+  exist. The directory is removed only when it is empty. The suppression
+  entries of that repository's checkouts are dropped.
+- A checkout removed while its repository row stays: the marker and the
+  repository directory are left alone, and a suppression entry for the
+  checkout's path is added to `suppressed-admissions-<workspace>.json` in the
+  config dir. The entry stops the worktree sweep on the next open of that
+  repository from bringing the row back. This holds for every checkout,
+  whatever its role and whether baude manages it or not. The entry is lifted
+  when you open that exact folder again, and dropped when the repository row
+  is removed.
+- Standalone folder: there is no marker and no suppression entry is written.
+
+### After removing the default checkout
+
+The default checkout is the checkout of the repository's default branch. It is
+your own clone when the clone is on that branch, which is the usual case.
+
+A default checkout removed with `D` stays removed. Launching baude inside
+another worktree of the same repository, or opening one with `n`, starts no
+session and creates no new default checkout. The repository's other rows are
+kept, and a message says how to bring the checkout back.
+
+If the removal kept the folder, which is the case when the default checkout is
+your own clone or a worktree you made, the message reads
+`default checkout <path> was removed; open that folder to bring it back`.
+Launch baude inside that folder or open it with `n`.
+
+If the removal deleted the folder, which is the case when the default checkout
+was a worktree baude created, the message reads
+`default checkout was removed with its folder; remove this repository and open it again to bring it back`.
+There are two ways back. Remove the repository row with `D` and open the
+repository again, which gives it a new default checkout the way a first open
+does. Or put a worktree of the default branch back at the removed path with
+`git worktree add <path> <default-branch>` and launch baude inside that
+folder. The message does not show the removed path; it is the one the
+confirmation listed under `paths deleted`.
+
+Either way the checkout returns as a new row, and nothing is resumed from the
+row that was removed.
 
 ## Usage panel
 
@@ -770,6 +897,34 @@ The existing remote `x` close and `r` restart/reopen compatibility actions are
 non-destructive to Git topology; uppercase `X` is never available remotely.
 Shell panes, local worktree lifecycle, and the editor key stay local-only.
 
+`D` works on a remote row. It removes the checkout or standalone row that owns
+that session on the daemon, never a whole repository. The steps are:
+
+1. The TUI asks that row's daemon for a preview in the background and shows a
+   `remote removal` waiting box. A session the daemon lists no removable row
+   for gets a message instead, and no request is sent.
+2. The daemon's preview is shown in the same confirmation a local `D` uses
+   (see [Removing projects](#removing-projects)).
+3. On `y` or `enter` the TUI sends the previewed report back to the daemon,
+   unchanged and once.
+4. The daemon performs the removal on its own machine. A directory listed
+   under `paths deleted` is deleted on the daemon's host. Nothing on the local
+   machine is touched.
+
+A preview that is refused or gets no answer closes with a message, and nothing
+is changed. If the daemon's rows changed after the preview, nothing is removed
+and the daemon's fresh preview replaces the confirmation with the note
+`rows changed since the preview; review the refreshed confirmation`. If the
+daemon refuses the removal, the confirmation stays open with the daemon's
+message and `enter` sends the same report again. If the row is already gone
+on the daemon, the removal closes and a message says so.
+
+A removal that was sent and got no answer is never sent again, because the
+daemon may have carried it out. When the daemon no longer lists the row, the
+TUI reports it removed. Otherwise the confirmation stays open and says the row
+may or may not have been removed, and `enter` asks the daemon for a new
+preview.
+
 ## bauded (experimental)
 
 A headless daemon (shipped in the release tarball, or `cargo run -p bauded`)
@@ -812,6 +967,82 @@ external assets.
 | `GET /sessions/{id}/stream` | SSE live tail of new messages |
 | `GET/POST /sessions/{id}/permission` | prompt mode: pending tool-permission request / `{decision}` allow·deny |
 | `GET /push/key` · `POST/DELETE /push/subscribe` | Web Push: VAPID key + subscriptions |
+| `GET /rows` | the row hierarchy: repositories with their checkouts, then standalone folders, each with the key a removal names it by |
+| `POST /removals/preview` | `{checkout: <key>}`, `{repository: <key>}` or `{standalone: <key>}`: a dry run that returns the removal report and changes nothing |
+| `POST /removals` | the previewed report, sent back unchanged: perform the removal and return the committed report |
+| `GET /events` | SSE: one `rows_removed` message per committed removal |
+
+### Removing rows over the API
+
+Removal is two calls. `POST /removals/preview` takes one target and returns a
+report of what removing it would do: the rows dropped, the runtimes killed,
+the paths deleted and the paths kept. `POST /removals` takes that report back
+unchanged and performs the removal. The daemon reads only the report's target
+and compares its rows, runtimes and deleted paths with its own state. Every
+row, runtime and path it acts on comes from the daemon's own state, not from
+the request.
+
+| Status | Meaning |
+|--------|---------|
+| 200 | the preview, or the report of the committed removal |
+| 409 | from `POST /removals`: the rows, runtimes or paths to delete changed since the preview. Nothing was removed, and the body is the fresh preview as JSON |
+| 404 | the target row is unknown |
+| 503 | from `POST /removals`: refused on the daemon's own state. The repository is busy, a save of the daemon's state is blocked or failed, or a runtime handle is missing |
+| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, or a validation failed. From `POST /removals/preview`: any error other than an unknown target |
+
+Every error body is plain text except the 409.
+
+A 200 from `POST /removals` can carry `"outcome": "saved_degraded"` and a
+`detail` text under `persistence`. The removal happened: the row is gone from
+`GET /rows`, its session is gone and its runtime is dead. The save of the
+daemon's state is what was degraded: the daemon's persistence status stays
+dirty and holds the detail as its error.
+
+`GET /events` is a server-sent event stream for the whole daemon. It carries
+one `rows_removed` message per committed `POST /removals`, and the message
+data is the same JSON report that call returned. The stream has no history and
+no replay, so a client that connects late or falls behind reads `GET /rows`
+to catch up.
+
+### Removing rows in the PWA
+
+The PWA's list follows `GET /rows`: each repository as a heading with its
+checkouts beneath it, then a `folders` group. Each repository heading, each
+checkout and each folder has a `✕` remove control. A session that no row
+claims is still listed, after those groups, and has no remove control because
+it has no key to remove it by.
+
+A checkout is tagged `main` or `worktree`. The tag is not a guide to what a
+removal deletes. The page tags a default checkout `main` whether or not baude
+created it, and one that baude created is deleted like any other managed
+worktree. A linked worktree the daemon was pointed at, and did not create, is
+tagged `worktree` and is kept. The confirmation for every checkout is titled
+`Remove this checkout?`, so read its `paths deleted` list before you press
+`remove`.
+
+The control opens a confirmation titled `Remove this repository?`,
+`Remove this checkout?` or `Remove this standalone session?`. It lists
+`rows dropped`, `runtimes killed`, `paths deleted` and `paths kept`, plus
+`already removed` and `cleared` when they apply. `cancel`, Escape or a tap
+outside the box closes it and sends nothing, except while a removal is in
+flight, when the confirmation stays up until the daemon answers. `remove`
+sends the report on screen back to the daemon. When the removal is done the
+rows leave the list and a result line gives the counts, for example
+`removed 1 row, killed 1 runtime, deleted 0 paths`.
+
+When something fails the error is shown in the confirmation and the button
+reads `retry`. After a failed preview, `retry` asks for the preview again.
+After a failed removal, `retry` sends the same report again. If the rows
+changed since the preview, the page reloads the list and shows the daemon's
+fresh preview with the button back at `remove`; nothing is confirmed for you.
+If the row is already gone, the confirmation closes with `already removed`.
+
+The page listens on `GET /events`, so a row removed from another client leaves
+the list, and a confirmation open on that row closes with `removed elsewhere`.
+
+Which directories a removal deletes and which it keeps is the same on the
+daemon as in the TUI: see
+[What is deleted and what is kept](#what-is-deleted-and-what-is-kept).
 
 ### Deploy (compose + Tailscale)
 
