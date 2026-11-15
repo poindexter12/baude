@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.0](https://github.com/poindexter12/baude/compare/v2.7.3...v2.8.0) (2026-11-15)
+
+
+### Features
+
+* remove projects from the TUI, the daemon and the PWA ([f714bf7](https://github.com/poindexter12/baude/commit/f714bf7259fb0019ca7d37117794f24623ee44de))
+
 ## [2.7.3](https://github.com/poindexter12/baude/compare/v2.7.2...v2.7.3) (2026-10-26)
 
 
