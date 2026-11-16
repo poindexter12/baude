@@ -3045,6 +3045,263 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// `DELETE /sessions/{id}`, for a window probe.
+    fn delete_request(id: u64) -> Request<Body> {
+        Request::delete(format!("/sessions/{id}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Pin every window read in `reads` to 503 with `expected` as its body.
+    /// Every status is checked before any body, so a request the exclusion
+    /// let through is named with all the others in one failure.
+    fn assert_window_busy(reads: &[WindowRead], expected: &str, marker: &str) {
+        let statuses: Vec<(&str, Option<StatusCode>)> = reads
+            .iter()
+            .map(|read| (read.what.as_str(), read.status))
+            .collect();
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.status == Some(StatusCode::SERVICE_UNAVAILABLE)),
+            "22.1-11 {marker} busy pin: a request on the row being removed was not refused \
+             with 503 during the slow stage: {statuses:?}"
+        );
+        for read in reads {
+            read.answered(StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                String::from_utf8_lossy(&read.body),
+                expected,
+                "22.1-11 {marker} busy pin: {}",
+                read.what
+            );
+        }
+    }
+
+    /// The ids of a `GET /sessions` body read during the window, sorted.
+    fn window_session_ids(read: &WindowRead) -> Vec<u64> {
+        let mut ids: Vec<u64> = read
+            .served()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// 22.1-11, T-22.1-42: while the removal of one checkout is parked in
+    /// its slow stage with the mutex free, every request that would change
+    /// the same repository answers 503 naming its main checkout: executing a
+    /// fresh preview of the sibling checkout, a plain and a worktree
+    /// `POST /sessions` into it, archive and DELETE of the sibling's session
+    /// and DELETE of the doomed session, which is out of the registry. The
+    /// removal then commits once, and the sibling is removable afterwards.
+    #[tokio::test]
+    async fn removals_same_repository_is_busy_during_the_slow_stage() {
+        let fixture = removal_fixture_two_checkouts("window-busy-repo").await;
+        let app = &fixture.app;
+        let shared = &fixture.shared;
+        let repo = fixture.repo.path().canonicalize().unwrap();
+        let busy = format!("repository busy: {}", repo.display());
+        let (main_id, main_key) = (fixture.main_id, fixture.main_key);
+        let (doomed_id, doomed_key) = (fixture.worktree_id, fixture.worktree_key);
+        let main_pid = previewed_agent_pid(&preview_report(app, main_key).await, main_key);
+        let report = preview_report(app, doomed_key).await;
+        let doomed_pid = previewed_agent_pid(&report, doomed_key);
+        assert_eq!(session_ids(app).await, vec![main_id, doomed_id]);
+        let mut events = open_events(app).await;
+
+        let _reapers = crate::manager::lock(shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_repo = repo.clone();
+        let probe = probe_slow_stage(shared, &pause, 1, move || async move {
+            let app = &probe_app;
+            let preview = window_request(
+                app,
+                "POST /removals/preview of the main checkout",
+                post_json(
+                    "/removals/preview",
+                    &serde_json::json!({ "checkout": main_key }).to_string(),
+                ),
+            )
+            .await;
+            let fresh = String::from_utf8_lossy(&preview.body).into_owned();
+            let busy_reads = vec![
+                window_request(
+                    app,
+                    "POST /removals of the main checkout's fresh preview",
+                    post_json("/removals", &fresh),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions on the main checkout path",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_repo }).to_string(),
+                    ),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions with worktree branch second",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_repo, "worktree": "second" })
+                            .to_string(),
+                    ),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST archive of the main checkout's session",
+                    post_json(&format!("/sessions/{main_id}/archive"), ""),
+                )
+                .await,
+                window_request(
+                    app,
+                    "DELETE of the main checkout's session",
+                    delete_request(main_id),
+                )
+                .await,
+                window_request(
+                    app,
+                    "DELETE of the doomed session",
+                    delete_request(doomed_id),
+                )
+                .await,
+            ];
+            let sessions = window_request(app, "GET /sessions", get("/sessions")).await;
+            (preview, busy_reads, sessions)
+        });
+        let (status, body) = removal_call(app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let (preview, busy_reads, sessions) = window.outcome.expect("the probe ran");
+        preview.served();
+        assert_window_busy(&busy_reads, &busy, "repository");
+        assert_eq!(
+            window_session_ids(&sessions),
+            vec![main_id],
+            "22.1-11 repository busy pin: a session was spawned or lost during the slow stage"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": doomed_key }])
+        );
+        expect_exactly_one(&mut events, &executed, "the removal of the worktree").await;
+        assert!(wait_for_pid_gone(doomed_pid), "the removed agent is alive");
+        assert!(pid_is_alive(main_pid), "a busy refusal stopped the sibling");
+        assert_eq!(session_ids(app).await, vec![main_id]);
+        let rows = rows_body(app).await;
+        assert_eq!(checkout_entries(&rows).len(), 1, "{rows}");
+        assert!(rows_checkout(&rows, main_key).is_some(), "{rows}");
+        assert_eq!(
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "second"]
+            )
+            .as_deref(),
+            Some(""),
+            "a busy worktree request created its branch"
+        );
+
+        let fresh = preview_report(app, main_key).await;
+        let executed =
+            assert_executed(app, &fresh, "the main checkout once the repository is free").await;
+        expect_exactly_one(&mut events, &executed, "the main checkout's removal").await;
+        assert!(
+            wait_for_pid_gone(main_pid),
+            "the main checkout's agent is alive"
+        );
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// 22.1-11, T-22.1-42: while a folder's removal is parked in its slow
+    /// stage with the mutex free, a second removal of the same report and a
+    /// plain `POST /sessions` on the folder answer 503 naming the folder, and
+    /// no runtime is spawned for it.
+    #[tokio::test]
+    async fn removals_standalone_is_busy_during_the_slow_stage() {
+        let (root, _owner, folder, _workspace, shared, app) = folder_fixture("window-busy-folder");
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let report = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&report);
+        let before = session_ids(&app).await;
+        assert_eq!(before, vec![id]);
+        let busy = format!("folder busy: {}", folder.display());
+        let mut events = open_events(&app).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_report = report.clone();
+        let probe_folder = folder.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            let app = &probe_app;
+            let busy_reads = vec![
+                window_request(
+                    app,
+                    "POST /removals of the same report again",
+                    post_json("/removals", &probe_report.to_string()),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions on the folder",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_folder }).to_string(),
+                    ),
+                )
+                .await,
+            ];
+            let sessions = window_request(app, "GET /sessions", get("/sessions")).await;
+            (busy_reads, sessions)
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let (busy_reads, sessions) = window.outcome.expect("the probe ran");
+        assert_window_busy(&busy_reads, &busy, "folder");
+        let during = window_session_ids(&sessions);
+        assert!(
+            during.iter().all(|listed| before.contains(listed)),
+            "22.1-11 folder busy pin: a runtime was spawned during the slow stage: {during:?}, \
+             before {before:?}"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+        expect_exactly_one(&mut events, &executed, "the folder's removal").await;
+        assert!(wait_for_pid_gone(agent_pid), "the removed agent is alive");
+        assert_eq!(
+            session_ids(&app).await,
+            Vec::<u64>::new(),
+            "22.1-11 folder busy pin: a runtime outlived the folder's removal"
+        );
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
