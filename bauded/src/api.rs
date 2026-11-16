@@ -4046,8 +4046,10 @@ mod tests {
         removal_teardown(&restarted, &root);
     }
 
-    /// Two executes of one previewed standalone report contend on the manager
-    /// mutex; exactly one commits and only it reports the kill.
+    /// Two executes of one previewed standalone report; exactly one commits
+    /// and only it reports the kill. The loser either arrives while the
+    /// winner holds the folder reservation and answers 503 busy, or arrives
+    /// after the commit and finds the row gone, 404.
     #[tokio::test]
     async fn standalone_concurrent_removals_of_one_folder_commit_once() {
         let (root, _owner, folder, workspace, shared, app) =
@@ -4075,11 +4077,16 @@ mod tests {
         assert_eq!(winners, 1, "exactly one removal commits: {outcomes:?}");
         let mut statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
         statuses.sort_unstable();
-        assert_eq!(
-            statuses,
-            [200, 404],
-            "exactly one removal commits: {outcomes:?}"
+        assert!(
+            statuses == [200, 404] || statuses == [200, 503],
+            "exactly one removal commits, the other finds the row gone or busy: {outcomes:?}"
         );
+        let busy_body = format!("folder busy: {}", folder.canonicalize().unwrap().display());
+        for (status, text) in &outcomes {
+            if *status == 503 {
+                assert_eq!(text, &busy_body, "{outcomes:?}");
+            }
+        }
         for (status, text) in &outcomes {
             let reports_a_kill = serde_json::from_str::<serde_json::Value>(text)
                 .ok()
