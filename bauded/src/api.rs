@@ -813,6 +813,7 @@ mod tests {
     use axum::Router;
     use baude_core::removal::{RemovalError, RemovalTarget, RowKey};
     use baude_core::repository::CheckoutKey;
+    use baude_core::testing::FixtureRoot;
     use baude_core::workspace::Workspace;
     use std::path::PathBuf;
 
@@ -829,22 +830,17 @@ mod tests {
     /// the same ambient config reads.
     pub(super) struct ApiScope {
         /// Struct fields drop in declaration order, so the identity is restored
-        /// while its own root is still installed.
+        /// while its own root is still installed, and the root directory is
+        /// removed only after both redirects are restored.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        _root: baude_core::testing::FixtureRoot,
     }
 
     #[must_use = "the returned ApiScope owns this case's root and identity; bind it to a named \
                   local that outlives every handler await"]
     pub(super) fn api_scope(label: &str) -> ApiScope {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bauded-scope-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = baude_core::testing::FixtureRoot::new(&format!("bauded-scope-{label}"));
         let redirect = baude_core::testing::TestRedirect::new(&root);
         let identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -856,6 +852,7 @@ mod tests {
         ApiScope {
             _identity: identity,
             _redirect: redirect,
+            _root: root,
         }
     }
 
@@ -2223,20 +2220,17 @@ mod tests {
     /// The setup every removal fixture shares: an isolated root, one
     /// initialized fixture repository, and a persisting daemon whose state
     /// file lives under that root. No session is admitted yet.
-    fn removal_setup(label: &str) -> (PathBuf, FixtureRepo, Workspace, Shared, Router) {
+    fn removal_setup(label: &str) -> (FixtureRoot, FixtureRepo, Workspace, Shared, Router) {
         let root = removal_root(label);
         let fixture = initialized_repo(&root, "repo");
         let (workspace, shared, app) = removal_daemon(&root);
         (root, fixture, workspace, shared, app)
     }
 
-    /// A fresh, empty, isolated root for one removal fixture.
-    fn removal_root(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    /// A fresh, empty, isolated root for one removal fixture, removed when the
+    /// returned guard drops.
+    fn removal_root(label: &str) -> FixtureRoot {
+        FixtureRoot::new(&format!("bauded-removal-{label}"))
     }
 
     /// A persisting daemon whose state file lives under `root`, over
@@ -2265,7 +2259,7 @@ mod tests {
     async fn removal_fixture(
         label: &str,
     ) -> (
-        PathBuf,
+        FixtureRoot,
         FixtureRepo,
         Workspace,
         Shared,
@@ -2282,7 +2276,6 @@ mod tests {
     /// One fixture repository with two checkouts, each owning a live runtime:
     /// the main checkout and a managed worktree on branch `topic`.
     struct TwoCheckoutFixture {
-        root: PathBuf,
         repo: FixtureRepo,
         workspace: Workspace,
         shared: Shared,
@@ -2292,6 +2285,9 @@ mod tests {
         worktree_id: u64,
         worktree_key: CheckoutKey,
         worktree_path: PathBuf,
+        /// Declared last so the directory goes after the redirects and the
+        /// manager above it have dropped.
+        root: FixtureRoot,
     }
 
     /// The two-checkout fixture, built on `removal_setup`. Both sessions are
@@ -2393,10 +2389,10 @@ mod tests {
         root.join(workspace.state_file("daemon-state"))
     }
 
-    /// Stop every runtime the fixture still owns and drop its root.
-    fn removal_teardown(shared: &Shared, root: &Path) {
+    /// Stop every runtime the fixture still owns. The root itself is removed
+    /// by its `FixtureRoot` when the fixture drops, also on panic.
+    fn removal_teardown(shared: &Shared, _root: &Path) {
         crate::manager::lock(shared).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn preview_report(app: &Router, key: CheckoutKey) -> serde_json::Value {
@@ -2821,7 +2817,9 @@ mod tests {
     /// folder, the workspace, the shared manager and the router.
     #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives every handler await"]
-    fn folder_fixture(label: &str) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+    fn folder_fixture(
+        label: &str,
+    ) -> (FixtureRoot, FixtureRepo, PathBuf, Workspace, Shared, Router) {
         let root = removal_root(label);
         // Root first, identity second, the order `initialized_repo_in_workspace`
         // acquires them in.
@@ -3014,7 +3012,7 @@ mod tests {
                   to a named local that outlives every handler await"]
     fn recording_folder_fixture(
         label: &str,
-    ) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+    ) -> (FixtureRoot, FixtureRepo, PathBuf, Workspace, Shared, Router) {
         let (root, owner, folder, workspace, _plain_shared, _plain_app) = folder_fixture(label);
         let root_text = root.to_str().unwrap();
         assert!(
@@ -5988,7 +5986,6 @@ mod tests {
             Err(RemovalError::UnknownTarget(_))
         ));
         restored.kill_all();
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
@@ -6110,7 +6107,6 @@ mod tests {
         assert!(body.contains("persistence is blocked"), "{body}");
         assert!(pid_is_alive(agent_pid));
 
-        std::fs::remove_dir_all(&second_root).unwrap();
         removal_teardown(&shared, &root);
     }
 
