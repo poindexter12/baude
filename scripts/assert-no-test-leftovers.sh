@@ -582,13 +582,16 @@ def process_cases(test):
 
     process_case(
         test, "an orphan seen across the persist window fails with orphans=1",
-        DETACH.format(w="w", secs=9)
-        + '; sleep 5; kill "$(cat "$TMPDIR/w.pid")"; sleep 1',
+        # A sample period is the interval plus the lsof and ps time, which
+        # swings past a second on a busy macOS host. Wait long enough for the
+        # first sample, the persist window and one more sample at that pace.
+        DETACH.format(w="w", secs=15)
+        + '; sleep 9; kill "$(cat "$TMPDIR/w.pid")"; sleep 1',
         1, summary(0, 1, 0, 0), pid_names=("w",),
     )
     process_case(
         test, "a descendant working in the dir past the window is not an orphan",
-        'mkdir "$TMPDIR/w2" && cd "$TMPDIR/w2" && sleep 4',
+        'mkdir "$TMPDIR/w2" && cd "$TMPDIR/w2" && sleep 9',
         0, summary(0, 0, 0, 0),
     )
     process_case(
