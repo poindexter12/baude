@@ -5812,6 +5812,93 @@ mod tests {
         assert!(!manager.runtime_checkouts.contains_key(&checkout));
     }
 
+    /// The poll's early-resume reconcile goes through `Manager::remove`,
+    /// which refuses a session whose repository a removal holds. Since
+    /// 22.1-10 a removal holds that reservation with the manager lock free,
+    /// so the poll can meet it. The poll must then neither panic nor drop
+    /// the session, and the next tick after the hold ends reconciles it.
+    #[test]
+    fn poll_defers_an_early_resume_reconcile_while_its_repository_is_busy() {
+        let fixture = persistence_fixture("early-targeted-resume-busy");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(
+                repo.to_str().unwrap(),
+                None,
+                Some("early resume while busy"),
+            )
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        let resume_id = "resume-daemon-early-busy";
+        manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
+        manager.remove(runtime).unwrap();
+        let transcript_cwd = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = match manager.reopen_checkout(checkout).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let _reopened_reapers = manager.runtime_reapers_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let repository = manager.repository_state.checkouts[0].repository_key;
+
+        let hold = manager.reserve_repository_for_test(repository);
+        manager.poll();
+        assert!(
+            manager.session(reopened).is_ok(),
+            "22.1-10 poll pin: the poll dropped a session whose repository was busy"
+        );
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "22.1-10 poll pin: the poll reconciled a row of a busy repository"
+        );
+
+        drop(hold);
+        assert!(
+            manager
+                .session_mut(reopened)
+                .unwrap()
+                .early_targeted_resume_exit(),
+            "the early-exit window closed before the next tick; the retry cannot be observed"
+        );
+        manager.poll();
+        assert!(
+            !manager.runtime_checkouts.contains_key(&checkout),
+            "22.1-10 poll pin: the next tick after the hold ended did not reconcile the row"
+        );
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.checkouts[0].session.resume_id, None);
+    }
+
     /// The folder counterpart of the test above: the same command double and
     /// the same polling entry, with a plain folder admitted through `create`
     /// in place of the repository. The row is kept, closed, with no resume id.
