@@ -3071,6 +3071,90 @@ mod tests {
         assert_eq!(load_state(&f.state_root()), state);
     }
 
+    // ---- stages run apart (plan 22.1-08) ----
+
+    /// A save closure that keeps a copy of the `StateFile` it was handed and
+    /// writes it under `state_root`, plus a count of its calls.
+    fn recording_save(
+        state_root: &Path,
+    ) -> (
+        impl FnOnce(&StateFile) -> Result<(), SaveError>,
+        Rc<std::cell::RefCell<Option<RepositoryState>>>,
+        Rc<Cell<u32>>,
+    ) {
+        let received = Rc::new(std::cell::RefCell::new(None));
+        let calls = Rc::new(Cell::new(0));
+        let sink = Rc::clone(&received);
+        let counter = Rc::clone(&calls);
+        let root = state_root.to_path_buf();
+        let save = move |file: &StateFile| {
+            counter.set(counter.get() + 1);
+            *sink.borrow_mut() = Some(file.state.clone());
+            persist::save_current_at_test(&root, "state.json", file, None, None)
+        };
+        (save, received, calls)
+    }
+
+    fn has_repository(state: &RepositoryState, key: RepositoryKey) -> bool {
+        state
+            .repositories
+            .iter()
+            .any(|repository| repository.key == key)
+    }
+
+    /// A repository admitted while the kill and delete ran without the lock
+    /// survives the commit: the save describes the state `commit` is handed
+    /// minus the removed rows, not a candidate built before the window.
+    #[test]
+    fn commit_rederives_the_candidate_from_current_state() {
+        let f = RemovalFixture::new("rederive");
+        let (mut state, _a, a_checkout, managed) = inactive_row(&f, "wt-rederive");
+        write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+
+        let prepared =
+            prepare(&state, RemovalTarget::Checkout(a_checkout), &handles).expect("prepare");
+        let effects = stop_and_delete(&prepared, &mut handles).expect("stop and delete");
+        assert!(
+            !managed.exists(),
+            "the disk stage deleted A's managed worktree"
+        );
+
+        let b_main = f.root.join("b");
+        fs::create_dir_all(&b_main).expect("create repository B's main worktree");
+        let b = repository(&mut state, &b_main);
+        let b_checkout = checkout(&mut state, b, CheckoutRole::Main, false, &b_main);
+        state
+            .validate_for_save()
+            .expect("the state with B admitted is save-valid");
+        let (save, received, calls) = recording_save(&f.state_root());
+
+        commit(&mut state, prepared, effects, &mut handles, save).expect("commit");
+
+        assert!(
+            has_repository(&state, b),
+            "repository B, admitted between stop_and_delete and commit, is missing from the state after commit"
+        );
+        assert!(
+            has_checkout(&state, b_checkout),
+            "B's checkout is missing from the state after commit"
+        );
+        assert!(!has_checkout(&state, a_checkout));
+        assert_eq!(calls.get(), 1, "one save");
+        let saved = received
+            .borrow_mut()
+            .take()
+            .expect("the save closure received a StateFile");
+        assert!(
+            has_repository(&saved, b),
+            "repository B is missing from the saved StateFile"
+        );
+        assert!(has_checkout(&saved, b_checkout));
+        assert!(!has_checkout(&saved, a_checkout));
+        assert_eq!(saved, state);
+        assert_eq!(load_state(&f.state_root()), state);
+    }
+
     // ---- crash and disk failure between delete and save (plan 05) ----
 
     use crate::git::ReconciliationUnavailable;
