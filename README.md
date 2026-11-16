@@ -490,6 +490,17 @@ by itself.
   is removed.
 - Standalone folder: there is no marker and no suppression entry is written.
 
+The TUI and a daemon on the same machine share the suppression store when they
+use the same config dir and the same workspace. A removal in either keeps the
+row out of the TUI's sweep. Opening the folder in either lifts the entry for
+both: in the TUI with `n`, `c` or a launch inside it, on the daemon with
+`POST /sessions` or the PWA's new session. The entry lifted is the one for the
+checkout root of the folder you opened, so opening a subfolder of a removed
+worktree lifts that worktree's entry. A daemon run from the compose file keeps
+its own config volume, and so its own store. A session the daemon opened in a
+subfolder of a checkout is stored on that subfolder, and removing it writes an
+entry for the subfolder that nothing reads.
+
 ### After removing the default checkout
 
 The default checkout is the checkout of the repository's default branch. It is
@@ -1037,7 +1048,8 @@ outside the box closes it and sends nothing, except while a removal is in
 flight, when the confirmation stays up until the daemon answers. `remove`
 sends the report on screen back to the daemon. When the removal is done the
 rows leave the list and a result line gives the counts, for example
-`removed 1 row, killed 1 runtime, deleted 0 paths`.
+`removed 1 row, killed 1 runtime, deleted 0 paths`. A removal here writes the
+same suppression entry as one in the TUI.
 
 When something fails the error is shown in the confirmation and the button
 reads `retry`. After a failed preview, `retry` asks for the preview again.
