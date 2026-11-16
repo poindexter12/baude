@@ -3,7 +3,7 @@
 //! shutdown. State persists to its own file (`daemon-state.json`) so a daemon
 //! restart restores every session via `claude --continue`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -217,6 +217,53 @@ impl std::fmt::Display for RemoveRowsError {
     }
 }
 
+/// Cloneable reservation registry for standalone rows, the same shape as
+/// core's `RepositoryReservations`: a guard releases its key on drop and
+/// holds its own share of the table, independent of the manager mutex.
+#[derive(Clone, Debug, Default)]
+struct StandaloneReservations {
+    held: Arc<Mutex<HashSet<StandaloneKey>>>,
+}
+
+impl StandaloneReservations {
+    /// Reserve `key`, or refuse when another holder has it.
+    fn reserve(&self, key: StandaloneKey) -> std::result::Result<StandaloneReservation, ()> {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        if !held.insert(key) {
+            return Err(());
+        }
+        drop(held);
+        Ok(StandaloneReservation {
+            held: Arc::clone(&self.held),
+            key,
+        })
+    }
+
+    /// Whether some guard holds `key` now.
+    fn is_reserved(&self, key: StandaloneKey) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&key)
+    }
+}
+
+/// A held standalone reservation; dropping it releases the row.
+#[derive(Debug)]
+pub(crate) struct StandaloneReservation {
+    held: Arc<Mutex<HashSet<StandaloneKey>>>,
+    key: StandaloneKey,
+}
+
+impl Drop for StandaloneReservation {
+    fn drop(&mut self) {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
 /// Overwrite the retained session metadata of every checkout still present in
 /// `state` with its live value. The single merge implementation: both the
 /// ordinary save and the removal save go through it, so the two cannot drift.
@@ -276,6 +323,10 @@ pub struct Manager {
     /// of this registry and `runtime_checkouts`.
     runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
+    /// The standalone rows a removal holds. The daemon's own registry, the
+    /// standalone counterpart of `repository_reservations`: core reserves
+    /// repositories only.
+    standalone_reservations: StandaloneReservations,
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
@@ -710,6 +761,7 @@ impl Manager {
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
+            standalone_reservations: StandaloneReservations::default(),
             persistence_blocked: false,
             persistence_dirty: false,
             persistence_error: None,
@@ -1466,6 +1518,16 @@ impl Manager {
         self.repository_reservations
             .reserve(key)
             .unwrap_or_else(|_| panic!("repository {key:?} is already reserved"))
+    }
+
+    /// Take the real reservation of standalone row `key`, the folder
+    /// counterpart of `reserve_repository_for_test`. The guard owns its share
+    /// of the table and outlives the manager lock.
+    #[cfg(test)]
+    pub(crate) fn reserve_standalone_for_test(&self, key: StandaloneKey) -> StandaloneReservation {
+        self.standalone_reservations
+            .reserve(key)
+            .unwrap_or_else(|()| panic!("standalone {key:?} is already reserved"))
     }
 
     /// Store and launch what a daemon before 21-10 stored and launched for a

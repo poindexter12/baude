@@ -7638,6 +7638,122 @@ mod tests {
         let response = app.oneshot(get("/sessions/999999/stream")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// The standalone key of the one `/rows` standalone entry, typed.
+    fn standalone_key_typed(entry: &serde_json::Value) -> baude_core::repository::StandaloneKey {
+        serde_json::from_value(entry["standalone_key"].clone())
+            .unwrap_or_else(|error| panic!("standalone_key does not parse: {error}: {entry}"))
+    }
+
+    /// 22.1-09, T-22.1-29. A folder row a removal holds refuses a second
+    /// removal with 503 and touches nothing; once the hold drops, a fresh
+    /// preview executes.
+    #[tokio::test]
+    async fn busy_standalone_removal_is_503_while_reserved() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-folder-removal");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let preview = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&preview);
+        assert!(pid_is_alive(agent_pid));
+        let before = world_snapshot(&app, &state_path).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: a removal of a reserved folder row answered {status} \
+             with body {body}"
+        );
+        assert_eq!(body, format!("folder busy: {}", folder.display()));
+        assert!(pid_is_alive(agent_pid), "a busy refusal stopped the agent");
+        assert_eq!(session_ids(&app).await, vec![id]);
+        assert_world_unchanged(&app, &state_path, &before, "after the folder busy 503").await;
+        assert_folder_untouched(&folder);
+
+        drop(hold);
+        let fresh = preview_target(&app, &row).await;
+        assert_executed(&app, &fresh, "a fresh preview once the folder is free").await;
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-31. A plain `POST /sessions` on a reserved folder row
+    /// answers 503 and spawns nothing, for a live row and for a closed one;
+    /// once the hold drops the same request opens the folder.
+    #[tokio::test]
+    async fn busy_standalone_plain_admission_is_503_and_spawns_nothing() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-folder-admit");
+        let state_path = removal_state_file(&root, &workspace);
+        let folder_text = folder.to_str().unwrap();
+        let busy_body = format!("folder busy: {}", folder.display());
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(agent_pid));
+
+        // Live row.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: POST /sessions on a reserved live folder row answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, busy_body);
+        assert_eq!(session_ids(&app).await, vec![id]);
+        assert_eq!(
+            only_runtime_pid(&preview_target(&app, &row).await),
+            agent_pid,
+            "the recorded runtime changed under a busy refusal"
+        );
+        assert!(pid_is_alive(agent_pid));
+        assert_world_unchanged(&app, &state_path, &before, "after the live-row 503").await;
+        drop(hold);
+
+        // Closed row: the close itself runs with no hold.
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(wait_for_pid_gone(agent_pid));
+        let closed = only_standalone_row(&app).await;
+        assert_eq!(closed["session_id"], serde_json::Value::Null, "{closed}");
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: POST /sessions on a reserved closed folder row answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, busy_body);
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+        assert_world_unchanged(&app, &state_path, &before, "after the closed-row 503").await;
+        drop(hold);
+
+        // Free again: the same request reopens the row under its key.
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let reopened = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_typed(&reopened), key, "{reopened}");
+        assert_eq!(session_ids(&app).await.len(), 1);
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
 }
 
 #[cfg(test)]
