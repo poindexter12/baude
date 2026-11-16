@@ -3846,6 +3846,88 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// The repository's common directory as `git rev-parse --git-common-dir`
+    /// prints it for `checkout`, made absolute against `checkout` when git
+    /// prints it relative, as it does for a main checkout.
+    fn printed_common_dir(checkout: &Path) -> PathBuf {
+        let printed = PathBuf::from(
+            git_read(checkout, &["rev-parse", "--git-common-dir"])
+                .expect("git reports the checkout's common directory"),
+        );
+        if printed.is_absolute() {
+            printed
+        } else {
+            checkout.join(printed)
+        }
+    }
+
+    /// An entry for `checkout`, written the way core's clear stage writes
+    /// one: the checkout path and its repository's common directory.
+    fn seed_entry(checkout: &Path) {
+        baude_core::suppression::suppress(
+            &baude_core::persist::config_dir(),
+            checkout,
+            &printed_common_dir(checkout),
+            1,
+        )
+        .unwrap();
+        assert!(reads_suppressed(checkout), "{}", checkout.display());
+    }
+
+    /// A daemon admission of a subfolder of a checkout lifts the entry for
+    /// that checkout's root, the key the TUI lifts for the same folder. The
+    /// daemon stores the subfolder itself on the row it admits, so a lift
+    /// keyed on the stored path would leave the checkout's entry behind. An
+    /// entry for a sibling worktree of the same repository stays.
+    #[tokio::test]
+    async fn suppression_daemon_subfolder_admission_lifts_the_checkout_entry() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-subfolder");
+        let base = root.canonicalize().unwrap();
+
+        // A git-init repository with two worktrees the user made by hand.
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = base.join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+        let by_hand_sibling = base.join("by-hand-sibling");
+        add_by_hand_worktree(&main_path, &by_hand_sibling, "by-hand-sibling");
+
+        // The cloned shape: its managed branch worktree and, as the sibling,
+        // its managed default worktree.
+        let topology = baude_core::testing::cloned_topology(&base);
+
+        for (checkout, sibling) in [
+            (&by_hand, &by_hand_sibling),
+            (&topology.managed_worktree, &topology.default_worktree),
+        ] {
+            let sub = checkout.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            seed_entry(checkout);
+            seed_entry(sibling);
+
+            let (status, body) = open_folder(&app, sub.to_str().unwrap(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "POST /sessions {}: {body}",
+                sub.display()
+            );
+            assert!(
+                !reads_suppressed(checkout),
+                "admitting the subfolder {} left the entry for its checkout {} in the store",
+                sub.display(),
+                checkout.display()
+            );
+            assert!(
+                reads_suppressed(sibling),
+                "admitting {} lifted the sibling entry {}",
+                sub.display(),
+                sibling.display()
+            );
+        }
+
+        removal_teardown(&shared, &root);
+    }
+
     /// A folder an earlier daemon stored as an unavailable repository plus a
     /// checkout keeps that shape, takes a second session into the same
     /// repository row, and becomes a standalone row only after that
