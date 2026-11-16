@@ -233,14 +233,14 @@ See `.planning/BACKLOG.md`:
 **Plans:** 11 plans
 
 Plans:
-- [ ] 22.1-01-PLAN.md
-- [ ] 22.1-02-PLAN.md
-- [ ] 22.1-03-PLAN.md
-- [ ] 22.1-04-PLAN.md
-- [ ] 22.1-05-PLAN.md
-- [ ] 22.1-06-PLAN.md
-- [ ] 22.1-07-PLAN.md
-- [ ] 22.1-08-PLAN.md
-- [ ] 22.1-09-PLAN.md
-- [ ] 22.1-10-PLAN.md
-- [ ] 22.1-11-PLAN.md
+- [x] 22.1-01-PLAN.md
+- [x] 22.1-02-PLAN.md
+- [x] 22.1-03-PLAN.md
+- [x] 22.1-04-PLAN.md
+- [x] 22.1-05-PLAN.md
+- [x] 22.1-06-PLAN.md
+- [x] 22.1-07-PLAN.md
+- [x] 22.1-08-PLAN.md
+- [x] 22.1-09-PLAN.md
+- [x] 22.1-10-PLAN.md
+- [x] 22.1-11-PLAN.md
