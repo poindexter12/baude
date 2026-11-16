@@ -1557,12 +1557,15 @@ impl Manager {
     ///
     /// An explicit admission is the one thing that lifts a suppression
     /// entry (D-11). Every arm of `admit` that returns a session has stored
-    /// its row durably and launched it by then, so the lift runs here, once,
-    /// with the path that row stores: core keyed the entry on the stored
-    /// path of the row it removed, never on a request string. An arm that
-    /// returns an error lifts nothing, and a non-persisting manager stores
-    /// no row and lifts nothing. Restore, reopen, the restart route and the
-    /// legacy migration never come through here.
+    /// its row durably and launched it by then, so the lift runs here, once.
+    /// The key is the checkout root of the path that row stores,
+    /// `suppression::lift_key`, the same key the TUI lifts: core keyed the
+    /// entry on the checkout path of the row it removed, never on a request
+    /// string, and a row stored on a subfolder names its checkout's entry
+    /// through that root. An arm that returns an error lifts nothing, and a
+    /// non-persisting manager stores no row and lifts nothing. Restore,
+    /// reopen, the restart route and the legacy migration never come
+    /// through here.
     pub fn create(
         &mut self,
         repo: &str,
@@ -1600,12 +1603,15 @@ impl Manager {
             .map(|checkout| checkout.observed_path.to_path_buf())
     }
 
-    /// Forget the suppression entry for exactly `admitted`. Advisory: a
-    /// store error is logged with the path and never fails the admission
-    /// that asked for it. It reads no row and writes no state of its own.
+    /// Forget the suppression entry for the checkout root of `admitted`, the
+    /// stored row path, as `suppression::lift_key` names it for both
+    /// clients. Advisory: a store error is logged with the path and never
+    /// fails the admission that asked for it. It reads no row and writes no
+    /// state of its own.
     fn lift_admission_suppression(&self, admitted: &Path) {
-        if let Err(error) = suppression::lift(&persist::config_dir(), admitted) {
-            eprintln!("lift suppression {}: {error}", admitted.display());
+        let key = suppression::lift_key(admitted);
+        if let Err(error) = suppression::lift(&persist::config_dir(), &key) {
+            eprintln!("lift suppression {}: {error}", key.display());
         }
     }
 

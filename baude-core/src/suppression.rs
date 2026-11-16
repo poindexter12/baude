@@ -88,6 +88,24 @@ pub fn is_suppressed(root: &Path, path: &Path) -> bool {
     current(root).entries.contains_key(&folder_key(path))
 }
 
+/// The path an explicit admission of `admitted` lifts: the checkout root git
+/// reports for it, else its canonical path, else the path as given. The TUI
+/// and the daemon both lift this key, so opening a folder lifts the same
+/// entry in either client, also when the folder is a subfolder of a
+/// checkout. For a linked worktree the root is the worktree itself, never
+/// the main worktree, so admitting one never lifts a sibling's entry.
+///
+/// Residual, by design: a daemon row stored on a subfolder of a checkout
+/// writes its entry on that subfolder when it is removed, and `lift_key` of
+/// the subfolder names the checkout root, so that entry is never lifted. It
+/// is never read either: the TUI sweep consults only the worktree roots git
+/// lists, and the daemon consults no entry.
+pub fn lift_key(admitted: &Path) -> PathBuf {
+    crate::git::repo_root(admitted)
+        .or_else(|| admitted.canonicalize().ok())
+        .unwrap_or_else(|| admitted.to_path_buf())
+}
+
 /// Forget the entry for exactly `path`. Returns `Ok(true)` when an entry was
 /// removed and `Ok(false)` without writing when the key or the file is
 /// absent, so an untouched file stays byte-identical and an absent file
