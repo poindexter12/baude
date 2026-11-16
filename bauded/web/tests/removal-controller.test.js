@@ -698,6 +698,31 @@ test("conflict_refetches_rows_before_rerender_and_names_new_child", async () => 
   assert.deepEqual(sentBody(h.pending("POST", "/removals")), driftReport());
 });
 
+test("drift_refresh_retitles_when_a_folder_will_be_deleted", async () => {
+  const h = harness();
+  // The first preview deletes nothing: the worktree folder was already gone.
+  await execute(h, {
+    report: previewReport({ paths_deleted: [], already_removed: [`${WORKTREES}/topic-7`] }),
+  });
+  const before = h.controller.getModal().html;
+  assert.ok(before.startsWith("<h3>Remove this checkout?</h3>"), before.slice(0, 80));
+
+  // Between preview and confirm the folder came back, so the fresh report
+  // the daemon answers 409 with now deletes it.
+  const fresh = previewReport();
+  await h.fail("POST", "/removals", 409, JSON.stringify(fresh));
+  await h.reply("GET", "/rows", rowsBody());
+  await h.confirming;
+
+  const modal = h.controller.getModal();
+  assert.equal(modal.phase, "preview");
+  assert.equal(modal.drift, true);
+  assert.deepEqual(modal.report, fresh);
+  const title = BaudeRemoval.escapeHtml("Remove this worktree and delete its folder?");
+  assert.ok(modal.html.startsWith(`<h3>${title}</h3>`), modal.html.slice(0, 80));
+  assert.equal(h.count("POST", "/removals"), 1, "the re-render confirms nothing");
+});
+
 test("conflict_refetch_does_not_reuse_a_poll_already_in_flight", async () => {
   const h = harness();
   await execute(h, { target: { repository: 1 }, report: repositoryReport() });

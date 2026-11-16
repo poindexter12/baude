@@ -238,6 +238,75 @@ test("confirmation_view_mirrors_the_tui_section_order", () => {
   assert.equal(titled({ standalone: 2 }), "Remove this standalone session?");
 });
 
+// The preview of removing repository 1 whole, deleting `deleted` folders.
+function repositoryReport(deleted, overrides = {}) {
+  return checkoutReport({
+    target: { repository: 1 },
+    rows_removed: [{ checkout: 7 }, { checkout: 8 }, { repository: 1 }],
+    paths_deleted: deleted,
+    ...overrides,
+  });
+}
+
+// The preview of removing folder 2: a standalone row whose folder is kept.
+function standaloneReport(overrides = {}) {
+  return checkoutReport({
+    target: { standalone: 2 },
+    rows_removed: [{ standalone: 2 }],
+    runtimes_killed: [],
+    paths_deleted: [],
+    paths_kept: [`${HOME}/notes`],
+    ...overrides,
+  });
+}
+
+test("confirmation_title_says_when_a_folder_is_deleted", () => {
+  const { confirmationView, renderConfirmation, rowsIndex, escapeHtml } = BaudeRemoval;
+  const index = rowsIndex(rowsBody());
+  const title = (report) => confirmationView(report, index).title;
+
+  // A checkout whose removal deletes its folder says so.
+  assert.equal(title(checkoutReport()), "Remove this worktree and delete its folder?");
+
+  // A repository counts the folders its removal deletes.
+  assert.equal(
+    title(repositoryReport([`${WORKTREES}/topic-7`])),
+    "Remove this repository and delete 1 folder?",
+  );
+  assert.equal(
+    title(repositoryReport([`${WORKTREES}/topic-7`, `${WORKTREES}/other-8`, `${WORKTREES}/third-9`])),
+    "Remove this repository and delete 3 folders?",
+  );
+
+  // A folder that is already gone is not deleted by this removal.
+  const gone = [`${WORKTREES}/topic-7`];
+  assert.equal(
+    title(checkoutReport({ paths_deleted: [], already_removed: gone })),
+    "Remove this checkout?",
+  );
+  assert.equal(
+    title(repositoryReport([], { already_removed: gone })),
+    "Remove this repository?",
+  );
+
+  // A standalone session keeps its title whatever paths_deleted holds.
+  assert.equal(title(standaloneReport()), "Remove this standalone session?");
+  assert.equal(
+    title(standaloneReport({ paths_deleted: [`${HOME}/notes`] })),
+    "Remove this standalone session?",
+  );
+
+  // The view carries the title raw and the renderer escapes it exactly once.
+  for (const report of [checkoutReport(), repositoryReport([`${WORKTREES}/topic-7`]), standaloneReport()]) {
+    const view = confirmationView(report, index);
+    const html = renderConfirmation(view);
+    assert.ok(
+      html.startsWith(`<h3>${escapeHtml(view.title)}</h3>`),
+      `heading is the once-escaped title: ${html.slice(0, 80)}`,
+    );
+  }
+});
+
 test("module_loads_as_a_browser_script_with_no_globals", () => {
   // The same file is a browser script tag. Run it in a context that has the
   // language built-ins and nothing else: no module loader, no host object, no
