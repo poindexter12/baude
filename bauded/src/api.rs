@@ -2545,9 +2545,15 @@ mod tests {
     impl WindowRead {
         /// Pin the read to 200 within two seconds and return its body.
         fn served(&self) -> serde_json::Value {
+            self.answered(StatusCode::OK);
+            serde_json::from_slice(&self.body).unwrap()
+        }
+
+        /// Pin the request to `expected` within two seconds.
+        fn answered(&self, expected: StatusCode) {
             assert_eq!(
                 self.status,
-                Some(StatusCode::OK),
+                Some(expected),
                 "22.1-10 window pin: {} during the slow stage: {self:?}, body {}",
                 self.what,
                 String::from_utf8_lossy(&self.body)
@@ -2558,8 +2564,61 @@ mod tests {
                 self.what,
                 self.elapsed
             );
-            serde_json::from_slice(&self.body).unwrap()
         }
+    }
+
+    /// Two unrelated repositories under one root, the shape of
+    /// `row_kinds_parent_removal_leaves_a_sibling_repository_untouched`: the
+    /// fixture repository and `repo-sibling`, whose directory name extends
+    /// it, each with a live main checkout session admitted through the
+    /// router. Returns the root, the fixture owner, the workspace, the shared
+    /// manager, the router, and the session id and checkout key of each.
+    #[allow(clippy::type_complexity)]
+    async fn two_repository_fixture(
+        label: &str,
+    ) -> (
+        FixtureRoot,
+        FixtureRepo,
+        Workspace,
+        Shared,
+        Router,
+        (u64, CheckoutKey),
+        (u64, CheckoutKey),
+    ) {
+        let (root, fixture, workspace, shared, app) = removal_setup(label);
+        let repo = fixture.path().canonicalize().unwrap();
+        let sibling = root.join("repo-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        git(&sibling, &["init", "-b", "main"]);
+        git(&sibling, &["config", "user.email", "test@example.com"]);
+        git(&sibling, &["config", "user.name", "Test"]);
+        std::fs::write(sibling.join("file"), b"one").unwrap();
+        git(&sibling, &["add", "file"]);
+        git(&sibling, &["commit", "-m", "initial"]);
+        let sibling = sibling.canonicalize().unwrap();
+        let (first_id, first_key, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        let (second_id, second_key, _) = admit_removal_session(&shared, &app, &sibling, None).await;
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 2, "{rows}");
+        (
+            root,
+            fixture,
+            workspace,
+            shared,
+            app,
+            (first_id, first_key),
+            (second_id, second_key),
+        )
+    }
+
+    /// `GET /rows` of a manager restored fresh from the state file under
+    /// `root`, its relaunched runtimes stopped and reaped before returning.
+    fn restored_rows(root: &Path, workspace: &Workspace) -> serde_json::Value {
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        restored.restore_at(root, workspace);
+        let rows = serde_json::to_value(restored.rows()).unwrap();
+        restored.kill_all_and_reap_for_test();
+        rows
     }
 
     /// Send `request` under a two-second bound, timing it.
@@ -2690,6 +2749,53 @@ mod tests {
         assert_eq!(executed.status(), StatusCode::OK);
         assert!(rows_checkout(&rows_body(&app).await, key).is_none());
         assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-39: the commit saves the survivors' live metadata as it is at
+    /// commit time. A session in another repository archived while the
+    /// removal is in its slow stage stays archived in the state file.
+    #[tokio::test]
+    async fn removals_metadata_changed_during_the_slow_stage_is_saved() {
+        let (root, _fixture, workspace, shared, app, (_, doomed), (survivor_id, survivor)) =
+            two_repository_fixture("window-metadata").await;
+        let report = preview_report(&app, doomed).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(
+                &probe_app,
+                "POST archive of the other repository's session",
+                post_json(&format!("/sessions/{survivor_id}/archive"), ""),
+            )
+            .await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        window
+            .outcome
+            .expect("the probe ran")
+            .answered(StatusCode::NO_CONTENT);
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, doomed).is_none(), "{restored}");
+        let saved = rows_checkout(&restored, survivor).expect("the survivor is restored");
+        assert_eq!(
+            saved["archived"], true,
+            "22.1-10 metadata pin: the removal commit saved the survivor as it was before the \
+             slow stage: {saved}"
+        );
 
         removal_teardown(&shared, &root);
     }
