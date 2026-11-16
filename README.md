@@ -1008,20 +1008,29 @@ to catch up.
 
 The PWA's list follows `GET /rows`: each repository as a heading with its
 checkouts beneath it, then a `folders` group. Each repository heading, each
-checkout and each folder has a `✕` remove control. A session that no row
-claims is still listed, after those groups, and has no remove control because
-it has no key to remove it by.
+checkout and each folder has a `✕` remove control. Sessions that no row
+claims are listed last, under an `other sessions` heading with archived ones
+at the end, and have no remove control because they have no key to remove
+them by.
 
 A checkout is tagged `main` or `worktree`. The tag is not a guide to what a
 removal deletes. The page tags a default checkout `main` whether or not baude
 created it, and one that baude created is deleted like any other managed
 worktree. A linked worktree the daemon was pointed at, and did not create, is
-tagged `worktree` and is kept. The confirmation for every checkout is titled
-`Remove this checkout?`, so read its `paths deleted` list before you press
-`remove`.
+tagged `worktree` and is kept. The confirmation title says what the tags do
+not: a checkout whose removal deletes its folder is titled
+`Remove this worktree and delete its folder?`, and a repository whose removal
+deletes folders says how many, as in
+`Remove this repository and delete 2 folders?`. Any other confirmation is
+titled `Remove this <kind>?`. The title counts only the `paths deleted` list,
+never a folder that is `already removed`.
 
-The control opens a confirmation titled `Remove this repository?`,
-`Remove this checkout?` or `Remove this standalone session?`. It lists
+The control opens a confirmation titled
+`Remove this worktree and delete its folder?` or `Remove this checkout?` for a
+checkout, `Remove this repository and delete 1 folder?`,
+`Remove this repository and delete N folders?` or `Remove this repository?`
+for a repository, and
+`Remove this standalone session?` for a folder. It lists
 `rows dropped`, `runtimes killed`, `paths deleted` and `paths kept`, plus
 `already removed` and `cleared` when they apply. `cancel`, Escape or a tap
 outside the box closes it and sends nothing, except while a removal is in
