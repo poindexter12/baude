@@ -483,3 +483,9 @@ A session kill signals the PTY leader's process group. A job the agent's shell s
 ### BL-13 — v2.8 cleanup follow-ups from the Phase 22.1 code review
 
 Info items IN-01, IN-02, IN-03, IN-05, IN-06 and IN-07 in `.planning/phases/22.1-v2-8-cleanup/22.1-REVIEW.md`: a duplicate session name after a failed removal, a repeated push notification for restored sessions, every session listed under "other sessions" before the first `/rows` body, runtimes leaked outside TMPDIR are invisible to the leftover check, the sampler never prunes `first_seen`, and no timeouts on the check's `lsof`/`ps` calls or the CI `check` job. Also: the remote TUI client does not yet treat the new mid-removal 503s as transient; the 503 on the PTY socket upgrade has no test; and `busy_session_routes_answer_503_while_the_repository_is_reserved` failed once under load because `waiting_reason` changed between its two `/sessions` reads.
+
+## Captured 2026-11-16
+
+### BL-14 — Reopening a checkout whose folder is gone still says to repair it
+
+Pressing Enter on a checkout protected as `unavailable: missing` shows "Open details with i and repair the checkout" at `baude/src/app.rs:1425`. Since v2.8.0 the right move for a missing folder is `D`, which drops the row and, for a baude-managed worktree, lists the folder as already removed. The message should point at `D` for the `missing` cause and keep the repair advice for the other causes. Follow-up from closing issue #128.

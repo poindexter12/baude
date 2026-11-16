@@ -230,7 +230,7 @@ See `.planning/BACKLOG.md`:
 **Goal:** Close the v2.8 audit tech debt the owner chose for this milestone: one shared lift-key function and consistent re-admission between the TUI and the daemon over their shared suppression store; test hygiene so suites leave no stray runtimes or fixture temp dirs; PWA rows that say whether removal deletes a folder and an "other sessions" heading for unclaimed sessions; and WR-06, so POST /removals no longer holds the manager mutex for the whole removal while T-21-14, T-21-28 and T-21-53 stay mitigated.
 **Requirements**: TBD
 **Depends on:** Phase 22
-**Plans:** 11 plans
+**Plans:** 11/11 plans complete
 
 Plans:
 - [x] 22.1-01-PLAN.md
