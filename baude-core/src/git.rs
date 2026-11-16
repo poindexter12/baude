@@ -374,6 +374,154 @@ mod not_repository_tests {
     }
 }
 
+#[cfg(test)]
+mod paired_rev_parse_tests {
+    use super::{discover_repository, split_two_lines, RepositoryDiscoveryError};
+    use crate::testing::{git_in, FixtureRoot};
+    use std::path::{Path, PathBuf};
+
+    fn rev_parse_one(path: &Path, flag: &str) -> PathBuf {
+        PathBuf::from(git_in(path, &["rev-parse", "--path-format=absolute", flag]).trim_end())
+            .canonicalize()
+            .unwrap()
+    }
+
+    #[test]
+    fn split_two_lines_takes_exactly_two_newline_terminated_lines() {
+        assert_eq!(
+            split_two_lines(b"/a/.git\n/a\n".to_vec()),
+            Some((b"/a/.git\n".to_vec(), b"/a\n".to_vec()))
+        );
+        // A path holding a newline makes three lines; the caller falls back.
+        assert_eq!(split_two_lines(b"/a\nb/.git\n/a\nb\n".to_vec()), None);
+        assert_eq!(split_two_lines(b"/a/.git\n".to_vec()), None);
+        assert_eq!(split_two_lines(b"/a/.git\n/a".to_vec()), None);
+        assert_eq!(split_two_lines(Vec::new()), None);
+    }
+
+    /// The paired call answers what the two single calls answer, from a
+    /// subfolder of a linked worktree of a true clone: the shape where the
+    /// common directory and the selected worktree differ the most.
+    #[test]
+    fn paired_discovery_matches_the_single_calls_in_a_linked_worktree_of_a_clone() {
+        let root = FixtureRoot::new("baude-git-paired-rev-parse");
+        let upstream = root.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git_in(&upstream, &["init", "-q", "-b", "main"]);
+        git_in(&upstream, &["config", "user.email", "test@example.com"]);
+        git_in(&upstream, &["config", "user.name", "Test"]);
+        std::fs::write(upstream.join("tracked"), b"one\n").unwrap();
+        git_in(&upstream, &["add", "tracked"]);
+        git_in(&upstream, &["commit", "-q", "-m", "initial"]);
+        let clone = root.join("clone");
+        git_in(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let linked = root.join("linked");
+        git_in(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let inside = linked.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let snapshot = discover_repository(&inside).expect("discovery");
+        assert_eq!(
+            snapshot.common_dir,
+            rev_parse_one(&inside, "--git-common-dir")
+        );
+        assert_eq!(
+            snapshot.selected_worktree.path,
+            rev_parse_one(&inside, "--show-toplevel")
+        );
+        assert_eq!(
+            snapshot.selected_worktree.path,
+            linked.canonicalize().unwrap()
+        );
+        assert_eq!(snapshot.main_worktree, clone.canonicalize().unwrap());
+    }
+
+    /// Inside a `.git` directory `--show-toplevel` refuses, so the paired call
+    /// fails and discovery falls back to one call per question: the error is
+    /// the one the selected-worktree call has always given.
+    #[test]
+    fn inside_a_git_directory_the_fallback_keeps_the_selected_worktree_error() {
+        let root = FixtureRoot::new("baude-git-paired-gitdir");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+
+        match discover_repository(&repo.join(".git")) {
+            Err(RepositoryDiscoveryError::GitCommand { operation, .. }) => {
+                assert_eq!(operation, "rev-parse selected worktree")
+            }
+            other => panic!("expected the selected-worktree git error, got {other:?}"),
+        }
+    }
+}
+
+/// Raw stdout of the common-directory and selected-worktree questions.
+type StdoutPair = (Vec<u8>, Vec<u8>);
+
+/// The common directory and the selected worktree from one
+/// `rev-parse --git-common-dir --show-toplevel`, as the raw stdout each
+/// single-question call would have printed.
+///
+/// `Ok(None)` sends the caller back to one call per question, which keeps the
+/// old answers and the old errors wherever the paired call is not a clean
+/// answer: git failed for any reason other than "not a repository" (a bare
+/// repository or a `.git` directory, where `--show-toplevel` refuses), the
+/// call could not start, or the output is not exactly two newline-terminated
+/// lines, which is how a path containing a newline would show up. `Err(())`
+/// is "not a repository", the same verdict the single common-directory call
+/// gives.
+fn common_and_selected(path: &Path) -> std::result::Result<Option<StdoutPair>, ()> {
+    let output = match git_bytes(
+        path,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+            OsStr::new("--show-toplevel"),
+        ],
+        "rev-parse common directory and selected worktree",
+    ) {
+        Ok(output) => output,
+        Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
+            if is_not_repository_stderr(&stderr) =>
+        {
+            return Err(());
+        }
+        Err(_) => return Ok(None),
+    };
+    Ok(split_two_lines(output.stdout))
+}
+
+/// `first\nsecond\n` as `(first\n, second\n)`, each half shaped like the
+/// output of a one-path `rev-parse`; `None` for any other line count.
+fn split_two_lines(stdout: Vec<u8>) -> Option<StdoutPair> {
+    if stdout.last() != Some(&b'\n') || stdout.iter().filter(|&&b| b == b'\n').count() != 2 {
+        return None;
+    }
+    let split = stdout.iter().position(|&b| b == b'\n')? + 1;
+    let mut first = stdout;
+    let second = first.split_off(split);
+    Some((first, second))
+}
+
 /// Discover canonical repository membership without reading Git's on-disk layout.
 pub fn discover_repository(
     path: &Path,
@@ -385,23 +533,37 @@ pub fn discover_repository(
                 source,
             })?;
 
-    let common_output = match git_bytes(
-        &canonical_input,
-        &[
-            OsStr::new("rev-parse"),
-            OsStr::new("--path-format=absolute"),
-            OsStr::new("--git-common-dir"),
-        ],
-        "rev-parse common directory",
-    ) {
-        Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
-            if is_not_repository_stderr(&stderr) =>
-        {
-            return Err(RepositoryDiscoveryError::NotRepository(canonical_input));
-        }
-        result => result?,
+    // One `rev-parse` usually answers both the common directory and the
+    // selected worktree. Discovery runs on every reconcile and process start
+    // is slow on macOS, so the pair costs one git start instead of two. When
+    // that one call cannot answer unambiguously, `paired` is `None` and each
+    // question gets its own call, exactly as before.
+    let paired = match common_and_selected(&canonical_input) {
+        Ok(paired) => paired,
+        Err(()) => return Err(RepositoryDiscoveryError::NotRepository(canonical_input)),
     };
-    let common_dir = path_from_git_stdout(common_output.stdout, "rev-parse common directory")?
+    let common_stdout = match &paired {
+        Some((common, _)) => common.clone(),
+        None => {
+            match git_bytes(
+                &canonical_input,
+                &[
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--path-format=absolute"),
+                    OsStr::new("--git-common-dir"),
+                ],
+                "rev-parse common directory",
+            ) {
+                Err(RepositoryDiscoveryError::GitCommand { stderr, .. })
+                    if is_not_repository_stderr(&stderr) =>
+                {
+                    return Err(RepositoryDiscoveryError::NotRepository(canonical_input));
+                }
+                result => result?.stdout,
+            }
+        }
+    };
+    let common_dir = path_from_git_stdout(common_stdout, "rev-parse common directory")?
         .canonicalize()
         .map_err(|source| RepositoryDiscoveryError::Canonicalize {
             path: path.to_path_buf(),
@@ -417,22 +579,27 @@ pub fn discover_repository(
 
     // This query identifies the selected checkout only; repository identity is the
     // canonical common directory plus Git's main-first worktree inventory above.
-    let selected_output = git_bytes(
-        &canonical_input,
-        &[
-            OsStr::new("rev-parse"),
-            OsStr::new("--path-format=absolute"),
-            OsStr::new("--show-toplevel"),
-        ],
-        "rev-parse selected worktree",
-    )?;
-    let selected_path =
-        path_from_git_stdout(selected_output.stdout, "rev-parse selected worktree")?
-            .canonicalize()
-            .map_err(|source| RepositoryDiscoveryError::Canonicalize {
-                path: path.to_path_buf(),
-                source,
-            })?;
+    let selected_stdout = match paired {
+        Some((_, selected)) => selected,
+        None => {
+            git_bytes(
+                &canonical_input,
+                &[
+                    OsStr::new("rev-parse"),
+                    OsStr::new("--path-format=absolute"),
+                    OsStr::new("--show-toplevel"),
+                ],
+                "rev-parse selected worktree",
+            )?
+            .stdout
+        }
+    };
+    let selected_path = path_from_git_stdout(selected_stdout, "rev-parse selected worktree")?
+        .canonicalize()
+        .map_err(|source| RepositoryDiscoveryError::Canonicalize {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let selected_worktree = worktrees
         .iter()
         .find(|record| record.path == selected_path)
