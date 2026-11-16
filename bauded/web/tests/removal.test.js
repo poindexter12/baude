@@ -175,7 +175,7 @@ test("confirmation_view_mirrors_the_tui_section_order", () => {
   const { confirmationView, rowsIndex } = BaudeRemoval;
   const view = confirmationView(checkoutReport(), rowsIndex(rowsBody()));
 
-  assert.equal(view.title, "Remove this checkout?");
+  assert.equal(view.title, "Remove this worktree and delete its folder?");
   assert.deepStrictEqual(
     view.sections.map((s) => s.label),
     ["rows dropped", "runtimes killed", "paths deleted", "paths kept"],
@@ -231,50 +231,34 @@ test("confirmation_view_mirrors_the_tui_section_order", () => {
   assert.deepStrictEqual(full.sections[5].lines, ["1 binding, 2 markers, 1 suppression entry"]);
   assert.equal(full.sections[5].count, 4);
 
-  // The title names the target kind for all three RemovalTarget shapes.
+  // The title names the target kind for all three RemovalTarget shapes. This
+  // report deletes one path, so the repository title counts it.
   const titled = (target) =>
     confirmationView(checkoutReport({ target }), rowsIndex(rowsBody())).title;
-  assert.equal(titled({ repository: 1 }), "Remove this repository?");
+  assert.equal(titled({ repository: 1 }), "Remove this repository and delete 1 folder?");
   assert.equal(titled({ standalone: 2 }), "Remove this standalone session?");
 });
 
-// The preview of removing repository 1 whole, deleting `deleted` folders.
-function repositoryReport(deleted, overrides = {}) {
-  return checkoutReport({
-    target: { repository: 1 },
-    rows_removed: [{ checkout: 7 }, { checkout: 8 }, { repository: 1 }],
-    paths_deleted: deleted,
-    ...overrides,
-  });
-}
-
-// The preview of removing folder 2: a standalone row whose folder is kept.
-function standaloneReport(overrides = {}) {
-  return checkoutReport({
-    target: { standalone: 2 },
-    rows_removed: [{ standalone: 2 }],
-    runtimes_killed: [],
-    paths_deleted: [],
-    paths_kept: [`${HOME}/notes`],
-    ...overrides,
-  });
-}
-
+// repositoryReport and standaloneReport are the Task 2 factories below; a
+// function declaration is hoisted, so they are in scope here.
 test("confirmation_title_says_when_a_folder_is_deleted", () => {
   const { confirmationView, renderConfirmation, rowsIndex, escapeHtml } = BaudeRemoval;
   const index = rowsIndex(rowsBody());
   const title = (report) => confirmationView(report, index).title;
+  // Repository 1's preview, deleting exactly `deleted`.
+  const repository = (deleted, overrides = {}) =>
+    repositoryReport({ paths_deleted: deleted, ...overrides });
 
   // A checkout whose removal deletes its folder says so.
   assert.equal(title(checkoutReport()), "Remove this worktree and delete its folder?");
 
   // A repository counts the folders its removal deletes.
   assert.equal(
-    title(repositoryReport([`${WORKTREES}/topic-7`])),
+    title(repository([`${WORKTREES}/topic-7`])),
     "Remove this repository and delete 1 folder?",
   );
   assert.equal(
-    title(repositoryReport([`${WORKTREES}/topic-7`, `${WORKTREES}/other-8`, `${WORKTREES}/third-9`])),
+    title(repository([`${WORKTREES}/topic-7`, `${WORKTREES}/other-8`, `${WORKTREES}/third-9`])),
     "Remove this repository and delete 3 folders?",
   );
 
@@ -285,7 +269,7 @@ test("confirmation_title_says_when_a_folder_is_deleted", () => {
     "Remove this checkout?",
   );
   assert.equal(
-    title(repositoryReport([], { already_removed: gone })),
+    title(repository([], { already_removed: gone })),
     "Remove this repository?",
   );
 
@@ -297,7 +281,7 @@ test("confirmation_title_says_when_a_folder_is_deleted", () => {
   );
 
   // The view carries the title raw and the renderer escapes it exactly once.
-  for (const report of [checkoutReport(), repositoryReport([`${WORKTREES}/topic-7`]), standaloneReport()]) {
+  for (const report of [checkoutReport(), repository([`${WORKTREES}/topic-7`]), standaloneReport()]) {
     const view = confirmationView(report, index);
     const html = renderConfirmation(view);
     assert.ok(
