@@ -1181,35 +1181,25 @@ mod tests {
     /// The name plus pid plus a per-process sequence is what keeps roots unique:
     /// pid alone collides between two tests in one binary, and a name alone
     /// collides between two binaries running at once.
+    ///
+    /// The root is declared last so it drops after the redirect, and a
+    /// [`crate::testing::RuntimeReaper`] a test binds after the fixture drops
+    /// before both: whatever runs in the root is gone before the root is.
     struct PtyFixture {
-        root: PathBuf,
         _redirect: crate::testing::TestRedirect,
+        root: crate::testing::FixtureRoot,
     }
 
     impl PtyFixture {
         fn new(name: &str) -> Self {
-            use std::sync::atomic::AtomicUsize;
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "baude-pty-{name}-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
+            let root = crate::testing::FixtureRoot::new(&format!("baude-pty-{name}"));
             let _redirect = crate::testing::TestRedirect::new(&root);
-            Self { root, _redirect }
+            Self { _redirect, root }
         }
 
         /// The cwd handed to the child — inside the fixture, by construction.
         fn cwd(&self) -> &Path {
-            &self.root
-        }
-    }
-
-    impl Drop for PtyFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            self.root.path()
         }
     }
 
@@ -1553,6 +1543,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        // The gate shell's job control moves `sleep` out of the recorded
+        // group; the reaper sweeps the recorded session for it.
+        let _reaper = crate::testing::RuntimeReaper::for_pty(&pty);
         let identity = pty.process_identity().clone();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !marker.exists() {
@@ -1701,6 +1694,9 @@ mod tests {
     fn kill_reaps_live_child() {
         let fixture = PtyFixture::new("reap-kill");
         let mut pty = Pty::spawn(Some("trap '' HUP; sleep 30"), fixture.cwd(), 5, 40).unwrap();
+        // `kill()` stops the leader only; the job-control `sleep` it started
+        // in a group of its own is the reaper's.
+        let _reaper = crate::testing::RuntimeReaper::for_pty(&pty);
         let pid = pty.pid().expect("pid while alive");
         std::thread::sleep(Duration::from_millis(200));
         pty.kill();
