@@ -248,8 +248,6 @@ pub struct RemovalInFlight {
     runtimes: Vec<RowRuntime>,
     /// The session ids moved out of the registry.
     consumed: Vec<u64>,
-    overrides: Vec<(CheckoutKey, RetainedSessionState)>,
-    standalone_overrides: Vec<(StandaloneKey, RetainedStandaloneSessionState)>,
     #[cfg(test)]
     pause: Option<RemovalPauseForTest>,
     /// Held, never read: dropping the value releases the repository.
@@ -1392,9 +1390,9 @@ impl Manager {
         {
             return Err(RemoveRowsError::Drift(Box::new(fresh)));
         }
-        // Snapshot while the removed rows' sessions are still registered;
-        // the merge at save time skips them because their rows are gone from
-        // the candidate.
+        // Taken while the removed rows' sessions are still registered. Only
+        // the doomed rows' entries are used here; the save's own overrides
+        // are taken in `finish_removal`, under the commit lock.
         let overrides = self.survivor_runtime_overrides();
         let standalone_overrides = self.standalone_runtime_overrides();
         // `rows()` merges live metadata from the registry, and the doomed
@@ -1417,8 +1415,6 @@ impl Manager {
             prepared,
             runtimes,
             consumed,
-            overrides,
-            standalone_overrides,
             #[cfg(test)]
             pause: self.removal_pause_for_test.clone(),
             _repository_reservation: repository_reservation,
@@ -1444,8 +1440,6 @@ impl Manager {
             prepared,
             mut runtimes,
             consumed,
-            overrides,
-            standalone_overrides,
             #[cfg(test)]
                 pause: _,
             _repository_reservation,
@@ -1469,6 +1463,14 @@ impl Manager {
                 return Err(RemoveRowsError::SlowStagePanicked(message));
             }
         };
+        // Taken now, under the commit lock, so a survivor renamed or
+        // archived during the slow stage is saved as it is, never as it was
+        // when the removal began. The removed rows' sessions are out of the
+        // registry and contribute nothing; their rows are gone from the
+        // candidate anyway. The closure cannot borrow `self` while core holds
+        // `&mut self.repository_state`, hence an owned snapshot.
+        let overrides = self.survivor_runtime_overrides();
+        let standalone_overrides = self.standalone_runtime_overrides();
         let persist_enabled = self.persist;
         #[cfg(test)]
         let test_target = self.persistence_target_for_test.clone();
