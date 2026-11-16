@@ -7918,6 +7918,124 @@ mod tests {
 
         removal_teardown(&shared, &root);
     }
+
+    /// The status and body of a bodiless `POST` to a session route.
+    async fn post_route(app: &Router, path: &str) -> (StatusCode, String) {
+        let res = app.clone().oneshot(post_json(path, "")).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// DELETE, restart, archive and unarchive of session `id`, each pinned to
+    /// 503 with `expected` as its body and checked to change nothing.
+    async fn assert_session_routes_busy(
+        app: &Router,
+        state_path: &Path,
+        id: u64,
+        agent_pid: u64,
+        expected: &str,
+    ) {
+        let before = world_snapshot(app, state_path).await;
+        let archived_before = body_json(
+            app.clone()
+                .oneshot(get(&format!("/sessions/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await["archived"]
+            .clone();
+        for route in ["delete", "restart", "archive", "unarchive"] {
+            let (status, body) = match route {
+                "delete" => delete_session_status(app, id).await,
+                other => post_route(app, &format!("/sessions/{id}/{other}")).await,
+            };
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "22.1-09 session route busy pin: {route} of session {id} answered {status} with \
+                 body {body}"
+            );
+            assert_eq!(body, expected, "{route}");
+            assert_eq!(
+                session_ids(app).await,
+                vec![id],
+                "{route} dropped the session"
+            );
+            let listed = body_json(
+                app.clone()
+                    .oneshot(get(&format!("/sessions/{id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(listed["archived"], archived_before, "{route}: {listed}");
+            assert!(pid_is_alive(agent_pid), "{route} stopped the agent");
+            assert_world_unchanged(app, state_path, &before, route).await;
+        }
+    }
+
+    /// 22.1-09, T-22.1-32. The session routes that change a session answer
+    /// 503 while its repository is reserved, and change nothing.
+    #[tokio::test]
+    async fn busy_session_routes_answer_503_while_the_repository_is_reserved() {
+        let (root, fixture, workspace, shared, app, id, key) =
+            removal_fixture("busy-routes-repo").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let agent_pid = previewed_agent_pid(&preview_report(&app, key).await, key);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        assert_session_routes_busy(
+            &app,
+            &state_path,
+            id,
+            agent_pid,
+            &format!("repository busy: {}", repo.display()),
+        )
+        .await;
+
+        drop(hold);
+        let (status, body) = post_route(&app, &format!("/sessions/{id}/archive")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-32. The same four routes for a folder session whose
+    /// standalone row is reserved.
+    #[tokio::test]
+    async fn busy_session_routes_answer_503_while_the_folder_is_reserved() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-routes-folder");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        assert_session_routes_busy(
+            &app,
+            &state_path,
+            id,
+            agent_pid,
+            &format!("folder busy: {}", folder.display()),
+        )
+        .await;
+        assert_folder_untouched(&folder);
+
+        drop(hold);
+        let (status, body) = post_route(&app, &format!("/sessions/{id}/archive")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        removal_teardown(&shared, &root);
+    }
 }
 
 #[cfg(test)]

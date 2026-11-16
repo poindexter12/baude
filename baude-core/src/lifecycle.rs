@@ -2872,6 +2872,11 @@ impl RepositoryReservations {
             repository,
         })
     }
+
+    /// Whether a guard of either kind holds `repository` now.
+    pub fn is_reserved(&self, _repository: RepositoryKey) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -3780,6 +3785,37 @@ mod tests {
         );
         drop(guard);
         assert!(reservations.reserve(repository).is_ok());
+    }
+
+    #[test]
+    fn reservations_report_what_they_hold() {
+        let state = close_state();
+        let checkout = state.checkouts[0].key;
+        let repository = state.checkouts[0].repository_key;
+        let reservations = RepositoryReservations::default();
+        assert!(!reservations.is_reserved(repository), "nothing is held yet");
+
+        let mutation = reservations.reserve(repository).unwrap();
+        assert!(
+            reservations.is_reserved(repository),
+            "a held mutation guard must report its repository reserved"
+        );
+        drop(mutation);
+        assert!(
+            !reservations.is_reserved(repository),
+            "the mutation guard dropped"
+        );
+
+        let reopen = reservations.reserve_reopen(repository, checkout).unwrap();
+        assert!(
+            reservations.is_reserved(repository),
+            "a held reopen guard must report its repository reserved"
+        );
+        drop(reopen);
+        assert!(
+            !reservations.is_reserved(repository),
+            "the reopen guard dropped"
+        );
     }
 
     #[test]
