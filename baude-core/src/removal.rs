@@ -455,11 +455,12 @@ pub fn remove(
 
 /// What [`prepare`] resolved: the selected rows and every clearing the
 /// clearing stage will attempt, both derived from the state `prepare` read.
+/// It deliberately carries no save candidate: [`commit`] builds that from
+/// the state it is handed, so a change made to other rows between the two
+/// stages is saved rather than reverted.
 pub struct PreparedRemoval {
     set: RemovalSet,
     planned: Vec<ClearedItem>,
-    candidate: RepositoryState,
-    removed: RemovedRows,
 }
 
 /// What [`stop_and_delete`] did: the runtimes it stopped and the paths it
@@ -483,6 +484,16 @@ pub fn prepare(
     let set = select_rows(state, target)?;
     let planned = planned_clearings(state, &set);
     preflight(&set, runtimes)?;
+    candidate_without(state, &set)?;
+    Ok(PreparedRemoval { set, planned })
+}
+
+/// A clone of `state` with the set's rows removed, refused unless it passes
+/// `validate_for_save`, together with the rows the clone dropped.
+fn candidate_without(
+    state: &RepositoryState,
+    set: &RemovalSet,
+) -> Result<(RepositoryState, RemovedRows), RemovalError> {
     let mut candidate = state.clone();
     let removed = candidate.remove_rows(
         &set.repository_keys(),
@@ -492,12 +503,7 @@ pub fn prepare(
     candidate
         .validate_for_save()
         .map_err(RemovalError::Validation)?;
-    Ok(PreparedRemoval {
-        set,
-        planned,
-        candidate,
-        removed,
-    })
+    Ok((candidate, removed))
 }
 
 /// The kill stage, then the disk stage, for the prepared set. Reads no
@@ -514,10 +520,13 @@ pub fn stop_and_delete(
     Ok(StageEffects { killed, disk })
 }
 
-/// Save the removal once and run the clearing stage. `*state` is replaced
-/// and the removed rows' handles are drained from `runtimes` only after the
-/// save returns `Ok` or reports a committed replacement; on every `Err`
-/// `*state` and `runtimes` are untouched.
+/// Save the removal once and run the clearing stage. The save candidate is
+/// rebuilt here from `*state` as it is now, minus the prepared rows, and
+/// validated again, so a row another caller admitted or changed since
+/// [`prepare`] is saved rather than reverted to the state `prepare` read.
+/// `*state` is replaced and the removed rows' handles are drained from
+/// `runtimes` only after the save returns `Ok` or reports a committed
+/// replacement; on every `Err` `*state` and `runtimes` are untouched.
 pub fn commit(
     state: &mut RepositoryState,
     prepared: PreparedRemoval,
@@ -525,12 +534,8 @@ pub fn commit(
     runtimes: &mut Vec<RowRuntime>,
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
-    let PreparedRemoval {
-        set,
-        planned,
-        candidate,
-        removed,
-    } = prepared;
+    let PreparedRemoval { set, planned } = prepared;
+    let (candidate, removed) = candidate_without(state, &set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
     let clearing = clear_stage(&removed, state, &planned);
     Ok(report_from_set(
