@@ -122,6 +122,9 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
         // failure, never the caller's "not found"/"bad request" fallback.
         MutationError::Teardown(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         MutationError::Domain(error) => (fallback, error.to_string()),
+        // The repository or folder is reserved by another mutation: refused
+        // on the daemon's own state, the same 503 a busy removal answers.
+        MutationError::Busy(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
     }
 }
 
@@ -138,7 +141,8 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
             RemovalError::Persist { .. } | RemovalError::RuntimeHandleMissing(_),
         )
         | RemoveRowsError::Blocked(_)
-        | RemoveRowsError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | RemoveRowsError::Busy(_)
+        | RemoveRowsError::FolderBusy(_) => StatusCode::SERVICE_UNAVAILABLE,
         // SelectionChanged follows a kill and a delete: core's commit found
         // the target selecting other rows than prepare did. It is unreachable
         // under the daemon's exclusion around a removal, so seeing it means
@@ -193,6 +197,14 @@ async fn execute_removal(
                 None => removal_error(RemoveRowsError::Busy(repository)),
             }
         }
+        Err(RemoveRowsError::FolderBusy(key)) => match manager.standalone_path(key) {
+            Some(path) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("folder busy: {}", path.display()),
+            )
+                .into_response(),
+            None => removal_error(RemoveRowsError::FolderBusy(key)),
+        },
         Err(error) => removal_error(error),
     }
 }
@@ -362,6 +374,7 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
             MutationError::Teardown(error) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             }
+            MutationError::Busy(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             MutationError::Domain(error) => {
                 let message = error.to_string();
                 if message.starts_with("no session") {

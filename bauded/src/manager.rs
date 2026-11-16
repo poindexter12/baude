@@ -50,6 +50,11 @@ pub enum MutationError {
     /// failure, never "no such session": the session still exists and its
     /// checkout is left TeardownPending for a retry.
     Teardown(anyhow::Error),
+    /// The repository or folder the request would change is reserved by
+    /// another mutation, such as a removal. The message is the whole body a
+    /// client is shown, `repository busy: <main checkout>` or
+    /// `folder busy: <folder>`, built under the manager lock.
+    Busy(String),
 }
 
 impl std::fmt::Display for MutationError {
@@ -58,6 +63,7 @@ impl std::fmt::Display for MutationError {
             Self::Domain(error) => error.fmt(f),
             Self::Persistence(error) => error.fmt(f),
             Self::Teardown(error) => error.fmt(f),
+            Self::Busy(message) => f.write_str(message),
         }
     }
 }
@@ -204,6 +210,8 @@ pub enum RemoveRowsError {
     Removal(RemovalError),
     Blocked(persist::SaveError),
     Busy(RepositoryKey),
+    /// The standalone row is reserved by another removal.
+    FolderBusy(StandaloneKey),
 }
 
 impl std::fmt::Display for RemoveRowsError {
@@ -213,6 +221,7 @@ impl std::fmt::Display for RemoveRowsError {
             Self::Removal(error) => write!(f, "{error}"),
             Self::Blocked(error) => write!(f, "{error}"),
             Self::Busy(repository) => write!(f, "repository busy: {repository:?}"),
+            Self::FolderBusy(key) => write!(f, "folder busy: {key:?}"),
         }
     }
 }
@@ -1191,6 +1200,17 @@ impl Manager {
             ),
             None => None,
         };
+        // A standalone row has no repository to reserve, so the daemon's own
+        // registry refuses a second removal of the same folder. Like the
+        // repository guard, it lives until this method returns.
+        let _standalone_reservation = match target {
+            RemovalTarget::Standalone(key) => Some(
+                self.standalone_reservations
+                    .reserve(key)
+                    .map_err(|()| RemoveRowsError::FolderBusy(key))?,
+            ),
+            RemovalTarget::Repository(_) | RemovalTarget::Checkout(_) => None,
+        };
         // The report is recomputed under the caller's lock. Only what the run
         // would do is compared; `cleared` and `already_removed` are filesystem
         // probes that would make the recheck flap on advisory state.
@@ -1382,6 +1402,21 @@ impl Manager {
             .iter()
             .find(|saved| saved.key == repository)
             .map(|saved| saved.observed_main_worktree.to_path_buf())
+    }
+
+    /// The canonical path a standalone row stores, for a busy refusal's body.
+    pub fn standalone_path(&self, key: StandaloneKey) -> Option<PathBuf> {
+        self.repository_state
+            .standalone_session(key)
+            .map(|row| row.canonical_path.to_path_buf())
+    }
+
+    /// The refusal for a reserved standalone row, its body naming the folder.
+    fn folder_busy(&self, key: StandaloneKey) -> MutationError {
+        MutationError::Busy(match self.standalone_path(key) {
+            Some(path) => format!("folder busy: {}", path.display()),
+            None => format!("folder busy: {key:?}"),
+        })
     }
 
     /// `GET /rows` — the hierarchy projection. A pure read: it admits nothing,
@@ -1746,6 +1781,12 @@ impl Manager {
             };
             let join = match &route {
                 PlainAdmission::ReuseStandalone(key) => {
+                    // A row a removal holds is neither handed out nor
+                    // reopened: a reopen would spawn a runtime the removal's
+                    // commit then drops from the registry.
+                    if self.standalone_reservations.is_reserved(*key) {
+                        return Err(self.folder_busy(*key));
+                    }
                     // One row per folder. A live row is the same session; a
                     // closed one is reopened under its key. Either way the
                     // request's name is not applied.
