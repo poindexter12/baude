@@ -529,8 +529,7 @@ mod tests {
         };
         git(root, &["init", "-q", "-b", "main", name]);
         let repo = root.join(name);
-        git(&repo, &["config", "user.name", "Baude Test"]);
-        git(&repo, &["config", "user.email", "baude@example.invalid"]);
+        crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
         std::fs::write(repo.join("tracked.txt"), b"fixture\n").unwrap();
         git(&repo, &["add", "tracked.txt"]);
         git(&repo, &["commit", "-q", "-m", "fixture"]);

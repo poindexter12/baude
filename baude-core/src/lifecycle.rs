@@ -3954,8 +3954,7 @@ mod tests {
     fn drift_repo(fixture: &LifecycleFixture) -> (PathBuf, PathBuf) {
         let repo = fixture.subdir("repo");
         git_in(&repo, &["init", "-q", "-b", "main"]);
-        git_in(&repo, &["config", "user.email", "test@example.com"]);
-        git_in(&repo, &["config", "user.name", "Test"]);
+        crate::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("tracked"), b"one\n").unwrap();
         git_in(&repo, &["add", "tracked"]);
         git_in(&repo, &["commit", "-q", "-m", "initial"]);
@@ -4319,8 +4318,7 @@ mod tests {
     fn cloned_topology(fixture: &LifecycleFixture) -> (PathBuf, PathBuf, PathBuf) {
         let upstream = fixture.subdir("upstream");
         git_in(&upstream, &["init", "-q", "-b", "main"]);
-        git_in(&upstream, &["config", "user.email", "test@example.com"]);
-        git_in(&upstream, &["config", "user.name", "Test"]);
+        crate::testing::set_git_identity(&upstream, "Test", "test@example.com");
         std::fs::write(upstream.join("tracked"), b"one\n").unwrap();
         git_in(&upstream, &["add", "tracked"]);
         git_in(&upstream, &["commit", "-q", "-m", "initial"]);

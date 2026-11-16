@@ -1020,8 +1020,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -1084,8 +1083,7 @@ mod tests {
         let repo = root.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -2660,8 +2658,7 @@ mod tests {
         let sibling = root.join("repo-sibling");
         std::fs::create_dir_all(&sibling).unwrap();
         git(&sibling, &["init", "-b", "main"]);
-        git(&sibling, &["config", "user.email", "test@example.com"]);
-        git(&sibling, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&sibling, "Test", "test@example.com");
         std::fs::write(sibling.join("file"), b"one").unwrap();
         git(&sibling, &["add", "file"]);
         git(&sibling, &["commit", "-m", "initial"]);
@@ -6643,8 +6640,7 @@ mod tests {
         let sibling = root.join("repo-sibling");
         std::fs::create_dir_all(&sibling).unwrap();
         git(&sibling, &["init", "-b", "main"]);
-        git(&sibling, &["config", "user.email", "test@example.com"]);
-        git(&sibling, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&sibling, "Test", "test@example.com");
         std::fs::write(sibling.join("file"), b"one").unwrap();
         git(&sibling, &["add", "file"]);
         git(&sibling, &["commit", "-m", "initial"]);

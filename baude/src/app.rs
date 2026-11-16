@@ -9035,8 +9035,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -10813,8 +10812,7 @@ mod tests {
         let second_repo = root.join("second");
         std::fs::create_dir_all(&second_repo).unwrap();
         git(&second_repo, &["init", "-b", "main"]);
-        git(&second_repo, &["config", "user.email", "test@example.com"]);
-        git(&second_repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&second_repo, "Test", "test@example.com");
         std::fs::write(second_repo.join("file"), b"two").unwrap();
         git(&second_repo, &["add", "file"]);
         git(&second_repo, &["commit", "-m", "initial"]);

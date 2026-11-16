@@ -536,8 +536,7 @@ mod tests {
         let topology = crate::testing::cloned_topology(root);
         let init = folder(root, "init");
         crate::testing::git_in(&init, &["init", "-q", "-b", "main"]);
-        crate::testing::git_in(&init, &["config", "user.email", "test@example.com"]);
-        crate::testing::git_in(&init, &["config", "user.name", "Test"]);
+        crate::testing::set_git_identity(&init, "Test", "test@example.com");
         std::fs::write(init.join("tracked"), b"one\n").unwrap();
         crate::testing::git_in(&init, &["add", "tracked"]);
         crate::testing::git_in(&init, &["commit", "-q", "-m", "initial"]);

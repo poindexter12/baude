@@ -408,8 +408,7 @@ mod paired_rev_parse_tests {
         let upstream = root.join("upstream");
         std::fs::create_dir_all(&upstream).unwrap();
         git_in(&upstream, &["init", "-q", "-b", "main"]);
-        git_in(&upstream, &["config", "user.email", "test@example.com"]);
-        git_in(&upstream, &["config", "user.name", "Test"]);
+        crate::testing::set_git_identity(&upstream, "Test", "test@example.com");
         std::fs::write(upstream.join("tracked"), b"one\n").unwrap();
         git_in(&upstream, &["add", "tracked"]);
         git_in(&upstream, &["commit", "-q", "-m", "initial"]);
