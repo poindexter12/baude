@@ -553,9 +553,210 @@ pub fn spawn_unkillable_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, Hol
     (pty, guard)
 }
 
+// ---- fixture hygiene guards (phase 22.1) ----
+
+/// Kills what a fixture runtime left behind when it drops, also on panic.
+///
+/// The recorded process group alone is not enough: the PTY runs its command
+/// under an interactive shell, whose job control puts the command in a
+/// process group of its own, and a command that ignores HUP outlives its
+/// leader there. What still names it is the session the PTY child created.
+pub struct RuntimeReaper {
+    leader: i32,
+    process_group: i32,
+    session: i32,
+}
+
+impl RuntimeReaper {
+    /// A reaper for the runtime `identity` records.
+    pub fn for_identity(identity: &crate::repository::ProcessIdentity) -> Self {
+        Self {
+            leader: identity.pid as i32,
+            process_group: identity.process_group,
+            session: identity.session,
+        }
+    }
+
+    /// A reaper for `pty`'s recorded runtime. Build it right after the spawn,
+    /// before the test kills the leader, and bind it after the fixture root so
+    /// it drops first.
+    pub fn for_pty(pty: &Pty) -> Self {
+        Self::for_identity(pty.process_identity())
+    }
+}
+
+impl Drop for RuntimeReaper {
+    fn drop(&mut self) {
+        let _ = (self.leader, self.session);
+        // SAFETY: the group id was recorded from this fixture's own leader.
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `ps -eo pid=,pgid=,stat=` row per live process, zombies left out.
+    fn live_rows() -> Vec<(i32, i32)> {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,pgid=,stat="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                let pgid = fields.next()?.parse().ok()?;
+                let stat = fields.next().unwrap_or("");
+                (!stat.starts_with('Z')).then_some((pid, pgid))
+            })
+            .collect()
+    }
+
+    /// Live processes whose session id is `session`, with their groups.
+    fn live_session_members(session: i32) -> Vec<(i32, i32)> {
+        live_rows()
+            .into_iter()
+            // SAFETY: getsid only reads the process table.
+            .filter(|(pid, _)| unsafe { libc::getsid(*pid) } == session)
+            .collect()
+    }
+
+    /// SIGKILLs each recorded pid when the test unwinds, so a failed
+    /// assertion never leaks a 30 s process. A passing test signals nothing.
+    struct KillOnPanic(Vec<i32>);
+
+    impl Drop for KillOnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                for pid in &self.0 {
+                    // SAFETY: each pid was recorded from a process this test spawned.
+                    unsafe {
+                        libc::kill(*pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A scratch root for the reaper tests, removed at the end.
+    fn reaper_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("baude-testing-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create reaper root");
+        root
+    }
+
+    /// The real job-control shape: the interactive gate shell runs `sleep` in
+    /// a process group of its own, `trap '' HUP` keeps it alive past its
+    /// leader, and only the recorded session still names it.
+    #[test]
+    fn runtime_reaper_kills_job_control_children_in_the_recorded_session() {
+        let root = reaper_root("reaper-session");
+        let _redirect = TestRedirect::new(&root);
+        let mut pty =
+            Pty::spawn(Some("trap '' HUP; sleep 30"), &root, 5, 40).expect("spawn runtime");
+        let identity = pty.process_identity().clone();
+        let reaper = RuntimeReaper::for_pty(&pty);
+        assert_eq!(
+            identity.pid as i32, identity.session,
+            "the PTY child must lead its own session"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let moved = loop {
+            let outside = live_session_members(identity.session)
+                .into_iter()
+                .find(|(_, pgid)| *pgid != identity.process_group);
+            if let Some((pid, _)) = outside {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no member of session {} outside group {} appeared within 5 s",
+                identity.session,
+                identity.process_group
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _cleanup = KillOnPanic(vec![moved]);
+        // Let the trap arm before the leader dies.
+        std::thread::sleep(Duration::from_millis(200));
+
+        pty.kill();
+        drop(reaper);
+
+        let survivors = live_session_members(identity.session);
+        assert!(
+            survivors.is_empty(),
+            "surviving pid(s) in recorded session {} after the reaper dropped: {survivors:?} \
+             (job-control child was {moved})",
+            identity.session
+        );
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sweep is gated on the recorded session being the recorded leader:
+    /// an identity naming somebody else's session must never sweep it.
+    #[test]
+    fn runtime_reaper_never_sweeps_a_session_it_does_not_lead() {
+        use std::os::unix::process::CommandExt;
+
+        let mut outsider = std::process::Command::new("perl")
+            .args([
+                "-MPOSIX",
+                "-e",
+                "my $sid = POSIX::setsid(); exit 3 unless defined $sid && $sid != -1; sleep 30",
+            ])
+            .spawn()
+            .expect("spawn setsid sleeper");
+        let outsider_pid = outsider.id() as i32;
+        let mut named = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn named child");
+        let named_pid = named.id() as i32;
+        let _cleanup = KillOnPanic(vec![outsider_pid, named_pid]);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: getsid only reads the process table.
+        while unsafe { libc::getsid(outsider_pid) } != outsider_pid {
+            assert!(
+                Instant::now() < deadline,
+                "the perl sleeper never left the harness session"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let identity = crate::repository::ProcessIdentity {
+            pid: named_pid as u32,
+            start_time: 0,
+            process_group: named_pid,
+            session: outsider_pid,
+        };
+        drop(RuntimeReaper::for_identity(&identity));
+
+        // SAFETY: signal zero is a liveness probe only.
+        let alive = unsafe { libc::kill(outsider_pid, 0) } == 0
+            && outsider.try_wait().expect("try_wait outsider").is_none();
+        assert!(
+            alive,
+            "the reaper swept session {outsider_pid}, which its leader {named_pid} does not lead"
+        );
+        // SAFETY: the pid is this test's own perl child.
+        unsafe {
+            libc::kill(outsider_pid, libc::SIGKILL);
+        }
+        let _ = outsider.wait();
+        let _ = named.wait();
+    }
 
     /// Declared FIRST in this module on purpose, and it constructs no
     /// [`TestRedirect`] at all: that is what proves the guard is armed from the
