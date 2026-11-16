@@ -139,11 +139,16 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
         )
         | RemoveRowsError::Blocked(_)
         | RemoveRowsError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // SelectionChanged follows a kill and a delete: core's commit found
+        // the target selecting other rows than prepare did. It is unreachable
+        // under the daemon's exclusion around a removal, so seeing it means
+        // that exclusion was broken.
         RemoveRowsError::Removal(
             RemovalError::RuntimeSurvived { .. }
             | RemovalError::DiskRemoval { .. }
             | RemovalError::RuntimeIdentityMismatch { .. }
-            | RemovalError::Validation(_),
+            | RemovalError::Validation(_)
+            | RemovalError::SelectionChanged { .. },
         ) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     match error {

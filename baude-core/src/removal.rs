@@ -252,6 +252,15 @@ pub enum RemovalError {
     Persist {
         error: crate::persist::SaveError,
     },
+    /// At [`commit`], `target` no longer selects exactly the rows
+    /// [`prepare`] selected. The kill and disk stages have already run, so
+    /// this is reachable only when the caller's exclusion across the window
+    /// was broken; the state and the file are left untouched.
+    SelectionChanged {
+        target: RemovalTarget,
+        expected: Vec<RowKey>,
+        found: Vec<RowKey>,
+    },
 }
 
 impl fmt::Display for RemovalError {
@@ -281,6 +290,16 @@ impl fmt::Display for RemovalError {
             }
             Self::Validation(error) => write!(f, "removed state failed validation: {error}"),
             Self::Persist { error } => write!(f, "could not persist the removed row set: {error}"),
+            Self::SelectionChanged {
+                target,
+                expected,
+                found,
+            } => write!(
+                f,
+                "removal target {target:?} changed while its runtimes were stopped and its \
+                 directories deleted: prepared rows {expected:?}, rows selected now {found:?}; \
+                 nothing was saved"
+            ),
         }
     }
 }
@@ -488,6 +507,27 @@ pub fn prepare(
     Ok(PreparedRemoval { set, planned })
 }
 
+/// Refuse unless `set.target` still selects exactly the rows of `set` in
+/// `state`. Row keys are compared as sets, since keys are unique and the
+/// disk label of a deleted directory is expected to have changed. A target
+/// that no longer resolves at all selects no rows.
+fn reselect(state: &RepositoryState, set: &RemovalSet) -> Result<(), RemovalError> {
+    let expected: Vec<RowKey> = set.rows.iter().map(|row| row.row).collect();
+    let found: Vec<RowKey> = match select_rows(state, set.target) {
+        Ok(now) => now.rows.iter().map(|row| row.row).collect(),
+        Err(_) => Vec::new(),
+    };
+    let same = expected.len() == found.len() && expected.iter().all(|key| found.contains(key));
+    if same {
+        return Ok(());
+    }
+    Err(RemovalError::SelectionChanged {
+        target: set.target,
+        expected,
+        found,
+    })
+}
+
 /// A clone of `state` with the set's rows removed, refused unless it passes
 /// `validate_for_save`, together with the rows the clone dropped.
 fn candidate_without(
@@ -524,6 +564,14 @@ pub fn stop_and_delete(
 /// rebuilt here from `*state` as it is now, minus the prepared rows, and
 /// validated again, so a row another caller admitted or changed since
 /// [`prepare`] is saved rather than reverted to the state `prepare` read.
+///
+/// Before anything is built, the prepared target is selected again against
+/// `*state` and must name exactly the prepared rows, compared by row key
+/// only: a managed directory the disk stage deleted now reads as
+/// `AlreadyRemoved`, which is expected. Any other difference, a child added
+/// to the repository or a prepared row gone, returns
+/// [`RemovalError::SelectionChanged`] before the save closure is called.
+///
 /// `*state` is replaced and the removed rows' handles are drained from
 /// `runtimes` only after the save returns `Ok` or reports a committed
 /// replacement; on every `Err` `*state` and `runtimes` are untouched.
@@ -535,6 +583,7 @@ pub fn commit(
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
     let PreparedRemoval { set, planned } = prepared;
+    reselect(state, &set)?;
     let (candidate, removed) = candidate_without(state, &set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
     let clearing = clear_stage(&removed, state, &planned);
