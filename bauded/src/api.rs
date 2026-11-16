@@ -7767,6 +7767,149 @@ mod tests {
 
         removal_teardown(&shared, &root);
     }
+
+    /// The repository key `/rows` serves for the checkout session `id` runs in.
+    async fn repository_key_of_session(
+        app: &Router,
+        id: u64,
+    ) -> baude_core::repository::RepositoryKey {
+        let row = rows_checkout_for_session(&rows_body(app).await, id);
+        serde_json::from_value(row["repository_key"].clone())
+            .unwrap_or_else(|error| panic!("repository_key does not parse: {error}: {row}"))
+    }
+
+    /// 22.1-09, T-22.1-30. A plain `POST /sessions` into a repository a
+    /// removal holds answers 503 and stores nothing, whether the path is its
+    /// main checkout, a linked worktree the user made or a subfolder, in a
+    /// `git init` repository and in a cloned one.
+    #[tokio::test]
+    async fn busy_repository_plain_admission_is_503_and_stores_nothing() {
+        let (root, fixture, workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-admit").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&repo, &by_hand, "by-hand");
+        let subfolder = repo.join("docs");
+        std::fs::create_dir_all(&subfolder).unwrap();
+        std::fs::write(subfolder.join("notes.md"), b"draft\n").unwrap();
+        let (_upstream, clone) = cloned_repo(&root);
+        let clone_id = opened_folder_id(&app, &clone).await;
+        let clone_subfolder = clone.join("src");
+        std::fs::create_dir_all(&clone_subfolder).unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let clone_repository = repository_key_of_session(&app, clone_id).await;
+        assert_ne!(repository, clone_repository);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let clone_hold =
+            crate::manager::lock(&shared).reserve_repository_for_test(clone_repository);
+        let before = world_snapshot(&app, &state_path).await;
+        let busy = format!("repository busy: {}", repo.display());
+        let clone_busy = format!("repository busy: {}", clone.display());
+        for (path, expected, shape) in [
+            (&repo, &busy, "main checkout"),
+            (&by_hand, &busy, "linked worktree made by hand"),
+            (&subfolder, &busy, "subfolder of the main checkout"),
+            (
+                &clone_subfolder,
+                &clone_busy,
+                "subfolder of a cloned checkout",
+            ),
+        ] {
+            let (status, body) = open_folder(&app, path.to_str().unwrap(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "22.1-09 repository busy pin: POST /sessions on the {shape} {} of a reserved \
+                 repository answered {status} with body {body}",
+                path.display()
+            );
+            assert_eq!(&body, expected, "{shape}");
+            assert_world_unchanged(&app, &state_path, &before, shape).await;
+        }
+
+        drop(clone_hold);
+        drop(hold);
+        let (status, body) = open_folder(&app, by_hand.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            checkout_entries_at(&rows_body(&app).await, &by_hand).len(),
+            1
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, Pitfall 6. Worktree creation on a reserved repository is a
+    /// typed 503 with the same body, not a 400, and makes no branch; once the
+    /// hold drops the same request creates the worktree, so the worktree path
+    /// still takes exactly one reservation of its repository.
+    #[tokio::test]
+    async fn busy_repository_worktree_create_is_503() {
+        let (root, fixture, workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-worktree").await;
+        push_to_bare_origin(&root, fixture.path());
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let create = serde_json::json!({ "repo": repo, "worktree": "topic" });
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = removal_call(&app, "/sessions", &create).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 repository busy pin: worktree creation on a reserved repository answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, format!("repository busy: {}", repo.display()));
+        assert_eq!(
+            git_read(&repo, &["branch", "--list", "topic"]).as_deref(),
+            Some(""),
+            "a busy refusal created the branch"
+        );
+        assert_world_unchanged(&app, &state_path, &before, "after the worktree busy 503").await;
+
+        drop(hold);
+        let (status, body) = removal_call(&app, "/sessions", &create).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            git_read(&repo, &["branch", "--list", "topic"]).as_deref(),
+            Some("topic")
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-33. A reservation is keyed by the stored repository a
+    /// path joins: an unrelated repository is admitted while another one is
+    /// held.
+    #[tokio::test]
+    async fn busy_repository_leaves_an_unrelated_admission_alone() {
+        let (root, _fixture, _workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-unrelated").await;
+        let repository = repository_key_of_session(&app, id).await;
+        let unrelated = committed_repo(&root.join("b")).canonicalize().unwrap();
+
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let (status, body) = open_folder(&app, unrelated.to_str().unwrap(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "22.1-09 over-blocking pin: an unrelated repository was refused while another was \
+             reserved: {body}"
+        );
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 2, "{rows}");
+        assert_eq!(checkout_entries_at(&rows, &unrelated).len(), 1, "{rows}");
+        drop(hold);
+
+        removal_teardown(&shared, &root);
+    }
 }
 
 #[cfg(test)]
