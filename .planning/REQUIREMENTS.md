@@ -59,7 +59,7 @@ Approved scope: remove a repository, checkout, worktree or standalone row from b
 ### Validation and release
 
 - [x] **REL-01**: Integration tests cover each row kind with a live runtime and with no runtime, using fixtures shaped like real cloned and `git init` repositories, and assert on fixture output that process, worktree, binding and marker state are gone
-- [ ] **REL-02**: v2.8.0 ships through release-please with README and PWA docs describing the remove action, its confirmation, and what is and is not deleted
+- [x] **REL-02**: v2.8.0 ships through release-please with README and PWA docs describing the remove action, its confirmation, and what is and is not deleted
 
 ## Future Requirements
 
@@ -110,7 +110,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | API-02 | Phase 21 | Complete |
 | API-03 | Phase 21 | Complete |
 | REL-01 | Phase 22 | Complete |
-| REL-02 | Phase 22 | Pending |
+| REL-02 | Phase 22 | Complete |
 
 **Coverage:**
 - v2.8 requirements: 24 total

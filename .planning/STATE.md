@@ -2,20 +2,20 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase: 22.1
+current_phase: "22.1"
 current_phase_name: v2.8 Cleanup
-status: planning
-stopped_at: phase 22.1 inserted after the v2.8 audit, not yet planned (2026-11-15)
-last_updated: "2026-11-15T22:17:23.649Z"
-last_activity: 2026-11-15
-last_activity_desc: v2.8.0 released; milestone audit tech_debt; Phase 22.1 inserted
-state_head: 30089e4b5ef4dcb21442de9d7a4aa8409b12f000
+status: milestone_complete
+stopped_at: All v2.8 phases complete and verified, ready for /gsd-complete-milestone v2.8
+last_updated: "2026-11-16T14:54:05.021Z"
+last_activity: 2026-11-16
+last_activity_desc: Phases 22 and 22.1 verified passed; v2.8.1 released
+state_head: ec065eaafc268a54e2b32ae129139a715d3d472e
 progress:
   total_phases: 6
-  completed_phases: 1
-  total_plans: 38
-  completed_plans: 38
-  percent: 17
+  completed_phases: 6
+  total_plans: 49
+  completed_plans: 49
+  percent: 100
 ---
 
 # Project State
@@ -30,9 +30,9 @@ See: .planning/PROJECT.md (updated 2026-11-03)
 ## Current Position
 
 Phase: 22.1 — v2.8 Cleanup
-Plan: none yet
-Status: Inserted, ready to plan with /gsd-plan-phase 22.1
-Last activity: 2026-11-15 — v2.8.0 released by PR 130; milestone audit tech_debt; Phase 22.1 inserted
+Plan: 11 of 11
+Status: All v2.8 phases complete, ready for /gsd-complete-milestone v2.8
+Last activity: 2026-11-16 — Phases 22 and 22.1 verified passed; v2.8.1 released
 
 
 ## Performance Metrics
@@ -60,6 +60,8 @@ Last activity: 2026-11-15 — v2.8.0 released by PR 130; milestone audit tech_de
 | 17 | 1 | - | - |
 | 18 | 8 | - | - |
 | 21 | 11 | - | - |
+| 22.1 | 11 | - | - |
+| 22 | 8 | - | - |
 **Per-Plan Metrics:**
 
 | Plan | Duration | Tasks | Files |
@@ -409,7 +411,7 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-11-14T17:30:07.794Z
-Stopped at: context exhaustion at 76% (2026-11-14)
+Stopped at: Phase 22 complete, ready to plan Phase 22.1
 Resume file: None
 
 ## Operator Next Steps

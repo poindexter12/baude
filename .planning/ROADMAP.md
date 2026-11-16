@@ -70,10 +70,11 @@ Known gaps: see MILESTONES.md.
 **Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path, with the same removal available over the daemon REST API and from the PWA.
 
 - [x] Phase 18: Shared Kill-Then-Remove Lifecycle (8/8 plans) (completed 2026-11-03)
-- [x] Phase 19: Re-admission Suppression (0/? plans) (completed 2026-11-14)
-- [x] Phase 20: TUI Remove Action (0/? plans) (completed 2026-11-14)
-- [x] Phase 21: Daemon and PWA Parity (0/? plans) (completed 2026-11-13)
-- [ ] Phase 22: Validation and v2.8.0 Release (0/? plans)
+- [x] Phase 19: Re-admission Suppression (7/7 plans) (completed 2026-11-14)
+- [x] Phase 20: TUI Remove Action (4/4 plans) (completed 2026-11-14)
+- [x] Phase 21: Daemon and PWA Parity (11/11 plans) (completed 2026-11-13)
+- [x] Phase 22: Validation and v2.8.0 Release (8/8 plans) (completed 2026-11-16)
+- [x] Phase 22.1: v2.8 Cleanup (11/11 plans) (completed 2026-11-16)
 
 ### Phase 18: Shared Kill-Then-Remove Lifecycle
 
@@ -202,7 +203,7 @@ Plans:
   2. README and PWA docs describe the remove action, its confirmation, and what is and is not deleted
   3. `scripts/gate.sh` and `scripts/gate.sh --linux` pass and v2.8.0 is released through release-please
 
-**Plans**: 8 plans
+**Plans**: 8/8 plans complete
 
 Plans, in execution order. 22-06, 22-07 and 22-08 are gap closure, added 2026-11-14: verifying phases 18 and 19 reproduced two product defects, and both are fixed before the validation tests run. Wave 1 runs one plan at a time, in the order listed.
 - [x] 22-06-PLAN.md — Wave 1. Gap closure, Phase 18 truth 13: `Pty::kill_and_wait` succeeds on macOS when the group's only member is an exited, unreaped leader; BL-11 marked resolved
@@ -212,7 +213,7 @@ Plans, in execution order. 22-06, 22-07 and 22-08 are gap closure, added 2026-11
 - [x] 22-02-PLAN.md — Wave 2. Daemon: `rows_removed` seen on GET /events over a real socket, and a parent removal on a true clone read from disk
 - [x] 22-03-PLAN.md — Wave 2. TUI: single-target confirm of a main checkout and of a standalone row, read from process table and files
 - [x] 22-04-PLAN.md — Wave 2. README: removing projects, the confirmation, deletes and keeps, the daemon endpoints and event, remote rows
-- [ ] 22-05-PLAN.md — Wave 3. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
+- [x] 22-05-PLAN.md — Wave 3. Both gates on the final commit, message checks, push and one pull request to main; the release itself is the owner's
 
 ## Backlog
 
@@ -230,7 +231,7 @@ See `.planning/BACKLOG.md`:
 **Goal:** Close the v2.8 audit tech debt the owner chose for this milestone: one shared lift-key function and consistent re-admission between the TUI and the daemon over their shared suppression store; test hygiene so suites leave no stray runtimes or fixture temp dirs; PWA rows that say whether removal deletes a folder and an "other sessions" heading for unclaimed sessions; and WR-06, so POST /removals no longer holds the manager mutex for the whole removal while T-21-14, T-21-28 and T-21-53 stay mitigated.
 **Requirements**: TBD
 **Depends on:** Phase 22
-**Plans:** 11 plans
+**Plans:** 11/11 plans complete
 
 Plans:
 - [x] 22.1-01-PLAN.md
