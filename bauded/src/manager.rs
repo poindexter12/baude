@@ -1411,6 +1411,15 @@ impl Manager {
             .map(|row| row.canonical_path.to_path_buf())
     }
 
+    /// The refusal for a reserved repository, its body naming the stored main
+    /// checkout, the same body a busy `POST /removals` answers with.
+    fn repository_busy(&self, repository: RepositoryKey) -> MutationError {
+        MutationError::Busy(match self.repository_path(repository) {
+            Some(path) => format!("repository busy: {}", path.display()),
+            None => format!("repository busy: {repository:?}"),
+        })
+    }
+
     /// The refusal for a reserved standalone row, its body naming the folder.
     fn folder_busy(&self, key: StandaloneKey) -> MutationError {
         MutationError::Busy(match self.standalone_path(key) {
@@ -1747,8 +1756,8 @@ impl Manager {
                     ..
                 }
                 | LifecycleOutcome::Focused { runtime, .. } => runtime,
-                LifecycleOutcome::Busy { .. } => {
-                    return Err(anyhow!("repository lifecycle is busy; retry the action").into())
+                LifecycleOutcome::Busy { repository } => {
+                    return Err(self.repository_busy(repository))
                 }
                 _ => return Err(anyhow!("activation produced no runtime").into()),
             };
@@ -1803,6 +1812,31 @@ impl Manager {
                 }
                 PlainAdmission::Discovered => None,
                 PlainAdmission::JoinStored(key) => Some(*key),
+            };
+            // The stored repository this admission adds a checkout to: the
+            // joined row, or the row whose common directory discovery found.
+            // It is reserved until the admission returns, so no admission
+            // adds a child to a repository a removal holds. Only this plain
+            // path reserves here; the worktree path above took its own
+            // reservation inside `activate_branch_worktree` and has returned.
+            let joined = match (&route, &discovery) {
+                (PlainAdmission::JoinStored(key), _) => Some(*key),
+                (PlainAdmission::Discovered, Ok(snapshot)) => {
+                    let common = PersistedPath::from_path(&snapshot.common_dir);
+                    self.repository_state
+                        .repositories
+                        .iter()
+                        .find(|repository| repository.observed_common_dir == common)
+                        .map(|repository| repository.key)
+                }
+                _ => None,
+            };
+            let _reservation = match joined {
+                Some(repository) => match self.repository_reservations.reserve(repository) {
+                    Ok(reservation) => Some(reservation),
+                    Err(_) => return Err(self.repository_busy(repository)),
+                },
+                None => None,
             };
             self.ensure_runtime_capacity(&cwd, &repo_root, &route)?;
             let state_before = self.repository_state.clone();

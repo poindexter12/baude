@@ -7868,7 +7868,11 @@ mod tests {
         );
         assert_eq!(body, format!("repository busy: {}", repo.display()));
         assert_eq!(
-            git_read(&repo, &["branch", "--list", "topic"]).as_deref(),
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "topic"]
+            )
+            .as_deref(),
             Some(""),
             "a busy refusal created the branch"
         );
@@ -7878,7 +7882,11 @@ mod tests {
         let (status, body) = removal_call(&app, "/sessions", &create).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(
-            git_read(&repo, &["branch", "--list", "topic"]).as_deref(),
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "topic"]
+            )
+            .as_deref(),
             Some("topic")
         );
 
