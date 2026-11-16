@@ -1300,9 +1300,15 @@ mod tests {
     /// Append JSONL records to a transcript fixture and point `meta` at it,
     /// then drive the real incremental reader. Mirrors how `poll()` feeds
     /// `read_transcript_tail` (offset-tracked tail reads), so tests exercise
-    /// the same seam production does. Returns the temp path for cleanup.
-    fn feed_transcript(meta: &mut ClaudeMeta, suffix: &str, lines: &[&str]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+    /// the same seam production does. Returns the fixture root holding the
+    /// transcript, which removes it on drop, and the transcript path.
+    fn feed_transcript(
+        meta: &mut ClaudeMeta,
+        suffix: &str,
+        lines: &[&str],
+    ) -> (crate::testing::FixtureRoot, PathBuf) {
+        let root = crate::testing::FixtureRoot::new(&format!("baude-test-transcript-{suffix}"));
+        let path = root.join(format!(
             "baude-test-transcript-{}-{}.jsonl",
             std::process::id(),
             suffix
@@ -1315,7 +1321,7 @@ mod tests {
         fs::write(&path, body).unwrap();
         meta.transcript = Some(path.clone());
         meta.read_transcript_tail();
-        path
+        (root, path)
     }
 
     #[test]
@@ -1327,7 +1333,7 @@ mod tests {
         // Case A: transcript sets the model, then the bridge emits its own —
         // bridge wins (poll order: transcript, then bridge).
         let mut meta = ClaudeMeta::default();
-        let tpath = feed_transcript(
+        let (_troot, tpath) = feed_transcript(
             &mut meta,
             "model-wins",
             &[r#"{"type":"assistant","message":{"model":"from-transcript"}}"#],
@@ -1349,7 +1355,7 @@ mod tests {
         // Case B: transcript sets the model, the bridge omits it —
         // the transcript value survives (the model guard prevents clobber).
         let mut meta2 = ClaudeMeta::default();
-        let tpath2 = feed_transcript(
+        let (_troot2, tpath2) = feed_transcript(
             &mut meta2,
             "model-survives",
             &[r#"{"type":"assistant","message":{"model":"keep-me"}}"#],
@@ -1803,13 +1809,8 @@ mod tests {
     /// A unique on-disk fixture root. Keyed by pid and a counter so parallel
     /// cases never collide, and rooted in the temp dir because the redirect
     /// short-circuits before any containment check.
-    fn isolated_claude_root(label: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "baude-meta-claude-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+    fn isolated_claude_root(label: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-meta-claude-{label}"))
     }
 
     #[test]
@@ -1916,8 +1917,6 @@ mod tests {
         assert_eq!(meta.model.as_deref(), Some("fixture-model"));
         assert_eq!(meta.totals.input, 3);
         assert_eq!(meta.transcript_path(), Some(transcript.as_path()));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1933,12 +1932,7 @@ mod tests {
         // filesystem timestamp tick. Pin the mtime to a fixed value so the
         // test reproduces coarse-granularity behaviour on any filesystem,
         // then confirm a grown file is still read.
-        let dir = std::env::temp_dir().join(format!(
-            "baude-meta-gate-{}-{}",
-            std::process::id(),
-            "same-tick"
-        ));
-        let _ = fs::create_dir_all(&dir);
+        let dir = crate::testing::FixtureRoot::new("baude-meta-gate-same-tick");
         let path = dir.join("hook-events.jsonl");
         fs::write(&path, b"{\"schema\":1,\"event\":\"Stop\",\"ts\":1}\n").unwrap();
         let frozen = fs::metadata(&path).unwrap().modified().unwrap();
@@ -1966,7 +1960,6 @@ mod tests {
             !(mtime_unchanged && len_unchanged),
             "an mtime-only gate would skip this read and lose the second Stop event"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- BL-02: the claude session id must resolve for every real spawn ----
@@ -2083,7 +2076,6 @@ mod tests {
 
         assert_eq!(meta.session_id.as_deref(), Some(sid.as_str()));
         assert_eq!(meta.model.as_deref(), Some("claude-opus-4-8"));
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Sub-cause 2, as suspected, does not reproduce: Claude stamps
@@ -2117,7 +2109,6 @@ mod tests {
         meta.poll(&cwd, Some(pid), spawn, &cwd);
 
         assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4-6"));
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A session-leader shell that forks one child, the shape of the pane
@@ -2205,7 +2196,6 @@ mod tests {
 
         reap(pane, forked);
         reap(other_pane, other_forked);
-        fs::remove_dir_all(&root).ok();
 
         assert_eq!(first.0.as_deref(), Some(sid.as_str()));
         assert_eq!(first.1.as_deref(), Some("claude-opus-4-8"));
@@ -2337,7 +2327,6 @@ mod tests {
         let _ = pane.wait();
 
         assert_eq!(resolved, (Some(sid), Some("claude-opus-4-8".to_string())));
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Per-directory env shape: the pane shell starts with baude's dir, and
@@ -2381,7 +2370,6 @@ mod tests {
 
         assert_eq!(first.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(second.as_deref(), Some("claude-sonnet-4-6"));
-        fs::remove_dir_all(&root).ok();
     }
 
     /// The macOS `KERN_PROCARGS2` layout: argc, exec path, NUL padding, argv,
