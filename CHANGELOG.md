@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.1](https://github.com/poindexter12/baude/compare/v2.8.0...v2.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* v2.8 cleanup of removal locking, suppression sync and test hygiene ([24de8db](https://github.com/poindexter12/baude/commit/24de8db48d08f34036d5a138617c917b109fb04c))
+
 ## [2.8.0](https://github.com/poindexter12/baude/compare/v2.7.3...v2.8.0) (2026-11-15)
 
 
