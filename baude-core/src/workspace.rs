@@ -725,15 +725,7 @@ mod tests {
             return;
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "baude-seeded-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&root).expect("child fixture root");
+        let root = crate::testing::FixtureRoot::new("baude-seeded-cache");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -742,8 +734,8 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(SEEDED_CACHE_CHILD, "1")
-            .env("BAUDE_TEST_FIXTURE_ROOT", &root)
-            .env("HOME", &root)
+            .env("BAUDE_TEST_FIXTURE_ROOT", root.path())
+            .env("HOME", root.path())
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("CLAUDE_CONFIG_DIR", root.join("claude"))
@@ -754,7 +746,6 @@ mod tests {
         let status = output.status;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             status.success(),
             "seeded-cache child failed ({status})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
