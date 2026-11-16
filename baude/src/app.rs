@@ -8899,6 +8899,10 @@ mod tests {
         /// root that no longer exists.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        /// The owned root, declared last so it is removed only after both
+        /// guards above are restored. `None` when the root came from
+        /// `BAUDE_TEST_FIXTURE_ROOT`: the re-executing parent owns that one.
+        _owned_root: Option<baude_core::testing::FixtureRoot>,
     }
 
     impl AdmissionRepo {
@@ -8963,12 +8967,18 @@ mod tests {
     #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives the test body"]
     fn admission_repo(name: &str) -> AdmissionRepo {
-        let root = std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
-            });
-        let _ = std::fs::remove_dir_all(&root);
+        let (root, owned_root) = match std::env::var_os("BAUDE_TEST_FIXTURE_ROOT") {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                let _ = std::fs::remove_dir_all(&root);
+                (root, None)
+            }
+            None => {
+                let owned =
+                    baude_core::testing::FixtureRoot::new(&format!("baude-admission-{name}"));
+                (owned.to_path_buf(), Some(owned))
+            }
+        };
         // Managed worktrees are allocated under the data dir and the hook seed
         // is derived from the binary path, so one redirect pins both to the
         // fixture root before anything can create either. Without this the
@@ -9017,6 +9027,7 @@ mod tests {
             repo,
             _identity: identity,
             _redirect: redirect,
+            _owned_root: owned_root,
         }
     }
 
@@ -10619,6 +10630,27 @@ mod tests {
         app.message.as_ref().map(|(message, _)| message.as_str())
     }
 
+    /// Stop every runtime `app` lists and reap what each one leaves behind.
+    ///
+    /// `App::kill_all` signals each session's PTY leader. A command the
+    /// interactive gate shell ran as a job sits in a process group of its own
+    /// and can outlive that leader; what still names it is the session the
+    /// leader created. So a reaper per agent and shell identity is built
+    /// before `kill_all` and dropped after it, sweeping the recorded session.
+    fn kill_all_and_reap(app: &mut App) {
+        let reapers: Vec<baude_core::testing::RuntimeReaper> = app
+            .sessions
+            .iter()
+            .flat_map(|session| {
+                std::iter::once(session.claude.process_identity())
+                    .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+            })
+            .map(baude_core::testing::RuntimeReaper::for_identity)
+            .collect();
+        app.kill_all();
+        drop(reapers);
+    }
+
     /// READM-03 read side, D-09 and D-11: an entry for a linked worktree keeps
     /// the inventory sweep from admitting it while its siblings still come in.
     #[test]
@@ -10648,8 +10680,7 @@ mod tests {
         assert!(is_suppressed(&fx.suppressed), "the sweep never lifts");
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// READM-04, D-12 and D-13: `n` with the checkout's own path lifts the
@@ -10708,8 +10739,7 @@ mod tests {
         assert!(!checkout_row(&app, &fx.kept).unwrap().active_intent());
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// The cloned shape plus two linked worktrees outside the managed root,
@@ -11864,8 +11894,7 @@ mod tests {
         assert_eq!(app.repository_state.checkouts.len(), 2);
         assert_eq!(app.repository_state.repositories.len(), 1);
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-12, the other two routes: a relaunch inside the removed checkout
@@ -11883,7 +11912,7 @@ mod tests {
             .unwrap()
             .expect("initial runtime");
         assert!(checkout_row(&first, &fx.suppressed).is_none());
-        first.kill_all();
+        kill_all_and_reap(&mut first);
 
         // Relaunch from a subfolder inside the removed checkout, over the same
         // state file: the launch-dir admission in `restore` is the route.
@@ -11933,8 +11962,7 @@ mod tests {
         );
         relaunched.repository_state.validate().unwrap();
 
-        relaunched.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut relaunched);
     }
 
     /// D-09: the store is advisory. When the lift cannot write, the admission
@@ -11988,8 +12016,7 @@ mod tests {
         );
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// SQ-5, end to end: the user runs `git switch` in their own primary
@@ -17414,7 +17441,7 @@ mod tests {
         }
         assert_eq!(app.sessions.len(), n, "fixture created {n} runtimes");
         let order = app.ordered_ids();
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         let mut restarted = App::new(repo);
         restarted.remote = None;
         restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
@@ -17432,7 +17459,7 @@ mod tests {
 
     #[test]
     fn restore_single_durable_save_for_n_sessions() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-one-save", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-one-save", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let first = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -17456,8 +17483,7 @@ mod tests {
             1,
             "Phase B releases never save"
         );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -17626,10 +17652,9 @@ mod tests {
         broken_branch: String,
         /// Where the fixture's saved state file lives.
         state_root: PathBuf,
-        /// The fixture root to remove when the case is done.
-        root: PathBuf,
-        /// Retained so the fixture's redirects outlive the App. Fields drop
-        /// in DECLARATION order, so this one is last to drop it LAST.
+        /// Retained so the fixture's redirects and root outlive the App.
+        /// Fields drop in DECLARATION order, so this one is last to drop it
+        /// LAST.
         _fixture: AdmissionRepo,
     }
 
@@ -17643,7 +17668,6 @@ mod tests {
             app,
             broken_branch,
             state_root,
-            root,
             _fixture: fixture,
         }
     }
@@ -17760,8 +17784,7 @@ mod tests {
             let case = how.label();
             let mut stale = stale_restore_fixture(&format!("restore-cause-{case}"), 3, how);
             assert_one_row_refused(&mut stale, 3, case);
-            stale.app.kill_all();
-            let _ = std::fs::remove_dir_all(&stale.root);
+            kill_all_and_reap(&mut stale.app);
         }
     }
 
@@ -17774,8 +17797,7 @@ mod tests {
                 stale_restore_fixture(&format!("restore-{tag}"), 3, BreakCheckout::BranchChanged);
             retag_saved_checkout_lifecycle(&stale.state_root, &stale.broken_branch, tag);
             assert_one_row_refused(&mut stale, 3, tag);
-            stale.app.kill_all();
-            let _ = std::fs::remove_dir_all(&stale.root);
+            kill_all_and_reap(&mut stale.app);
         }
     }
 
@@ -17790,9 +17812,8 @@ mod tests {
         primary: CheckoutKey,
         /// A retained checkout that is not the primary.
         feature: CheckoutKey,
-        root: PathBuf,
         /// Fields drop in DECLARATION order, so the fixture is last and its
-        /// redirects outlive the App.
+        /// redirects and root outlive the App.
         _fixture: AdmissionRepo,
     }
 
@@ -17840,7 +17861,7 @@ mod tests {
             .find(|key| *key != primary)
             .expect("a non-primary checkout");
         assert_eq!(app.sessions.len(), n + 1, "{n} checkouts and a standalone");
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         let mut restarted = App::new(repo);
         restarted.remote = None;
         restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
@@ -17850,7 +17871,6 @@ mod tests {
             standalone,
             primary,
             feature,
-            root,
             _fixture: fixture,
         }
     }
@@ -17897,8 +17917,7 @@ mod tests {
         assert!(saved.app.restore_in_progress(), "Phase B has work to do");
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "every surviving row released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     /// BL-07(a): the launch-directory admission runs after the saved sessions
@@ -17934,8 +17953,7 @@ mod tests {
         );
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "every saved session released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     /// BL-07(b): the backstop. A Phase A write refused for a reason that names
@@ -17987,13 +18005,12 @@ mod tests {
         assert!(saved.app.restore_in_progress(), "the rest still release");
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "the other rows all released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     #[test]
     fn restore_unpauses_only_after_durable_save() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-release-order", 2);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-release-order", 2);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -18009,13 +18026,12 @@ mod tests {
             .expect("second step");
         assert_eq!(gated_count(&app), 0);
         assert!(finished && !app.restore_in_progress());
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_incremental_one_per_iteration() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-incremental", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-incremental", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -18029,13 +18045,12 @@ mod tests {
             .expect("step 3");
         assert_eq!(gated_count(&app), 0, "step 3: last release");
         assert!(finished);
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_progress_visible() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-progress", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-progress", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let msg = |app: &App| {
@@ -18054,13 +18069,12 @@ mod tests {
             .expect("step 3");
         assert_eq!(msg(&app), "restoring 3/3");
         assert!(finished);
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_maintains_sidebar_order() {
-        let (_fixture, mut app, order, root) = saved_sessions_fixture("restore-order", 3);
+        let (_fixture, mut app, order, _root) = saved_sessions_fixture("restore-order", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let mut steps = 0;
@@ -18075,8 +18089,7 @@ mod tests {
             order,
             "restored sidebar order equals the saved order"
         );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
