@@ -505,6 +505,83 @@ mod tests {
         );
     }
 
+    /// The worktree path `git worktree list --porcelain`, run in `checkout`,
+    /// prints for `checkout` itself. Exactly one listed worktree names it.
+    fn porcelain_path(checkout: &Path) -> PathBuf {
+        let listed = crate::testing::git_in(checkout, &["worktree", "list", "--porcelain"]);
+        let matching: Vec<PathBuf> = listed
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .filter(|path| folder_key(path) == folder_key(checkout))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "git lists {} exactly once: {listed}",
+            checkout.display()
+        );
+        matching[0].clone()
+    }
+
+    /// T-22.1-22: the lift key of every row kind, and of a subfolder of
+    /// each, is the worktree git lists for that checkout: never the main
+    /// worktree for a linked one, never a parent. A folder git does not know
+    /// keys on its own canonical path.
+    #[test]
+    fn lift_key_names_the_checkout_root_for_every_row_kind() {
+        let guards = identity("lift-key");
+        let root: &Path = &guards.2;
+
+        let topology = crate::testing::cloned_topology(root);
+        let init = folder(root, "init");
+        crate::testing::git_in(&init, &["init", "-q", "-b", "main"]);
+        crate::testing::git_in(&init, &["config", "user.email", "test@example.com"]);
+        crate::testing::git_in(&init, &["config", "user.name", "Test"]);
+        std::fs::write(init.join("tracked"), b"one\n").unwrap();
+        crate::testing::git_in(&init, &["add", "tracked"]);
+        crate::testing::git_in(&init, &["commit", "-q", "-m", "initial"]);
+        let by_hand = root.join("by-hand");
+        crate::testing::git_in(
+            &init,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "by-hand",
+                by_hand.to_str().unwrap(),
+            ],
+        );
+
+        let kinds: [(&str, &Path); 5] = [
+            ("clone main checkout", &topology.clone),
+            ("managed default worktree", &topology.default_worktree),
+            ("managed branch worktree", &topology.managed_worktree),
+            ("git-init main checkout", &init),
+            ("hand-made linked worktree", &by_hand),
+        ];
+        for (kind, checkout) in kinds {
+            let listed = porcelain_path(checkout);
+            assert_eq!(
+                folder_key(&lift_key(checkout)),
+                folder_key(&listed),
+                "{kind} {}",
+                checkout.display()
+            );
+            let sub = folder(checkout, "sub");
+            assert_eq!(
+                folder_key(&lift_key(&sub)),
+                folder_key(&listed),
+                "subfolder {} of the {kind}",
+                sub.display()
+            );
+        }
+
+        let plain = folder(root, "plain");
+        assert_eq!(lift_key(&plain), plain.canonicalize().unwrap());
+    }
+
     #[test]
     fn file_is_named_per_workspace_beside_breadcrumbs() {
         let _guards = identity("naming");

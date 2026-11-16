@@ -2498,14 +2498,15 @@ impl App {
         Ok(())
     }
 
-    /// Forget the suppression entry for the repository root of `path`, if any,
+    /// Forget the suppression entry for the checkout root of `path`, if any,
     /// so an explicit admission of a removed checkout re-admits it. The key is
-    /// the admitted path's own `repo_root`, never the main worktree and never a
-    /// child, so admitting the parent root leaves a child's entry alone (D-12).
+    /// `suppression::lift_key`, the one the daemon lifts too: the admitted
+    /// path's own checkout root, never the main worktree and never a child, so
+    /// admitting the parent root leaves a child's entry alone (D-12).
     /// The store is advisory: a write failure is a message, never an error out
     /// of an admission or a launch (D-09).
     fn lift_suppression(&mut self, path: &Path) {
-        let key_path = git::repo_root(path).unwrap_or_else(|| path.to_path_buf());
+        let key_path = suppression::lift_key(path);
         if let Err(error) = suppression::lift(&persist::config_dir(), &key_path) {
             self.set_message(format!("suppression lift failed: {error}"));
         }
@@ -10720,6 +10721,33 @@ mod tests {
         assert_eq!(app.repository_state.checkouts.len(), 3);
         assert!(!checkout_row(&app, &fx.kept).unwrap().active_intent());
         app.repository_state.validate().unwrap();
+
+        kill_all_and_reap(&mut app);
+    }
+
+    /// The TUI side of the shared lift key: admitting a subfolder of a
+    /// hand-made linked worktree lifts the entry for that worktree, as a
+    /// daemon admission of the same subfolder does, and leaves a sibling
+    /// worktree's entry alone.
+    #[test]
+    fn tui_subfolder_admission_lifts_the_checkout_entry() {
+        let fx = suppression_fixture("suppression-lift-subfolder");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+        seed_suppression(&fx.kept, &fx.common_dir);
+        let sub = fx.suppressed.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&sub)
+            .expect("explicit admission of a subfolder of the suppressed worktree");
+
+        assert!(
+            !is_suppressed(&fx.suppressed),
+            "admitting {} left the entry for its checkout {}",
+            sub.display(),
+            fx.suppressed.display()
+        );
+        assert!(is_suppressed(&fx.kept), "a sibling entry stays");
 
         kill_all_and_reap(&mut app);
     }
