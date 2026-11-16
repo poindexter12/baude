@@ -710,22 +710,18 @@ function renderList() {
   let rows;
   if (removalController) {
     // The hierarchy comes from the controller's /rows body, joined to
-    // /sessions on session id. A session no row claims is still listed, as a
-    // card with no remove control: it has no durable key to remove by.
-    const claimed = new Set();
-    const tree = BaudeRemovalController.renderRowsList(removalController.getRows(), {
+    // /sessions on session id. A session no row claims is still listed, under
+    // `other sessions` with archived ones last, as a card with no remove
+    // control: it has no durable key to remove by.
+    const rowsBody = removalController.getRows();
+    rows = BaudeRemovalController.renderRowsList(rowsBody, {
       removal: BaudeRemoval,
       card: (sid) => {
         const s = session(sid);
-        if (!s) return null;
-        claimed.add(s.id);
-        return rowHtml(s);
+        return s ? rowHtml(s) : null;
       },
+      keyless: BaudeRemovalController.unclaimedSessions(rowsBody, state.sessions),
     });
-    const rest = (list) => list.filter((s) => !claimed.has(s.id)).map(rowHtml).join("");
-    const restArchived = rest(archived);
-    rows = tree + rest(active)
-      + (restArchived ? `<div class="secthead">archived</div>${restArchived}` : "");
   } else {
     rows = active.map(rowHtml).join("")
       + (archived.length

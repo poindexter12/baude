@@ -186,11 +186,11 @@ mod tests {
         // A new cache name is what makes an installed page drop the shell it
         // cached before the removal scripts existed.
         assert!(
-            worker.contains("\"baude-v7\""),
-            "cache name is not baude-v7"
+            worker.contains("\"baude-v8\""),
+            "cache name is not baude-v8"
         );
         assert!(
-            !worker.contains("baude-v6"),
+            !worker.contains("baude-v7"),
             "the old cache name is still served"
         );
 

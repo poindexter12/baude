@@ -503,6 +503,27 @@
     return rows.filter((row) => row.archived !== true).concat(rows.filter((row) => row.archived === true));
   }
 
+  // The /sessions entries no /rows row claims: every session whose id no
+  // repository checkout and no standalone row carries as session_id, in the
+  // order served with archived ones last. These are renderRowsList's
+  // `keyless` sessions. Neither argument is changed, and a malformed part of
+  // either is skipped rather than thrown on.
+  function unclaimedSessions(rowsBody, sessions) {
+    const body = isRecord(rowsBody) ? rowsBody : {};
+    const claimed = new Set();
+    const claim = (row) => {
+      if (isRecord(row) && row.session_id !== null && row.session_id !== undefined) {
+        claimed.add(row.session_id);
+      }
+    };
+    for (const repository of asArray(body.repositories)) {
+      if (!isRecord(repository)) continue;
+      for (const checkout of asArray(repository.checkouts)) claim(checkout);
+    }
+    for (const standalone of asArray(body.standalone)) claim(standalone);
+    return archivedLast(asArray(sessions).filter((session) => isRecord(session) && !claimed.has(session.id)));
+  }
+
   // One row: its card when it has a live session the page knows, else its
   // name and path, then what it is, then its remove control.
   function rowHtml(removal, kind, key, row, role, options) {
@@ -572,7 +593,9 @@
     };
   }
 
-  const BaudeRemovalController = { createRemovalController, renderRowsList, confirmControl };
+  const BaudeRemovalController = {
+    createRemovalController, renderRowsList, unclaimedSessions, confirmControl,
+  };
 
   globalThis.BaudeRemovalController = BaudeRemovalController;
   if (typeof module !== "undefined" && module.exports) {
