@@ -3160,6 +3160,69 @@ mod tests {
         assert_eq!(load_state(&f.state_root()), state);
     }
 
+    /// A checkout added to the target repository after `prepare` would be
+    /// orphaned by a save of the prepared rows. `commit` refuses with
+    /// `SelectionChanged`, naming both row lists, and leaves the state, the
+    /// file and the save closure untouched. The assertions read the error's
+    /// Debug name, Display and source, the forms a caller sees.
+    #[test]
+    fn commit_refuses_when_the_selected_rows_changed() {
+        let f = RemovalFixture::new("selection-changed");
+        let (mut state, k, _child, managed) = inactive_row(&f, "wt-selection");
+        let before_bytes = write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let target = RemovalTarget::Repository(k);
+
+        let prepared = prepare(&state, target, &handles).expect("prepare");
+        let expected: Vec<RowKey> = prepared.set.rows.iter().map(|row| row.row).collect();
+        let effects = stop_and_delete(&prepared, &mut handles).expect("stop and delete");
+        assert!(
+            !managed.exists(),
+            "the disk stage deleted the managed child"
+        );
+
+        let late = f.root.join("late");
+        fs::create_dir_all(&late).expect("create the late checkout");
+        checkout(&mut state, k, CheckoutRole::ManagedBranch, false, &late);
+        state
+            .validate_for_save()
+            .expect("the state with the late checkout is save-valid");
+        let found: Vec<RowKey> = select_rows(&state, target)
+            .expect("the target still resolves")
+            .rows
+            .iter()
+            .map(|row| row.row)
+            .collect();
+        assert_ne!(found, expected, "the fixture changed the selection");
+        let before = state.clone();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let error = commit(&mut state, prepared, effects, &mut handles, save)
+            .expect_err("commit must refuse a changed selection");
+
+        let debug = format!("{error:?}");
+        assert!(
+            debug.starts_with("SelectionChanged"),
+            "commit must refuse with SelectionChanged, got {debug}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{expected:?}")),
+            "message {message:?} must name the prepared rows {expected:?}"
+        );
+        assert!(
+            message.contains(&format!("{found:?}")),
+            "message {message:?} must name the rows the target selects now {found:?}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "SelectionChanged wraps no other error"
+        );
+        assert_eq!(state, before, "the state is untouched");
+        assert_eq!(calls.get(), 0, "the save closure is never called");
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
+    }
+
     // ---- crash and disk failure between delete and save (plan 05) ----
 
     use crate::git::ReconciliationUnavailable;
