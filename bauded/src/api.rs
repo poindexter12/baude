@@ -3928,6 +3928,118 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// The worktree path `git worktree list --porcelain`, run in `main`,
+    /// prints for the worktree checked out on `branch`.
+    fn porcelain_path_on_branch(main: &Path, branch: &str) -> PathBuf {
+        let listed = git_read(main, &["worktree", "list", "--porcelain"])
+            .expect("git lists the repository's worktrees");
+        let wanted = format!("branch refs/heads/{branch}");
+        let matching: Vec<PathBuf> = listed
+            .split("\n\n")
+            .filter(|block| block.lines().any(|line| line == wanted))
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("worktree "))
+                    .map(PathBuf::from)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "one worktree on {branch}: {listed}");
+        matching[0].clone()
+    }
+
+    /// The cross-client write side: a removal over REST writes exactly the
+    /// entry the TUI's admission sweep reads. One entry, keyed on the path
+    /// git lists for the removed worktree, tagged with the repository's
+    /// common directory, with no primary member, for a directory that is
+    /// still there for a sweep to find.
+    #[tokio::test]
+    async fn suppression_daemon_removal_writes_the_entry_the_tui_sweep_reads() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-shape");
+        let config = baude_core::persist::config_dir();
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+
+        opened_folder_id(&app, &main_path).await;
+        let by_hand_id = opened_folder_id(&app, &by_hand).await;
+        let rows = rows_body(&app).await;
+        let entries = checkout_entries_at(&rows, &by_hand);
+        assert_eq!(entries.len(), 1, "{rows}");
+        assert_eq!(
+            entries[0]["session_id"].as_u64(),
+            Some(by_hand_id),
+            "{rows}"
+        );
+        assert!(!baude_core::suppression::file_path(&config).exists());
+
+        removed_over_routes(
+            &app,
+            &serde_json::json!({ "checkout": entries[0]["checkout_key"] }),
+        )
+        .await;
+
+        let listed = porcelain_path_on_branch(&main_path, "by-hand");
+        let text = std::fs::read_to_string(baude_core::suppression::file_path(&config)).unwrap();
+        let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let written = store["entries"].as_object().expect("an entries object");
+        assert_eq!(written.len(), 1, "{store}");
+        let (key, entry) = written.iter().next().unwrap();
+        assert_eq!(
+            key,
+            &baude_core::breadcrumbs::folder_key(&listed),
+            "{store}"
+        );
+        assert_eq!(
+            entry["repository_common_dir"].as_str(),
+            Some(baude_core::breadcrumbs::folder_key(&printed_common_dir(&main_path)).as_str()),
+            "{store}"
+        );
+        assert_eq!(entry.get("primary"), None, "{store}");
+        assert!(by_hand.is_dir(), "{}", by_hand.display());
+        assert!(
+            baude_core::suppression::is_suppressed(&config, &listed),
+            "{}",
+            listed.display()
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The cross-client lift side: an entry written exactly as core's clear
+    /// stage writes one, by whichever client removed the row, is gone once
+    /// the daemon admits that path.
+    #[tokio::test]
+    async fn suppression_daemon_admission_lifts_an_entry_any_client_wrote() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-any-client");
+        let config = baude_core::persist::config_dir();
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+
+        baude_core::suppression::suppress(
+            &config,
+            &by_hand,
+            &printed_common_dir(&by_hand),
+            baude_core::meta::now_unix_ms(),
+        )
+        .unwrap();
+        assert!(reads_suppressed(&by_hand), "{}", by_hand.display());
+
+        let (status, body) = open_folder(&app, by_hand.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            !reads_suppressed(&by_hand),
+            "POST /sessions admitted {} and its entry is still in the store",
+            by_hand.display()
+        );
+        let text = std::fs::read_to_string(baude_core::suppression::file_path(&config)).unwrap();
+        let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(store["entries"], serde_json::json!({}), "{store}");
+
+        removal_teardown(&shared, &root);
+    }
+
     /// A folder an earlier daemon stored as an unavailable repository plus a
     /// checkout keeps that shape, takes a second session into the same
     /// repository row, and becomes a standalone row only after that
