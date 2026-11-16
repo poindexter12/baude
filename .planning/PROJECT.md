@@ -14,19 +14,14 @@ a Tailscale/VPN interface rather than an auth layer.
 You can see at a glance which of your many coding-agent sessions needs you next —
 and act on it — whether you're at the terminal or on your phone.
 
-## Current State (v2.7.3; last GSD milestone v2.3 shipped 2026-09-22)
+## Current State (v2.8.1; GSD milestone v2.8 Project Removal closed 2026-11-16)
 
-v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 through Phase 17 (phases 13-17, archived under `milestones/v2.3-*`, closed out 2026-10-13). v2.3.1 through v2.7.3 shipped from the backlog and from sidequest tickets rather than from GSD phases, so no roadmap phase covers them. The codebase is about 62.3k lines of Rust across `baude-core`, `baude`, and `bauded`.
+v2.8.1 is the current release. GSD milestone v2.8 Project Removal (phases 18 to 22.1, archived under `milestones/v2.8-*`) shipped as v2.8.0 on 2026-11-15, and its cleanup phase 22.1 shipped as v2.8.1 on 2026-11-16. Any row, a repository with all its children, a checkout, a worktree or a standalone folder, can now be removed in one confirmed action from the TUI, the daemon REST API or the PWA, even while its runtime is live. The codebase is about 95.5k lines of Rust across `baude-core`, `baude`, and `bauded`, tests included.
 
-## Current Milestone: v2.8 Project Removal
+## Next Milestone
 
-**Goal:** Remove a repository, checkout, worktree or standalone row from baude in one action, even while a runtime is live, so the project is gone from the sidebar, the state file and every rediscovery path.
+Not yet defined. Start it with `/gsd-new-milestone`. Candidates from the backlog: first-frame latency, CI suite time on macOS, BL-12 production job-control leak, BL-13 remote TUI handling of 503 Busy, issue #127 cross-workspace primary_default path.
 
-**Target features:**
-- A remove action that works on repository parents (with all children), single checkout or worktree children, and standalone folder rows, including rows with a live runtime
-- Owned runtime is killed before the rows drop; baude-managed worktrees are removed from disk; main checkouts, standalone folders and local branches are never deleted
-- Removal clears the folder-workspace binding and marker ownership so the startup sweep and reconcile do not re-admit the project; it comes back only through `n`, `c`, or launching baude inside the folder
-- Daemon parity: the same removal over the REST API and from the PWA
 ## Requirements
 
 ### Validated
@@ -68,6 +63,10 @@ v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 throug
 - ✓ Idle baude costs no measurable CPU: dirty-flag redraw, live-row-only metadata polling with mtime gating, opt-in idle-child suspension via SIGSTOP/SIGCONT, and a configurable (disableable) usage poller — v2.3 Phase 15, measured at 0.000000 CPU-seconds per idle minute
 - ✓ Static single-character status codes replace the wall-clock spinner and needs-input flash, so nothing repaints on a timer — v2.3 Phase 15 (UX-02)
 - ✓ Pane focus is remembered across session switches — v2.3 Phase 16 (UX-01)
+- ✓ Remove a repository parent with every child, a single checkout or worktree child, or a standalone row in one confirmed action, even while a runtime is live; managed worktrees are deleted, main checkouts, standalone folders and local branches never are — v2.8
+- ✓ Removed projects stay gone across reconcile and relaunch until re-added by `n`, `c`, or launching inside the folder; TUI and daemon lift suppression through one shared key — v2.8
+- ✓ The daemon exposes the same removal over REST with `rows_removed` events, the PWA offers it with a confirmation that names deleted folders, and the daemon lock is released during the slow kill and delete stage — v2.8
+- ✓ Test suites leave no stray runtimes or fixture directories, enforced by a leftover check in the gate and CI — v2.8 Phase 22.1
 
 > v0.7 code-complete; data paths Claude-validated live (4 integration bugs found + fixed). Pending human UATs before public ship: hook-state flip visual (BL-01), PWA activity-strip + TUI `v` overlay visuals, live-`claude` `--permission-prompt-tool` MCP wire contract, first-phone Web Push. Tracked in `.planning/STATE.md` Deferred Items + per-phase UAT.md.
 
@@ -75,16 +74,12 @@ v2.7.3 is the current release. The latest GSD-completed milestone is v2.3 throug
 
 <!-- Current milestone scope. -->
 
-v2.8 Project Removal:
-
-- [ ] User can remove a repository parent with every child, a single checkout or worktree child, or a standalone row from the sidebar in one confirmed action, even while a runtime is live
-- [ ] Removed projects stay gone across reconcile and relaunch until re-added by `n`, `c`, or launching inside the folder
-- [ ] The daemon exposes the same removal over REST and the PWA offers it
-
-Carried out of v2.3, not in this milestone:
+No milestone is active. Carried forward, not yet scheduled:
 
 - [ ] Reduce first-frame latency. v2.3 made startup *measurable* and idle *quiet*, which it set out to do, but the measured `first_frame` is 5,537 ms of a 6,859 ms total on a release binary with an empty state. Cutting that was never in v2.3's scope and is still open.
-- [x] Replace `timing_disabled_when_env_unset` with a test that exercises the production `BAUDE_TIMING` gate rather than re-reading the environment variable. Done (SQ-12): the gate is now `timing_requested`, called by `main` and tested over env values crossed with the flag.
+- [ ] Production session kill sweeps the recorded session so job-control children cannot outlive it (BL-12, KILL-02 related).
+- [ ] Remote TUI treats mid-removal 503 Busy as transient and shows the daemon's reason (BL-13, integration W1).
+- [ ] Daemon repository dirs carry an ownership marker so READM-02 holds on the daemon side too (v2.8 integration F4).
 
 ### Out of Scope
 
@@ -100,14 +95,15 @@ Carried out of v2.3, not in this milestone:
 
 ## Context
 
-- Mature codebase at **v2.6.0**, about 62.3k lines of Rust; public repo `github.com/poindexter12/baude`, MIT.
+- Mature codebase at **v2.8.1**, about 95.5k lines of Rust including tests; public repo `github.com/poindexter12/baude`, MIT.
 - Cargo workspace: `baude-core/` (pty, session, meta, persist, git, bridge — no UI deps), `baude/` (ratatui TUI), `bauded/` (axum daemon + embedded PWA).
 - Distributed as prebuilt binaries via `mise`/`ubi` (release.yml builds 4 targets) and a multi-arch `ghcr.io/poindexter12/bauded` image.
 - CI gates on `cargo fmt --check` + `clippy -D warnings` + tests — all three must pass before push.
 - The active workspace binds a backend and keeps Claude Code and OpenCode session pools, commands, state files, and daemon ports isolated.
 - Worktree creation/removal and dirty-state checks already exist in `baude-core/src/git.rs`; v2.0 changes the product model from a flat session list to a persistent repository hierarchy.
 - Phases 5 through 7 are retained as completed v2.0 history. The Phase 6 corrective shared-core work is shipped, not an active v2.2 blocker; explicitly deferred human verification remains recorded in STATE.md.
-- The v2.3 GSD-completed milestone runs through Phase 17; the next phase number is 18.
+- The v2.8 GSD-completed milestone runs through Phase 22.1; the next phase number is 23.
+- CI suite time is dominated by serial `cargo test -- --test-threads=1` (#58): 464 s on `macos-15` against 176 s on `ubuntu-22.04` for the same suite. The suite also flakes under heavy host load: four `bauded` tests failed at a load average near 38 and passed in isolation (BL-13).
 - Full-suite cost is host-dependent by roughly an order of magnitude. The same 832 tests across 10 binaries, both measured 2026-10-13: 59 s run serially on a 3-core CI runner with a warm cache, versus 659 s wall clock on a loaded dev host with a cold compile. Each test spawns a real `git` inside a contained fixture root, which makes the suite sensitive to host load rather than intrinsically slow. Take any timeout from the host that will actually run it — a 600 s limit chosen against the loaded figure has already cost one executor a false hang report.
 - Workspace (state namespace) resolution chain: `BAUDE_WORKSPACE` -> folder-memory hint (`~/.config/baude/folder-workspaces.json`, keyed by exact canonical launch dir) -> config `workspace` -> `BAUDE_BACKEND` -> config `backend` -> `claude`. The launch folder itself never names the workspace.
 - Managed worktrees live at `~/.local/share/baude/worktrees/<workspace>/repository-<key>/<primary|branch-label>-<key>`; keys are per-state-file counters (TUI `state-<ws>.json` and daemon `daemon-state-<ws>.json` each start at 1). Since v2.3 Phase 14 each path also carries a stable `physical_key` — a SHA256 digest of the canonical common directory, claimed through an atomic marker file — so two repos can no longer collide on the same `repository-1`; collisions that do occur are reported through `collision_line()` in TUI, daemon, and scan output.
@@ -152,7 +148,10 @@ Carried out of v2.3, not in this milestone:
 | Leave Phase 13 and 14 `VALIDATION.md` as unfilled templates rather than back-filling them at closeout (2026-10-13) | A validation contract invented after the fact never governed the execution it claims to describe; a visible gap is worth more than a fabricated record | ✓ Good — recorded in MILESTONES.md Known Gaps |
 | GSD must not create tags: `git.create_tag: false` (2026-10-13) | release-please owns the `vX.Y.Z` namespace; GSD's closeout would mint a bare `v2.3`, colliding with it | ✓ Good — no bare GSD tag exists for v2.3 |
 | Removal is one ordered pipeline in baude-core: select, preflight, clone, remove rows, validate, kill, disk, single save; forced worktree removal runs against the common dir, proves group membership by session, and refuses worktrees holding submodule gitdirs (2026-11-03) | The TUI and daemon must share one path so parity is structural, and every destructive step must be gated by evidence from the live tree rather than from the saved row | ✓ Good — Phase 18, four cross-AI review cycles then one code review; all Critical and Warning findings fixed |
-| Prove the Linux gate at HEAD with the unmodified gate.sh in rust:1-bookworm and CARGO_TARGET_DIR off the bind mount, rather than editing gate.sh --linux inside the phase (2026-11-03) | The --linux lane fails on this host from a Docker Desktop bind-mount visibility race, not from phase code; the one-line fix is out of plan 07's allowlist and is deferred to the roadmap, so the proof had to come from an equivalent invocation | — Pending — fix tracked in deferred-items and WINDOWS.md; blocks /gsd-ship until landed |
+| Prove the Linux gate at HEAD with the unmodified gate.sh in rust:1-bookworm and CARGO_TARGET_DIR off the bind mount, rather than editing gate.sh --linux inside the phase (2026-11-03) | The --linux lane fails on this host from a Docker Desktop bind-mount visibility race, not from phase code; the one-line fix is out of plan 07's allowlist and is deferred to the roadmap, so the proof had to come from an equivalent invocation | ⚠️ Revisit — the race is intermittent and the Linux gate passed through Phase 22.1; acknowledged at the v2.8 close and tracked as BL-15 |
+| Insert Phase 22.1 to clear the v2.8 audit's tech debt before closing, after v2.8.0 had already shipped (2026-11-15) | Suppression sync, test leftovers, PWA wording and the whole-removal mutex were small enough to fix now and would each have aged into a harder problem | ✓ Good — shipped as v2.8.1; integration findings F2 and F3 closed |
+| WR-06: hold the daemon manager lock only to reserve and to save and publish; run kill and delete unlocked, and answer 503 Busy on any route touching a held repository, folder or session (2026-11-15) | One removal blocked every other request for its whole duration; a narrow lock keeps T-21-14, T-21-28 and T-21-53 mitigated while the rest of the daemon stays responsive | ✓ Good — window tests pin the unlocked stage; remote TUI message quality is BL-13 |
+| Close v2.8 by override on phases 18 to 21 whose verification went stale only because 22.1 edited covered files (2026-11-16) | Phases 22 and 22.1 were re-verified against the final tree and the re-audit found every flow intact; re-verifying four older phases would re-check the same code | — Pending — third milestone in a row closed by override, now with a fresh re-audit behind it |
 
 ## Evolution
 
@@ -172,4 +171,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-11-03 after Phase 18*
+*Last updated: 2026-11-16 after v2.8 milestone*

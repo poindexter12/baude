@@ -1,5 +1,33 @@
 # Milestones
 
+## v2.8 Project Removal (Shipped: 2026-11-16)
+
+**Phases completed:** 6 phases (18-22, 22.1 inserted), 49 plans, 57 tasks
+**Release:** v2.8.0 via release-please (PR #130) from squash commit `f714bf7` ("feat: remove projects from the TUI, the daemon and the PWA", #129); cleanup phase 22.1 shipped as v2.8.1 (PR #132) from squash commit `24de8db` (#131). Planning close-out in #133.
+**Timeline:** 2026-11-01 (v2.7.3 baseline, requirements defined) -> 2026-11-15 (v2.8.0 published) -> 2026-11-16 (v2.8.1 published, records closed)
+**Closeout type:** override_closeout
+**Known verification overrides:** 1 newly acknowledged, 14 carried forward from a prior close (see STATE.md Deferred Items)
+
+**Delivered:** any project can now be removed from baude in one confirmed action, from the TUI, the daemon REST API or the phone PWA, even while its agent is running. The owned runtime is killed first, baude-made worktrees are deleted, user checkouts, folders and branches never are, and the project stays gone across relaunch until the user adds it back.
+
+**Key accomplishments:**
+- One shared `baude-core::removal` pipeline for every row kind: preview, kill the owned process group SIGTERM then SIGKILL, delete managed worktrees, one atomic save, with a crash at any stage leaving a consistent state
+- Re-admission suppression: removal clears the folder binding and the ownership marker and records a suppression entry, so sweeps and reconcile never bring a removed project back; `n`, `c` or launching inside the folder lift it through one `suppression::lift_key` shared by TUI and daemon
+- TUI `D` action on repository, main checkout, worktree, unmanaged and standalone rows, with a confirmation naming the rows, the runtime to kill and the folders deleted versus kept, and a retry path on failure
+- Daemon `GET /rows`, `POST /removals/preview`, `POST /removals` and `rows_removed` events, with the manager lock released during the slow kill and delete stage and 503 Busy on routes touching a held repository, folder or session; the PWA offers the same removal and says when a folder will be deleted
+- Test hygiene: `FixtureRoot` and `RuntimeReaper` fixtures, and a leftover check wrapping the suite in `scripts/gate.sh` and CI that fails on stray runtimes or fixture directories
+
+### Known Gaps
+
+- Phases 18 to 21 read `verification_status: stale` at close, so this closed as `override_closeout`. Each passed at execution time: Phase 18 12/13, Phase 19 40/43, Phase 20 18/19, Phase 21 on owner sign-off, with their gate truths discharged by Phase 22. They went stale only because Phase 22.1 edited files their reports cover. Phases 22 (5/5) and 22.1 (18/18) were re-verified against the final tree on 2026-11-16, and the re-audit found 18/18 integration connections and 6/6 end-to-end flows intact.
+- Acknowledged at close: `scripts/gate.sh --linux` can fail on a macOS host with E0463 from a Docker Desktop bind-mount race, because the container target dir sits on the mount. Intermittent; tracked as BL-15 with a one-line fix.
+- Integration F4: daemon repository dirs carry no ownership marker, so READM-02 holds on the TUI side only. F5: TUI and daemon each own their save and reservation around the shared core stages, by design.
+- The remote TUI shows mid-removal 503 Busy as a failure without the daemon's reason and does not retry; the PTY upgrade 503 is untested; several `bauded` tests are load-sensitive. All in BL-13. BL-12: job-control children can outlive a production session kill. BL-14: the reopen message for a missing checkout still says to repair it instead of pointing at `D`.
+- `22.1-VALIDATION.md` and `22-VALIDATION.md` remain `status: draft`; no `22.1-SECURITY.md` was written, its threat rows live in the re-pointed `21-SECURITY.md`.
+- No GSD `v2.8` tag was created; the release-please tags `v2.8.0` and `v2.8.1` are the ship markers.
+
+---
+
 ## v2.3 Launch Defaults and Startup Speed (Shipped: 2026-09-22)
 
 **Phases completed:** 5 phases (13-17), 12 plans, 21 tasks

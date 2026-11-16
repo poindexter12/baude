@@ -2,38 +2,37 @@
 gsd_state_version: "1.0"
 milestone: v2.8
 milestone_name: Project Removal
-current_phase: "22.1"
-current_phase_name: v2.8 Cleanup
-status: milestone_complete
-stopped_at: All v2.8 phases complete and verified, ready for /gsd-complete-milestone v2.8
-last_updated: "2026-11-16T14:54:05.021Z"
+status: Awaiting next milestone
+stopped_at: Milestone v2.8 completed and archived; next is /gsd-new-milestone
+last_updated: "2026-11-16T16:32:28.467Z"
 last_activity: 2026-11-16
-last_activity_desc: Phases 22 and 22.1 verified passed; v2.8.1 released
-state_head: ec065eaafc268a54e2b32ae129139a715d3d472e
+last_activity_desc: Milestone v2.8 completed and archived
+state_head: 912025f1d6645338e69dd3ed64a2c2737e3bee82
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 49
   completed_plans: 49
   percent: 100
+current_phase: "22.1"
+current_phase_name: v2.8 Cleanup
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-11-03)
+See: .planning/PROJECT.md (updated 2026-11-16)
 
 **Core value:** You can see at a glance which of your many coding-agent sessions needs you next and act on it from the terminal or phone.
-**Current focus:** Phase 22.1 — v2.8 Cleanup
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Phase: 22.1 — v2.8 Cleanup
-Plan: 11 of 11
-Status: All v2.8 phases complete, ready for /gsd-complete-milestone v2.8
-Last activity: 2026-11-16 — Phases 22 and 22.1 verified passed; v2.8.1 released
-
+Phase: Milestone v2.8 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-11-16 — Milestone v2.8 completed and archived
 
 ## Performance Metrics
 
@@ -370,6 +369,8 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 | Category | Item | Status | Deferred At | Milestone |
 |----------|------|--------|-------------|-----------|
+| deferred_items | 18/deferred-items.md: scripts/gate.sh --linux fails on a macOS host from a Docker Desktop bind-mount race, E0463 can't find crate; intermittent, the Linux gate passed through Phase 22.1 | acknowledged, tracked as BL-15 | 2026-11-16 | v2.8 |
+| verification_stale | 18, 19, 20, 21: read `verification_status: stale` at close only because Phase 22.1 edited files their reports cover. Each passed at execution time; 22 and 22.1 were re-verified against the final tree and the re-audit found 18/18 connections and 6/6 flows | override accepted by Joe at close | 2026-11-16 | v2.8 |
 | uat_gaps | 05/05-HUMAN-UAT.md | partial | 2026-09-03 | v2.0 |
 | uat_gaps | 07/07-UAT-EVIDENCE.md | unknown (evidence log, not scenario UAT) | 2026-09-03 | v2.0 |
 | uat_gaps | 01/01-UAT.md (archived v0.7) | testing, 1 pending | 2026-09-03 | v2.0 |
@@ -411,10 +412,9 @@ Items acknowledged and deferred at milestone close, most recent first:
 ## Session Continuity
 
 Last session: 2026-11-14T17:30:07.794Z
-Stopped at: Phase 22 complete, ready to plan Phase 22.1
+Stopped at: Milestone v2.8 completed and archived
 Resume file: None
 
 ## Operator Next Steps
 
 - Start the next milestone with /gsd-new-milestone
-- Closeout gate evidence (2026-10-13, at `e1b9732` on main): `cargo test --workspace` 832 passed / 0 failed / 0 ignored across 10 binaries in 659 s; `cargo fmt --all --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0
