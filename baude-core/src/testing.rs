@@ -617,7 +617,61 @@ impl AsRef<Path> for FixtureRoot {
 }
 
 impl Drop for FixtureRoot {
-    fn drop(&mut self) {}
+    /// Remove the tree. `NotFound` is fine; on `PermissionDenied` the tree is
+    /// made owner-writable and the removal retried once. Any other outcome is
+    /// printed, never a panic: a drop that panics while the test is already
+    /// unwinding aborts the whole suite.
+    fn drop(&mut self) {
+        let named = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(Self::is_fixture_name);
+        if !named {
+            eprintln!(
+                "FixtureRoot: refusing to remove {}, not a fixture name",
+                self.path.display()
+            );
+            return;
+        }
+        let error = match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                make_owner_writable(&self.path);
+                match std::fs::remove_dir_all(&self.path) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+        eprintln!(
+            "FixtureRoot: cannot remove {}: {error}",
+            self.path.display()
+        );
+    }
+}
+
+/// Give the owner rwx on every directory under `path`, top down, so a tree a
+/// test made read-only can be removed. Symlinks are never followed.
+fn make_owner_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o700);
+    let _ = std::fs::set_permissions(path, perms);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_owner_writable(&entry.path());
+        }
+    }
 }
 
 /// Kills what a fixture runtime left behind when it drops, also on panic.
@@ -792,36 +846,9 @@ mod tests {
         }
     }
 
-    /// A scratch root for the reaper tests, removed at the end.
-    fn reaper_root(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("baude-testing-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create reaper root");
-        root
-    }
-
-    /// Make every directory under `path` owner-writable, so a test that left
-    /// a read-only tree can still clean it up after a failed assertion.
+    /// Remove a tree a failed assertion left, read-only parts included.
     fn force_remove(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        fn walk(path: &Path) {
-            let Ok(meta) = std::fs::symlink_metadata(path) else {
-                return;
-            };
-            if !meta.is_dir() {
-                return;
-            }
-            let mut perms = meta.permissions();
-            perms.set_mode(perms.mode() | 0o700);
-            let _ = std::fs::set_permissions(path, perms);
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    walk(&entry.path());
-                }
-            }
-        }
-        walk(path);
+        make_owner_writable(path);
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -896,7 +923,7 @@ mod tests {
     /// leader, and only the recorded session still names it.
     #[test]
     fn runtime_reaper_kills_job_control_children_in_the_recorded_session() {
-        let root = reaper_root("reaper-session");
+        let root = FixtureRoot::new("baude-testing-reaper-session");
         let _redirect = TestRedirect::new(&root);
         let mut pty =
             Pty::spawn(Some("trap '' HUP; sleep 30"), &root, 5, 40).expect("spawn runtime");
@@ -937,8 +964,6 @@ mod tests {
              (job-control child was {moved})",
             identity.session
         );
-        drop(pty);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The sweep is gated on the recorded session being the recorded leader:
