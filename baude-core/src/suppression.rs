@@ -185,24 +185,22 @@ mod tests {
     const WORKSPACE: &str = "suppression-ws";
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
-    fn scratch(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("baude-suppression-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-suppression-{name}"))
     }
 
     /// Redirect every fixture path and pin a workspace identity so
-    /// `workspace::active()` resolves under test.
-    fn identity(name: &str) -> (TestRedirect, TestRedirect) {
-        let redirect = TestRedirect::new(scratch(&format!("{name}-root")));
+    /// `workspace::active()` resolves under test. The redirect's root is the
+    /// last element, so it drops after both guards.
+    fn identity(name: &str) -> (TestRedirect, TestRedirect, crate::testing::FixtureRoot) {
+        let root = scratch(&format!("{name}-root"));
+        let redirect = TestRedirect::new(&root);
         let config = Config {
             workspace: Some(WORKSPACE.to_string()),
             ..Config::default()
         };
         let ws = crate::workspace::override_for_test(&config, None);
-        (redirect, ws)
+        (redirect, ws, root)
     }
 
     /// A real folder under `base` so `folder_key` canonicalizes it the way a
@@ -502,6 +500,6 @@ mod tests {
         let workspace = crate::workspace::active();
         assert_eq!(name, workspace.state_file(FILE_BASE));
         assert_ne!(name, workspace.state_file(crate::breadcrumbs::FILE_BASE));
-        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(path.parent(), Some(dir.path()));
     }
 }

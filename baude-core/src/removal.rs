@@ -1208,15 +1208,13 @@ mod tests {
     struct TempTree {
         _identity: crate::testing::TestRedirect,
         _redirect: crate::testing::TestRedirect,
-        root: PathBuf,
+        /// Declared last so the tree is removed after both guards drop.
+        root: crate::testing::FixtureRoot,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("baude-removal-{}-{label}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create fixture root");
+            let root = crate::testing::FixtureRoot::new(&format!("baude-removal-{label}"));
             let redirect = crate::testing::TestRedirect::new(&root);
             let identity = fixture_identity();
             Self {
@@ -1241,12 +1239,6 @@ mod tests {
         /// A directory that only the test may populate with a state file.
         fn state_dir(&self) -> PathBuf {
             self.dir("state")
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1748,28 +1740,30 @@ mod tests {
     /// Per-test root under the temp dir with a real repository, a managed
     /// root under the redirect and a state directory. Canonicalized because
     /// Git reports the resolved form of a worktree path and the managed-root
-    /// containment check compares canonical paths. The redirect is a field
-    /// declared before `root` so it is still installed while the root is
-    /// torn down.
+    /// containment check compares canonical paths. The guards are fields
+    /// declared before `_root`, so they are restored before the tree is
+    /// removed; that removal resolves no redirected path.
     struct RemovalFixture {
         _identity: crate::testing::TestRedirect,
         _redirect: crate::testing::TestRedirect,
+        /// The canonical form of `_root`, the path every case is handed.
         root: PathBuf,
+        /// Declared last so the tree is removed after both guards drop.
+        _root: crate::testing::FixtureRoot,
     }
 
     impl RemovalFixture {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("baude-removal-live-{label}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create fixture root");
-            let root = fs::canonicalize(&root).expect("canonicalize fixture root");
+            let fixture_root =
+                crate::testing::FixtureRoot::new(&format!("baude-removal-live-{label}"));
+            let root = fs::canonicalize(&fixture_root).expect("canonicalize fixture root");
             let redirect = crate::testing::TestRedirect::new(&root);
             let identity = fixture_identity();
             let fixture = Self {
                 _identity: identity,
                 _redirect: redirect,
                 root,
+                _root: fixture_root,
             };
             git_ok(&fixture.root, &["init", "-q", "-b", "main", "repo"]);
             let repo = fixture.repo();
@@ -1824,12 +1818,6 @@ mod tests {
             crate::git::discover_repository(&self.repo())
                 .expect("discover repository")
                 .common_dir
-        }
-    }
-
-    impl Drop for RemovalFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
