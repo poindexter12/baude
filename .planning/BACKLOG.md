@@ -489,3 +489,7 @@ Info items IN-01, IN-02, IN-03, IN-05, IN-06 and IN-07 in `.planning/phases/22.1
 ### BL-14 — Reopening a checkout whose folder is gone still says to repair it
 
 Pressing Enter on a checkout protected as `unavailable: missing` shows "Open details with i and repair the checkout" at `baude/src/app.rs:1425`. Since v2.8.0 the right move for a missing folder is `D`, which drops the row and, for a baude-managed worktree, lists the folder as already removed. The message should point at `D` for the `missing` cause and keep the repair advice for the other causes. Follow-up from closing issue #128.
+
+### BL-15 — `scripts/gate.sh --linux` can fail on macOS with E0463 from a Docker Desktop bind-mount race
+
+The Linux gate compiles with `CARGO_TARGET_DIR=/work/target/linux-gate/target`, on the virtiofs bind mount. After clippy fills `deps/`, rustc intermittently cannot see an rlib cargo just wrote and fails with `can't find crate for <dep>`, naming a different crate each run. With the target dir on container-local disk the same gate exits 0. Fix: one line in the `docker run` call in `scripts/gate.sh` that moves the target dir to a named Docker volume or a container-local path, keeping `CARGO_HOME` on the mount so the registry cache survives. Full investigation in `.planning/milestones/v2.8-phases/18-shared-kill-then-remove-lifecycle/deferred-items.md` and 18-07-SUMMARY.md. Acknowledged and deferred at the v2.8 close.
