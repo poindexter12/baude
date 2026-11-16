@@ -273,7 +273,6 @@ pub fn send(vapid: &Vapid, sub: &Subscription, payload: &[u8]) -> Result<bool> {
 mod tests {
     use super::*;
     use aes_gcm::aead::Aead;
-    use std::path::PathBuf;
 
     /// Decrypt an aes128gcm body the way a user agent would — proves both
     /// directions of the RFC 8291 construction agree.
@@ -364,14 +363,9 @@ mod tests {
     // check belongs to the external observer in plan 06.
 
     /// A unique on-disk fixture root, keyed by pid and a counter so parallel
-    /// cases never collide.
-    fn isolated_push_root(label: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "bauded-push-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+    /// cases never collide, and removed when the returned guard drops.
+    fn isolated_push_root(label: &str) -> baude_core::testing::FixtureRoot {
+        baude_core::testing::FixtureRoot::new(&format!("bauded-push-{label}"))
     }
 
     /// Local synthetic subscription data. The key material is never parsed —
@@ -422,8 +416,6 @@ mod tests {
         let subs = reloaded.subs();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].endpoint, "https://push.example/aaa");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -456,7 +448,6 @@ mod tests {
                 inner_state.vapid.public_b64, state.vapid.public_b64,
                 "a second root must not read the first root's key"
             );
-            std::fs::remove_dir_all(&inner).ok();
         }
 
         assert_eq!(
@@ -468,7 +459,6 @@ mod tests {
             std::fs::read_to_string(outer_config.join(SUBS_FILE)).unwrap(),
             outer_subs
         );
-        std::fs::remove_dir_all(&outer).ok();
     }
 
     /// `persist = false` is the shortcut a future contributor reaches for, and
@@ -495,7 +485,6 @@ mod tests {
             1,
             "the subscription is still held in memory"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// With no redirect and the thread-local escape probe held, resolution must

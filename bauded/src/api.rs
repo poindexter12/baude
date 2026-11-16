@@ -1006,13 +1006,7 @@ mod tests {
             for workspace in ["api-identity-alpha", "api-identity-beta"] {
                 let barrier = Arc::clone(&barrier);
                 threads.push(std::thread::spawn(move || {
-                    let root = std::env::temp_dir().join(format!(
-                        "bauded-{workspace}-{}-{:?}",
-                        std::process::id(),
-                        std::thread::current().id()
-                    ));
-                    let _ = std::fs::remove_dir_all(&root);
-                    std::fs::create_dir_all(&root).unwrap();
+                    let root = FixtureRoot::new(&format!("bauded-{workspace}"));
                     let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
                     barrier.wait();
                     let resolved = baude_core::workspace::active().name.clone();
@@ -1034,7 +1028,6 @@ mod tests {
                     );
                     assert!(fixture.path().exists());
                     drop(fixture);
-                    let _ = std::fs::remove_dir_all(&root);
                 }));
             }
             for thread in threads {
@@ -1045,10 +1038,7 @@ mod tests {
         /// An override-free thread cannot inherit a live API fixture identity.
         #[test]
         fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
-            let root =
-                std::env::temp_dir().join(format!("bauded-identity-escape-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
+            let root = FixtureRoot::new("bauded-identity-escape");
             let _fixture = initialized_repo(&root, "repo");
             let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
             let payload = probe.expect_err("an override-free reader must not resolve an identity");
@@ -1062,7 +1052,6 @@ mod tests {
                 message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
                 "expected the identity-escape panic, got {message:?}"
             );
-            let _ = std::fs::remove_dir_all(&root);
         }
     }
 
@@ -1101,12 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn flat_session_api_remains_a_non_hierarchical_compatibility_projection() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-flat-api-compatibility-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = FixtureRoot::new("bauded-flat-api-compatibility");
         let fixture = initialized_repo(&root, "repo");
         let repo = fixture.path().canonicalize().unwrap();
         let workspace = baude_core::workspace::resolve(
@@ -1200,7 +1184,6 @@ mod tests {
             .success());
 
         crate::manager::lock(&state).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1277,7 +1260,7 @@ mod tests {
             (AtomicFailure::Rename, false),
             (AtomicFailure::DirectorySync, true),
         ] {
-            let suffix = format!("{:?}-{}", failure, std::process::id());
+            let suffix = format!("{failure:?}");
             let workspace = baude_core::workspace::resolve(
                 Some("claude"),
                 None,
@@ -1285,9 +1268,7 @@ mod tests {
                 |_| {},
             );
 
-            let create_root = std::env::temp_dir().join(format!("bauded-api-create-{suffix}"));
-            let _ = std::fs::remove_dir_all(&create_root);
-            std::fs::create_dir_all(&create_root).unwrap();
+            let create_root = FixtureRoot::new(&format!("bauded-api-create-{suffix}"));
             let create_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             crate::manager::lock(&create_state).persist_at_for_test(
                 &create_root,
@@ -1323,9 +1304,7 @@ mod tests {
                 );
             }
 
-            let delete_root = std::env::temp_dir().join(format!("bauded-api-delete-{suffix}"));
-            let _ = std::fs::remove_dir_all(&delete_root);
-            std::fs::create_dir_all(&delete_root).unwrap();
+            let delete_root = FixtureRoot::new(&format!("bauded-api-delete-{suffix}"));
             let delete_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             let delete_id = {
                 let mut manager = crate::manager::lock(&delete_state);
@@ -1367,9 +1346,7 @@ mod tests {
             assert_eq!(retained.checkouts.len(), 1);
             assert_eq!(retained.checkouts[0].active_intent(), !committed);
 
-            let archive_root = std::env::temp_dir().join(format!("bauded-api-archive-{suffix}"));
-            let _ = std::fs::remove_dir_all(&archive_root);
-            std::fs::create_dir_all(&archive_root).unwrap();
+            let archive_root = FixtureRoot::new(&format!("bauded-api-archive-{suffix}"));
             let archive_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             let archive_id = {
                 let mut manager = crate::manager::lock(&archive_state);
@@ -1410,9 +1387,7 @@ mod tests {
                 committed
             );
 
-            let restart_root = std::env::temp_dir().join(format!("bauded-api-restart-{suffix}"));
-            let _ = std::fs::remove_dir_all(&restart_root);
-            std::fs::create_dir_all(&restart_root).unwrap();
+            let restart_root = FixtureRoot::new(&format!("bauded-api-restart-{suffix}"));
             let restart_fixture = initialized_repo(&restart_root, "repo");
             let repo = restart_fixture.path().to_path_buf();
             let restart_state = Arc::new(Mutex::new(Manager::new("true".into(), true)));
@@ -1461,9 +1436,6 @@ mod tests {
             for state in [&create_state, &delete_state, &archive_state, &restart_state] {
                 crate::manager::lock(state).kill_all();
             }
-            for root in [create_root, delete_root, archive_root, restart_root] {
-                std::fs::remove_dir_all(root).unwrap();
-            }
         }
     }
 
@@ -1482,10 +1454,7 @@ mod tests {
             &persist::Config::default(),
             |_| {},
         );
-        let root =
-            std::env::temp_dir().join(format!("bauded-api-delete-teardown-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = FixtureRoot::new("bauded-api-delete-teardown");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
         let id = {
             let mut manager = crate::manager::lock(&state);
@@ -1523,7 +1492,6 @@ mod tests {
         assert_eq!(delete(id).await.unwrap().status(), StatusCode::NOT_FOUND);
 
         crate::manager::lock(&state).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// End a fixture runtime the way a crashed agent does, by signalling its
@@ -1635,11 +1603,7 @@ mod tests {
     async fn restart_api_refuses_replaced_repository_path() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
-            "bauded-api-restart-replaced-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = FixtureRoot::new("bauded-api-restart-replaced");
         let fixture = initialized_repo(&root, "repo");
         let repo = fixture.path().to_path_buf();
         let replacement_fixture = initialized_repo(&root, "replacement");
@@ -1657,7 +1621,6 @@ mod tests {
             crate::manager::lock(&state).info(id).unwrap().status,
             "exited"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

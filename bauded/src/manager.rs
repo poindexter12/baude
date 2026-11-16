@@ -4101,7 +4101,6 @@ mod tests {
     use super::*;
     use baude_core::lifecycle::LifecycleOutcome;
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// The plain admission router over values, with no process: each of the
@@ -4282,8 +4281,6 @@ mod tests {
             })
     }
 
-    static NEXT_MANAGER_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
     /// A literal fixture config: no file is read, no environment variable is
     /// consulted, and the workspace/backend choice is written down in the
     /// source of the test that made it (D-06).
@@ -4313,8 +4310,10 @@ mod tests {
         /// call site. Tying the redirect's lifetime to the fixture's is the
         /// whole reason the guard is RAII (D-01).
         _redirect: baude_core::testing::TestRedirect,
-        root: PathBuf,
         workspace: baude_core::workspace::Workspace,
+        /// Declared last, so the directory is removed after both redirects are
+        /// restored, also when the test panicked.
+        root: baude_core::testing::FixtureRoot,
     }
 
     impl ManagerFixture {
@@ -4328,11 +4327,7 @@ mod tests {
         #[must_use = "the fixture owns this case's root, redirects and identity; bind it to a \
                       named local that outlives every Manager, session and PTY it isolates"]
         fn with_workspace_name(label: &str, workspace_name: &str) -> Self {
-            let sequence = NEXT_MANAGER_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("bauded-{label}-{}-{sequence}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("create unique manager fixture root");
+            let root = baude_core::testing::FixtureRoot::new(&format!("bauded-{label}"));
             let config = fixture_config(workspace_name);
             // Acquisition order is root FIRST, identity SECOND, so the identity
             // is resolved with this fixture's roots already installed.
@@ -4362,14 +4357,6 @@ mod tests {
             let path = self.root.join(relative);
             std::fs::create_dir_all(&path).expect("create manager fixture subdirectory");
             path
-        }
-    }
-
-    impl Drop for ManagerFixture {
-        fn drop(&mut self) {
-            // Swallowed like `GitFixture::drop`: a cleanup failure must not
-            // mask the assertion failure that is the reason the test matters.
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
