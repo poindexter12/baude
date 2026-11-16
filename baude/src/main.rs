@@ -2500,6 +2500,13 @@ mod keyboard_negotiation_tests {
             None,
         );
         let mut app = App::new(tmp.to_path_buf());
+        // A command double, so the launch-dir runtime restore starts is the
+        // same on every machine rather than whatever `claude` resolves to
+        // here. It ignores HUP, as a real agent's children may, so its job
+        // outlives a plain kill of the PTY leader and only the reaping
+        // cleanup below leaves nothing behind. It accepts every appended
+        // argument as a positional parameter.
+        app.set_agent_cmd_for_test("sh -c 'trap \"\" HUP; sleep 30; true'");
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let (mut started, mut finished) = (false, false);
@@ -2530,8 +2537,14 @@ mod keyboard_negotiation_tests {
         }
         // Truly idle: no sessions (so no status timers or child output) and no
         // transient message left to expire. Settle the selection change, then
-        // measure.
-        app.kill_all();
+        // measure. The sessions the runtimes lead are recorded first, so the
+        // end of the test can check that nothing in them outlived the kill.
+        let led = sessions_led_by_runtimes(&app);
+        assert!(
+            !led.is_empty(),
+            "restore started no runtime, so the cleanup below would check nothing"
+        );
+        crate::app::kill_all_and_reap(&mut app);
         app.sessions.clear();
         app.message = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2564,6 +2577,52 @@ mod keyboard_negotiation_tests {
             app.sessions.len()
         );
         assert!(!app.dirty, "nothing may leave dirty set while idle");
+        let survivors = live_in_sessions(&led);
+        assert!(
+            survivors.is_empty(),
+            "a process of a runtime this test started outlived the test: {survivors:?} \
+             in the sessions its runtimes led, {led:?}"
+        );
+    }
+
+    /// The sessions the agent and shell runtimes of `app` lead. A PTY child
+    /// calls setsid, so its pid is its session id; an identity that does not
+    /// lead its session names one this test did not create, and is left out.
+    fn sessions_led_by_runtimes(app: &App) -> Vec<i32> {
+        app.sessions
+            .iter()
+            .flat_map(|session| {
+                std::iter::once(session.claude.process_identity())
+                    .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+            })
+            .filter(|identity| identity.session == identity.pid as i32)
+            .map(|identity| identity.session)
+            .collect()
+    }
+
+    /// Live processes, zombies left out, whose session is one of `sessions`,
+    /// as `(pid, session)`.
+    fn live_in_sessions(sessions: &[i32]) -> Vec<(i32, i32)> {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,stat="])
+            .output()
+            .expect("ps");
+        // SAFETY: getpid only reads this process's own id.
+        let me = unsafe { libc::getpid() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid: i32 = fields.next()?.parse().ok()?;
+                let stat = fields.next().unwrap_or("");
+                if pid <= 1 || pid == me || stat.starts_with('Z') {
+                    return None;
+                }
+                // SAFETY: getsid only reads the process table.
+                let session = unsafe { libc::getsid(pid) };
+                sessions.contains(&session).then_some((pid, session))
+            })
+            .collect()
     }
 
     #[test]

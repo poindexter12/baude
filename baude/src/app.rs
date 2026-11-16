@@ -8365,11 +8365,51 @@ mod link_open {
     }
 }
 
+/// Stop every runtime `app` lists and reap what each one leaves behind.
+/// Test-only, shared by the app tests and the loop tests in `main.rs`.
+///
+/// `App::kill_all` signals each session's PTY leader. A command the
+/// interactive gate shell ran as a job sits in a process group of its own
+/// and can outlive that leader; what still names it is the session the
+/// leader created. So a reaper per agent and shell identity is built
+/// before `kill_all` and dropped after it, sweeping the recorded session.
+#[cfg(test)]
+pub(crate) fn kill_all_and_reap(app: &mut App) {
+    let reapers: Vec<_> = app.sessions.iter().flat_map(session_reapers).collect();
+    app.kill_all();
+    drop(reapers);
+}
+
+impl App {
+    /// Test-only: run `cmd` as the agent of every session this app starts
+    /// from now on, the way the app tests set `config.claude_cmd`.
+    #[cfg(test)]
+    pub(crate) fn set_agent_cmd_for_test(&mut self, cmd: &str) {
+        self.config.claude_cmd = Some(cmd.to_string());
+    }
+}
+
+/// Reapers for the agent and, when present, the shell `session` records.
+///
+/// Bind them before a test kills a session or its agent itself: once the
+/// App restarts or forgets that runtime, `kill_all_and_reap` no longer
+/// sees its identity, so these are what sweep its recorded session.
+#[cfg(test)]
+pub(crate) fn session_reapers(
+    session: &baude_core::session::Session,
+) -> Vec<baude_core::testing::RuntimeReaper> {
+    std::iter::once(session.claude.process_identity())
+        .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+        .map(baude_core::testing::RuntimeReaper::for_identity)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, Focus, LocalAdmissionRoute, Modal, RestoreSite, SelId,
+        active_restore_checkouts, checkout_for_runtime, kill_all_and_reap, local_admission_route,
+        require_same_checkout_path, session_reapers, App, Focus, LocalAdmissionRoute, Modal,
+        RestoreSite, SelId,
     };
     use crate::hierarchy::LocalRow;
     use baude_core::lifecycle::{
@@ -10605,33 +10645,6 @@ mod tests {
 
     fn last_message(app: &App) -> Option<&str> {
         app.message.as_ref().map(|(message, _)| message.as_str())
-    }
-
-    /// Stop every runtime `app` lists and reap what each one leaves behind.
-    ///
-    /// `App::kill_all` signals each session's PTY leader. A command the
-    /// interactive gate shell ran as a job sits in a process group of its own
-    /// and can outlive that leader; what still names it is the session the
-    /// leader created. So a reaper per agent and shell identity is built
-    /// before `kill_all` and dropped after it, sweeping the recorded session.
-    fn kill_all_and_reap(app: &mut App) {
-        let reapers: Vec<_> = app.sessions.iter().flat_map(session_reapers).collect();
-        app.kill_all();
-        drop(reapers);
-    }
-
-    /// Reapers for the agent and, when present, the shell `session` records.
-    ///
-    /// Bind them before a test kills a session or its agent itself: once the
-    /// App restarts or forgets that runtime, `kill_all_and_reap` no longer
-    /// sees its identity, so these are what sweep its recorded session.
-    fn session_reapers(
-        session: &baude_core::session::Session,
-    ) -> Vec<baude_core::testing::RuntimeReaper> {
-        std::iter::once(session.claude.process_identity())
-            .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
-            .map(baude_core::testing::RuntimeReaper::for_identity)
-            .collect()
     }
 
     /// READM-03 read side, D-09 and D-11: an entry for a linked worktree keeps
