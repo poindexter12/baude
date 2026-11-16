@@ -2587,15 +2587,7 @@ mod tests {
     ) {
         let (root, fixture, workspace, shared, app) = removal_setup(label);
         let repo = fixture.path().canonicalize().unwrap();
-        let sibling = root.join("repo-sibling");
-        std::fs::create_dir_all(&sibling).unwrap();
-        git(&sibling, &["init", "-b", "main"]);
-        git(&sibling, &["config", "user.email", "test@example.com"]);
-        git(&sibling, &["config", "user.name", "Test"]);
-        std::fs::write(sibling.join("file"), b"one").unwrap();
-        git(&sibling, &["add", "file"]);
-        git(&sibling, &["commit", "-m", "initial"]);
-        let sibling = sibling.canonicalize().unwrap();
+        let sibling = sibling_repo(&root);
         let (first_id, first_key, _) = admit_removal_session(&shared, &app, &repo, None).await;
         let (second_id, second_key, _) = admit_removal_session(&shared, &app, &sibling, None).await;
         let rows = rows_body(&app).await;
@@ -2609,6 +2601,20 @@ mod tests {
             (first_id, first_key),
             (second_id, second_key),
         )
+    }
+
+    /// A `git init` repository named `repo-sibling` under `root`, beside the
+    /// fixture repository whose name it extends, not admitted anywhere.
+    fn sibling_repo(root: &Path) -> PathBuf {
+        let sibling = root.join("repo-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        git(&sibling, &["init", "-b", "main"]);
+        git(&sibling, &["config", "user.email", "test@example.com"]);
+        git(&sibling, &["config", "user.name", "Test"]);
+        std::fs::write(sibling.join("file"), b"one").unwrap();
+        git(&sibling, &["add", "file"]);
+        git(&sibling, &["commit", "-m", "initial"]);
+        sibling.canonicalize().unwrap()
     }
 
     /// `GET /rows` of a manager restored fresh from the state file under
@@ -2796,6 +2802,123 @@ mod tests {
             "22.1-10 metadata pin: the removal commit saved the survivor as it was before the \
              slow stage: {saved}"
         );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Whether `/rows` lists a repository parent at `path`.
+    fn rows_has_repository_at(rows: &serde_json::Value, path: &Path) -> bool {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parent| parent["path"] == path.to_str().unwrap())
+    }
+
+    /// T-21-28 across the window: an admission into an unrelated repository
+    /// while a removal is in its slow stage survives that removal's commit,
+    /// because the commit rebuilds its candidate from the state as it is.
+    #[tokio::test]
+    async fn removals_admission_in_another_repository_survives_the_commit() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("window-admission").await;
+        let other = sibling_repo(&root);
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let body = serde_json::json!({ "repo": other }).to_string();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(
+                &probe_app,
+                "POST /sessions into another repository",
+                post_json("/sessions", &body),
+            )
+            .await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        window
+            .outcome
+            .expect("the probe ran")
+            .answered(StatusCode::CREATED);
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        let rows = rows_body(&app).await;
+        assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+        assert!(
+            rows_has_repository_at(&rows, &other),
+            "22.1-10 candidate pin: the admission made during the slow stage is gone: {rows}"
+        );
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+        assert!(
+            rows_has_repository_at(&restored, &other),
+            "22.1-10 candidate pin: the admission made during the slow stage was not saved: \
+             {restored}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Two removals of checkouts in two repositories, parked in their slow
+    /// stages together with the mutex free, both commit: each commit
+    /// rebuilds its candidate from the state the other already committed.
+    #[tokio::test]
+    async fn removals_two_repositories_in_flight_both_commit() {
+        let (root, _fixture, workspace, shared, app, (_, first), (_, second)) =
+            two_repository_fixture("window-two").await;
+        let mut events = open_events(&app).await;
+        let first_report = preview_report(&app, first).await;
+        let second_report = preview_report(&app, second).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe = probe_slow_stage(&shared, &pause, 2, || async {});
+        let (first_executed, second_executed) = tokio::join!(
+            removal_call(&app, "/removals", &first_report),
+            removal_call(&app, "/removals", &second_report),
+        );
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 2, "both removals reached their slow stage");
+        assert!(
+            window.mutex_free,
+            "the mutex was held with two removals in their slow stage"
+        );
+        assert!(!pause.timed_out(), "a removal waited out its pause bound");
+        assert_eq!(first_executed.0, StatusCode::OK, "{}", first_executed.1);
+        assert_eq!(second_executed.0, StatusCode::OK, "{}", second_executed.1);
+        let mut executed: Vec<serde_json::Value> = [first_executed.1, second_executed.1]
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let mut announced = vec![
+            expect_rows_removed(&mut events, "the first commit").await,
+            expect_rows_removed(&mut events, "the second commit").await,
+        ];
+        expect_silence(&mut events, Duration::from_millis(300), "after two commits").await;
+        executed.sort_by_key(|report| report["target"].to_string());
+        announced.sort_by_key(|report| report["target"].to_string());
+        assert_eq!(announced, executed);
+
+        let rows = rows_body(&app).await;
+        let restored = restored_rows(&root, &workspace);
+        for key in [first, second] {
+            assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+            assert!(
+                rows_checkout(&restored, key).is_none(),
+                "22.1-10 candidate pin: a removed row came back in the state file: {restored}"
+            );
+        }
 
         removal_teardown(&shared, &root);
     }
