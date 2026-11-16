@@ -533,6 +533,10 @@ pub struct Manager {
     /// standalone counterpart of `repository_reservations`: core reserves
     /// repositories only.
     standalone_reservations: StandaloneReservations,
+    /// Early targeted-resume exits whose reconcile the poll deferred because a
+    /// removal held the session's row, by session id, with the spawn time of
+    /// the runtime that exited. See `reconcile_early_targeted_resume_exits`.
+    pending_early_resume_reconciles: HashMap<u64, u64>,
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
@@ -975,6 +979,7 @@ impl Manager {
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
             standalone_reservations: StandaloneReservations::default(),
+            pending_early_resume_reconciles: HashMap::new(),
             persistence_blocked: false,
             persistence_dirty: false,
             persistence_error: None,
@@ -4439,31 +4444,37 @@ impl Manager {
     /// Reconcile an immediate `--resume` rejection through the ordinary
     /// retained remove boundary so child reaping and retryable lifecycle state
     /// stay identical to an explicit close.
+    ///
+    /// `remove` refuses a session whose repository or folder a removal holds,
+    /// and a removal's slow stage can hold it past the early-exit window. A
+    /// reconcile refused that way is kept in `pending_early_resume_reconciles`
+    /// and retried on every tick until it runs, whatever the window says, for
+    /// as long as the session still holds the runtime that exited.
     fn reconcile_early_targeted_resume_exits(&mut self) {
-        let exited: Vec<_> = self
-            .sessions
-            .iter_mut()
-            .filter_map(|session| {
-                session
-                    .early_targeted_resume_exit()
-                    .then(|| {
-                        self.runtime_checkouts
-                            .iter()
-                            .find_map(|(key, runtime)| {
-                                (*runtime == session.id).then_some(RuntimeOwner::Checkout(*key))
-                            })
-                            .or_else(|| {
-                                self.runtime_standalones.iter().find_map(|(key, runtime)| {
-                                    (*runtime == session.id)
-                                        .then_some(RuntimeOwner::Standalone(*key))
-                                })
-                            })
-                            .map(|owner| (owner, session.id))
-                    })
-                    .flatten()
-            })
-            .collect();
-        for (owner, id) in exited {
+        let pending = std::mem::take(&mut self.pending_early_resume_reconciles);
+        let mut exited = Vec::new();
+        for session in &mut self.sessions {
+            // A restart gives the session a new spawn time, so a deferred
+            // reconcile never reaches the runtime that replaced the dead one.
+            let deferred = pending.get(&session.id) == Some(&session.spawn_unix_ms)
+                && session.claude.is_exited();
+            if deferred || session.early_targeted_resume_exit() {
+                exited.push((session.id, session.spawn_unix_ms));
+            }
+        }
+        // A deferred session a removal holds out of the registry stays
+        // pending: it comes back if that removal fails, and its row forgets
+        // the runtime if the removal commits.
+        for (id, spawn) in pending {
+            let registered = self.sessions.iter().any(|session| session.id == id);
+            if !registered && self.runtime_owner(id).is_some() {
+                self.pending_early_resume_reconciles.insert(id, spawn);
+            }
+        }
+        for (id, spawn) in exited {
+            let Some(owner) = self.runtime_owner(id) else {
+                continue;
+            };
             match owner {
                 RuntimeOwner::Checkout(checkout) => {
                     if let Some(saved) = self
@@ -4481,10 +4492,27 @@ impl Manager {
                     }
                 }
             }
-            if let Err(error) = self.remove(id) {
-                eprintln!("failed to reconcile early targeted resume: {error}");
+            match self.remove(id) {
+                Ok(()) => {}
+                // A removal holds the row for now; the next tick retries.
+                Err(MutationError::Busy(_)) => {
+                    self.pending_early_resume_reconciles.insert(id, spawn);
+                }
+                Err(error) => eprintln!("failed to reconcile early targeted resume: {error}"),
             }
         }
+    }
+
+    /// The row whose runtime session `id` is, if any.
+    fn runtime_owner(&self, id: u64) -> Option<RuntimeOwner> {
+        self.runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(RuntimeOwner::Checkout(*key)))
+            .or_else(|| {
+                self.runtime_standalones.iter().find_map(|(key, runtime)| {
+                    (*runtime == id).then_some(RuntimeOwner::Standalone(*key))
+                })
+            })
     }
 
     pub fn poll(&mut self) {
@@ -6108,6 +6136,106 @@ mod tests {
         );
         let persisted = persisted_at(&root, workspace);
         assert_eq!(persisted.checkouts[0].session.resume_id, None);
+    }
+
+    /// WR-03: a removal's slow stage can hold the repository for longer than
+    /// the early-exit window. The reconcile the poll deferred while it was
+    /// busy is then kept pending, and the first tick after the hold ends runs
+    /// it, although the window that first flagged the exit has closed.
+    #[test]
+    fn poll_runs_a_deferred_early_resume_reconcile_after_the_window_closed() {
+        let fixture = persistence_fixture("early-targeted-resume-long-hold");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(repo.to_str().unwrap(), None, Some("early resume long hold"))
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        let resume_id = "resume-daemon-early-long-hold";
+        manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
+        manager.remove(runtime).unwrap();
+        let transcript_cwd = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = match manager.reopen_checkout(checkout).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let _reopened_reapers = manager.runtime_reapers_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let repository = manager.repository_state.checkouts[0].repository_key;
+
+        let hold = manager.reserve_repository_for_test(repository);
+        manager.poll();
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "the poll reconciled a row of a busy repository"
+        );
+        // Hold the repository past the early-exit window, ticking as the
+        // daemon's poll thread does.
+        let deadline = Instant::now()
+            + Duration::from_millis(baude_core::session::EARLY_RESUME_ID_EXIT_WINDOW_MS)
+            + Duration::from_secs(5);
+        while manager
+            .session_mut(reopened)
+            .unwrap()
+            .early_targeted_resume_exit()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the early-exit window never closed"
+            );
+            manager.poll();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        manager.poll();
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "the poll reconciled a row of a busy repository after the window"
+        );
+
+        drop(hold);
+        manager.poll();
+        assert!(
+            !manager.runtime_checkouts.contains_key(&checkout),
+            "WR-03 pin: the reconcile deferred while the repository was busy was lost once the \
+             hold outlasted the early-exit window"
+        );
+        assert!(manager.session(reopened).is_err());
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.checkouts[0].session.resume_id, None);
+        assert_eq!(
+            baude_core::lifecycle::lifecycle_capability(persisted.checkouts[0].lifecycle()),
+            Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
+        );
     }
 
     /// The folder counterpart of the test above: the same command double and
