@@ -3974,6 +3974,38 @@ impl Manager {
         }
     }
 
+    /// Test-only: a reaper for the agent and, when present, the shell of
+    /// every session this manager lists, recorded now.
+    ///
+    /// A fixture agent runs under an interactive shell, whose job control
+    /// can give the command a process group of its own. Killing the PTY
+    /// leader does not always reach that job, which is reparented to pid 1
+    /// but stays in the session the leader created. Each reaper sweeps that
+    /// recorded session when it drops. Bind these before a test kills,
+    /// removes or restarts a runtime itself: once the manager forgets or
+    /// replaces it, `kill_all_and_reap_for_test` no longer sees its identity.
+    #[cfg(test)]
+    pub(crate) fn runtime_reapers_for_test(&self) -> Vec<baude_core::testing::RuntimeReaper> {
+        self.sessions
+            .iter()
+            .flat_map(|session| {
+                std::iter::once(session.claude.process_identity())
+                    .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+            })
+            .map(baude_core::testing::RuntimeReaper::for_identity)
+            .collect()
+    }
+
+    /// Test-only: `kill_all`, then reap the recorded session of every runtime
+    /// this manager listed before it, so a job that outlived its PTY leader
+    /// does not outlive the test.
+    #[cfg(test)]
+    pub(crate) fn kill_all_and_reap_for_test(&mut self) {
+        let reapers = self.runtime_reapers_for_test();
+        self.kill_all();
+        drop(reapers);
+    }
+
     fn session(&self, id: u64) -> Result<&Session> {
         self.sessions
             .iter()
@@ -4567,6 +4599,7 @@ mod tests {
         // macOS canonicalizes /tmp to /private/tmp
         assert!(m.info(info.id).unwrap().cwd.ends_with("/tmp"));
         assert!(m.info(99).is_none());
+        let _reapers = m.runtime_reapers_for_test();
         m.remove(info.id).unwrap();
         assert!(m.list().is_empty());
         assert!(m.remove(info.id).is_err());
@@ -4836,6 +4869,7 @@ mod tests {
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(manager.runtime_checkouts.len(), 1);
 
+        let _reapers = manager.runtime_reapers_for_test();
         manager
             .session_mut(runtime)
             .unwrap()
@@ -4861,7 +4895,7 @@ mod tests {
         ));
         assert_eq!(manager.repository_state.checkouts.len(), 2);
         assert_eq!(manager.runtime_checkouts.len(), 2);
-        manager.kill_all();
+        manager.kill_all_and_reap_for_test();
         let linked: Vec<_> = manager
             .repository_state
             .checkouts
@@ -4995,7 +5029,7 @@ mod tests {
         assert_eq!(recovered.health(), &CheckoutHealth::Available);
         assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
 
-        restarted.kill_all();
+        restarted.kill_all_and_reap_for_test();
         git(
             &repo,
             &[
@@ -5106,6 +5140,7 @@ mod tests {
             assert!(pid_is_live(original_shell_pid));
             manager.persist_at_for_test(&root, workspace, Some(failure));
 
+            let _reapers = manager.runtime_reapers_for_test();
             let close_error = manager.remove(id).unwrap_err().to_string();
             assert_eq!(manager.repository_state.repositories.len(), 1);
             assert_eq!(manager.repository_state.checkouts.len(), 1);
@@ -5157,7 +5192,7 @@ mod tests {
                         .pid()
                         .unwrap()
                 ));
-                manager.kill_all();
+                manager.kill_all_and_reap_for_test();
             }
         }
     }
@@ -5189,6 +5224,7 @@ mod tests {
             .fail_next_teardown_for_test("shell stop refused once");
         let before = manager.repository_state.clone();
 
+        let _reapers = manager.runtime_reapers_for_test();
         let partial = manager.remove(id).unwrap_err().to_string();
         assert!(partial.contains("shell stopped: false"), "got: {partial}");
         assert!(manager.session(id).unwrap().claude.is_exited());
@@ -5279,6 +5315,7 @@ mod tests {
             .unwrap();
         let resume_id = "resume-daemon-early";
         manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
         let transcript_cwd = manager.repository_state.checkouts[0]
             .observed_path
@@ -5337,6 +5374,7 @@ mod tests {
             .expect("a plain folder is admitted as a standalone row");
         let resume_id = "resume-daemon-early-folder";
         manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
         let closed = persisted_at(&root, workspace);
         assert_eq!(
@@ -5399,6 +5437,7 @@ mod tests {
             .find_map(|(key, id)| (*id == runtime).then_some(*key))
             .unwrap();
         manager.session_id_for_test(runtime, "opaque-daemon-target");
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
 
         let outcome = manager.reopen_checkout(checkout).unwrap();
@@ -5420,6 +5459,7 @@ mod tests {
         );
         assert_eq!(manager.runtime_checkouts.len(), 1);
 
+        let _reopened_reapers = manager.runtime_reapers_for_test();
         manager.remove(reopened_runtime).unwrap();
         manager.persist_at_for_test(&root, workspace, Some(persist::AtomicFailure::Rename));
         assert!(manager.reopen_checkout(checkout).is_err());
@@ -5474,6 +5514,7 @@ mod tests {
         std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
 
         manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
+        let _reapers = manager.runtime_reapers_for_test();
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
         let error = manager
             .confirm_remove_worktree(confirmation)
@@ -5558,6 +5599,7 @@ mod tests {
                     .unwrap()
                     .fail_next_teardown_for_test("shell stop refused once");
             }
+            let _reapers = manager.runtime_reapers_for_test();
             let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
 
             let error = manager
@@ -5610,7 +5652,7 @@ mod tests {
                 persisted_at(&root, workspace).checkouts[0].session.archived,
                 committed
             );
-            manager.kill_all();
+            manager.kill_all_and_reap_for_test();
         }
     }
 
@@ -5631,7 +5673,7 @@ mod tests {
         );
         // Unknown id → Err (→ 404 upstream).
         assert!(m.event_path(9999).is_err());
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5674,7 +5716,7 @@ mod tests {
         assert!(m.activity(9999, 10).is_err());
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5685,7 +5727,7 @@ mod tests {
         let b = m.create("/tmp", None, None).unwrap();
         assert_eq!(a.name, "tmp");
         assert_eq!(b.name, "tmp (2)");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5697,7 +5739,7 @@ mod tests {
         // refuse rather than write into a not-yet-listening PTY.
         let err = m.post_message(id, "hello").unwrap_err().to_string();
         assert!(err.contains("starting"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5723,7 +5765,7 @@ mod tests {
             assert!(Instant::now() < deadline, "screen never showed output");
             std::thread::sleep(Duration::from_millis(300));
         }
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5733,7 +5775,7 @@ mod tests {
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.restart(id).unwrap_err().to_string();
         assert!(err.contains("still running"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5746,8 +5788,9 @@ mod tests {
             assert!(Instant::now() < deadline, "stub never exited");
             std::thread::sleep(Duration::from_millis(100));
         }
+        let _reapers = m.runtime_reapers_for_test();
         m.restart(id).unwrap();
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5761,7 +5804,7 @@ mod tests {
         m.set_archived(id, false).unwrap();
         assert!(!m.info(id).unwrap().archived);
         assert!(m.set_archived(99, true).is_err());
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     fn proc_state(pid: u32) -> String {
@@ -5832,7 +5875,7 @@ mod tests {
             |st| !st.is_empty() && !st.starts_with('T'),
             "running again",
         );
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5851,7 +5894,7 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(100));
         assert!(!proc_state(pid).starts_with('T'), "keep never SIGSTOPs");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5872,7 +5915,7 @@ mod tests {
         assert!(info.archived, "long-waiting session should auto-archive");
         assert!(info.suspended, "auto-archive applies policy=suspend");
         wait_for_state(pid, |st| st.starts_with('T'), "stopped");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5885,7 +5928,7 @@ mod tests {
         s.archived = true;
         s.suspend_idle_child().expect("suspend");
         assert!(m.info(id).unwrap().suspended);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5907,7 +5950,7 @@ mod tests {
         let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
         assert!(!s.auto_archive_tick(idle), "tick undid a manual unarchive");
         assert!(!m.info(id).unwrap().archived);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5949,7 +5992,7 @@ mod tests {
         assert!(lines[1].contains("Stop"));
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5965,7 +6008,7 @@ mod tests {
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.ingest_event(id, "{}").unwrap_err().to_string();
         assert!(err.contains("session_id"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6000,7 +6043,7 @@ mod tests {
         assert!(contents.contains(&sid));
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6020,7 +6063,7 @@ mod tests {
             .meta
             .last_tool = Some(("Bash".to_string(), 1));
         assert_eq!(m.info(id).unwrap().last_tool.as_deref(), Some("Bash"));
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6047,7 +6090,7 @@ mod tests {
             m.info(id).unwrap().waiting_reason.as_deref(),
             Some("permission")
         );
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6083,7 +6126,7 @@ mod tests {
         let p = m.pending(id).unwrap().expect("pending present");
         assert_eq!(p.request_id, "r1");
         assert_eq!(p.tool, "Bash");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6109,7 +6152,7 @@ mod tests {
         // The decision is readable by a waiter (the bridge's poll).
         let d = m.decision(id).unwrap().expect("decision recorded");
         assert_eq!(d.decision, "allow");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6120,7 +6163,7 @@ mod tests {
         m.set_pending(id, pending("r2", "Write")).unwrap();
         m.resolve_pending(id, "deny").unwrap();
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "deny");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6136,7 +6179,7 @@ mod tests {
         m.set_pending(id, pending("r2", "Edit")).unwrap();
         assert!(m.decision(id).unwrap().is_none());
         assert_eq!(m.pending(id).unwrap().unwrap().request_id, "r2");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6195,7 +6238,7 @@ mod tests {
                 .expect("resolve must wake the waiter");
         });
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "allow");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6235,7 +6278,7 @@ mod tests {
             Some("ForeignMarker")
         );
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
     }
 
@@ -6320,7 +6363,7 @@ mod tests {
             m.collisions[0].allocated_path.display()
         );
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
     }
 
@@ -6388,7 +6431,7 @@ mod tests {
         };
         let own_file = pane_pid.map(|p| claude.join("sessions").join(format!("{p}.json")));
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
 
         assert!(

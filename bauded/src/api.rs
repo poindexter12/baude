@@ -1149,6 +1149,7 @@ mod tests {
             assert!(crate::manager::lock(&state).info(id).is_some());
         }
 
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let deleted = app
             .clone()
             .oneshot(
@@ -1183,7 +1184,7 @@ mod tests {
             .unwrap()
             .success());
 
-        crate::manager::lock(&state).kill_all();
+        crate::manager::lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1317,6 +1318,7 @@ mod tests {
                 manager.persist_at_for_test(&delete_root, &workspace, Some(failure));
                 id
             };
+            let _delete_reapers = crate::manager::lock(&delete_state).runtime_reapers_for_test();
             let response = super::router(Arc::clone(&delete_state))
                 .oneshot(
                     Request::delete(format!("/sessions/{delete_id}"))
@@ -1414,6 +1416,7 @@ mod tests {
                 &workspace,
                 Some(failure),
             );
+            let _restart_reapers = crate::manager::lock(&restart_state).runtime_reapers_for_test();
             let response = super::router(Arc::clone(&restart_state))
                 .oneshot(post_json(&format!("/sessions/{restart_id}/restart"), ""))
                 .await
@@ -1434,7 +1437,7 @@ mod tests {
             );
 
             for state in [&create_state, &delete_state, &archive_state, &restart_state] {
-                crate::manager::lock(state).kill_all();
+                crate::manager::lock(state).kill_all_and_reap_for_test();
             }
         }
     }
@@ -1467,6 +1470,7 @@ mod tests {
             manager.fail_next_agent_teardown_for_test(id, "agent stop refused once");
             id
         };
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let delete = |id: u64| {
             super::router(Arc::clone(&state)).oneshot(
                 Request::delete(format!("/sessions/{id}"))
@@ -1491,7 +1495,7 @@ mod tests {
         // A genuinely unknown id is still 404.
         assert_eq!(delete(id).await.unwrap().status(), StatusCode::NOT_FOUND);
 
-        crate::manager::lock(&state).kill_all();
+        crate::manager::lock(&state).kill_all_and_reap_for_test();
     }
 
     /// End a fixture runtime the way a crashed agent does, by signalling its
@@ -1574,6 +1578,7 @@ mod tests {
     async fn restart_api_follows_a_branch_switch_on_a_main_checkout() {
         let fixture = removal_fixture_two_checkouts("restart-follows").await;
         let main_path = fixture.repo.path().canonicalize().unwrap();
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         exit_fixture_runtime(&fixture, fixture.main_id, fixture.main_key).await;
         git(&main_path, &["switch", "-c", "changed"]);
         let expected = git_read(&main_path, &["symbolic-ref", "-q", "HEAD"])
@@ -1666,7 +1671,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_file(&path);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1743,7 +1748,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_file(&path);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1774,7 +1779,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1876,7 +1881,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1914,7 +1919,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(res).await["decision"], "deny");
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     /// WR-04: a decision that lands while a long-poll GET is in flight must wake
@@ -1983,7 +1988,7 @@ mod tests {
             "long-poll did not wake promptly on decision: took {elapsed:?}"
         );
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1999,7 +2004,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_lifecycle_over_http() {
-        let (_scope, app) = app();
+        // `app()` spelled out, so the case keeps the manager it needs to bind
+        // a reaper before its own DELETE drops the runtime.
+        let _scope = api_scope("router");
+        let state: Shared = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let app = super::router(Arc::clone(&state));
         // create
         let res = app
             .clone()
@@ -2056,6 +2065,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::ACCEPTED);
 
         // delete
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let res = app
             .clone()
             .oneshot(
@@ -2355,7 +2365,7 @@ mod tests {
     /// Stop every runtime the fixture still owns. The root itself is removed
     /// by its `FixtureRoot` when the fixture drops, also on panic.
     fn removal_teardown(shared: &Shared, _root: &Path) {
-        crate::manager::lock(shared).kill_all();
+        crate::manager::lock(shared).kill_all_and_reap_for_test();
     }
 
     async fn preview_report(app: &Router, key: CheckoutKey) -> serde_json::Value {
@@ -2413,6 +2423,7 @@ mod tests {
             "the fixture runtime must be live before the removal"
         );
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = app
             .clone()
             .oneshot(post_json("/removals", &report.to_string()))
@@ -2467,6 +2478,7 @@ mod tests {
             .unwrap();
         assert!(live.archived);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = execute_previewed(app, fixture.worktree_key).await;
         assert_eq!(executed.status(), StatusCode::OK);
         let executed = body_json(executed).await;
@@ -2516,7 +2528,7 @@ mod tests {
         assert_eq!(survivor.session.name, live.name);
         assert_eq!(survivor.session.branch, live.branch);
 
-        restored.kill_all();
+        restored.kill_all_and_reap_for_test();
         removal_teardown(&fixture.shared, &fixture.root);
     }
 
@@ -2528,6 +2540,7 @@ mod tests {
         let app = &fixture.app;
         let repo_path = fixture.repo.path().canonicalize().unwrap();
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let first = execute_previewed(app, fixture.worktree_key).await;
         assert_status(
             first,
@@ -2603,6 +2616,7 @@ mod tests {
     #[tokio::test]
     async fn removals_execute_survives_a_fresh_restore() {
         let (root, _fixture, workspace, shared, app, _id, key) = removal_fixture("restore").await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = execute_previewed(&app, key).await;
         assert_eq!(executed.status(), StatusCode::OK);
 
@@ -2747,6 +2761,7 @@ mod tests {
         let preview = preview_target(&app, &target).await;
         let agent_pid = only_runtime_pid(&preview);
         assert!(pid_is_alive(agent_pid));
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(&app, &target).await;
         assert!(
             !removed.paths_deleted.contains(&by_hand),
@@ -2921,6 +2936,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
 
         // Execute, echoing the previewed report verbatim.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3107,6 +3123,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert!(wait_for_pid_gone(agent_pid));
@@ -3173,6 +3190,7 @@ mod tests {
         assert!(pid_is_alive(first_pid));
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (restarted, restarted_app) =
             restarted_daemon(&root, &workspace, &recording_agent_cmd(&root));
         assert!(
@@ -3192,6 +3210,7 @@ mod tests {
         let second_pid = only_runtime_pid(&preview);
         assert_ne!(second_pid, first_pid);
         assert!(pid_is_alive(second_pid));
+        let _restarted_reapers = crate::manager::lock(&restarted).runtime_reapers_for_test();
         let (status, body) = removal_call(&restarted_app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3234,6 +3253,7 @@ mod tests {
         let launches = launch_lines(&root, 1);
         assert_eq!(launches.len(), 1, "{launches:?}");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         let (status, body) = open_folder(&app, folder.to_str().unwrap(), None).await;
@@ -3272,6 +3292,7 @@ mod tests {
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
         // End the agent from outside, the way it dies under a user.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let killed = Command::new("kill")
             .arg(ended_pid.to_string())
             .status()
@@ -3311,6 +3332,7 @@ mod tests {
         let relaunched_pid = only_runtime_pid(&preview);
         assert_ne!(relaunched_pid, ended_pid);
         assert!(pid_is_alive(relaunched_pid));
+        let _relaunched_reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3336,6 +3358,7 @@ mod tests {
         assert!(pid_is_alive(first_pid));
 
         std::fs::remove_dir_all(&folder).unwrap();
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (restarted, restarted_app) = restarted_daemon(&root, &workspace, REMOVAL_AGENT_CMD);
         assert!(
             wait_for_pid_gone(first_pid),
@@ -3383,6 +3406,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
         let body = preview.to_string();
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (first, second) = tokio::join!(
             app.clone().oneshot(post_json("/removals", &body)),
             app.clone().oneshot(post_json("/removals", &body)),
@@ -3435,6 +3459,7 @@ mod tests {
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(
             status,
@@ -3487,6 +3512,7 @@ mod tests {
             let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
             crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, Some(failure));
 
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let (status, body) = delete_session_status(&app, id).await;
             assert_eq!(
                 status,
@@ -3634,6 +3660,7 @@ mod tests {
         let main_path = fixture.repo.path().canonicalize().unwrap();
 
         // A managed worktree removed with its directory: P.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3685,6 +3712,7 @@ mod tests {
             Some(by_hand_id),
             "{rows}"
         );
+        let _by_hand_reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": by_hand_entries[0]["checkout_key"] }),
@@ -3726,6 +3754,7 @@ mod tests {
         let fixture = removal_fixture_two_checkouts("suppress-parent").await;
         let app = &fixture.app;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3767,6 +3796,7 @@ mod tests {
         let main_path = fixture.repo.path().canonicalize().unwrap();
         let before = checkout_entries(&rows_body(app).await).len();
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3815,7 +3845,7 @@ mod tests {
         assert!(reads_suppressed(&p), "{}", p.display());
         assert!(reads_suppressed(&main_path), "{}", main_path.display());
 
-        crate::manager::lock(&fixture.shared).kill_all();
+        crate::manager::lock(&fixture.shared).kill_all_and_reap_for_test();
         removal_teardown(&restarted, &fixture.root);
     }
 
@@ -3827,6 +3857,7 @@ mod tests {
         opened_folder_id(&app, &folder).await;
         let key = standalone_key_of(&only_standalone_row(&app).await);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(&app, &serde_json::json!({ "standalone": key })).await;
         assert_eq!(
             cleared_paths(
@@ -3973,6 +4004,7 @@ mod tests {
         );
         assert!(!baude_core::suppression::file_path(&config).exists());
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         removed_over_routes(
             &app,
             &serde_json::json!({ "checkout": entries[0]["checkout_key"] }),
@@ -4091,6 +4123,7 @@ mod tests {
         for pid in &agent_pids {
             assert!(pid_is_alive(*pid), "{preview}");
         }
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4163,6 +4196,7 @@ mod tests {
         assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
         assert_eq!(entry["path"].as_str(), stale.to_str(), "{entry}");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             &app,
             &serde_json::json!({ "standalone": standalone_key_of(&entry) }),
@@ -4192,6 +4226,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
         let body = report.to_string();
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (first, second) = tokio::join!(
             app.clone().oneshot(post_json("/removals", &body)),
             app.clone().oneshot(post_json("/removals", &body)),
@@ -4470,6 +4505,7 @@ mod tests {
         let before = rows_checkout(&rows_body(&fixture.app).await, fixture.worktree_key).unwrap();
         assert_eq!(before["session_id"], fixture.worktree_id);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let deleted = fixture
             .app
             .clone()
@@ -4602,6 +4638,7 @@ mod tests {
             let before = rows_body(&app).await;
             assert!(rows_checkout(&before, key).is_some(), "{before}");
 
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let read = app.clone().oneshot(get("/rows"));
             let removal = app
                 .clone()
@@ -4773,6 +4810,7 @@ mod tests {
         let before = std::fs::read(&state_file).unwrap();
 
         // Execute, echoing the previewed report verbatim.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5039,6 +5077,7 @@ mod tests {
         assert_eq!(kept.len(), 1, "{preview}");
         assert_eq!(Path::new(&kept[0]).canonicalize().unwrap(), main_path);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5093,6 +5132,7 @@ mod tests {
 
         let target = serde_json::json!({ "repository": repo_row["repository_key"] });
         let preview = preview_target(&app, &target).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5151,6 +5191,7 @@ mod tests {
                 preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
             let child_report = preview_report(app, fixture.worktree_key).await;
 
+            let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
             let parent = removal_call(app, "/removals", &parent_report);
             let child = removal_call(app, "/removals", &child_report);
             let ((parent_status, parent_body), (child_status, child_body)) = if parent_first {
@@ -5223,6 +5264,7 @@ mod tests {
                 preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
 
             let read = rows_bytes(app);
+            let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
             let removal = removal_call(app, "/removals", &report);
             let (raced, (status, body)) = if read_first {
                 tokio::join!(read, removal)
@@ -5312,6 +5354,7 @@ mod tests {
             "{preview}"
         );
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5371,6 +5414,7 @@ mod tests {
             "{preview}"
         );
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(main_path.is_dir());
@@ -5613,6 +5657,7 @@ mod tests {
         assert!(second_worktree.is_dir());
 
         // Resending the 409 body verbatim executes it.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let resent = app
             .clone()
             .oneshot(post_json("/removals", &raw))
@@ -5664,6 +5709,7 @@ mod tests {
         let previewed_pid = previewed_agent_pid(&stale, key);
 
         // The agent dies and is restarted while the modal is open.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let signalled = Command::new("kill")
             .arg(previewed_pid.to_string())
             .status()
@@ -5781,6 +5827,7 @@ mod tests {
             assert_eq!(steering[field], previewed[field]);
         }
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &steering).await;
         assert_eq!(
             status,
@@ -5823,6 +5870,7 @@ mod tests {
         let agent_pid = only_runtime_pid(&stale);
 
         // Closing the session keeps the row and ends its runtime.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert!(wait_for_pid_gone(agent_pid));
@@ -5892,6 +5940,7 @@ mod tests {
         let agent_pid = previewed_agent_pid(&previewed, key);
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         let body = assert_refused(
@@ -5937,6 +5986,7 @@ mod tests {
         let agent_pid = only_runtime_pid(&previewed);
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         let body = assert_refused(
@@ -5995,6 +6045,7 @@ mod tests {
         let other_pid = other_pid.as_u64().unwrap();
         let before = world_snapshot(app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         crate::manager::lock(&fixture.shared)
             .fail_next_agent_teardown_for_test(armed_id, "agent stop refused once");
         let body = assert_refused(
@@ -6075,6 +6126,7 @@ mod tests {
         assert_eq!(planned_paths.len(), 1, "{previewed}");
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared).persist_at_for_test(
             &root,
             &workspace,
@@ -6135,14 +6187,14 @@ mod tests {
         assert!(!crate::manager::lock(&shared).persistence_status().dirty);
 
         // A fresh restore does not list the row.
-        crate::manager::lock(&shared).kill_all();
+        crate::manager::lock(&shared).kill_all_and_reap_for_test();
         let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
         restored.restore_at(&root, &workspace);
         assert!(matches!(
             restored.preview_removal(RemovalTarget::Checkout(worktree_key)),
             Err(RemovalError::UnknownTarget(_))
         ));
-        restored.kill_all();
+        restored.kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -6157,6 +6209,7 @@ mod tests {
             &workspace,
             Some(baude_core::persist::AtomicFailure::DirectorySync),
         );
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed =
             assert_executed(&app, &previewed, "a save whose replacement committed").await;
         assert_eq!(
@@ -6206,6 +6259,7 @@ mod tests {
 
         // A real reservation, held across the request with the manager lock
         // released.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let reservation = crate::manager::lock(&shared).reserve_repository_for_test(repository);
         let body = assert_refused(
             removal_response(&app, &previewed).await,
@@ -6275,6 +6329,7 @@ mod tests {
         // 21-10's recorded case: the path of a managed worktree the daemon
         // removed, so nothing is there to admit.
         let removed = fixture.worktree_path.clone();
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -6449,6 +6504,7 @@ mod tests {
         assert!(rows_lists(&rows_body(&app).await, &row));
 
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let response = removal_response(&app, &previewed).await;
         assert_eq!(response.status(), StatusCode::OK);
         let executed = body_json(response).await;
@@ -6481,6 +6537,7 @@ mod tests {
         let mut second = open_events(&app).await;
 
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let response = removal_response(&app, &previewed).await;
         assert_eq!(response.status(), StatusCode::OK);
         let executed = body_json(response).await;
@@ -6505,6 +6562,7 @@ mod tests {
         // An earlier subscriber proves the removal was announced at all, so
         // the silence below is the absence of replay and not of publishing.
         let mut early = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = execute_previewed(&app, key).await;
         assert_eq!(executed.status(), StatusCode::OK);
         expect_rows_removed(&mut early, "the subscriber that was connected").await;
@@ -6557,6 +6615,7 @@ mod tests {
             let mut events = open_events(&app).await;
 
             let previewed = preview_target(&app, &row).await;
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let executed = assert_executed(&app, &previewed, "a standalone row").await;
             assert_eq!(executed["rows_removed"], serde_json::json!([row]));
             expect_exactly_one(&mut events, &executed, "a standalone row").await;
@@ -6572,6 +6631,7 @@ mod tests {
         let mut events = open_events(app).await;
 
         let previewed = preview_target(app, &target).await;
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &previewed, "a repository parent").await;
         let removed = executed["rows_removed"].as_array().unwrap().clone();
         for row in [
@@ -6608,6 +6668,7 @@ mod tests {
         expect_silence(&mut events, Duration::from_millis(500), "after the 409").await;
 
         let retried = preview_target(app, &target).await;
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &retried, "the re-previewed removal").await;
         assert_eq!(
             executed["rows_removed"].as_array().unwrap().len(),
@@ -6626,6 +6687,7 @@ mod tests {
         let mut events = open_events(&app).await;
         let previewed = preview_report(&app, key).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         assert_refused(
@@ -6655,6 +6717,7 @@ mod tests {
         let mut events = open_events(app).await;
         let previewed = preview_target(app, &target).await;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         crate::manager::lock(&fixture.shared).persist_at_for_test(
             &fixture.root,
             &fixture.workspace,
@@ -6703,6 +6766,7 @@ mod tests {
             &workspace,
             Some(baude_core::persist::AtomicFailure::DirectorySync),
         );
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed =
             assert_executed(&app, &previewed, "a save whose replacement committed").await;
         let announced = expect_exactly_one(&mut events, &executed, "a degraded commit").await;
@@ -6743,6 +6807,7 @@ mod tests {
         expect_silence(&mut events, within, "after the busy 503").await;
 
         drop(reservation);
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &previewed, "the same body once free").await;
         expect_exactly_one(&mut events, &executed, "the same body once free").await;
 
@@ -6808,6 +6873,7 @@ mod tests {
                 .publish_for_test(DaemonEvent::RowsRemoved(synthetic_report(number)));
         }
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = assert_executed(&app, &previewed, "a removal after the flood").await;
 
         // `next_sse_frame` panics if the body ends, so reaching the real
@@ -7229,6 +7295,7 @@ mod tests {
         let state_before = std::fs::read(&state_file).unwrap();
 
         // The removal, with the previewed report echoed verbatim.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, executed) = socket_request(addr, "POST", "/removals", Some(&previewed)).await;
         assert_eq!(status, StatusCode::OK, "POST /removals: {executed}");
         assert_eq!(executed["rows_removed"], serde_json::json!([row]));
@@ -7481,6 +7548,7 @@ mod tests {
         assert_eq!(worktree_row["repository_key"], target["repository"]);
 
         let preview = preview_target(&app, &target).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "POST /removals {target}: {body}");
 
@@ -7646,6 +7714,6 @@ mod pty_ws_tests {
         assert_eq!((shot.rows, shot.cols), (30, 100));
 
         drop(ws);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 }
