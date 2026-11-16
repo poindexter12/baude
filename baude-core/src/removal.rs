@@ -3127,26 +3127,32 @@ mod tests {
 
     // ---- stages run apart (plan 22.1-08) ----
 
-    /// A save closure that keeps a copy of the `StateFile` it was handed and
-    /// writes it under `state_root`, plus a count of its calls.
+    /// What a recording save closure saw: how often it was called and the
+    /// state of the last `StateFile` it was handed.
+    #[derive(Default)]
+    struct SaveRecord {
+        calls: u32,
+        received: Option<RepositoryState>,
+    }
+
+    /// A save closure that records each `StateFile` it is handed and writes
+    /// it under `state_root`.
     fn recording_save(
         state_root: &Path,
     ) -> (
         impl FnOnce(&StateFile) -> Result<(), SaveError>,
-        Rc<std::cell::RefCell<Option<RepositoryState>>>,
-        Rc<Cell<u32>>,
+        Rc<std::cell::RefCell<SaveRecord>>,
     ) {
-        let received = Rc::new(std::cell::RefCell::new(None));
-        let calls = Rc::new(Cell::new(0));
-        let sink = Rc::clone(&received);
-        let counter = Rc::clone(&calls);
+        let record = Rc::new(std::cell::RefCell::new(SaveRecord::default()));
+        let sink = Rc::clone(&record);
         let root = state_root.to_path_buf();
         let save = move |file: &StateFile| {
-            counter.set(counter.get() + 1);
-            *sink.borrow_mut() = Some(file.state.clone());
+            let mut seen = sink.borrow_mut();
+            seen.calls += 1;
+            seen.received = Some(file.state.clone());
             persist::save_current_at_test(&root, "state.json", file, None, None)
         };
-        (save, received, calls)
+        (save, record)
     }
 
     fn has_repository(state: &RepositoryState, key: RepositoryKey) -> bool {
@@ -3181,7 +3187,7 @@ mod tests {
         state
             .validate_for_save()
             .expect("the state with B admitted is save-valid");
-        let (save, received, calls) = recording_save(&f.state_root());
+        let (save, record) = recording_save(&f.state_root());
 
         commit(&mut state, prepared, effects, &mut handles, save).expect("commit");
 
@@ -3194,9 +3200,10 @@ mod tests {
             "B's checkout is missing from the state after commit"
         );
         assert!(!has_checkout(&state, a_checkout));
-        assert_eq!(calls.get(), 1, "one save");
-        let saved = received
+        assert_eq!(record.borrow().calls, 1, "one save");
+        let saved = record
             .borrow_mut()
+            .received
             .take()
             .expect("the save closure received a StateFile");
         assert!(
