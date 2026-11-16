@@ -154,9 +154,11 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
             | RemovalError::Validation(_)
             | RemovalError::SelectionChanged { .. },
         )
-        // The slow stage panicked after the handles were put back: a
-        // server-side failure, and some runtime may already be stopped.
-        | RemoveRowsError::SlowStagePanicked(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // A stage panicked and the handles were put back: a server-side
+        // failure, and some runtime may already be stopped.
+        | RemoveRowsError::SlowStagePanicked(_)
+        | RemoveRowsError::PreparePanicked(_)
+        | RemoveRowsError::CommitPanicked { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     match error {
         RemoveRowsError::Drift(report) => (status, Json(*report)).into_response(),
@@ -2979,6 +2981,237 @@ mod tests {
             wait_for_pid_gone(agent_pid),
             "the retried removal's agent is still alive"
         );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Run one removal of the fixture's checkout with a panic armed at `at`
+    /// in a locked stage, and return what it answered with the agent pid
+    /// the preview named.
+    async fn removal_with_panic_at(
+        shared: &Shared,
+        app: &Router,
+        key: CheckoutKey,
+        at: crate::manager::RemovalPanicForTest,
+    ) -> (StatusCode, String, u64) {
+        let report = preview_report(app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        crate::manager::lock(shared).panic_in_removal_for_test(at);
+        let (status, body) = removal_call(app, "/removals", &report).await;
+        (status, body, agent_pid)
+    }
+
+    /// Pin a removal that panicked before its commit landed: a 500 naming
+    /// the panic from the removal itself, the session back in the registry
+    /// and still mapped to its row, the agent alive, no event; and the
+    /// reservation released, so a fresh preview commits once.
+    async fn assert_uncommitted_panic_restored(
+        shared: &Shared,
+        app: &Router,
+        events: &mut EventsBody,
+        (id, key): (u64, CheckoutKey),
+        (status, body, agent_pid): (StatusCode, String, u64),
+        message: &str,
+        marker: &str,
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 {marker} pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 {marker} pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 {marker} pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(app).await,
+            [id],
+            "WR-01 {marker} pin: the session did not come back to the registry"
+        );
+        assert_eq!(
+            crate::manager::lock(shared).checkout_key_for_runtime_for_test(id),
+            Some(key),
+            "WR-01 {marker} pin: the row lost its runtime mapping"
+        );
+        assert!(pid_is_alive(agent_pid), "the panic struck before the kill");
+        let rows = rows_body(app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        expect_silence(events, Duration::from_millis(500), "after the panic").await;
+
+        let retried = preview_report(app, key).await;
+        assert_eq!(
+            previewed_agent_pid(&retried, key),
+            agent_pid,
+            "the restored handle is not the runtime the removal took"
+        );
+        let executed = assert_executed(app, &retried, "the retry after a panic").await;
+        expect_exactly_one(events, &executed, "the retry after a panic").await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+    }
+
+    /// WR-01: a panic in `begin_removal`, after the doomed session left the
+    /// registry and while core's `prepare` runs, puts the handle back,
+    /// releases the reservation and answers the removal's own 500.
+    #[tokio::test]
+    async fn removals_panic_while_preparing_restores_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("panic-prepare").await;
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected prepare panic";
+        let answered = removal_with_panic_at(
+            &shared,
+            &app,
+            key,
+            crate::manager::RemovalPanicForTest::Prepare(message.into()),
+        )
+        .await;
+        assert_uncommitted_panic_restored(
+            &shared,
+            &app,
+            &mut events,
+            (id, key),
+            answered,
+            message,
+            "prepare panic",
+        )
+        .await;
+        removal_teardown(&shared, &root);
+    }
+
+    /// WR-01: a panic inside the save closure core's `commit` calls, after
+    /// the kill, puts the handle back, releases the reservation and answers
+    /// the removal's own 500. Nothing was saved, so the row stands.
+    #[tokio::test]
+    async fn removals_panic_in_the_save_restores_handles() {
+        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("panic-save").await;
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected save panic";
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        crate::manager::lock(&shared)
+            .panic_in_removal_for_test(crate::manager::RemovalPanicForTest::Save(message.into()));
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 save panic pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 save panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 save panic pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            [id],
+            "WR-01 save panic pin: the session did not come back to the registry"
+        );
+        assert_eq!(
+            crate::manager::lock(&shared).checkout_key_for_runtime_for_test(id),
+            Some(key),
+            "WR-01 save panic pin: the row lost its runtime mapping"
+        );
+        let rows = rows_body(&app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        let restored = restored_rows(&root, &workspace);
+        assert!(
+            rows_checkout(&restored, key).is_some(),
+            "the panic struck before the save, so the file still holds the row: {restored}"
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after the save panic",
+        )
+        .await;
+
+        // The kill ran before the save, so the restored handle is a stopped
+        // runtime; the reservation is free again and a fresh removal commits.
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the slow stage ran before the save, so the agent is stopped"
+        );
+        let retried = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &retried, "the retry after a save panic").await;
+        expect_exactly_one(&mut events, &executed, "the retry after a save panic").await;
+        assert!(session_ids(&app).await.is_empty());
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// WR-01: a panic in `finish_removal` after core's `commit` returned
+    /// `Ok` answers the removal's own 500 and publishes nothing. The commit
+    /// stands, so the registry is reconciled to it: the removed row's
+    /// runtime mapping is dropped, the session is not listed, and the
+    /// released reservation lets the repository take a new session.
+    #[tokio::test]
+    async fn removals_panic_after_the_commit_keeps_the_registry_consistent() {
+        let (root, fixture, workspace, shared, app, id, key) =
+            removal_fixture("panic-after-commit").await;
+        let repo = fixture.path().canonicalize().unwrap();
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected after-commit panic";
+        let (status, body, agent_pid) = removal_with_panic_at(
+            &shared,
+            &app,
+            key,
+            crate::manager::RemovalPanicForTest::AfterCommit(message.into()),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 after-commit panic pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 after-commit panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 after-commit panic pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            crate::manager::lock(&shared).checkout_key_for_runtime_for_test(id),
+            None,
+            "WR-01 after-commit panic pin: the removed row is still mapped to its runtime"
+        );
+        assert!(
+            session_ids(&app).await.is_empty(),
+            "WR-01 after-commit panic pin: the removed session is still listed"
+        );
+        let rows = rows_body(&app).await;
+        assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+        assert!(wait_for_pid_gone(agent_pid), "the removed agent is alive");
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after the after-commit panic",
+        )
+        .await;
+
+        let (readmitted, _, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        assert_ne!(readmitted, id);
+        assert_eq!(session_ids(&app).await, [readmitted]);
 
         removal_teardown(&shared, &root);
     }

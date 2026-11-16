@@ -216,6 +216,18 @@ pub enum RemoveRowsError {
     /// The slow stage, the kill and the delete, panicked; the payload is the
     /// panic message. Every runtime handle was put back and nothing saved.
     SlowStagePanicked(String),
+    /// Stage one panicked after the rows' sessions left the registry; the
+    /// payload is the panic message. Every handle was put back and nothing
+    /// was changed.
+    PreparePanicked(String),
+    /// Stage three panicked. Every handle core did not consume was put back,
+    /// and no event was published. `rows_removed` says whether core's commit
+    /// had already replaced the state; when it had, the removed rows'
+    /// registry entries were dropped so the registry matches the state.
+    CommitPanicked {
+        message: String,
+        rows_removed: bool,
+    },
 }
 
 impl std::fmt::Display for RemoveRowsError {
@@ -230,6 +242,25 @@ impl std::fmt::Display for RemoveRowsError {
                 f,
                 "removal panicked while stopping runtimes and deleting worktrees, \
                  nothing was saved: {message}"
+            ),
+            Self::PreparePanicked(message) => write!(
+                f,
+                "removal panicked while preparing, nothing was changed: {message}"
+            ),
+            Self::CommitPanicked {
+                message,
+                rows_removed: false,
+            } => write!(
+                f,
+                "removal panicked while committing, the rows stand: {message}"
+            ),
+            Self::CommitPanicked {
+                message,
+                rows_removed: true,
+            } => write!(
+                f,
+                "removal panicked after its commit, the rows were removed \
+                 and no event was sent: {message}"
             ),
         }
     }
@@ -248,6 +279,9 @@ pub struct RemovalInFlight {
     runtimes: Vec<RowRuntime>,
     /// The session ids moved out of the registry.
     consumed: Vec<u64>,
+    /// The rows the removal takes, for reconciling the registry with the
+    /// state after a panic in the commit stage.
+    rows: Vec<RowKey>,
     #[cfg(test)]
     pause: Option<RemovalPauseForTest>,
     /// Held, never read: dropping the value releases the repository.
@@ -420,6 +454,22 @@ impl RemovalPauseForTest {
     }
 }
 
+/// Test-only: where the next removal panics in one of its two locked
+/// stages, and with what message. The slow stage's own panic is armed on
+/// [`RemovalPauseForTest`] instead.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum RemovalPanicForTest {
+    /// In `begin_removal`, where core's `prepare` runs, after the doomed
+    /// sessions left the registry.
+    Prepare(String),
+    /// In the save closure core's `commit` calls, before anything is written.
+    Save(String),
+    /// In `finish_removal`, after core's `commit` returned `Ok` and before
+    /// the registry bookkeeping and the publish.
+    AfterCommit(String),
+}
+
 /// Overwrite the retained session metadata of every checkout still present in
 /// `state` with its live value. The single merge implementation: both the
 /// ordinary save and the removal save go through it, so the two cannot drift.
@@ -505,6 +555,10 @@ pub struct Manager {
     /// Test-only: the gate a removal passes between prepare and the kill.
     #[cfg(test)]
     removal_pause_for_test: Option<RemovalPauseForTest>,
+    /// Test-only: a panic the next removal raises in one of its two locked
+    /// stages. Taken by the removal that raises it.
+    #[cfg(test)]
+    removal_panic_for_test: Option<RemovalPanicForTest>,
     /// Startup timing stages (config load, state load, listener bound, etc.)
     pub startup_timing: crate::timing::StartupTiming,
 }
@@ -935,6 +989,8 @@ impl Manager {
             spawn_error_for_test: None,
             #[cfg(test)]
             removal_pause_for_test: None,
+            #[cfg(test)]
+            removal_panic_for_test: None,
             startup_timing: crate::timing::StartupTiming::new(0),
         }
     }
@@ -1404,17 +1460,44 @@ impl Manager {
         self.merge_doomed_rows_live_metadata(&fresh, &overrides, &standalone_overrides);
         let runtimes = self.collect_row_runtimes(&fresh);
         let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
-        let prepared = match removal::prepare(&self.repository_state, target, &runtimes) {
-            Ok(prepared) => prepared,
-            Err(error) => {
+        #[cfg(test)]
+        let prepare_panic = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::Prepare(message) => Some(message),
+            _ => None,
+        });
+        // The handles are out of the registry from here until the in-flight
+        // value owns them. They are only borrowed by the closure, so a panic
+        // in core's prepare still finds every one of them here to put back;
+        // the reservations drop when this returns.
+        let state = &self.repository_state;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(message) = prepare_panic {
+                panic!("{message}");
+            }
+            removal::prepare(state, target, &runtimes)
+        }));
+        let prepared = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
                 self.abandon_removal(runtimes, &error);
                 return Err(RemoveRowsError::Removal(error));
+            }
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                self.restore_row_runtimes(runtimes);
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                return Err(RemoveRowsError::PreparePanicked(message));
             }
         };
         Ok(RemovalInFlight {
             prepared,
             runtimes,
             consumed,
+            rows: fresh.rows_removed.clone(),
             #[cfg(test)]
             pause: self.removal_pause_for_test.clone(),
             _repository_reservation: repository_reservation,
@@ -1431,6 +1514,12 @@ impl Manager {
     /// committed save reaches the one `publish`. The reservation the
     /// in-flight value carries is released when this returns, after that
     /// publish.
+    ///
+    /// The stage runs inside one `catch_unwind`. The handles stay owned out
+    /// here and the stage only borrows them, so a panic anywhere in it, core's
+    /// `commit` and the save closure included, still finds every handle core
+    /// did not consume: [`Self::recover_from_commit_panic`] puts them back
+    /// and the answer is a 500 naming the panic, with nothing published.
     pub fn finish_removal(
         &mut self,
         inflight: RemovalInFlight,
@@ -1440,22 +1529,106 @@ impl Manager {
             prepared,
             mut runtimes,
             consumed,
+            rows,
             #[cfg(test)]
                 pause: _,
             _repository_reservation,
             _standalone_reservation,
         } = inflight;
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.commit_removal(prepared, stage2, &mut runtimes, &consumed)
+        }));
+        match finished {
+            Ok(result) => result,
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                let rows_removed =
+                    self.recover_from_commit_panic(std::mem::take(&mut runtimes), &consumed, &rows);
+                Err(RemoveRowsError::CommitPanicked {
+                    message,
+                    rows_removed,
+                })
+            }
+        }
+    }
+
+    /// Put the registry back in step with `repository_state` after a panic
+    /// in the commit stage, and return whether the commit had already
+    /// removed the rows.
+    ///
+    /// Every handle still in `runtimes` goes back to the registry: before
+    /// core's commit replaced the state that is every handle, after it only
+    /// those core did not consume. A row core's commit removed loses its
+    /// `runtime_checkouts` or `runtime_standalones` entry, as on the
+    /// committed path; a row that stands keeps its entry, which still names
+    /// its restored session. Core replaces the state in one assignment, so
+    /// the rows are either all gone or all present.
+    fn recover_from_commit_panic(
+        &mut self,
+        runtimes: Vec<RowRuntime>,
+        consumed: &[u64],
+        rows: &[RowKey],
+    ) -> bool {
+        self.restore_row_runtimes(runtimes);
+        let mut rows_removed = false;
+        for row in rows {
+            let state = &self.repository_state;
+            let gone = match row {
+                RowKey::Checkout(key) => !state.checkouts.iter().any(|saved| saved.key == *key),
+                RowKey::Standalone(key) => state.standalone_session(*key).is_none(),
+                RowKey::Repository(key) => {
+                    !state.repositories.iter().any(|saved| saved.key == *key)
+                }
+            };
+            if !gone {
+                continue;
+            }
+            rows_removed = true;
+            match row {
+                RowKey::Checkout(key) => {
+                    self.runtime_checkouts.remove(key);
+                }
+                RowKey::Standalone(key) => {
+                    self.runtime_standalones.remove(key);
+                }
+                RowKey::Repository(_) => {}
+            }
+        }
+        for id in consumed {
+            if !self.sessions.iter().any(|session| session.id == *id) {
+                if let Some(notify) = self.permission_notify.remove(id) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.atomic_failure_for_test = None;
+        }
+        rows_removed
+    }
+
+    /// The body of [`Self::finish_removal`], under its `catch_unwind`. Every
+    /// exit that puts handles back takes them out of `runtimes`, so whatever
+    /// a panic leaves there is still owed to the registry.
+    fn commit_removal(
+        &mut self,
+        prepared: PreparedRemoval,
+        stage2: SlowStageOutcome,
+        runtimes: &mut Vec<RowRuntime>,
+        consumed: &[u64],
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
         let effects = match stage2 {
             Ok(Ok(effects)) => effects,
             Ok(Err(error)) => {
-                self.abandon_removal(runtimes, &error);
+                self.abandon_removal(std::mem::take(runtimes), &error);
                 return Err(RemoveRowsError::Removal(error));
             }
             Err(panic) => {
                 // The handles were never moved into the panicking closure, so
                 // every one of them is still here to put back.
                 let message = panic_message(panic.as_ref());
-                self.restore_row_runtimes(runtimes);
+                self.restore_row_runtimes(std::mem::take(runtimes));
                 #[cfg(test)]
                 {
                     self.atomic_failure_for_test = None;
@@ -1476,7 +1649,16 @@ impl Manager {
         let test_target = self.persistence_target_for_test.clone();
         #[cfg(test)]
         let atomic_failure = self.atomic_failure_for_test;
+        #[cfg(test)]
+        let save_panic = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::Save(message) => Some(message),
+            _ => None,
+        });
         let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            #[cfg(test)]
+            if let Some(message) = save_panic {
+                panic!("{message}");
+            }
             if !persist_enabled {
                 return Ok(());
             }
@@ -1502,7 +1684,7 @@ impl Manager {
             &mut self.repository_state,
             prepared,
             effects,
-            &mut runtimes,
+            runtimes,
             save,
         );
         let report = match result {
@@ -1512,10 +1694,17 @@ impl Manager {
                 // refusal: core left `repository_state` untouched and every
                 // handle in the Vec, so the rows and their registry entries
                 // all stand.
-                self.abandon_removal(runtimes, &error);
+                self.abandon_removal(std::mem::take(runtimes), &error);
                 return Err(RemoveRowsError::Removal(error));
             }
         };
+        #[cfg(test)]
+        if let Some(message) = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::AfterCommit(message) => Some(message),
+            _ => None,
+        }) {
+            panic!("{message}");
+        }
         for row in &report.rows_removed {
             match row {
                 RowKey::Checkout(key) => {
@@ -1529,7 +1718,7 @@ impl Manager {
         }
         // Handles the core did not consume stay registered.
         let restored: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
-        self.restore_row_runtimes(runtimes);
+        self.restore_row_runtimes(std::mem::take(runtimes));
         for id in consumed.iter().filter(|id| !restored.contains(id)) {
             // Wake before forgetting, so no long-poll hangs on a row that no
             // longer exists.
@@ -1879,6 +2068,28 @@ impl Manager {
         let pause = RemovalPauseForTest::default();
         self.removal_pause_for_test = Some(pause.clone());
         pause
+    }
+
+    /// Test-only: make the next removal panic at `at`.
+    #[cfg(test)]
+    pub(crate) fn panic_in_removal_for_test(&mut self, at: RemovalPanicForTest) {
+        self.removal_panic_for_test = Some(at);
+    }
+
+    /// The armed removal panic's message when `matches` accepts its stage,
+    /// taken so it fires once.
+    #[cfg(test)]
+    fn take_removal_panic_for_test(
+        &mut self,
+        matches: fn(&RemovalPanicForTest) -> Option<&String>,
+    ) -> Option<String> {
+        let message = self
+            .removal_panic_for_test
+            .as_ref()
+            .and_then(matches)?
+            .clone();
+        self.removal_panic_for_test = None;
+        Some(message)
     }
 
     /// Take the real reservation of standalone row `key`, the folder
