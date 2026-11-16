@@ -3302,6 +3302,100 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// 22.1-11, T-22.1-43: a teardown failure hit inside the unlocked slow
+    /// stage answers 500 and leaves the daemon as it was: `/rows` unchanged,
+    /// the session back in the registry with its agent alive, no event. A
+    /// fresh preview then commits once.
+    ///
+    /// The failure is armed before the removal starts, while the session is
+    /// still registered: `fail_next_agent_teardown_for_test` finds it through
+    /// the session list, which the removal empties for the window. The
+    /// injection itself is keyed by the agent pid, so it fires in the kill on
+    /// the removal's blocking thread, after the pause.
+    #[tokio::test]
+    async fn removals_failure_in_the_slow_stage_leaves_rows_and_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-failure").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let rows_before = rows_body(&app).await;
+        assert!(rows_checkout(&rows_before, key).is_some(), "{rows_before}");
+        assert_eq!(session_ids(&app).await, vec![id]);
+        let mut events = open_events(&app).await;
+
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(&probe_app, "GET /rows", get("/rows")).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let during = window.outcome.expect("the probe ran").served();
+        assert_eq!(
+            during, rows_before,
+            "/rows changed during the slow stage of a removal"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "22.1-11 failure pin: a refused stop in the slow stage answered {status}: {body}"
+        );
+        assert!(
+            body.contains("agent stop refused once"),
+            "22.1-11 failure pin: the 500 body does not name the refused stop: {body}"
+        );
+        assert_eq!(
+            rows_body(&app).await,
+            rows_before,
+            "22.1-11 failure pin: /rows changed after a failed removal"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            vec![id],
+            "22.1-11 failure pin: the session did not come back to the registry"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "22.1-11 failure pin: the refused stop left the agent dead"
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after a failure in the slow stage",
+        )
+        .await;
+
+        let retried = preview_report(&app, key).await;
+        assert_eq!(
+            previewed_agent_pid(&retried, key),
+            agent_pid,
+            "the restored handle is not the runtime the removal took"
+        );
+        let executed =
+            assert_executed(&app, &retried, "the retry after a slow-stage failure").await;
+        expect_exactly_one(
+            &mut events,
+            &executed,
+            "the retry after a slow-stage failure",
+        )
+        .await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
