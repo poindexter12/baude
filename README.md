@@ -998,10 +998,23 @@ the request.
 | 200 | the preview, or the report of the committed removal |
 | 409 | from `POST /removals`: the rows, runtimes or paths to delete changed since the preview. Nothing was removed, and the body is the fresh preview as JSON |
 | 404 | the target row is unknown |
-| 503 | from `POST /removals`: refused on the daemon's own state. The repository is busy, a save of the daemon's state is blocked or failed, or a runtime handle is missing |
-| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, or a validation failed. From `POST /removals/preview`: any error other than an unknown target |
+| 503 | refused on the daemon's own state. From `POST /removals`: the repository or folder is busy with another removal, a save of the daemon's state is blocked or failed, or a runtime handle is missing. From the session routes listed below: the repository or folder is busy with a removal |
+| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, a validation failed, or the removal panicked while stopping runtimes and deleting worktrees. From `POST /removals/preview`: any error other than an unknown target |
 
 Every error body is plain text except the 409.
+
+Other requests are served while a removal stops runtimes and deletes
+worktrees. `GET /rows` keeps listing the rows being removed until the removal
+commits, then drops them all at once. `GET /sessions` stops listing the
+sessions being removed while the removal runs, and lists them again if it
+fails. A request that would change the repository or folder being removed
+answers 503 with the body `repository busy: <path>`, naming the repository's
+main checkout, or `folder busy: <path>`. Those requests are `POST /removals`
+for any of its rows, `POST /sessions` into it with or without a `worktree`
+branch, and `DELETE`, `restart`, `archive` and `unarchive` of its sessions.
+Creating a worktree in a busy repository used to answer 400 and now answers
+this 503. `POST /removals/preview` is still served during a removal and reads
+the rows as they were. Every other route keeps its status codes.
 
 A 200 from `POST /removals` can carry `"outcome": "saved_degraded"` and a
 `detail` text under `persistence`. The removal happened: the row is gone from
