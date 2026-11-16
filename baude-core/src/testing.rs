@@ -555,6 +555,71 @@ pub fn spawn_unkillable_runtime(cwd: &Path, holder_pid_path: &Path) -> (Pty, Hol
 
 // ---- fixture hygiene guards (phase 22.1) ----
 
+/// A fixture directory under `temp_dir()`, removed when it drops, also when
+/// the test panicked.
+///
+/// The path is `temp_dir()` verbatim, never canonicalized: tests rely on the
+/// macOS `/var` symlink staying in the path they are handed.
+pub struct FixtureRoot {
+    path: PathBuf,
+}
+
+impl FixtureRoot {
+    /// Create `temp_dir()/<prefix>-<pid>-<seq>`, removing a stale copy first.
+    ///
+    /// The pid keeps two test binaries apart and the process-wide sequence
+    /// keeps two roots in one binary apart. `prefix` must start with `baude-`
+    /// or `bauded-` and name a single path component; anything else panics
+    /// here, so the drop can only ever remove a tree it created.
+    pub fn new(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        assert!(
+            Self::is_fixture_name(prefix),
+            "FixtureRoot prefix {prefix:?} must start with baude- or bauded- and name one \
+             path component"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("create fixture root {}: {error}", path.display()));
+        Self { path }
+    }
+
+    /// The root's path, under `temp_dir()` as returned.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn is_fixture_name(name: &str) -> bool {
+        (name.starts_with("baude-") || name.starts_with("bauded-"))
+            && !name.contains('/')
+            && !name.contains("..")
+    }
+}
+
+impl std::ops::Deref for FixtureRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for FixtureRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FixtureRoot {
+    fn drop(&mut self) {}
+}
+
 /// Kills what a fixture runtime left behind when it drops, also on panic.
 ///
 /// The recorded process group alone is not enough: the PTY runs its command
@@ -734,6 +799,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create reaper root");
         root
+    }
+
+    /// Make every directory under `path` owner-writable, so a test that left
+    /// a read-only tree can still clean it up after a failed assertion.
+    fn force_remove(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fn walk(path: &Path) {
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                return;
+            };
+            if !meta.is_dir() {
+                return;
+            }
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o700);
+            let _ = std::fs::set_permissions(path, perms);
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    walk(&entry.path());
+                }
+            }
+        }
+        walk(path);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn fixture_root_is_removed_when_the_test_panics() {
+        let seen = std::sync::Mutex::new(None::<PathBuf>);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let root = FixtureRoot::new("baude-testing-panic");
+            std::fs::write(root.join("marker"), b"x").expect("write marker");
+            *seen.lock().unwrap() = Some(root.path().to_path_buf());
+            panic!("the fixture body failed");
+        }));
+        assert!(outcome.is_err(), "the body must have panicked");
+        let path = seen.lock().unwrap().clone().expect("root path recorded");
+        let remained = path.exists();
+        if remained {
+            force_remove(&path);
+        }
+        assert!(
+            !remained,
+            "fixture root {} still exists after a panicking test",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn fixture_root_paths_are_unique_and_prefixed() {
+        let first = FixtureRoot::new("baude-testing-unique");
+        let second = FixtureRoot::new("baude-testing-unique");
+        assert_ne!(first.path(), second.path());
+        for root in [&first, &second] {
+            assert!(root.is_dir(), "{} was not created", root.display());
+            assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            assert!(
+                name.starts_with("baude-testing-unique-"),
+                "unexpected name {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_root_removes_a_read_only_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = FixtureRoot::new("baude-testing-read-only");
+        let path = root.path().to_path_buf();
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).expect("create locked dir");
+        std::fs::write(locked.join("file"), b"x").expect("write file");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+            .expect("make read-only");
+        drop(root);
+        let remained = path.exists();
+        if remained {
+            force_remove(&path);
+        }
+        assert!(
+            !remained,
+            "fixture root {} with a read-only subtree still exists after drop",
+            path.display()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must start with baude- or bauded-")]
+    fn fixture_root_refuses_a_foreign_prefix() {
+        let _root = FixtureRoot::new("other-x");
     }
 
     /// The real job-control shape: the interactive gate shell runs `sleep` in
