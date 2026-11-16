@@ -2643,6 +2643,57 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// T-22.1-38: `GET /rows` during the window shows the doomed row exactly
+    /// as before the removal, live metadata included, though its session is
+    /// out of the registry; after the commit the row is gone.
+    #[tokio::test]
+    async fn removals_rows_shape_is_stable_during_the_slow_stage() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-shape").await;
+        let archived = app
+            .clone()
+            .oneshot(post_json(&format!("/sessions/{id}/archive"), ""))
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+        let before = rows_checkout(&rows_body(&app).await, key).expect("the row before");
+        assert_eq!(before["archived"], true, "{before}");
+        assert_eq!(before["session_id"], id, "{before}");
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(&probe_app, "GET /rows", get("/rows")).await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        let rows = window.outcome.expect("the probe ran").served();
+        let during = rows_checkout(&rows, key).expect("the doomed row is listed until the commit");
+        assert_eq!(
+            during["archived"], true,
+            "22.1-10 shape pin: the doomed row read as un-archived during the slow stage: {during}"
+        );
+        assert_eq!(during["session_id"], id, "{during}");
+        assert_eq!(
+            during, before,
+            "the doomed row changed shape during the window"
+        );
+
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(rows_checkout(&rows_body(&app).await, key).is_none());
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
