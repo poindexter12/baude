@@ -227,22 +227,16 @@ pub fn clear(root: Option<&Path>, folder: &Path) -> std::io::Result<bool> {
 mod tests {
     use super::*;
     use crate::testing::TestRedirect;
-    use std::path::PathBuf;
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
-    fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "baude-folder-workspace-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-folder-workspace-{name}"))
     }
 
     #[test]
     fn records_and_recalls_one_folder_preserving_others() {
-        let _redirect = TestRedirect::new(scratch("roundtrip-root"));
+        let redirect_root = scratch("roundtrip-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("roundtrip");
         record(Some(&dir), Path::new("/mem/api"), "opencode", 10);
         record(Some(&dir), Path::new("/mem/web"), "work", 20);
@@ -266,7 +260,8 @@ mod tests {
 
     #[test]
     fn clear_removes_only_the_named_key() {
-        let _redirect = TestRedirect::new(scratch("clear-root"));
+        let redirect_root = scratch("clear-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("clear");
         let home = Path::new("/mem");
         record(Some(&dir), Path::new("/mem/api"), "shared", 10);
@@ -306,7 +301,8 @@ mod tests {
 
     #[test]
     fn unknown_folder_disabled_switch_or_env_never_consult_memory() {
-        let _redirect = TestRedirect::new(scratch("gates-root"));
+        let redirect_root = scratch("gates-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("gates");
         record(Some(&dir), Path::new("/mem/api"), "opencode", 5);
 
@@ -336,7 +332,8 @@ mod tests {
 
     #[test]
     fn corrupt_file_degrades_to_no_memory_with_one_note_and_heals_on_record() {
-        let _redirect = TestRedirect::new(scratch("corrupt-root"));
+        let redirect_root = scratch("corrupt-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("corrupt");
         std::fs::write(dir.join(FILE_NAME), b"{not json").unwrap();
         let plan = plan_launch(true, None, None, Some(&dir), Path::new("/mem/api"));
@@ -369,7 +366,8 @@ mod tests {
 
     #[test]
     fn find_binding_at_parent_level_returns_parent_workspace() {
-        let _redirect = TestRedirect::new(scratch("find-binding-parent-root"));
+        let redirect_root = scratch("find-binding-parent-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-parent");
         let parent = Path::new("/mem");
         let home = Path::new("/home/user");
@@ -382,7 +380,8 @@ mod tests {
 
     #[test]
     fn find_binding_at_grandparent_when_parent_has_no_binding() {
-        let _redirect = TestRedirect::new(scratch("find-binding-grandparent-root"));
+        let redirect_root = scratch("find-binding-grandparent-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-grandparent");
         let grandparent = Path::new("/mem");
         let _parent = Path::new("/mem/api");
@@ -397,7 +396,8 @@ mod tests {
 
     #[test]
     fn find_binding_nearest_wins_when_both_parent_and_grandparent_have_bindings() {
-        let _redirect = TestRedirect::new(scratch("find-binding-nearest-root"));
+        let redirect_root = scratch("find-binding-nearest-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-nearest");
         let grandparent = Path::new("/mem");
         let parent = Path::new("/mem/api");
@@ -413,7 +413,8 @@ mod tests {
 
     #[test]
     fn find_binding_stops_at_home_boundary() {
-        let _redirect = TestRedirect::new(scratch("find-binding-home-root"));
+        let redirect_root = scratch("find-binding-home-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-home");
         let above_home = Path::new("/");
         let home = Path::new("/home/user");
@@ -427,7 +428,8 @@ mod tests {
 
     #[test]
     fn find_binding_returns_none_when_no_binding_exists() {
-        let _redirect = TestRedirect::new(scratch("find-binding-none-root"));
+        let redirect_root = scratch("find-binding-none-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-none");
         let launch_dir = Path::new("/mem/api/src");
         let home = Path::new("/home/user");
@@ -438,7 +440,8 @@ mod tests {
 
     #[test]
     fn find_binding_at_home_with_binding_returns_some() {
-        let _redirect = TestRedirect::new(scratch("find-binding-at-home-root"));
+        let redirect_root = scratch("find-binding-at-home-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-at-home");
         let home = Path::new("/home/user");
 
@@ -450,7 +453,8 @@ mod tests {
 
     #[test]
     fn find_binding_at_home_without_binding_returns_none() {
-        let _redirect = TestRedirect::new(scratch("find-binding-no-binding-root"));
+        let redirect_root = scratch("find-binding-no-binding-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("find-binding-no-binding");
         let home = Path::new("/home/user");
 
@@ -460,7 +464,8 @@ mod tests {
 
     #[test]
     fn plan_launch_with_baude_backend_and_binding_returns_hint() {
-        let _redirect = TestRedirect::new(scratch("plan-launch-backend-root"));
+        let redirect_root = scratch("plan-launch-backend-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("plan-launch-backend");
 
         let parent_dir = scratch("plan-launch-backend-parent");
@@ -478,7 +483,8 @@ mod tests {
 
     #[test]
     fn plan_launch_with_baude_backend_and_no_binding_derives() {
-        let _redirect = TestRedirect::new(scratch("plan-launch-derive-root"));
+        let redirect_root = scratch("plan-launch-derive-root");
+        let _redirect = TestRedirect::new(&redirect_root);
         let dir = scratch("plan-launch-derive");
 
         // Create a temporary git repository to test derivation.

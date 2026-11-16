@@ -143,18 +143,15 @@ pub fn start_workspace(
 #[cfg(test)]
 mod tests {
     use crate::testing::TestRedirect;
-    use std::path::PathBuf;
 
-    fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("baude-launch-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-launch-{name}"))
     }
 
     #[test]
     fn test_wspc02_start_workspace_derives_persists_recalls() {
-        let _redirect = TestRedirect::new(scratch("wspc02-root"));
+        let redirect_root = scratch("wspc02-root");
+        let _redirect = TestRedirect::new(&redirect_root);
 
         // Create a git repository.
         let repo_dir = scratch("wspc02-repo");
@@ -189,7 +186,8 @@ mod tests {
 
     #[test]
     fn test_daemon_startup_parity_with_tui() {
-        let _redirect = TestRedirect::new(scratch("daemon-parity-root"));
+        let redirect_root = scratch("daemon-parity-root");
+        let _redirect = TestRedirect::new(&redirect_root);
 
         // Create a git repository.
         let repo_dir = scratch("daemon-parity-repo");

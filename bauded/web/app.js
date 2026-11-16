@@ -230,8 +230,33 @@ async function openChat(sid) {
     render();
     scrollChat(true);
   } catch (e) {
-    if (e.status === 404) { location.hash = "#/"; toast("session is gone"); }
+    const outcome = sessionRequestOutcome(e.status);
+    if (outcome === "gone") { location.hash = "#/"; toast("session is gone"); }
+    else if (outcome === "busy") retryChatLater(sid, e.message);
   }
+}
+
+// How a failed request on a session's route reads; see sessionRequestOutcome
+// in removal.js. Without that script only a 404 is told apart.
+function sessionRequestOutcome(status) {
+  if (typeof BaudeRemoval !== "undefined") return BaudeRemoval.sessionRequestOutcome(status);
+  return status === 404 ? "gone" : "failed";
+}
+
+// A 503 on a session's route is transient: the daemon answers it while a
+// removal of the session's row stops runtimes and deletes worktrees, and the
+// session comes back if that removal fails. A stream opened meanwhile was
+// refused too, so both streams are reopened along with the history. A session
+// the removal did take answers 404 by then, and the view leaves as usual.
+const SESSION_BUSY_RETRY_MS = 2000;
+function retryChatLater(sid, why) {
+  toast(`${why}, retrying`);
+  setTimeout(() => {
+    if (state.sid !== sid) return;
+    closeStream();
+    openChat(sid);
+    openActivity(sid);
+  }, SESSION_BUSY_RETRY_MS);
 }
 
 function scrollChat(force) {
@@ -710,22 +735,18 @@ function renderList() {
   let rows;
   if (removalController) {
     // The hierarchy comes from the controller's /rows body, joined to
-    // /sessions on session id. A session no row claims is still listed, as a
-    // card with no remove control: it has no durable key to remove by.
-    const claimed = new Set();
-    const tree = BaudeRemovalController.renderRowsList(removalController.getRows(), {
+    // /sessions on session id. A session no row claims is still listed, under
+    // `other sessions` with archived ones last, as a card with no remove
+    // control: it has no durable key to remove by.
+    const rowsBody = removalController.getRows();
+    rows = BaudeRemovalController.renderRowsList(rowsBody, {
       removal: BaudeRemoval,
       card: (sid) => {
         const s = session(sid);
-        if (!s) return null;
-        claimed.add(s.id);
-        return rowHtml(s);
+        return s ? rowHtml(s) : null;
       },
+      keyless: BaudeRemovalController.unclaimedSessions(rowsBody, state.sessions),
     });
-    const rest = (list) => list.filter((s) => !claimed.has(s.id)).map(rowHtml).join("");
-    const restArchived = rest(archived);
-    rows = tree + rest(active)
-      + (restArchived ? `<div class="secthead">archived</div>${restArchived}` : "");
   } else {
     rows = active.map(rowHtml).join("")
       + (archived.length

@@ -354,9 +354,7 @@ mod not_repository_tests {
 
     #[test]
     fn a_folder_whose_gitfile_points_nowhere_is_not_a_repository() {
-        let root =
-            std::env::temp_dir().join(format!("baude-git-stale-gitfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testing::FixtureRoot::new("baude-git-stale-gitfile");
         let stale = root.join("stale");
         std::fs::create_dir_all(&stale).unwrap();
         let gone = root
@@ -367,7 +365,6 @@ mod not_repository_tests {
         std::fs::write(stale.join(".git"), format!("gitdir: {}\n", gone.display())).unwrap();
 
         let outcome = discover_repository(&stale);
-        let _ = std::fs::remove_dir_all(&root);
         match outcome {
             Err(RepositoryDiscoveryError::NotRepository(path)) => {
                 assert!(path.ends_with("stale"), "{}", path.display())
@@ -3638,20 +3635,14 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
     struct GitFixture {
-        root: PathBuf,
+        root: crate::testing::FixtureRoot,
     }
 
     impl GitFixture {
         fn new() -> Self {
-            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("baude-git-test-{}-{sequence}", std::process::id()));
-            std::fs::create_dir(&root).expect("create unique Git fixture root");
+            let root = crate::testing::FixtureRoot::new("baude-git-test");
             Self { root }
         }
 
@@ -3835,12 +3826,6 @@ mod tests {
                 ],
             );
             path
-        }
-    }
-
-    impl Drop for GitFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 

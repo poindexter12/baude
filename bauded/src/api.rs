@@ -18,7 +18,8 @@ use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 use baude_core::removal::{RemovalError, RemovalReport, RemovalTarget};
 
 use crate::manager::{
-    lock, MutationError, PermissionView, RemoveRowsError, RowsView, SessionInfo, Shared,
+    lock, MutationError, PermissionView, RemoveRowsError, RowsView, SessionBusy, SessionInfo,
+    Shared,
 };
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
@@ -111,8 +112,20 @@ pub fn push_router(state: crate::push::SharedPush) -> Router {
 
 type ApiError = (StatusCode, String);
 
-fn not_found(e: anyhow::Error) -> ApiError {
-    (StatusCode::NOT_FOUND, e.to_string())
+/// Status for a failed lookup on a single-session route. A session a removal
+/// holds out of the registry while it stops runtimes and deletes worktrees
+/// answers 503 with the busy body the four mutating routes use: it comes
+/// back if the removal fails. Any other failed lookup is 404.
+fn session_error(e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<SessionBusy>() {
+        Some(SessionBusy(message)) => (StatusCode::SERVICE_UNAVAILABLE, message.clone()),
+        None => (StatusCode::NOT_FOUND, e.to_string()),
+    }
+}
+
+/// Whether a lookup failed only because a removal holds the session for now.
+fn is_session_busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SessionBusy>().is_some()
 }
 
 fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
@@ -122,6 +135,9 @@ fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
         // failure, never the caller's "not found"/"bad request" fallback.
         MutationError::Teardown(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         MutationError::Domain(error) => (fallback, error.to_string()),
+        // The repository or folder is reserved by another mutation: refused
+        // on the daemon's own state, the same 503 a busy removal answers.
+        MutationError::Busy(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
     }
 }
 
@@ -138,13 +154,24 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
             RemovalError::Persist { .. } | RemovalError::RuntimeHandleMissing(_),
         )
         | RemoveRowsError::Blocked(_)
-        | RemoveRowsError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | RemoveRowsError::Busy(_)
+        | RemoveRowsError::FolderBusy(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // SelectionChanged follows a kill and a delete: core's commit found
+        // the target selecting other rows than prepare did. It is unreachable
+        // under the daemon's exclusion around a removal, so seeing it means
+        // that exclusion was broken.
         RemoveRowsError::Removal(
             RemovalError::RuntimeSurvived { .. }
             | RemovalError::DiskRemoval { .. }
             | RemovalError::RuntimeIdentityMismatch { .. }
-            | RemovalError::Validation(_),
-        ) => StatusCode::INTERNAL_SERVER_ERROR,
+            | RemovalError::Validation(_)
+            | RemovalError::SelectionChanged { .. },
+        )
+        // A stage panicked and the handles were put back: a server-side
+        // failure, and some runtime may already be stopped.
+        | RemoveRowsError::SlowStagePanicked(_)
+        | RemoveRowsError::PreparePanicked(_)
+        | RemoveRowsError::CommitPanicked { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     match error {
         RemoveRowsError::Drift(report) => (status, Json(*report)).into_response(),
@@ -169,14 +196,62 @@ async fn preview_removal(
 /// `POST /removals`: the body is the previewed report echoed verbatim. Only
 /// its target and its three compared sets are read; every path, runtime and
 /// row acted on comes from the daemon's own state.
+///
+/// The whole removal runs in one `spawn_blocking` closure, which runs to the
+/// end once started: a client that goes away mid-removal drops only the
+/// await below, never the commit or the return of the runtime handles. The
+/// manager lock is taken twice inside it, for `begin_removal` and for
+/// `finish_removal`; the kill and the delete between them run with no lock,
+/// so other requests are served meanwhile. No `MutexGuard` crosses an await.
 async fn execute_removal(
     State(state): State<Shared>,
     Json(previewed): Json<RemovalReport>,
 ) -> axum::response::Response {
-    let mut manager = lock(&state);
-    match manager.remove_rows(&previewed) {
+    // Fixture redirects are thread-local; the blocking thread gets the
+    // handler thread's before it resolves any path.
+    #[cfg(test)]
+    let redirects = baude_core::testing::capture();
+    let joined = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _redirect = baude_core::testing::TestRedirect::install(redirects);
+        run_removal(&state, &previewed)
+    })
+    .await;
+    match joined {
+        Ok(response) => response,
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("removal task failed: {join}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The three stages of `POST /removals`, on the blocking thread.
+fn run_removal(state: &Shared, previewed: &RemovalReport) -> axum::response::Response {
+    let mut inflight = {
+        let mut manager = lock(state);
+        match manager.begin_removal(previewed) {
+            Ok(inflight) => inflight,
+            Err(error) => return removal_refusal(&manager, error),
+        }
+    };
+    let stage2 = inflight.stop_and_delete();
+    let mut manager = lock(state);
+    match manager.finish_removal(inflight, stage2) {
         Ok(report) => Json(report).into_response(),
-        Err(RemoveRowsError::Busy(repository)) => {
+        Err(error) => removal_refusal(&manager, error),
+    }
+}
+
+/// The response for a removal that did not happen, built under the manager
+/// lock so a busy body can name the path the daemon resolved for itself.
+fn removal_refusal(
+    manager: &crate::manager::Manager,
+    error: RemoveRowsError,
+) -> axum::response::Response {
+    match error {
+        RemoveRowsError::Busy(repository) => {
             // The key alone names nothing a client can show, so the body
             // carries the repository path the daemon resolved for itself.
             match manager.repository_path(repository) {
@@ -188,7 +263,15 @@ async fn execute_removal(
                 None => removal_error(RemoveRowsError::Busy(repository)),
             }
         }
-        Err(error) => removal_error(error),
+        RemoveRowsError::FolderBusy(key) => match manager.standalone_path(key) {
+            Some(path) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("folder busy: {}", path.display()),
+            )
+                .into_response(),
+            None => removal_error(RemoveRowsError::FolderBusy(key)),
+        },
+        error => removal_error(error),
     }
 }
 
@@ -238,9 +321,9 @@ async fn get_session(
     Path(id): Path<u64>,
 ) -> Result<Json<SessionInfo>, ApiError> {
     lock(&state)
-        .info(id)
+        .session_info(id)
         .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no session {id}")))
+        .map_err(session_error)
 }
 
 #[derive(Deserialize)]
@@ -283,7 +366,7 @@ async fn get_messages(
     Path(id): Path<u64>,
     Query(q): Query<MessagesQuery>,
 ) -> Result<Json<Vec<ChatMessage>>, ApiError> {
-    let path = lock(&state).transcript_path(id).map_err(not_found)?;
+    let path = lock(&state).transcript_path(id).map_err(session_error)?;
     let Some(path) = path else {
         // Session exists but Claude hasn't written a transcript yet.
         return Ok(Json(vec![]));
@@ -311,7 +394,7 @@ async fn get_activity(
     Query(q): Query<ActivityQuery>,
 ) -> Result<Json<Vec<HookEvent>>, ApiError> {
     let limit = q.limit.unwrap_or(ACTIVITY_CAP).min(ACTIVITY_CAP);
-    let act = lock(&state).activity(id, limit).map_err(not_found)?;
+    let act = lock(&state).activity(id, limit).map_err(session_error)?;
     Ok(Json(act))
 }
 
@@ -329,6 +412,9 @@ async fn post_message(
         return Err((StatusCode::BAD_REQUEST, "empty message".into()));
     }
     lock(&state).post_message(id, &body.text).map_err(|e| {
+        if is_session_busy(&e) {
+            return session_error(e);
+        }
         let msg = e.to_string();
         if msg.starts_with("no session") {
             (StatusCode::NOT_FOUND, msg)
@@ -344,7 +430,7 @@ async fn interrupt(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).interrupt(id).map_err(not_found)?;
+    lock(&state).interrupt(id).map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -357,6 +443,7 @@ async fn restart(State(state): State<Shared>, Path(id): Path<u64>) -> Result<Sta
             MutationError::Teardown(error) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             }
+            MutationError::Busy(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
             MutationError::Domain(error) => {
                 let message = error.to_string();
                 if message.starts_with("no session") {
@@ -396,7 +483,8 @@ async fn unarchive(
 ///
 /// Security (T-02-08/09): the `Path<u64>` extractor rejects a non-numeric id
 /// at the framework layer; an unknown / unresolvable session is a 404 via
-/// `not_found`; a malformed body is appended best-effort. There is no 500
+/// `session_error`, and a session a removal holds is its 503, so no event is
+/// appended for either; a malformed body is appended best-effort. There is no 500
 /// path. No auth layer — the route inherits the tailnet/loopback-bound,
 /// single-user security model.
 async fn post_event(
@@ -404,7 +492,9 @@ async fn post_event(
     Path(id): Path<u64>,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).ingest_event(id, &body).map_err(not_found)?;
+    lock(&state)
+        .ingest_event(id, &body)
+        .map_err(session_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -412,7 +502,7 @@ async fn post_event(
 /// the `permission-mcp` bridge POSTed, or the resolved decision once a human
 /// answered (the bridge long-polls this until `decision` appears). Returns JSON
 /// `null` when nothing is pending and nothing resolved. Unknown id → 404 via
-/// `not_found`; `Path<u64>` rejects a non-numeric id at the framework layer
+/// `session_error`; `Path<u64>` rejects a non-numeric id at the framework layer
 /// (T-04-09). No auth — inherits the tailnet/loopback single-user model (T-04-08).
 #[derive(Deserialize)]
 struct PermissionQuery {
@@ -443,7 +533,7 @@ async fn get_permission(
         // hang for the full wait window on an unlucky interleaving.
         let notify = {
             let mut m = lock(&state);
-            m.permission_notify(id).map_err(not_found)?
+            m.permission_notify(id).map_err(session_error)?
         };
         // Register the waiter first. `Notify::notified()` only stores a permit
         // for an already-registered waiter, so this MUST precede the state read.
@@ -451,8 +541,8 @@ async fn get_permission(
         tokio::pin!(notified);
         let (pending, decision) = {
             let m = lock(&state);
-            let pending = m.pending(id).map_err(not_found)?;
-            let decision = m.decision(id).map_err(not_found)?;
+            let pending = m.pending(id).map_err(session_error)?;
+            let decision = m.decision(id).map_err(session_error)?;
             (pending, decision)
         };
         // Only block when there is something pending and nothing resolved yet.
@@ -465,8 +555,8 @@ async fn get_permission(
     }
 
     let m = lock(&state);
-    let pending = m.pending(id).map_err(not_found)?;
-    let decision = m.decision(id).map_err(not_found)?;
+    let pending = m.pending(id).map_err(session_error)?;
+    let decision = m.decision(id).map_err(session_error)?;
     drop(m);
     let view = match (pending, decision) {
         // A pending request awaiting a human decision.
@@ -544,7 +634,7 @@ async fn post_permission(
         // forward-compat but not enforced/stored in v0.7 (see PermissionBody).
         lock(&state)
             .resolve_pending(id, &decision)
-            .map_err(not_found)?;
+            .map_err(session_error)?;
         return Ok(StatusCode::ACCEPTED);
     }
 
@@ -561,7 +651,9 @@ async fn post_permission(
         input: body.input.unwrap_or(serde_json::Value::Null),
         ts: body.ts.unwrap_or_else(now_unix_ms),
     };
-    lock(&state).set_pending(id, pending).map_err(not_found)?;
+    lock(&state)
+        .set_pending(id, pending)
+        .map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -570,7 +662,7 @@ async fn get_queue(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Json<Vec<String>>, ApiError> {
-    let path = lock(&state).transcript_path(id).map_err(not_found)?;
+    let path = lock(&state).transcript_path(id).map_err(session_error)?;
     Ok(Json(match path {
         Some(p) => transcript::queued(&p),
         None => vec![],
@@ -581,7 +673,7 @@ async fn get_screen(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Json<crate::manager::Screenshot>, ApiError> {
-    lock(&state).screen(id).map(Json).map_err(not_found)
+    lock(&state).screen(id).map(Json).map_err(session_error)
 }
 
 #[derive(Deserialize)]
@@ -599,7 +691,9 @@ async fn post_keys(
     if body.keys.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no keys".into()));
     }
-    lock(&state).send_keys(id, &body.keys).map_err(not_found)?;
+    lock(&state)
+        .send_keys(id, &body.keys)
+        .map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -613,7 +707,7 @@ async fn pty_ws(
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Result<axum::response::Response, ApiError> {
     // Validate before upgrading so a bad id is a clean 404, not a dead socket.
-    lock(&state).transcript_path(id).map_err(not_found)?;
+    lock(&state).transcript_path(id).map_err(session_error)?;
     Ok(ws.on_upgrade(move |socket| pty_session(socket, state, id)))
 }
 
@@ -690,14 +784,22 @@ async fn stream(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    lock(&state).transcript_path(id).map_err(not_found)?;
+    lock(&state).transcript_path(id).map_err(session_error)?;
 
     let stream = async_stream::stream! {
         let mut current: Option<PathBuf> = None;
         let mut tail = Tail::default();
         loop {
-            let path = match lock(&state).transcript_path(id) {
+            // Bound first, so the guard drops before any await below.
+            let looked_up = lock(&state).transcript_path(id);
+            let path = match looked_up {
                 Ok(p) => p,
+                // A removal holds the session for now and puts it back if it
+                // fails, so the stream stays open through the busy window.
+                Err(error) if is_session_busy(&error) => {
+                    tokio::time::sleep(Duration::from_millis(STREAM_POLL_MS)).await;
+                    continue;
+                }
                 Err(_) => break, // session deleted
             };
             if let Some(path) = path {
@@ -765,14 +867,21 @@ async fn activity_stream(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    lock(&state).event_path(id).map_err(not_found)?;
+    lock(&state).event_path(id).map_err(session_error)?;
 
     let stream = async_stream::stream! {
         let mut current: Option<PathBuf> = None;
         let mut tail = EventTail::default();
         loop {
-            let path = match lock(&state).event_path(id) {
+            // Bound first, so the guard drops before any await below.
+            let looked_up = lock(&state).event_path(id);
+            let path = match looked_up {
                 Ok(p) => p,
+                // As in `stream`: a busy session stays streamed.
+                Err(error) if is_session_busy(&error) => {
+                    tokio::time::sleep(Duration::from_millis(STREAM_POLL_MS)).await;
+                    continue;
+                }
                 Err(_) => break, // session deleted
             };
             if let Some(path) = path {
@@ -813,6 +922,7 @@ mod tests {
     use axum::Router;
     use baude_core::removal::{RemovalError, RemovalTarget, RowKey};
     use baude_core::repository::CheckoutKey;
+    use baude_core::testing::FixtureRoot;
     use baude_core::workspace::Workspace;
     use std::path::PathBuf;
 
@@ -829,22 +939,17 @@ mod tests {
     /// the same ambient config reads.
     pub(super) struct ApiScope {
         /// Struct fields drop in declaration order, so the identity is restored
-        /// while its own root is still installed.
+        /// while its own root is still installed, and the root directory is
+        /// removed only after both redirects are restored.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        _root: baude_core::testing::FixtureRoot,
     }
 
     #[must_use = "the returned ApiScope owns this case's root and identity; bind it to a named \
                   local that outlives every handler await"]
     pub(super) fn api_scope(label: &str) -> ApiScope {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bauded-scope-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = baude_core::testing::FixtureRoot::new(&format!("bauded-scope-{label}"));
         let redirect = baude_core::testing::TestRedirect::new(&root);
         let identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -856,6 +961,7 @@ mod tests {
         ApiScope {
             _identity: identity,
             _redirect: redirect,
+            _root: root,
         }
     }
 
@@ -1009,13 +1115,7 @@ mod tests {
             for workspace in ["api-identity-alpha", "api-identity-beta"] {
                 let barrier = Arc::clone(&barrier);
                 threads.push(std::thread::spawn(move || {
-                    let root = std::env::temp_dir().join(format!(
-                        "bauded-{workspace}-{}-{:?}",
-                        std::process::id(),
-                        std::thread::current().id()
-                    ));
-                    let _ = std::fs::remove_dir_all(&root);
-                    std::fs::create_dir_all(&root).unwrap();
+                    let root = FixtureRoot::new(&format!("bauded-{workspace}"));
                     let fixture = initialized_repo_in_workspace(&root, "repo", workspace);
                     barrier.wait();
                     let resolved = baude_core::workspace::active().name.clone();
@@ -1037,7 +1137,6 @@ mod tests {
                     );
                     assert!(fixture.path().exists());
                     drop(fixture);
-                    let _ = std::fs::remove_dir_all(&root);
                 }));
             }
             for thread in threads {
@@ -1048,10 +1147,7 @@ mod tests {
         /// An override-free thread cannot inherit a live API fixture identity.
         #[test]
         fn an_override_free_probe_cannot_inherit_a_fixture_identity() {
-            let root =
-                std::env::temp_dir().join(format!("bauded-identity-escape-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
+            let root = FixtureRoot::new("bauded-identity-escape");
             let _fixture = initialized_repo(&root, "repo");
             let probe = std::thread::spawn(|| baude_core::workspace::active().name.clone()).join();
             let payload = probe.expect_err("an override-free reader must not resolve an identity");
@@ -1065,7 +1161,6 @@ mod tests {
                 message.contains(baude_core::workspace::IDENTITY_ESCAPE_PANIC_MARKER),
                 "expected the identity-escape panic, got {message:?}"
             );
-            let _ = std::fs::remove_dir_all(&root);
         }
     }
 
@@ -1104,12 +1199,7 @@ mod tests {
 
     #[tokio::test]
     async fn flat_session_api_remains_a_non_hierarchical_compatibility_projection() {
-        let root = std::env::temp_dir().join(format!(
-            "bauded-flat-api-compatibility-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = FixtureRoot::new("bauded-flat-api-compatibility");
         let fixture = initialized_repo(&root, "repo");
         let repo = fixture.path().canonicalize().unwrap();
         let workspace = baude_core::workspace::resolve(
@@ -1168,6 +1258,7 @@ mod tests {
             assert!(crate::manager::lock(&state).info(id).is_some());
         }
 
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let deleted = app
             .clone()
             .oneshot(
@@ -1202,8 +1293,7 @@ mod tests {
             .unwrap()
             .success());
 
-        crate::manager::lock(&state).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        crate::manager::lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1280,7 +1370,7 @@ mod tests {
             (AtomicFailure::Rename, false),
             (AtomicFailure::DirectorySync, true),
         ] {
-            let suffix = format!("{:?}-{}", failure, std::process::id());
+            let suffix = format!("{failure:?}");
             let workspace = baude_core::workspace::resolve(
                 Some("claude"),
                 None,
@@ -1288,9 +1378,7 @@ mod tests {
                 |_| {},
             );
 
-            let create_root = std::env::temp_dir().join(format!("bauded-api-create-{suffix}"));
-            let _ = std::fs::remove_dir_all(&create_root);
-            std::fs::create_dir_all(&create_root).unwrap();
+            let create_root = FixtureRoot::new(&format!("bauded-api-create-{suffix}"));
             let create_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             crate::manager::lock(&create_state).persist_at_for_test(
                 &create_root,
@@ -1326,9 +1414,7 @@ mod tests {
                 );
             }
 
-            let delete_root = std::env::temp_dir().join(format!("bauded-api-delete-{suffix}"));
-            let _ = std::fs::remove_dir_all(&delete_root);
-            std::fs::create_dir_all(&delete_root).unwrap();
+            let delete_root = FixtureRoot::new(&format!("bauded-api-delete-{suffix}"));
             let delete_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             let delete_id = {
                 let mut manager = crate::manager::lock(&delete_state);
@@ -1341,6 +1427,7 @@ mod tests {
                 manager.persist_at_for_test(&delete_root, &workspace, Some(failure));
                 id
             };
+            let _delete_reapers = crate::manager::lock(&delete_state).runtime_reapers_for_test();
             let response = super::router(Arc::clone(&delete_state))
                 .oneshot(
                     Request::delete(format!("/sessions/{delete_id}"))
@@ -1370,9 +1457,7 @@ mod tests {
             assert_eq!(retained.checkouts.len(), 1);
             assert_eq!(retained.checkouts[0].active_intent(), !committed);
 
-            let archive_root = std::env::temp_dir().join(format!("bauded-api-archive-{suffix}"));
-            let _ = std::fs::remove_dir_all(&archive_root);
-            std::fs::create_dir_all(&archive_root).unwrap();
+            let archive_root = FixtureRoot::new(&format!("bauded-api-archive-{suffix}"));
             let archive_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
             let archive_id = {
                 let mut manager = crate::manager::lock(&archive_state);
@@ -1413,9 +1498,7 @@ mod tests {
                 committed
             );
 
-            let restart_root = std::env::temp_dir().join(format!("bauded-api-restart-{suffix}"));
-            let _ = std::fs::remove_dir_all(&restart_root);
-            std::fs::create_dir_all(&restart_root).unwrap();
+            let restart_root = FixtureRoot::new(&format!("bauded-api-restart-{suffix}"));
             let restart_fixture = initialized_repo(&restart_root, "repo");
             let repo = restart_fixture.path().to_path_buf();
             let restart_state = Arc::new(Mutex::new(Manager::new("true".into(), true)));
@@ -1442,6 +1525,7 @@ mod tests {
                 &workspace,
                 Some(failure),
             );
+            let _restart_reapers = crate::manager::lock(&restart_state).runtime_reapers_for_test();
             let response = super::router(Arc::clone(&restart_state))
                 .oneshot(post_json(&format!("/sessions/{restart_id}/restart"), ""))
                 .await
@@ -1462,10 +1546,7 @@ mod tests {
             );
 
             for state in [&create_state, &delete_state, &archive_state, &restart_state] {
-                crate::manager::lock(state).kill_all();
-            }
-            for root in [create_root, delete_root, archive_root, restart_root] {
-                std::fs::remove_dir_all(root).unwrap();
+                crate::manager::lock(state).kill_all_and_reap_for_test();
             }
         }
     }
@@ -1485,10 +1566,7 @@ mod tests {
             &persist::Config::default(),
             |_| {},
         );
-        let root =
-            std::env::temp_dir().join(format!("bauded-api-delete-teardown-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = FixtureRoot::new("bauded-api-delete-teardown");
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
         let id = {
             let mut manager = crate::manager::lock(&state);
@@ -1501,6 +1579,7 @@ mod tests {
             manager.fail_next_agent_teardown_for_test(id, "agent stop refused once");
             id
         };
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let delete = |id: u64| {
             super::router(Arc::clone(&state)).oneshot(
                 Request::delete(format!("/sessions/{id}"))
@@ -1525,8 +1604,7 @@ mod tests {
         // A genuinely unknown id is still 404.
         assert_eq!(delete(id).await.unwrap().status(), StatusCode::NOT_FOUND);
 
-        crate::manager::lock(&state).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        crate::manager::lock(&state).kill_all_and_reap_for_test();
     }
 
     /// End a fixture runtime the way a crashed agent does, by signalling its
@@ -1609,6 +1687,7 @@ mod tests {
     async fn restart_api_follows_a_branch_switch_on_a_main_checkout() {
         let fixture = removal_fixture_two_checkouts("restart-follows").await;
         let main_path = fixture.repo.path().canonicalize().unwrap();
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         exit_fixture_runtime(&fixture, fixture.main_id, fixture.main_key).await;
         git(&main_path, &["switch", "-c", "changed"]);
         let expected = git_read(&main_path, &["symbolic-ref", "-q", "HEAD"])
@@ -1638,11 +1717,7 @@ mod tests {
     async fn restart_api_refuses_replaced_repository_path() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
-            "bauded-api-restart-replaced-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = FixtureRoot::new("bauded-api-restart-replaced");
         let fixture = initialized_repo(&root, "repo");
         let repo = fixture.path().to_path_buf();
         let replacement_fixture = initialized_repo(&root, "replacement");
@@ -1660,7 +1735,6 @@ mod tests {
             crate::manager::lock(&state).info(id).unwrap().status,
             "exited"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1706,7 +1780,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_file(&path);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1783,7 +1857,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_file(&path);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1814,7 +1888,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1916,7 +1990,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -1954,7 +2028,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(res).await["decision"], "deny");
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     /// WR-04: a decision that lands while a long-poll GET is in flight must wake
@@ -2023,7 +2097,7 @@ mod tests {
             "long-poll did not wake promptly on decision: took {elapsed:?}"
         );
 
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -2039,7 +2113,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_lifecycle_over_http() {
-        let (_scope, app) = app();
+        // `app()` spelled out, so the case keeps the manager it needs to bind
+        // a reaper before its own DELETE drops the runtime.
+        let _scope = api_scope("router");
+        let state: Shared = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let app = super::router(Arc::clone(&state));
         // create
         let res = app
             .clone()
@@ -2096,6 +2174,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::ACCEPTED);
 
         // delete
+        let _reapers = crate::manager::lock(&state).runtime_reapers_for_test();
         let res = app
             .clone()
             .oneshot(
@@ -2223,20 +2302,17 @@ mod tests {
     /// The setup every removal fixture shares: an isolated root, one
     /// initialized fixture repository, and a persisting daemon whose state
     /// file lives under that root. No session is admitted yet.
-    fn removal_setup(label: &str) -> (PathBuf, FixtureRepo, Workspace, Shared, Router) {
+    fn removal_setup(label: &str) -> (FixtureRoot, FixtureRepo, Workspace, Shared, Router) {
         let root = removal_root(label);
         let fixture = initialized_repo(&root, "repo");
         let (workspace, shared, app) = removal_daemon(&root);
         (root, fixture, workspace, shared, app)
     }
 
-    /// A fresh, empty, isolated root for one removal fixture.
-    fn removal_root(label: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("bauded-removal-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    /// A fresh, empty, isolated root for one removal fixture, removed when the
+    /// returned guard drops.
+    fn removal_root(label: &str) -> FixtureRoot {
+        FixtureRoot::new(&format!("bauded-removal-{label}"))
     }
 
     /// A persisting daemon whose state file lives under `root`, over
@@ -2265,7 +2341,7 @@ mod tests {
     async fn removal_fixture(
         label: &str,
     ) -> (
-        PathBuf,
+        FixtureRoot,
         FixtureRepo,
         Workspace,
         Shared,
@@ -2282,7 +2358,6 @@ mod tests {
     /// One fixture repository with two checkouts, each owning a live runtime:
     /// the main checkout and a managed worktree on branch `topic`.
     struct TwoCheckoutFixture {
-        root: PathBuf,
         repo: FixtureRepo,
         workspace: Workspace,
         shared: Shared,
@@ -2292,6 +2367,9 @@ mod tests {
         worktree_id: u64,
         worktree_key: CheckoutKey,
         worktree_path: PathBuf,
+        /// Declared last so the directory goes after the redirects and the
+        /// manager above it have dropped.
+        root: FixtureRoot,
     }
 
     /// The two-checkout fixture, built on `removal_setup`. Both sessions are
@@ -2393,10 +2471,10 @@ mod tests {
         root.join(workspace.state_file("daemon-state"))
     }
 
-    /// Stop every runtime the fixture still owns and drop its root.
-    fn removal_teardown(shared: &Shared, root: &Path) {
-        crate::manager::lock(shared).kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+    /// Stop every runtime the fixture still owns. The root itself is removed
+    /// by its `FixtureRoot` when the fixture drops, also on panic.
+    fn removal_teardown(shared: &Shared, _root: &Path) {
+        crate::manager::lock(shared).kill_all_and_reap_for_test();
     }
 
     async fn preview_report(app: &Router, key: CheckoutKey) -> serde_json::Value {
@@ -2420,6 +2498,1408 @@ mod tests {
         let agent_pid = killed[0]["agent_pid"].as_u64().unwrap();
         assert_ne!(agent_pid, 0);
         agent_pid
+    }
+
+    /// What a window probe saw while removals were parked at the start of
+    /// their slow stage.
+    struct WindowProbe<T> {
+        /// How many removals had entered the slow stage when the probe looked.
+        entered: usize,
+        /// Whether `try_lock` found the manager mutex free while the removals
+        /// were parked, looking for up to a second. Only `WouldBlock` at
+        /// every look counts as held.
+        mutex_free: bool,
+        /// The probe's own result, `None` unless every awaited removal entered
+        /// and the mutex was free.
+        outcome: Option<T>,
+    }
+
+    /// Releases the gate when dropped, so a probe that panics never leaves a
+    /// removal waiting out its bound.
+    struct ReleaseOnDrop(crate::manager::RemovalPauseForTest);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Start a thread that waits until `entrants` removals are parked at
+    /// `pause`, records whether the manager mutex is free, then, only if it
+    /// is, runs `probe` on a current-thread runtime of its own, and finally
+    /// releases the gate. The test thread's redirects are captured here and
+    /// installed first on the thread. The removal itself is driven from the
+    /// test body, so its handler captures the test thread's redirects too.
+    ///
+    /// Run this way, a removal that held the mutex across its slow stage
+    /// cannot hang the test: the probe sees `WouldBlock`, skips its requests
+    /// and releases the gate, and the test then fails on `mutex_free`.
+    fn probe_slow_stage<T, F, Fut>(
+        shared: &Shared,
+        pause: &crate::manager::RemovalPauseForTest,
+        entrants: usize,
+        probe: F,
+    ) -> std::thread::JoinHandle<WindowProbe<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+    {
+        let redirects = baude_core::testing::capture();
+        let shared = Arc::clone(shared);
+        let pause = pause.clone();
+        std::thread::spawn(move || {
+            let _redirect = baude_core::testing::TestRedirect::install(redirects);
+            let release = ReleaseOnDrop(pause.clone());
+            let all_entered = pause.wait_entered(entrants, Duration::from_secs(10));
+            let entered = pause.entered();
+            // Another request, such as an open stream's poll, can hold the
+            // mutex for an instant, so the probe looks for up to a second. A
+            // removal that held it across its slow stage, where it stays
+            // parked until this thread releases it, holds it at every look.
+            let looking = Instant::now() + Duration::from_secs(1);
+            let mutex_free = loop {
+                match shared.try_lock() {
+                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => break true,
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < looking => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => break false,
+                }
+            };
+            let outcome = (all_entered && mutex_free).then(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(probe())
+            });
+            drop(release);
+            WindowProbe {
+                entered,
+                mutex_free,
+                outcome,
+            }
+        })
+    }
+
+    /// One request made during a removal's slow stage.
+    #[derive(Debug)]
+    struct WindowRead {
+        what: String,
+        /// `None` when no answer came within two seconds.
+        status: Option<StatusCode>,
+        body: Vec<u8>,
+        elapsed: Duration,
+    }
+
+    impl WindowRead {
+        /// Pin the read to 200 within two seconds and return its body.
+        fn served(&self) -> serde_json::Value {
+            self.answered(StatusCode::OK);
+            serde_json::from_slice(&self.body).unwrap()
+        }
+
+        /// Pin the request to `expected` within two seconds.
+        fn answered(&self, expected: StatusCode) {
+            assert_eq!(
+                self.status,
+                Some(expected),
+                "22.1-10 window pin: {} during the slow stage: {self:?}, body {}",
+                self.what,
+                String::from_utf8_lossy(&self.body)
+            );
+            assert!(
+                self.elapsed < Duration::from_secs(2),
+                "22.1-10 window pin: {} took {:?} during the slow stage",
+                self.what,
+                self.elapsed
+            );
+        }
+    }
+
+    /// Two unrelated repositories under one root, the shape of
+    /// `row_kinds_parent_removal_leaves_a_sibling_repository_untouched`: the
+    /// fixture repository and `repo-sibling`, whose directory name extends
+    /// it, each with a live main checkout session admitted through the
+    /// router. Returns the root, the fixture owner, the workspace, the shared
+    /// manager, the router, and the session id and checkout key of each.
+    #[allow(clippy::type_complexity)]
+    async fn two_repository_fixture(
+        label: &str,
+    ) -> (
+        FixtureRoot,
+        FixtureRepo,
+        Workspace,
+        Shared,
+        Router,
+        (u64, CheckoutKey),
+        (u64, CheckoutKey),
+    ) {
+        let (root, fixture, workspace, shared, app) = removal_setup(label);
+        let repo = fixture.path().canonicalize().unwrap();
+        let sibling = sibling_repo(&root);
+        let (first_id, first_key, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        let (second_id, second_key, _) = admit_removal_session(&shared, &app, &sibling, None).await;
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 2, "{rows}");
+        (
+            root,
+            fixture,
+            workspace,
+            shared,
+            app,
+            (first_id, first_key),
+            (second_id, second_key),
+        )
+    }
+
+    /// A `git init` repository named `repo-sibling` under `root`, beside the
+    /// fixture repository whose name it extends, not admitted anywhere.
+    fn sibling_repo(root: &Path) -> PathBuf {
+        let sibling = root.join("repo-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        git(&sibling, &["init", "-b", "main"]);
+        git(&sibling, &["config", "user.email", "test@example.com"]);
+        git(&sibling, &["config", "user.name", "Test"]);
+        std::fs::write(sibling.join("file"), b"one").unwrap();
+        git(&sibling, &["add", "file"]);
+        git(&sibling, &["commit", "-m", "initial"]);
+        sibling.canonicalize().unwrap()
+    }
+
+    /// `GET /rows` of a manager restored fresh from the state file under
+    /// `root`, its relaunched runtimes stopped and reaped before returning.
+    fn restored_rows(root: &Path, workspace: &Workspace) -> serde_json::Value {
+        let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
+        restored.restore_at(root, workspace);
+        let rows = serde_json::to_value(restored.rows()).unwrap();
+        restored.kill_all_and_reap_for_test();
+        rows
+    }
+
+    /// Send `request` under a two-second bound, timing it.
+    async fn window_request(app: &Router, what: &str, request: Request<Body>) -> WindowRead {
+        let started = Instant::now();
+        let answered = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, bytes.to_vec())
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let (status, body) = match answered {
+            Ok((status, body)) => (Some(status), body),
+            Err(_) => (None, Vec::new()),
+        };
+        WindowRead {
+            what: what.to_string(),
+            status,
+            body,
+            elapsed,
+        }
+    }
+
+    /// WR-06: while a removal is parked between prepare and the kill, the
+    /// manager mutex is free and other requests are served. The window is
+    /// observed from another thread, not raced: the probe looks only after
+    /// the removal reported that it entered its slow stage, and the removal
+    /// moves on only once the probe released it.
+    #[tokio::test]
+    async fn removals_serve_other_requests_during_the_slow_stage() {
+        let (root, _fixture, _workspace, shared, app, _id, key) =
+            removal_fixture("window-serve").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            let rows = window_request(&probe_app, "GET /rows", get("/rows")).await;
+            let sessions = window_request(&probe_app, "GET /sessions", get("/sessions")).await;
+            let info = window_request(&probe_app, "GET /info", get("/info")).await;
+            (rows, sessions, info)
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(
+            window.mutex_free,
+            "22.1-10 WR-06 pin: the manager mutex was held while the removal was in its slow stage"
+        );
+        let (rows, sessions, info) = window.outcome.expect("the probe ran");
+        let rows = rows.served();
+        assert!(
+            rows_checkout(&rows, key).is_some(),
+            "the doomed checkout is listed until the commit: {rows}"
+        );
+        sessions.served();
+        info.served();
+
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed = body_json(executed).await;
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-38: `GET /rows` during the window shows the doomed row exactly
+    /// as before the removal, live metadata included, though its session is
+    /// out of the registry; after the commit the row is gone.
+    #[tokio::test]
+    async fn removals_rows_shape_is_stable_during_the_slow_stage() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-shape").await;
+        let archived = app
+            .clone()
+            .oneshot(post_json(&format!("/sessions/{id}/archive"), ""))
+            .await
+            .unwrap();
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+        let before = rows_checkout(&rows_body(&app).await, key).expect("the row before");
+        assert_eq!(before["archived"], true, "{before}");
+        assert_eq!(before["session_id"], id, "{before}");
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(&probe_app, "GET /rows", get("/rows")).await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        let rows = window.outcome.expect("the probe ran").served();
+        let during = rows_checkout(&rows, key).expect("the doomed row is listed until the commit");
+        assert_eq!(
+            during["archived"], true,
+            "22.1-10 shape pin: the doomed row read as un-archived during the slow stage: {during}"
+        );
+        assert_eq!(during["session_id"], id, "{during}");
+        assert_eq!(
+            during, before,
+            "the doomed row changed shape during the window"
+        );
+
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(rows_checkout(&rows_body(&app).await, key).is_none());
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-39: the commit saves the survivors' live metadata as it is at
+    /// commit time. A session in another repository archived while the
+    /// removal is in its slow stage stays archived in the state file.
+    #[tokio::test]
+    async fn removals_metadata_changed_during_the_slow_stage_is_saved() {
+        let (root, _fixture, workspace, shared, app, (_, doomed), (survivor_id, survivor)) =
+            two_repository_fixture("window-metadata").await;
+        let report = preview_report(&app, doomed).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(
+                &probe_app,
+                "POST archive of the other repository's session",
+                post_json(&format!("/sessions/{survivor_id}/archive"), ""),
+            )
+            .await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        window
+            .outcome
+            .expect("the probe ran")
+            .answered(StatusCode::NO_CONTENT);
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, doomed).is_none(), "{restored}");
+        let saved = rows_checkout(&restored, survivor).expect("the survivor is restored");
+        assert_eq!(
+            saved["archived"], true,
+            "22.1-10 metadata pin: the removal commit saved the survivor as it was before the \
+             slow stage: {saved}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Whether `/rows` lists a repository parent at `path`.
+    fn rows_has_repository_at(rows: &serde_json::Value, path: &Path) -> bool {
+        rows["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parent| parent["path"] == path.to_str().unwrap())
+    }
+
+    /// T-21-28 across the window: an admission into an unrelated repository
+    /// while a removal is in its slow stage survives that removal's commit,
+    /// because the commit rebuilds its candidate from the state as it is.
+    #[tokio::test]
+    async fn removals_admission_in_another_repository_survives_the_commit() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("window-admission").await;
+        let other = sibling_repo(&root);
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let body = serde_json::json!({ "repo": other }).to_string();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(
+                &probe_app,
+                "POST /sessions into another repository",
+                post_json("/sessions", &body),
+            )
+            .await
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        window
+            .outcome
+            .expect("the probe ran")
+            .answered(StatusCode::CREATED);
+        assert_eq!(executed.status(), StatusCode::OK);
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        let rows = rows_body(&app).await;
+        assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+        assert!(
+            rows_has_repository_at(&rows, &other),
+            "22.1-10 candidate pin: the admission made during the slow stage is gone: {rows}"
+        );
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+        assert!(
+            rows_has_repository_at(&restored, &other),
+            "22.1-10 candidate pin: the admission made during the slow stage was not saved: \
+             {restored}"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Two removals of checkouts in two repositories, parked in their slow
+    /// stages together with the mutex free, both commit: each commit
+    /// rebuilds its candidate from the state the other already committed.
+    #[tokio::test]
+    async fn removals_two_repositories_in_flight_both_commit() {
+        let (root, _fixture, workspace, shared, app, (_, first), (_, second)) =
+            two_repository_fixture("window-two").await;
+        let mut events = open_events(&app).await;
+        let first_report = preview_report(&app, first).await;
+        let second_report = preview_report(&app, second).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe = probe_slow_stage(&shared, &pause, 2, || async {});
+        let (first_executed, second_executed) = tokio::join!(
+            removal_call(&app, "/removals", &first_report),
+            removal_call(&app, "/removals", &second_report),
+        );
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 2, "both removals reached their slow stage");
+        assert!(
+            window.mutex_free,
+            "the mutex was held with two removals in their slow stage"
+        );
+        assert!(!pause.timed_out(), "a removal waited out its pause bound");
+        assert_eq!(first_executed.0, StatusCode::OK, "{}", first_executed.1);
+        assert_eq!(second_executed.0, StatusCode::OK, "{}", second_executed.1);
+        let mut executed: Vec<serde_json::Value> = [first_executed.1, second_executed.1]
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let mut announced = vec![
+            expect_rows_removed(&mut events, "the first commit").await,
+            expect_rows_removed(&mut events, "the second commit").await,
+        ];
+        expect_silence(&mut events, Duration::from_millis(300), "after two commits").await;
+        executed.sort_by_key(|report| report["target"].to_string());
+        announced.sort_by_key(|report| report["target"].to_string());
+        assert_eq!(announced, executed);
+
+        let rows = rows_body(&app).await;
+        let restored = restored_rows(&root, &workspace);
+        for key in [first, second] {
+            assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+            assert!(
+                rows_checkout(&restored, key).is_none(),
+                "22.1-10 candidate pin: a removed row came back in the state file: {restored}"
+            );
+        }
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-37: a panic raised inside the slow stage, here by the test
+    /// pause, which runs in the same `catch_unwind` closure as the kill and
+    /// the delete, puts every runtime handle back and publishes nothing. The
+    /// answer is the removal's own 500 naming the panic, not a lost task, and
+    /// the released reservation lets a fresh preview commit.
+    #[tokio::test]
+    async fn removals_panic_in_the_slow_stage_restores_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-panic").await;
+        let mut events = open_events(&app).await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        pause.panic_after_release("22.1-10 injected slow-stage panic");
+        let probe = probe_slow_stage(&shared, &pause, 1, || async {});
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "22.1-10 panic pin: {body}"
+        );
+        assert!(
+            body.contains("22.1-10 injected slow-stage panic"),
+            "22.1-10 panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "22.1-10 panic pin: the panic escaped the slow stage and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            [id],
+            "22.1-10 panic pin: the session did not come back to the registry"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "the panic struck before the kill, so the agent must still run"
+        );
+        let rows = rows_body(&app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        expect_silence(&mut events, Duration::from_millis(500), "after the panic").await;
+
+        let retried = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &retried, "the retry after a panic").await;
+        expect_exactly_one(&mut events, &executed, "the retry after a panic").await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Run one removal of the fixture's checkout with a panic armed at `at`
+    /// in a locked stage, and return what it answered with the agent pid
+    /// the preview named.
+    async fn removal_with_panic_at(
+        shared: &Shared,
+        app: &Router,
+        key: CheckoutKey,
+        at: crate::manager::RemovalPanicForTest,
+    ) -> (StatusCode, String, u64) {
+        let report = preview_report(app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        crate::manager::lock(shared).panic_in_removal_for_test(at);
+        let (status, body) = removal_call(app, "/removals", &report).await;
+        (status, body, agent_pid)
+    }
+
+    /// Pin a removal that panicked before its commit landed: a 500 naming
+    /// the panic from the removal itself, the session back in the registry
+    /// and still mapped to its row, the agent alive, no event; and the
+    /// reservation released, so a fresh preview commits once.
+    async fn assert_uncommitted_panic_restored(
+        shared: &Shared,
+        app: &Router,
+        events: &mut EventsBody,
+        (id, key): (u64, CheckoutKey),
+        (status, body, agent_pid): (StatusCode, String, u64),
+        message: &str,
+        marker: &str,
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 {marker} pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 {marker} pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 {marker} pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(app).await,
+            [id],
+            "WR-01 {marker} pin: the session did not come back to the registry"
+        );
+        assert_eq!(
+            crate::manager::lock(shared).checkout_key_for_runtime_for_test(id),
+            Some(key),
+            "WR-01 {marker} pin: the row lost its runtime mapping"
+        );
+        assert!(pid_is_alive(agent_pid), "the panic struck before the kill");
+        let rows = rows_body(app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        expect_silence(events, Duration::from_millis(500), "after the panic").await;
+
+        let retried = preview_report(app, key).await;
+        assert_eq!(
+            previewed_agent_pid(&retried, key),
+            agent_pid,
+            "the restored handle is not the runtime the removal took"
+        );
+        let executed = assert_executed(app, &retried, "the retry after a panic").await;
+        expect_exactly_one(events, &executed, "the retry after a panic").await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+    }
+
+    /// WR-01: a panic in `begin_removal`, after the doomed session left the
+    /// registry and while core's `prepare` runs, puts the handle back,
+    /// releases the reservation and answers the removal's own 500.
+    #[tokio::test]
+    async fn removals_panic_while_preparing_restores_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("panic-prepare").await;
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected prepare panic";
+        let answered = removal_with_panic_at(
+            &shared,
+            &app,
+            key,
+            crate::manager::RemovalPanicForTest::Prepare(message.into()),
+        )
+        .await;
+        assert_uncommitted_panic_restored(
+            &shared,
+            &app,
+            &mut events,
+            (id, key),
+            answered,
+            message,
+            "prepare panic",
+        )
+        .await;
+        removal_teardown(&shared, &root);
+    }
+
+    /// WR-01: a panic inside the save closure core's `commit` calls, after
+    /// the kill, puts the handle back, releases the reservation and answers
+    /// the removal's own 500. Nothing was saved, so the row stands.
+    #[tokio::test]
+    async fn removals_panic_in_the_save_restores_handles() {
+        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("panic-save").await;
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected save panic";
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        crate::manager::lock(&shared)
+            .panic_in_removal_for_test(crate::manager::RemovalPanicForTest::Save(message.into()));
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 save panic pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 save panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 save panic pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            [id],
+            "WR-01 save panic pin: the session did not come back to the registry"
+        );
+        assert_eq!(
+            crate::manager::lock(&shared).checkout_key_for_runtime_for_test(id),
+            Some(key),
+            "WR-01 save panic pin: the row lost its runtime mapping"
+        );
+        let rows = rows_body(&app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        let restored = restored_rows(&root, &workspace);
+        assert!(
+            rows_checkout(&restored, key).is_some(),
+            "the panic struck before the save, so the file still holds the row: {restored}"
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after the save panic",
+        )
+        .await;
+
+        // The kill ran before the save, so the restored handle is a stopped
+        // runtime; the reservation is free again and a fresh removal commits.
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the slow stage ran before the save, so the agent is stopped"
+        );
+        let retried = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &retried, "the retry after a save panic").await;
+        expect_exactly_one(&mut events, &executed, "the retry after a save panic").await;
+        assert!(session_ids(&app).await.is_empty());
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// WR-01: a panic in `finish_removal` after core's `commit` returned
+    /// `Ok` answers the removal's own 500 and publishes nothing. The commit
+    /// stands, so the registry is reconciled to it: the removed row's
+    /// runtime mapping is dropped, the session is not listed, and the
+    /// released reservation lets the repository take a new session.
+    #[tokio::test]
+    async fn removals_panic_after_the_commit_keeps_the_registry_consistent() {
+        let (root, fixture, workspace, shared, app, id, key) =
+            removal_fixture("panic-after-commit").await;
+        let repo = fixture.path().canonicalize().unwrap();
+        let mut events = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let message = "WR-01 injected after-commit panic";
+        let (status, body, agent_pid) = removal_with_panic_at(
+            &shared,
+            &app,
+            key,
+            crate::manager::RemovalPanicForTest::AfterCommit(message.into()),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WR-01 after-commit panic pin: {body}"
+        );
+        assert!(
+            body.contains(message),
+            "WR-01 after-commit panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "WR-01 after-commit panic pin: the panic escaped the removal and lost the task: {body}"
+        );
+        assert_eq!(
+            crate::manager::lock(&shared).checkout_key_for_runtime_for_test(id),
+            None,
+            "WR-01 after-commit panic pin: the removed row is still mapped to its runtime"
+        );
+        assert!(
+            session_ids(&app).await.is_empty(),
+            "WR-01 after-commit panic pin: the removed session is still listed"
+        );
+        let rows = rows_body(&app).await;
+        assert!(rows_checkout(&rows, key).is_none(), "{rows}");
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+        assert!(wait_for_pid_gone(agent_pid), "the removed agent is alive");
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after the after-commit panic",
+        )
+        .await;
+
+        let (readmitted, _, _) = admit_removal_session(&shared, &app, &repo, None).await;
+        assert_ne!(readmitted, id);
+        assert_eq!(session_ids(&app).await, [readmitted]);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-36: a client that goes away while its removal is in the slow
+    /// stage does not stop the removal. The handler's future is dropped once
+    /// the pause reports the removal entered; the blocking closure still
+    /// kills, commits and publishes.
+    #[tokio::test]
+    async fn removals_complete_after_the_client_goes_away() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("window-disconnect").await;
+        let mut events = open_events(&app).await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let entered = pause.clone();
+        let removal = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()));
+        tokio::select! {
+            answered = removal => {
+                panic!("the removal answered while parked in its slow stage: {answered:?}")
+            }
+            entered = tokio::task::spawn_blocking(move || {
+                entered.wait_entered(1, Duration::from_secs(10))
+            }) => assert!(entered.unwrap(), "the removal never reached its slow stage"),
+        }
+        // The removal's future, the client's side of it, is gone here.
+        pause.release();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if rows_checkout(&rows_body(&app).await, key).is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "22.1-10 disconnect pin: the row is still listed 5 s after the release"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        let announced = expect_rows_removed(&mut events, "a removal whose client went away").await;
+        assert_eq!(
+            announced["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(300),
+            "after the one commit",
+        )
+        .await;
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// `DELETE /sessions/{id}`, for a window probe.
+    fn delete_request(id: u64) -> Request<Body> {
+        Request::delete(format!("/sessions/{id}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Pin every window read in `reads` to 503 with `expected` as its body.
+    /// Every status is checked before any body, so a request the exclusion
+    /// let through is named with all the others in one failure.
+    fn assert_window_busy(reads: &[WindowRead], expected: &str, marker: &str) {
+        let statuses: Vec<(&str, Option<StatusCode>)> = reads
+            .iter()
+            .map(|read| (read.what.as_str(), read.status))
+            .collect();
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.status == Some(StatusCode::SERVICE_UNAVAILABLE)),
+            "22.1-11 {marker} busy pin: a request on the row being removed was not refused \
+             with 503 during the slow stage: {statuses:?}"
+        );
+        for read in reads {
+            read.answered(StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                String::from_utf8_lossy(&read.body),
+                expected,
+                "22.1-11 {marker} busy pin: {}",
+                read.what
+            );
+        }
+    }
+
+    /// The ids of a `GET /sessions` body read during the window, sorted.
+    fn window_session_ids(read: &WindowRead) -> Vec<u64> {
+        let mut ids: Vec<u64> = read
+            .served()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// 22.1-11, T-22.1-42: while the removal of one checkout is parked in
+    /// its slow stage with the mutex free, every request that would change
+    /// the same repository answers 503 naming its main checkout: executing a
+    /// fresh preview of the sibling checkout, a plain and a worktree
+    /// `POST /sessions` into it, archive and DELETE of the sibling's session
+    /// and DELETE of the doomed session, which is out of the registry. The
+    /// removal then commits once, and the sibling is removable afterwards.
+    #[tokio::test]
+    async fn removals_same_repository_is_busy_during_the_slow_stage() {
+        let fixture = removal_fixture_two_checkouts("window-busy-repo").await;
+        let app = &fixture.app;
+        let shared = &fixture.shared;
+        let repo = fixture.repo.path().canonicalize().unwrap();
+        let busy = format!("repository busy: {}", repo.display());
+        let (main_id, main_key) = (fixture.main_id, fixture.main_key);
+        let (doomed_id, doomed_key) = (fixture.worktree_id, fixture.worktree_key);
+        let main_pid = previewed_agent_pid(&preview_report(app, main_key).await, main_key);
+        let report = preview_report(app, doomed_key).await;
+        let doomed_pid = previewed_agent_pid(&report, doomed_key);
+        assert_eq!(session_ids(app).await, vec![main_id, doomed_id]);
+        let mut events = open_events(app).await;
+
+        let _reapers = crate::manager::lock(shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_repo = repo.clone();
+        let probe = probe_slow_stage(shared, &pause, 1, move || async move {
+            let app = &probe_app;
+            let preview = window_request(
+                app,
+                "POST /removals/preview of the main checkout",
+                post_json(
+                    "/removals/preview",
+                    &serde_json::json!({ "checkout": main_key }).to_string(),
+                ),
+            )
+            .await;
+            let fresh = String::from_utf8_lossy(&preview.body).into_owned();
+            let busy_reads = vec![
+                window_request(
+                    app,
+                    "POST /removals of the main checkout's fresh preview",
+                    post_json("/removals", &fresh),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions on the main checkout path",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_repo }).to_string(),
+                    ),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions with worktree branch second",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_repo, "worktree": "second" })
+                            .to_string(),
+                    ),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST archive of the main checkout's session",
+                    post_json(&format!("/sessions/{main_id}/archive"), ""),
+                )
+                .await,
+                window_request(
+                    app,
+                    "DELETE of the main checkout's session",
+                    delete_request(main_id),
+                )
+                .await,
+                window_request(
+                    app,
+                    "DELETE of the doomed session",
+                    delete_request(doomed_id),
+                )
+                .await,
+            ];
+            let sessions = window_request(app, "GET /sessions", get("/sessions")).await;
+            (preview, busy_reads, sessions)
+        });
+        let (status, body) = removal_call(app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let (preview, busy_reads, sessions) = window.outcome.expect("the probe ran");
+        preview.served();
+        assert_window_busy(&busy_reads, &busy, "repository");
+        assert_eq!(
+            window_session_ids(&sessions),
+            vec![main_id],
+            "22.1-11 repository busy pin: a session was spawned or lost during the slow stage"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": doomed_key }])
+        );
+        expect_exactly_one(&mut events, &executed, "the removal of the worktree").await;
+        assert!(wait_for_pid_gone(doomed_pid), "the removed agent is alive");
+        assert!(pid_is_alive(main_pid), "a busy refusal stopped the sibling");
+        assert_eq!(session_ids(app).await, vec![main_id]);
+        let rows = rows_body(app).await;
+        assert_eq!(checkout_entries(&rows).len(), 1, "{rows}");
+        assert!(rows_checkout(&rows, main_key).is_some(), "{rows}");
+        assert_eq!(
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "second"]
+            )
+            .as_deref(),
+            Some(""),
+            "a busy worktree request created its branch"
+        );
+
+        let fresh = preview_report(app, main_key).await;
+        let executed =
+            assert_executed(app, &fresh, "the main checkout once the repository is free").await;
+        expect_exactly_one(&mut events, &executed, "the main checkout's removal").await;
+        assert!(
+            wait_for_pid_gone(main_pid),
+            "the main checkout's agent is alive"
+        );
+
+        removal_teardown(&fixture.shared, &fixture.root);
+    }
+
+    /// 22.1-11, T-22.1-42: while a folder's removal is parked in its slow
+    /// stage with the mutex free, a second removal of the same report and a
+    /// plain `POST /sessions` on the folder answer 503 naming the folder, and
+    /// no runtime is spawned for it.
+    #[tokio::test]
+    async fn removals_standalone_is_busy_during_the_slow_stage() {
+        let (root, _owner, folder, _workspace, shared, app) = folder_fixture("window-busy-folder");
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let report = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&report);
+        let before = session_ids(&app).await;
+        assert_eq!(before, vec![id]);
+        let busy = format!("folder busy: {}", folder.display());
+        let mut events = open_events(&app).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_report = report.clone();
+        let probe_folder = folder.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            let app = &probe_app;
+            let busy_reads = vec![
+                window_request(
+                    app,
+                    "POST /removals of the same report again",
+                    post_json("/removals", &probe_report.to_string()),
+                )
+                .await,
+                window_request(
+                    app,
+                    "POST /sessions on the folder",
+                    post_json(
+                        "/sessions",
+                        &serde_json::json!({ "repo": probe_folder }).to_string(),
+                    ),
+                )
+                .await,
+            ];
+            let sessions = window_request(app, "GET /sessions", get("/sessions")).await;
+            (busy_reads, sessions)
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let (busy_reads, sessions) = window.outcome.expect("the probe ran");
+        assert_window_busy(&busy_reads, &busy, "folder");
+        let during = window_session_ids(&sessions);
+        assert!(
+            during.iter().all(|listed| before.contains(listed)),
+            "22.1-11 folder busy pin: a runtime was spawned during the slow stage: {during:?}, \
+             before {before:?}"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(executed["rows_removed"], serde_json::json!([row]));
+        expect_exactly_one(&mut events, &executed, "the folder's removal").await;
+        assert!(wait_for_pid_gone(agent_pid), "the removed agent is alive");
+        assert_eq!(
+            session_ids(&app).await,
+            Vec::<u64>::new(),
+            "22.1-11 folder busy pin: a runtime outlived the folder's removal"
+        );
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-11, T-22.1-43: a teardown failure hit inside the unlocked slow
+    /// stage answers 500 and leaves the daemon as it was: `/rows` unchanged,
+    /// the session back in the registry with its agent alive, no event. A
+    /// fresh preview then commits once.
+    ///
+    /// The failure is armed before the removal starts, while the session is
+    /// still registered: `fail_next_agent_teardown_for_test` finds it through
+    /// the session list, which the removal empties for the window. The
+    /// injection itself is keyed by the agent pid, so it fires in the kill on
+    /// the removal's blocking thread, after the pause.
+    #[tokio::test]
+    async fn removals_failure_in_the_slow_stage_leaves_rows_and_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-failure").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let rows_before = rows_body(&app).await;
+        assert!(rows_checkout(&rows_before, key).is_some(), "{rows_before}");
+        assert_eq!(session_ids(&app).await, vec![id]);
+        let mut events = open_events(&app).await;
+
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_request(&probe_app, "GET /rows", get("/rows")).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let during = window.outcome.expect("the probe ran").served();
+        assert_eq!(
+            during, rows_before,
+            "/rows changed during the slow stage of a removal"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "22.1-11 failure pin: a refused stop in the slow stage answered {status}: {body}"
+        );
+        assert!(
+            body.contains("agent stop refused once"),
+            "22.1-11 failure pin: the 500 body does not name the refused stop: {body}"
+        );
+        assert_eq!(
+            rows_body(&app).await,
+            rows_before,
+            "22.1-11 failure pin: /rows changed after a failed removal"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            vec![id],
+            "22.1-11 failure pin: the session did not come back to the registry"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "22.1-11 failure pin: the refused stop left the agent dead"
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(500),
+            "after a failure in the slow stage",
+        )
+        .await;
+
+        let retried = preview_report(&app, key).await;
+        assert_eq!(
+            previewed_agent_pid(&retried, key),
+            agent_pid,
+            "the restored handle is not the runtime the removal took"
+        );
+        let executed =
+            assert_executed(&app, &retried, "the retry after a slow-stage failure").await;
+        expect_exactly_one(
+            &mut events,
+            &executed,
+            "the retry after a slow-stage failure",
+        )
+        .await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// A request on each single-session route of session `id` that looks the
+    /// session up by id, apart from the four mutating routes the busy tests
+    /// above cover and the PTY socket, whose upgrade a `oneshot` request
+    /// cannot reach. Each is labelled for a window probe.
+    fn session_route_requests(id: u64, hook_sid: &str) -> Vec<(String, Request<Body>)> {
+        let path = |tail: &str| format!("/sessions/{id}{tail}");
+        let hook = serde_json::json!({ "session_id": hook_sid, "event": "Stop" }).to_string();
+        vec![
+            ("GET /sessions/{id}".into(), get(&path(""))),
+            ("GET messages".into(), get(&path("/messages"))),
+            (
+                "POST messages".into(),
+                post_json(&path("/messages"), r#"{"text":"hello"}"#),
+            ),
+            ("GET queue".into(), get(&path("/queue"))),
+            ("GET screen".into(), get(&path("/screen"))),
+            (
+                "POST keys".into(),
+                post_json(&path("/keys"), r#"{"keys":["enter"]}"#),
+            ),
+            ("POST interrupt".into(), post_json(&path("/interrupt"), "")),
+            ("GET permission".into(), get(&path("/permission"))),
+            (
+                "POST permission request".into(),
+                post_json(&path("/permission"), r#"{"tool":"Bash"}"#),
+            ),
+            (
+                "POST permission decision".into(),
+                post_json(&path("/permission"), r#"{"decision":"deny"}"#),
+            ),
+            ("GET activity".into(), get(&path("/activity"))),
+            (
+                "POST hook event".into(),
+                Request::post(path("/event"))
+                    .body(Body::from(hook))
+                    .unwrap(),
+            ),
+            ("GET stream".into(), get(&path("/stream"))),
+            ("GET activity-stream".into(), get(&path("/activity-stream"))),
+        ]
+    }
+
+    /// Send every request of `requests` under the window bound, in order.
+    async fn window_requests(
+        app: &Router,
+        requests: Vec<(String, Request<Body>)>,
+    ) -> Vec<WindowRead> {
+        let mut reads = Vec::new();
+        for (what, request) in requests {
+            reads.push(window_request(app, &what, request).await);
+        }
+        reads
+    }
+
+    /// Owner decision on IN-04: while a removal is in its slow stage, every
+    /// single-session route of a doomed session answers the same 503 as the
+    /// four mutating routes, not the 404 of an unknown session. The probe
+    /// runs only once the removal is parked and `try_lock` found the mutex
+    /// free. Once the removal commits, the same routes answer 404.
+    #[tokio::test]
+    async fn removals_doomed_session_routes_are_busy_then_gone() {
+        let (root, fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-session-routes").await;
+        let repo = fixture.path().canonicalize().unwrap();
+        let busy = format!("repository busy: {}", repo.display());
+        let hook_sid = format!("item4-busy-then-gone-{}", std::process::id());
+        let hook_file = baude_core::hook::event_path(&hook_sid);
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_sid = hook_sid.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_requests(&probe_app, session_route_requests(id, &probe_sid)).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let reads = window.outcome.expect("the probe ran");
+        assert_window_busy(&reads, &busy, "doomed session route");
+        assert!(
+            !std::path::Path::new(&hook_file).exists(),
+            "a hook event for a doomed session was appended during the window"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for read in window_requests(&app, session_route_requests(id, &hook_sid)).await {
+            read.answered(StatusCode::NOT_FOUND);
+        }
+        assert!(!std::path::Path::new(&hook_file).exists());
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Owner decision on IN-04, the failure side: a folder session's routes
+    /// answer 503 `folder busy: <folder>` during a removal that then fails,
+    /// and serve the session again afterwards. A `stream` opened before the
+    /// removal stays open through the window and the failure, and ends once
+    /// a retried removal commits.
+    #[tokio::test]
+    async fn removals_doomed_session_routes_come_back_after_a_failure() {
+        let (root, _owner, folder, _workspace, shared, app) =
+            folder_fixture("window-session-routes-failure");
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let report = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&report);
+        let busy = format!("folder busy: {}", folder.display());
+        let hook_sid = format!("item4-come-back-{}", std::process::id());
+        let hook_file = baude_core::hook::event_path(&hook_sid);
+        let _ = std::fs::remove_file(&hook_file);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let stream = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/stream")))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        // Driven on this test's runtime, which is free while the removal
+        // runs on the blocking pool, so the stream's loop keeps ticking
+        // through the window. Finishes when the stream ends.
+        let mut stream = stream.into_body();
+        let driver = tokio::spawn(async move { while let Some(Ok(_)) = stream.frame().await {} });
+
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_sid = hook_sid.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            // More than two ticks of the stream's poll, all inside the window.
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            let named = [
+                "GET /sessions/{id}",
+                "GET messages",
+                "POST keys",
+                "POST hook event",
+            ];
+            let requests = session_route_requests(id, &probe_sid)
+                .into_iter()
+                .filter(|(what, _)| named.contains(&what.as_str()))
+                .collect();
+            window_requests(&probe_app, requests).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        assert_window_busy(
+            &window.outcome.expect("the probe ran"),
+            &busy,
+            "doomed folder session route",
+        );
+        assert!(
+            !driver.is_finished(),
+            "owner decision pin: a stream of the doomed session ended during the window"
+        );
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the removal was armed to fail: {body}"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "the refused stop left the agent dead"
+        );
+
+        let path = |tail: &str| format!("/sessions/{id}{tail}");
+        let info = window_request(&app, "GET /sessions/{id} after", get(&path(""))).await;
+        assert_eq!(info.served()["id"], id);
+        window_request(&app, "GET messages after", get(&path("/messages")))
+            .await
+            .served();
+        window_request(
+            &app,
+            "POST keys after",
+            post_json(&path("/keys"), r#"{"keys":["enter"]}"#),
+        )
+        .await
+        .answered(StatusCode::ACCEPTED);
+        let hook = serde_json::json!({ "session_id": hook_sid, "event": "Stop" }).to_string();
+        window_request(
+            &app,
+            "POST hook event after",
+            Request::post(path("/event"))
+                .body(Body::from(hook))
+                .unwrap(),
+        )
+        .await
+        .answered(StatusCode::NO_CONTENT);
+        let appended = std::fs::read_to_string(&hook_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&hook_file);
+        assert!(
+            appended.contains("Stop"),
+            "the hook event was not appended: {appended}"
+        );
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            !driver.is_finished(),
+            "owner decision pin: the stream ended after the failed removal put the session back"
+        );
+
+        let retried = preview_target(&app, &row).await;
+        let (status, body) = removal_call(&app, "/removals", &retried).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("the stream outlived the committed removal of its session")
+            .unwrap();
+        window_request(&app, "GET /sessions/{id} once committed", get(&path("")))
+            .await
+            .answered(StatusCode::NOT_FOUND);
+
+        removal_teardown(&shared, &root);
     }
 
     #[tokio::test]
@@ -2454,6 +3934,7 @@ mod tests {
             "the fixture runtime must be live before the removal"
         );
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = app
             .clone()
             .oneshot(post_json("/removals", &report.to_string()))
@@ -2508,6 +3989,7 @@ mod tests {
             .unwrap();
         assert!(live.archived);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = execute_previewed(app, fixture.worktree_key).await;
         assert_eq!(executed.status(), StatusCode::OK);
         let executed = body_json(executed).await;
@@ -2557,7 +4039,7 @@ mod tests {
         assert_eq!(survivor.session.name, live.name);
         assert_eq!(survivor.session.branch, live.branch);
 
-        restored.kill_all();
+        restored.kill_all_and_reap_for_test();
         removal_teardown(&fixture.shared, &fixture.root);
     }
 
@@ -2569,6 +4051,7 @@ mod tests {
         let app = &fixture.app;
         let repo_path = fixture.repo.path().canonicalize().unwrap();
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let first = execute_previewed(app, fixture.worktree_key).await;
         assert_status(
             first,
@@ -2644,6 +4127,7 @@ mod tests {
     #[tokio::test]
     async fn removals_execute_survives_a_fresh_restore() {
         let (root, _fixture, workspace, shared, app, _id, key) = removal_fixture("restore").await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = execute_previewed(&app, key).await;
         assert_eq!(executed.status(), StatusCode::OK);
 
@@ -2788,6 +4272,7 @@ mod tests {
         let preview = preview_target(&app, &target).await;
         let agent_pid = only_runtime_pid(&preview);
         assert!(pid_is_alive(agent_pid));
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(&app, &target).await;
         assert!(
             !removed.paths_deleted.contains(&by_hand),
@@ -2821,7 +4306,9 @@ mod tests {
     /// folder, the workspace, the shared manager and the router.
     #[must_use = "the returned FixtureRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives every handler await"]
-    fn folder_fixture(label: &str) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+    fn folder_fixture(
+        label: &str,
+    ) -> (FixtureRoot, FixtureRepo, PathBuf, Workspace, Shared, Router) {
         let root = removal_root(label);
         // Root first, identity second, the order `initialized_repo_in_workspace`
         // acquires them in.
@@ -2960,6 +4447,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
 
         // Execute, echoing the previewed report verbatim.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3014,7 +4502,7 @@ mod tests {
                   to a named local that outlives every handler await"]
     fn recording_folder_fixture(
         label: &str,
-    ) -> (PathBuf, FixtureRepo, PathBuf, Workspace, Shared, Router) {
+    ) -> (FixtureRoot, FixtureRepo, PathBuf, Workspace, Shared, Router) {
         let (root, owner, folder, workspace, _plain_shared, _plain_app) = folder_fixture(label);
         let root_text = root.to_str().unwrap();
         assert!(
@@ -3146,6 +4634,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert!(wait_for_pid_gone(agent_pid));
@@ -3212,6 +4701,7 @@ mod tests {
         assert!(pid_is_alive(first_pid));
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (restarted, restarted_app) =
             restarted_daemon(&root, &workspace, &recording_agent_cmd(&root));
         assert!(
@@ -3231,6 +4721,7 @@ mod tests {
         let second_pid = only_runtime_pid(&preview);
         assert_ne!(second_pid, first_pid);
         assert!(pid_is_alive(second_pid));
+        let _restarted_reapers = crate::manager::lock(&restarted).runtime_reapers_for_test();
         let (status, body) = removal_call(&restarted_app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3273,6 +4764,7 @@ mod tests {
         let launches = launch_lines(&root, 1);
         assert_eq!(launches.len(), 1, "{launches:?}");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         let (status, body) = open_folder(&app, folder.to_str().unwrap(), None).await;
@@ -3311,6 +4803,7 @@ mod tests {
         assert_eq!(launch_lines(&root, 1).len(), 1);
 
         // End the agent from outside, the way it dies under a user.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let killed = Command::new("kill")
             .arg(ended_pid.to_string())
             .status()
@@ -3350,6 +4843,7 @@ mod tests {
         let relaunched_pid = only_runtime_pid(&preview);
         assert_ne!(relaunched_pid, ended_pid);
         assert!(pid_is_alive(relaunched_pid));
+        let _relaunched_reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -3375,6 +4869,7 @@ mod tests {
         assert!(pid_is_alive(first_pid));
 
         std::fs::remove_dir_all(&folder).unwrap();
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (restarted, restarted_app) = restarted_daemon(&root, &workspace, REMOVAL_AGENT_CMD);
         assert!(
             wait_for_pid_gone(first_pid),
@@ -3408,8 +4903,10 @@ mod tests {
         removal_teardown(&restarted, &root);
     }
 
-    /// Two executes of one previewed standalone report contend on the manager
-    /// mutex; exactly one commits and only it reports the kill.
+    /// Two executes of one previewed standalone report; exactly one commits
+    /// and only it reports the kill. The loser either arrives while the
+    /// winner holds the folder reservation and answers 503 busy, or arrives
+    /// after the commit and finds the row gone, 404.
     #[tokio::test]
     async fn standalone_concurrent_removals_of_one_folder_commit_once() {
         let (root, _owner, folder, workspace, shared, app) =
@@ -3422,6 +4919,7 @@ mod tests {
         assert!(pid_is_alive(agent_pid));
         let body = preview.to_string();
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (first, second) = tokio::join!(
             app.clone().oneshot(post_json("/removals", &body)),
             app.clone().oneshot(post_json("/removals", &body)),
@@ -3436,11 +4934,16 @@ mod tests {
         assert_eq!(winners, 1, "exactly one removal commits: {outcomes:?}");
         let mut statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
         statuses.sort_unstable();
-        assert_eq!(
-            statuses,
-            [200, 404],
-            "exactly one removal commits: {outcomes:?}"
+        assert!(
+            statuses == [200, 404] || statuses == [200, 503],
+            "exactly one removal commits, the other finds the row gone or busy: {outcomes:?}"
         );
+        let busy_body = format!("folder busy: {}", folder.canonicalize().unwrap().display());
+        for (status, text) in &outcomes {
+            if *status == 503 {
+                assert_eq!(text, &busy_body, "{outcomes:?}");
+            }
+        }
         for (status, text) in &outcomes {
             let reports_a_kill = serde_json::from_str::<serde_json::Value>(text)
                 .ok()
@@ -3474,6 +4977,7 @@ mod tests {
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(
             status,
@@ -3526,6 +5030,7 @@ mod tests {
             let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
             crate::manager::lock(&shared).persist_at_for_test(&root, &workspace, Some(failure));
 
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let (status, body) = delete_session_status(&app, id).await;
             assert_eq!(
                 status,
@@ -3673,6 +5178,7 @@ mod tests {
         let main_path = fixture.repo.path().canonicalize().unwrap();
 
         // A managed worktree removed with its directory: P.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3724,6 +5230,7 @@ mod tests {
             Some(by_hand_id),
             "{rows}"
         );
+        let _by_hand_reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": by_hand_entries[0]["checkout_key"] }),
@@ -3765,6 +5272,7 @@ mod tests {
         let fixture = removal_fixture_two_checkouts("suppress-parent").await;
         let app = &fixture.app;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3806,6 +5314,7 @@ mod tests {
         let main_path = fixture.repo.path().canonicalize().unwrap();
         let before = checkout_entries(&rows_body(app).await).len();
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -3854,7 +5363,7 @@ mod tests {
         assert!(reads_suppressed(&p), "{}", p.display());
         assert!(reads_suppressed(&main_path), "{}", main_path.display());
 
-        crate::manager::lock(&fixture.shared).kill_all();
+        crate::manager::lock(&fixture.shared).kill_all_and_reap_for_test();
         removal_teardown(&restarted, &fixture.root);
     }
 
@@ -3866,6 +5375,7 @@ mod tests {
         opened_folder_id(&app, &folder).await;
         let key = standalone_key_of(&only_standalone_row(&app).await);
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(&app, &serde_json::json!({ "standalone": key })).await;
         assert_eq!(
             cleared_paths(
@@ -3881,6 +5391,201 @@ mod tests {
         let id = opened_folder_id(&app, &folder).await;
         let entry = only_standalone_row(&app).await;
         assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The repository's common directory as `git rev-parse --git-common-dir`
+    /// prints it for `checkout`, made absolute against `checkout` when git
+    /// prints it relative, as it does for a main checkout.
+    fn printed_common_dir(checkout: &Path) -> PathBuf {
+        let printed = PathBuf::from(
+            git_read(checkout, &["rev-parse", "--git-common-dir"])
+                .expect("git reports the checkout's common directory"),
+        );
+        if printed.is_absolute() {
+            printed
+        } else {
+            checkout.join(printed)
+        }
+    }
+
+    /// An entry for `checkout`, written the way core's clear stage writes
+    /// one: the checkout path and its repository's common directory.
+    fn seed_entry(checkout: &Path) {
+        baude_core::suppression::suppress(
+            &baude_core::persist::config_dir(),
+            checkout,
+            &printed_common_dir(checkout),
+            1,
+        )
+        .unwrap();
+        assert!(reads_suppressed(checkout), "{}", checkout.display());
+    }
+
+    /// A daemon admission of a subfolder of a checkout lifts the entry for
+    /// that checkout's root, the key the TUI lifts for the same folder. The
+    /// daemon stores the subfolder itself on the row it admits, so a lift
+    /// keyed on the stored path would leave the checkout's entry behind. An
+    /// entry for a sibling worktree of the same repository stays.
+    #[tokio::test]
+    async fn suppression_daemon_subfolder_admission_lifts_the_checkout_entry() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-subfolder");
+        let base = root.canonicalize().unwrap();
+
+        // A git-init repository with two worktrees the user made by hand.
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = base.join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+        let by_hand_sibling = base.join("by-hand-sibling");
+        add_by_hand_worktree(&main_path, &by_hand_sibling, "by-hand-sibling");
+
+        // The cloned shape: its managed branch worktree and, as the sibling,
+        // its managed default worktree.
+        let topology = baude_core::testing::cloned_topology(&base);
+
+        for (checkout, sibling) in [
+            (&by_hand, &by_hand_sibling),
+            (&topology.managed_worktree, &topology.default_worktree),
+        ] {
+            let sub = checkout.join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            seed_entry(checkout);
+            seed_entry(sibling);
+
+            let (status, body) = open_folder(&app, sub.to_str().unwrap(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "POST /sessions {}: {body}",
+                sub.display()
+            );
+            assert!(
+                !reads_suppressed(checkout),
+                "admitting the subfolder {} left the entry for its checkout {} in the store",
+                sub.display(),
+                checkout.display()
+            );
+            assert!(
+                reads_suppressed(sibling),
+                "admitting {} lifted the sibling entry {}",
+                sub.display(),
+                sibling.display()
+            );
+        }
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The worktree path `git worktree list --porcelain`, run in `main`,
+    /// prints for the worktree checked out on `branch`.
+    fn porcelain_path_on_branch(main: &Path, branch: &str) -> PathBuf {
+        let listed = git_read(main, &["worktree", "list", "--porcelain"])
+            .expect("git lists the repository's worktrees");
+        let wanted = format!("branch refs/heads/{branch}");
+        let matching: Vec<PathBuf> = listed
+            .split("\n\n")
+            .filter(|block| block.lines().any(|line| line == wanted))
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("worktree "))
+                    .map(PathBuf::from)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "one worktree on {branch}: {listed}");
+        matching[0].clone()
+    }
+
+    /// The cross-client write side: a removal over REST writes exactly the
+    /// entry the TUI's admission sweep reads. One entry, keyed on the path
+    /// git lists for the removed worktree, tagged with the repository's
+    /// common directory, with no primary member, for a directory that is
+    /// still there for a sweep to find.
+    #[tokio::test]
+    async fn suppression_daemon_removal_writes_the_entry_the_tui_sweep_reads() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-shape");
+        let config = baude_core::persist::config_dir();
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+
+        opened_folder_id(&app, &main_path).await;
+        let by_hand_id = opened_folder_id(&app, &by_hand).await;
+        let rows = rows_body(&app).await;
+        let entries = checkout_entries_at(&rows, &by_hand);
+        assert_eq!(entries.len(), 1, "{rows}");
+        assert_eq!(
+            entries[0]["session_id"].as_u64(),
+            Some(by_hand_id),
+            "{rows}"
+        );
+        assert!(!baude_core::suppression::file_path(&config).exists());
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        removed_over_routes(
+            &app,
+            &serde_json::json!({ "checkout": entries[0]["checkout_key"] }),
+        )
+        .await;
+
+        let listed = porcelain_path_on_branch(&main_path, "by-hand");
+        let text = std::fs::read_to_string(baude_core::suppression::file_path(&config)).unwrap();
+        let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let written = store["entries"].as_object().expect("an entries object");
+        assert_eq!(written.len(), 1, "{store}");
+        let (key, entry) = written.iter().next().unwrap();
+        assert_eq!(
+            key,
+            &baude_core::breadcrumbs::folder_key(&listed),
+            "{store}"
+        );
+        assert_eq!(
+            entry["repository_common_dir"].as_str(),
+            Some(baude_core::breadcrumbs::folder_key(&printed_common_dir(&main_path)).as_str()),
+            "{store}"
+        );
+        assert_eq!(entry.get("primary"), None, "{store}");
+        assert!(by_hand.is_dir(), "{}", by_hand.display());
+        assert!(
+            baude_core::suppression::is_suppressed(&config, &listed),
+            "{}",
+            listed.display()
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The cross-client lift side: an entry written exactly as core's clear
+    /// stage writes one, by whichever client removed the row, is gone once
+    /// the daemon admits that path.
+    #[tokio::test]
+    async fn suppression_daemon_admission_lifts_an_entry_any_client_wrote() {
+        let (root, fixture, _workspace, shared, app) = removal_setup("suppress-any-client");
+        let config = baude_core::persist::config_dir();
+        let main_path = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&main_path, &by_hand, "by-hand");
+
+        baude_core::suppression::suppress(
+            &config,
+            &by_hand,
+            &printed_common_dir(&by_hand),
+            baude_core::meta::now_unix_ms(),
+        )
+        .unwrap();
+        assert!(reads_suppressed(&by_hand), "{}", by_hand.display());
+
+        let (status, body) = open_folder(&app, by_hand.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            !reads_suppressed(&by_hand),
+            "POST /sessions admitted {} and its entry is still in the store",
+            by_hand.display()
+        );
+        let text = std::fs::read_to_string(baude_core::suppression::file_path(&config)).unwrap();
+        let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(store["entries"], serde_json::json!({}), "{store}");
 
         removal_teardown(&shared, &root);
     }
@@ -3936,6 +5641,7 @@ mod tests {
         for pid in &agent_pids {
             assert!(pid_is_alive(*pid), "{preview}");
         }
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4008,6 +5714,7 @@ mod tests {
         assert_eq!(entry["session_id"].as_u64(), Some(id), "{entry}");
         assert_eq!(entry["path"].as_str(), stale.to_str(), "{entry}");
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let removed = removed_over_routes(
             &app,
             &serde_json::json!({ "standalone": standalone_key_of(&entry) }),
@@ -4024,19 +5731,23 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
-    /// API-01 concurrency edge. Both requests carry the same previewed report
-    /// and contend on the manager mutex; whichever loses must find the row
-    /// already gone. The fresh restore at the end is what witnesses that no
-    /// partial state is readable: core leaves the state untouched on a
-    /// failure and persists with one atomic save.
+    /// API-01 concurrency edge. Both requests carry the same previewed report.
+    /// The loser either arrives while the winner holds the repository
+    /// reservation, from its first lock scope until after its commit, and
+    /// answers 503 busy, or arrives after the commit and finds the row gone,
+    /// 404. The fresh restore at the end is what witnesses that no partial
+    /// state is readable: core leaves the state untouched on a failure and
+    /// persists with one atomic save.
     #[tokio::test]
     async fn removals_concurrent_execute_of_the_same_row_commits_once() {
-        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("concurrent").await;
+        let (root, fixture, workspace, shared, app, id, key) = removal_fixture("concurrent").await;
+        let main_checkout = fixture.path().canonicalize().unwrap();
         let report = preview_report(&app, key).await;
         let agent_pid = previewed_agent_pid(&report, key);
         assert!(pid_is_alive(agent_pid));
         let body = report.to_string();
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (first, second) = tokio::join!(
             app.clone().oneshot(post_json("/removals", &body)),
             app.clone().oneshot(post_json("/removals", &body)),
@@ -4049,11 +5760,17 @@ mod tests {
         }
         outcomes.sort();
         let statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
-        assert_eq!(
-            statuses,
-            [200, 404],
-            "one removal must win and the other must find the row gone: {outcomes:?}"
+        assert!(
+            statuses == [200, 404] || statuses == [200, 503],
+            "one removal must win and the other must find the row gone or busy: {outcomes:?}"
         );
+        if statuses[1] == 503 {
+            assert_eq!(
+                outcomes[1].1,
+                format!("repository busy: {}", main_checkout.display()),
+                "{outcomes:?}"
+            );
+        }
 
         // One kill: the process is gone, and only the winner reports it.
         assert!(
@@ -4315,6 +6032,7 @@ mod tests {
         let before = rows_checkout(&rows_body(&fixture.app).await, fixture.worktree_key).unwrap();
         assert_eq!(before["session_id"], fixture.worktree_id);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let deleted = fixture
             .app
             .clone()
@@ -4427,9 +6145,14 @@ mod tests {
     }
 
     /// API-03 concurrency: a read racing a removal sees the projection from
-    /// before the removal or from after it, never a half-applied one, because
-    /// both handlers take the one manager mutex. Both candidates are observed
-    /// bodies. No sleep forces an ordering: the mutex is what is under test.
+    /// before the removal or from after it, never a half-applied one. The
+    /// removal no longer holds the manager mutex throughout: the read may
+    /// land in the slow stage, with the lock free. Two things keep that read
+    /// in the pre-removal shape: the first lock scope merges the doomed rows'
+    /// live metadata into the stored rows before their sessions leave the
+    /// registry, and the commit replaces the stored rows and publishes inside
+    /// the second lock scope, so no read sees part of a commit. Both
+    /// candidates are observed bodies. No sleep forces an ordering.
     ///
     /// The two requests are joined on the test thread, since the fixture's
     /// containment redirect is thread-local and a worker thread would escape
@@ -4447,6 +6170,7 @@ mod tests {
             let before = rows_body(&app).await;
             assert!(rows_checkout(&before, key).is_some(), "{before}");
 
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let read = app.clone().oneshot(get("/rows"));
             let removal = app
                 .clone()
@@ -4618,6 +6342,7 @@ mod tests {
         let before = std::fs::read(&state_file).unwrap();
 
         // Execute, echoing the previewed report verbatim.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4884,6 +6609,7 @@ mod tests {
         assert_eq!(kept.len(), 1, "{preview}");
         assert_eq!(Path::new(&kept[0]).canonicalize().unwrap(), main_path);
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4938,6 +6664,7 @@ mod tests {
 
         let target = serde_json::json!({ "repository": repo_row["repository_key"] });
         let preview = preview_target(&app, &target).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4996,6 +6723,7 @@ mod tests {
                 preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
             let child_report = preview_report(app, fixture.worktree_key).await;
 
+            let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
             let parent = removal_call(app, "/removals", &parent_report);
             let child = removal_call(app, "/removals", &child_report);
             let ((parent_status, parent_body), (child_status, child_body)) = if parent_first {
@@ -5012,13 +6740,20 @@ mod tests {
             let parent_won = parent_status == StatusCode::OK;
             let child_won = child_status == StatusCode::OK;
             assert!(parent_won != child_won, "{outcome}");
-            // The loser's status names why: its target is gone, or its
-            // compared sets changed under it.
-            if parent_won {
-                assert_eq!(child_status, StatusCode::NOT_FOUND, "{outcome}");
+            // The loser's status names why: the winner still held the
+            // repository, its target is gone, or its compared sets changed
+            // under it.
+            // A child that lost finds its row gone; a repository removal that
+            // lost finds its row set changed.
+            let (loser_status, gone_or_changed) = if parent_won {
+                (child_status, StatusCode::NOT_FOUND)
             } else {
-                assert_eq!(parent_status, StatusCode::CONFLICT, "{outcome}");
-            }
+                (parent_status, StatusCode::CONFLICT)
+            };
+            assert!(
+                loser_status == gone_or_changed || loser_status == StatusCode::SERVICE_UNAVAILABLE,
+                "{outcome}"
+            );
 
             let after = rows_body(app).await;
             if parent_won {
@@ -5068,6 +6803,7 @@ mod tests {
                 preview_target(app, &serde_json::json!({ "repository": repository_key })).await;
 
             let read = rows_bytes(app);
+            let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
             let removal = removal_call(app, "/removals", &report);
             let (raced, (status, body)) = if read_first {
                 tokio::join!(read, removal)
@@ -5157,6 +6893,7 @@ mod tests {
             "{preview}"
         );
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let executed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -5216,6 +6953,7 @@ mod tests {
             "{preview}"
         );
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(main_path.is_dir());
@@ -5458,6 +7196,7 @@ mod tests {
         assert!(second_worktree.is_dir());
 
         // Resending the 409 body verbatim executes it.
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let resent = app
             .clone()
             .oneshot(post_json("/removals", &raw))
@@ -5509,6 +7248,7 @@ mod tests {
         let previewed_pid = previewed_agent_pid(&stale, key);
 
         // The agent dies and is restarted while the modal is open.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let signalled = Command::new("kill")
             .arg(previewed_pid.to_string())
             .status()
@@ -5626,6 +7366,7 @@ mod tests {
             assert_eq!(steering[field], previewed[field]);
         }
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let (status, body) = removal_call(app, "/removals", &steering).await;
         assert_eq!(
             status,
@@ -5668,6 +7409,7 @@ mod tests {
         let agent_pid = only_runtime_pid(&stale);
 
         // Closing the session keeps the row and ends its runtime.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = delete_session_status(&app, id).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert!(wait_for_pid_gone(agent_pid));
@@ -5737,6 +7479,7 @@ mod tests {
         let agent_pid = previewed_agent_pid(&previewed, key);
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         let body = assert_refused(
@@ -5782,6 +7525,7 @@ mod tests {
         let agent_pid = only_runtime_pid(&previewed);
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         let body = assert_refused(
@@ -5840,6 +7584,7 @@ mod tests {
         let other_pid = other_pid.as_u64().unwrap();
         let before = world_snapshot(app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         crate::manager::lock(&fixture.shared)
             .fail_next_agent_teardown_for_test(armed_id, "agent stop refused once");
         let body = assert_refused(
@@ -5920,6 +7665,7 @@ mod tests {
         assert_eq!(planned_paths.len(), 1, "{previewed}");
         let before = world_snapshot(&app, &state_path).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared).persist_at_for_test(
             &root,
             &workspace,
@@ -5980,15 +7726,14 @@ mod tests {
         assert!(!crate::manager::lock(&shared).persistence_status().dirty);
 
         // A fresh restore does not list the row.
-        crate::manager::lock(&shared).kill_all();
+        crate::manager::lock(&shared).kill_all_and_reap_for_test();
         let mut restored = Manager::new(REMOVAL_AGENT_CMD.into(), true);
         restored.restore_at(&root, &workspace);
         assert!(matches!(
             restored.preview_removal(RemovalTarget::Checkout(worktree_key)),
             Err(RemovalError::UnknownTarget(_))
         ));
-        restored.kill_all();
-        std::fs::remove_dir_all(&root).unwrap();
+        restored.kill_all_and_reap_for_test();
     }
 
     #[tokio::test]
@@ -6003,6 +7748,7 @@ mod tests {
             &workspace,
             Some(baude_core::persist::AtomicFailure::DirectorySync),
         );
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed =
             assert_executed(&app, &previewed, "a save whose replacement committed").await;
         assert_eq!(
@@ -6052,6 +7798,7 @@ mod tests {
 
         // A real reservation, held across the request with the manager lock
         // released.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let reservation = crate::manager::lock(&shared).reserve_repository_for_test(repository);
         let body = assert_refused(
             removal_response(&app, &previewed).await,
@@ -6110,7 +7857,6 @@ mod tests {
         assert!(body.contains("persistence is blocked"), "{body}");
         assert!(pid_is_alive(agent_pid));
 
-        std::fs::remove_dir_all(&second_root).unwrap();
         removal_teardown(&shared, &root);
     }
 
@@ -6122,6 +7868,7 @@ mod tests {
         // 21-10's recorded case: the path of a managed worktree the daemon
         // removed, so nothing is there to admit.
         let removed = fixture.worktree_path.clone();
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         removed_over_routes(
             app,
             &serde_json::json!({ "checkout": fixture.worktree_key }),
@@ -6296,6 +8043,7 @@ mod tests {
         assert!(rows_lists(&rows_body(&app).await, &row));
 
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let response = removal_response(&app, &previewed).await;
         assert_eq!(response.status(), StatusCode::OK);
         let executed = body_json(response).await;
@@ -6328,6 +8076,7 @@ mod tests {
         let mut second = open_events(&app).await;
 
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let response = removal_response(&app, &previewed).await;
         assert_eq!(response.status(), StatusCode::OK);
         let executed = body_json(response).await;
@@ -6352,6 +8101,7 @@ mod tests {
         // An earlier subscriber proves the removal was announced at all, so
         // the silence below is the absence of replay and not of publishing.
         let mut early = open_events(&app).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = execute_previewed(&app, key).await;
         assert_eq!(executed.status(), StatusCode::OK);
         expect_rows_removed(&mut early, "the subscriber that was connected").await;
@@ -6404,6 +8154,7 @@ mod tests {
             let mut events = open_events(&app).await;
 
             let previewed = preview_target(&app, &row).await;
+            let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
             let executed = assert_executed(&app, &previewed, "a standalone row").await;
             assert_eq!(executed["rows_removed"], serde_json::json!([row]));
             expect_exactly_one(&mut events, &executed, "a standalone row").await;
@@ -6419,6 +8170,7 @@ mod tests {
         let mut events = open_events(app).await;
 
         let previewed = preview_target(app, &target).await;
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &previewed, "a repository parent").await;
         let removed = executed["rows_removed"].as_array().unwrap().clone();
         for row in [
@@ -6455,6 +8207,7 @@ mod tests {
         expect_silence(&mut events, Duration::from_millis(500), "after the 409").await;
 
         let retried = preview_target(app, &target).await;
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &retried, "the re-previewed removal").await;
         assert_eq!(
             executed["rows_removed"].as_array().unwrap().len(),
@@ -6473,6 +8226,7 @@ mod tests {
         let mut events = open_events(&app).await;
         let previewed = preview_report(&app, key).await;
 
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         crate::manager::lock(&shared)
             .fail_next_agent_teardown_for_test(id, "agent stop refused once");
         assert_refused(
@@ -6502,6 +8256,7 @@ mod tests {
         let mut events = open_events(app).await;
         let previewed = preview_target(app, &target).await;
 
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         crate::manager::lock(&fixture.shared).persist_at_for_test(
             &fixture.root,
             &fixture.workspace,
@@ -6550,6 +8305,7 @@ mod tests {
             &workspace,
             Some(baude_core::persist::AtomicFailure::DirectorySync),
         );
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed =
             assert_executed(&app, &previewed, "a save whose replacement committed").await;
         let announced = expect_exactly_one(&mut events, &executed, "a degraded commit").await;
@@ -6590,6 +8346,7 @@ mod tests {
         expect_silence(&mut events, within, "after the busy 503").await;
 
         drop(reservation);
+        let _reapers = crate::manager::lock(&fixture.shared).runtime_reapers_for_test();
         let executed = assert_executed(app, &previewed, "the same body once free").await;
         expect_exactly_one(&mut events, &executed, "the same body once free").await;
 
@@ -6655,6 +8412,7 @@ mod tests {
                 .publish_for_test(DaemonEvent::RowsRemoved(synthetic_report(number)));
         }
         let previewed = preview_report(&app, key).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let executed = assert_executed(&app, &previewed, "a removal after the flood").await;
 
         // `next_sse_frame` panics if the body ends, so reaching the real
@@ -7076,6 +8834,7 @@ mod tests {
         let state_before = std::fs::read(&state_file).unwrap();
 
         // The removal, with the previewed report echoed verbatim.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, executed) = socket_request(addr, "POST", "/removals", Some(&previewed)).await;
         assert_eq!(status, StatusCode::OK, "POST /removals: {executed}");
         assert_eq!(executed["rows_removed"], serde_json::json!([row]));
@@ -7328,6 +9087,7 @@ mod tests {
         assert_eq!(worktree_row["repository_key"], target["repository"]);
 
         let preview = preview_target(&app, &target).await;
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
         let (status, body) = removal_call(&app, "/removals", &preview).await;
         assert_eq!(status, StatusCode::OK, "POST /removals {target}: {body}");
 
@@ -7412,6 +9172,391 @@ mod tests {
         let response = app.oneshot(get("/sessions/999999/stream")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// The standalone key of the one `/rows` standalone entry, typed.
+    fn standalone_key_typed(entry: &serde_json::Value) -> baude_core::repository::StandaloneKey {
+        serde_json::from_value(entry["standalone_key"].clone())
+            .unwrap_or_else(|error| panic!("standalone_key does not parse: {error}: {entry}"))
+    }
+
+    /// 22.1-09, T-22.1-29. A folder row a removal holds refuses a second
+    /// removal with 503 and touches nothing; once the hold drops, a fresh
+    /// preview executes.
+    #[tokio::test]
+    async fn busy_standalone_removal_is_503_while_reserved() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-folder-removal");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let preview = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&preview);
+        assert!(pid_is_alive(agent_pid));
+        let before = world_snapshot(&app, &state_path).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let (status, body) = removal_call(&app, "/removals", &preview).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: a removal of a reserved folder row answered {status} \
+             with body {body}"
+        );
+        assert_eq!(body, format!("folder busy: {}", folder.display()));
+        assert!(pid_is_alive(agent_pid), "a busy refusal stopped the agent");
+        assert_eq!(session_ids(&app).await, vec![id]);
+        assert_world_unchanged(&app, &state_path, &before, "after the folder busy 503").await;
+        assert_folder_untouched(&folder);
+
+        drop(hold);
+        let fresh = preview_target(&app, &row).await;
+        assert_executed(&app, &fresh, "a fresh preview once the folder is free").await;
+        assert!(wait_for_pid_gone(agent_pid));
+        assert_eq!(rows_body(&app).await["standalone"], serde_json::json!([]));
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-31. A plain `POST /sessions` on a reserved folder row
+    /// answers 503 and spawns nothing, for a live row and for a closed one;
+    /// once the hold drops the same request opens the folder.
+    #[tokio::test]
+    async fn busy_standalone_plain_admission_is_503_and_spawns_nothing() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-folder-admit");
+        let state_path = removal_state_file(&root, &workspace);
+        let folder_text = folder.to_str().unwrap();
+        let busy_body = format!("folder busy: {}", folder.display());
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(agent_pid));
+
+        // Live row.
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: POST /sessions on a reserved live folder row answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, busy_body);
+        assert_eq!(session_ids(&app).await, vec![id]);
+        assert_eq!(
+            only_runtime_pid(&preview_target(&app, &row).await),
+            agent_pid,
+            "the recorded runtime changed under a busy refusal"
+        );
+        assert!(pid_is_alive(agent_pid));
+        assert_world_unchanged(&app, &state_path, &before, "after the live-row 503").await;
+        drop(hold);
+
+        // Closed row: the close itself runs with no hold.
+        let (status, body) = delete_session_status(&app, id).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(wait_for_pid_gone(agent_pid));
+        let closed = only_standalone_row(&app).await;
+        assert_eq!(closed["session_id"], serde_json::Value::Null, "{closed}");
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 folder busy pin: POST /sessions on a reserved closed folder row answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, busy_body);
+        assert_eq!(session_ids(&app).await, Vec::<u64>::new());
+        assert_world_unchanged(&app, &state_path, &before, "after the closed-row 503").await;
+        drop(hold);
+
+        // Free again: the same request reopens the row under its key.
+        let (status, body) = open_folder(&app, folder_text, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let reopened = only_standalone_row(&app).await;
+        assert_eq!(standalone_key_typed(&reopened), key, "{reopened}");
+        assert_eq!(session_ids(&app).await.len(), 1);
+        assert_folder_untouched(&folder);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The repository key `/rows` serves for the checkout session `id` runs in.
+    async fn repository_key_of_session(
+        app: &Router,
+        id: u64,
+    ) -> baude_core::repository::RepositoryKey {
+        let row = rows_checkout_for_session(&rows_body(app).await, id);
+        serde_json::from_value(row["repository_key"].clone())
+            .unwrap_or_else(|error| panic!("repository_key does not parse: {error}: {row}"))
+    }
+
+    /// 22.1-09, T-22.1-30. A plain `POST /sessions` into a repository a
+    /// removal holds answers 503 and stores nothing, whether the path is its
+    /// main checkout, a linked worktree the user made or a subfolder, in a
+    /// `git init` repository and in a cloned one.
+    #[tokio::test]
+    async fn busy_repository_plain_admission_is_503_and_stores_nothing() {
+        let (root, fixture, workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-admit").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let by_hand = root.canonicalize().unwrap().join("by-hand");
+        add_by_hand_worktree(&repo, &by_hand, "by-hand");
+        let subfolder = repo.join("docs");
+        std::fs::create_dir_all(&subfolder).unwrap();
+        std::fs::write(subfolder.join("notes.md"), b"draft\n").unwrap();
+        let (_upstream, clone) = cloned_repo(&root);
+        let clone_id = opened_folder_id(&app, &clone).await;
+        let clone_subfolder = clone.join("src");
+        std::fs::create_dir_all(&clone_subfolder).unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let clone_repository = repository_key_of_session(&app, clone_id).await;
+        assert_ne!(repository, clone_repository);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let clone_hold =
+            crate::manager::lock(&shared).reserve_repository_for_test(clone_repository);
+        let before = world_snapshot(&app, &state_path).await;
+        let busy = format!("repository busy: {}", repo.display());
+        let clone_busy = format!("repository busy: {}", clone.display());
+        for (path, expected, shape) in [
+            (&repo, &busy, "main checkout"),
+            (&by_hand, &busy, "linked worktree made by hand"),
+            (&subfolder, &busy, "subfolder of the main checkout"),
+            (
+                &clone_subfolder,
+                &clone_busy,
+                "subfolder of a cloned checkout",
+            ),
+        ] {
+            let (status, body) = open_folder(&app, path.to_str().unwrap(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "22.1-09 repository busy pin: POST /sessions on the {shape} {} of a reserved \
+                 repository answered {status} with body {body}",
+                path.display()
+            );
+            assert_eq!(&body, expected, "{shape}");
+            assert_world_unchanged(&app, &state_path, &before, shape).await;
+        }
+
+        drop(clone_hold);
+        drop(hold);
+        let (status, body) = open_folder(&app, by_hand.to_str().unwrap(), None).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            checkout_entries_at(&rows_body(&app).await, &by_hand).len(),
+            1
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, Pitfall 6. Worktree creation on a reserved repository is a
+    /// typed 503 with the same body, not a 400, and makes no branch; once the
+    /// hold drops the same request creates the worktree, so the worktree path
+    /// still takes exactly one reservation of its repository.
+    #[tokio::test]
+    async fn busy_repository_worktree_create_is_503() {
+        let (root, fixture, workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-worktree").await;
+        push_to_bare_origin(&root, fixture.path());
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let create = serde_json::json!({ "repo": repo, "worktree": "topic" });
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let before = world_snapshot(&app, &state_path).await;
+        let (status, body) = removal_call(&app, "/sessions", &create).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "22.1-09 repository busy pin: worktree creation on a reserved repository answered \
+             {status} with body {body}"
+        );
+        assert_eq!(body, format!("repository busy: {}", repo.display()));
+        assert_eq!(
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "topic"]
+            )
+            .as_deref(),
+            Some(""),
+            "a busy refusal created the branch"
+        );
+        assert_world_unchanged(&app, &state_path, &before, "after the worktree busy 503").await;
+
+        drop(hold);
+        let (status, body) = removal_call(&app, "/sessions", &create).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            git_read(
+                &repo,
+                &["branch", "--list", "--format=%(refname:short)", "topic"]
+            )
+            .as_deref(),
+            Some("topic")
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-33. A reservation is keyed by the stored repository a
+    /// path joins: an unrelated repository is admitted while another one is
+    /// held.
+    #[tokio::test]
+    async fn busy_repository_leaves_an_unrelated_admission_alone() {
+        let (root, _fixture, _workspace, shared, app, id, _key) =
+            removal_fixture("busy-repo-unrelated").await;
+        let repository = repository_key_of_session(&app, id).await;
+        let unrelated = committed_repo(&root.join("b")).canonicalize().unwrap();
+
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        let (status, body) = open_folder(&app, unrelated.to_str().unwrap(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "22.1-09 over-blocking pin: an unrelated repository was refused while another was \
+             reserved: {body}"
+        );
+        let rows = rows_body(&app).await;
+        assert_eq!(rows["repositories"].as_array().unwrap().len(), 2, "{rows}");
+        assert_eq!(checkout_entries_at(&rows, &unrelated).len(), 1, "{rows}");
+        drop(hold);
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// The status and body of a bodiless `POST` to a session route.
+    async fn post_route(app: &Router, path: &str) -> (StatusCode, String) {
+        let res = app.clone().oneshot(post_json(path, "")).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// DELETE, restart, archive and unarchive of session `id`, each pinned to
+    /// 503 with `expected` as its body and checked to change nothing.
+    async fn assert_session_routes_busy(
+        app: &Router,
+        state_path: &Path,
+        id: u64,
+        agent_pid: u64,
+        expected: &str,
+    ) {
+        let before = world_snapshot(app, state_path).await;
+        let archived_before = body_json(
+            app.clone()
+                .oneshot(get(&format!("/sessions/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await["archived"]
+            .clone();
+        for route in ["delete", "restart", "archive", "unarchive"] {
+            let (status, body) = match route {
+                "delete" => delete_session_status(app, id).await,
+                other => post_route(app, &format!("/sessions/{id}/{other}")).await,
+            };
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "22.1-09 session route busy pin: {route} of session {id} answered {status} with \
+                 body {body}"
+            );
+            assert_eq!(body, expected, "{route}");
+            assert_eq!(
+                session_ids(app).await,
+                vec![id],
+                "{route} dropped the session"
+            );
+            let listed = body_json(
+                app.clone()
+                    .oneshot(get(&format!("/sessions/{id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(listed["archived"], archived_before, "{route}: {listed}");
+            assert!(pid_is_alive(agent_pid), "{route} stopped the agent");
+            assert_world_unchanged(app, state_path, &before, route).await;
+        }
+    }
+
+    /// 22.1-09, T-22.1-32. The session routes that change a session answer
+    /// 503 while its repository is reserved, and change nothing.
+    #[tokio::test]
+    async fn busy_session_routes_answer_503_while_the_repository_is_reserved() {
+        let (root, fixture, workspace, shared, app, id, key) =
+            removal_fixture("busy-routes-repo").await;
+        let state_path = removal_state_file(&root, &workspace);
+        let repo = fixture.path().canonicalize().unwrap();
+        let repository = repository_key_of_session(&app, id).await;
+        let agent_pid = previewed_agent_pid(&preview_report(&app, key).await, key);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_repository_for_test(repository);
+        assert_session_routes_busy(
+            &app,
+            &state_path,
+            id,
+            agent_pid,
+            &format!("repository busy: {}", repo.display()),
+        )
+        .await;
+
+        drop(hold);
+        let (status, body) = post_route(&app, &format!("/sessions/{id}/archive")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// 22.1-09, T-22.1-32. The same four routes for a folder session whose
+    /// standalone row is reserved.
+    #[tokio::test]
+    async fn busy_session_routes_answer_503_while_the_folder_is_reserved() {
+        let (root, _owner, folder, workspace, shared, app) = folder_fixture("busy-routes-folder");
+        let state_path = removal_state_file(&root, &workspace);
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let key = standalone_key_typed(&entry);
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let agent_pid = only_runtime_pid(&preview_target(&app, &row).await);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let hold = crate::manager::lock(&shared).reserve_standalone_for_test(key);
+        assert_session_routes_busy(
+            &app,
+            &state_path,
+            id,
+            agent_pid,
+            &format!("folder busy: {}", folder.display()),
+        )
+        .await;
+        assert_folder_untouched(&folder);
+
+        drop(hold);
+        let (status, body) = post_route(&app, &format!("/sessions/{id}/archive")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        removal_teardown(&shared, &root);
+    }
 }
 
 #[cfg(test)]
@@ -7493,6 +9638,6 @@ mod pty_ws_tests {
         assert_eq!((shot.rows, shot.cols), (30, 100));
 
         drop(ws);
-        lock(&state).kill_all();
+        lock(&state).kill_all_and_reap_for_test();
     }
 }

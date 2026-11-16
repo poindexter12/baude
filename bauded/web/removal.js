@@ -220,7 +220,24 @@
     // readers_parked is not rendered: it is always empty in a preview and the
     // TUI does not show it either.
 
-    return { title: `Remove this ${targetKind(source.target)}?`, sections };
+    return { title: confirmationTitle(targetKind(source.target), deleted.length), sections };
+  }
+
+  // The confirmation's title, from the target kind and how many folders the
+  // removal deletes. Only paths_deleted counts: already_removed is gone
+  // before the removal runs and a row tag says nothing about deletion. Core
+  // deletes a checkout's folder only for a managed worktree, so a checkout
+  // that deletes anything is one. A repository's own main checkout is never
+  // deleted, so its title counts folders instead of naming "its folder".
+  // Raw text from a fixed vocabulary; renderConfirmation escapes it.
+  function confirmationTitle(kind, deletedCount) {
+    if (kind === "checkout" && deletedCount >= 1) {
+      return "Remove this worktree and delete its folder?";
+    }
+    if (kind === "repository" && deletedCount >= 1) {
+      return `Remove this repository and delete ${plural(deletedCount, "folder", "folders")}?`;
+    }
+    return `Remove this ${kind}?`;
   }
 
   // The single escaping site. Takes a view, never a report: a report handed
@@ -312,6 +329,19 @@
       + `deleted ${plural(deleted, "path", "paths")}`;
   }
 
+  // What a failed request on one session's route means for a view of that
+  // session, read from its HTTP status. A 404 says the daemon has no such
+  // session, so the view is gone. A 503 is transient: while a removal of the
+  // session's row stops runtimes and deletes worktrees, every route of that
+  // session answers 503 with a busy body, and the session comes back if the
+  // removal fails. Any other status, or none for a network failure, is an
+  // ordinary failure.
+  function sessionRequestOutcome(status) {
+    if (status === 404) return "gone";
+    if (status === 503) return "busy";
+    return "failed";
+  }
+
   // ---- snapshot arbitration ----
   //
   // A list poll that left before a removal can land after it and still list
@@ -390,6 +420,7 @@
     parseDriftBody,
     clearingFailures,
     removalNotice,
+    sessionRequestOutcome,
   };
 
   globalThis.BaudeRemoval = BaudeRemoval;

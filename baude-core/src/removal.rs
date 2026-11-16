@@ -252,6 +252,15 @@ pub enum RemovalError {
     Persist {
         error: crate::persist::SaveError,
     },
+    /// At [`commit`], `target` no longer selects exactly the rows
+    /// [`prepare`] selected. The kill and disk stages have already run, so
+    /// this is reachable only when the caller's exclusion across the window
+    /// was broken; the state and the file are left untouched.
+    SelectionChanged {
+        target: RemovalTarget,
+        expected: Vec<RowKey>,
+        found: Vec<RowKey>,
+    },
 }
 
 impl fmt::Display for RemovalError {
@@ -281,6 +290,16 @@ impl fmt::Display for RemovalError {
             }
             Self::Validation(error) => write!(f, "removed state failed validation: {error}"),
             Self::Persist { error } => write!(f, "could not persist the removed row set: {error}"),
+            Self::SelectionChanged {
+                target,
+                expected,
+                found,
+            } => write!(
+                f,
+                "removal target {target:?} changed while its runtimes were stopped and its \
+                 directories deleted: prepared rows {expected:?}, rows selected now {found:?}; \
+                 nothing was saved"
+            ),
         }
     }
 }
@@ -433,15 +452,88 @@ impl From<crate::git::ForcedRemovalError> for DiskRemovalFailure {
 /// This is deliberately not the close protocol or the tombstoned-removal
 /// protocol the TUI uses: a kill failure leaves the row exactly as it was,
 /// with no pending lifecycle written.
+///
+/// `remove` is the composition of three public stages, run back to back:
+/// [`prepare`] (selection, planned clearings, preflight and candidate
+/// validation, with no runtime, disk or file touched), [`stop_and_delete`]
+/// (the kill and disk stages, reading no `RepositoryState`) and [`commit`]
+/// (the one save and the clearing stage). A caller that runs them apart, for
+/// instance to release a lock during the slow kill and delete, must hold an
+/// exclusion across the window that keeps every row of the set from being
+/// added to, reopened or removed by anyone else until `commit` returns.
 pub fn remove(
     state: &mut RepositoryState,
     target: RemovalTarget,
     runtimes: &mut Vec<RowRuntime>,
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
+    let prepared = prepare(state, target, runtimes)?;
+    let effects = stop_and_delete(&prepared, runtimes)?;
+    commit(state, prepared, effects, runtimes, save)
+}
+
+/// What [`prepare`] resolved: the selected rows and every clearing the
+/// clearing stage will attempt, both derived from the state `prepare` read.
+/// It deliberately carries no save candidate: [`commit`] builds that from
+/// the state it is handed, so a change made to other rows between the two
+/// stages is saved rather than reverted.
+pub struct PreparedRemoval {
+    set: RemovalSet,
+    planned: Vec<ClearedItem>,
+}
+
+/// What [`stop_and_delete`] did: the runtimes it stopped and the paths it
+/// deleted, kept or found already gone.
+pub struct StageEffects {
+    killed: Vec<KilledRuntime>,
+    disk: DiskResults,
+}
+
+/// Resolve `target` and refuse everything that can be refused before an
+/// irreversible effect: `select_rows`, the planned clearings, `preflight`,
+/// then a candidate with the set's rows removed run through
+/// `validate_for_save`. Touches no runtime, deletes nothing and writes no
+/// file; its only filesystem access is the read-only probes of
+/// `select_rows`, `planned_clearings` and `preflight`.
+pub fn prepare(
+    state: &RepositoryState,
+    target: RemovalTarget,
+    runtimes: &[RowRuntime],
+) -> Result<PreparedRemoval, RemovalError> {
     let set = select_rows(state, target)?;
     let planned = planned_clearings(state, &set);
     preflight(&set, runtimes)?;
+    candidate_without(state, &set)?;
+    Ok(PreparedRemoval { set, planned })
+}
+
+/// Refuse unless `set.target` still selects exactly the rows of `set` in
+/// `state`. Row keys are compared as sets, since keys are unique and the
+/// disk label of a deleted directory is expected to have changed. A target
+/// that no longer resolves at all selects no rows.
+fn reselect(state: &RepositoryState, set: &RemovalSet) -> Result<(), RemovalError> {
+    let expected: Vec<RowKey> = set.rows.iter().map(|row| row.row).collect();
+    let found: Vec<RowKey> = match select_rows(state, set.target) {
+        Ok(now) => now.rows.iter().map(|row| row.row).collect(),
+        Err(_) => Vec::new(),
+    };
+    let same = expected.len() == found.len() && expected.iter().all(|key| found.contains(key));
+    if same {
+        return Ok(());
+    }
+    Err(RemovalError::SelectionChanged {
+        target: set.target,
+        expected,
+        found,
+    })
+}
+
+/// A clone of `state` with the set's rows removed, refused unless it passes
+/// `validate_for_save`, together with the rows the clone dropped.
+fn candidate_without(
+    state: &RepositoryState,
+    set: &RemovalSet,
+) -> Result<(RepositoryState, RemovedRows), RemovalError> {
     let mut candidate = state.clone();
     let removed = candidate.remove_rows(
         &set.repository_keys(),
@@ -451,16 +543,56 @@ pub fn remove(
     candidate
         .validate_for_save()
         .map_err(RemovalError::Validation)?;
-    let killed = kill_stage(&set, runtimes)?;
-    let disk = disk_stage(&set)?;
+    Ok((candidate, removed))
+}
+
+/// The kill stage, then the disk stage, for the prepared set. Reads no
+/// `RepositoryState`, so it may run without the lock that guards the state,
+/// provided the caller's exclusion keeps the set's rows unchanged until
+/// [`commit`]. An `Err` names the row it stopped on; the state and the file
+/// are untouched and every handle stays in `runtimes`.
+pub fn stop_and_delete(
+    prepared: &PreparedRemoval,
+    runtimes: &mut [RowRuntime],
+) -> Result<StageEffects, RemovalError> {
+    let killed = kill_stage(&prepared.set, runtimes)?;
+    let disk = disk_stage(&prepared.set)?;
+    Ok(StageEffects { killed, disk })
+}
+
+/// Save the removal once and run the clearing stage. The save candidate is
+/// rebuilt here from `*state` as it is now, minus the prepared rows, and
+/// validated again, so a row another caller admitted or changed since
+/// [`prepare`] is saved rather than reverted to the state `prepare` read.
+///
+/// Before anything is built, the prepared target is selected again against
+/// `*state` and must name exactly the prepared rows, compared by row key
+/// only: a managed directory the disk stage deleted now reads as
+/// `AlreadyRemoved`, which is expected. Any other difference, a child added
+/// to the repository or a prepared row gone, returns
+/// [`RemovalError::SelectionChanged`] before the save closure is called.
+///
+/// `*state` is replaced and the removed rows' handles are drained from
+/// `runtimes` only after the save returns `Ok` or reports a committed
+/// replacement; on every `Err` `*state` and `runtimes` are untouched.
+pub fn commit(
+    state: &mut RepositoryState,
+    prepared: PreparedRemoval,
+    effects: StageEffects,
+    runtimes: &mut Vec<RowRuntime>,
+    save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
+) -> Result<RemovalReport, RemovalError> {
+    let PreparedRemoval { set, planned } = prepared;
+    reselect(state, &set)?;
+    let (candidate, removed) = candidate_without(state, &set)?;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
     let clearing = clear_stage(&removed, state, &planned);
     Ok(report_from_set(
         &set,
         planned,
         Some(StageResults {
-            killed,
-            disk,
+            killed: effects.killed,
+            disk: effects.disk,
             readers_parked,
             persistence,
             clearing,
@@ -1208,15 +1340,13 @@ mod tests {
     struct TempTree {
         _identity: crate::testing::TestRedirect,
         _redirect: crate::testing::TestRedirect,
-        root: PathBuf,
+        /// Declared last so the tree is removed after both guards drop.
+        root: crate::testing::FixtureRoot,
     }
 
     impl TempTree {
         fn new(label: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("baude-removal-{}-{label}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create fixture root");
+            let root = crate::testing::FixtureRoot::new(&format!("baude-removal-{label}"));
             let redirect = crate::testing::TestRedirect::new(&root);
             let identity = fixture_identity();
             Self {
@@ -1241,12 +1371,6 @@ mod tests {
         /// A directory that only the test may populate with a state file.
         fn state_dir(&self) -> PathBuf {
             self.dir("state")
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1748,28 +1872,30 @@ mod tests {
     /// Per-test root under the temp dir with a real repository, a managed
     /// root under the redirect and a state directory. Canonicalized because
     /// Git reports the resolved form of a worktree path and the managed-root
-    /// containment check compares canonical paths. The redirect is a field
-    /// declared before `root` so it is still installed while the root is
-    /// torn down.
+    /// containment check compares canonical paths. The guards are fields
+    /// declared before `_root`, so they are restored before the tree is
+    /// removed; that removal resolves no redirected path.
     struct RemovalFixture {
         _identity: crate::testing::TestRedirect,
         _redirect: crate::testing::TestRedirect,
+        /// The canonical form of `_root`, the path every case is handed.
         root: PathBuf,
+        /// Declared last so the tree is removed after both guards drop.
+        _root: crate::testing::FixtureRoot,
     }
 
     impl RemovalFixture {
         fn new(label: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("baude-removal-live-{label}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create fixture root");
-            let root = fs::canonicalize(&root).expect("canonicalize fixture root");
+            let fixture_root =
+                crate::testing::FixtureRoot::new(&format!("baude-removal-live-{label}"));
+            let root = fs::canonicalize(&fixture_root).expect("canonicalize fixture root");
             let redirect = crate::testing::TestRedirect::new(&root);
             let identity = fixture_identity();
             let fixture = Self {
                 _identity: identity,
                 _redirect: redirect,
                 root,
+                _root: fixture_root,
             };
             git_ok(&fixture.root, &["init", "-q", "-b", "main", "repo"]);
             let repo = fixture.repo();
@@ -1824,12 +1950,6 @@ mod tests {
             crate::git::discover_repository(&self.repo())
                 .expect("discover repository")
                 .common_dir
-        }
-    }
-
-    impl Drop for RemovalFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -3003,6 +3123,160 @@ mod tests {
         assert_eq!(report.paths_kept, vec![f.repo()]);
         assert_eq!(report.persistence, PersistenceOutcome::Saved);
         assert_eq!(load_state(&f.state_root()), state);
+    }
+
+    // ---- stages run apart (plan 22.1-08) ----
+
+    /// What a recording save closure saw: how often it was called and the
+    /// state of the last `StateFile` it was handed.
+    #[derive(Default)]
+    struct SaveRecord {
+        calls: u32,
+        received: Option<RepositoryState>,
+    }
+
+    /// A save closure that records each `StateFile` it is handed and writes
+    /// it under `state_root`.
+    fn recording_save(
+        state_root: &Path,
+    ) -> (
+        impl FnOnce(&StateFile) -> Result<(), SaveError>,
+        Rc<std::cell::RefCell<SaveRecord>>,
+    ) {
+        let record = Rc::new(std::cell::RefCell::new(SaveRecord::default()));
+        let sink = Rc::clone(&record);
+        let root = state_root.to_path_buf();
+        let save = move |file: &StateFile| {
+            let mut seen = sink.borrow_mut();
+            seen.calls += 1;
+            seen.received = Some(file.state.clone());
+            persist::save_current_at_test(&root, "state.json", file, None, None)
+        };
+        (save, record)
+    }
+
+    fn has_repository(state: &RepositoryState, key: RepositoryKey) -> bool {
+        state
+            .repositories
+            .iter()
+            .any(|repository| repository.key == key)
+    }
+
+    /// A repository admitted while the kill and delete ran without the lock
+    /// survives the commit: the save describes the state `commit` is handed
+    /// minus the removed rows, not a candidate built before the window.
+    #[test]
+    fn commit_rederives_the_candidate_from_current_state() {
+        let f = RemovalFixture::new("rederive");
+        let (mut state, _a, a_checkout, managed) = inactive_row(&f, "wt-rederive");
+        write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+
+        let prepared =
+            prepare(&state, RemovalTarget::Checkout(a_checkout), &handles).expect("prepare");
+        let effects = stop_and_delete(&prepared, &mut handles).expect("stop and delete");
+        assert!(
+            !managed.exists(),
+            "the disk stage deleted A's managed worktree"
+        );
+
+        let b_main = f.root.join("b");
+        fs::create_dir_all(&b_main).expect("create repository B's main worktree");
+        let b = repository(&mut state, &b_main);
+        let b_checkout = checkout(&mut state, b, CheckoutRole::Main, false, &b_main);
+        state
+            .validate_for_save()
+            .expect("the state with B admitted is save-valid");
+        let (save, record) = recording_save(&f.state_root());
+
+        commit(&mut state, prepared, effects, &mut handles, save).expect("commit");
+
+        assert!(
+            has_repository(&state, b),
+            "repository B, admitted between stop_and_delete and commit, is missing from the state after commit"
+        );
+        assert!(
+            has_checkout(&state, b_checkout),
+            "B's checkout is missing from the state after commit"
+        );
+        assert!(!has_checkout(&state, a_checkout));
+        assert_eq!(record.borrow().calls, 1, "one save");
+        let saved = record
+            .borrow_mut()
+            .received
+            .take()
+            .expect("the save closure received a StateFile");
+        assert!(
+            has_repository(&saved, b),
+            "repository B is missing from the saved StateFile"
+        );
+        assert!(has_checkout(&saved, b_checkout));
+        assert!(!has_checkout(&saved, a_checkout));
+        assert_eq!(saved, state);
+        assert_eq!(load_state(&f.state_root()), state);
+    }
+
+    /// A checkout added to the target repository after `prepare` would be
+    /// orphaned by a save of the prepared rows. `commit` refuses with
+    /// `SelectionChanged`, naming both row lists, and leaves the state, the
+    /// file and the save closure untouched. The assertions read the error's
+    /// Debug name, Display and source, the forms a caller sees.
+    #[test]
+    fn commit_refuses_when_the_selected_rows_changed() {
+        let f = RemovalFixture::new("selection-changed");
+        let (mut state, k, _child, managed) = inactive_row(&f, "wt-selection");
+        let before_bytes = write_seed(&f, &state);
+        let mut handles: Vec<RowRuntime> = Vec::new();
+        let target = RemovalTarget::Repository(k);
+
+        let prepared = prepare(&state, target, &handles).expect("prepare");
+        let expected: Vec<RowKey> = prepared.set.rows.iter().map(|row| row.row).collect();
+        let effects = stop_and_delete(&prepared, &mut handles).expect("stop and delete");
+        assert!(
+            !managed.exists(),
+            "the disk stage deleted the managed child"
+        );
+
+        let late = f.root.join("late");
+        fs::create_dir_all(&late).expect("create the late checkout");
+        checkout(&mut state, k, CheckoutRole::ManagedBranch, false, &late);
+        state
+            .validate_for_save()
+            .expect("the state with the late checkout is save-valid");
+        let found: Vec<RowKey> = select_rows(&state, target)
+            .expect("the target still resolves")
+            .rows
+            .iter()
+            .map(|row| row.row)
+            .collect();
+        assert_ne!(found, expected, "the fixture changed the selection");
+        let before = state.clone();
+        let (save, calls) = counting_save(&f.state_root());
+
+        let error = commit(&mut state, prepared, effects, &mut handles, save)
+            .expect_err("commit must refuse a changed selection");
+
+        let debug = format!("{error:?}");
+        assert!(
+            debug.starts_with("SelectionChanged"),
+            "commit must refuse with SelectionChanged, got {debug}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{expected:?}")),
+            "message {message:?} must name the prepared rows {expected:?}"
+        );
+        assert!(
+            message.contains(&format!("{found:?}")),
+            "message {message:?} must name the rows the target selects now {found:?}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "SelectionChanged wraps no other error"
+        );
+        assert_eq!(state, before, "the state is untouched");
+        assert_eq!(calls.get(), 0, "the save closure is never called");
+        assert_eq!(fs::read(f.state_path()).expect("read"), before_bytes);
     }
 
     // ---- crash and disk failure between delete and save (plan 05) ----

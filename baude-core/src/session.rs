@@ -1279,16 +1279,22 @@ mod tests {
         assert_ne!(meta.last_session_mtime, Some(t2));
     }
 
-    fn signal_fixture(label: &str) -> (crate::testing::TestRedirect, crate::pty::Pty) {
-        let root =
-            std::env::temp_dir().join(format!("baude-signal-{label}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&root);
+    /// Returns the root first: bound as `let (_root, _redirect, pty)`, the Pty
+    /// drops first, then the redirect, then the root.
+    fn signal_fixture(
+        label: &str,
+    ) -> (
+        crate::testing::FixtureRoot,
+        crate::testing::TestRedirect,
+        crate::pty::Pty,
+    ) {
+        let root = crate::testing::FixtureRoot::new(&format!("baude-signal-{label}"));
         let redirect = crate::testing::TestRedirect::new(&root);
         let pty = crate::pty::Pty::spawn_paused(Some("/bin/sh -c 'sleep 30'"), &[], &root, 5, 40)
             .expect("spawn")
             .release()
             .expect("release");
-        (redirect, pty)
+        (root, redirect, pty)
     }
 
     fn proc_state(pid: u32) -> String {
@@ -1327,7 +1333,7 @@ mod tests {
 
     #[test]
     fn suspend_process_becomes_stopped() {
-        let (_redirect, mut pty) = signal_fixture("stopped");
+        let (_root, _redirect, mut pty) = signal_fixture("stopped");
         let pid = pty.process_identity().pid;
         wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
         pty.suspend().expect("suspend verified child");
@@ -1343,7 +1349,7 @@ mod tests {
 
     #[test]
     fn suspend_resume_cycle() {
-        let (_redirect, mut pty) = signal_fixture("cycle");
+        let (_root, _redirect, mut pty) = signal_fixture("cycle");
         let pid = pty.process_identity().pid;
         wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
         for _ in 0..2 {
@@ -1359,7 +1365,7 @@ mod tests {
     fn suspend_sends_sigstop_to_group_leader_only() {
         // The gate shell leads its own process group; signaling the group stops
         // the shell AND the `sleep` it spawned, never anything outside it.
-        let (_redirect, mut pty) = signal_fixture("group");
+        let (_root, _redirect, mut pty) = signal_fixture("group");
         let pid = pty.process_identity().pid;
         wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
         // The gate shell may exec its command (no children) or fork it; either
@@ -1387,7 +1393,7 @@ mod tests {
 
     #[test]
     fn suspend_refuses_on_identity_mismatch() {
-        let (_redirect, mut pty) = signal_fixture("mismatch-suspend");
+        let (_root, _redirect, mut pty) = signal_fixture("mismatch-suspend");
         let pid = pty.process_identity().pid;
         wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
         pty.corrupt_identity_for_test();
@@ -1405,7 +1411,7 @@ mod tests {
 
     #[test]
     fn resume_refuses_on_identity_mismatch() {
-        let (_redirect, mut pty) = signal_fixture("mismatch-resume");
+        let (_root, _redirect, mut pty) = signal_fixture("mismatch-resume");
         let pid = pty.process_identity().pid;
         wait_for(pid, |s| !s.is_empty() && !s.starts_with('T'), "running");
         pty.corrupt_identity_for_test();
@@ -1425,16 +1431,22 @@ mod tests {
     /// would mask BL-10's bug (no explicit wait after the eventual SIGKILL).
     /// Trapping SIGHUP forces `portable_pty` through to its real SIGKILL
     /// fallback, the exact path `Pty::kill()` must reap itself.
-    fn hup_trapping_fixture(label: &str) -> (crate::testing::TestRedirect, crate::pty::Pty) {
-        let root =
-            std::env::temp_dir().join(format!("baude-signal-{label}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&root);
+    ///
+    /// Returned in the same order as [`signal_fixture`].
+    fn hup_trapping_fixture(
+        label: &str,
+    ) -> (
+        crate::testing::FixtureRoot,
+        crate::testing::TestRedirect,
+        crate::pty::Pty,
+    ) {
+        let root = crate::testing::FixtureRoot::new(&format!("baude-signal-{label}"));
         let redirect = crate::testing::TestRedirect::new(&root);
         let pty = crate::pty::Pty::spawn_paused(Some("trap '' HUP; sleep 30"), &[], &root, 5, 40)
             .expect("spawn")
             .release()
             .expect("release");
-        (redirect, pty)
+        (root, redirect, pty)
     }
 
     fn assert_reaped(pid: u32) {
@@ -1461,9 +1473,13 @@ mod tests {
     /// the 5s deadline and fails on that code.
     #[test]
     fn session_kill_reaps_both_children() {
-        let (_agent_redirect, agent) = hup_trapping_fixture("session-kill-agent");
+        let (_agent_root, _agent_redirect, agent) = hup_trapping_fixture("session-kill-agent");
+        // Job control moves each `sleep` out of its recorded group; these
+        // reapers sweep the recorded sessions once the Session has dropped.
+        let _agent_reaper = crate::testing::RuntimeReaper::for_pty(&agent);
         let agent_pid = agent.process_identity().pid;
-        let (_shell_redirect, shell) = hup_trapping_fixture("session-kill-shell");
+        let (_shell_root, _shell_redirect, shell) = hup_trapping_fixture("session-kill-shell");
+        let _shell_reaper = crate::testing::RuntimeReaper::for_pty(&shell);
         let shell_pid = shell.process_identity().pid;
         wait_for(
             agent_pid,
@@ -1633,10 +1649,12 @@ mod tests {
         }
     }
 
-    fn group_extinction_root(label: &str) -> (PathBuf, crate::testing::TestRedirect) {
-        let root = std::env::temp_dir().join(format!("baude-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    /// Bound as `let (root, _redirect)`, the redirect drops before the root,
+    /// and every Pty or guard bound later drops before both.
+    fn group_extinction_root(
+        label: &str,
+    ) -> (crate::testing::FixtureRoot, crate::testing::TestRedirect) {
+        let root = crate::testing::FixtureRoot::new(&format!("baude-{label}"));
         let redirect = crate::testing::TestRedirect::new(&root);
         (root, redirect)
     }

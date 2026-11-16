@@ -698,6 +698,31 @@ test("conflict_refetches_rows_before_rerender_and_names_new_child", async () => 
   assert.deepEqual(sentBody(h.pending("POST", "/removals")), driftReport());
 });
 
+test("drift_refresh_retitles_when_a_folder_will_be_deleted", async () => {
+  const h = harness();
+  // The first preview deletes nothing: the worktree folder was already gone.
+  await execute(h, {
+    report: previewReport({ paths_deleted: [], already_removed: [`${WORKTREES}/topic-7`] }),
+  });
+  const before = h.controller.getModal().html;
+  assert.ok(before.startsWith("<h3>Remove this checkout?</h3>"), before.slice(0, 80));
+
+  // Between preview and confirm the folder came back, so the fresh report
+  // the daemon answers 409 with now deletes it.
+  const fresh = previewReport();
+  await h.fail("POST", "/removals", 409, JSON.stringify(fresh));
+  await h.reply("GET", "/rows", rowsBody());
+  await h.confirming;
+
+  const modal = h.controller.getModal();
+  assert.equal(modal.phase, "preview");
+  assert.equal(modal.drift, true);
+  assert.deepEqual(modal.report, fresh);
+  const title = BaudeRemoval.escapeHtml("Remove this worktree and delete its folder?");
+  assert.ok(modal.html.startsWith(`<h3>${title}</h3>`), modal.html.slice(0, 80));
+  assert.equal(h.count("POST", "/removals"), 1, "the re-render confirms nothing");
+});
+
 test("conflict_refetch_does_not_reuse_a_poll_already_in_flight", async () => {
   const h = harness();
   await execute(h, { target: { repository: 1 }, report: repositoryReport() });
@@ -1530,6 +1555,95 @@ test("keyless_session_has_no_remove_control", () => {
   // No keyless session, no heading.
   assert.ok(!renderList(fourKindsBody(), { card }).includes(">other sessions<"));
   assert.ok(!renderList(fourKindsBody(), { card, keyless: [] }).includes(">other sessions<"));
+});
+
+// The page's /sessions list: the three sessions fourKindsBody's rows claim,
+// two the daemon reports with no row, and an archived one with no row, in
+// the order the daemon served them.
+function sessionsWithUnclaimed() {
+  return [
+    sessionInfo(10, "old-scratch", { cwd: "/tmp/old", repo_root: null, archived: true }),
+    ...liveSessions().slice(0, 1),
+    sessionInfo(9, "scratch", { cwd: "/tmp/scratch", repo_root: null }),
+    ...liveSessions().slice(1),
+    sessionInfo(11, "probe", { cwd: "/tmp/probe", repo_root: null }),
+  ];
+}
+
+test("unclaimed_sessions_are_the_ones_no_row_names", () => {
+  const { unclaimedSessions } = controllerModule();
+  const body = fourKindsBody();
+  const sessions = sessionsWithUnclaimed();
+  const before = clone(sessions);
+
+  // Sessions 2, 3 and 4 belong to the main checkout, the worktree and the
+  // folder; the rest keep their served order with the archived one last.
+  const unclaimed = unclaimedSessions(body, sessions);
+  assert.deepEqual(unclaimed.map((s) => s.id), [9, 11, 10]);
+  assert.equal(unclaimed[2].archived, true);
+  assert.deepEqual(sessions, before, "the sessions list is not reordered");
+
+  // A claimed session never shows up, archived or not.
+  const archivedClaimed = sessions.map((s) => (s.id === 3 ? { ...s, archived: true } : s));
+  assert.deepEqual(unclaimedSessions(body, archivedClaimed).map((s) => s.id), [9, 11, 10]);
+
+  // A row with no live session claims nothing.
+  const quiet = rowsBody({
+    repositories: [repositoryRow({ checkouts: [mainCheckout(), worktreeCheckout({ session_id: null })] })],
+    standalone: [standaloneRow({ session_id: null })],
+  });
+  assert.deepEqual(unclaimedSessions(quiet, sessions).map((s) => s.id), [9, 3, 4, 11, 10]);
+
+  // What can be read is read; nothing throws.
+  assert.deepEqual(unclaimedSessions(null, sessions).map((s) => s.id), [2, 9, 3, 4, 11, 10]);
+  assert.deepEqual(unclaimedSessions([], sessions).map((s) => s.id), [2, 9, 3, 4, 11, 10]);
+  assert.deepEqual(unclaimedSessions(body, null), []);
+  assert.deepEqual(unclaimedSessions(body, { 0: sessions[0] }), []);
+  const ragged = {
+    repositories: [
+      null,
+      7,
+      { repository_key: 1, checkouts: "none" },
+      { repository_key: 2, checkouts: [null, "x", mainCheckout({ session_id: 2 })] },
+    ],
+    standalone: [null, standaloneRow({ session_id: 4 })],
+  };
+  assert.deepEqual(
+    unclaimedSessions(ragged, [null, 5, ...sessions]).map((s) => s.id),
+    [9, 3, 11, 10],
+  );
+});
+
+test("other_sessions_heading_holds_active_and_archived_unclaimed_cards", () => {
+  const { unclaimedSessions } = controllerModule();
+  const body = fourKindsBody();
+  const sessions = sessionsWithUnclaimed();
+  const { card } = cards(sessions);
+
+  const html = renderList(body, { card, keyless: unclaimedSessions(body, sessions) });
+
+  const heading = html.indexOf(">other sessions<");
+  assert.ok(heading >= 0, "the heading is rendered");
+  assert.equal(html.split(">other sessions<").length, 2, "one heading");
+  const tail = html.slice(heading);
+  const active = tail.indexOf('data-sid="9"');
+  const archived = tail.indexOf('data-sid="10"');
+  assert.ok(active >= 0, "the active unclaimed card is under the heading");
+  assert.ok(archived >= 0, "the archived unclaimed card is under the heading");
+  assert.ok(tail.indexOf('data-sid="11"') < archived, "archived comes last");
+  assert.ok(active < archived);
+  assert.ok(tail.includes('<button class="row archived" data-sid="10">'));
+  assert.ok(!tail.includes("data-kind"), "nothing under that heading can be removed");
+  assert.ok(!tail.includes('class="rm"'));
+  // Every session is listed exactly once.
+  for (const s of sessions) {
+    assert.equal(html.split(`data-sid="${s.id}"`).length, 2, `session ${s.id} listed once`);
+  }
+  // Every claimed session sits above the heading, inside its row.
+  for (const id of [2, 3, 4]) {
+    assert.ok(html.indexOf(`data-sid="${id}"`) < heading, `session ${id} is under its row`);
+  }
+  assert.equal(removeControls(html).length, 4);
 });
 
 test("rows_without_a_live_session_still_offer_remove", () => {

@@ -3,7 +3,7 @@
 //! shutdown. State persists to its own file (`daemon-state.json`) so a daemon
 //! restart restores every session via `claude --continue`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -18,7 +18,8 @@ use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
 use baude_core::removal::{
-    self, PersistenceOutcome, RemovalError, RemovalReport, RemovalTarget, RowKey, RowRuntime,
+    self, PersistenceOutcome, PreparedRemoval, RemovalError, RemovalReport, RemovalTarget, RowKey,
+    RowRuntime, StageEffects,
 };
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
@@ -50,6 +51,11 @@ pub enum MutationError {
     /// failure, never "no such session": the session still exists and its
     /// checkout is left TeardownPending for a retry.
     Teardown(anyhow::Error),
+    /// The repository or folder the request would change is reserved by
+    /// another mutation, such as a removal. The message is the whole body a
+    /// client is shown, `repository busy: <main checkout>` or
+    /// `folder busy: <folder>`, built under the manager lock.
+    Busy(String),
 }
 
 impl std::fmt::Display for MutationError {
@@ -58,6 +64,7 @@ impl std::fmt::Display for MutationError {
             Self::Domain(error) => error.fmt(f),
             Self::Persistence(error) => error.fmt(f),
             Self::Teardown(error) => error.fmt(f),
+            Self::Busy(message) => f.write_str(message),
         }
     }
 }
@@ -194,7 +201,7 @@ impl DaemonEvent {
     }
 }
 
-/// Why `Manager::remove_rows` did not remove anything.
+/// Why `Manager::begin_removal` or `Manager::finish_removal` removed nothing.
 #[derive(Debug)]
 pub enum RemoveRowsError {
     /// The row set, runtimes or deleted paths changed since the preview; the
@@ -204,6 +211,23 @@ pub enum RemoveRowsError {
     Removal(RemovalError),
     Blocked(persist::SaveError),
     Busy(RepositoryKey),
+    /// The standalone row is reserved by another removal.
+    FolderBusy(StandaloneKey),
+    /// The slow stage, the kill and the delete, panicked; the payload is the
+    /// panic message. Every runtime handle was put back and nothing saved.
+    SlowStagePanicked(String),
+    /// Stage one panicked after the rows' sessions left the registry; the
+    /// payload is the panic message. Every handle was put back and nothing
+    /// was changed.
+    PreparePanicked(String),
+    /// Stage three panicked. Every handle core did not consume was put back,
+    /// and no event was published. `rows_removed` says whether core's commit
+    /// had already replaced the state; when it had, the removed rows'
+    /// registry entries were dropped so the registry matches the state.
+    CommitPanicked {
+        message: String,
+        rows_removed: bool,
+    },
 }
 
 impl std::fmt::Display for RemoveRowsError {
@@ -213,8 +237,237 @@ impl std::fmt::Display for RemoveRowsError {
             Self::Removal(error) => write!(f, "{error}"),
             Self::Blocked(error) => write!(f, "{error}"),
             Self::Busy(repository) => write!(f, "repository busy: {repository:?}"),
+            Self::FolderBusy(key) => write!(f, "folder busy: {key:?}"),
+            Self::SlowStagePanicked(message) => write!(
+                f,
+                "removal panicked while stopping runtimes and deleting worktrees, \
+                 nothing was saved: {message}"
+            ),
+            Self::PreparePanicked(message) => write!(
+                f,
+                "removal panicked while preparing, nothing was changed: {message}"
+            ),
+            Self::CommitPanicked {
+                message,
+                rows_removed: false,
+            } => write!(
+                f,
+                "removal panicked while committing, the rows stand: {message}"
+            ),
+            Self::CommitPanicked {
+                message,
+                rows_removed: true,
+            } => write!(
+                f,
+                "removal panicked after its commit, the rows were removed \
+                 and no event was sent: {message}"
+            ),
         }
     }
+}
+
+/// What the unlocked slow stage of a removal returned: core's
+/// `stop_and_delete` result, or the panic it raised.
+pub type SlowStageOutcome = std::thread::Result<std::result::Result<StageEffects, RemovalError>>;
+
+/// A removal between its two locked stages, from [`Manager::begin_removal`]
+/// to [`Manager::finish_removal`]. It owns the runtime handles moved out of
+/// the registry and the reservation that keeps every other mutation of the
+/// rows out until the commit.
+pub struct RemovalInFlight {
+    prepared: PreparedRemoval,
+    runtimes: Vec<RowRuntime>,
+    /// The session ids moved out of the registry.
+    consumed: Vec<u64>,
+    /// The rows the removal takes, for reconciling the registry with the
+    /// state after a panic in the commit stage.
+    rows: Vec<RowKey>,
+    #[cfg(test)]
+    pause: Option<RemovalPauseForTest>,
+    /// Held, never read: dropping the value releases the repository.
+    _repository_reservation: Option<lifecycle::RepositoryReservation>,
+    /// Held, never read: dropping the value releases the standalone row.
+    _standalone_reservation: Option<StandaloneReservation>,
+}
+
+impl RemovalInFlight {
+    /// Stage two, with no manager lock held: core's kill and disk stages,
+    /// which read no `RepositoryState`. The test gate and `stop_and_delete`
+    /// run inside one `catch_unwind`, so a panic from either is caught the
+    /// same way; the handles stay owned by `self` whatever happens, for
+    /// `finish_removal` to commit or put back.
+    pub fn stop_and_delete(&mut self) -> SlowStageOutcome {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(pause) = &self.pause {
+                pause.enter_and_wait();
+            }
+            removal::stop_and_delete(&self.prepared, &mut self.runtimes)
+        }))
+    }
+}
+
+/// The text of a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "a panic with no message".to_string()
+    }
+}
+
+/// Cloneable reservation registry for standalone rows, the same shape as
+/// core's `RepositoryReservations`: a guard releases its key on drop and
+/// holds its own share of the table, independent of the manager mutex.
+#[derive(Clone, Debug, Default)]
+struct StandaloneReservations {
+    held: Arc<Mutex<HashSet<StandaloneKey>>>,
+}
+
+impl StandaloneReservations {
+    /// Reserve `key`, or refuse when another holder has it.
+    fn reserve(&self, key: StandaloneKey) -> std::result::Result<StandaloneReservation, ()> {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        if !held.insert(key) {
+            return Err(());
+        }
+        drop(held);
+        Ok(StandaloneReservation {
+            held: Arc::clone(&self.held),
+            key,
+        })
+    }
+
+    /// Whether some guard holds `key` now.
+    fn is_reserved(&self, key: StandaloneKey) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&key)
+    }
+}
+
+/// A held standalone reservation; dropping it releases the row.
+#[derive(Debug)]
+pub(crate) struct StandaloneReservation {
+    held: Arc<Mutex<HashSet<StandaloneKey>>>,
+    key: StandaloneKey,
+}
+
+impl Drop for StandaloneReservation {
+    fn drop(&mut self) {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
+/// Test-only: a gate every removal passes on its way into the slow stage,
+/// after prepare and before the kill, so a test can act while a removal is
+/// parked there. Cloneable; every clone is the same gate.
+///
+/// Each removal entering the slow stage counts itself as entered and waits
+/// for [`Self::release`], bounded at ten seconds; a removal that gave up
+/// waiting is recorded, so a test can tell a real release from a timeout.
+/// Once released the gate stays open. An armed panic is raised by the first
+/// removal that leaves the gate after the release, and by no later one.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RemovalPauseForTest {
+    gate: Arc<(Mutex<RemovalPauseState>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RemovalPauseState {
+    entered: usize,
+    released: bool,
+    timed_out: bool,
+    panic_after_release: Option<String>,
+}
+
+#[cfg(test)]
+impl RemovalPauseForTest {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn state(&self) -> MutexGuard<'_, RemovalPauseState> {
+        self.gate
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Called by a removal at the start of its slow stage.
+    fn enter_and_wait(&self) {
+        let (_, condvar) = &*self.gate;
+        let mut state = self.state();
+        state.entered += 1;
+        condvar.notify_all();
+        let (mut state, wait) = condvar
+            .wait_timeout_while(state, Self::WAIT, |state| !state.released)
+            .unwrap_or_else(|error| error.into_inner());
+        if wait.timed_out() {
+            state.timed_out = true;
+        }
+        let panic = state.panic_after_release.take();
+        // The guard drops before the panic, so the gate is never poisoned.
+        drop(state);
+        if let Some(message) = panic {
+            panic!("{message}");
+        }
+    }
+
+    /// Wait until `count` removals have entered, bounded at `within`.
+    pub(crate) fn wait_entered(&self, count: usize, within: std::time::Duration) -> bool {
+        let (_, condvar) = &*self.gate;
+        let state = self.state();
+        let (state, _) = condvar
+            .wait_timeout_while(state, within, |state| state.entered < count)
+            .unwrap_or_else(|error| error.into_inner());
+        state.entered >= count
+    }
+
+    /// How many removals have entered so far.
+    pub(crate) fn entered(&self) -> usize {
+        self.state().entered
+    }
+
+    /// Let every parked removal, and every later one, through.
+    pub(crate) fn release(&self) {
+        let (_, condvar) = &*self.gate;
+        self.state().released = true;
+        condvar.notify_all();
+    }
+
+    /// Whether any removal gave up waiting for the release.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.state().timed_out
+    }
+
+    /// Make the first removal that leaves the gate after the release panic
+    /// with `message`, from inside its slow stage.
+    pub(crate) fn panic_after_release(&self, message: &str) {
+        self.state().panic_after_release = Some(message.to_string());
+    }
+}
+
+/// Test-only: where the next removal panics in one of its two locked
+/// stages, and with what message. The slow stage's own panic is armed on
+/// [`RemovalPauseForTest`] instead.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum RemovalPanicForTest {
+    /// In `begin_removal`, where core's `prepare` runs, after the doomed
+    /// sessions left the registry.
+    Prepare(String),
+    /// In the save closure core's `commit` calls, before anything is written.
+    Save(String),
+    /// In `finish_removal`, after core's `commit` returned `Ok` and before
+    /// the registry bookkeeping and the publish.
+    AfterCommit(String),
 }
 
 /// Overwrite the retained session metadata of every checkout still present in
@@ -276,6 +529,14 @@ pub struct Manager {
     /// of this registry and `runtime_checkouts`.
     runtime_standalones: HashMap<StandaloneKey, u64>,
     repository_reservations: RepositoryReservations,
+    /// The standalone rows a removal holds. The daemon's own registry, the
+    /// standalone counterpart of `repository_reservations`: core reserves
+    /// repositories only.
+    standalone_reservations: StandaloneReservations,
+    /// Early targeted-resume exits whose reconcile the poll deferred because a
+    /// removal held the session's row, by session id, with the spawn time of
+    /// the runtime that exited. See `reconcile_early_targeted_resume_exits`.
+    pending_early_resume_reconciles: HashMap<u64, u64>,
     persistence_blocked: bool,
     /// True after a failed save so API owners can surface degraded durability.
     pub persistence_dirty: bool,
@@ -295,6 +556,13 @@ pub struct Manager {
     atomic_failure_window_for_test: (usize, usize),
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
+    /// Test-only: the gate a removal passes between prepare and the kill.
+    #[cfg(test)]
+    removal_pause_for_test: Option<RemovalPauseForTest>,
+    /// Test-only: a panic the next removal raises in one of its two locked
+    /// stages. Taken by the removal that raises it.
+    #[cfg(test)]
+    removal_panic_for_test: Option<RemovalPanicForTest>,
     /// Startup timing stages (config load, state load, listener bound, etc.)
     pub startup_timing: crate::timing::StartupTiming,
 }
@@ -710,6 +978,8 @@ impl Manager {
             runtime_checkouts: HashMap::new(),
             runtime_standalones: HashMap::new(),
             repository_reservations: RepositoryReservations::default(),
+            standalone_reservations: StandaloneReservations::default(),
+            pending_early_resume_reconciles: HashMap::new(),
             persistence_blocked: false,
             persistence_dirty: false,
             persistence_error: None,
@@ -722,6 +992,10 @@ impl Manager {
             atomic_failure_window_for_test: (0, usize::MAX),
             #[cfg(test)]
             spawn_error_for_test: None,
+            #[cfg(test)]
+            removal_pause_for_test: None,
+            #[cfg(test)]
+            removal_panic_for_test: None,
             startup_timing: crate::timing::StartupTiming::new(0),
         }
     }
@@ -1109,20 +1383,35 @@ impl Manager {
         &self,
         target: RemovalTarget,
     ) -> std::result::Result<RemovalReport, RemovalError> {
-        // No reservation: the caller holds the global manager mutex, which
-        // already serializes this read against every mutation, and core's
-        // own `remove` re-selects its rows rather than trusting a preview.
+        // No reservation: a preview is a read of the stored rows under the
+        // caller's lock. It may run while another removal is in its slow
+        // stage, when the doomed rows are still stored, and then reads them
+        // as they were; executing such a preview meets that removal's
+        // reservation and answers busy. `begin_removal` recomputes the
+        // report under its own lock and core's `commit` re-selects its rows,
+        // so neither trusts a preview.
         removal::preview_removal(&self.repository_state, target)
     }
 
-    /// `POST /removals`: kill, delete and drop the previewed rows in one save.
+    /// `POST /removals`, stage one, under the manager lock: refuse a blocked
+    /// persistence, reserve the target's repository or standalone row,
+    /// recompute the report and compare it with the previewed one, move the
+    /// rows' live sessions out of the registry and run core's `prepare`.
+    ///
+    /// The returned value owns the reservation, the moved runtime handles
+    /// and the prepared set. The caller drops the lock, runs
+    /// [`RemovalInFlight::stop_and_delete`] without it, and hands both back
+    /// to [`Self::finish_removal`] under the lock again. The reservation is
+    /// held from before the recheck until `finish_removal` has published,
+    /// which is what keeps every other mutation of these rows out of the
+    /// unlocked window.
     ///
     /// The Phase 18 force path, not the close protocol: nothing here routes
     /// through `Manager::remove` or `teardown_retained_runtime`.
-    pub fn remove_rows(
+    pub fn begin_removal(
         &mut self,
         previewed: &RemovalReport,
-    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+    ) -> std::result::Result<RemovalInFlight, RemoveRowsError> {
         if self.persistence_blocked {
             return Err(RemoveRowsError::Blocked(
                 persist::SaveError::before_replacement(anyhow!(
@@ -1131,7 +1420,7 @@ impl Manager {
             ));
         }
         let target = previewed.target;
-        let _reservation = match self.removal_target_repository(target) {
+        let repository_reservation = match self.removal_target_repository(target) {
             Some(repository) => Some(
                 self.repository_reservations
                     .reserve(repository)
@@ -1139,8 +1428,19 @@ impl Manager {
             ),
             None => None,
         };
-        // The report is recomputed under the caller's lock. Only what the run
-        // would do is compared; `cleared` and `already_removed` are filesystem
+        // A standalone row has no repository to reserve, so the daemon's own
+        // registry refuses a second removal of the same folder. Like the
+        // repository guard, it is carried in the in-flight value.
+        let standalone_reservation = match target {
+            RemovalTarget::Standalone(key) => Some(
+                self.standalone_reservations
+                    .reserve(key)
+                    .map_err(|()| RemoveRowsError::FolderBusy(key))?,
+            ),
+            RemovalTarget::Repository(_) | RemovalTarget::Checkout(_) => None,
+        };
+        // The report is recomputed under the lock. Only what the run would
+        // do is compared; `cleared` and `already_removed` are filesystem
         // probes that would make the recheck flap on advisory state.
         let fresh = self
             .preview_removal(target)
@@ -1151,20 +1451,219 @@ impl Manager {
         {
             return Err(RemoveRowsError::Drift(Box::new(fresh)));
         }
-        // Snapshot before the core call: the closure cannot borrow `self`
-        // while `remove` holds `&mut self.repository_state`. The removed rows'
-        // sessions are still registered here, and the merge skips them because
-        // their checkouts are gone from the candidate.
+        // Taken while the removed rows' sessions are still registered. Only
+        // the doomed rows' entries are used here; the save's own overrides
+        // are taken in `finish_removal`, under the commit lock.
         let overrides = self.survivor_runtime_overrides();
         let standalone_overrides = self.standalone_runtime_overrides();
-        let mut runtimes = self.collect_row_runtimes(&fresh);
+        // `rows()` merges live metadata from the registry, and the doomed
+        // rows' sessions are about to leave it until the commit. Writing
+        // their live metadata into the stored rows first keeps `GET /rows`
+        // serving them unchanged through the window. It is what the next
+        // save would write for them anyway, so a removal that does not
+        // commit leaves nothing a save would not have.
+        self.merge_doomed_rows_live_metadata(&fresh, &overrides, &standalone_overrides);
+        let runtimes = self.collect_row_runtimes(&fresh);
         let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        #[cfg(test)]
+        let prepare_panic = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::Prepare(message) => Some(message),
+            _ => None,
+        });
+        // The handles are out of the registry from here until the in-flight
+        // value owns them. They are only borrowed by the closure, so a panic
+        // in core's prepare still finds every one of them here to put back;
+        // the reservations drop when this returns.
+        let state = &self.repository_state;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(message) = prepare_panic {
+                panic!("{message}");
+            }
+            removal::prepare(state, target, &runtimes)
+        }));
+        let prepared = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.abandon_removal(runtimes, &error);
+                return Err(RemoveRowsError::Removal(error));
+            }
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                self.restore_row_runtimes(runtimes);
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                return Err(RemoveRowsError::PreparePanicked(message));
+            }
+        };
+        Ok(RemovalInFlight {
+            prepared,
+            runtimes,
+            consumed,
+            rows: fresh.rows_removed.clone(),
+            #[cfg(test)]
+            pause: self.removal_pause_for_test.clone(),
+            _repository_reservation: repository_reservation,
+            _standalone_reservation: standalone_reservation,
+        })
+    }
+
+    /// `POST /removals`, stage three, under the manager lock again: commit
+    /// what the unlocked stage did, or put everything back.
+    ///
+    /// A panic or an error from the slow stage, and every error from core's
+    /// `commit`, return every runtime handle to the registry and publish
+    /// nothing; `repository_state` is untouched on all of them. Only a
+    /// committed save reaches the one `publish`. The reservation the
+    /// in-flight value carries is released when this returns, after that
+    /// publish.
+    ///
+    /// The stage runs inside one `catch_unwind`. The handles stay owned out
+    /// here and the stage only borrows them, so a panic anywhere in it, core's
+    /// `commit` and the save closure included, still finds every handle core
+    /// did not consume: [`Self::recover_from_commit_panic`] puts them back
+    /// and the answer is a 500 naming the panic, with nothing published.
+    pub fn finish_removal(
+        &mut self,
+        inflight: RemovalInFlight,
+        stage2: SlowStageOutcome,
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+        let RemovalInFlight {
+            prepared,
+            mut runtimes,
+            consumed,
+            rows,
+            #[cfg(test)]
+                pause: _,
+            _repository_reservation,
+            _standalone_reservation,
+        } = inflight;
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.commit_removal(prepared, stage2, &mut runtimes, &consumed)
+        }));
+        match finished {
+            Ok(result) => result,
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                let rows_removed =
+                    self.recover_from_commit_panic(std::mem::take(&mut runtimes), &consumed, &rows);
+                Err(RemoveRowsError::CommitPanicked {
+                    message,
+                    rows_removed,
+                })
+            }
+        }
+    }
+
+    /// Put the registry back in step with `repository_state` after a panic
+    /// in the commit stage, and return whether the commit had already
+    /// removed the rows.
+    ///
+    /// Every handle still in `runtimes` goes back to the registry: before
+    /// core's commit replaced the state that is every handle, after it only
+    /// those core did not consume. A row core's commit removed loses its
+    /// `runtime_checkouts` or `runtime_standalones` entry, as on the
+    /// committed path; a row that stands keeps its entry, which still names
+    /// its restored session. Core replaces the state in one assignment, so
+    /// the rows are either all gone or all present.
+    fn recover_from_commit_panic(
+        &mut self,
+        runtimes: Vec<RowRuntime>,
+        consumed: &[u64],
+        rows: &[RowKey],
+    ) -> bool {
+        self.restore_row_runtimes(runtimes);
+        let mut rows_removed = false;
+        for row in rows {
+            let state = &self.repository_state;
+            let gone = match row {
+                RowKey::Checkout(key) => !state.checkouts.iter().any(|saved| saved.key == *key),
+                RowKey::Standalone(key) => state.standalone_session(*key).is_none(),
+                RowKey::Repository(key) => {
+                    !state.repositories.iter().any(|saved| saved.key == *key)
+                }
+            };
+            if !gone {
+                continue;
+            }
+            rows_removed = true;
+            match row {
+                RowKey::Checkout(key) => {
+                    self.runtime_checkouts.remove(key);
+                }
+                RowKey::Standalone(key) => {
+                    self.runtime_standalones.remove(key);
+                }
+                RowKey::Repository(_) => {}
+            }
+        }
+        for id in consumed {
+            if !self.sessions.iter().any(|session| session.id == *id) {
+                if let Some(notify) = self.permission_notify.remove(id) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.atomic_failure_for_test = None;
+        }
+        rows_removed
+    }
+
+    /// The body of [`Self::finish_removal`], under its `catch_unwind`. Every
+    /// exit that puts handles back takes them out of `runtimes`, so whatever
+    /// a panic leaves there is still owed to the registry.
+    fn commit_removal(
+        &mut self,
+        prepared: PreparedRemoval,
+        stage2: SlowStageOutcome,
+        runtimes: &mut Vec<RowRuntime>,
+        consumed: &[u64],
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+        let effects = match stage2 {
+            Ok(Ok(effects)) => effects,
+            Ok(Err(error)) => {
+                self.abandon_removal(std::mem::take(runtimes), &error);
+                return Err(RemoveRowsError::Removal(error));
+            }
+            Err(panic) => {
+                // The handles were never moved into the panicking closure, so
+                // every one of them is still here to put back.
+                let message = panic_message(panic.as_ref());
+                self.restore_row_runtimes(std::mem::take(runtimes));
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                return Err(RemoveRowsError::SlowStagePanicked(message));
+            }
+        };
+        // Taken now, under the commit lock, so a survivor renamed or
+        // archived during the slow stage is saved as it is, never as it was
+        // when the removal began. The removed rows' sessions are out of the
+        // registry and contribute nothing; their rows are gone from the
+        // candidate anyway. The closure cannot borrow `self` while core holds
+        // `&mut self.repository_state`, hence an owned snapshot.
+        let overrides = self.survivor_runtime_overrides();
+        let standalone_overrides = self.standalone_runtime_overrides();
         let persist_enabled = self.persist;
         #[cfg(test)]
         let test_target = self.persistence_target_for_test.clone();
         #[cfg(test)]
         let atomic_failure = self.atomic_failure_for_test;
+        #[cfg(test)]
+        let save_panic = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::Save(message) => Some(message),
+            _ => None,
+        });
         let save = move |file: &StateFile| -> std::result::Result<(), persist::SaveError> {
+            #[cfg(test)]
+            if let Some(message) = save_panic {
+                panic!("{message}");
+            }
             if !persist_enabled {
                 return Ok(());
             }
@@ -1186,24 +1685,31 @@ impl Manager {
             }
             persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &merged)
         };
-        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        let result = removal::commit(
+            &mut self.repository_state,
+            prepared,
+            effects,
+            runtimes,
+            save,
+        );
         let report = match result {
             Ok(report) => report,
             Err(error) => {
-                // Core left `repository_state` untouched and every handle in
-                // the Vec, so the rows and their registry entries all stand.
-                self.restore_row_runtimes(runtimes);
-                #[cfg(test)]
-                {
-                    self.atomic_failure_for_test = None;
-                }
-                if matches!(error, RemovalError::Persist { .. }) {
-                    self.persistence_dirty = true;
-                    self.persistence_error = Some(error.to_string());
-                }
+                // A persist failure, `SelectionChanged` or a validation
+                // refusal: core left `repository_state` untouched and every
+                // handle in the Vec, so the rows and their registry entries
+                // all stand.
+                self.abandon_removal(std::mem::take(runtimes), &error);
                 return Err(RemoveRowsError::Removal(error));
             }
         };
+        #[cfg(test)]
+        if let Some(message) = self.take_removal_panic_for_test(|at| match at {
+            RemovalPanicForTest::AfterCommit(message) => Some(message),
+            _ => None,
+        }) {
+            panic!("{message}");
+        }
         for row in &report.rows_removed {
             match row {
                 RowKey::Checkout(key) => {
@@ -1217,7 +1723,7 @@ impl Manager {
         }
         // Handles the core did not consume stay registered.
         let restored: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
-        self.restore_row_runtimes(runtimes);
+        self.restore_row_runtimes(std::mem::take(runtimes));
         for id in consumed.iter().filter(|id| !restored.contains(id)) {
             // Wake before forgetting, so no long-poll hangs on a row that no
             // longer exists.
@@ -1237,13 +1743,52 @@ impl Manager {
             // A real run never reports a planned outcome.
             PersistenceOutcome::Planned => {}
         }
-        // The caller holds the manager mutex for this whole method, so no
-        // reader can see the row after the event is queued. That is a
-        // property of this code position, not something a test observes.
-        // Core's durable save has returned, which covers `SavedDegraded`: the
-        // replacement committed. No other exit of this method publishes.
+        // The caller holds the manager mutex across this whole method, the
+        // commit lock scope, so no reader can see the row after the event is
+        // queued: core's commit replaced the state above under the same
+        // guard. That is a property of this code position, not something a
+        // test observes. Core's durable save has returned, which covers
+        // `SavedDegraded`: the replacement committed. No other exit of this
+        // method or of `begin_removal` publishes.
         self.publish(DaemonEvent::RowsRemoved(report.clone()));
         Ok(report)
+    }
+
+    /// Merge the live metadata of the rows `report` removes, and of no other
+    /// row, into `repository_state`, through the one merge implementation.
+    fn merge_doomed_rows_live_metadata(
+        &mut self,
+        report: &RemovalReport,
+        overrides: &[(CheckoutKey, RetainedSessionState)],
+        standalone_overrides: &[(StandaloneKey, RetainedStandaloneSessionState)],
+    ) {
+        let doomed: Vec<(CheckoutKey, RetainedSessionState)> = overrides
+            .iter()
+            .filter(|(key, _)| report.rows_removed.contains(&RowKey::Checkout(*key)))
+            .cloned()
+            .collect();
+        let doomed_standalone: Vec<(StandaloneKey, RetainedStandaloneSessionState)> =
+            standalone_overrides
+                .iter()
+                .filter(|(key, _)| report.rows_removed.contains(&RowKey::Standalone(*key)))
+                .cloned()
+                .collect();
+        merge_live_runtime_metadata(&mut self.repository_state, &doomed, &doomed_standalone);
+    }
+
+    /// Put a removal that will not commit back: every handle returns to the
+    /// registry, the test save failure is cleared, and a persist failure
+    /// marks persistence degraded, exactly as one failed save does.
+    fn abandon_removal(&mut self, runtimes: Vec<RowRuntime>, error: &RemovalError) {
+        self.restore_row_runtimes(runtimes);
+        #[cfg(test)]
+        {
+            self.atomic_failure_for_test = None;
+        }
+        if matches!(error, RemovalError::Persist { .. }) {
+            self.persistence_dirty = true;
+            self.persistence_error = Some(error.to_string());
+        }
     }
 
     /// A receiver for every event published from now on. Nothing published
@@ -1330,6 +1875,58 @@ impl Manager {
             .iter()
             .find(|saved| saved.key == repository)
             .map(|saved| saved.observed_main_worktree.to_path_buf())
+    }
+
+    /// The canonical path a standalone row stores, for a busy refusal's body.
+    pub fn standalone_path(&self, key: StandaloneKey) -> Option<PathBuf> {
+        self.repository_state
+            .standalone_session(key)
+            .map(|row| row.canonical_path.to_path_buf())
+    }
+
+    /// The refusal for a reserved repository, its body naming the stored main
+    /// checkout, the same body a busy `POST /removals` answers with.
+    fn repository_busy(&self, repository: RepositoryKey) -> MutationError {
+        MutationError::Busy(match self.repository_path(repository) {
+            Some(path) => format!("repository busy: {}", path.display()),
+            None => format!("repository busy: {repository:?}"),
+        })
+    }
+
+    /// The refusal for session `id` when the row it runs in is reserved: its
+    /// checkout's repository or its standalone folder. The id is resolved
+    /// through `runtime_checkouts` and `runtime_standalones`, which keep their
+    /// entries while a removal holds the session, so a session a removal has
+    /// moved out of `sessions` still answers busy rather than "no session".
+    fn session_busy(&self, id: u64) -> Option<MutationError> {
+        let checkout = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key));
+        if let Some(checkout) = checkout {
+            let repository = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout)?
+                .repository_key;
+            return self
+                .repository_reservations
+                .is_reserved(repository)
+                .then(|| self.repository_busy(repository));
+        }
+        let key = self.standalone_owner(id)?;
+        self.standalone_reservations
+            .is_reserved(key)
+            .then(|| self.folder_busy(key))
+    }
+
+    /// The refusal for a reserved standalone row, its body naming the folder.
+    fn folder_busy(&self, key: StandaloneKey) -> MutationError {
+        MutationError::Busy(match self.standalone_path(key) {
+            Some(path) => format!("folder busy: {}", path.display()),
+            None => format!("folder busy: {key:?}"),
+        })
     }
 
     /// `GET /rows` — the hierarchy projection. A pure read: it admits nothing,
@@ -1468,6 +2065,48 @@ impl Manager {
             .unwrap_or_else(|_| panic!("repository {key:?} is already reserved"))
     }
 
+    /// Test-only: park every removal from now on at the start of its slow
+    /// stage, after prepare and before the kill, until the returned gate is
+    /// released. See [`RemovalPauseForTest`].
+    #[cfg(test)]
+    pub(crate) fn pause_removals_for_test(&mut self) -> RemovalPauseForTest {
+        let pause = RemovalPauseForTest::default();
+        self.removal_pause_for_test = Some(pause.clone());
+        pause
+    }
+
+    /// Test-only: make the next removal panic at `at`.
+    #[cfg(test)]
+    pub(crate) fn panic_in_removal_for_test(&mut self, at: RemovalPanicForTest) {
+        self.removal_panic_for_test = Some(at);
+    }
+
+    /// The armed removal panic's message when `matches` accepts its stage,
+    /// taken so it fires once.
+    #[cfg(test)]
+    fn take_removal_panic_for_test(
+        &mut self,
+        matches: fn(&RemovalPanicForTest) -> Option<&String>,
+    ) -> Option<String> {
+        let message = self
+            .removal_panic_for_test
+            .as_ref()
+            .and_then(matches)?
+            .clone();
+        self.removal_panic_for_test = None;
+        Some(message)
+    }
+
+    /// Take the real reservation of standalone row `key`, the folder
+    /// counterpart of `reserve_repository_for_test`. The guard owns its share
+    /// of the table and outlives the manager lock.
+    #[cfg(test)]
+    pub(crate) fn reserve_standalone_for_test(&self, key: StandaloneKey) -> StandaloneReservation {
+        self.standalone_reservations
+            .reserve(key)
+            .unwrap_or_else(|()| panic!("standalone {key:?} is already reserved"))
+    }
+
     /// Store and launch what a daemon before 21-10 stored and launched for a
     /// folder git does not report as a repository, so a test can stand on
     /// that shape. The allocation is the one `record_checkout_intent` made
@@ -1557,12 +2196,15 @@ impl Manager {
     ///
     /// An explicit admission is the one thing that lifts a suppression
     /// entry (D-11). Every arm of `admit` that returns a session has stored
-    /// its row durably and launched it by then, so the lift runs here, once,
-    /// with the path that row stores: core keyed the entry on the stored
-    /// path of the row it removed, never on a request string. An arm that
-    /// returns an error lifts nothing, and a non-persisting manager stores
-    /// no row and lifts nothing. Restore, reopen, the restart route and the
-    /// legacy migration never come through here.
+    /// its row durably and launched it by then, so the lift runs here, once.
+    /// The key is the checkout root of the path that row stores,
+    /// `suppression::lift_key`, the same key the TUI lifts: core keyed the
+    /// entry on the checkout path of the row it removed, never on a request
+    /// string, and a row stored on a subfolder names its checkout's entry
+    /// through that root. An arm that returns an error lifts nothing, and a
+    /// non-persisting manager stores no row and lifts nothing. Restore,
+    /// reopen, the restart route and the legacy migration never come
+    /// through here.
     pub fn create(
         &mut self,
         repo: &str,
@@ -1600,12 +2242,15 @@ impl Manager {
             .map(|checkout| checkout.observed_path.to_path_buf())
     }
 
-    /// Forget the suppression entry for exactly `admitted`. Advisory: a
-    /// store error is logged with the path and never fails the admission
-    /// that asked for it. It reads no row and writes no state of its own.
+    /// Forget the suppression entry for the checkout root of `admitted`, the
+    /// stored row path, as `suppression::lift_key` names it for both
+    /// clients. Advisory: a store error is logged with the path and never
+    /// fails the admission that asked for it. It reads no row and writes no
+    /// state of its own.
     fn lift_admission_suppression(&self, admitted: &Path) {
-        if let Err(error) = suppression::lift(&persist::config_dir(), admitted) {
-            eprintln!("lift suppression {}: {error}", admitted.display());
+        let key = suppression::lift_key(admitted);
+        if let Err(error) = suppression::lift(&persist::config_dir(), &key) {
+            eprintln!("lift suppression {}: {error}", key.display());
         }
     }
 
@@ -1644,8 +2289,8 @@ impl Manager {
                     ..
                 }
                 | LifecycleOutcome::Focused { runtime, .. } => runtime,
-                LifecycleOutcome::Busy { .. } => {
-                    return Err(anyhow!("repository lifecycle is busy; retry the action").into())
+                LifecycleOutcome::Busy { repository } => {
+                    return Err(self.repository_busy(repository))
                 }
                 _ => return Err(anyhow!("activation produced no runtime").into()),
             };
@@ -1678,6 +2323,12 @@ impl Manager {
             };
             let join = match &route {
                 PlainAdmission::ReuseStandalone(key) => {
+                    // A row a removal holds is neither handed out nor
+                    // reopened: a reopen would spawn a runtime the removal's
+                    // commit then drops from the registry.
+                    if self.standalone_reservations.is_reserved(*key) {
+                        return Err(self.folder_busy(*key));
+                    }
                     // One row per folder. A live row is the same session; a
                     // closed one is reopened under its key. Either way the
                     // request's name is not applied.
@@ -1694,6 +2345,31 @@ impl Manager {
                 }
                 PlainAdmission::Discovered => None,
                 PlainAdmission::JoinStored(key) => Some(*key),
+            };
+            // The stored repository this admission adds a checkout to: the
+            // joined row, or the row whose common directory discovery found.
+            // It is reserved until the admission returns, so no admission
+            // adds a child to a repository a removal holds. Only this plain
+            // path reserves here; the worktree path above took its own
+            // reservation inside `activate_branch_worktree` and has returned.
+            let joined = match (&route, &discovery) {
+                (PlainAdmission::JoinStored(key), _) => Some(*key),
+                (PlainAdmission::Discovered, Ok(snapshot)) => {
+                    let common = PersistedPath::from_path(&snapshot.common_dir);
+                    self.repository_state
+                        .repositories
+                        .iter()
+                        .find(|repository| repository.observed_common_dir == common)
+                        .map(|repository| repository.key)
+                }
+                _ => None,
+            };
+            let _reservation = match joined {
+                Some(repository) => match self.repository_reservations.reserve(repository) {
+                    Ok(reservation) => Some(reservation),
+                    Err(_) => return Err(self.repository_busy(repository)),
+                },
+                None => None,
             };
             self.ensure_runtime_capacity(&cwd, &repo_root, &route)?;
             let state_before = self.repository_state.clone();
@@ -3125,6 +3801,9 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> MutationResult<()> {
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
+        }
         self.session(id)?;
         // A folder session is closed, never dropped: its row stays and must
         // stop recording the runtime.
@@ -3295,7 +3974,8 @@ impl Manager {
     // The bridge POSTs a pending request (set_pending), the PWA/phone POSTs the
     // decision (resolve_pending), and the bridge's GET poll reads it (decision).
     // All route `Err -> 404` via `self.session(id)?`/`session_mut(id)?` exactly
-    // like `ingest_event`. Pitfall 4: these only touch state UNDER the lock; the
+    // like `ingest_event`, or 503 for a session a removal holds, see
+    // `SessionBusy`. Pitfall 4: these only touch state UNDER the lock; the
     // actual wait happens OUTSIDE via the Arc<Notify> from `permission_notify`.
 
     /// Store a fresh pending permission request on a known session, clearing any
@@ -3509,6 +4189,9 @@ impl Manager {
                 "daemon persistence is blocked after a state load failure"
             ))
             .into());
+        }
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
         }
         if !self.session(id)?.claude.is_exited() {
             return Err(anyhow!("claude is still running").into());
@@ -3759,34 +4442,46 @@ impl Manager {
         self.sessions.iter().find(|s| s.id == id).map(session_info)
     }
 
+    /// `GET /sessions/{id}`: the session's info, or the lookup error that
+    /// tells a busy session from a missing one.
+    pub fn session_info(&self, id: u64) -> Result<SessionInfo> {
+        self.session(id).map(session_info)
+    }
+
     /// Reconcile an immediate `--resume` rejection through the ordinary
     /// retained remove boundary so child reaping and retryable lifecycle state
     /// stay identical to an explicit close.
+    ///
+    /// `remove` refuses a session whose repository or folder a removal holds,
+    /// and a removal's slow stage can hold it past the early-exit window. A
+    /// reconcile refused that way is kept in `pending_early_resume_reconciles`
+    /// and retried on every tick until it runs, whatever the window says, for
+    /// as long as the session still holds the runtime that exited.
     fn reconcile_early_targeted_resume_exits(&mut self) {
-        let exited: Vec<_> = self
-            .sessions
-            .iter_mut()
-            .filter_map(|session| {
-                session
-                    .early_targeted_resume_exit()
-                    .then(|| {
-                        self.runtime_checkouts
-                            .iter()
-                            .find_map(|(key, runtime)| {
-                                (*runtime == session.id).then_some(RuntimeOwner::Checkout(*key))
-                            })
-                            .or_else(|| {
-                                self.runtime_standalones.iter().find_map(|(key, runtime)| {
-                                    (*runtime == session.id)
-                                        .then_some(RuntimeOwner::Standalone(*key))
-                                })
-                            })
-                            .map(|owner| (owner, session.id))
-                    })
-                    .flatten()
-            })
-            .collect();
-        for (owner, id) in exited {
+        let pending = std::mem::take(&mut self.pending_early_resume_reconciles);
+        let mut exited = Vec::new();
+        for session in &mut self.sessions {
+            // A restart gives the session a new spawn time, so a deferred
+            // reconcile never reaches the runtime that replaced the dead one.
+            let deferred = pending.get(&session.id) == Some(&session.spawn_unix_ms)
+                && session.claude.is_exited();
+            if deferred || session.early_targeted_resume_exit() {
+                exited.push((session.id, session.spawn_unix_ms));
+            }
+        }
+        // A deferred session a removal holds out of the registry stays
+        // pending: it comes back if that removal fails, and its row forgets
+        // the runtime if the removal commits.
+        for (id, spawn) in pending {
+            let registered = self.sessions.iter().any(|session| session.id == id);
+            if !registered && self.runtime_owner(id).is_some() {
+                self.pending_early_resume_reconciles.insert(id, spawn);
+            }
+        }
+        for (id, spawn) in exited {
+            let Some(owner) = self.runtime_owner(id) else {
+                continue;
+            };
             match owner {
                 RuntimeOwner::Checkout(checkout) => {
                     if let Some(saved) = self
@@ -3804,10 +4499,27 @@ impl Manager {
                     }
                 }
             }
-            if let Err(error) = self.remove(id) {
-                eprintln!("failed to reconcile early targeted resume: {error}");
+            match self.remove(id) {
+                Ok(()) => {}
+                // A removal holds the row for now; the next tick retries.
+                Err(MutationError::Busy(_)) => {
+                    self.pending_early_resume_reconciles.insert(id, spawn);
+                }
+                Err(error) => eprintln!("failed to reconcile early targeted resume: {error}"),
             }
         }
+    }
+
+    /// The row whose runtime session `id` is, if any.
+    fn runtime_owner(&self, id: u64) -> Option<RuntimeOwner> {
+        self.runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(RuntimeOwner::Checkout(*key)))
+            .or_else(|| {
+                self.runtime_standalones.iter().find_map(|(key, runtime)| {
+                    (*runtime == id).then_some(RuntimeOwner::Standalone(*key))
+                })
+            })
     }
 
     pub fn poll(&mut self) {
@@ -3846,6 +4558,9 @@ impl Manager {
     /// stop sending notifications. A manual archive sticks until unarchived
     /// or re-engaged; an automatic one also lifts when a new turn starts.
     pub fn set_archived(&mut self, id: u64, archived: bool) -> MutationResult<()> {
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
+        }
         let s = self.session_mut(id)?;
         let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);
@@ -3968,20 +4683,81 @@ impl Manager {
         }
     }
 
-    fn session(&self, id: u64) -> Result<&Session> {
+    /// Test-only: a reaper for the agent and, when present, the shell of
+    /// every session this manager lists, recorded now.
+    ///
+    /// A fixture agent runs under an interactive shell, whose job control
+    /// can give the command a process group of its own. Killing the PTY
+    /// leader does not always reach that job, which is reparented to pid 1
+    /// but stays in the session the leader created. Each reaper sweeps that
+    /// recorded session when it drops. Bind these before a test kills,
+    /// removes or restarts a runtime itself: once the manager forgets or
+    /// replaces it, `kill_all_and_reap_for_test` no longer sees its identity.
+    #[cfg(test)]
+    pub(crate) fn runtime_reapers_for_test(&self) -> Vec<baude_core::testing::RuntimeReaper> {
         self.sessions
             .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| anyhow!("no session {id}"))
+            .flat_map(|session| {
+                std::iter::once(session.claude.process_identity())
+                    .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+            })
+            .map(baude_core::testing::RuntimeReaper::for_identity)
+            .collect()
+    }
+
+    /// Test-only: `kill_all`, then reap the recorded session of every runtime
+    /// this manager listed before it, so a job that outlived its PTY leader
+    /// does not outlive the test.
+    #[cfg(test)]
+    pub(crate) fn kill_all_and_reap_for_test(&mut self) {
+        let reapers = self.runtime_reapers_for_test();
+        self.kill_all();
+        drop(reapers);
+    }
+
+    fn session(&self, id: u64) -> Result<&Session> {
+        match self.sessions.iter().find(|s| s.id == id) {
+            Some(session) => Ok(session),
+            None => Err(self.missing_session(id)),
+        }
     }
 
     fn session_mut(&mut self, id: u64) -> Result<&mut Session> {
-        self.sessions
-            .iter_mut()
-            .find(|s| s.id == id)
-            .ok_or_else(|| anyhow!("no session {id}"))
+        match self.sessions.iter().position(|s| s.id == id) {
+            Some(index) => Ok(&mut self.sessions[index]),
+            None => Err(self.missing_session(id)),
+        }
+    }
+
+    /// The error for a lookup of `id` that found no session. A session a
+    /// removal holds out of the registry during its slow stage is busy, not
+    /// missing: `session_busy` still resolves it through `runtime_checkouts`
+    /// and `runtime_standalones`, which keep it until the commit, and the
+    /// error carries the same body the four mutating routes answer with.
+    /// Once the removal commits, or for an id nothing maps, it is
+    /// "no session".
+    fn missing_session(&self, id: u64) -> anyhow::Error {
+        match self.session_busy(id) {
+            Some(MutationError::Busy(message)) => anyhow::Error::new(SessionBusy(message)),
+            _ => anyhow!("no session {id}"),
+        }
     }
 }
+
+/// A session lookup refused because a removal holds the session out of the
+/// registry while it stops runtimes and deletes worktrees. The message is
+/// the whole body a client is shown, `repository busy: <main checkout>` or
+/// `folder busy: <folder>`. The session comes back if the removal fails.
+#[derive(Debug)]
+pub struct SessionBusy(pub String);
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionBusy {}
 
 /// `GET /sessions/{id}/screen` payload.
 #[derive(Serialize)]
@@ -4101,7 +4877,6 @@ mod tests {
     use super::*;
     use baude_core::lifecycle::LifecycleOutcome;
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// The plain admission router over values, with no process: each of the
@@ -4282,8 +5057,6 @@ mod tests {
             })
     }
 
-    static NEXT_MANAGER_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
     /// A literal fixture config: no file is read, no environment variable is
     /// consulted, and the workspace/backend choice is written down in the
     /// source of the test that made it (D-06).
@@ -4313,8 +5086,10 @@ mod tests {
         /// call site. Tying the redirect's lifetime to the fixture's is the
         /// whole reason the guard is RAII (D-01).
         _redirect: baude_core::testing::TestRedirect,
-        root: PathBuf,
         workspace: baude_core::workspace::Workspace,
+        /// Declared last, so the directory is removed after both redirects are
+        /// restored, also when the test panicked.
+        root: baude_core::testing::FixtureRoot,
     }
 
     impl ManagerFixture {
@@ -4328,11 +5103,7 @@ mod tests {
         #[must_use = "the fixture owns this case's root, redirects and identity; bind it to a \
                       named local that outlives every Manager, session and PTY it isolates"]
         fn with_workspace_name(label: &str, workspace_name: &str) -> Self {
-            let sequence = NEXT_MANAGER_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("bauded-{label}-{}-{sequence}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("create unique manager fixture root");
+            let root = baude_core::testing::FixtureRoot::new(&format!("bauded-{label}"));
             let config = fixture_config(workspace_name);
             // Acquisition order is root FIRST, identity SECOND, so the identity
             // is resolved with this fixture's roots already installed.
@@ -4362,14 +5133,6 @@ mod tests {
             let path = self.root.join(relative);
             std::fs::create_dir_all(&path).expect("create manager fixture subdirectory");
             path
-        }
-    }
-
-    impl Drop for ManagerFixture {
-        fn drop(&mut self) {
-            // Swallowed like `GitFixture::drop`: a cleanup failure must not
-            // mask the assertion failure that is the reason the test matters.
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -4574,6 +5337,7 @@ mod tests {
         // macOS canonicalizes /tmp to /private/tmp
         assert!(m.info(info.id).unwrap().cwd.ends_with("/tmp"));
         assert!(m.info(99).is_none());
+        let _reapers = m.runtime_reapers_for_test();
         m.remove(info.id).unwrap();
         assert!(m.list().is_empty());
         assert!(m.remove(info.id).is_err());
@@ -4843,6 +5607,7 @@ mod tests {
         assert_eq!(manager.repository_state.checkouts.len(), 1);
         assert_eq!(manager.runtime_checkouts.len(), 1);
 
+        let _reapers = manager.runtime_reapers_for_test();
         manager
             .session_mut(runtime)
             .unwrap()
@@ -4868,7 +5633,7 @@ mod tests {
         ));
         assert_eq!(manager.repository_state.checkouts.len(), 2);
         assert_eq!(manager.runtime_checkouts.len(), 2);
-        manager.kill_all();
+        manager.kill_all_and_reap_for_test();
         let linked: Vec<_> = manager
             .repository_state
             .checkouts
@@ -5002,7 +5767,7 @@ mod tests {
         assert_eq!(recovered.health(), &CheckoutHealth::Available);
         assert!(restarted.runtime_checkouts.contains_key(&recovered.key));
 
-        restarted.kill_all();
+        restarted.kill_all_and_reap_for_test();
         git(
             &repo,
             &[
@@ -5113,6 +5878,7 @@ mod tests {
             assert!(pid_is_live(original_shell_pid));
             manager.persist_at_for_test(&root, workspace, Some(failure));
 
+            let _reapers = manager.runtime_reapers_for_test();
             let close_error = manager.remove(id).unwrap_err().to_string();
             assert_eq!(manager.repository_state.repositories.len(), 1);
             assert_eq!(manager.repository_state.checkouts.len(), 1);
@@ -5164,7 +5930,7 @@ mod tests {
                         .pid()
                         .unwrap()
                 ));
-                manager.kill_all();
+                manager.kill_all_and_reap_for_test();
             }
         }
     }
@@ -5196,6 +5962,7 @@ mod tests {
             .fail_next_teardown_for_test("shell stop refused once");
         let before = manager.repository_state.clone();
 
+        let _reapers = manager.runtime_reapers_for_test();
         let partial = manager.remove(id).unwrap_err().to_string();
         assert!(partial.contains("shell stopped: false"), "got: {partial}");
         assert!(manager.session(id).unwrap().claude.is_exited());
@@ -5286,6 +6053,7 @@ mod tests {
             .unwrap();
         let resume_id = "resume-daemon-early";
         manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
         let transcript_cwd = manager.repository_state.checkouts[0]
             .observed_path
@@ -5319,6 +6087,193 @@ mod tests {
         assert!(!manager.runtime_checkouts.contains_key(&checkout));
     }
 
+    /// The poll's early-resume reconcile goes through `Manager::remove`,
+    /// which refuses a session whose repository a removal holds. Since
+    /// 22.1-10 a removal holds that reservation with the manager lock free,
+    /// so the poll can meet it. The poll must then neither panic nor drop
+    /// the session, and the next tick after the hold ends reconciles it.
+    #[test]
+    fn poll_defers_an_early_resume_reconcile_while_its_repository_is_busy() {
+        let fixture = persistence_fixture("early-targeted-resume-busy");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(
+                repo.to_str().unwrap(),
+                None,
+                Some("early resume while busy"),
+            )
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        let resume_id = "resume-daemon-early-busy";
+        manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
+        manager.remove(runtime).unwrap();
+        let transcript_cwd = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = match manager.reopen_checkout(checkout).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let _reopened_reapers = manager.runtime_reapers_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let repository = manager.repository_state.checkouts[0].repository_key;
+
+        let hold = manager.reserve_repository_for_test(repository);
+        manager.poll();
+        assert!(
+            manager.session(reopened).is_ok(),
+            "22.1-10 poll pin: the poll dropped a session whose repository was busy"
+        );
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "22.1-10 poll pin: the poll reconciled a row of a busy repository"
+        );
+
+        drop(hold);
+        assert!(
+            manager
+                .session_mut(reopened)
+                .unwrap()
+                .early_targeted_resume_exit(),
+            "the early-exit window closed before the next tick; the retry cannot be observed"
+        );
+        manager.poll();
+        assert!(
+            !manager.runtime_checkouts.contains_key(&checkout),
+            "22.1-10 poll pin: the next tick after the hold ended did not reconcile the row"
+        );
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.checkouts[0].session.resume_id, None);
+    }
+
+    /// WR-03: a removal's slow stage can hold the repository for longer than
+    /// the early-exit window. The reconcile the poll deferred while it was
+    /// busy is then kept pending, and the first tick after the hold ends runs
+    /// it, although the window that first flagged the exit has closed.
+    #[test]
+    fn poll_runs_a_deferred_early_resume_reconcile_after_the_window_closed() {
+        let fixture = persistence_fixture("early-targeted-resume-long-hold");
+        let root = fixture.root().to_path_buf();
+        let workspace = fixture.workspace();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "file"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut manager = Manager::new("sh -c 'sleep 30'".into(), true);
+        manager.persist_at_for_test(&root, workspace, None);
+        let runtime = manager
+            .create(repo.to_str().unwrap(), None, Some("early resume long hold"))
+            .unwrap()
+            .id;
+        let checkout = manager
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, id)| (*id == runtime).then_some(*key))
+            .unwrap();
+        let resume_id = "resume-daemon-early-long-hold";
+        manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
+        manager.remove(runtime).unwrap();
+        let transcript_cwd = manager.repository_state.checkouts[0]
+            .observed_path
+            .to_path_buf();
+        let transcript = baude_core::meta::transcript_file(&transcript_cwd, resume_id);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+        manager.claude_cmd = "sh -c 'exit 1'".into();
+        let reopened = match manager.reopen_checkout(checkout).unwrap() {
+            LifecycleOutcome::Reopened { runtime, .. } => runtime,
+            other => panic!("unexpected reopen outcome: {other:?}"),
+        };
+        let _reopened_reapers = manager.runtime_reapers_for_test();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.session(reopened).unwrap().claude.is_exited() {
+            assert!(Instant::now() < deadline, "resumed child never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let repository = manager.repository_state.checkouts[0].repository_key;
+
+        let hold = manager.reserve_repository_for_test(repository);
+        manager.poll();
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "the poll reconciled a row of a busy repository"
+        );
+        // Hold the repository past the early-exit window, ticking as the
+        // daemon's poll thread does.
+        let deadline = Instant::now()
+            + Duration::from_millis(baude_core::session::EARLY_RESUME_ID_EXIT_WINDOW_MS)
+            + Duration::from_secs(5);
+        while manager
+            .session_mut(reopened)
+            .unwrap()
+            .early_targeted_resume_exit()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the early-exit window never closed"
+            );
+            manager.poll();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        manager.poll();
+        assert_eq!(
+            manager.runtime_checkouts.get(&checkout),
+            Some(&reopened),
+            "the poll reconciled a row of a busy repository after the window"
+        );
+
+        drop(hold);
+        manager.poll();
+        assert!(
+            !manager.runtime_checkouts.contains_key(&checkout),
+            "WR-03 pin: the reconcile deferred while the repository was busy was lost once the \
+             hold outlasted the early-exit window"
+        );
+        assert!(manager.session(reopened).is_err());
+        let persisted = persisted_at(&root, workspace);
+        assert_eq!(persisted.checkouts[0].session.resume_id, None);
+        assert_eq!(
+            baude_core::lifecycle::lifecycle_capability(persisted.checkouts[0].lifecycle()),
+            Some(baude_core::lifecycle::LifecycleCapability::RetryReopen)
+        );
+    }
+
     /// The folder counterpart of the test above: the same command double and
     /// the same polling entry, with a plain folder admitted through `create`
     /// in place of the repository. The row is kept, closed, with no resume id.
@@ -5344,6 +6299,7 @@ mod tests {
             .expect("a plain folder is admitted as a standalone row");
         let resume_id = "resume-daemon-early-folder";
         manager.session_id_for_test(runtime, resume_id);
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
         let closed = persisted_at(&root, workspace);
         assert_eq!(
@@ -5406,6 +6362,7 @@ mod tests {
             .find_map(|(key, id)| (*id == runtime).then_some(*key))
             .unwrap();
         manager.session_id_for_test(runtime, "opaque-daemon-target");
+        let _reapers = manager.runtime_reapers_for_test();
         manager.remove(runtime).unwrap();
 
         let outcome = manager.reopen_checkout(checkout).unwrap();
@@ -5427,6 +6384,7 @@ mod tests {
         );
         assert_eq!(manager.runtime_checkouts.len(), 1);
 
+        let _reopened_reapers = manager.runtime_reapers_for_test();
         manager.remove(reopened_runtime).unwrap();
         manager.persist_at_for_test(&root, workspace, Some(persist::AtomicFailure::Rename));
         assert!(manager.reopen_checkout(checkout).is_err());
@@ -5481,6 +6439,7 @@ mod tests {
         std::fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
 
         manager.persist_at_for_test(&state_root, workspace, Some(persist::AtomicFailure::Rename));
+        let _reapers = manager.runtime_reapers_for_test();
         let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
         let error = manager
             .confirm_remove_worktree(confirmation)
@@ -5565,6 +6524,7 @@ mod tests {
                     .unwrap()
                     .fail_next_teardown_for_test("shell stop refused once");
             }
+            let _reapers = manager.runtime_reapers_for_test();
             let confirmation = manager.prepare_remove_worktree(checkout).unwrap();
 
             let error = manager
@@ -5617,7 +6577,7 @@ mod tests {
                 persisted_at(&root, workspace).checkouts[0].session.archived,
                 committed
             );
-            manager.kill_all();
+            manager.kill_all_and_reap_for_test();
         }
     }
 
@@ -5638,7 +6598,7 @@ mod tests {
         );
         // Unknown id → Err (→ 404 upstream).
         assert!(m.event_path(9999).is_err());
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5681,7 +6641,7 @@ mod tests {
         assert!(m.activity(9999, 10).is_err());
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5692,7 +6652,7 @@ mod tests {
         let b = m.create("/tmp", None, None).unwrap();
         assert_eq!(a.name, "tmp");
         assert_eq!(b.name, "tmp (2)");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5704,7 +6664,7 @@ mod tests {
         // refuse rather than write into a not-yet-listening PTY.
         let err = m.post_message(id, "hello").unwrap_err().to_string();
         assert!(err.contains("starting"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5730,7 +6690,7 @@ mod tests {
             assert!(Instant::now() < deadline, "screen never showed output");
             std::thread::sleep(Duration::from_millis(300));
         }
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5740,7 +6700,7 @@ mod tests {
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.restart(id).unwrap_err().to_string();
         assert!(err.contains("still running"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5753,8 +6713,9 @@ mod tests {
             assert!(Instant::now() < deadline, "stub never exited");
             std::thread::sleep(Duration::from_millis(100));
         }
+        let _reapers = m.runtime_reapers_for_test();
         m.restart(id).unwrap();
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5768,7 +6729,7 @@ mod tests {
         m.set_archived(id, false).unwrap();
         assert!(!m.info(id).unwrap().archived);
         assert!(m.set_archived(99, true).is_err());
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     fn proc_state(pid: u32) -> String {
@@ -5839,7 +6800,7 @@ mod tests {
             |st| !st.is_empty() && !st.starts_with('T'),
             "running again",
         );
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5858,7 +6819,7 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(100));
         assert!(!proc_state(pid).starts_with('T'), "keep never SIGSTOPs");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5879,7 +6840,7 @@ mod tests {
         assert!(info.archived, "long-waiting session should auto-archive");
         assert!(info.suspended, "auto-archive applies policy=suspend");
         wait_for_state(pid, |st| st.starts_with('T'), "stopped");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5892,7 +6853,7 @@ mod tests {
         s.archived = true;
         s.suspend_idle_child().expect("suspend");
         assert!(m.info(id).unwrap().suspended);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5914,7 +6875,7 @@ mod tests {
         let s = m.sessions.iter_mut().find(|s| s.id == id).unwrap();
         assert!(!s.auto_archive_tick(idle), "tick undid a manual unarchive");
         assert!(!m.info(id).unwrap().archived);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5956,7 +6917,7 @@ mod tests {
         assert!(lines[1].contains("Stop"));
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -5972,7 +6933,7 @@ mod tests {
         let id = m.create("/tmp", None, None).unwrap().id;
         let err = m.ingest_event(id, "{}").unwrap_err().to_string();
         assert!(err.contains("session_id"), "got: {err}");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6007,7 +6968,7 @@ mod tests {
         assert!(contents.contains(&sid));
 
         let _ = std::fs::remove_file(&path);
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6027,7 +6988,7 @@ mod tests {
             .meta
             .last_tool = Some(("Bash".to_string(), 1));
         assert_eq!(m.info(id).unwrap().last_tool.as_deref(), Some("Bash"));
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6054,7 +7015,7 @@ mod tests {
             m.info(id).unwrap().waiting_reason.as_deref(),
             Some("permission")
         );
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6090,7 +7051,7 @@ mod tests {
         let p = m.pending(id).unwrap().expect("pending present");
         assert_eq!(p.request_id, "r1");
         assert_eq!(p.tool, "Bash");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6116,7 +7077,7 @@ mod tests {
         // The decision is readable by a waiter (the bridge's poll).
         let d = m.decision(id).unwrap().expect("decision recorded");
         assert_eq!(d.decision, "allow");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6127,7 +7088,7 @@ mod tests {
         m.set_pending(id, pending("r2", "Write")).unwrap();
         m.resolve_pending(id, "deny").unwrap();
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "deny");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6143,7 +7104,7 @@ mod tests {
         m.set_pending(id, pending("r2", "Edit")).unwrap();
         assert!(m.decision(id).unwrap().is_none());
         assert_eq!(m.pending(id).unwrap().unwrap().request_id, "r2");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6202,7 +7163,7 @@ mod tests {
                 .expect("resolve must wake the waiter");
         });
         assert_eq!(m.decision(id).unwrap().unwrap().decision, "allow");
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
     }
 
     #[test]
@@ -6242,7 +7203,7 @@ mod tests {
             Some("ForeignMarker")
         );
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
     }
 
@@ -6327,7 +7288,7 @@ mod tests {
             m.collisions[0].allocated_path.display()
         );
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
     }
 
@@ -6395,7 +7356,7 @@ mod tests {
         };
         let own_file = pane_pid.map(|p| claude.join("sessions").join(format!("{p}.json")));
 
-        m.kill_all();
+        m.kill_all_and_reap_for_test();
         drop(fixture);
 
         assert!(

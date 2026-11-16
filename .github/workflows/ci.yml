@@ -44,6 +44,10 @@ jobs:
       # is trusted to judge a suite run.
       - name: self-test the real-root observer
         run: bash scripts/assert-real-roots-untouched.sh --self-test
+      # The test leftover check proves itself the same way, against synthetic
+      # fixture entries and processes, before it judges the suite.
+      - name: self-test the test leftover check
+        run: bash scripts/assert-no-test-leftovers.sh --self-test
       # Bracket the suite (#72): the per-resolver guards each prove one
       # resolution is contained, but only this pair proves the aggregate claim
       # — that running the suite neither creates nor modifies the real config
@@ -56,7 +60,14 @@ jobs:
       # signature of cross-test process interference (PTY children spawned in
       # parallel with pid/pgid churn), not a lifecycle defect. Every assertion
       # stays intact; serial execution removes the interference channel.
-      - run: cargo test -- --test-threads=1
+      #
+      # The suite runs under the test leftover check, which fails the step on a
+      # runtime orphaned while the suite runs, a process still working in its
+      # TMPDIR at the end, or a fixture entry left behind. The TMPDIR comes from
+      # mktemp under the runner's own TMPDIR: that keeps macOS on the /var
+      # symlink the tests rely on and keeps both runners outside the checkout.
+      - name: run the suite and assert it leaves no runtime or fixture entry behind
+        run: bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- cargo test -- --test-threads=1
       # Runs even when the suite failed: a run that fails AND leaks is the case
       # most worth catching, and the two statuses are reported independently so
       # neither masks the other. Guarded on the snapshot having been taken, so

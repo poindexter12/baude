@@ -948,9 +948,7 @@ mod tests {
         // WR-06: the shared seed wrapper creates .claude/settings.local.json,
         // merges baude's hook entries, and is idempotent across re-runs (the
         // daemon re-seeds every persisted session on each restart).
-        let cwd = std::env::temp_dir().join(format!("baude-seed-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = crate::testing::FixtureRoot::new("baude-seed-test");
 
         let fresh_warnings = seed_settings(&cwd);
         assert!(
@@ -976,20 +974,14 @@ mod tests {
         );
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second, "re-seed must be idempotent");
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     // ---- seed guard (HREG-03) ------------------------------------------
 
     /// Unique per-test cwd fixture, same shape as
     /// `seed_settings_writes_idempotent_merge` (temp_dir + pid-suffixed).
-    fn seed_guard_cwd(tag: &str) -> std::path::PathBuf {
-        let cwd =
-            std::env::temp_dir().join(format!("baude-seed-guard-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        std::fs::create_dir_all(&cwd).unwrap();
-        cwd
+    fn seed_guard_cwd(tag: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-seed-guard-{tag}"))
     }
 
     #[test]
@@ -1021,8 +1013,6 @@ mod tests {
             b"{not json".to_vec(),
             "unparseable file must remain byte-identical"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -1046,8 +1036,6 @@ mod tests {
                 "missing seeded hook array for {ev}"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -1069,8 +1057,6 @@ mod tests {
             rendered.contains(&path.display().to_string()),
             "Display must contain the full settings path, got: {rendered}"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -1097,8 +1083,6 @@ mod tests {
             0,
             "the directory must still be empty — nothing written into it"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -1125,8 +1109,6 @@ mod tests {
             b"[1,2]".to_vec(),
             "non-object file must remain byte-identical"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[cfg(unix)]
@@ -1166,8 +1148,6 @@ mod tests {
             original.to_vec(),
             "original bytes must be intact after a failed write"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -1196,8 +1176,6 @@ mod tests {
             b"{not json".to_vec(),
             "refused file must stay byte-identical across repeated attempts"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     // ---- POSIX-quoted seeded command (HREG-04, 09-03) --------------------
@@ -1385,7 +1363,5 @@ mod tests {
             "ran",
             "exactly the stub under the hostile path must have run"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 }

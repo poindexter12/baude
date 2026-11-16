@@ -74,21 +74,16 @@ mod tests {
     /// router is typed over `Shared`, so one has to exist.
     struct WebScope {
         /// Fields drop in declaration order, so the identity is restored while
-        /// its own root is still installed.
+        /// its own root is still installed, and the root directory is removed
+        /// only after both redirects are restored.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        _root: baude_core::testing::FixtureRoot,
     }
 
     /// `web::router` with a state, as `api::router` mounts it.
     fn app(label: &str) -> (WebScope, Router) {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "bauded-web-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = baude_core::testing::FixtureRoot::new(&format!("bauded-web-{label}"));
         let redirect = baude_core::testing::TestRedirect::new(&root);
         let identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -100,6 +95,7 @@ mod tests {
         let scope = WebScope {
             _identity: identity,
             _redirect: redirect,
+            _root: root,
         };
         let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
         (scope, super::router().with_state(state))
@@ -186,11 +182,11 @@ mod tests {
         // A new cache name is what makes an installed page drop the shell it
         // cached before the removal scripts existed.
         assert!(
-            worker.contains("\"baude-v7\""),
-            "cache name is not baude-v7"
+            worker.contains("\"baude-v8\""),
+            "cache name is not baude-v8"
         );
         assert!(
-            !worker.contains("baude-v6"),
+            !worker.contains("baude-v7"),
             "the old cache name is still served"
         );
 

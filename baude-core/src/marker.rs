@@ -351,19 +351,12 @@ pub fn clear_owned(dir: &Path, owner_common_dir: &[u8]) -> io::Result<MarkerClea
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[allow(dead_code)]
-    fn test_dir(name: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("baude-marker-test-{}-{}", name, n));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create test dir");
-        path
+    fn test_dir(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-marker-test-{name}"))
     }
 
     #[test]
@@ -424,7 +417,7 @@ mod tests {
             recorded_at_ms: 1000,
         };
 
-        let test_dir_path = test_dir.clone();
+        let test_dir_path = test_dir.to_path_buf();
         let barrier = Arc::new(Barrier::new(2));
 
         let thread1_barrier = barrier.clone();
@@ -502,7 +495,7 @@ mod tests {
             recorded_at_ms: 1000,
         };
 
-        let test_dir_path = test_dir.clone();
+        let test_dir_path = test_dir.to_path_buf();
         let barrier = Arc::new(Barrier::new(3));
 
         let mut threads = vec![];

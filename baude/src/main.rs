@@ -1538,25 +1538,18 @@ mod worktrees_cli_tests {
     };
     use baude_core::worktree_scan::{ScanReport, ScanRoots, REPORT_FORMAT_VERSION};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
     /// A synthetic pair of scan roots plus a report directory that lies outside
     /// both of them, so saving a report can never be mistaken for a write into
     /// a root the read-only contract asserts is unchanged.
     struct CliFixture {
-        root: PathBuf,
+        root: baude_core::testing::FixtureRoot,
     }
 
     impl CliFixture {
         fn new(label: &str) -> Self {
-            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "baude-worktrees-cli-{label}-{}-{sequence}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root =
+                baude_core::testing::FixtureRoot::new(&format!("baude-worktrees-cli-{label}"));
             std::fs::create_dir_all(root.join("worktrees")).expect("create fixture worktrees base");
             std::fs::create_dir_all(root.join("config")).expect("create fixture config dir");
             std::fs::create_dir_all(root.join("reports")).expect("create fixture report dir");
@@ -1651,12 +1644,6 @@ mod worktrees_cli_tests {
             listing(&self.base(), "worktrees/", &mut entries);
             listing(&self.config(), "config/", &mut entries);
             entries
-        }
-    }
-
-    impl Drop for CliFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -2453,11 +2440,10 @@ mod keyboard_negotiation_tests {
     fn dirty_flag_set_on_input() {
         // Test: after input event, app.dirty == true.
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-dirty");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-dirty");
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.dirty = false;
         let event = Event::Key(KeyEvent {
             code: KeyCode::Char('a'),
@@ -2473,11 +2459,10 @@ mod keyboard_negotiation_tests {
     fn dirty_flag_set_on_resize() {
         // Test: after sync_sizes with new area, app.dirty == true.
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-resize");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-resize");
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.dirty = false;
         let new_area = Rect::new(0, 0, 100, 50);
         app.sync_sizes(new_area);
@@ -2490,11 +2475,10 @@ mod keyboard_negotiation_tests {
     fn dirty_flag_cleared_after_draw() {
         // Test: dirty flag is managed by run() loop, verify it exists and is bool
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-draw");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-draw");
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.dirty = true;
         assert!(app.dirty);
         app.dirty = false;
@@ -2506,8 +2490,7 @@ mod keyboard_negotiation_tests {
         // Drive the real loop body: the first step draws the empty frame and
         // releases restore; after one settle step an idle app never draws.
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join(format!("baude-test-idle-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-idle");
         let _redirect = TestRedirect::new(&tmp);
         let _identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -2516,7 +2499,14 @@ mod keyboard_negotiation_tests {
             },
             None,
         );
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
+        // A command double, so the launch-dir runtime restore starts is the
+        // same on every machine rather than whatever `claude` resolves to
+        // here. It ignores HUP, as a real agent's children may, so its job
+        // outlives a plain kill of the PTY leader and only the reaping
+        // cleanup below leaves nothing behind. It accepts every appended
+        // argument as a positional parameter.
+        app.set_agent_cmd_for_test("sh -c 'trap \"\" HUP; sleep 30; true'");
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let (mut started, mut finished) = (false, false);
@@ -2547,8 +2537,14 @@ mod keyboard_negotiation_tests {
         }
         // Truly idle: no sessions (so no status timers or child output) and no
         // transient message left to expire. Settle the selection change, then
-        // measure.
-        app.kill_all();
+        // measure. The sessions the runtimes lead are recorded first, so the
+        // end of the test can check that nothing in them outlived the kill.
+        let led = sessions_led_by_runtimes(&app);
+        assert!(
+            !led.is_empty(),
+            "restore started no runtime, so the cleanup below would check nothing"
+        );
+        crate::app::kill_all_and_reap(&mut app);
         app.sessions.clear();
         app.message = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2581,6 +2577,52 @@ mod keyboard_negotiation_tests {
             app.sessions.len()
         );
         assert!(!app.dirty, "nothing may leave dirty set while idle");
+        let survivors = live_in_sessions(&led);
+        assert!(
+            survivors.is_empty(),
+            "a process of a runtime this test started outlived the test: {survivors:?} \
+             in the sessions its runtimes led, {led:?}"
+        );
+    }
+
+    /// The sessions the agent and shell runtimes of `app` lead. A PTY child
+    /// calls setsid, so its pid is its session id; an identity that does not
+    /// lead its session names one this test did not create, and is left out.
+    fn sessions_led_by_runtimes(app: &App) -> Vec<i32> {
+        app.sessions
+            .iter()
+            .flat_map(|session| {
+                std::iter::once(session.claude.process_identity())
+                    .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+            })
+            .filter(|identity| identity.session == identity.pid as i32)
+            .map(|identity| identity.session)
+            .collect()
+    }
+
+    /// Live processes, zombies left out, whose session is one of `sessions`,
+    /// as `(pid, session)`.
+    fn live_in_sessions(sessions: &[i32]) -> Vec<(i32, i32)> {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,stat="])
+            .output()
+            .expect("ps");
+        // SAFETY: getpid only reads this process's own id.
+        let me = unsafe { libc::getpid() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid: i32 = fields.next()?.parse().ok()?;
+                let stat = fields.next().unwrap_or("");
+                if pid <= 1 || pid == me || stat.starts_with('Z') {
+                    return None;
+                }
+                // SAFETY: getsid only reads the process table.
+                let session = unsafe { libc::getsid(pid) };
+                sessions.contains(&session).then_some((pid, session))
+            })
+            .collect()
     }
 
     #[test]
@@ -2732,9 +2774,7 @@ mod keyboard_negotiation_tests {
         // happened two seconds in" — misleading in exactly the report that
         // exists to diagnose slow startup.
         use baude_core::testing::TestRedirect;
-        let tmp =
-            std::env::temp_dir().join(format!("baude-test-timing-units-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-timing-units");
         let _redirect = TestRedirect::new(&tmp);
         let _identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -2743,7 +2783,7 @@ mod keyboard_negotiation_tests {
             },
             None,
         );
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let mut timing = StartupTiming {
@@ -2795,9 +2835,7 @@ mod keyboard_negotiation_tests {
         // The loop recorder sees first_frame, then session_restore (with the
         // restored count), then first_metadata_poll — in that order.
         use baude_core::testing::TestRedirect;
-        let tmp =
-            std::env::temp_dir().join(format!("baude-test-timing-order-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-timing-order");
         let _redirect = TestRedirect::new(&tmp);
         let _identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -2806,7 +2844,7 @@ mod keyboard_negotiation_tests {
             },
             None,
         );
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
             .expect("test terminal");
         let mut timing = StartupTiming {

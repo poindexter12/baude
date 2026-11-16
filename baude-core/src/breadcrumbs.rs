@@ -320,12 +320,8 @@ mod tests {
     }
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
-    fn scratch(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("baude-breadcrumbs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-breadcrumbs-{name}"))
     }
 
     fn state_with(checkout: &str, standalone: &str) -> RepositoryState {
@@ -391,7 +387,7 @@ mod tests {
 
         // Another folder's entry, written first.
         let mut other = FolderContext::load(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &ws,
             Path::new("/tmp/crumb/other-folder"),
             10,
@@ -400,7 +396,7 @@ mod tests {
         other.flush(&state, 10);
 
         let mut mine = FolderContext::load(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &ws,
             Path::new("/tmp/crumb/my-folder"),
             20,
@@ -416,7 +412,7 @@ mod tests {
         assert_eq!(on_disk.schema_version, SCHEMA_VERSION);
         assert_eq!(on_disk.folders.len(), 2);
         let mine_reloaded = FolderContext::load(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &ws,
             Path::new("/tmp/crumb/my-folder"),
             30,
@@ -434,7 +430,7 @@ mod tests {
             })
         );
         let other_reloaded = FolderContext::load(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &ws,
             Path::new("/tmp/crumb/other-folder"),
             30,
@@ -449,8 +445,12 @@ mod tests {
         let dir = scratch("corrupt");
         let ws = workspace();
         std::fs::write(dir.join(ws.state_file(FILE_BASE)), b"{not json").unwrap();
-        let mut context =
-            FolderContext::load(Some(dir.clone()), &ws, Path::new("/tmp/crumb/folder"), 5);
+        let mut context = FolderContext::load(
+            Some(dir.to_path_buf()),
+            &ws,
+            Path::new("/tmp/crumb/folder"),
+            5,
+        );
         assert!(context.is_unpopulated());
         assert!(context.take_load_note().is_some());
         assert!(context.take_load_note().is_none());
@@ -469,8 +469,12 @@ mod tests {
         let dir = scratch("prune");
         let ws = workspace();
         let state = state_with("/tmp/crumb/repo", "/tmp/crumb/notes");
-        let mut context =
-            FolderContext::load(Some(dir.clone()), &ws, Path::new("/tmp/crumb/folder"), 0);
+        let mut context = FolderContext::load(
+            Some(dir.to_path_buf()),
+            &ws,
+            Path::new("/tmp/crumb/folder"),
+            0,
+        );
         context.record_checkout(&path("/tmp/crumb/repo"), 1);
         context.record_checkout(&path("/tmp/crumb/removed-worktree"), 2);
         context.record_standalone(&path("/tmp/crumb/gone"), 3);
@@ -481,7 +485,7 @@ mod tests {
 
         context.maybe_flush(&state, 3_000);
         let reloaded = FolderContext::load(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &ws,
             Path::new("/tmp/crumb/folder"),
             4_000,
@@ -580,7 +584,8 @@ mod tests {
 
     #[test]
     fn flush_drops_crumb_of_removed_path() {
-        let root = std::fs::canonicalize(scratch("removed-path")).unwrap();
+        let fixture_root = scratch("removed-path");
+        let root = std::fs::canonicalize(&fixture_root).unwrap();
         // Redirect first, identity second: locals drop in reverse order, so
         // the identity is restored before the root it was resolved against.
         let _redirect = crate::testing::TestRedirect::new(&root);

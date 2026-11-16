@@ -366,8 +366,7 @@ mod tests {
 
     #[test]
     fn queue_replay() {
-        let dir = std::env::temp_dir().join(format!("bauded-q-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = baude_core::testing::FixtureRoot::new("bauded-q");
         let path = dir.join("q.jsonl");
         std::fs::write(
             &path,
@@ -384,13 +383,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(queued(&path), vec!["two", "three"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn tail_consumes_only_complete_lines() {
-        let dir = std::env::temp_dir().join(format!("bauded-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = baude_core::testing::FixtureRoot::new("bauded-test");
         let path = dir.join("t.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
@@ -412,14 +409,11 @@ mod tests {
         let second = tail.read_new(&path);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].uuid, "u2");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn event_tail_yields_hook_events_skips_malformed_and_advances() {
-        let dir = std::env::temp_dir().join(format!("bauded-evtail-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = baude_core::testing::FixtureRoot::new("bauded-evtail-test");
         let path = dir.join("activity.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         // Mixed well-formed events + one malformed line + one event-less line.
@@ -459,15 +453,11 @@ mod tests {
         let third = tail.read_new(&path);
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].ts, 9);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn event_tail_end_of_skips_history() {
-        let dir =
-            std::env::temp_dir().join(format!("bauded-evtail-endof-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = baude_core::testing::FixtureRoot::new("bauded-evtail-endof-test");
         let path = dir.join("activity.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"event":"UserPromptSubmit","ts":1}}"#).unwrap();
@@ -482,7 +472,5 @@ mod tests {
         let new = tail.read_new(&path);
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].event, "Stop");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

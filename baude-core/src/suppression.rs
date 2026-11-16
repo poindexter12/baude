@@ -88,6 +88,24 @@ pub fn is_suppressed(root: &Path, path: &Path) -> bool {
     current(root).entries.contains_key(&folder_key(path))
 }
 
+/// The path an explicit admission of `admitted` lifts: the checkout root git
+/// reports for it, else its canonical path, else the path as given. The TUI
+/// and the daemon both lift this key, so opening a folder lifts the same
+/// entry in either client, also when the folder is a subfolder of a
+/// checkout. For a linked worktree the root is the worktree itself, never
+/// the main worktree, so admitting one never lifts a sibling's entry.
+///
+/// Residual, by design: a daemon row stored on a subfolder of a checkout
+/// writes its entry on that subfolder when it is removed, and `lift_key` of
+/// the subfolder names the checkout root, so that entry is never lifted. It
+/// is never read either: the TUI sweep consults only the worktree roots git
+/// lists, and the daemon consults no entry.
+pub fn lift_key(admitted: &Path) -> PathBuf {
+    crate::git::repo_root(admitted)
+        .or_else(|| admitted.canonicalize().ok())
+        .unwrap_or_else(|| admitted.to_path_buf())
+}
+
 /// Forget the entry for exactly `path`. Returns `Ok(true)` when an entry was
 /// removed and `Ok(false)` without writing when the key or the file is
 /// absent, so an untouched file stays byte-identical and an absent file
@@ -185,24 +203,22 @@ mod tests {
     const WORKSPACE: &str = "suppression-ws";
 
     /// Fresh scratch dir per test, following the repo's temp-dir convention.
-    fn scratch(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("baude-suppression-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn scratch(name: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-suppression-{name}"))
     }
 
     /// Redirect every fixture path and pin a workspace identity so
-    /// `workspace::active()` resolves under test.
-    fn identity(name: &str) -> (TestRedirect, TestRedirect) {
-        let redirect = TestRedirect::new(scratch(&format!("{name}-root")));
+    /// `workspace::active()` resolves under test. The redirect's root is the
+    /// last element, so it drops after both guards.
+    fn identity(name: &str) -> (TestRedirect, TestRedirect, crate::testing::FixtureRoot) {
+        let root = scratch(&format!("{name}-root"));
+        let redirect = TestRedirect::new(&root);
         let config = Config {
             workspace: Some(WORKSPACE.to_string()),
             ..Config::default()
         };
         let ws = crate::workspace::override_for_test(&config, None);
-        (redirect, ws)
+        (redirect, ws, root)
     }
 
     /// A real folder under `base` so `folder_key` canonicalizes it the way a
@@ -489,6 +505,83 @@ mod tests {
         );
     }
 
+    /// The worktree path `git worktree list --porcelain`, run in `checkout`,
+    /// prints for `checkout` itself. Exactly one listed worktree names it.
+    fn porcelain_path(checkout: &Path) -> PathBuf {
+        let listed = crate::testing::git_in(checkout, &["worktree", "list", "--porcelain"]);
+        let matching: Vec<PathBuf> = listed
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .filter(|path| folder_key(path) == folder_key(checkout))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "git lists {} exactly once: {listed}",
+            checkout.display()
+        );
+        matching[0].clone()
+    }
+
+    /// T-22.1-22: the lift key of every row kind, and of a subfolder of
+    /// each, is the worktree git lists for that checkout: never the main
+    /// worktree for a linked one, never a parent. A folder git does not know
+    /// keys on its own canonical path.
+    #[test]
+    fn lift_key_names_the_checkout_root_for_every_row_kind() {
+        let guards = identity("lift-key");
+        let root: &Path = &guards.2;
+
+        let topology = crate::testing::cloned_topology(root);
+        let init = folder(root, "init");
+        crate::testing::git_in(&init, &["init", "-q", "-b", "main"]);
+        crate::testing::git_in(&init, &["config", "user.email", "test@example.com"]);
+        crate::testing::git_in(&init, &["config", "user.name", "Test"]);
+        std::fs::write(init.join("tracked"), b"one\n").unwrap();
+        crate::testing::git_in(&init, &["add", "tracked"]);
+        crate::testing::git_in(&init, &["commit", "-q", "-m", "initial"]);
+        let by_hand = root.join("by-hand");
+        crate::testing::git_in(
+            &init,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "by-hand",
+                by_hand.to_str().unwrap(),
+            ],
+        );
+
+        let kinds: [(&str, &Path); 5] = [
+            ("clone main checkout", &topology.clone),
+            ("managed default worktree", &topology.default_worktree),
+            ("managed branch worktree", &topology.managed_worktree),
+            ("git-init main checkout", &init),
+            ("hand-made linked worktree", &by_hand),
+        ];
+        for (kind, checkout) in kinds {
+            let listed = porcelain_path(checkout);
+            assert_eq!(
+                folder_key(&lift_key(checkout)),
+                folder_key(&listed),
+                "{kind} {}",
+                checkout.display()
+            );
+            let sub = folder(checkout, "sub");
+            assert_eq!(
+                folder_key(&lift_key(&sub)),
+                folder_key(&listed),
+                "subfolder {} of the {kind}",
+                sub.display()
+            );
+        }
+
+        let plain = folder(root, "plain");
+        assert_eq!(lift_key(&plain), plain.canonicalize().unwrap());
+    }
+
     #[test]
     fn file_is_named_per_workspace_beside_breadcrumbs() {
         let _guards = identity("naming");
@@ -502,6 +595,6 @@ mod tests {
         let workspace = crate::workspace::active();
         assert_eq!(name, workspace.state_file(FILE_BASE));
         assert_ne!(name, workspace.state_file(crate::breadcrumbs::FILE_BASE));
-        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(path.parent(), Some(dir.path()));
     }
 }

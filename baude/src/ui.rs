@@ -2917,13 +2917,15 @@ mod tests {
     /// to a NAMED local that outlives the App's final render — returning only
     /// the App would compile and leave the whole case unredirected.
     struct UiFixture {
-        root: std::path::PathBuf,
         /// Struct fields drop in DECLARATION order, the reverse of locals, so
         /// the identity is declared first and therefore restored while its own
         /// root is still installed — mirroring the acquisition order below
         /// (root first, identity second).
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        /// Declared last so it drops last: the tree is removed only after
+        /// both guards above have been restored.
+        root: baude_core::testing::FixtureRoot,
     }
 
     impl UiFixture {
@@ -2939,13 +2941,7 @@ mod tests {
         #[must_use = "the returned UiFixture owns this case's root and identity; bind it to a \
                       named local that outlives the App's final render"]
         fn with_config(label: &str, workspace: &str, auto_archive_minutes: Option<u64>) -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "baude-ui-{label}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root = baude_core::testing::FixtureRoot::new(&format!("baude-ui-{label}"));
             std::fs::create_dir_all(root.join("config")).unwrap();
             if let Some(minutes) = auto_archive_minutes {
                 std::fs::write(
@@ -2963,9 +2959,9 @@ mod tests {
                 None,
             );
             Self {
-                root,
                 _identity: identity,
                 _redirect: redirect,
+                root,
             }
         }
 

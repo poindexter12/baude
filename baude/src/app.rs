@@ -2498,14 +2498,15 @@ impl App {
         Ok(())
     }
 
-    /// Forget the suppression entry for the repository root of `path`, if any,
+    /// Forget the suppression entry for the checkout root of `path`, if any,
     /// so an explicit admission of a removed checkout re-admits it. The key is
-    /// the admitted path's own `repo_root`, never the main worktree and never a
-    /// child, so admitting the parent root leaves a child's entry alone (D-12).
+    /// `suppression::lift_key`, the one the daemon lifts too: the admitted
+    /// path's own checkout root, never the main worktree and never a child, so
+    /// admitting the parent root leaves a child's entry alone (D-12).
     /// The store is advisory: a write failure is a message, never an error out
     /// of an admission or a launch (D-09).
     fn lift_suppression(&mut self, path: &Path) {
-        let key_path = git::repo_root(path).unwrap_or_else(|| path.to_path_buf());
+        let key_path = suppression::lift_key(path);
         if let Err(error) = suppression::lift(&persist::config_dir(), &key_path) {
             self.set_message(format!("suppression lift failed: {error}"));
         }
@@ -8364,11 +8365,51 @@ mod link_open {
     }
 }
 
+/// Stop every runtime `app` lists and reap what each one leaves behind.
+/// Test-only, shared by the app tests and the loop tests in `main.rs`.
+///
+/// `App::kill_all` signals each session's PTY leader. A command the
+/// interactive gate shell ran as a job sits in a process group of its own
+/// and can outlive that leader; what still names it is the session the
+/// leader created. So a reaper per agent and shell identity is built
+/// before `kill_all` and dropped after it, sweeping the recorded session.
+#[cfg(test)]
+pub(crate) fn kill_all_and_reap(app: &mut App) {
+    let reapers: Vec<_> = app.sessions.iter().flat_map(session_reapers).collect();
+    app.kill_all();
+    drop(reapers);
+}
+
+impl App {
+    /// Test-only: run `cmd` as the agent of every session this app starts
+    /// from now on, the way the app tests set `config.claude_cmd`.
+    #[cfg(test)]
+    pub(crate) fn set_agent_cmd_for_test(&mut self, cmd: &str) {
+        self.config.claude_cmd = Some(cmd.to_string());
+    }
+}
+
+/// Reapers for the agent and, when present, the shell `session` records.
+///
+/// Bind them before a test kills a session or its agent itself: once the
+/// App restarts or forgets that runtime, `kill_all_and_reap` no longer
+/// sees its identity, so these are what sweep its recorded session.
+#[cfg(test)]
+pub(crate) fn session_reapers(
+    session: &baude_core::session::Session,
+) -> Vec<baude_core::testing::RuntimeReaper> {
+    std::iter::once(session.claude.process_identity())
+        .chain(session.shell.as_ref().map(|shell| shell.process_identity()))
+        .map(baude_core::testing::RuntimeReaper::for_identity)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        active_restore_checkouts, checkout_for_runtime, local_admission_route,
-        require_same_checkout_path, App, Focus, LocalAdmissionRoute, Modal, RestoreSite, SelId,
+        active_restore_checkouts, checkout_for_runtime, kill_all_and_reap, local_admission_route,
+        require_same_checkout_path, session_reapers, App, Focus, LocalAdmissionRoute, Modal,
+        RestoreSite, SelId,
     };
     use crate::hierarchy::LocalRow;
     use baude_core::lifecycle::{
@@ -8720,15 +8761,7 @@ mod tests {
             return;
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "baude-worker-isolation-app-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-worker-isolation-app");
         for leaf in [
             "fixture",
             "markers",
@@ -8757,7 +8790,7 @@ mod tests {
         // the developer's data through a path this test does not name.
         command.env_clear();
         command.env(WORKER_ISOLATION_APP_CHILD, "1");
-        command.env("BAUDE_TEST_FIXTURE_ROOT", &root);
+        command.env("BAUDE_TEST_FIXTURE_ROOT", root.path());
         command.env("HOME", root.join("ambient").join("home"));
         command.env("XDG_CONFIG_HOME", root.join("ambient").join("config"));
         command.env("XDG_DATA_HOME", root.join("ambient").join("data"));
@@ -8773,9 +8806,6 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let ccusage_marker = markers.join("ccusage").exists();
         let date_marker = markers.join("date").exists();
-        if status.success() {
-            let _ = std::fs::remove_dir_all(&root);
-        }
         assert!(
             status.success(),
             "worker-isolation child failed ({status})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -8899,6 +8929,10 @@ mod tests {
         /// root that no longer exists.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        /// The owned root, declared last so it is removed only after both
+        /// guards above are restored. `None` when the root came from
+        /// `BAUDE_TEST_FIXTURE_ROOT`: the re-executing parent owns that one.
+        _owned_root: Option<baude_core::testing::FixtureRoot>,
     }
 
     impl AdmissionRepo {
@@ -8933,19 +8967,14 @@ mod tests {
         /// while its own root is still installed.
         _identity: baude_core::testing::TestRedirect,
         _redirect: baude_core::testing::TestRedirect,
+        /// Declared last so the tree is removed after both guards restored.
+        _root: baude_core::testing::FixtureRoot,
     }
 
     #[must_use = "the returned IsolationScope owns this case's root and identity guards; bind it \
                   to a named local that outlives every App it isolates"]
     fn isolation_scope(label: &str) -> IsolationScope {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "baude-isolation-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = baude_core::testing::FixtureRoot::new(&format!("baude-isolation-{label}"));
         let redirect = baude_core::testing::TestRedirect::new(&root);
         let identity = baude_core::workspace::override_for_test(
             &baude_core::persist::Config {
@@ -8957,18 +8986,25 @@ mod tests {
         IsolationScope {
             _identity: identity,
             _redirect: redirect,
+            _root: root,
         }
     }
 
     #[must_use = "the returned AdmissionRepo owns the redirect that contains this fixture; bind it \
                   to a named local that outlives the test body"]
     fn admission_repo(name: &str) -> AdmissionRepo {
-        let root = std::env::var_os("BAUDE_TEST_FIXTURE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("baude-admission-{name}-{}", std::process::id()))
-            });
-        let _ = std::fs::remove_dir_all(&root);
+        let (root, owned_root) = match std::env::var_os("BAUDE_TEST_FIXTURE_ROOT") {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                let _ = std::fs::remove_dir_all(&root);
+                (root, None)
+            }
+            None => {
+                let owned =
+                    baude_core::testing::FixtureRoot::new(&format!("baude-admission-{name}"));
+                (owned.to_path_buf(), Some(owned))
+            }
+        };
         // Managed worktrees are allocated under the data dir and the hook seed
         // is derived from the binary path, so one redirect pins both to the
         // fixture root before anything can create either. Without this the
@@ -9017,6 +9053,7 @@ mod tests {
             repo,
             _identity: identity,
             _redirect: redirect,
+            _owned_root: owned_root,
         }
     }
 
@@ -9766,13 +9803,9 @@ mod tests {
         );
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
-        let action_state_root = std::env::temp_dir().join(format!(
-            "baude-hierarchy-action-state-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&action_state_root);
-        std::fs::create_dir_all(&action_state_root).unwrap();
-        app.persistence_root_for_test = Some(action_state_root.clone());
+        let action_state_root =
+            baude_core::testing::FixtureRoot::new("baude-hierarchy-action-state");
+        app.persistence_root_for_test = Some(action_state_root.to_path_buf());
         app.install_hierarchy_state_for_test(state, HashMap::new());
 
         app.selected_id = Some(super::SelId::Repository(repository));
@@ -9879,9 +9912,8 @@ mod tests {
         app.handle_sidebar_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         assert!(!app.show_archived);
         assert_eq!(app.ordered_ids(), hidden_order);
-        std::fs::remove_dir_all(action_state_root).unwrap();
 
-        let (_fixture, mut app, repo, root, checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, _root, checkout, runtime, worktree_path) =
             removal_app("hierarchy-action-matrix", 180_000);
         let repository = app.repository_state.checkouts[0].repository_key;
         let baseline_state = app.repository_state.clone();
@@ -9990,8 +10022,9 @@ mod tests {
             app.repository_state.checkouts.len(),
             baseline_state.checkouts.len() + 1
         );
+        let _reap_killed = session_reapers(app.session(runtime).unwrap());
         app.session_mut(runtime).unwrap().kill();
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         std::fs::remove_dir_all(&collision).unwrap();
         git(
             &repo,
@@ -10003,7 +10036,6 @@ mod tests {
                 worktree_path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
         assert_eq!(checkout, baseline_state.checkouts[0].key);
     }
 
@@ -10245,7 +10277,7 @@ mod tests {
             Some("shell hidden at this terminal height — resize to 13+ rows; session input is paused")
         );
 
-        let (_fixture, mut app, repo, root, _checkout, runtime, worktree_path) =
+        let (_fixture, mut app, repo, _root, _checkout, runtime, worktree_path) =
             removal_app("tiny-resize", 185_000);
         app.sync_sizes(ratatui::layout::Rect::new(0, 0, 100, 30));
         let before = app
@@ -10294,6 +10326,7 @@ mod tests {
             "PTY minimum regressed: {visible:?}"
         );
 
+        let _reap_killed = session_reapers(app.session(runtime).unwrap());
         app.session_mut(runtime).unwrap().kill();
         git(
             &repo,
@@ -10305,7 +10338,6 @@ mod tests {
                 worktree_path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10380,7 +10412,6 @@ mod tests {
         assert_eq!(app.repository_state.checkouts.len(), 1);
         assert!(app.repository_state.checkouts[0].active_intent());
         assert_eq!(std::fs::read(&blocked_root).unwrap(), b"not a directory");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10419,7 +10450,6 @@ mod tests {
         assert!(restarted.repository_state.checkouts[0].active_intent());
         assert!(restarted.sessions.is_empty());
         assert!(restarted.runtime_checkouts.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10436,7 +10466,7 @@ mod tests {
         app.admit_repository(&repo)
             .unwrap()
             .expect("initial runtime");
-        app.kill_all();
+        kill_all_and_reap(&mut app);
 
         let mut restarted = App::new(repo.clone());
         restarted.remote = None;
@@ -10454,8 +10484,7 @@ mod tests {
         assert!(matches!(restarted.focus, super::Focus::Claude));
         assert!(restarted.message.is_none(), "got: {:?}", restarted.message);
         restarted.repository_state.validate().unwrap();
-        restarted.kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        kill_all_and_reap(&mut restarted);
     }
 
     #[test]
@@ -10524,8 +10553,7 @@ mod tests {
             .checkouts
             .iter()
             .any(|checkout| checkout.key == row_key));
-        app.kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// A pushed fixture with two linked branch worktrees beside the managed
@@ -10648,8 +10676,7 @@ mod tests {
         assert!(is_suppressed(&fx.suppressed), "the sweep never lifts");
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// READM-04, D-12 and D-13: `n` with the checkout's own path lifts the
@@ -10708,8 +10735,34 @@ mod tests {
         assert!(!checkout_row(&app, &fx.kept).unwrap().active_intent());
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
+    }
+
+    /// The TUI side of the shared lift key: admitting a subfolder of a
+    /// hand-made linked worktree lifts the entry for that worktree, as a
+    /// daemon admission of the same subfolder does, and leaves a sibling
+    /// worktree's entry alone.
+    #[test]
+    fn tui_subfolder_admission_lifts_the_checkout_entry() {
+        let fx = suppression_fixture("suppression-lift-subfolder");
+        seed_suppression(&fx.suppressed, &fx.common_dir);
+        seed_suppression(&fx.kept, &fx.common_dir);
+        let sub = fx.suppressed.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut app = suppression_app(&fx, fx.repo.clone());
+        app.admit_repository(&sub)
+            .expect("explicit admission of a subfolder of the suppressed worktree");
+
+        assert!(
+            !is_suppressed(&fx.suppressed),
+            "admitting {} left the entry for its checkout {}",
+            sub.display(),
+            fx.suppressed.display()
+        );
+        assert!(is_suppressed(&fx.kept), "a sibling entry stays");
+
+        kill_all_and_reap(&mut app);
     }
 
     /// The cloned shape plus two linked worktrees outside the managed root,
@@ -11029,9 +11082,8 @@ mod tests {
         );
         restarted.repository_state.validate().unwrap();
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
     }
 
     /// READM-04, D-13: relaunching inside the removed unmanaged checkout lifts
@@ -11086,9 +11138,8 @@ mod tests {
         assert_eq!(restarted.repository_state.repositories.len(), 1);
         restarted.repository_state.validate().unwrap();
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
     }
 
     fn worktree_list(repo: &Path) -> String {
@@ -11222,9 +11273,8 @@ mod tests {
             .map_err(|error| error.to_string());
         let message = last_message(&restarted).map(str::to_owned);
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert!(
             row_at_repo.is_none(),
@@ -11303,9 +11353,8 @@ mod tests {
             .map_err(|error| error.to_string());
         let message = last_message(&restarted).map(str::to_owned);
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(
             list_before, list_after,
@@ -11457,9 +11506,8 @@ mod tests {
         restarted.restore();
         let seen = primary_return(&restarted, &fx.repo, &common_dir);
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(primary_path, fx.repo, "the primary was the clone itself");
         assert!(entry_written, "removal wrote the entry");
@@ -11495,9 +11543,8 @@ mod tests {
         restarted.open_repo_session(fx.repo.clone());
         let seen = primary_return(&restarted, &fx.repo, &common_dir);
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(
             primaries_after_launch,
@@ -11540,9 +11587,8 @@ mod tests {
         restarted.open_repo_session_via(fx.repo.clone(), LocalAdmissionRoute::CloneCompletion);
         let seen = primary_return(&restarted, &fx.repo, &common_dir);
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(
             primaries_after_launch,
@@ -11624,10 +11670,9 @@ mod tests {
         let seen = primary_return(&returned, &primary_path, &common_dir);
         let message = last_message(&returned).map(str::to_owned);
 
-        returned.kill_all();
-        sibling.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut returned);
+        kill_all_and_reap(&mut sibling);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(managed, Some(true), "the primary was a worktree baude made");
         assert_ne!(
@@ -11719,10 +11764,9 @@ mod tests {
             .map_err(|error| error.to_string());
         let message = last_message(&returned).map(str::to_owned);
 
-        returned.kill_all();
-        sibling.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut returned);
+        kill_all_and_reap(&mut sibling);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(managed, Some(true), "the primary was a worktree baude made");
         assert!(folder_gone, "the removal deleted the managed worktree");
@@ -11808,9 +11852,8 @@ mod tests {
             .validate()
             .map_err(|error| error.to_string());
 
-        restarted.kill_all();
-        first.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut restarted);
+        kill_all_and_reap(&mut first);
 
         assert_eq!(
             fact_written,
@@ -11864,8 +11907,7 @@ mod tests {
         assert_eq!(app.repository_state.checkouts.len(), 2);
         assert_eq!(app.repository_state.repositories.len(), 1);
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-12, the other two routes: a relaunch inside the removed checkout
@@ -11883,7 +11925,7 @@ mod tests {
             .unwrap()
             .expect("initial runtime");
         assert!(checkout_row(&first, &fx.suppressed).is_none());
-        first.kill_all();
+        kill_all_and_reap(&mut first);
 
         // Relaunch from a subfolder inside the removed checkout, over the same
         // state file: the launch-dir admission in `restore` is the route.
@@ -11933,8 +11975,7 @@ mod tests {
         );
         relaunched.repository_state.validate().unwrap();
 
-        relaunched.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut relaunched);
     }
 
     /// D-09: the store is advisory. When the lift cannot write, the admission
@@ -11988,8 +12029,7 @@ mod tests {
         );
         app.repository_state.validate().unwrap();
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// SQ-5, end to end: the user runs `git switch` in their own primary
@@ -12067,8 +12107,7 @@ mod tests {
             .iter()
             .all(|checkout| checkout.health() == &CheckoutHealth::Available));
         app.repository_state.validate_for_save().unwrap();
-        app.kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -12128,8 +12167,7 @@ mod tests {
         assert_eq!(main_row.lifecycle(), &CheckoutLifecycle::Inactive);
         assert!(!main_row.session.is_worktree);
         app.repository_state.validate().unwrap();
-        app.kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// The other provisioning shape: a repository that came from `git clone` and so
@@ -12162,8 +12200,7 @@ mod tests {
             PersistedPath::from_path(&repo.canonicalize().unwrap())
         );
         app.repository_state.validate().unwrap();
-        app.kill_all();
-        std::fs::remove_dir_all(root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -12325,6 +12362,7 @@ mod tests {
             LifecycleOutcome::Busy { repository }
         );
         drop(reservation);
+        let _reap_killed: Vec<_> = app.sessions.iter().flat_map(session_reapers).collect();
         for session in &mut app.sessions {
             session.kill();
         }
@@ -12342,7 +12380,6 @@ mod tests {
                 .current_dir(&repo)
                 .status();
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12403,7 +12440,6 @@ mod tests {
         assert!(app.runtime_checkouts.is_empty());
         assert!(app.sessions.is_empty());
         assert!(!branch_retained);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12474,7 +12510,6 @@ mod tests {
                 occupied.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12565,7 +12600,6 @@ mod tests {
                 .arg(path)
                 .current_dir(&repo)
                 .status();
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -12698,7 +12732,6 @@ mod tests {
                 path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12798,6 +12831,7 @@ mod tests {
                 assert!(restored.shell_open);
                 let restored_shell = restored.shell.as_ref().unwrap();
                 assert!(!restored_shell.is_exited());
+                let _reap_killed = session_reapers(app.session(runtime).unwrap());
                 app.session_mut(runtime).unwrap().kill();
             }
             let path = app.repository_state.checkouts[0]
@@ -12813,7 +12847,6 @@ mod tests {
                     path.to_str().unwrap(),
                 ],
             );
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -12888,16 +12921,13 @@ mod tests {
                 path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn local_tui_dogfood_real_git_flow_survives_restart_without_duplicates() {
         const CHILD: &str = "BAUDE_REAL_GIT_DOGFOOD_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let root =
-                std::env::temp_dir().join(format!("baude-real-git-dogfood-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let root = baude_core::testing::FixtureRoot::new("baude-real-git-dogfood");
             std::fs::create_dir_all(root.join("home")).unwrap();
             std::fs::create_dir_all(root.join("data")).unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
@@ -12907,7 +12937,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
-                .env("BAUDE_TEST_FIXTURE_ROOT", &root)
+                .env("BAUDE_TEST_FIXTURE_ROOT", root.path())
                 .env("XDG_DATA_HOME", root.join("data"))
                 .env("HOME", root.join("home"))
                 // `HOME` alone does NOT contain the child's config resolution:
@@ -12927,7 +12957,6 @@ mod tests {
                 .env_remove("BAUDE_DAEMON_URL")
                 .status()
                 .unwrap();
-            let _ = std::fs::remove_dir_all(&root);
             assert!(status.success(), "isolated dogfood subprocess failed");
             return;
         }
@@ -13117,7 +13146,7 @@ mod tests {
                 persisted_before_restart
             );
 
-            current.take().unwrap().kill_all();
+            kill_all_and_reap(&mut current.take().unwrap());
             let mut restarted = app_for_dogfood(root.join("not-a-repository"), &state_root);
             restarted.restore();
             current = Some(restarted);
@@ -13190,7 +13219,7 @@ mod tests {
         }));
 
         if let Some(mut app) = current {
-            app.kill_all();
+            kill_all_and_reap(&mut app);
         }
         if let Err(panic) = result {
             if repo.exists() {
@@ -13281,7 +13310,6 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -13367,6 +13395,7 @@ mod tests {
             app.save();
             let prepared = app.prepare_remove_worktree(checkout);
             assert!(prepared.is_ok(), "got: {prepared:?}");
+            let _reap_killed: Vec<_> = app.sessions.iter().flat_map(session_reapers).collect();
             for session in &mut app.sessions {
                 session.kill();
             }
@@ -13380,13 +13409,12 @@ mod tests {
                     path.to_str().unwrap(),
                 ],
             );
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
     fn lifecycle_remove_clean_local_stop_git_and_compensation_failures_preserve_context() {
-        let (_fixture, mut app, repo, root, checkout, runtime, path) =
+        let (_fixture, mut app, repo, _root, checkout, runtime, path) =
             removal_app("safe-remove-stop-refusal", 150_000);
         let before = app.repository_state.clone();
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
@@ -13420,6 +13448,7 @@ mod tests {
         app.spawn_error_for_test = Some("resume unavailable".into());
         let confirmation = app.prepare_remove_worktree(checkout).unwrap_err();
         assert!(confirmation.to_string().contains("Untracked"));
+        let _reap_killed = session_reapers(app.session(compensated_runtime).unwrap());
         app.session_mut(compensated_runtime).unwrap().kill();
         std::fs::remove_file(path.join("agent-race-after-second")).unwrap();
         git(
@@ -13432,9 +13461,8 @@ mod tests {
                 path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
 
-        let (_fixture, mut app, repo, root, checkout, _, path) =
+        let (_fixture, mut app, repo, _root, checkout, _, path) =
             removal_app("safe-remove-compensation-failure", 160_000);
         let confirmation = app.prepare_remove_worktree(checkout).unwrap();
         app.remove_git_refusal_for_test = true;
@@ -13460,7 +13488,6 @@ mod tests {
                 path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -13469,7 +13496,7 @@ mod tests {
             ("remove-agent-partial", true, 170_000),
             ("remove-shell-partial", false, 180_000),
         ] {
-            let (_fixture, mut app, repo, root, checkout, runtime, path) =
+            let (_fixture, mut app, repo, _root, checkout, runtime, path) =
                 removal_app(label, offset);
             app.session_mut(runtime).unwrap().open_shell(5, 40).unwrap();
             if fail_agent {
@@ -13506,7 +13533,6 @@ mod tests {
             assert!(!path.exists());
             assert!(app.sessions.is_empty());
             assert!(app.runtime_checkouts.is_empty());
-            std::fs::remove_dir_all(root).unwrap();
             drop(repo);
         }
     }
@@ -13574,6 +13600,7 @@ mod tests {
         );
         assert_eq!(app.repository_state, before);
         assert_eq!(app.runtime_checkouts, HashMap::from([(checkout, runtime)]));
+        let _reap_killed = session_reapers(app.session(runtime).unwrap());
         app.session_mut(runtime).unwrap().kill();
         std::fs::remove_file(target_path.join("blocked")).unwrap();
         git(
@@ -13586,7 +13613,6 @@ mod tests {
                 target_path.to_str().unwrap(),
             ],
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     // ---- D remove action (plan 20-02) ---------------------------------------
@@ -13980,8 +14006,7 @@ mod tests {
         assert_eq!(app.removal_row_label(&local_key), local_name);
         assert!(local_dir.is_dir(), "the local worktree is still on disk");
         assert!(pid_is_live(live_pid));
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-10: a remote session the daemon's rows index gives no key gets a
@@ -14127,9 +14152,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
 
-    fn end_remote_remove(mut app: App, fx: &RelaunchFixture) {
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+    fn end_remote_remove(mut app: App, _fx: &RelaunchFixture) {
+        kill_all_and_reap(&mut app);
     }
 
     /// D-12: `D` hands the preview to a worker and returns; the draw thread
@@ -14749,8 +14773,7 @@ mod tests {
             );
         }
 
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// Esc always ends a preview wait, and never pretends to recall a
@@ -15194,7 +15217,7 @@ mod tests {
         // outside baude, and the relaunch reconciles the row to Unavailable;
         // `D` is still offered.
         app.reopen_checkout(rows.unmanaged).unwrap();
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         std::fs::remove_dir_all(&fx.unmanaged).unwrap();
         let mut relaunched = relaunch_app(&fx, fx.repo.clone());
         relaunched.restore();
@@ -15219,8 +15242,7 @@ mod tests {
             .unwrap()
         );
         relaunched.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        relaunched.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut relaunched);
     }
 
     /// TUI-02, D-03: a row with a live runtime is not refused; the report
@@ -15255,8 +15277,7 @@ mod tests {
             "preview kills nothing; the agent is still live"
         );
         app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// TUI-03, D-08, D-11: Enter removes the managed worktree row from the
@@ -15326,8 +15347,7 @@ mod tests {
                 .any(|row| row.key == rows.second),
             "removal is scoped: the other repository is untouched"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// T-20-03, D-06: Esc closes the modal and nothing moved: state, state
@@ -15360,8 +15380,7 @@ mod tests {
         assert_eq!(app.sessions.len(), sessions_before);
         assert_eq!(app.save_attempts_for_test.get(), saves_before);
         assert!(pid_is_live(live_pid));
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// TUI-03, D-05, D-11: `D` on a repository row previews the parent and
@@ -15507,8 +15526,7 @@ mod tests {
             message.contains("6 rows") && message.contains("3 runtimes"),
             "footer reports counts: {message}"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// Signal zero to the group: `true` once no member is left to probe.
@@ -15683,8 +15701,7 @@ mod tests {
             message.contains("1 row") && message.contains("1 runtime"),
             "footer reports the retry's counts: {message}"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// TUI-04, D-09, T-20-10: a save failure after the kill stage leaves the
@@ -15792,8 +15809,7 @@ mod tests {
             message.contains("1 row") && message.contains("1 runtime"),
             "footer reports the retry's counts: {message}"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-10, T-20-11: a clearing failure after the committed save does not
@@ -15864,8 +15880,7 @@ mod tests {
                 && message.contains(&managed_path.display().to_string()),
             "the footer names what could not be cleared: {message}"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// The folder bindings file as it is on disk under `config`, parsed from
@@ -15988,8 +16003,7 @@ mod tests {
             baude_core::suppression::is_suppressed(&config, &fx.repo),
             "a suppression entry was written for the clone"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// The entry names directly under `dir`, sorted.
@@ -16115,8 +16129,7 @@ mod tests {
             store_before,
             "the suppression store is byte-identical to before, or still absent"
         );
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-08: a row set that changed behind the modal refreshes the modal
@@ -16170,8 +16183,7 @@ mod tests {
             "footer explains the refresh: {message}"
         );
         app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     /// D-05, D-08: a runtime admitted for a row already in the set after
@@ -16245,8 +16257,7 @@ mod tests {
             "footer explains the refresh: {message}"
         );
         app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.kill_all();
-        std::fs::remove_dir_all(&fx.root).unwrap();
+        kill_all_and_reap(&mut app);
     }
 
     fn checkout_row_by_key(app: &App, key: CheckoutKey) -> &SavedCheckout {
@@ -16260,9 +16271,7 @@ mod tests {
     #[test]
     fn standalone_admission_dedup_close_reopen_and_missing_are_durable() {
         let _scope = isolation_scope("standalone-lifecycle");
-        let root =
-            std::env::temp_dir().join(format!("baude-standalone-lifecycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-standalone-lifecycle");
         let folder = root.join("plain folder");
         let state_root = root.join("state");
         std::fs::create_dir_all(&folder).unwrap();
@@ -16363,17 +16372,12 @@ mod tests {
             loaded.state.standalone_session(key).unwrap().lifecycle(),
             StandaloneLifecycle::Missing
         ));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn standalone_failed_first_spawn_retries_fresh_intent() {
         let _scope = isolation_scope("standalone-first-spawn");
-        let root = std::env::temp_dir().join(format!(
-            "baude-standalone-first-spawn-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-standalone-first-spawn");
         let folder = root.join("folder");
         let state_root = root.join("state");
         std::fs::create_dir_all(&folder).unwrap();
@@ -16412,7 +16416,6 @@ mod tests {
                 .ever_launched
         );
         app.close_standalone(key).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The field report (SQ-4), reproduced on the path it took: a non-repo
@@ -16424,11 +16427,7 @@ mod tests {
     #[test]
     fn standalone_reopen_of_resume_id_without_transcript_continues_and_clears_it() {
         let _scope = isolation_scope("standalone-stale-resume");
-        let root = std::env::temp_dir().join(format!(
-            "baude-standalone-stale-resume-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-standalone-stale-resume");
         let folder = root.join("poindexter12");
         let state_root = root.join("state");
         let argv = root.join("argv.txt");
@@ -16550,15 +16549,12 @@ mod tests {
         );
         app.close_standalone(key).unwrap();
         assert!(!app.runtime_standalones.contains_key(&key));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn standalone_active_runtime_is_restored_with_exact_recorded_teardown() {
         let _scope = isolation_scope("standalone-restore");
-        let root =
-            std::env::temp_dir().join(format!("baude-standalone-restore-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-standalone-restore");
         let folder = root.join("folder");
         let state_root = root.join("state");
         std::fs::create_dir_all(&folder).unwrap();
@@ -16594,7 +16590,6 @@ mod tests {
         ));
         restarted.close_standalone(key).unwrap();
         std::mem::forget(crashed);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn context_fixture() -> (
@@ -16784,16 +16779,12 @@ mod tests {
     fn folder_context_restore_prefers_the_last_used_session() {
         let _scope = isolation_scope("folder-context-restore");
         let (state, inside_main, _inside_wt, outside_main, _standalone) = context_fixture();
-        let root = std::env::temp_dir().join(format!(
-            "baude-folder-context-restore-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-folder-context-restore");
         std::fs::create_dir_all(&root).unwrap();
 
         let mut seeded = App::new(PathBuf::from("/not-a-repository"));
         seeded.remote = None;
-        seeded.persistence_root_for_test = Some(root.clone());
+        seeded.persistence_root_for_test = Some(root.to_path_buf());
         seeded.install_hierarchy_state_for_test(state.clone(), HashMap::new());
         seeded.save();
         assert!(
@@ -16805,7 +16796,7 @@ mod tests {
         // Relaunch: last_selected resolves and wins over first-row order.
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
-        app.persistence_root_for_test = Some(root.clone());
+        app.persistence_root_for_test = Some(root.to_path_buf());
         app.enable_folder_context_for_test(Path::new("/ctx/inside"));
         app.folder_context
             .as_mut()
@@ -16822,7 +16813,7 @@ mod tests {
         // context row.
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
-        app.persistence_root_for_test = Some(root.clone());
+        app.persistence_root_for_test = Some(root.to_path_buf());
         app.enable_folder_context_for_test(Path::new("/ctx/inside"));
         app.folder_context
             .as_mut()
@@ -16834,8 +16825,6 @@ mod tests {
         );
         app.restore();
         assert_eq!(app.selected_id, Some(SelId::Checkout(inside_main)));
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A workspace another baude already owns must be reported as exactly
@@ -16845,9 +16834,7 @@ mod tests {
     fn held_workspace_lock_names_the_holder_instead_of_asking_for_a_repair() {
         // Installed before the `workspace::active()` read two lines below.
         let _scope = isolation_scope("held-workspace-lock");
-        let root =
-            std::env::temp_dir().join(format!("baude-held-workspace-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new("baude-held-workspace-lock");
         std::fs::create_dir_all(&root).unwrap();
         let workspace = baude_core::workspace::active();
         let lock_path = root.join(format!(".{}.lock", workspace.state_file("state")));
@@ -16861,7 +16848,7 @@ mod tests {
 
         let mut app = App::new(PathBuf::from("/not-a-repository"));
         app.remote = None;
-        app.persistence_root_for_test = Some(root.clone());
+        app.persistence_root_for_test = Some(root.to_path_buf());
         app.restore();
 
         assert!(app.persistence_blocked());
@@ -16879,7 +16866,6 @@ mod tests {
         assert!(refused.contains("already owns this workspace"), "{refused}");
 
         holder.unlock().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     // ---- seed warning surface (HREG-03 / D-10, app-level) ----------------
@@ -16890,15 +16876,7 @@ mod tests {
     /// point (never `prepare_cwd` directly — that would not be an app-level
     /// spawn test) under the Phase-8 guarded fixture.
     fn assert_seed_warning_survives_spawn_attempt(tag: &str, malformed: &[u8]) {
-        let root = std::env::temp_dir().join(format!(
-            "baude-seed-warning-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = baude_core::testing::FixtureRoot::new(&format!("baude-seed-warning-{tag}"));
         std::fs::create_dir_all(root.join("config")).unwrap();
         let _redirect = baude_core::testing::TestRedirect::new(&root);
         let _identity = baude_core::workspace::override_for_test(
@@ -16959,7 +16937,6 @@ mod tests {
         );
 
         drop(app);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -16975,20 +16952,16 @@ mod tests {
     #[test]
     fn test_open_new_session_prefill_inside_repo_returns_git_root() {
         // Test that when inside a repo, prefill shows repo root with trailing /
-        let root = std::env::temp_dir().join(format!("baude-test-{}-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
-        let tmp = std::env::temp_dir().join(format!("baude-test-repo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-repo");
         let _ = std::process::Command::new("git")
             .args(["init"])
             .current_dir(&tmp)
             .output();
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.remote = None;
 
         app.open_new_session_modal();
@@ -16998,23 +16971,17 @@ mod tests {
         } else {
             panic!("expected InputKind::NewSessionPath modal");
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_open_new_session_prefill_outside_repo_with_config_new_session_dir() {
         // Test that when outside a repo with config, prefill shows config.new_session_dir with trailing /
-        let root =
-            std::env::temp_dir().join(format!("baude-test-{}-config-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-config-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
-        let tmp = std::env::temp_dir().join(format!("baude-test-nonrepo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-nonrepo");
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.remote = None;
         app.config.new_session_dir = Some("/tmp/sessions".into());
 
@@ -17025,23 +16992,17 @@ mod tests {
         } else {
             panic!("expected InputKind::NewSessionPath modal");
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_open_new_session_prefill_outside_repo_no_config() {
         // Test that when outside a repo without config, prefill shows launch_dir with trailing /
-        let root =
-            std::env::temp_dir().join(format!("baude-test-{}-no-config-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-no-config-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
-        let tmp = std::env::temp_dir().join(format!("baude-test-noconfig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-noconfig");
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.remote = None;
         app.config.new_session_dir = None;
 
@@ -17052,27 +17013,21 @@ mod tests {
         } else {
             panic!("expected InputKind::NewSessionPath modal");
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_open_new_session_prefill_all_cases_end_with_slash() {
         // Verify that all three prefill cases end with trailing slash
-        let root =
-            std::env::temp_dir().join(format!("baude-test-{}-allcases-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-allcases-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
         // Case 1: inside repo
-        let tmp1 = std::env::temp_dir().join(format!("baude-test-case1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp1);
-        std::fs::create_dir_all(&tmp1).unwrap();
+        let tmp1 = baude_core::testing::FixtureRoot::new("baude-test-case1");
         let _ = std::process::Command::new("git")
             .args(["init"])
             .current_dir(&tmp1)
             .output();
-        let mut app = App::new(tmp1.clone());
+        let mut app = App::new(tmp1.to_path_buf());
         app.remote = None;
         app.open_new_session_modal();
         if let Modal::Input { buf, .. } = &app.modal {
@@ -17081,10 +17036,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp1);
 
         // Case 2: outside repo with config
-        let tmp2 = std::env::temp_dir().join(format!("baude-test-case2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp2);
-        std::fs::create_dir_all(&tmp2).unwrap();
-        let mut app = App::new(tmp2.clone());
+        let tmp2 = baude_core::testing::FixtureRoot::new("baude-test-case2");
+        let mut app = App::new(tmp2.to_path_buf());
         app.remote = None;
         app.config.new_session_dir = Some("/tmp/sessions".into());
         app.open_new_session_modal();
@@ -17097,10 +17050,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp2);
 
         // Case 3: outside repo without config
-        let tmp3 = std::env::temp_dir().join(format!("baude-test-case3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp3);
-        std::fs::create_dir_all(&tmp3).unwrap();
-        let mut app = App::new(tmp3.clone());
+        let tmp3 = baude_core::testing::FixtureRoot::new("baude-test-case3");
+        let mut app = App::new(tmp3.to_path_buf());
         app.remote = None;
         app.config.new_session_dir = None;
         app.open_new_session_modal();
@@ -17110,27 +17061,21 @@ mod tests {
                 "Case 3: outside repo without config should end with /"
             );
         }
-        let _ = std::fs::remove_dir_all(&tmp3);
     }
 
     #[test]
     fn test_admit_repository_same_from_root_and_subfolder() {
         // Test that admitting the same repo from root and subfolder creates only one row
-        let root =
-            std::env::temp_dir().join(format!("baude-test-{}-dedup-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-dedup-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
-        let tmp = std::env::temp_dir().join(format!("baude-test-dedup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-dedup");
         let _ = std::process::Command::new("git")
             .args(["init"])
             .current_dir(&tmp)
             .output();
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.remote = None;
         let _workspace = baude_core::workspace::override_for_test(&app.config, None);
 
@@ -17148,27 +17093,21 @@ mod tests {
             count1, count2,
             "same repo from root and subfolder should not create duplicates"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_admit_repository_deduplication_by_canonical_common_dir() {
         // Test that canonical common dir deduplication prevents duplicates
-        let root =
-            std::env::temp_dir().join(format!("baude-test-{}-canonical-root", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-canonical-root");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
-        let tmp = std::env::temp_dir().join(format!("baude-test-canonical-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-canonical");
         let _ = std::process::Command::new("git")
             .args(["init"])
             .current_dir(&tmp)
             .output();
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         app.remote = None;
         let _workspace = baude_core::workspace::override_for_test(&app.config, None);
 
@@ -17186,7 +17125,6 @@ mod tests {
             count1, count2,
             "canonical common dir should prevent duplicates"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -17194,13 +17132,8 @@ mod tests {
         // Verify that when manager admits a repository and a collision is detected,
         // it sets the status message with collision information.
         use std::os::unix::ffi::OsStrExt;
-        let root = std::env::temp_dir().join(format!(
-            "baude-test-{}-collision-status",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let _redirect = baude_core::testing::TestRedirect::new(root.clone());
+        let root = baude_core::testing::FixtureRoot::new("baude-test-collision-status");
+        let _redirect = baude_core::testing::TestRedirect::new(&root);
 
         // Create a repository with proper remote setup
         let repo_dir = root.join("repo");
@@ -17309,8 +17242,6 @@ mod tests {
             msg.contains("repository-") && msg.contains("-2"),
             "message should contain allocated -2 path"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -17318,11 +17249,10 @@ mod tests {
         // Test: screen_generation() accessor loads from Arc<AtomicU64> correctly.
         // Simplified: verify accessor exists and returns a u64 from Pty
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-gen");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-gen");
         let _redirect = TestRedirect::new(&tmp);
 
-        let app = App::new(tmp.clone());
+        let app = App::new(tmp.to_path_buf());
         // App starts with no sessions
         assert!(app.sessions.is_empty());
         // Verify last_known_screen_gen map exists and is empty
@@ -17334,11 +17264,10 @@ mod tests {
         // Test: dirty flag logic is in tick() for generation changes.
         // Simplified: verify App has the tracking map
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-marks");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-marks");
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         // last_known_screen_gen should be initialized as HashMap
         app.last_known_screen_gen.insert(123, 0);
         assert_eq!(app.last_known_screen_gen.get(&123), Some(&0));
@@ -17350,11 +17279,10 @@ mod tests {
     fn idle_no_dirty_after_first_frame() {
         // Test: after first_frame_drawn is true, verify dirty flag behavior.
         use baude_core::testing::TestRedirect;
-        let tmp = std::env::temp_dir().join("baude-test-idle2");
-        let _ = std::fs::create_dir_all(&tmp);
+        let tmp = baude_core::testing::FixtureRoot::new("baude-test-idle2");
         let _redirect = TestRedirect::new(&tmp);
 
-        let mut app = App::new(tmp.clone());
+        let mut app = App::new(tmp.to_path_buf());
         assert!(!app.first_frame_drawn);
         app.first_frame_drawn = true;
         assert!(app.first_frame_drawn);
@@ -17414,7 +17342,7 @@ mod tests {
         }
         assert_eq!(app.sessions.len(), n, "fixture created {n} runtimes");
         let order = app.ordered_ids();
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         let mut restarted = App::new(repo);
         restarted.remote = None;
         restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
@@ -17432,7 +17360,7 @@ mod tests {
 
     #[test]
     fn restore_single_durable_save_for_n_sessions() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-one-save", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-one-save", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let first = crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -17456,13 +17384,12 @@ mod tests {
             1,
             "Phase B releases never save"
         );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_save_failure_kills_paused_children_and_records_no_unpaused_child() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-save-fails", 2);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-save-fails", 2);
         app.atomic_failure_for_test = Some(persist::AtomicFailure::Write);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
@@ -17488,7 +17415,6 @@ mod tests {
             .unwrap_or_default();
         assert!(message.starts_with("restore save failed"), "got: {message}");
         assert!(message.contains("none was released"), "got: {message}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The one way a real worktree stops reconciling, one case per
@@ -17626,10 +17552,9 @@ mod tests {
         broken_branch: String,
         /// Where the fixture's saved state file lives.
         state_root: PathBuf,
-        /// The fixture root to remove when the case is done.
-        root: PathBuf,
-        /// Retained so the fixture's redirects outlive the App. Fields drop
-        /// in DECLARATION order, so this one is last to drop it LAST.
+        /// Retained so the fixture's redirects and root outlive the App.
+        /// Fields drop in DECLARATION order, so this one is last to drop it
+        /// LAST.
         _fixture: AdmissionRepo,
     }
 
@@ -17643,7 +17568,6 @@ mod tests {
             app,
             broken_branch,
             state_root,
-            root,
             _fixture: fixture,
         }
     }
@@ -17760,8 +17684,7 @@ mod tests {
             let case = how.label();
             let mut stale = stale_restore_fixture(&format!("restore-cause-{case}"), 3, how);
             assert_one_row_refused(&mut stale, 3, case);
-            stale.app.kill_all();
-            let _ = std::fs::remove_dir_all(&stale.root);
+            kill_all_and_reap(&mut stale.app);
         }
     }
 
@@ -17774,8 +17697,7 @@ mod tests {
                 stale_restore_fixture(&format!("restore-{tag}"), 3, BreakCheckout::BranchChanged);
             retag_saved_checkout_lifecycle(&stale.state_root, &stale.broken_branch, tag);
             assert_one_row_refused(&mut stale, 3, tag);
-            stale.app.kill_all();
-            let _ = std::fs::remove_dir_all(&stale.root);
+            kill_all_and_reap(&mut stale.app);
         }
     }
 
@@ -17790,9 +17712,8 @@ mod tests {
         primary: CheckoutKey,
         /// A retained checkout that is not the primary.
         feature: CheckoutKey,
-        root: PathBuf,
         /// Fields drop in DECLARATION order, so the fixture is last and its
-        /// redirects outlive the App.
+        /// redirects and root outlive the App.
         _fixture: AdmissionRepo,
     }
 
@@ -17840,7 +17761,7 @@ mod tests {
             .find(|key| *key != primary)
             .expect("a non-primary checkout");
         assert_eq!(app.sessions.len(), n + 1, "{n} checkouts and a standalone");
-        app.kill_all();
+        kill_all_and_reap(&mut app);
         let mut restarted = App::new(repo);
         restarted.remote = None;
         restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
@@ -17850,7 +17771,6 @@ mod tests {
             standalone,
             primary,
             feature,
-            root,
             _fixture: fixture,
         }
     }
@@ -17897,8 +17817,7 @@ mod tests {
         assert!(saved.app.restore_in_progress(), "Phase B has work to do");
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "every surviving row released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     /// BL-07(a): the launch-directory admission runs after the saved sessions
@@ -17934,8 +17853,7 @@ mod tests {
         );
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "every saved session released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     /// BL-07(b): the backstop. A Phase A write refused for a reason that names
@@ -17987,13 +17905,12 @@ mod tests {
         assert!(saved.app.restore_in_progress(), "the rest still release");
         while saved.app.restore_step() {}
         assert_eq!(gated_count(&saved.app), 0, "the other rows all released");
-        saved.app.kill_all();
-        let _ = std::fs::remove_dir_all(&saved.root);
+        kill_all_and_reap(&mut saved.app);
     }
 
     #[test]
     fn restore_unpauses_only_after_durable_save() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-release-order", 2);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-release-order", 2);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -18009,13 +17926,12 @@ mod tests {
             .expect("second step");
         assert_eq!(gated_count(&app), 0);
         assert!(finished && !app.restore_in_progress());
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_incremental_one_per_iteration() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-incremental", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-incremental", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         crate::step_with(&mut terminal, &mut app, &mut started, &mut finished, false)
@@ -18029,13 +17945,12 @@ mod tests {
             .expect("step 3");
         assert_eq!(gated_count(&app), 0, "step 3: last release");
         assert!(finished);
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_progress_visible() {
-        let (_fixture, mut app, _order, root) = saved_sessions_fixture("restore-progress", 3);
+        let (_fixture, mut app, _order, _root) = saved_sessions_fixture("restore-progress", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let msg = |app: &App| {
@@ -18054,13 +17969,12 @@ mod tests {
             .expect("step 3");
         assert_eq!(msg(&app), "restoring 3/3");
         assert!(finished);
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
     fn restore_maintains_sidebar_order() {
-        let (_fixture, mut app, order, root) = saved_sessions_fixture("restore-order", 3);
+        let (_fixture, mut app, order, _root) = saved_sessions_fixture("restore-order", 3);
         let mut terminal = loop_terminal();
         let (mut started, mut finished) = (false, false);
         let mut steps = 0;
@@ -18075,8 +17989,7 @@ mod tests {
             order,
             "restored sidebar order equals the saved order"
         );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18115,8 +18028,7 @@ mod tests {
             "archived session should not be polled"
         );
 
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18142,6 +18054,9 @@ mod tests {
             let checkout = app.repository_state.checkouts[0].key;
 
             if late {
+                let _reap_killed = baude_core::testing::RuntimeReaper::for_pty(
+                    &app.session(runtime).unwrap().claude,
+                );
                 app.session_mut(runtime).unwrap().claude.kill();
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -18171,6 +18086,9 @@ mod tests {
             );
 
             if late {
+                let _reap_killed = baude_core::testing::RuntimeReaper::for_pty(
+                    &app.session(runtime).unwrap().claude,
+                );
                 let session = app.session_mut(runtime).unwrap();
                 session.spawn_unix_ms = baude_core::meta::now_unix_ms()
                     - baude_core::session::EARLY_RESUME_ID_EXIT_WINDOW_MS
@@ -18215,8 +18133,7 @@ mod tests {
                 );
                 assert!(!app.runtime_checkouts.contains_key(&checkout));
             }
-            app.kill_all();
-            let _ = std::fs::remove_dir_all(root);
+            kill_all_and_reap(&mut app);
         }
     }
 
@@ -18244,6 +18161,7 @@ mod tests {
         assert_eq!(app.sessions[0].poll_meta_calls_for_test.get(), 0);
 
         // Kill the child process to make it exited
+        let _reap_killed = session_reapers(&app.sessions[0]);
         app.sessions[0].kill();
 
         // Call tick which should skip poll_meta for exited sessions
@@ -18256,8 +18174,7 @@ mod tests {
             "exited session should not be polled"
         );
 
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18308,8 +18225,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18347,8 +18263,7 @@ mod tests {
         // Verify child_suspended is false (killed, not suspended)
         assert!(!app.sessions[0].child_suspended);
 
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
     #[test]
     fn manual_archive_applies_idle_child_policy_and_unarchive_resumes() {
@@ -18420,8 +18335,7 @@ mod tests {
             "unarchive resumes the child"
         );
         wait(pid, &|s| !s.starts_with('T'));
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(root);
+        kill_all_and_reap(&mut app);
     }
 
     /// UX-01 fixture: a repository with one admitted runtime whose shell pane
@@ -18469,7 +18383,7 @@ mod tests {
             Focus::Claude,
             "alt+up again stays on the agent pane"
         );
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18485,7 +18399,7 @@ mod tests {
         app.session_mut(runtime).unwrap().shell_open = false;
         app.handle_key(alt(KeyCode::Down));
         assert_eq!(app.focus, Focus::Claude, "no shell means no move");
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18518,7 +18432,7 @@ mod tests {
         assert!(!app.session(runtime).unwrap().pane_focus_shell);
         app.restore_pane_focus();
         assert_eq!(app.focus, Focus::Claude, "no shell, no shell focus");
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18533,6 +18447,8 @@ mod tests {
         app.remember_pane_focus();
 
         // The agent exits; the user steps back to the sidebar and presses `r`.
+        let _reap_killed =
+            baude_core::testing::RuntimeReaper::for_pty(&app.session(runtime).unwrap().claude);
         app.session_mut(runtime).unwrap().claude.kill();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !app.session(runtime).unwrap().claude.is_exited() {
@@ -18554,7 +18470,7 @@ mod tests {
             Focus::Shell,
             "a restarted session lands on the pane it was left on"
         );
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18604,6 +18520,8 @@ mod tests {
 
         // The middle row's agent exits; its row stays in the sidebar.
         app.selected_id = Some(middle);
+        let _reap_killed =
+            baude_core::testing::RuntimeReaper::for_pty(&app.selected().unwrap().claude);
         app.selected_mut().unwrap().claude.kill();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !app.selected().unwrap().claude.is_exited() {
@@ -18626,7 +18544,7 @@ mod tests {
         app.focus = Focus::Sidebar;
         app.handle_key(alt(KeyCode::Right));
         assert_eq!(app.selected_id, Some(middle));
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18647,7 +18565,7 @@ mod tests {
             Focus::Shell,
             "alt+down is a no-op on a remote row"
         );
-        app.kill_all();
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18715,8 +18633,7 @@ mod tests {
             "open resumes"
         );
         wait(pid, &|s| !s.is_empty() && !s.starts_with('T'));
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
 
     #[test]
@@ -18759,7 +18676,6 @@ mod tests {
             !rendered.contains("● 1") && !rendered.contains("◐ 1"),
             "{rendered}"
         );
-        app.kill_all();
-        let _ = std::fs::remove_dir_all(&root);
+        kill_all_and_reap(&mut app);
     }
 }

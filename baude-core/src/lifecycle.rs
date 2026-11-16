@@ -2872,6 +2872,14 @@ impl RepositoryReservations {
             repository,
         })
     }
+
+    /// Whether a guard of either kind holds `repository` now.
+    pub fn is_reserved(&self, repository: RepositoryKey) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&repository)
+    }
 }
 
 #[derive(Debug)]
@@ -2908,9 +2916,6 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_LIFECYCLE_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     /// Owns one activation case's fixture root: the redirect that pins every
     /// resolved config, state and managed-worktree path inside it, plus the
@@ -2931,20 +2936,19 @@ mod tests {
         /// unredirected while still compiling and still reading like an
         /// isolated fixture at the call site.
         _redirect: crate::testing::TestRedirect,
+        /// The canonical form of `_root`, the path every case is handed.
         root: PathBuf,
+        /// Declared last so the tree is removed after both guards are
+        /// restored, also when the case panicked.
+        _root: crate::testing::FixtureRoot,
     }
 
     impl LifecycleFixture {
         #[must_use = "the returned LifecycleFixture owns this case's root and identity; bind it \
                       to a named local declared before every path it contains"]
         fn new(label: &str) -> Self {
-            let sequence = NEXT_LIFECYCLE_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "baude-lifecycle-{label}-{}-{sequence}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).expect("create unique lifecycle fixture root");
+            let fixture_root =
+                crate::testing::FixtureRoot::new(&format!("baude-lifecycle-{label}"));
             // Canonicalized because activation compares a composed managed path
             // against the path Git reports for the same worktree. On macOS
             // `temp_dir()` is `/var/...`, a symlink to `/private/var/...`, and
@@ -2952,7 +2956,8 @@ mod tests {
             // makes an exact path owner look like a different one. Real data
             // roots have no such symlink, which is why this only surfaces under
             // a temp-dir fixture.
-            let root = std::fs::canonicalize(&root).expect("canonicalize lifecycle fixture root");
+            let root =
+                std::fs::canonicalize(&fixture_root).expect("canonicalize lifecycle fixture root");
             // Acquisition order is root FIRST, identity SECOND, so the identity
             // is resolved with this fixture's roots already installed.
             let redirect = crate::testing::TestRedirect::new(&root);
@@ -2967,6 +2972,7 @@ mod tests {
                 _identity: identity,
                 _redirect: redirect,
                 root,
+                _root: fixture_root,
             }
         }
 
@@ -2982,14 +2988,6 @@ mod tests {
             let path = self.root.join(relative);
             std::fs::create_dir_all(&path).expect("create lifecycle fixture subdirectory");
             path
-        }
-    }
-
-    impl Drop for LifecycleFixture {
-        fn drop(&mut self) {
-            // Swallowed like `GitFixture::drop`: a cleanup failure must not mask
-            // the assertion failure that is the reason the case matters.
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -3790,6 +3788,37 @@ mod tests {
         );
         drop(guard);
         assert!(reservations.reserve(repository).is_ok());
+    }
+
+    #[test]
+    fn reservations_report_what_they_hold() {
+        let state = close_state();
+        let checkout = state.checkouts[0].key;
+        let repository = state.checkouts[0].repository_key;
+        let reservations = RepositoryReservations::default();
+        assert!(!reservations.is_reserved(repository), "nothing is held yet");
+
+        let mutation = reservations.reserve(repository).unwrap();
+        assert!(
+            reservations.is_reserved(repository),
+            "a held mutation guard must report its repository reserved"
+        );
+        drop(mutation);
+        assert!(
+            !reservations.is_reserved(repository),
+            "the mutation guard dropped"
+        );
+
+        let reopen = reservations.reserve_reopen(repository, checkout).unwrap();
+        assert!(
+            reservations.is_reserved(repository),
+            "a held reopen guard must report its repository reserved"
+        );
+        drop(reopen);
+        assert!(
+            !reservations.is_reserved(repository),
+            "the reopen guard dropped"
+        );
     }
 
     #[test]

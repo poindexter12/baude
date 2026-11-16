@@ -490,6 +490,17 @@ by itself.
   is removed.
 - Standalone folder: there is no marker and no suppression entry is written.
 
+The TUI and a daemon on the same machine share the suppression store when they
+use the same config dir and the same workspace. A removal in either keeps the
+row out of the TUI's sweep. Opening the folder in either lifts the entry for
+both: in the TUI with `n`, `c` or a launch inside it, on the daemon with
+`POST /sessions` or the PWA's new session. The entry lifted is the one for the
+checkout root of the folder you opened, so opening a subfolder of a removed
+worktree lifts that worktree's entry. A daemon run from the compose file keeps
+its own config volume, and so its own store. A session the daemon opened in a
+subfolder of a checkout is stored on that subfolder, and removing it writes an
+entry for the subfolder that nothing reads.
+
 ### After removing the default checkout
 
 The default checkout is the checkout of the repository's default branch. It is
@@ -987,10 +998,30 @@ the request.
 | 200 | the preview, or the report of the committed removal |
 | 409 | from `POST /removals`: the rows, runtimes or paths to delete changed since the preview. Nothing was removed, and the body is the fresh preview as JSON |
 | 404 | the target row is unknown |
-| 503 | from `POST /removals`: refused on the daemon's own state. The repository is busy, a save of the daemon's state is blocked or failed, or a runtime handle is missing |
-| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, or a validation failed. From `POST /removals/preview`: any error other than an unknown target |
+| 503 | refused on the daemon's own state. From `POST /removals`: the repository or folder is busy with another removal, a save of the daemon's state is blocked or failed, or a runtime handle is missing. From the session routes described below: the repository or folder is busy with a removal |
+| 500 | from `POST /removals`: a runtime survived the kill, a directory could not be deleted, a runtime's identity did not match, a validation failed, or the removal panicked while stopping runtimes and deleting worktrees. From `POST /removals/preview`: any error other than an unknown target |
 
 Every error body is plain text except the 409.
+
+Other requests are served while a removal stops runtimes and deletes
+worktrees. `GET /rows` keeps listing the rows being removed until the removal
+commits, then drops them all at once. `GET /sessions` stops listing the
+sessions being removed while the removal runs, and lists them again if it
+fails. A request that would change the repository or folder being removed
+answers 503 with the body `repository busy: <path>`, naming the repository's
+main checkout, or `folder busy: <path>`. Those requests are `POST /removals`
+for any of its rows, `POST /sessions` into it with or without a `worktree`
+branch, and `DELETE`, `restart`, `archive` and `unarchive` of its sessions.
+Creating a worktree in a busy repository used to answer 400 and now answers
+this 503. Every other route that names one of the sessions being removed
+answers the same 503 while the removal runs: `GET /sessions/{id}`, its
+messages, queue, screen, keys, interrupt, permission and activity routes, the
+hook event `POST /sessions/{id}/event`, and the `stream`, `activity-stream`
+and `pty` connections. Once the removal commits they answer 404, and if it
+fails they serve the session again. A `stream` or `activity-stream` already
+open when the removal starts stays open through it. `POST /removals/preview`
+is still served during a removal and reads the rows as they were. Every other
+route keeps its status codes.
 
 A 200 from `POST /removals` can carry `"outcome": "saved_degraded"` and a
 `detail` text under `persistence`. The removal happened: the row is gone from
@@ -1008,27 +1039,37 @@ to catch up.
 
 The PWA's list follows `GET /rows`: each repository as a heading with its
 checkouts beneath it, then a `folders` group. Each repository heading, each
-checkout and each folder has a `✕` remove control. A session that no row
-claims is still listed, after those groups, and has no remove control because
-it has no key to remove it by.
+checkout and each folder has a `✕` remove control. Sessions that no row
+claims are listed last, under an `other sessions` heading with archived ones
+at the end, and have no remove control because they have no key to remove
+them by.
 
 A checkout is tagged `main` or `worktree`. The tag is not a guide to what a
 removal deletes. The page tags a default checkout `main` whether or not baude
 created it, and one that baude created is deleted like any other managed
 worktree. A linked worktree the daemon was pointed at, and did not create, is
-tagged `worktree` and is kept. The confirmation for every checkout is titled
-`Remove this checkout?`, so read its `paths deleted` list before you press
-`remove`.
+tagged `worktree` and is kept. The confirmation title says what the tags do
+not: a checkout whose removal deletes its folder is titled
+`Remove this worktree and delete its folder?`, and a repository whose removal
+deletes folders says how many, as in
+`Remove this repository and delete 2 folders?`. Any other confirmation is
+titled `Remove this <kind>?`. The title counts only the `paths deleted` list,
+never a folder that is `already removed`.
 
-The control opens a confirmation titled `Remove this repository?`,
-`Remove this checkout?` or `Remove this standalone session?`. It lists
+The control opens a confirmation titled
+`Remove this worktree and delete its folder?` or `Remove this checkout?` for a
+checkout, `Remove this repository and delete 1 folder?`,
+`Remove this repository and delete N folders?` or `Remove this repository?`
+for a repository, and
+`Remove this standalone session?` for a folder. It lists
 `rows dropped`, `runtimes killed`, `paths deleted` and `paths kept`, plus
 `already removed` and `cleared` when they apply. `cancel`, Escape or a tap
 outside the box closes it and sends nothing, except while a removal is in
 flight, when the confirmation stays up until the daemon answers. `remove`
 sends the report on screen back to the daemon. When the removal is done the
 rows leave the list and a result line gives the counts, for example
-`removed 1 row, killed 1 runtime, deleted 0 paths`.
+`removed 1 row, killed 1 runtime, deleted 0 paths`. A removal here writes the
+same suppression entry as one in the TUI.
 
 When something fails the error is shown in the confirmation and the button
 reads `retry`. After a failed preview, `retry` asks for the preview again.

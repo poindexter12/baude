@@ -251,12 +251,8 @@ mod tests {
     /// A fixture root under the real temp dir, deliberately NOT canonical: on
     /// macOS `temp_dir()` is `/var/...`, a symlink to `/private/var/...`, the
     /// same shape as a `/tmp` session cwd in the field.
-    fn resume_fixture(label: &str) -> (std::path::PathBuf, crate::testing::TestRedirect) {
-        let root = std::env::temp_dir().join(format!(
-            "baude-claude-resume-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn resume_fixture(label: &str) -> (crate::testing::FixtureRoot, crate::testing::TestRedirect) {
+        let root = crate::testing::FixtureRoot::new(&format!("baude-claude-resume-{label}"));
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         let redirect = crate::testing::TestRedirect::new(&root);
         (root, redirect)
@@ -282,7 +278,6 @@ mod tests {
         // A transcript for the id under a DIFFERENT cwd does not count:
         // `claude --resume` looks in the spawn cwd's project dir.
         assert!(!ClaudeBackend.resume_target_exists(&root, live));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -295,7 +290,6 @@ mod tests {
 
         assert!(ClaudeBackend.resume_target_exists(&real, id));
         assert!(ClaudeBackend.resume_target_exists(&cwd, id));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -318,7 +312,6 @@ mod tests {
             );
         }
         assert!(ClaudeBackend.resume_target_exists(&cwd, "real"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -406,9 +399,7 @@ mod tests {
         // `baude` server without discarding a user's sibling MCP servers, and
         // must be idempotent across re-spawns (restore()). Moved from
         // bauded/src/manager.rs when the duplicated seeder collapsed here.
-        let cwd = std::env::temp_dir().join(format!("baude-core-mcp-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = crate::testing::FixtureRoot::new("baude-core-mcp-test");
         let path = crate::permission::mcp_config_path(&cwd);
 
         // Pre-existing user config with a sibling server.
@@ -445,20 +436,14 @@ mod tests {
             v2["mcpServers"]["baude"]["args"][0].as_str(),
             Some("permission-mcp")
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     // ---- seed_mcp_config guard (HREG-03 / D-03) --------------------------
 
     /// Unique per-test cwd fixture, same shape as hook.rs's `seed_guard_cwd`
     /// (temp_dir + pid-suffixed).
-    fn mcp_guard_cwd(tag: &str) -> std::path::PathBuf {
-        let cwd =
-            std::env::temp_dir().join(format!("baude-mcp-guard-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cwd);
-        std::fs::create_dir_all(&cwd).unwrap();
-        cwd
+    fn mcp_guard_cwd(tag: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-mcp-guard-{tag}"))
     }
 
     #[test]
@@ -491,8 +476,6 @@ mod tests {
             b"{not json".to_vec(),
             "unparseable file must remain byte-identical"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -519,8 +502,6 @@ mod tests {
             b"[1,2]".to_vec(),
             "non-object file must remain byte-identical"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -542,8 +523,6 @@ mod tests {
             v["mcpServers"]["baude"]["command"].is_string(),
             "fresh seed must register mcpServers.baude.command, got {v}"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -576,7 +555,5 @@ mod tests {
             !command.starts_with('\''),
             "command must not start with a single-quote character, got: {command}"
         );
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 }

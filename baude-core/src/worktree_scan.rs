@@ -1911,24 +1911,18 @@ mod tests {
         SavedStandaloneSession, StandaloneLifecycle,
     };
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
     /// A tree shaped exactly like the real one, under a unique temp root.
-    /// Same convention as `git::tests::GitFixture`: an atomic counter in the
-    /// root name so parallel cases cannot collide, and a `Drop` that cleans
-    /// up and swallows its errors.
+    /// Same convention as `git::tests::GitFixture`: a `FixtureRoot` whose name
+    /// carries the pid and a counter so parallel cases cannot collide, and
+    /// which removes the tree when the fixture drops, also on panic.
     struct ScanFixture {
-        root: PathBuf,
+        root: crate::testing::FixtureRoot,
     }
 
     impl ScanFixture {
         fn new() -> Self {
-            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("baude-scan-test-{}-{sequence}", std::process::id()));
-            std::fs::create_dir(&root).expect("create unique scan fixture root");
+            let root = crate::testing::FixtureRoot::new("baude-scan-test");
             std::fs::create_dir(root.join("worktrees")).expect("create fixture worktrees base");
             std::fs::create_dir(root.join("config")).expect("create fixture config dir");
             Self { root }
@@ -1993,12 +1987,6 @@ mod tests {
             git_ok(&self.root, &["add", "tracked.txt"]);
             git_ok(&self.root, &["commit", "-q", "-m", "fixture"]);
             self.root.canonicalize().expect("canonicalize fixture root")
-        }
-    }
-
-    impl Drop for ScanFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 

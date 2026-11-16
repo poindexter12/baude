@@ -1274,15 +1274,8 @@ mod tests {
         assert_eq!(config_dir(), outer.join("config"));
     }
 
-    fn isolated_root(label: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let root = std::env::temp_dir().join(format!(
-            "baude-persist-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn isolated_root(label: &str) -> crate::testing::FixtureRoot {
+        crate::testing::FixtureRoot::new(&format!("baude-persist-{label}"))
     }
 
     fn current_fixture(prefix: &str) -> StateFile {
@@ -1612,7 +1605,6 @@ mod tests {
         let third = migrate_for_workspace_at(&root, base, &workspace, reconcile_legacy).unwrap();
         assert!(matches!(third, LoadOutcome::Current(_)));
         assert_eq!(std::fs::read(&fallback_path).unwrap(), dormant_bytes);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1709,7 +1701,6 @@ mod tests {
             load_for_workspace_strict_at(&root, "state", &workspace, reconcile_legacy),
             Err(LoadError::Read { ref path, .. }) if path == &primary
         ));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1735,7 +1726,6 @@ mod tests {
             Err(LoadError::Locked { ref path, holder: None }) if path == &lock_path
         ));
         lock.unlock().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The holder stamps its pid so the refusal can name the process to quit.
@@ -1757,7 +1747,6 @@ mod tests {
         hold_state_lock(&destination).expect("re-entrant claim is a no-op");
 
         release_state_lock_for_test(&destination);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// WLOCK-04: contention is decided by `try_lock`, never by lock-file
@@ -1803,7 +1792,6 @@ mod tests {
         );
 
         release_state_lock_for_test(&destination);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1879,7 +1867,6 @@ mod tests {
             .unwrap(),
             LoadOutcome::Missing
         ));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1913,8 +1900,6 @@ mod tests {
         assert!(claude.state.standalone_sessions[0]
             .owned_runtime()
             .is_some());
-        std::fs::remove_dir_all(claude_root).unwrap();
-        std::fs::remove_dir_all(opencode_root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1941,7 +1926,6 @@ mod tests {
             reconstructed.as_os_str().as_bytes(),
             original.as_os_str().as_bytes()
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1992,7 +1976,6 @@ mod tests {
         assert!(
             load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()).is_err()
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2046,7 +2029,6 @@ mod tests {
             load_for_workspace_strict_at(&root, "state", &workspace, |_| unreachable!()),
             Err(LoadError::InvalidState { .. })
         ));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
