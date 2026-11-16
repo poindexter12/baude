@@ -98,6 +98,11 @@ fn current() -> Redirects {
     REDIRECTS.with(|cell| cell.borrow().clone())
 }
 
+/// The redirects live on the calling thread.
+pub fn capture() -> Redirects {
+    current()
+}
+
 /// Redirects every fixture-owned path for the CURRENT THREAD, restoring the
 /// previous set on drop.
 ///
@@ -155,6 +160,16 @@ impl TestRedirect {
         let mut next = current();
         next.workspace = Some(workspace);
         Self::swap(next)
+    }
+
+    /// Install `redirects` on the calling thread, restoring its previous set
+    /// on drop.
+    pub fn install(redirects: Redirects) -> Self {
+        let _ = redirects;
+        Self {
+            previous: current(),
+            _not_send: PhantomData,
+        }
     }
 
     fn swap(next: Redirects) -> Self {
@@ -1113,5 +1128,85 @@ mod tests {
             real.display()
         );
         assert!(real.ends_with("baude/worktrees"), "got {}", real.display());
+    }
+
+    /// The text of a panic payload, for a `join` that returned `Err`.
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(text) = payload.downcast_ref::<String>() {
+            return text.clone();
+        }
+        if let Some(text) = payload.downcast_ref::<&str>() {
+            return (*text).to_string();
+        }
+        "a non-string panic payload".to_string()
+    }
+
+    fn is_empty(redirects: &Redirects) -> bool {
+        redirects.worktrees_base.is_none()
+            && redirects.config_dir.is_none()
+            && redirects.claude_config_dir.is_none()
+            && redirects.home_dir.is_none()
+            && redirects.hook_command.is_none()
+            && redirects.workspace.is_none()
+    }
+
+    /// Redirects are thread-local, so work handed to another thread escapes
+    /// them unless that thread installs what this one captured. Both workers
+    /// hold a `NoFixtureRoot`, so containment can only come from the install
+    /// and the bare worker takes the escape path whatever the environment.
+    #[test]
+    fn installed_redirects_contain_a_worker_thread() {
+        let root = FixtureRoot::new("baude-testing-install");
+        let _redirect = TestRedirect::new(&root);
+        let redirects = capture();
+
+        let installed = std::thread::spawn(move || {
+            let _no_root = NoFixtureRoot::new();
+            let guard = TestRedirect::install(redirects);
+            let resolved = (crate::git::worktrees_base(), crate::persist::config_dir());
+            drop(guard);
+            (resolved, is_empty(&current()))
+        })
+        .join();
+        let ((worktrees, config), emptied) = installed.unwrap_or_else(|payload| {
+            panic!(
+                "the worker that installed the captured redirects escaped them: {}",
+                panic_text(payload.as_ref())
+            )
+        });
+        assert!(
+            worktrees.starts_with(&*root),
+            "worker worktrees base {} is outside the fixture root {}",
+            worktrees.display(),
+            root.display()
+        );
+        assert!(
+            config.starts_with(&*root),
+            "worker config dir {} is outside the fixture root {}",
+            config.display(),
+            root.display()
+        );
+        assert!(
+            emptied,
+            "the worker's redirects were not empty after its installed guard dropped"
+        );
+
+        let bare = std::thread::spawn(|| {
+            let _no_root = NoFixtureRoot::new();
+            crate::git::worktrees_base()
+        })
+        .join();
+        let payload = match bare {
+            Ok(escaped) => panic!(
+                "a worker without the install resolved {} instead of panicking",
+                escaped.display()
+            ),
+            Err(payload) => payload,
+        };
+        let text = panic_text(payload.as_ref());
+        assert!(
+            text.contains(ESCAPE_PANIC_MARKER),
+            "the bare worker panicked without the escape marker: {text}"
+        );
     }
 }
