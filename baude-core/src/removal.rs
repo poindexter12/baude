@@ -433,12 +433,53 @@ impl From<crate::git::ForcedRemovalError> for DiskRemovalFailure {
 /// This is deliberately not the close protocol or the tombstoned-removal
 /// protocol the TUI uses: a kill failure leaves the row exactly as it was,
 /// with no pending lifecycle written.
+///
+/// `remove` is the composition of three public stages, run back to back:
+/// [`prepare`] (selection, planned clearings, preflight and candidate
+/// validation, with no runtime, disk or file touched), [`stop_and_delete`]
+/// (the kill and disk stages, reading no `RepositoryState`) and [`commit`]
+/// (the one save and the clearing stage). A caller that runs them apart, for
+/// instance to release a lock during the slow kill and delete, must hold an
+/// exclusion across the window that keeps every row of the set from being
+/// added to, reopened or removed by anyone else until `commit` returns.
 pub fn remove(
     state: &mut RepositoryState,
     target: RemovalTarget,
     runtimes: &mut Vec<RowRuntime>,
     save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
 ) -> Result<RemovalReport, RemovalError> {
+    let prepared = prepare(state, target, runtimes)?;
+    let effects = stop_and_delete(&prepared, runtimes)?;
+    commit(state, prepared, effects, runtimes, save)
+}
+
+/// What [`prepare`] resolved: the selected rows and every clearing the
+/// clearing stage will attempt, both derived from the state `prepare` read.
+pub struct PreparedRemoval {
+    set: RemovalSet,
+    planned: Vec<ClearedItem>,
+    candidate: RepositoryState,
+    removed: RemovedRows,
+}
+
+/// What [`stop_and_delete`] did: the runtimes it stopped and the paths it
+/// deleted, kept or found already gone.
+pub struct StageEffects {
+    killed: Vec<KilledRuntime>,
+    disk: DiskResults,
+}
+
+/// Resolve `target` and refuse everything that can be refused before an
+/// irreversible effect: `select_rows`, the planned clearings, `preflight`,
+/// then a candidate with the set's rows removed run through
+/// `validate_for_save`. Touches no runtime, deletes nothing and writes no
+/// file; its only filesystem access is the read-only probes of
+/// `select_rows`, `planned_clearings` and `preflight`.
+pub fn prepare(
+    state: &RepositoryState,
+    target: RemovalTarget,
+    runtimes: &[RowRuntime],
+) -> Result<PreparedRemoval, RemovalError> {
     let set = select_rows(state, target)?;
     let planned = planned_clearings(state, &set);
     preflight(&set, runtimes)?;
@@ -451,16 +492,53 @@ pub fn remove(
     candidate
         .validate_for_save()
         .map_err(RemovalError::Validation)?;
-    let killed = kill_stage(&set, runtimes)?;
-    let disk = disk_stage(&set)?;
+    Ok(PreparedRemoval {
+        set,
+        planned,
+        candidate,
+        removed,
+    })
+}
+
+/// The kill stage, then the disk stage, for the prepared set. Reads no
+/// `RepositoryState`, so it may run without the lock that guards the state,
+/// provided the caller's exclusion keeps the set's rows unchanged until
+/// [`commit`]. An `Err` names the row it stopped on; the state and the file
+/// are untouched and every handle stays in `runtimes`.
+pub fn stop_and_delete(
+    prepared: &PreparedRemoval,
+    runtimes: &mut [RowRuntime],
+) -> Result<StageEffects, RemovalError> {
+    let killed = kill_stage(&prepared.set, runtimes)?;
+    let disk = disk_stage(&prepared.set)?;
+    Ok(StageEffects { killed, disk })
+}
+
+/// Save the removal once and run the clearing stage. `*state` is replaced
+/// and the removed rows' handles are drained from `runtimes` only after the
+/// save returns `Ok` or reports a committed replacement; on every `Err`
+/// `*state` and `runtimes` are untouched.
+pub fn commit(
+    state: &mut RepositoryState,
+    prepared: PreparedRemoval,
+    effects: StageEffects,
+    runtimes: &mut Vec<RowRuntime>,
+    save: impl FnOnce(&crate::persist::StateFile) -> Result<(), crate::persist::SaveError>,
+) -> Result<RemovalReport, RemovalError> {
+    let PreparedRemoval {
+        set,
+        planned,
+        candidate,
+        removed,
+    } = prepared;
     let (persistence, readers_parked) = persist_stage(state, candidate, &set, runtimes, save)?;
     let clearing = clear_stage(&removed, state, &planned);
     Ok(report_from_set(
         &set,
         planned,
         Some(StageResults {
-            killed,
-            disk,
+            killed: effects.killed,
+            disk: effects.disk,
             readers_parked,
             persistence,
             clearing,
