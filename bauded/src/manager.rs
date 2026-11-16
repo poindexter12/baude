@@ -1420,6 +1420,34 @@ impl Manager {
         })
     }
 
+    /// The refusal for session `id` when the row it runs in is reserved: its
+    /// checkout's repository or its standalone folder. The id is resolved
+    /// through `runtime_checkouts` and `runtime_standalones`, which keep their
+    /// entries while a removal holds the session, so a session a removal has
+    /// moved out of `sessions` still answers busy rather than "no session".
+    fn session_busy(&self, id: u64) -> Option<MutationError> {
+        let checkout = self
+            .runtime_checkouts
+            .iter()
+            .find_map(|(key, runtime)| (*runtime == id).then_some(*key));
+        if let Some(checkout) = checkout {
+            let repository = self
+                .repository_state
+                .checkouts
+                .iter()
+                .find(|saved| saved.key == checkout)?
+                .repository_key;
+            return self
+                .repository_reservations
+                .is_reserved(repository)
+                .then(|| self.repository_busy(repository));
+        }
+        let key = self.standalone_owner(id)?;
+        self.standalone_reservations
+            .is_reserved(key)
+            .then(|| self.folder_busy(key))
+    }
+
     /// The refusal for a reserved standalone row, its body naming the folder.
     fn folder_busy(&self, key: StandaloneKey) -> MutationError {
         MutationError::Busy(match self.standalone_path(key) {
@@ -3268,6 +3296,9 @@ impl Manager {
     }
 
     pub fn remove(&mut self, id: u64) -> MutationResult<()> {
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
+        }
         self.session(id)?;
         // A folder session is closed, never dropped: its row stays and must
         // stop recording the runtime.
@@ -3653,6 +3684,9 @@ impl Manager {
             ))
             .into());
         }
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
+        }
         if !self.session(id)?.claude.is_exited() {
             return Err(anyhow!("claude is still running").into());
         }
@@ -3989,6 +4023,9 @@ impl Manager {
     /// stop sending notifications. A manual archive sticks until unarchived
     /// or re-engaged; an automatic one also lifts when a new turn starts.
     pub fn set_archived(&mut self, id: u64, archived: bool) -> MutationResult<()> {
+        if let Some(busy) = self.session_busy(id) {
+            return Err(busy);
+        }
         let s = self.session_mut(id)?;
         let archived_before = (s.archived, s.archived_by_user);
         s.set_archived(archived);

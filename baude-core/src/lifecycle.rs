@@ -2874,8 +2874,11 @@ impl RepositoryReservations {
     }
 
     /// Whether a guard of either kind holds `repository` now.
-    pub fn is_reserved(&self, _repository: RepositoryKey) -> bool {
-        false
+    pub fn is_reserved(&self, repository: RepositoryKey) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&repository)
     }
 }
 
