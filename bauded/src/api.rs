@@ -18,7 +18,8 @@ use baude_core::meta::{HookEvent, ACTIVITY_CAP};
 use baude_core::removal::{RemovalError, RemovalReport, RemovalTarget};
 
 use crate::manager::{
-    lock, MutationError, PermissionView, RemoveRowsError, RowsView, SessionInfo, Shared,
+    lock, MutationError, PermissionView, RemoveRowsError, RowsView, SessionBusy, SessionInfo,
+    Shared,
 };
 use crate::transcript::{self, ChatMessage, EventTail, Tail};
 
@@ -111,8 +112,20 @@ pub fn push_router(state: crate::push::SharedPush) -> Router {
 
 type ApiError = (StatusCode, String);
 
-fn not_found(e: anyhow::Error) -> ApiError {
-    (StatusCode::NOT_FOUND, e.to_string())
+/// Status for a failed lookup on a single-session route. A session a removal
+/// holds out of the registry while it stops runtimes and deletes worktrees
+/// answers 503 with the busy body the four mutating routes use: it comes
+/// back if the removal fails. Any other failed lookup is 404.
+fn session_error(e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<SessionBusy>() {
+        Some(SessionBusy(message)) => (StatusCode::SERVICE_UNAVAILABLE, message.clone()),
+        None => (StatusCode::NOT_FOUND, e.to_string()),
+    }
+}
+
+/// Whether a lookup failed only because a removal holds the session for now.
+fn is_session_busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SessionBusy>().is_some()
 }
 
 fn mutation_error(error: MutationError, fallback: StatusCode) -> ApiError {
@@ -308,9 +321,9 @@ async fn get_session(
     Path(id): Path<u64>,
 ) -> Result<Json<SessionInfo>, ApiError> {
     lock(&state)
-        .info(id)
+        .session_info(id)
         .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no session {id}")))
+        .map_err(session_error)
 }
 
 #[derive(Deserialize)]
@@ -353,7 +366,7 @@ async fn get_messages(
     Path(id): Path<u64>,
     Query(q): Query<MessagesQuery>,
 ) -> Result<Json<Vec<ChatMessage>>, ApiError> {
-    let path = lock(&state).transcript_path(id).map_err(not_found)?;
+    let path = lock(&state).transcript_path(id).map_err(session_error)?;
     let Some(path) = path else {
         // Session exists but Claude hasn't written a transcript yet.
         return Ok(Json(vec![]));
@@ -381,7 +394,7 @@ async fn get_activity(
     Query(q): Query<ActivityQuery>,
 ) -> Result<Json<Vec<HookEvent>>, ApiError> {
     let limit = q.limit.unwrap_or(ACTIVITY_CAP).min(ACTIVITY_CAP);
-    let act = lock(&state).activity(id, limit).map_err(not_found)?;
+    let act = lock(&state).activity(id, limit).map_err(session_error)?;
     Ok(Json(act))
 }
 
@@ -399,6 +412,9 @@ async fn post_message(
         return Err((StatusCode::BAD_REQUEST, "empty message".into()));
     }
     lock(&state).post_message(id, &body.text).map_err(|e| {
+        if is_session_busy(&e) {
+            return session_error(e);
+        }
         let msg = e.to_string();
         if msg.starts_with("no session") {
             (StatusCode::NOT_FOUND, msg)
@@ -414,7 +430,7 @@ async fn interrupt(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).interrupt(id).map_err(not_found)?;
+    lock(&state).interrupt(id).map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -467,7 +483,8 @@ async fn unarchive(
 ///
 /// Security (T-02-08/09): the `Path<u64>` extractor rejects a non-numeric id
 /// at the framework layer; an unknown / unresolvable session is a 404 via
-/// `not_found`; a malformed body is appended best-effort. There is no 500
+/// `session_error`, and a session a removal holds is its 503, so no event is
+/// appended for either; a malformed body is appended best-effort. There is no 500
 /// path. No auth layer — the route inherits the tailnet/loopback-bound,
 /// single-user security model.
 async fn post_event(
@@ -475,7 +492,9 @@ async fn post_event(
     Path(id): Path<u64>,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    lock(&state).ingest_event(id, &body).map_err(not_found)?;
+    lock(&state)
+        .ingest_event(id, &body)
+        .map_err(session_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -483,7 +502,7 @@ async fn post_event(
 /// the `permission-mcp` bridge POSTed, or the resolved decision once a human
 /// answered (the bridge long-polls this until `decision` appears). Returns JSON
 /// `null` when nothing is pending and nothing resolved. Unknown id → 404 via
-/// `not_found`; `Path<u64>` rejects a non-numeric id at the framework layer
+/// `session_error`; `Path<u64>` rejects a non-numeric id at the framework layer
 /// (T-04-09). No auth — inherits the tailnet/loopback single-user model (T-04-08).
 #[derive(Deserialize)]
 struct PermissionQuery {
@@ -514,7 +533,7 @@ async fn get_permission(
         // hang for the full wait window on an unlucky interleaving.
         let notify = {
             let mut m = lock(&state);
-            m.permission_notify(id).map_err(not_found)?
+            m.permission_notify(id).map_err(session_error)?
         };
         // Register the waiter first. `Notify::notified()` only stores a permit
         // for an already-registered waiter, so this MUST precede the state read.
@@ -522,8 +541,8 @@ async fn get_permission(
         tokio::pin!(notified);
         let (pending, decision) = {
             let m = lock(&state);
-            let pending = m.pending(id).map_err(not_found)?;
-            let decision = m.decision(id).map_err(not_found)?;
+            let pending = m.pending(id).map_err(session_error)?;
+            let decision = m.decision(id).map_err(session_error)?;
             (pending, decision)
         };
         // Only block when there is something pending and nothing resolved yet.
@@ -536,8 +555,8 @@ async fn get_permission(
     }
 
     let m = lock(&state);
-    let pending = m.pending(id).map_err(not_found)?;
-    let decision = m.decision(id).map_err(not_found)?;
+    let pending = m.pending(id).map_err(session_error)?;
+    let decision = m.decision(id).map_err(session_error)?;
     drop(m);
     let view = match (pending, decision) {
         // A pending request awaiting a human decision.
@@ -615,7 +634,7 @@ async fn post_permission(
         // forward-compat but not enforced/stored in v0.7 (see PermissionBody).
         lock(&state)
             .resolve_pending(id, &decision)
-            .map_err(not_found)?;
+            .map_err(session_error)?;
         return Ok(StatusCode::ACCEPTED);
     }
 
@@ -632,7 +651,9 @@ async fn post_permission(
         input: body.input.unwrap_or(serde_json::Value::Null),
         ts: body.ts.unwrap_or_else(now_unix_ms),
     };
-    lock(&state).set_pending(id, pending).map_err(not_found)?;
+    lock(&state)
+        .set_pending(id, pending)
+        .map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -641,7 +662,7 @@ async fn get_queue(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Json<Vec<String>>, ApiError> {
-    let path = lock(&state).transcript_path(id).map_err(not_found)?;
+    let path = lock(&state).transcript_path(id).map_err(session_error)?;
     Ok(Json(match path {
         Some(p) => transcript::queued(&p),
         None => vec![],
@@ -652,7 +673,7 @@ async fn get_screen(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Json<crate::manager::Screenshot>, ApiError> {
-    lock(&state).screen(id).map(Json).map_err(not_found)
+    lock(&state).screen(id).map(Json).map_err(session_error)
 }
 
 #[derive(Deserialize)]
@@ -670,7 +691,9 @@ async fn post_keys(
     if body.keys.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no keys".into()));
     }
-    lock(&state).send_keys(id, &body.keys).map_err(not_found)?;
+    lock(&state)
+        .send_keys(id, &body.keys)
+        .map_err(session_error)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -684,7 +707,7 @@ async fn pty_ws(
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Result<axum::response::Response, ApiError> {
     // Validate before upgrading so a bad id is a clean 404, not a dead socket.
-    lock(&state).transcript_path(id).map_err(not_found)?;
+    lock(&state).transcript_path(id).map_err(session_error)?;
     Ok(ws.on_upgrade(move |socket| pty_session(socket, state, id)))
 }
 
@@ -761,14 +784,22 @@ async fn stream(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    lock(&state).transcript_path(id).map_err(not_found)?;
+    lock(&state).transcript_path(id).map_err(session_error)?;
 
     let stream = async_stream::stream! {
         let mut current: Option<PathBuf> = None;
         let mut tail = Tail::default();
         loop {
-            let path = match lock(&state).transcript_path(id) {
+            // Bound first, so the guard drops before any await below.
+            let looked_up = lock(&state).transcript_path(id);
+            let path = match looked_up {
                 Ok(p) => p,
+                // A removal holds the session for now and puts it back if it
+                // fails, so the stream stays open through the busy window.
+                Err(error) if is_session_busy(&error) => {
+                    tokio::time::sleep(Duration::from_millis(STREAM_POLL_MS)).await;
+                    continue;
+                }
                 Err(_) => break, // session deleted
             };
             if let Some(path) = path {
@@ -836,14 +867,21 @@ async fn activity_stream(
     State(state): State<Shared>,
     Path(id): Path<u64>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    lock(&state).event_path(id).map_err(not_found)?;
+    lock(&state).event_path(id).map_err(session_error)?;
 
     let stream = async_stream::stream! {
         let mut current: Option<PathBuf> = None;
         let mut tail = EventTail::default();
         loop {
-            let path = match lock(&state).event_path(id) {
+            // Bound first, so the guard drops before any await below.
+            let looked_up = lock(&state).event_path(id);
+            let path = match looked_up {
                 Ok(p) => p,
+                // As in `stream`: a busy session stays streamed.
+                Err(error) if is_session_busy(&error) => {
+                    tokio::time::sleep(Duration::from_millis(STREAM_POLL_MS)).await;
+                    continue;
+                }
                 Err(_) => break, // session deleted
             };
             if let Some(path) = path {
@@ -2467,8 +2505,9 @@ mod tests {
     struct WindowProbe<T> {
         /// How many removals had entered the slow stage when the probe looked.
         entered: usize,
-        /// Whether `try_lock` found the manager mutex free at that moment.
-        /// Only `WouldBlock` counts as held.
+        /// Whether `try_lock` found the manager mutex free while the removals
+        /// were parked, looking for up to a second. Only `WouldBlock` at
+        /// every look counts as held.
         mutex_free: bool,
         /// The probe's own result, `None` unless every awaited removal entered
         /// and the mutex was free.
@@ -2514,9 +2553,19 @@ mod tests {
             let release = ReleaseOnDrop(pause.clone());
             let all_entered = pause.wait_entered(entrants, Duration::from_secs(10));
             let entered = pause.entered();
-            let mutex_free = match shared.try_lock() {
-                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
-                Err(std::sync::TryLockError::WouldBlock) => false,
+            // Another request, such as an open stream's poll, can hold the
+            // mutex for an instant, so the probe looks for up to a second. A
+            // removal that held it across its slow stage, where it stays
+            // parked until this thread releases it, holds it at every look.
+            let looking = Instant::now() + Duration::from_secs(1);
+            let mutex_free = loop {
+                match shared.try_lock() {
+                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => break true,
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < looking => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => break false,
+                }
             };
             let outcome = (all_entered && mutex_free).then(|| {
                 tokio::runtime::Builder::new_current_thread()
@@ -3625,6 +3674,230 @@ mod tests {
             wait_for_pid_gone(agent_pid),
             "the retried removal's agent is still alive"
         );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// A request on each single-session route of session `id` that looks the
+    /// session up by id, apart from the four mutating routes the busy tests
+    /// above cover and the PTY socket, whose upgrade a `oneshot` request
+    /// cannot reach. Each is labelled for a window probe.
+    fn session_route_requests(id: u64, hook_sid: &str) -> Vec<(String, Request<Body>)> {
+        let path = |tail: &str| format!("/sessions/{id}{tail}");
+        let hook = serde_json::json!({ "session_id": hook_sid, "event": "Stop" }).to_string();
+        vec![
+            ("GET /sessions/{id}".into(), get(&path(""))),
+            ("GET messages".into(), get(&path("/messages"))),
+            (
+                "POST messages".into(),
+                post_json(&path("/messages"), r#"{"text":"hello"}"#),
+            ),
+            ("GET queue".into(), get(&path("/queue"))),
+            ("GET screen".into(), get(&path("/screen"))),
+            (
+                "POST keys".into(),
+                post_json(&path("/keys"), r#"{"keys":["enter"]}"#),
+            ),
+            ("POST interrupt".into(), post_json(&path("/interrupt"), "")),
+            ("GET permission".into(), get(&path("/permission"))),
+            (
+                "POST permission request".into(),
+                post_json(&path("/permission"), r#"{"tool":"Bash"}"#),
+            ),
+            (
+                "POST permission decision".into(),
+                post_json(&path("/permission"), r#"{"decision":"deny"}"#),
+            ),
+            ("GET activity".into(), get(&path("/activity"))),
+            (
+                "POST hook event".into(),
+                Request::post(path("/event"))
+                    .body(Body::from(hook))
+                    .unwrap(),
+            ),
+            ("GET stream".into(), get(&path("/stream"))),
+            ("GET activity-stream".into(), get(&path("/activity-stream"))),
+        ]
+    }
+
+    /// Send every request of `requests` under the window bound, in order.
+    async fn window_requests(
+        app: &Router,
+        requests: Vec<(String, Request<Body>)>,
+    ) -> Vec<WindowRead> {
+        let mut reads = Vec::new();
+        for (what, request) in requests {
+            reads.push(window_request(app, &what, request).await);
+        }
+        reads
+    }
+
+    /// Owner decision on IN-04: while a removal is in its slow stage, every
+    /// single-session route of a doomed session answers the same 503 as the
+    /// four mutating routes, not the 404 of an unknown session. The probe
+    /// runs only once the removal is parked and `try_lock` found the mutex
+    /// free. Once the removal commits, the same routes answer 404.
+    #[tokio::test]
+    async fn removals_doomed_session_routes_are_busy_then_gone() {
+        let (root, fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-session-routes").await;
+        let repo = fixture.path().canonicalize().unwrap();
+        let busy = format!("repository busy: {}", repo.display());
+        let hook_sid = format!("item4-busy-then-gone-{}", std::process::id());
+        let hook_file = baude_core::hook::event_path(&hook_sid);
+        let report = preview_report(&app, key).await;
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_sid = hook_sid.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            window_requests(&probe_app, session_route_requests(id, &probe_sid)).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let reads = window.outcome.expect("the probe ran");
+        assert_window_busy(&reads, &busy, "doomed session route");
+        assert!(
+            !std::path::Path::new(&hook_file).exists(),
+            "a hook event for a doomed session was appended during the window"
+        );
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for read in window_requests(&app, session_route_requests(id, &hook_sid)).await {
+            read.answered(StatusCode::NOT_FOUND);
+        }
+        assert!(!std::path::Path::new(&hook_file).exists());
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// Owner decision on IN-04, the failure side: a folder session's routes
+    /// answer 503 `folder busy: <folder>` during a removal that then fails,
+    /// and serve the session again afterwards. A `stream` opened before the
+    /// removal stays open through the window and the failure, and ends once
+    /// a retried removal commits.
+    #[tokio::test]
+    async fn removals_doomed_session_routes_come_back_after_a_failure() {
+        let (root, _owner, folder, _workspace, shared, app) =
+            folder_fixture("window-session-routes-failure");
+        let id = opened_folder_id(&app, &folder).await;
+        let entry = only_standalone_row(&app).await;
+        let row = serde_json::json!({ "standalone": standalone_key_of(&entry) });
+        let report = preview_target(&app, &row).await;
+        let agent_pid = only_runtime_pid(&report);
+        let busy = format!("folder busy: {}", folder.display());
+        let hook_sid = format!("item4-come-back-{}", std::process::id());
+        let hook_file = baude_core::hook::event_path(&hook_sid);
+        let _ = std::fs::remove_file(&hook_file);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        crate::manager::lock(&shared)
+            .fail_next_agent_teardown_for_test(id, "agent stop refused once");
+        let stream = app
+            .clone()
+            .oneshot(get(&format!("/sessions/{id}/stream")))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        // Driven on this test's runtime, which is free while the removal
+        // runs on the blocking pool, so the stream's loop keeps ticking
+        // through the window. Finishes when the stream ends.
+        let mut stream = stream.into_body();
+        let driver = tokio::spawn(async move { while let Some(Ok(_)) = stream.frame().await {} });
+
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe_sid = hook_sid.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            // More than two ticks of the stream's poll, all inside the window.
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            let named = [
+                "GET /sessions/{id}",
+                "GET messages",
+                "POST keys",
+                "POST hook event",
+            ];
+            let requests = session_route_requests(id, &probe_sid)
+                .into_iter()
+                .filter(|(what, _)| named.contains(&what.as_str()))
+                .collect();
+            window_requests(&probe_app, requests).await
+        });
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(window.mutex_free, "the mutex was held in the slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        assert_window_busy(
+            &window.outcome.expect("the probe ran"),
+            &busy,
+            "doomed folder session route",
+        );
+        assert!(
+            !driver.is_finished(),
+            "owner decision pin: a stream of the doomed session ended during the window"
+        );
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the removal was armed to fail: {body}"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "the refused stop left the agent dead"
+        );
+
+        let path = |tail: &str| format!("/sessions/{id}{tail}");
+        let info = window_request(&app, "GET /sessions/{id} after", get(&path(""))).await;
+        assert_eq!(info.served()["id"], id);
+        window_request(&app, "GET messages after", get(&path("/messages")))
+            .await
+            .served();
+        window_request(
+            &app,
+            "POST keys after",
+            post_json(&path("/keys"), r#"{"keys":["enter"]}"#),
+        )
+        .await
+        .answered(StatusCode::ACCEPTED);
+        let hook = serde_json::json!({ "session_id": hook_sid, "event": "Stop" }).to_string();
+        window_request(
+            &app,
+            "POST hook event after",
+            Request::post(path("/event"))
+                .body(Body::from(hook))
+                .unwrap(),
+        )
+        .await
+        .answered(StatusCode::NO_CONTENT);
+        let appended = std::fs::read_to_string(&hook_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&hook_file);
+        assert!(
+            appended.contains("Stop"),
+            "the hook event was not appended: {appended}"
+        );
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            !driver.is_finished(),
+            "owner decision pin: the stream ended after the failed removal put the session back"
+        );
+
+        let retried = preview_target(&app, &row).await;
+        let (status, body) = removal_call(&app, "/removals", &retried).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("the stream outlived the committed removal of its session")
+            .unwrap();
+        window_request(&app, "GET /sessions/{id} once committed", get(&path("")))
+            .await
+            .answered(StatusCode::NOT_FOUND);
 
         removal_teardown(&shared, &root);
     }

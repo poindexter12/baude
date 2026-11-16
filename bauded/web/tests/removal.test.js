@@ -832,3 +832,18 @@ test("indices_and_tombstones_ignore_prototype_shaped_keys", () => {
   const body = rowsBody();
   assert.deepStrictEqual(applySnapshot(body, {}), body);
 });
+
+// ---- a failed request on one session's route ----
+
+test("session_request_outcome_reads_a_busy_503_as_transient", () => {
+  // While a removal of its row stops runtimes and deletes worktrees, every
+  // route of a doomed session answers 503 with a busy body; the removal can
+  // still fail and the session come back. Only a 404 means it is gone.
+  assert.equal(BaudeRemoval.sessionRequestOutcome(503), "busy");
+  assert.equal(BaudeRemoval.sessionRequestOutcome(404), "gone");
+  // A network failure carries no status; every other status is an ordinary
+  // failure, not a reason to leave the view or to retry it.
+  for (const status of [undefined, 0, 400, 409, 500]) {
+    assert.equal(BaudeRemoval.sessionRequestOutcome(status), "failed", String(status));
+  }
+});

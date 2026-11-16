@@ -3974,7 +3974,8 @@ impl Manager {
     // The bridge POSTs a pending request (set_pending), the PWA/phone POSTs the
     // decision (resolve_pending), and the bridge's GET poll reads it (decision).
     // All route `Err -> 404` via `self.session(id)?`/`session_mut(id)?` exactly
-    // like `ingest_event`. Pitfall 4: these only touch state UNDER the lock; the
+    // like `ingest_event`, or 503 for a session a removal holds, see
+    // `SessionBusy`. Pitfall 4: these only touch state UNDER the lock; the
     // actual wait happens OUTSIDE via the Arc<Notify> from `permission_notify`.
 
     /// Store a fresh pending permission request on a known session, clearing any
@@ -4441,6 +4442,12 @@ impl Manager {
         self.sessions.iter().find(|s| s.id == id).map(session_info)
     }
 
+    /// `GET /sessions/{id}`: the session's info, or the lookup error that
+    /// tells a busy session from a missing one.
+    pub fn session_info(&self, id: u64) -> Result<SessionInfo> {
+        self.session(id).map(session_info)
+    }
+
     /// Reconcile an immediate `--resume` rejection through the ordinary
     /// retained remove boundary so child reaping and retryable lifecycle state
     /// stay identical to an explicit close.
@@ -4709,19 +4716,48 @@ impl Manager {
     }
 
     fn session(&self, id: u64) -> Result<&Session> {
-        self.sessions
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| anyhow!("no session {id}"))
+        match self.sessions.iter().find(|s| s.id == id) {
+            Some(session) => Ok(session),
+            None => Err(self.missing_session(id)),
+        }
     }
 
     fn session_mut(&mut self, id: u64) -> Result<&mut Session> {
-        self.sessions
-            .iter_mut()
-            .find(|s| s.id == id)
-            .ok_or_else(|| anyhow!("no session {id}"))
+        match self.sessions.iter().position(|s| s.id == id) {
+            Some(index) => Ok(&mut self.sessions[index]),
+            None => Err(self.missing_session(id)),
+        }
+    }
+
+    /// The error for a lookup of `id` that found no session. A session a
+    /// removal holds out of the registry during its slow stage is busy, not
+    /// missing: `session_busy` still resolves it through `runtime_checkouts`
+    /// and `runtime_standalones`, which keep it until the commit, and the
+    /// error carries the same body the four mutating routes answer with.
+    /// Once the removal commits, or for an id nothing maps, it is
+    /// "no session".
+    fn missing_session(&self, id: u64) -> anyhow::Error {
+        match self.session_busy(id) {
+            Some(MutationError::Busy(message)) => anyhow::Error::new(SessionBusy(message)),
+            _ => anyhow!("no session {id}"),
+        }
     }
 }
+
+/// A session lookup refused because a removal holds the session out of the
+/// registry while it stops runtimes and deletes worktrees. The message is
+/// the whole body a client is shown, `repository busy: <main checkout>` or
+/// `folder busy: <folder>`. The session comes back if the removal fails.
+#[derive(Debug)]
+pub struct SessionBusy(pub String);
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionBusy {}
 
 /// `GET /sessions/{id}/screen` payload.
 #[derive(Serialize)]

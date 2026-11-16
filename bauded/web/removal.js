@@ -329,6 +329,19 @@
       + `deleted ${plural(deleted, "path", "paths")}`;
   }
 
+  // What a failed request on one session's route means for a view of that
+  // session, read from its HTTP status. A 404 says the daemon has no such
+  // session, so the view is gone. A 503 is transient: while a removal of the
+  // session's row stops runtimes and deletes worktrees, every route of that
+  // session answers 503 with a busy body, and the session comes back if the
+  // removal fails. Any other status, or none for a network failure, is an
+  // ordinary failure.
+  function sessionRequestOutcome(status) {
+    if (status === 404) return "gone";
+    if (status === 503) return "busy";
+    return "failed";
+  }
+
   // ---- snapshot arbitration ----
   //
   // A list poll that left before a removal can land after it and still list
@@ -407,6 +420,7 @@
     parseDriftBody,
     clearingFailures,
     removalNotice,
+    sessionRequestOutcome,
   };
 
   globalThis.BaudeRemoval = BaudeRemoval;
