@@ -10,10 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  # One job per Ubuntu run and one per macOS shard. macOS process start is
+  # several times slower than Linux and the suite spawns real git and PTYs
+  # thousands of times, so the serial macOS suite is split across three runners
+  # by scripts/test-shard.sh; every shard still runs its tests serially, and
+  # together they run every test. Ubuntu runs the whole suite in one job under
+  # its required name. The macOS required check is the check-macos job below.
   check:
+    name: ${{ matrix.shards == 1 && format('check ({0})', matrix.os) || format('check ({0}, shard {1} of {2})', matrix.os, matrix.shard, matrix.shards) }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-22.04]
+        include:
+          - { os: ubuntu-22.04, shard: 1, shards: 1 }
+          - { os: macos-15, shard: 1, shards: 3 }
+          - { os: macos-15, shard: 2, shards: 3 }
+          - { os: macos-15, shard: 3, shards: 3 }
     runs-on: ${{ matrix.os }}
     steps:
       # PR commit checks compare against origin/main, so checkout needs the
@@ -24,17 +36,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The PWA suites are plain node:test files with no package and no
       # lockfile, so the runtime is pinned and nothing is cached.
+      # Lint and self-test steps judge the commit, not the platform's test
+      # split, so they run once per OS, on shard 1.
       - uses: actions/setup-node@v7
+        if: matrix.shard == 1
         with:
           node-version: 26
       - name: run the PWA suites
+        if: matrix.shard == 1
         run: bash scripts/check-web-suites.sh
       - run: cargo fmt --check
+        if: matrix.shard == 1
       - run: cargo clippy --all-targets -- -D warnings
+        if: matrix.shard == 1
       - name: self-test the commit-message guard
+        if: matrix.shard == 1
         run: bash scripts/check-commit-message.sh --self-test
       - name: check pull request commits and title
-        if: github.event_name == 'pull_request'
+        if: matrix.shard == 1 && github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
@@ -43,11 +62,22 @@ jobs:
       # The real-root observer proves itself against synthetic trees before it
       # is trusted to judge a suite run.
       - name: self-test the real-root observer
+        if: matrix.shard == 1
         run: bash scripts/assert-real-roots-untouched.sh --self-test
       # The test leftover check proves itself the same way, against synthetic
       # fixture entries and processes, before it judges the suite.
       - name: self-test the test leftover check
+        if: matrix.shard == 1
         run: bash scripts/assert-no-test-leftovers.sh --self-test
+      # /usr/bin/git on macOS can be the xcrun shim, which execs the real git and
+      # doubles the cost of every call. The suite makes thousands of them, so put
+      # the real binary first when git resolves to the shim.
+      - name: use the real git binary on macOS
+        if: runner.os == 'macOS'
+        run: |
+          if [ "$(command -v git)" = /usr/bin/git ] && real="$(xcrun -f git 2>/dev/null)"; then
+            dirname "$real" >> "$GITHUB_PATH"
+          fi
       # Bracket the suite (#72): the per-resolver guards each prove one
       # resolution is contained, but only this pair proves the aggregate claim
       # — that running the suite neither creates nor modifies the real config
@@ -67,7 +97,7 @@ jobs:
       # mktemp under the runner's own TMPDIR: that keeps macOS on the /var
       # symlink the tests rely on and keeps both runners outside the checkout.
       - name: run the suite and assert it leaves no runtime or fixture entry behind
-        run: bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- cargo test -- --test-threads=1
+        run: bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- bash scripts/test-shard.sh ${{ matrix.shard }} ${{ matrix.shards }}
       # Runs even when the suite failed: a run that fails AND leaks is the case
       # most worth catching, and the two statuses are reported independently so
       # neither masks the other. Guarded on the snapshot having been taken, so
@@ -76,6 +106,22 @@ jobs:
       - name: assert the suite left the real roots untouched
         if: always() && steps.roots-before.outcome == 'success'
         run: bash scripts/assert-real-roots-untouched.sh after
+
+  # The required check for macOS: green only when every macOS shard is green.
+  # `needs` reports the check matrix as a whole, so an Ubuntu failure turns this
+  # red too; the failing job is the one to read.
+  check-macos:
+    name: check (macos-15)
+    needs: check
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: every check job passed
+        env:
+          RESULT: ${{ needs.check.result }}
+        run: |
+          echo "check matrix result: $RESULT"
+          test "$RESULT" = success
 
   docker:
     runs-on: ubuntu-22.04
