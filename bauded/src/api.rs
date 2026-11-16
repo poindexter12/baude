@@ -2534,6 +2534,64 @@ mod tests {
         }
     }
 
+    /// WR-06: while a removal is parked between prepare and the kill, the
+    /// manager mutex is free and other requests are served. The window is
+    /// observed from another thread, not raced: the probe looks only after
+    /// the removal reported that it entered its slow stage, and the removal
+    /// moves on only once the probe released it.
+    #[tokio::test]
+    async fn removals_serve_other_requests_during_the_slow_stage() {
+        let (root, _fixture, _workspace, shared, app, _id, key) =
+            removal_fixture("window-serve").await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+        assert!(pid_is_alive(agent_pid));
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let probe_app = app.clone();
+        let probe = probe_slow_stage(&shared, &pause, 1, move || async move {
+            let rows = window_request(&probe_app, "GET /rows", get("/rows")).await;
+            let sessions = window_request(&probe_app, "GET /sessions", get("/sessions")).await;
+            let info = window_request(&probe_app, "GET /info", get("/info")).await;
+            (rows, sessions, info)
+        });
+        let executed = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()))
+            .await
+            .unwrap();
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(
+            window.mutex_free,
+            "22.1-10 WR-06 pin: the manager mutex was held while the removal was in its slow stage"
+        );
+        let (rows, sessions, info) = window.outcome.expect("the probe ran");
+        let rows = rows.served();
+        assert!(
+            rows_checkout(&rows, key).is_some(),
+            "the doomed checkout is listed until the commit: {rows}"
+        );
+        sessions.served();
+        info.served();
+
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed = body_json(executed).await;
+        assert_eq!(
+            executed["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
