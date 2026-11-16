@@ -583,14 +583,98 @@ impl RuntimeReaper {
     pub fn for_pty(pty: &Pty) -> Self {
         Self::for_identity(pty.process_identity())
     }
+
+    /// The recorded group may be signaled: never `kill(0)` or `kill(-1)`,
+    /// which reach the caller's own group or every process, and never the
+    /// harness's own group.
+    fn group_is_signalable(&self) -> bool {
+        // SAFETY: getpgrp only reads this process's own group id.
+        self.process_group > 1 && self.process_group != unsafe { libc::getpgrp() }
+    }
+
+    /// The recorded session may be swept only when it is the recorded leader's
+    /// own, which holds only for a PTY child that called setsid, and never
+    /// when it is the session the harness itself runs in.
+    fn sweeps_session(&self) -> bool {
+        // SAFETY: getsid(0) only reads this process's own session id.
+        self.leader > 1 && self.session == self.leader && self.session != unsafe { libc::getsid(0) }
+    }
+
+    /// Live pids of the recorded group and, when `sweep` holds, of the
+    /// recorded session. Zombies count as gone; this process is never listed.
+    /// `None` when `ps` could not be run.
+    fn live_members(&self, group: bool, sweep: bool) -> Option<Vec<i32>> {
+        let out = match std::process::Command::new("ps")
+            .args(["-eo", "pid=,pgid=,stat="])
+            .output()
+        {
+            Ok(out) => out,
+            Err(error) => {
+                eprintln!("RuntimeReaper: cannot run ps: {error}");
+                return None;
+            }
+        };
+        // SAFETY: getpid only reads this process's own id.
+        let me = unsafe { libc::getpid() };
+        let members = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid: i32 = fields.next()?.parse().ok()?;
+                let pgid: i32 = fields.next()?.parse().ok()?;
+                let stat = fields.next().unwrap_or("");
+                if pid <= 1 || pid == me || stat.starts_with('Z') {
+                    return None;
+                }
+                let in_group = group && pgid == self.process_group;
+                // SAFETY: getsid only reads the process table.
+                let in_session = sweep && unsafe { libc::getsid(pid) } == self.session;
+                (in_group || in_session).then_some(pid)
+            })
+            .collect();
+        Some(members)
+    }
 }
 
 impl Drop for RuntimeReaper {
+    /// SIGKILL the recorded group, then every process in the recorded session
+    /// when the leader owns it, then wait up to 5 s until none is left. It
+    /// never calls `waitpid`, because the `Pty` owns its child, and it never
+    /// panics: a survivor is printed and the drop returns.
     fn drop(&mut self) {
-        let _ = (self.leader, self.session);
-        // SAFETY: the group id was recorded from this fixture's own leader.
-        unsafe {
-            libc::kill(-self.process_group, libc::SIGKILL);
+        let group = self.group_is_signalable();
+        let sweep = self.sweeps_session();
+        if group {
+            // SAFETY: the group id was recorded from this fixture's own leader
+            // and is neither 0, 1 nor the harness's group. ESRCH and EPERM are
+            // ignored: the group is already gone or no longer ours.
+            unsafe {
+                libc::kill(-self.process_group, libc::SIGKILL);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let Some(live) = self.live_members(group, sweep) else {
+                return;
+            };
+            if live.is_empty() {
+                return;
+            }
+            for pid in &live {
+                // SAFETY: each pid is a live member of the recorded group or of
+                // the recorded session its own leader created.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "RuntimeReaper: pid(s) {live:?} of group {} or session {} still live after 5 s",
+                    self.process_group, self.session
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
