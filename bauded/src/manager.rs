@@ -1397,6 +1397,13 @@ impl Manager {
         // the candidate.
         let overrides = self.survivor_runtime_overrides();
         let standalone_overrides = self.standalone_runtime_overrides();
+        // `rows()` merges live metadata from the registry, and the doomed
+        // rows' sessions are about to leave it until the commit. Writing
+        // their live metadata into the stored rows first keeps `GET /rows`
+        // serving them unchanged through the window. It is what the next
+        // save would write for them anyway, so a removal that does not
+        // commit leaves nothing a save would not have.
+        self.merge_doomed_rows_live_metadata(&fresh, &overrides, &standalone_overrides);
         let runtimes = self.collect_row_runtimes(&fresh);
         let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
         let prepared = match removal::prepare(&self.repository_state, target, &runtimes) {
@@ -1549,6 +1556,28 @@ impl Manager {
         // method or of `begin_removal` publishes.
         self.publish(DaemonEvent::RowsRemoved(report.clone()));
         Ok(report)
+    }
+
+    /// Merge the live metadata of the rows `report` removes, and of no other
+    /// row, into `repository_state`, through the one merge implementation.
+    fn merge_doomed_rows_live_metadata(
+        &mut self,
+        report: &RemovalReport,
+        overrides: &[(CheckoutKey, RetainedSessionState)],
+        standalone_overrides: &[(StandaloneKey, RetainedStandaloneSessionState)],
+    ) {
+        let doomed: Vec<(CheckoutKey, RetainedSessionState)> = overrides
+            .iter()
+            .filter(|(key, _)| report.rows_removed.contains(&RowKey::Checkout(*key)))
+            .cloned()
+            .collect();
+        let doomed_standalone: Vec<(StandaloneKey, RetainedStandaloneSessionState)> =
+            standalone_overrides
+                .iter()
+                .filter(|(key, _)| report.rows_removed.contains(&RowKey::Standalone(*key)))
+                .cloned()
+                .collect();
+        merge_live_runtime_metadata(&mut self.repository_state, &doomed, &doomed_standalone);
     }
 
     /// Put a removal that will not commit back: every handle returns to the
