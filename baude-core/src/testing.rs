@@ -98,10 +98,22 @@ fn current() -> Redirects {
     REDIRECTS.with(|cell| cell.borrow().clone())
 }
 
-/// The redirects live on the calling thread.
+/// The redirects live on the calling thread, as a value that can be moved to
+/// another thread and installed there with [`TestRedirect::install`].
+///
+/// Redirects are thread-local: a thread the test starts sees none of them, so
+/// a test that hands work to another thread must capture here, on its own
+/// thread, and install on the other one before that thread resolves any path.
 pub fn capture() -> Redirects {
     current()
 }
+
+/// `Redirects` must cross threads for [`capture`] and
+/// [`TestRedirect::install`] to work.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Redirects>();
+};
 
 /// Redirects every fixture-owned path for the CURRENT THREAD, restoring the
 /// previous set on drop.
@@ -162,14 +174,17 @@ impl TestRedirect {
         Self::swap(next)
     }
 
-    /// Install `redirects` on the calling thread, restoring its previous set
-    /// on drop.
+    /// Install `redirects`, taken with [`capture`] on another thread, on the
+    /// calling thread, restoring the calling thread's previous set on drop.
+    ///
+    /// Redirects are thread-local, so a test that hands work to another
+    /// thread, a `std::thread` or a `spawn_blocking` closure, must call
+    /// [`capture`] on its own thread and `install` first thing on the other.
+    /// A thread that skips the install resolves real user paths and panics
+    /// with [`ESCAPE_PANIC_MARKER`]. Bind the guard to a named local, and let
+    /// it drop on the thread that installed it.
     pub fn install(redirects: Redirects) -> Self {
-        let _ = redirects;
-        Self {
-            previous: current(),
-            _not_send: PhantomData,
-        }
+        Self::swap(redirects)
     }
 
     fn swap(next: Redirects) -> Self {
