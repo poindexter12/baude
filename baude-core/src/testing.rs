@@ -921,12 +921,17 @@ mod tests {
     /// The real job-control shape: the interactive gate shell runs `sleep` in
     /// a process group of its own, `trap '' HUP` keeps it alive past its
     /// leader, and only the recorded session still names it.
+    ///
+    /// The trailing `true` is load-bearing: bash 5.2 execs the last command of
+    /// a `-c` string in place, so a bare `...; sleep 30` makes `sleep` the
+    /// session leader itself on Linux and the shape is never built. macOS's
+    /// bash 3.2 forks it either way.
     #[test]
     fn runtime_reaper_kills_job_control_children_in_the_recorded_session() {
         let root = FixtureRoot::new("baude-testing-reaper-session");
         let _redirect = TestRedirect::new(&root);
         let mut pty =
-            Pty::spawn(Some("trap '' HUP; sleep 30"), &root, 5, 40).expect("spawn runtime");
+            Pty::spawn(Some("trap '' HUP; sleep 30; true"), &root, 5, 40).expect("spawn runtime");
         let identity = pty.process_identity().clone();
         let reaper = RuntimeReaper::for_pty(&pty);
         assert_eq!(
