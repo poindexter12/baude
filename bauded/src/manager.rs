@@ -273,6 +273,95 @@ impl Drop for StandaloneReservation {
     }
 }
 
+/// Test-only: a gate every removal passes on its way into the slow stage,
+/// after prepare and before the kill, so a test can act while a removal is
+/// parked there. Cloneable; every clone is the same gate.
+///
+/// Each removal entering the slow stage counts itself as entered and waits
+/// for [`Self::release`], bounded at ten seconds; a removal that gave up
+/// waiting is recorded, so a test can tell a real release from a timeout.
+/// Once released the gate stays open. An armed panic is raised by the first
+/// removal that leaves the gate after the release, and by no later one.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RemovalPauseForTest {
+    gate: Arc<(Mutex<RemovalPauseState>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RemovalPauseState {
+    entered: usize,
+    released: bool,
+    timed_out: bool,
+    panic_after_release: Option<String>,
+}
+
+#[cfg(test)]
+impl RemovalPauseForTest {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn state(&self) -> MutexGuard<'_, RemovalPauseState> {
+        self.gate
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Called by a removal at the start of its slow stage.
+    fn enter_and_wait(&self) {
+        let (_, condvar) = &*self.gate;
+        let mut state = self.state();
+        state.entered += 1;
+        condvar.notify_all();
+        let (mut state, wait) = condvar
+            .wait_timeout_while(state, Self::WAIT, |state| !state.released)
+            .unwrap_or_else(|error| error.into_inner());
+        if wait.timed_out() {
+            state.timed_out = true;
+        }
+        let panic = state.panic_after_release.take();
+        // The guard drops before the panic, so the gate is never poisoned.
+        drop(state);
+        if let Some(message) = panic {
+            panic!("{message}");
+        }
+    }
+
+    /// Wait until `count` removals have entered, bounded at `within`.
+    pub(crate) fn wait_entered(&self, count: usize, within: std::time::Duration) -> bool {
+        let (_, condvar) = &*self.gate;
+        let state = self.state();
+        let (state, _) = condvar
+            .wait_timeout_while(state, within, |state| state.entered < count)
+            .unwrap_or_else(|error| error.into_inner());
+        state.entered >= count
+    }
+
+    /// How many removals have entered so far.
+    pub(crate) fn entered(&self) -> usize {
+        self.state().entered
+    }
+
+    /// Let every parked removal, and every later one, through.
+    pub(crate) fn release(&self) {
+        let (_, condvar) = &*self.gate;
+        self.state().released = true;
+        condvar.notify_all();
+    }
+
+    /// Whether any removal gave up waiting for the release.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.state().timed_out
+    }
+
+    /// Make the first removal that leaves the gate after the release panic
+    /// with `message`, from inside its slow stage.
+    pub(crate) fn panic_after_release(&self, message: &str) {
+        self.state().panic_after_release = Some(message.to_string());
+    }
+}
+
 /// Overwrite the retained session metadata of every checkout still present in
 /// `state` with its live value. The single merge implementation: both the
 /// ordinary save and the removal save go through it, so the two cannot drift.
@@ -355,6 +444,9 @@ pub struct Manager {
     atomic_failure_window_for_test: (usize, usize),
     #[cfg(test)]
     spawn_error_for_test: Option<String>,
+    /// Test-only: the gate a removal passes between prepare and the kill.
+    #[cfg(test)]
+    removal_pause_for_test: Option<RemovalPauseForTest>,
     /// Startup timing stages (config load, state load, listener bound, etc.)
     pub startup_timing: crate::timing::StartupTiming,
 }
@@ -783,6 +875,8 @@ impl Manager {
             atomic_failure_window_for_test: (0, usize::MAX),
             #[cfg(test)]
             spawn_error_for_test: None,
+            #[cfg(test)]
+            removal_pause_for_test: None,
             startup_timing: crate::timing::StartupTiming::new(0),
         }
     }
@@ -1258,7 +1352,23 @@ impl Manager {
             }
             persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &merged)
         };
-        let result = removal::remove(&mut self.repository_state, target, &mut runtimes, save);
+        // Core's three stages, in the order `removal::remove` runs them. The
+        // test gate sits between prepare and the kill, the slow stage's start.
+        let result =
+            removal::prepare(&self.repository_state, target, &runtimes).and_then(|prepared| {
+                #[cfg(test)]
+                if let Some(pause) = &self.removal_pause_for_test {
+                    pause.enter_and_wait();
+                }
+                let effects = removal::stop_and_delete(&prepared, &mut runtimes)?;
+                removal::commit(
+                    &mut self.repository_state,
+                    prepared,
+                    effects,
+                    &mut runtimes,
+                    save,
+                )
+            });
         let report = match result {
             Ok(report) => report,
             Err(error) => {
@@ -1590,6 +1700,16 @@ impl Manager {
         self.repository_reservations
             .reserve(key)
             .unwrap_or_else(|_| panic!("repository {key:?} is already reserved"))
+    }
+
+    /// Test-only: park every removal from now on at the start of its slow
+    /// stage, after prepare and before the kill, until the returned gate is
+    /// released. See [`RemovalPauseForTest`].
+    #[cfg(test)]
+    pub(crate) fn pause_removals_for_test(&mut self) -> RemovalPauseForTest {
+        let pause = RemovalPauseForTest::default();
+        self.removal_pause_for_test = Some(pause.clone());
+        pause
     }
 
     /// Take the real reservation of standalone row `key`, the folder

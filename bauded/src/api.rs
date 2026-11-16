@@ -2409,6 +2409,131 @@ mod tests {
         agent_pid
     }
 
+    /// What a window probe saw while removals were parked at the start of
+    /// their slow stage.
+    struct WindowProbe<T> {
+        /// How many removals had entered the slow stage when the probe looked.
+        entered: usize,
+        /// Whether `try_lock` found the manager mutex free at that moment.
+        /// Only `WouldBlock` counts as held.
+        mutex_free: bool,
+        /// The probe's own result, `None` unless every awaited removal entered
+        /// and the mutex was free.
+        outcome: Option<T>,
+    }
+
+    /// Releases the gate when dropped, so a probe that panics never leaves a
+    /// removal waiting out its bound.
+    struct ReleaseOnDrop(crate::manager::RemovalPauseForTest);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Start a thread that waits until `entrants` removals are parked at
+    /// `pause`, records whether the manager mutex is free, then, only if it
+    /// is, runs `probe` on a current-thread runtime of its own, and finally
+    /// releases the gate. The test thread's redirects are captured here and
+    /// installed first on the thread. The removal itself is driven from the
+    /// test body, so its handler captures the test thread's redirects too.
+    ///
+    /// Run this way, a removal that held the mutex across its slow stage
+    /// cannot hang the test: the probe sees `WouldBlock`, skips its requests
+    /// and releases the gate, and the test then fails on `mutex_free`.
+    fn probe_slow_stage<T, F, Fut>(
+        shared: &Shared,
+        pause: &crate::manager::RemovalPauseForTest,
+        entrants: usize,
+        probe: F,
+    ) -> std::thread::JoinHandle<WindowProbe<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+    {
+        let redirects = baude_core::testing::capture();
+        let shared = Arc::clone(shared);
+        let pause = pause.clone();
+        std::thread::spawn(move || {
+            let _redirect = baude_core::testing::TestRedirect::install(redirects);
+            let release = ReleaseOnDrop(pause.clone());
+            let all_entered = pause.wait_entered(entrants, Duration::from_secs(10));
+            let entered = pause.entered();
+            let mutex_free = match shared.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            let outcome = (all_entered && mutex_free).then(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(probe())
+            });
+            drop(release);
+            WindowProbe {
+                entered,
+                mutex_free,
+                outcome,
+            }
+        })
+    }
+
+    /// One request made during a removal's slow stage.
+    #[derive(Debug)]
+    struct WindowRead {
+        what: String,
+        /// `None` when no answer came within two seconds.
+        status: Option<StatusCode>,
+        body: Vec<u8>,
+        elapsed: Duration,
+    }
+
+    impl WindowRead {
+        /// Pin the read to 200 within two seconds and return its body.
+        fn served(&self) -> serde_json::Value {
+            assert_eq!(
+                self.status,
+                Some(StatusCode::OK),
+                "22.1-10 window pin: {} during the slow stage: {self:?}, body {}",
+                self.what,
+                String::from_utf8_lossy(&self.body)
+            );
+            assert!(
+                self.elapsed < Duration::from_secs(2),
+                "22.1-10 window pin: {} took {:?} during the slow stage",
+                self.what,
+                self.elapsed
+            );
+            serde_json::from_slice(&self.body).unwrap()
+        }
+    }
+
+    /// Send `request` under a two-second bound, timing it.
+    async fn window_request(app: &Router, what: &str, request: Request<Body>) -> WindowRead {
+        let started = Instant::now();
+        let answered = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, bytes.to_vec())
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let (status, body) = match answered {
+            Ok((status, body)) => (Some(status), body),
+            Err(_) => (None, Vec::new()),
+        };
+        WindowRead {
+            what: what.to_string(),
+            status,
+            body,
+            elapsed,
+        }
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
