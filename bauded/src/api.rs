@@ -153,7 +153,10 @@ fn removal_error(error: RemoveRowsError) -> axum::response::Response {
             | RemovalError::RuntimeIdentityMismatch { .. }
             | RemovalError::Validation(_)
             | RemovalError::SelectionChanged { .. },
-        ) => StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        // The slow stage panicked after the handles were put back: a
+        // server-side failure, and some runtime may already be stopped.
+        | RemoveRowsError::SlowStagePanicked(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     match error {
         RemoveRowsError::Drift(report) => (status, Json(*report)).into_response(),
@@ -178,14 +181,62 @@ async fn preview_removal(
 /// `POST /removals`: the body is the previewed report echoed verbatim. Only
 /// its target and its three compared sets are read; every path, runtime and
 /// row acted on comes from the daemon's own state.
+///
+/// The whole removal runs in one `spawn_blocking` closure, which runs to the
+/// end once started: a client that goes away mid-removal drops only the
+/// await below, never the commit or the return of the runtime handles. The
+/// manager lock is taken twice inside it, for `begin_removal` and for
+/// `finish_removal`; the kill and the delete between them run with no lock,
+/// so other requests are served meanwhile. No `MutexGuard` crosses an await.
 async fn execute_removal(
     State(state): State<Shared>,
     Json(previewed): Json<RemovalReport>,
 ) -> axum::response::Response {
-    let mut manager = lock(&state);
-    match manager.remove_rows(&previewed) {
+    // Fixture redirects are thread-local; the blocking thread gets the
+    // handler thread's before it resolves any path.
+    #[cfg(test)]
+    let redirects = baude_core::testing::capture();
+    let joined = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _redirect = baude_core::testing::TestRedirect::install(redirects);
+        run_removal(&state, &previewed)
+    })
+    .await;
+    match joined {
+        Ok(response) => response,
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("removal task failed: {join}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The three stages of `POST /removals`, on the blocking thread.
+fn run_removal(state: &Shared, previewed: &RemovalReport) -> axum::response::Response {
+    let mut inflight = {
+        let mut manager = lock(state);
+        match manager.begin_removal(previewed) {
+            Ok(inflight) => inflight,
+            Err(error) => return removal_refusal(&manager, error),
+        }
+    };
+    let stage2 = inflight.stop_and_delete();
+    let mut manager = lock(state);
+    match manager.finish_removal(inflight, stage2) {
         Ok(report) => Json(report).into_response(),
-        Err(RemoveRowsError::Busy(repository)) => {
+        Err(error) => removal_refusal(&manager, error),
+    }
+}
+
+/// The response for a removal that did not happen, built under the manager
+/// lock so a busy body can name the path the daemon resolved for itself.
+fn removal_refusal(
+    manager: &crate::manager::Manager,
+    error: RemoveRowsError,
+) -> axum::response::Response {
+    match error {
+        RemoveRowsError::Busy(repository) => {
             // The key alone names nothing a client can show, so the body
             // carries the repository path the daemon resolved for itself.
             match manager.repository_path(repository) {
@@ -197,7 +248,7 @@ async fn execute_removal(
                 None => removal_error(RemoveRowsError::Busy(repository)),
             }
         }
-        Err(RemoveRowsError::FolderBusy(key)) => match manager.standalone_path(key) {
+        RemoveRowsError::FolderBusy(key) => match manager.standalone_path(key) {
             Some(path) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("folder busy: {}", path.display()),
@@ -205,7 +256,7 @@ async fn execute_removal(
                 .into_response(),
             None => removal_error(RemoveRowsError::FolderBusy(key)),
         },
-        Err(error) => removal_error(error),
+        error => removal_error(error),
     }
 }
 
@@ -4414,14 +4465,17 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
-    /// API-01 concurrency edge. Both requests carry the same previewed report
-    /// and contend on the manager mutex; whichever loses must find the row
-    /// already gone. The fresh restore at the end is what witnesses that no
-    /// partial state is readable: core leaves the state untouched on a
-    /// failure and persists with one atomic save.
+    /// API-01 concurrency edge. Both requests carry the same previewed report.
+    /// The loser either arrives while the winner holds the repository
+    /// reservation, from its first lock scope until after its commit, and
+    /// answers 503 busy, or arrives after the commit and finds the row gone,
+    /// 404. The fresh restore at the end is what witnesses that no partial
+    /// state is readable: core leaves the state untouched on a failure and
+    /// persists with one atomic save.
     #[tokio::test]
     async fn removals_concurrent_execute_of_the_same_row_commits_once() {
-        let (root, _fixture, workspace, shared, app, id, key) = removal_fixture("concurrent").await;
+        let (root, fixture, workspace, shared, app, id, key) = removal_fixture("concurrent").await;
+        let main_checkout = fixture.path().canonicalize().unwrap();
         let report = preview_report(&app, key).await;
         let agent_pid = previewed_agent_pid(&report, key);
         assert!(pid_is_alive(agent_pid));
@@ -4440,11 +4494,17 @@ mod tests {
         }
         outcomes.sort();
         let statuses: Vec<u16> = outcomes.iter().map(|(status, _)| *status).collect();
-        assert_eq!(
-            statuses,
-            [200, 404],
-            "one removal must win and the other must find the row gone: {outcomes:?}"
+        assert!(
+            statuses == [200, 404] || statuses == [200, 503],
+            "one removal must win and the other must find the row gone or busy: {outcomes:?}"
         );
+        if statuses[1] == 503 {
+            assert_eq!(
+                outcomes[1].1,
+                format!("repository busy: {}", main_checkout.display()),
+                "{outcomes:?}"
+            );
+        }
 
         // One kill: the process is gone, and only the winner reports it.
         assert!(
@@ -5409,13 +5469,20 @@ mod tests {
             let parent_won = parent_status == StatusCode::OK;
             let child_won = child_status == StatusCode::OK;
             assert!(parent_won != child_won, "{outcome}");
-            // The loser's status names why: its target is gone, or its
-            // compared sets changed under it.
-            if parent_won {
-                assert_eq!(child_status, StatusCode::NOT_FOUND, "{outcome}");
+            // The loser's status names why: the winner still held the
+            // repository, its target is gone, or its compared sets changed
+            // under it.
+            // A child that lost finds its row gone; a repository removal that
+            // lost finds its row set changed.
+            let (loser_status, gone_or_changed) = if parent_won {
+                (child_status, StatusCode::NOT_FOUND)
             } else {
-                assert_eq!(parent_status, StatusCode::CONFLICT, "{outcome}");
-            }
+                (parent_status, StatusCode::CONFLICT)
+            };
+            assert!(
+                loser_status == gone_or_changed || loser_status == StatusCode::SERVICE_UNAVAILABLE,
+                "{outcome}"
+            );
 
             let after = rows_body(app).await;
             if parent_won {

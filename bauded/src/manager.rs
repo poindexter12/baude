@@ -18,7 +18,8 @@ use baude_core::meta::{now_unix_ms, ClaudeMeta, HookEvent};
 use baude_core::persist::{self, LegacyReconciliation, LoadOutcome, StateFile};
 use baude_core::pty::Pty;
 use baude_core::removal::{
-    self, PersistenceOutcome, RemovalError, RemovalReport, RemovalTarget, RowKey, RowRuntime,
+    self, PersistenceOutcome, PreparedRemoval, RemovalError, RemovalReport, RemovalTarget, RowKey,
+    RowRuntime, StageEffects,
 };
 use baude_core::repository::{
     CheckoutHealth, CheckoutKey, CheckoutLifecycle, CheckoutRole, OwnedRuntime, PersistedPath,
@@ -200,7 +201,7 @@ impl DaemonEvent {
     }
 }
 
-/// Why `Manager::remove_rows` did not remove anything.
+/// Why `Manager::begin_removal` or `Manager::finish_removal` removed nothing.
 #[derive(Debug)]
 pub enum RemoveRowsError {
     /// The row set, runtimes or deleted paths changed since the preview; the
@@ -212,6 +213,9 @@ pub enum RemoveRowsError {
     Busy(RepositoryKey),
     /// The standalone row is reserved by another removal.
     FolderBusy(StandaloneKey),
+    /// The slow stage, the kill and the delete, panicked; the payload is the
+    /// panic message. Every runtime handle was put back and nothing saved.
+    SlowStagePanicked(String),
 }
 
 impl std::fmt::Display for RemoveRowsError {
@@ -222,7 +226,63 @@ impl std::fmt::Display for RemoveRowsError {
             Self::Blocked(error) => write!(f, "{error}"),
             Self::Busy(repository) => write!(f, "repository busy: {repository:?}"),
             Self::FolderBusy(key) => write!(f, "folder busy: {key:?}"),
+            Self::SlowStagePanicked(message) => write!(
+                f,
+                "removal panicked while stopping runtimes and deleting worktrees, \
+                 nothing was saved: {message}"
+            ),
         }
+    }
+}
+
+/// What the unlocked slow stage of a removal returned: core's
+/// `stop_and_delete` result, or the panic it raised.
+pub type SlowStageOutcome = std::thread::Result<std::result::Result<StageEffects, RemovalError>>;
+
+/// A removal between its two locked stages, from [`Manager::begin_removal`]
+/// to [`Manager::finish_removal`]. It owns the runtime handles moved out of
+/// the registry and the reservation that keeps every other mutation of the
+/// rows out until the commit.
+pub struct RemovalInFlight {
+    prepared: PreparedRemoval,
+    runtimes: Vec<RowRuntime>,
+    /// The session ids moved out of the registry.
+    consumed: Vec<u64>,
+    overrides: Vec<(CheckoutKey, RetainedSessionState)>,
+    standalone_overrides: Vec<(StandaloneKey, RetainedStandaloneSessionState)>,
+    #[cfg(test)]
+    pause: Option<RemovalPauseForTest>,
+    /// Held, never read: dropping the value releases the repository.
+    _repository_reservation: Option<lifecycle::RepositoryReservation>,
+    /// Held, never read: dropping the value releases the standalone row.
+    _standalone_reservation: Option<StandaloneReservation>,
+}
+
+impl RemovalInFlight {
+    /// Stage two, with no manager lock held: core's kill and disk stages,
+    /// which read no `RepositoryState`. The test gate and `stop_and_delete`
+    /// run inside one `catch_unwind`, so a panic from either is caught the
+    /// same way; the handles stay owned by `self` whatever happens, for
+    /// `finish_removal` to commit or put back.
+    pub fn stop_and_delete(&mut self) -> SlowStageOutcome {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(pause) = &self.pause {
+                pause.enter_and_wait();
+            }
+            removal::stop_and_delete(&self.prepared, &mut self.runtimes)
+        }))
+    }
+}
+
+/// The text of a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "a panic with no message".to_string()
     }
 }
 
@@ -1264,20 +1324,35 @@ impl Manager {
         &self,
         target: RemovalTarget,
     ) -> std::result::Result<RemovalReport, RemovalError> {
-        // No reservation: the caller holds the global manager mutex, which
-        // already serializes this read against every mutation, and core's
-        // own `remove` re-selects its rows rather than trusting a preview.
+        // No reservation: a preview is a read of the stored rows under the
+        // caller's lock. It may run while another removal is in its slow
+        // stage, when the doomed rows are still stored, and then reads them
+        // as they were; executing such a preview meets that removal's
+        // reservation and answers busy. `begin_removal` recomputes the
+        // report under its own lock and core's `commit` re-selects its rows,
+        // so neither trusts a preview.
         removal::preview_removal(&self.repository_state, target)
     }
 
-    /// `POST /removals`: kill, delete and drop the previewed rows in one save.
+    /// `POST /removals`, stage one, under the manager lock: refuse a blocked
+    /// persistence, reserve the target's repository or standalone row,
+    /// recompute the report and compare it with the previewed one, move the
+    /// rows' live sessions out of the registry and run core's `prepare`.
+    ///
+    /// The returned value owns the reservation, the moved runtime handles
+    /// and the prepared set. The caller drops the lock, runs
+    /// [`RemovalInFlight::stop_and_delete`] without it, and hands both back
+    /// to [`Self::finish_removal`] under the lock again. The reservation is
+    /// held from before the recheck until `finish_removal` has published,
+    /// which is what keeps every other mutation of these rows out of the
+    /// unlocked window.
     ///
     /// The Phase 18 force path, not the close protocol: nothing here routes
     /// through `Manager::remove` or `teardown_retained_runtime`.
-    pub fn remove_rows(
+    pub fn begin_removal(
         &mut self,
         previewed: &RemovalReport,
-    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+    ) -> std::result::Result<RemovalInFlight, RemoveRowsError> {
         if self.persistence_blocked {
             return Err(RemoveRowsError::Blocked(
                 persist::SaveError::before_replacement(anyhow!(
@@ -1286,7 +1361,7 @@ impl Manager {
             ));
         }
         let target = previewed.target;
-        let _reservation = match self.removal_target_repository(target) {
+        let repository_reservation = match self.removal_target_repository(target) {
             Some(repository) => Some(
                 self.repository_reservations
                     .reserve(repository)
@@ -1296,8 +1371,8 @@ impl Manager {
         };
         // A standalone row has no repository to reserve, so the daemon's own
         // registry refuses a second removal of the same folder. Like the
-        // repository guard, it lives until this method returns.
-        let _standalone_reservation = match target {
+        // repository guard, it is carried in the in-flight value.
+        let standalone_reservation = match target {
             RemovalTarget::Standalone(key) => Some(
                 self.standalone_reservations
                     .reserve(key)
@@ -1305,8 +1380,8 @@ impl Manager {
             ),
             RemovalTarget::Repository(_) | RemovalTarget::Checkout(_) => None,
         };
-        // The report is recomputed under the caller's lock. Only what the run
-        // would do is compared; `cleared` and `already_removed` are filesystem
+        // The report is recomputed under the lock. Only what the run would
+        // do is compared; `cleared` and `already_removed` are filesystem
         // probes that would make the recheck flap on advisory state.
         let fresh = self
             .preview_removal(target)
@@ -1317,14 +1392,76 @@ impl Manager {
         {
             return Err(RemoveRowsError::Drift(Box::new(fresh)));
         }
-        // Snapshot before the core call: the closure cannot borrow `self`
-        // while `remove` holds `&mut self.repository_state`. The removed rows'
-        // sessions are still registered here, and the merge skips them because
-        // their checkouts are gone from the candidate.
+        // Snapshot while the removed rows' sessions are still registered;
+        // the merge at save time skips them because their rows are gone from
+        // the candidate.
         let overrides = self.survivor_runtime_overrides();
         let standalone_overrides = self.standalone_runtime_overrides();
-        let mut runtimes = self.collect_row_runtimes(&fresh);
+        let runtimes = self.collect_row_runtimes(&fresh);
         let consumed: Vec<u64> = runtimes.iter().map(|runtime| runtime.session.id).collect();
+        let prepared = match removal::prepare(&self.repository_state, target, &runtimes) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.abandon_removal(runtimes, &error);
+                return Err(RemoveRowsError::Removal(error));
+            }
+        };
+        Ok(RemovalInFlight {
+            prepared,
+            runtimes,
+            consumed,
+            overrides,
+            standalone_overrides,
+            #[cfg(test)]
+            pause: self.removal_pause_for_test.clone(),
+            _repository_reservation: repository_reservation,
+            _standalone_reservation: standalone_reservation,
+        })
+    }
+
+    /// `POST /removals`, stage three, under the manager lock again: commit
+    /// what the unlocked stage did, or put everything back.
+    ///
+    /// A panic or an error from the slow stage, and every error from core's
+    /// `commit`, return every runtime handle to the registry and publish
+    /// nothing; `repository_state` is untouched on all of them. Only a
+    /// committed save reaches the one `publish`. The reservation the
+    /// in-flight value carries is released when this returns, after that
+    /// publish.
+    pub fn finish_removal(
+        &mut self,
+        inflight: RemovalInFlight,
+        stage2: SlowStageOutcome,
+    ) -> std::result::Result<RemovalReport, RemoveRowsError> {
+        let RemovalInFlight {
+            prepared,
+            mut runtimes,
+            consumed,
+            overrides,
+            standalone_overrides,
+            #[cfg(test)]
+                pause: _,
+            _repository_reservation,
+            _standalone_reservation,
+        } = inflight;
+        let effects = match stage2 {
+            Ok(Ok(effects)) => effects,
+            Ok(Err(error)) => {
+                self.abandon_removal(runtimes, &error);
+                return Err(RemoveRowsError::Removal(error));
+            }
+            Err(panic) => {
+                // The handles were never moved into the panicking closure, so
+                // every one of them is still here to put back.
+                let message = panic_message(panic.as_ref());
+                self.restore_row_runtimes(runtimes);
+                #[cfg(test)]
+                {
+                    self.atomic_failure_for_test = None;
+                }
+                return Err(RemoveRowsError::SlowStagePanicked(message));
+            }
+        };
         let persist_enabled = self.persist;
         #[cfg(test)]
         let test_target = self.persistence_target_for_test.clone();
@@ -1352,37 +1489,21 @@ impl Manager {
             }
             persist::save_for_workspace_status(STATE_BASE, baude_core::workspace::active(), &merged)
         };
-        // Core's three stages, in the order `removal::remove` runs them. The
-        // test gate sits between prepare and the kill, the slow stage's start.
-        let result =
-            removal::prepare(&self.repository_state, target, &runtimes).and_then(|prepared| {
-                #[cfg(test)]
-                if let Some(pause) = &self.removal_pause_for_test {
-                    pause.enter_and_wait();
-                }
-                let effects = removal::stop_and_delete(&prepared, &mut runtimes)?;
-                removal::commit(
-                    &mut self.repository_state,
-                    prepared,
-                    effects,
-                    &mut runtimes,
-                    save,
-                )
-            });
+        let result = removal::commit(
+            &mut self.repository_state,
+            prepared,
+            effects,
+            &mut runtimes,
+            save,
+        );
         let report = match result {
             Ok(report) => report,
             Err(error) => {
-                // Core left `repository_state` untouched and every handle in
-                // the Vec, so the rows and their registry entries all stand.
-                self.restore_row_runtimes(runtimes);
-                #[cfg(test)]
-                {
-                    self.atomic_failure_for_test = None;
-                }
-                if matches!(error, RemovalError::Persist { .. }) {
-                    self.persistence_dirty = true;
-                    self.persistence_error = Some(error.to_string());
-                }
+                // A persist failure, `SelectionChanged` or a validation
+                // refusal: core left `repository_state` untouched and every
+                // handle in the Vec, so the rows and their registry entries
+                // all stand.
+                self.abandon_removal(runtimes, &error);
                 return Err(RemoveRowsError::Removal(error));
             }
         };
@@ -1419,13 +1540,30 @@ impl Manager {
             // A real run never reports a planned outcome.
             PersistenceOutcome::Planned => {}
         }
-        // The caller holds the manager mutex for this whole method, so no
-        // reader can see the row after the event is queued. That is a
-        // property of this code position, not something a test observes.
-        // Core's durable save has returned, which covers `SavedDegraded`: the
-        // replacement committed. No other exit of this method publishes.
+        // The caller holds the manager mutex across this whole method, the
+        // commit lock scope, so no reader can see the row after the event is
+        // queued: core's commit replaced the state above under the same
+        // guard. That is a property of this code position, not something a
+        // test observes. Core's durable save has returned, which covers
+        // `SavedDegraded`: the replacement committed. No other exit of this
+        // method or of `begin_removal` publishes.
         self.publish(DaemonEvent::RowsRemoved(report.clone()));
         Ok(report)
+    }
+
+    /// Put a removal that will not commit back: every handle returns to the
+    /// registry, the test save failure is cleared, and a persist failure
+    /// marks persistence degraded, exactly as one failed save does.
+    fn abandon_removal(&mut self, runtimes: Vec<RowRuntime>, error: &RemovalError) {
+        self.restore_row_runtimes(runtimes);
+        #[cfg(test)]
+        {
+            self.atomic_failure_for_test = None;
+        }
+        if matches!(error, RemovalError::Persist { .. }) {
+            self.persistence_dirty = true;
+            self.persistence_error = Some(error.to_string());
+        }
     }
 
     /// A receiver for every event published from now on. Nothing published
