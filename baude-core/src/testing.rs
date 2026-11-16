@@ -710,8 +710,16 @@ fn make_owner_writable(path: &Path) {
 /// under an interactive shell, whose job control puts the command in a
 /// process group of its own, and a command that ignores HUP outlives its
 /// leader there. What still names it is the session the PTY child created.
+///
+/// Pids are reused. Once the leader is reaped and its group is empty, the
+/// kernel may give its pid to a stranger, and a stranger that calls setsid
+/// then owns a group and a session with the recorded ids. So before it
+/// signals anything the reaper checks the recorded leader's start time, as
+/// `Pty::signal_verified` does, and leaves alone a pid that now names
+/// another process.
 pub struct RuntimeReaper {
     leader: i32,
+    start_time: u64,
     process_group: i32,
     session: i32,
 }
@@ -721,8 +729,29 @@ impl RuntimeReaper {
     pub fn for_identity(identity: &crate::repository::ProcessIdentity) -> Self {
         Self {
             leader: identity.pid as i32,
+            start_time: identity.start_time,
             process_group: identity.process_group,
             session: identity.session,
+        }
+    }
+
+    /// Whether a live process holds pid `pid` and is not the recorded
+    /// leader: a different pid than the leader's, or the leader's pid with
+    /// another start time. A pid nobody holds is taken as not reused: a
+    /// stranger's group or session with that id needs a process holding the
+    /// pid to create it, so what the recorded ids name then is the runtime's
+    /// own orphans. The one case this cannot tell apart is a stranger that
+    /// took the pid, made the group or session and already exited. When the
+    /// process cannot be inspected the answer is yes, so nothing is signalled
+    /// on a guess.
+    fn pid_names_a_stranger(&self, pid: i32) -> bool {
+        match crate::session::inspect_process_identity(pid as u32) {
+            Ok(None) => false,
+            Ok(Some(live)) => pid != self.leader || live.start_time != self.start_time,
+            Err(error) => {
+                eprintln!("RuntimeReaper: cannot verify pid {pid}, signalling nothing: {error}");
+                true
+            }
         }
     }
 
@@ -790,9 +819,13 @@ impl Drop for RuntimeReaper {
     /// when the leader owns it, then wait up to 5 s until none is left. It
     /// never calls `waitpid`, because the `Pty` owns its child, and it never
     /// panics: a survivor is printed and the drop returns.
+    ///
+    /// The group is signalled only while no stranger holds its id as a pid,
+    /// and the session only while no stranger holds the leader's pid; both
+    /// are checked again before every round of signals.
     fn drop(&mut self) {
-        let group = self.group_is_signalable();
-        let sweep = self.sweeps_session();
+        let group = self.group_is_signalable() && !self.pid_names_a_stranger(self.process_group);
+        let sweep = self.sweeps_session() && !self.pid_names_a_stranger(self.session);
         if group {
             // SAFETY: the group id was recorded from this fixture's own leader
             // and is neither 0, 1 nor the harness's group. ESRCH and EPERM are
@@ -807,6 +840,17 @@ impl Drop for RuntimeReaper {
                 return;
             };
             if live.is_empty() {
+                return;
+            }
+            // The leader's pid can be handed out while this loop waits.
+            if (group && self.pid_names_a_stranger(self.process_group))
+                || (sweep && self.pid_names_a_stranger(self.session))
+            {
+                eprintln!(
+                    "RuntimeReaper: pid {} now names another process; leaving group {} and \
+                     session {} alone",
+                    self.leader, self.process_group, self.session
+                );
                 return;
             }
             for pid in &live {
@@ -1034,9 +1078,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // The named child's real start time, so the group kill still reaches
+        // it and only the session rule is under test here.
+        let start_time = crate::session::inspect_process_identity(named_pid as u32)
+            .expect("inspect the named child")
+            .expect("the named child is live")
+            .start_time;
         let identity = crate::repository::ProcessIdentity {
             pid: named_pid as u32,
-            start_time: 0,
+            start_time,
             process_group: named_pid,
             session: outsider_pid,
         };
@@ -1055,6 +1105,80 @@ mod tests {
         }
         let _ = outsider.wait();
         let _ = named.wait();
+    }
+
+    /// WR-02: once the recorded leader is reaped, the kernel may hand its pid
+    /// to a stranger, and a stranger that calls setsid, as every terminal tab
+    /// and PTY child does, then owns a group and a session with the recorded
+    /// ids. The reaper tells the two apart by start time, as
+    /// `Pty::signal_verified` does, and signals neither. The stranger here is
+    /// a live session leader with a job in a group of its own, under an
+    /// identity whose start time is not its own.
+    #[test]
+    fn runtime_reaper_signals_nothing_when_the_leader_pid_was_reused() {
+        let mut stranger = std::process::Command::new("perl")
+            .args([
+                "-MPOSIX",
+                "-e",
+                "my $sid = POSIX::setsid(); exit 3 unless defined $sid && $sid != -1; \
+                 my $job = fork(); exit 4 unless defined $job; \
+                 if ($job == 0) { POSIX::setpgid(0, 0); sleep 30; exit 0 } \
+                 sleep 30",
+            ])
+            .spawn()
+            .expect("spawn setsid stranger");
+        let stranger_pid = stranger.id() as i32;
+        let mut cleanup = KillOnPanic(vec![stranger_pid]);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let job = loop {
+            // SAFETY: getsid only reads the process table.
+            let led = unsafe { libc::getsid(stranger_pid) } == stranger_pid;
+            let job = live_session_members(stranger_pid)
+                .into_iter()
+                .find(|(pid, pgid)| *pid != stranger_pid && *pgid == *pid);
+            if let (true, Some((job, _))) = (led, job) {
+                break job;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stranger never led a session with a job in its own group"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        cleanup.0.push(job);
+
+        let live = crate::session::inspect_process_identity(stranger_pid as u32)
+            .expect("inspect the stranger")
+            .expect("the stranger is live");
+        assert_eq!(live.process_group, stranger_pid);
+        assert_eq!(live.session, stranger_pid);
+        let recorded = crate::repository::ProcessIdentity {
+            pid: stranger_pid as u32,
+            start_time: live.start_time.wrapping_add(1),
+            process_group: stranger_pid,
+            session: stranger_pid,
+        };
+        drop(RuntimeReaper::for_identity(&recorded));
+
+        // SAFETY: signal zero is a liveness probe only.
+        let leader_alive = unsafe { libc::kill(stranger_pid, 0) } == 0
+            && stranger.try_wait().expect("try_wait stranger").is_none();
+        let job_alive = live_session_members(stranger_pid)
+            .iter()
+            .any(|(pid, _)| *pid == job);
+        assert!(
+            leader_alive && job_alive,
+            "WR-02 pin: the reaper signalled a reused pid's group or session: leader {stranger_pid} \
+             alive {leader_alive}, job {job} alive {job_alive}"
+        );
+        for pid in [job, stranger_pid] {
+            // SAFETY: each pid is this test's own perl child or its job.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = stranger.wait();
     }
 
     /// Declared FIRST in this module on purpose, and it constructs no
