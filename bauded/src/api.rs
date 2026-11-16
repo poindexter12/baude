@@ -2923,6 +2923,128 @@ mod tests {
         removal_teardown(&shared, &root);
     }
 
+    /// T-22.1-37: a panic raised inside the slow stage, here by the test
+    /// pause, which runs in the same `catch_unwind` closure as the kill and
+    /// the delete, puts every runtime handle back and publishes nothing. The
+    /// answer is the removal's own 500 naming the panic, not a lost task, and
+    /// the released reservation lets a fresh preview commit.
+    #[tokio::test]
+    async fn removals_panic_in_the_slow_stage_restores_handles() {
+        let (root, _fixture, _workspace, shared, app, id, key) =
+            removal_fixture("window-panic").await;
+        let mut events = open_events(&app).await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        pause.panic_after_release("22.1-10 injected slow-stage panic");
+        let probe = probe_slow_stage(&shared, &pause, 1, || async {});
+        let (status, body) = removal_call(&app, "/removals", &report).await;
+        let window = probe.join().expect("the probe thread");
+
+        assert_eq!(window.entered, 1, "the removal reached its slow stage");
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "22.1-10 panic pin: {body}"
+        );
+        assert!(
+            body.contains("22.1-10 injected slow-stage panic"),
+            "22.1-10 panic pin: the 500 body does not name the panic: {body}"
+        );
+        assert!(
+            !body.contains("removal task failed"),
+            "22.1-10 panic pin: the panic escaped the slow stage and lost the task: {body}"
+        );
+        assert_eq!(
+            session_ids(&app).await,
+            [id],
+            "22.1-10 panic pin: the session did not come back to the registry"
+        );
+        assert!(
+            pid_is_alive(agent_pid),
+            "the panic struck before the kill, so the agent must still run"
+        );
+        let rows = rows_body(&app).await;
+        let row = rows_checkout(&rows, key).expect("the row stands after the panic");
+        assert_eq!(row["session_id"], id, "{row}");
+        expect_silence(&mut events, Duration::from_millis(500), "after the panic").await;
+
+        let retried = preview_report(&app, key).await;
+        let executed = assert_executed(&app, &retried, "the retry after a panic").await;
+        expect_exactly_one(&mut events, &executed, "the retry after a panic").await;
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the retried removal's agent is still alive"
+        );
+
+        removal_teardown(&shared, &root);
+    }
+
+    /// T-22.1-36: a client that goes away while its removal is in the slow
+    /// stage does not stop the removal. The handler's future is dropped once
+    /// the pause reports the removal entered; the blocking closure still
+    /// kills, commits and publishes.
+    #[tokio::test]
+    async fn removals_complete_after_the_client_goes_away() {
+        let (root, _fixture, workspace, shared, app, _id, key) =
+            removal_fixture("window-disconnect").await;
+        let mut events = open_events(&app).await;
+        let report = preview_report(&app, key).await;
+        let agent_pid = previewed_agent_pid(&report, key);
+
+        let _reapers = crate::manager::lock(&shared).runtime_reapers_for_test();
+        let pause = crate::manager::lock(&shared).pause_removals_for_test();
+        let entered = pause.clone();
+        let removal = app
+            .clone()
+            .oneshot(post_json("/removals", &report.to_string()));
+        tokio::select! {
+            answered = removal => {
+                panic!("the removal answered while parked in its slow stage: {answered:?}")
+            }
+            entered = tokio::task::spawn_blocking(move || {
+                entered.wait_entered(1, Duration::from_secs(10))
+            }) => assert!(entered.unwrap(), "the removal never reached its slow stage"),
+        }
+        // The removal's future, the client's side of it, is gone here.
+        pause.release();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if rows_checkout(&rows_body(&app).await, key).is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "22.1-10 disconnect pin: the row is still listed 5 s after the release"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            wait_for_pid_gone(agent_pid),
+            "the removed runtime's agent process is still alive"
+        );
+        let announced = expect_rows_removed(&mut events, "a removal whose client went away").await;
+        assert_eq!(
+            announced["rows_removed"],
+            serde_json::json!([{ "checkout": key }])
+        );
+        expect_silence(
+            &mut events,
+            Duration::from_millis(300),
+            "after the one commit",
+        )
+        .await;
+        assert!(!pause.timed_out(), "the removal waited out its pause bound");
+        let restored = restored_rows(&root, &workspace);
+        assert!(rows_checkout(&restored, key).is_none(), "{restored}");
+
+        removal_teardown(&shared, &root);
+    }
+
     #[tokio::test]
     async fn removals_execute_drops_a_checkout_row_in_one_save() {
         let (root, fixture, _workspace, shared, app, id, key) = removal_fixture("execute").await;
@@ -5159,9 +5281,14 @@ mod tests {
     }
 
     /// API-03 concurrency: a read racing a removal sees the projection from
-    /// before the removal or from after it, never a half-applied one, because
-    /// both handlers take the one manager mutex. Both candidates are observed
-    /// bodies. No sleep forces an ordering: the mutex is what is under test.
+    /// before the removal or from after it, never a half-applied one. The
+    /// removal no longer holds the manager mutex throughout: the read may
+    /// land in the slow stage, with the lock free. Two things keep that read
+    /// in the pre-removal shape: the first lock scope merges the doomed rows'
+    /// live metadata into the stored rows before their sessions leave the
+    /// registry, and the commit replaces the stored rows and publishes inside
+    /// the second lock scope, so no read sees part of a commit. Both
+    /// candidates are observed bodies. No sleep forces an ordering.
     ///
     /// The two requests are joined on the test thread, since the fixture's
     /// containment redirect is thread-local and a worker thread would escape
