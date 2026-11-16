@@ -136,6 +136,46 @@ state with standalone non-git sessions, and the v2.0.0-beta release channel
 - Sessions: roughly 8 GSD sessions 2026-09-19 to 2026-09-22, plus the 2026-10-13 closeout session.
 - Notable: closeout cost a full 11-minute suite run plus three sidequest reconciliation refusals, each with a distinct real cause (a prunable worktree registration left by the phase's own measurement script, a verify running in a checkout parked on a stale branch, and a squash-merge making the pinned candidate unreachable).
 
+## Milestone: v2.8 — Project Removal
+
+**Shipped:** 2026-11-15 (v2.8.0), cleanup 2026-11-16 (v2.8.1) | **Records closed:** 2026-11-16
+**Phases:** 6 (18-22, 22.1 inserted) | **Plans:** 49 | **Tasks:** 57
+
+### What Was Built
+- One `baude-core::removal` pipeline for every row kind: preview, kill the owned process group, delete managed worktrees, one atomic save, crash-consistent at every stage. Later split into `prepare`, `stop_and_delete` and `commit` so the daemon can run the slow stage unlocked.
+- Re-admission suppression: removal clears folder bindings and ownership markers and writes a suppression entry; only `n`, `c` or launching inside the folder brings a project back, through one `lift_key` shared by TUI and daemon.
+- TUI `D` with a confirmation naming the rows, the runtime to kill and the folders deleted versus kept.
+- Daemon `GET /rows`, removal preview and execute, `rows_removed` events, 503 Busy while a removal holds a repository, folder or session; PWA removal whose confirmation says when a folder will be deleted.
+- Test hygiene: `FixtureRoot`, `RuntimeReaper`, and a leftover check wrapping the suite in the gate and CI.
+
+### What Worked
+- Closing the records the day the cleanup shipped. v2.3 waited three weeks and every phase went stale from main moving on; here the only staleness came from the milestone's own cleanup phase, and the two phases that mattered were re-verified against the final tree before the close.
+- Inserting a cleanup phase after the audit instead of backlogging the debt. Suppression sync, test leftovers, PWA wording and the whole-removal mutex were each small then and would each have been harder later.
+- A sandbox daemon with a fake agent for the owner's browser checks. Two PWA sign-offs took minutes each and touched nothing real.
+- Code review after execution caught three real defects in 22.1 (panic in locked stages, reaper signalling a recycled pid, a busy reconcile dropped too early) before merge.
+
+### What Was Inefficient
+- Phase 21 needed three replan cycles before execution, and a convergence stall had to be resumed from orchestrator state across sessions.
+- The suite runs serially (#58), so every gate and CI run pays it in full: 464 s on `macos-15` against 176 s on Ubuntu, and about 13 minutes on the dev host. A docs-only PR paid the same 9.5 minutes.
+- Load-sensitive tests: four `bauded` tests failed at a load average near 38 and passed in isolation, costing a full gate re-run on a docs-only branch.
+- GSD bookkeeping drift: roadmap plan counts read `0/?` for three completed phases, `phase.complete` set state back to "ready to plan" a finished phase, and two verifications had to be regenerated purely for digest freshness.
+
+### Patterns Established
+- Hold a shared lock only to reserve and to commit; run slow, irreversible work unlocked against a reservation, and answer 503 Busy to anything that would touch the reserved set.
+- A shared function, not a convention, for any key two clients must agree on (`suppression::lift_key`).
+- Tests that start runtimes reap them by identity, process start time included, and the gate fails on anything left behind.
+- Owner browser checks run against a sandbox daemon with its own HOME and a fake agent, torn down afterwards.
+
+### Key Lessons
+- A cleanup phase inserted after release is cheaper than the same items aged in the backlog, as long as it is scoped by the audit and not reopened.
+- When a test compares whole snapshots of live state, fields that move on their own, like `waiting_reason`, make it a load test. Compare what the test is about.
+- Re-verify the phases the final code actually changed; for the rest, an honest override with the reason written down beats re-checking unchanged goals.
+
+### Cost Observations
+- Model mix: opus-class orchestration, planning and review; executors and verifiers as GSD subagents. Not precisely instrumented.
+- Sessions: many, 2026-11-01 to 2026-11-16, including a multi-session Phase 21 replan.
+- Notable: the serial test suite is now the dominant wall-clock cost of every change, including docs-only ones.
+
 ## Cross-Milestone Trends
 
 | Milestone | Phases | Plans | Shipped |
@@ -144,9 +184,11 @@ state with standalone non-git sessions, and the v2.0.0-beta release channel
 | v2.0 Local TUI Dogfood Release | 3 | 16 | 2026-09-03 |
 | v2.2 Reliability and Terminal Usability | 5 | 25 | 2026-09-19 |
 | v2.3 Launch Defaults and Startup Speed | 5 | 12 | 2026-09-22 |
+| v2.8 Project Removal | 6 | 49 | 2026-11-15 |
 
 ### Recurring
 
-- **Closing by override, twice running.** v2.2 closed without a Phase 12 `VERIFICATION.md`; v2.3 closed with all five verifications stale. Different causes, same outcome: the verification artifact is the first thing dropped when a release is already out the door.
+- **Closing by override, three times running.** v2.2 closed without a Phase 12 `VERIFICATION.md`; v2.3 closed with all five verifications stale; v2.8 closed with four stale. v2.8 is the mildest: it closed the day its cleanup shipped, the staleness came only from its own cleanup phase, and the final-tree phases were re-verified first.
 - **Verification artifacts treated as paperwork after shipping.** v2.2's lesson was "run `/gsd-verify-work` per phase before moving on." v2.3 ran it on every phase and then let the records go stale instead. The gap moved rather than closed.
 - **Lint and test gates that pass without testing anything.** v2.2: a vendored crate failing to compile under `-D warnings` silently exempted everything downstream. v2.3: a tautological test counted toward a 9/9 score. Both passed cleanly for weeks.
+- **Serial test suite as the pacing cost.** Serialized for #58 interference, the suite now dominates every gate and CI run; v2.8 also saw it flake under host load. Sharding across runners and replacing fixed sleeps are the open levers.
