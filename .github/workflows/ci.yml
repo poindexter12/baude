@@ -135,10 +135,10 @@ jobs:
       matrix:
         include:
           # threads matches the runner's cores: 4 on Ubuntu, 3 on macOS.
-          - { os: ubuntu-22.04, shard: 1, shards: 4, threads: 4 }
-          - { os: ubuntu-22.04, shard: 2, shards: 4, threads: 4 }
-          - { os: ubuntu-22.04, shard: 3, shards: 4, threads: 4 }
-          - { os: ubuntu-22.04, shard: 4, shards: 4, threads: 4 }
+          # Two Ubuntu shards: at four threads their tests take about 20 s
+          # each, so a third or fourth shard mostly repeats the build.
+          - { os: ubuntu-22.04, shard: 1, shards: 2, threads: 4 }
+          - { os: ubuntu-22.04, shard: 2, shards: 2, threads: 4 }
           - { os: macos-15, shard: 1, shards: 5, threads: 3, lint: true, preload: 135 }
           - { os: macos-15, shard: 2, shards: 5, threads: 3 }
           - { os: macos-15, shard: 3, shards: 5, threads: 3 }
@@ -229,7 +229,7 @@ jobs:
       - name: the Ubuntu lint job and every Ubuntu shard it needed passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$JOBS_PASSED" -- 'ubuntu-22.04' ${{ needs.changes.outputs.rust == 'true' && 5 || 1 }}
+        run: bash -c "$JOBS_PASSED" -- 'ubuntu-22.04' ${{ needs.changes.outputs.rust == 'true' && 3 || 1 }}
   check-macos:
     name: check (macos-15)
     needs: [changes, lint, check]
@@ -285,14 +285,19 @@ jobs:
           curl -fsS http://127.0.0.1:8642/sessions | grep '"status":"waiting"'
           docker rm -f smoke
 
-  # Release builds for every target. Two of them need macOS runners, which
-  # would queue behind the shards, so pull requests run them only when they
-  # touch the release inputs: manifests, lockfile, release config or
-  # workflows, which includes release-please's own pull requests. Every push
-  # to main runs them.
+  # Release builds for every target. Two of them need macOS runners, and the
+  # account runs at most five macOS jobs at once, so pull requests run them
+  # only when they touch the release inputs: manifests, lockfile, release
+  # config or workflows, which includes release-please's own pull requests.
+  # Every push to main runs them.
+  #
+  # They wait for the test shards, so they never take a runner a macOS shard
+  # is queued for and the required checks report first. They still run when a
+  # shard failed or was skipped: a broken release build is worth reporting on
+  # its own.
   artifact-readiness:
-    needs: changes
-    if: needs.changes.outputs.release == 'true'
+    needs: [changes, check]
+    if: always() && needs.changes.result == 'success' && needs.changes.outputs.release == 'true'
     permissions:
       contents: read
     strategy:
