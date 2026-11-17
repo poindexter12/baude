@@ -45,6 +45,7 @@ jobs:
       rust: ${{ steps.pick.outputs.rust }}
       web: ${{ steps.pick.outputs.web }}
       docker: ${{ steps.pick.outputs.docker }}
+      release: ${{ steps.pick.outputs.release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -63,16 +64,17 @@ jobs:
             bash scripts/ci-changes.sh --all | tee -a "$GITHUB_OUTPUT"
           fi
 
-  # Checks that judge the commit rather than the test split, once per OS. The
-  # commit and title checks always run; the rest run when the change reaches
-  # what they check.
+  # Checks that judge the commit rather than the test split. The commit and
+  # title checks always run; the rest run when the change reaches what they
+  # check. This job is Ubuntu only: the account runs at most five macOS jobs at
+  # once, all of them shards, so macOS shard 1 runs the checks whose answer can
+  # differ by platform (clippy over cfg code, the two self-tests) itself.
   lint:
     name: check (${{ matrix.os }}, lint)
     needs: changes
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        os: [ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -135,23 +137,32 @@ jobs:
           - { os: ubuntu-22.04, shard: 2, shards: 4 }
           - { os: ubuntu-22.04, shard: 3, shards: 4 }
           - { os: ubuntu-22.04, shard: 4, shards: 4 }
-          - { os: macos-15, shard: 1, shards: 6 }
-          - { os: macos-15, shard: 2, shards: 6 }
-          - { os: macos-15, shard: 3, shards: 6 }
-          - { os: macos-15, shard: 4, shards: 6 }
-          - { os: macos-15, shard: 5, shards: 6 }
-          - { os: macos-15, shard: 6, shards: 6 }
+          - { os: macos-15, shard: 1, shards: 5, lint: true, preload: 45 }
+          - { os: macos-15, shard: 2, shards: 5 }
+          - { os: macos-15, shard: 3, shards: 5 }
+          - { os: macos-15, shard: 4, shards: 5 }
+          - { os: macos-15, shard: 5, shards: 5 }
     runs-on: ${{ matrix.os }}
     env:
       # Line tables keep file and line in panics and backtraces but skip the
       # full debug info, which is most of the link time for the test binaries.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       TEST_SHARD_PACKAGES: ${{ needs.changes.outputs.packages }}
+      # Seconds of shard 1's own lint work, so the deal gives it fewer tests.
+      TEST_SHARD_PRELOAD: ${{ matrix.preload || 5 }}
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
+      - run: cargo clippy --all-targets -- -D warnings
+        if: matrix.lint
+      - name: self-test the real-root observer
+        if: matrix.lint
+        run: bash scripts/assert-real-roots-untouched.sh --self-test
+      - name: self-test the test leftover check
+        if: matrix.lint
+        run: bash scripts/assert-no-test-leftovers.sh --self-test
       # /usr/bin/git on macOS can be the xcrun shim, which execs the real git and
       # doubles the cost of every call. The suite makes thousands of them, so put
       # the real binary first when git resolves to the shim.
@@ -219,10 +230,10 @@ jobs:
     steps:
       - name: the change classifier ran
         run: test "${{ needs.changes.result }}" = success
-      - name: the macOS lint job and every macOS shard it needed passed
+      - name: every macOS shard it needed passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$JOBS_PASSED" -- 'macos-15' ${{ needs.changes.outputs.rust == 'true' && 7 || 1 }}
+        run: bash -c "$JOBS_PASSED" -- 'macos-15' ${{ needs.changes.outputs.rust == 'true' && 5 || 0 }}
 
   docker:
     needs: changes
@@ -264,9 +275,14 @@ jobs:
           curl -fsS http://127.0.0.1:8642/sessions | grep '"status":"waiting"'
           docker rm -f smoke
 
+  # Release builds for every target. Two of them need macOS runners, which
+  # would queue behind the shards, so pull requests run them only when they
+  # touch the release inputs: manifests, lockfile, release config or
+  # workflows, which includes release-please's own pull requests. Every push
+  # to main runs them.
   artifact-readiness:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.release == 'true'
     permissions:
       contents: read
     strategy:

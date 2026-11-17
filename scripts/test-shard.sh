@@ -12,7 +12,8 @@
 # test from one serial run; a test missing from it, such as a new one, gets
 # DEFAULT_WEIGHT. Tests go heaviest first, ties by name, each to the shard with
 # the least time so far, ties to the lowest index. Shard 1 starts with
-# SHARD1_PRELOAD because it also runs the doctests.
+# SHARD1_PRELOAD seconds because it also runs the doctests, or TEST_SHARD_PRELOAD
+# when the caller gives shard 1 other work too, such as macOS clippy in CI.
 # Every runner computes the same deal from the same commit. The weights only
 # move tests between shards; no weight, stale or missing, can drop a test.
 #
@@ -78,7 +79,7 @@ listing="$(cargo test -q "${targets[@]}" -- --list --format terse)" || {
 weights="$(dirname "$0")/test-weights.tsv"
 [ -f "$weights" ] || weights=/dev/null
 DEFAULT_WEIGHT=0.05
-SHARD1_PRELOAD=5
+SHARD1_PRELOAD="${TEST_SHARD_PRELOAD:-5}"
 
 deal="$(
   printf '%s\n' "$listing" | LC_ALL=C sort | awk -F'\t' -v w="$weights" -v d="$DEFAULT_WEIGHT" '
