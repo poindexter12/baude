@@ -72,6 +72,7 @@ step bash scripts/check-web-suites.sh || exit 1
 step cargo fmt --check || exit 1
 step cargo clippy --all-targets -- -D warnings || exit 1
 step bash scripts/check-commit-message.sh --self-test || exit 1
+step bash scripts/ci-changes.sh --self-test || exit 1
 # CI checks the PR's commits against origin/main; locally that is whatever this
 # branch adds, and nothing on main itself.
 if git rev-parse --verify -q origin/main >/dev/null; then
