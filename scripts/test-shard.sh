@@ -12,7 +12,7 @@
 # test from one serial run; a test missing from it, such as a new one, gets
 # DEFAULT_WEIGHT. Tests go heaviest first, ties by name, each to the shard with
 # the least time so far, ties to the lowest index. Shard 1 starts with
-# SHARD1_PRELOAD because it also runs the doctests and the once-per-OS checks.
+# SHARD1_PRELOAD because it also runs the doctests.
 # Every runner computes the same deal from the same commit. The weights only
 # move tests between shards; no weight, stale or missing, can drop a test.
 #
@@ -54,7 +54,7 @@ listing="$(cargo test -q --lib --bins --tests -- --list --format terse)" || {
 weights="$(dirname "$0")/test-weights.tsv"
 [ -f "$weights" ] || weights=/dev/null
 DEFAULT_WEIGHT=0.05
-SHARD1_PRELOAD=60
+SHARD1_PRELOAD=5
 
 deal="$(
   printf '%s\n' "$listing" | LC_ALL=C sort | awk -F'\t' -v w="$weights" -v d="$DEFAULT_WEIGHT" '
@@ -96,4 +96,7 @@ fi
 if [ "${#names[@]}" -eq 0 ]; then
   exit 0
 fi
-exec cargo test --lib --bins --tests -- --test-threads=1 --exact "${names[@]}"
+# TEST_SHARD_LIBTEST_ARGS adds libtest options, split on spaces, for the
+# weight-measuring workflow: it asks for JSON events with per-test times.
+read -r -a extra <<<"${TEST_SHARD_LIBTEST_ARGS:-}"
+exec cargo test --lib --bins --tests -- --test-threads=1 ${extra[@]+"${extra[@]}"} --exact "${names[@]}"

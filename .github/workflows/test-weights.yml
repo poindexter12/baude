@@ -1,0 +1,70 @@
+name: test-weights
+
+# Measures how long every test takes on a CI macOS runner and publishes a fresh
+# scripts/test-weights.tsv as an artifact, for scripts/test-shard.sh to balance
+# shards with. Weights only move tests between shards and never drop one, so a
+# stale file costs balance, not coverage. Run it by hand after the suite's shape
+# changes, then commit the artifact's file.
+#
+# Per-test times need libtest's unstable JSON output, so this workflow, and
+# only this one, sets RUSTC_BOOTSTRAP. It runs the same shards the ci workflow
+# runs, serially within each shard, under the same leftover check.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/measure-test-weights]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: measure (macos-15, shard ${{ matrix.shard }} of 6)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    runs-on: macos-15
+    env:
+      RUSTC_BOOTSTRAP: 1
+      TEST_SHARD_LIBTEST_ARGS: -Z unstable-options --format json --report-time
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: use the real git binary on macOS
+        run: |
+          if [ "$(command -v git)" = /usr/bin/git ] && real="$(xcrun -f git 2>/dev/null)"; then
+            dirname "$real" >> "$GITHUB_PATH"
+          fi
+      - name: run the shard with per-test times
+        run: |
+          bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- \
+            bash scripts/test-shard.sh ${{ matrix.shard }} 6 > events.jsonl
+          jq -R -r 'fromjson? | select(.type == "test" and .event == "ok" and .exec_time != null) | "\(.exec_time)\t\(.name)"' events.jsonl > weights.part
+          wc -l < weights.part
+      - uses: actions/upload-artifact@v7
+        with:
+          name: weights-${{ matrix.shard }}
+          path: weights.part
+
+  merge:
+    needs: measure
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: weights-*
+          merge-multiple: false
+      - name: assemble scripts/test-weights.tsv
+        run: |
+          {
+            printf '# Seconds per test on a CI macos-15 runner, measured by the test-weights\n'
+            printf '# workflow on %s at %s. Regenerate with that workflow.\n' "$(date -u +%Y-%m-%d)" "$GITHUB_SHA"
+            cat weights-*/weights.part | awk -F'\t' '{ printf "%.3f\t%s\n", $1, $2 }' | LC_ALL=C sort -t "$(printf '\t')" -k2,2
+          } > test-weights.tsv
+          echo "$(grep -vc '^#' test-weights.tsv) tests measured"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: test-weights
+          path: test-weights.tsv
