@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.2](https://github.com/poindexter12/baude/compare/v2.8.1...v2.8.2) (2026-11-17)
+
+
+### Performance Improvements
+
+* cut test suite time on macOS by sharding and fewer git starts ([dd0e683](https://github.com/poindexter12/baude/commit/dd0e683fedea4c9e22d767f9ab33776f959ee6d4))
+
 ## [2.8.1](https://github.com/poindexter12/baude/compare/v2.8.0...v2.8.1) (2026-11-16)
 
 
