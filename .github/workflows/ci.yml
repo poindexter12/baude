@@ -37,11 +37,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, shard: 1, shards: 2 }
-          - { os: ubuntu-22.04, shard: 2, shards: 2 }
-          - { os: macos-15, shard: 1, shards: 3 }
-          - { os: macos-15, shard: 2, shards: 3 }
-          - { os: macos-15, shard: 3, shards: 3 }
+          - { os: ubuntu-22.04, shard: 1, shards: 4 }
+          - { os: ubuntu-22.04, shard: 2, shards: 4 }
+          - { os: ubuntu-22.04, shard: 3, shards: 4 }
+          - { os: ubuntu-22.04, shard: 4, shards: 4 }
+          - { os: macos-15, shard: 1, shards: 6 }
+          - { os: macos-15, shard: 2, shards: 6 }
+          - { os: macos-15, shard: 3, shards: 6 }
+          - { os: macos-15, shard: 4, shards: 6 }
+          - { os: macos-15, shard: 5, shards: 6 }
+          - { os: macos-15, shard: 6, shards: 6 }
     runs-on: ${{ matrix.os }}
     steps:
       # PR commit checks compare against origin/main, so checkout needs the
@@ -139,7 +144,7 @@ jobs:
       - name: every Ubuntu shard passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$SHARDS_PASSED" -- 'ubuntu-22.04' 2
+        run: bash -c "$SHARDS_PASSED" -- 'ubuntu-22.04' 4
   check-macos:
     name: check (macos-15)
     needs: check
@@ -151,7 +156,7 @@ jobs:
       - name: every macOS shard passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$SHARDS_PASSED" -- 'macos-15' 3
+        run: bash -c "$SHARDS_PASSED" -- 'macos-15' 6
 
   docker:
     runs-on: ubuntu-22.04
