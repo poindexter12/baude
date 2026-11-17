@@ -121,10 +121,11 @@ jobs:
         run: bash scripts/assert-no-test-leftovers.sh --self-test
 
   # One job per shard of the Rust suite, for the packages the change reaches.
-  # The suite spawns real git and PTYs thousands of times and runs serially
-  # (#58), so scripts/test-shard.sh splits it across runners, balanced by
-  # measured time. Every shard still runs its tests serially, and together the
-  # shards of one OS run every selected test.
+  # The suite spawns real git and PTYs thousands of times, so
+  # scripts/test-shard.sh splits it across runners, balanced by measured time,
+  # and each shard runs its tests under cargo-nextest, threads at a time, each
+  # test in its own process. Together the shards of one OS run every selected
+  # test.
   check:
     name: check (${{ matrix.os }}, shard ${{ matrix.shard }} of ${{ matrix.shards }})
     needs: changes
@@ -133,28 +134,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, shard: 1, shards: 4 }
-          - { os: ubuntu-22.04, shard: 2, shards: 4 }
-          - { os: ubuntu-22.04, shard: 3, shards: 4 }
-          - { os: ubuntu-22.04, shard: 4, shards: 4 }
-          - { os: macos-15, shard: 1, shards: 5, lint: true, preload: 45 }
-          - { os: macos-15, shard: 2, shards: 5 }
-          - { os: macos-15, shard: 3, shards: 5 }
-          - { os: macos-15, shard: 4, shards: 5 }
-          - { os: macos-15, shard: 5, shards: 5 }
+          # threads matches the runner's cores: 4 on Ubuntu, 3 on macOS.
+          # Two Ubuntu shards: at four threads their tests take about 20 s
+          # each, so a third or fourth shard mostly repeats the build.
+          - { os: ubuntu-22.04, shard: 1, shards: 2, threads: 4 }
+          - { os: ubuntu-22.04, shard: 2, shards: 2, threads: 4 }
+          - { os: macos-15, shard: 1, shards: 5, threads: 3, lint: true, preload: 135 }
+          - { os: macos-15, shard: 2, shards: 5, threads: 3 }
+          - { os: macos-15, shard: 3, shards: 5, threads: 3 }
+          - { os: macos-15, shard: 4, shards: 5, threads: 3 }
+          - { os: macos-15, shard: 5, shards: 5, threads: 3 }
     runs-on: ${{ matrix.os }}
     env:
       # Line tables keep file and line in panics and backtraces but skip the
       # full debug info, which is most of the link time for the test binaries.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       TEST_SHARD_PACKAGES: ${{ needs.changes.outputs.packages }}
-      # Seconds of shard 1's own lint work, so the deal gives it fewer tests.
+      # Shard 1's own lint work, so the deal gives it fewer tests. The deal
+      # counts serial test seconds, so wall seconds of other work count times
+      # threads: macOS clippy's 45 s is 135.
       TEST_SHARD_PRELOAD: ${{ matrix.preload || 5 }}
+      TEST_SHARD_THREADS: ${{ matrix.threads }}
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
+      # Keep equal to nextest_version in scripts/gate.sh.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.150
       - run: cargo clippy --all-targets -- -D warnings
         if: matrix.lint
       - name: self-test the real-root observer
@@ -179,11 +188,12 @@ jobs:
       - name: fingerprint the real roots before the suite
         id: roots-before
         run: bash scripts/assert-real-roots-untouched.sh before
-      # Serial test execution on CI (#58): the manager close-rollback test
-      # fails only on loaded 3-core CI runners with varying assertions — the
-      # signature of cross-test process interference (PTY children spawned in
-      # parallel with pid/pgid churn), not a lifecycle defect. Every assertion
-      # stays intact; serial execution removes the interference channel.
+      # The suite ran serially from #58, when the manager close-rollback test
+      # failed on loaded 3-core runners from PTY children spawned in parallel.
+      # A 2026-11-17 trial ran the whole suite 27 times under nextest at 2 to 4
+      # threads, macOS 3-core runners included, with no failure and nothing
+      # left behind; scripts/test-shard.sh records it. A flake that appears
+      # goes back to threads: 1, never behind a retry.
       #
       # The suite runs under the test leftover check, which fails the step on a
       # runtime orphaned while the suite runs, a process still working in its
@@ -219,7 +229,7 @@ jobs:
       - name: the Ubuntu lint job and every Ubuntu shard it needed passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$JOBS_PASSED" -- 'ubuntu-22.04' ${{ needs.changes.outputs.rust == 'true' && 5 || 1 }}
+        run: bash -c "$JOBS_PASSED" -- 'ubuntu-22.04' ${{ needs.changes.outputs.rust == 'true' && 3 || 1 }}
   check-macos:
     name: check (macos-15)
     needs: [changes, lint, check]
@@ -275,14 +285,19 @@ jobs:
           curl -fsS http://127.0.0.1:8642/sessions | grep '"status":"waiting"'
           docker rm -f smoke
 
-  # Release builds for every target. Two of them need macOS runners, which
-  # would queue behind the shards, so pull requests run them only when they
-  # touch the release inputs: manifests, lockfile, release config or
-  # workflows, which includes release-please's own pull requests. Every push
-  # to main runs them.
+  # Release builds for every target. Two of them need macOS runners, and the
+  # account runs at most five macOS jobs at once, so pull requests run them
+  # only when they touch the release inputs: manifests, lockfile, release
+  # config or workflows, which includes release-please's own pull requests.
+  # Every push to main runs them.
+  #
+  # They wait for the test shards, so they never take a runner a macOS shard
+  # is queued for and the required checks report first. They still run when a
+  # shard failed or was skipped: a broken release build is worth reporting on
+  # its own.
   artifact-readiness:
-    needs: changes
-    if: needs.changes.outputs.release == 'true'
+    needs: [changes, check]
+    if: always() && needs.changes.result == 'success' && needs.changes.outputs.release == 'true'
     permissions:
       contents: read
     strategy:

@@ -16382,8 +16382,8 @@ mod tests {
         std::fs::create_dir_all(&state_root).unwrap();
         let mut app = App::new(folder.clone());
         app.remote = None;
-        app.config.claude_cmd = Some("sleep 30".into());
-        app.config.opencode_cmd = Some("sleep 30".into());
+        app.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        app.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         app.persistence_root_for_test = Some(state_root);
         app.spawn_error_for_test = Some("first spawn blocked".into());
 
@@ -16559,8 +16559,8 @@ mod tests {
         std::fs::create_dir_all(&state_root).unwrap();
         let mut crashed = App::new(folder.clone());
         crashed.remote = None;
-        crashed.config.claude_cmd = Some("sleep 30".into());
-        crashed.config.opencode_cmd = Some("sleep 30".into());
+        crashed.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        crashed.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         crashed.persistence_root_for_test = Some(state_root.clone());
         let old_runtime = crashed.admit_standalone(&folder).unwrap().unwrap();
         let key = match crashed.selected_id.unwrap() {
@@ -16571,8 +16571,8 @@ mod tests {
 
         let mut restarted = App::new(folder.clone());
         restarted.remote = None;
-        restarted.config.claude_cmd = Some("sleep 30".into());
-        restarted.config.opencode_cmd = Some("sleep 30".into());
+        restarted.config.claude_cmd = Some("sh -c 'sleep 30'".into());
+        restarted.config.opencode_cmd = Some("sh -c 'sleep 30'".into());
         restarted.persistence_root_for_test = Some(state_root);
         restarted.restore();
         assert!(!pid_is_live(old_pid));
