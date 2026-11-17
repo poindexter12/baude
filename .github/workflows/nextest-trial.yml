@@ -1,0 +1,99 @@
+name: nextest-trial
+
+# A manual experiment, not a check: can the suite run tests in parallel
+# without flaking? Since #58 every shard runs its tests one at a time because
+# PTY tests interfered on loaded runners. Each job here runs the whole suite
+# several times under cargo-nextest at one thread count, inside the same
+# real-roots and leftover checks the check jobs use, and reports how long each
+# run took and which tests failed. The one-thread job measures nextest's own
+# cost of one process per test, apart from any gain from parallelism.
+
+on:
+  push:
+    branches: [ci/nextest-trial]
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Suite runs per job
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  trial:
+    name: trial (${{ matrix.os }}, ${{ matrix.threads }} threads, set ${{ matrix.set }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, threads: 1, set: 1 }
+          - { os: ubuntu-22.04, threads: 2, set: 1 }
+          - { os: ubuntu-22.04, threads: 2, set: 2 }
+          - { os: ubuntu-22.04, threads: 4, set: 1 }
+          - { os: ubuntu-22.04, threads: 4, set: 2 }
+          - { os: macos-15, threads: 1, set: 1 }
+          - { os: macos-15, threads: 2, set: 1 }
+          - { os: macos-15, threads: 2, set: 2 }
+          - { os: macos-15, threads: 3, set: 1 }
+          - { os: macos-15, threads: 3, set: 2 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nextest-trial
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.150
+      - name: use the real git binary
+        if: runner.os == 'macOS'
+        run: |
+          if [ "$(command -v git)" = /usr/bin/git ] && real="$(xcrun -f git 2>/dev/null)"; then
+            dirname "$real" >> "$GITHUB_PATH"
+          fi
+      - name: build the test binaries
+        run: cargo nextest run --workspace --no-run
+      - name: run the suite ${{ inputs.repeats || '3' }} times
+        shell: bash
+        run: |
+          mkdir -p trial
+          failed=0
+          for i in $(seq 1 "${{ inputs.repeats || '3' }}"); do
+            log="trial/run-$i.log"
+            bash scripts/assert-real-roots-untouched.sh before
+            start=$(date +%s)
+            # The leftover check keeps its own stdout for its verdict, so the
+            # suite writes its log itself.
+            if bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- \
+                bash -c "cargo nextest run --workspace --no-fail-fast --test-threads ${{ matrix.threads }} --failure-output final > '$log' 2>&1"; then
+              rc=0
+            else
+              rc=$?
+            fi
+            end=$(date +%s)
+            bash scripts/assert-real-roots-untouched.sh after || rc=99
+            summary=$(grep -E '^ *Summary' "$log" | tail -1)
+            echo "run $i: rc=$rc wall=$((end - start))s ${summary}" | tee -a trial/results.txt
+            grep -E '^ *(FAIL|TIMEOUT|SIGSEGV|SIGABRT|LEAK) \[' "$log" | sed 's/^/    /' | tee -a trial/results.txt || true
+            [ "$rc" = 0 ] || failed=1
+          done
+          {
+            echo "### ${{ matrix.os }}, ${{ matrix.threads }} threads, set ${{ matrix.set }}"
+            echo '```'
+            cat trial/results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: trial-${{ matrix.os }}-t${{ matrix.threads }}-s${{ matrix.set }}
+          path: trial/
