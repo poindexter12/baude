@@ -25,6 +25,10 @@
 # --exact, so a doctest named in a shard would silently run nowhere. Shard 1
 # runs every doctest instead, with `cargo test --doc`, before its named tests.
 #
+# TEST_SHARD_PACKAGES, when set, limits the suite to those workspace packages,
+# space-separated (scripts/ci-changes.sh picks them in CI). Unset means the whole
+# workspace. The deal covers exactly the selected packages' tests either way.
+#
 # Written for bash 3.2, the macOS system shell: no mapfile, no associative arrays.
 set -u
 
@@ -46,7 +50,27 @@ if [ "$count" -lt 1 ] || [ "$index" -lt 1 ] || [ "$index" -gt "$count" ]; then
   exit 2
 fi
 
-listing="$(cargo test -q --lib --bins --tests -- --list --format terse)" || {
+# Target selection: --lib only when a selected package has a library, because
+# cargo refuses --lib for a set of binary-only packages. Doctests live only in
+# libraries, so the same packages are the ones `cargo test --doc` covers.
+targets=(--lib --bins --tests)
+doc=(--doc)
+if [ -n "${TEST_SHARD_PACKAGES:-}" ]; then
+  targets=(--bins --tests)
+  doc=()
+  for pkg in $TEST_SHARD_PACKAGES; do
+    targets+=(-p "$pkg")
+    case "$pkg" in
+      vt100 | baude-core) doc+=(-p "$pkg") ;;
+    esac
+  done
+  if [ "${#doc[@]}" -gt 0 ]; then
+    targets+=(--lib)
+    doc+=(--doc)
+  fi
+fi
+
+listing="$(cargo test -q "${targets[@]}" -- --list --format terse)" || {
   echo "test-shard: cargo test -- --list failed" >&2
   exit 1
 }
@@ -90,8 +114,8 @@ if [ "$list_only" -eq 1 ]; then
   fi
   exit 0
 fi
-if [ "$index" -eq 1 ]; then
-  cargo test --doc -- --test-threads=1 || exit $?
+if [ "$index" -eq 1 ] && [ "${#doc[@]}" -gt 0 ]; then
+  cargo test "${doc[@]}" -- --test-threads=1 || exit $?
 fi
 if [ "${#names[@]}" -eq 0 ]; then
   exit 0
@@ -99,4 +123,4 @@ fi
 # TEST_SHARD_LIBTEST_ARGS adds libtest options, split on spaces, for the
 # weight-measuring workflow: it asks for JSON events with per-test times.
 read -r -a extra <<<"${TEST_SHARD_LIBTEST_ARGS:-}"
-exec cargo test --lib --bins --tests -- --test-threads=1 ${extra[@]+"${extra[@]}"} --exact "${names[@]}"
+exec cargo test "${targets[@]}" -- --test-threads=1 ${extra[@]+"${extra[@]}"} --exact "${names[@]}"

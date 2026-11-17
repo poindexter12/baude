@@ -9,41 +9,132 @@ on:
 permissions:
   contents: read
 
-# Used by the per-OS required checks: $1 is the runner label, $2 the number of
-# jobs that OS runs, its lint job plus its shards. Lists this run attempt's jobs
-# and requires exactly $2 of them for that OS, every one concluded success.
+# A new push to a pull request cancels that pull request's run in progress,
+# whose result no longer describes the branch. Pushes to main never cancel:
+# each one gets its own full run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Used by the per-OS required checks: $1 is the runner label, $2 how many of
+# that OS's jobs must have succeeded, its lint job plus every shard, or just
+# the lint job when the change needs no Rust tests. Any job for that OS that
+# concluded other than success or skipped fails the check, and so does a
+# success count other than $2, so a shard that never ran cannot pass for one
+# that did.
 env:
-  SHARDS_PASSED: |
+  JOBS_PASSED: |
     set -eu
     os="$1"; want="$2"
     gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
-      --jq ".jobs[] | select(.name | startswith(\"check ($os, \")) | \"\\(.conclusion)\\t\\(.name)\"" > shards.txt
-    cat shards.txt
-    total=$(wc -l < shards.txt)
-    passed=$(grep -c '^success	' shards.txt || true)
-    echo "$os: $passed of $want jobs passed, $total reported"
-    test "$total" -eq "$want" && test "$passed" -eq "$want"
+      --jq ".jobs[] | select(.name | startswith(\"check ($os, \")) | \"\\(.conclusion)\\t\\(.name)\"" > jobs.txt
+    cat jobs.txt
+    passed=$(grep -c '^success	' jobs.txt || true)
+    bad=$(grep -vcE '^(success|skipped)	' jobs.txt || true)
+    echo "$os: $passed of $want jobs passed, $bad failed or unfinished"
+    test "$bad" -eq 0 && test "$passed" -eq "$want"
 
 jobs:
-  # Per OS, one lint job (shard 0) and one job per test shard. The suite spawns
-  # real git and PTYs thousands of times and runs serially (#58), so
-  # scripts/test-shard.sh splits it across runners, balanced by measured time.
-  # Every shard still runs its tests serially, and together the shards of one
-  # OS run every test. The lint job runs the checks that judge the commit
-  # rather than the test split, once per OS, so no shard carries them. The
-  # required checks are the check-ubuntu and check-macos jobs below.
+  # What this change needs, from the paths it touches (scripts/ci-changes.sh).
+  # A pull request is judged by its diff from the base; every other event,
+  # including each push to main, runs everything.
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      packages: ${{ steps.pick.outputs.packages }}
+      rust: ${{ steps.pick.outputs.rust }}
+      web: ${{ steps.pick.outputs.web }}
+      docker: ${{ steps.pick.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: self-test the change classifier
+        run: bash scripts/ci-changes.sh --self-test
+      - name: pick the work this change needs
+        id: pick
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff --name-only "$BASE...HEAD" | tee changed.txt
+            bash scripts/ci-changes.sh < changed.txt | tee -a "$GITHUB_OUTPUT"
+          else
+            bash scripts/ci-changes.sh --all | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  # Checks that judge the commit rather than the test split, once per OS. The
+  # commit and title checks always run; the rest run when the change reaches
+  # what they check.
+  lint:
+    name: check (${{ matrix.os }}, lint)
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      # PR commit checks compare against origin/main, so checkout needs the
+      # base history rather than Actions' default depth-one checkout.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: self-test the commit-message guard
+        run: bash scripts/check-commit-message.sh --self-test
+      - name: check pull request commits and title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          bash scripts/check-commit-message.sh --range origin/main..HEAD
+          printf '%s\n' "$PR_TITLE" | bash scripts/check-commit-message.sh -
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.rust == 'true'
+        with:
+          key: lint
+      # The PWA suites are plain node:test files with no package and no
+      # lockfile, so the runtime is pinned and nothing is cached.
+      - uses: actions/setup-node@v7
+        if: needs.changes.outputs.web == 'true'
+        with:
+          node-version: 26
+      - name: run the PWA suites
+        if: needs.changes.outputs.web == 'true'
+        run: bash scripts/check-web-suites.sh
+      - run: cargo fmt --check
+        if: needs.changes.outputs.rust == 'true'
+      - run: cargo clippy --all-targets -- -D warnings
+        if: needs.changes.outputs.rust == 'true'
+      # The real-root observer and the test leftover check prove themselves
+      # against synthetic trees, fixture entries and processes before they are
+      # trusted to judge a suite run.
+      - name: self-test the real-root observer
+        if: needs.changes.outputs.rust == 'true'
+        run: bash scripts/assert-real-roots-untouched.sh --self-test
+      - name: self-test the test leftover check
+        if: needs.changes.outputs.rust == 'true'
+        run: bash scripts/assert-no-test-leftovers.sh --self-test
+
+  # One job per shard of the Rust suite, for the packages the change reaches.
+  # The suite spawns real git and PTYs thousands of times and runs serially
+  # (#58), so scripts/test-shard.sh splits it across runners, balanced by
+  # measured time. Every shard still runs its tests serially, and together the
+  # shards of one OS run every selected test.
   check:
-    name: check (${{ matrix.os }}, ${{ matrix.shard == 0 && 'lint' || format('shard {0} of {1}', matrix.shard, matrix.shards) }})
+    name: check (${{ matrix.os }}, shard ${{ matrix.shard }} of ${{ matrix.shards }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, shard: 0, shards: 4 }
           - { os: ubuntu-22.04, shard: 1, shards: 4 }
           - { os: ubuntu-22.04, shard: 2, shards: 4 }
           - { os: ubuntu-22.04, shard: 3, shards: 4 }
           - { os: ubuntu-22.04, shard: 4, shards: 4 }
-          - { os: macos-15, shard: 0, shards: 6 }
           - { os: macos-15, shard: 1, shards: 6 }
           - { os: macos-15, shard: 2, shards: 6 }
           - { os: macos-15, shard: 3, shards: 6 }
@@ -55,54 +146,17 @@ jobs:
       # Line tables keep file and line in panics and backtraces but skip the
       # full debug info, which is most of the link time for the test binaries.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      TEST_SHARD_PACKAGES: ${{ needs.changes.outputs.packages }}
     steps:
-      # PR commit checks compare against origin/main, so the lint job needs the
-      # base history; the shards need only the commit.
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: ${{ matrix.shard != 0 && 1 || 0 }}
-      # Separate caches: clippy builds check artifacts, the shards test ones.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.shard == 0 && 'lint' || 'test' }}
-      # The PWA suites are plain node:test files with no package and no
-      # lockfile, so the runtime is pinned and nothing is cached.
-      - uses: actions/setup-node@v7
-        if: matrix.shard == 0
-        with:
-          node-version: 26
-      - name: run the PWA suites
-        if: matrix.shard == 0
-        run: bash scripts/check-web-suites.sh
-      - run: cargo fmt --check
-        if: matrix.shard == 0
-      - run: cargo clippy --all-targets -- -D warnings
-        if: matrix.shard == 0
-      - name: self-test the commit-message guard
-        if: matrix.shard == 0
-        run: bash scripts/check-commit-message.sh --self-test
-      - name: check pull request commits and title
-        if: matrix.shard == 0 && github.event_name == 'pull_request'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          bash scripts/check-commit-message.sh --range origin/main..HEAD
-          printf '%s\n' "$PR_TITLE" | bash scripts/check-commit-message.sh -
-      # The real-root observer proves itself against synthetic trees before it
-      # is trusted to judge a suite run.
-      - name: self-test the real-root observer
-        if: matrix.shard == 0
-        run: bash scripts/assert-real-roots-untouched.sh --self-test
-      # The test leftover check proves itself the same way, against synthetic
-      # fixture entries and processes, before it judges the suite.
-      - name: self-test the test leftover check
-        if: matrix.shard == 0
-        run: bash scripts/assert-no-test-leftovers.sh --self-test
+          key: test
       # /usr/bin/git on macOS can be the xcrun shim, which execs the real git and
       # doubles the cost of every call. The suite makes thousands of them, so put
       # the real binary first when git resolves to the shim.
       - name: use the real git binary on macOS
-        if: matrix.shard != 0 && runner.os == 'macOS'
+        if: runner.os == 'macOS'
         run: |
           if [ "$(command -v git)" = /usr/bin/git ] && real="$(xcrun -f git 2>/dev/null)"; then
             dirname "$real" >> "$GITHUB_PATH"
@@ -112,7 +166,6 @@ jobs:
       # — that running the suite neither creates nor modifies the real config
       # dir, the real Claude config dir, or the real managed-worktrees root.
       - name: fingerprint the real roots before the suite
-        if: matrix.shard != 0
         id: roots-before
         run: bash scripts/assert-real-roots-untouched.sh before
       # Serial test execution on CI (#58): the manager close-rollback test
@@ -127,7 +180,6 @@ jobs:
       # mktemp under the runner's own TMPDIR: that keeps macOS on the /var
       # symlink the tests rely on and keeps both runners outside the checkout.
       - name: run the suite and assert it leaves no runtime or fixture entry behind
-        if: matrix.shard != 0
         run: bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- bash scripts/test-shard.sh ${{ matrix.shard }} ${{ matrix.shards }}
       # Runs even when the suite failed: a run that fails AND leaks is the case
       # most worth catching, and the two statuses are reported independently so
@@ -138,37 +190,43 @@ jobs:
         if: always() && steps.roots-before.outcome == 'success'
         run: bash scripts/assert-real-roots-untouched.sh after
 
-  # The required checks: one per OS, green only when that OS ran its lint job
-  # and every shard it was dealt, and each one succeeded. `needs` reports the matrix as a whole, so
-  # each job reads its own shards' conclusions from this run instead; a failing
-  # Ubuntu shard turns only check (ubuntu-22.04) red. A shard that did not run
-  # at all is missing from the count and fails the check too.
+  # The required checks: one per OS, green only when the change classifier ran,
+  # that OS's lint job passed, and, when the change needs Rust tests, every
+  # shard it was dealt passed too. `needs` reports a matrix as a whole, so each
+  # job reads its own OS's job conclusions from this run instead; a failing
+  # Ubuntu shard turns only check (ubuntu-22.04) red.
   check-ubuntu:
     name: check (ubuntu-22.04)
-    needs: check
+    needs: [changes, lint, check]
     if: always()
     runs-on: ubuntu-22.04
     permissions:
       actions: read
     steps:
-      - name: the Ubuntu lint job and every Ubuntu shard passed
+      - name: the change classifier ran
+        run: test "${{ needs.changes.result }}" = success
+      - name: the Ubuntu lint job and every Ubuntu shard it needed passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$SHARDS_PASSED" -- 'ubuntu-22.04' 5
+        run: bash -c "$JOBS_PASSED" -- 'ubuntu-22.04' ${{ needs.changes.outputs.rust == 'true' && 5 || 1 }}
   check-macos:
     name: check (macos-15)
-    needs: check
+    needs: [changes, lint, check]
     if: always()
     runs-on: ubuntu-22.04
     permissions:
       actions: read
     steps:
-      - name: the macOS lint job and every macOS shard passed
+      - name: the change classifier ran
+        run: test "${{ needs.changes.result }}" = success
+      - name: the macOS lint job and every macOS shard it needed passed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash -c "$SHARDS_PASSED" -- 'macos-15' 7
+        run: bash -c "$JOBS_PASSED" -- 'macos-15' ${{ needs.changes.outputs.rust == 'true' && 7 || 1 }}
 
   docker:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -207,6 +265,8 @@ jobs:
           docker rm -f smoke
 
   artifact-readiness:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     strategy:
