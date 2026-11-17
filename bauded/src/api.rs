@@ -976,7 +976,10 @@ mod tests {
                   outlives every handler await"]
     fn app() -> (ApiScope, axum::Router) {
         let scope = api_scope("router");
-        let router = super::router(Arc::new(Mutex::new(Manager::new("sleep 30".into(), false))));
+        let router = super::router(Arc::new(Mutex::new(Manager::new(
+            "sh -c 'sleep 30'".into(),
+            false,
+        ))));
         (scope, router)
     }
 
@@ -1206,7 +1209,7 @@ mod tests {
             &baude_core::persist::Config::default(),
             |_| {},
         );
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), true)));
         crate::manager::lock(&state).persist_at_for_test(&root, &workspace, None);
         let app = super::router(Arc::clone(&state));
 
@@ -1377,7 +1380,7 @@ mod tests {
             );
 
             let create_root = FixtureRoot::new(&format!("bauded-api-create-{suffix}"));
-            let create_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            let create_state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), true)));
             crate::manager::lock(&create_state).persist_at_for_test(
                 &create_root,
                 &workspace,
@@ -1413,7 +1416,7 @@ mod tests {
             }
 
             let delete_root = FixtureRoot::new(&format!("bauded-api-delete-{suffix}"));
-            let delete_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            let delete_state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), true)));
             let delete_id = {
                 let mut manager = crate::manager::lock(&delete_state);
                 manager.persist_at_for_test(&delete_root, &workspace, None);
@@ -1456,7 +1459,7 @@ mod tests {
             assert_eq!(retained.checkouts[0].active_intent(), !committed);
 
             let archive_root = FixtureRoot::new(&format!("bauded-api-archive-{suffix}"));
-            let archive_state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+            let archive_state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), true)));
             let archive_id = {
                 let mut manager = crate::manager::lock(&archive_state);
                 manager.persist_at_for_test(&archive_root, &workspace, None);
@@ -1565,7 +1568,7 @@ mod tests {
             |_| {},
         );
         let root = FixtureRoot::new("bauded-api-delete-teardown");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), true)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), true)));
         let id = {
             let mut manager = crate::manager::lock(&state);
             manager.persist_at_for_test(&root, &workspace, None);
@@ -1740,7 +1743,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("post-event");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         // Pin a deterministic claude session_id so the /tmp path is isolated.
         let sid = format!("api-event-test-{}", std::process::id());
@@ -1786,7 +1789,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("activity-events");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let sid = format!("api-activity-test-{}", std::process::id());
         let path = baude_core::hook::event_path(&sid);
@@ -1863,7 +1866,7 @@ mod tests {
         use crate::manager::lock;
 
         let _scope = api_scope("activity-stream");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1894,7 +1897,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-round-trip");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         let app = super::router(Arc::clone(&state));
 
@@ -1996,7 +1999,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-deny");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
@@ -2042,7 +2045,7 @@ mod tests {
         use crate::manager::{lock, PendingPermission};
 
         let _scope = api_scope("permission-long-poll");
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let id = lock(&state).create("/tmp", None, None).unwrap().id;
         {
             let mut m = lock(&state);
@@ -2114,7 +2117,7 @@ mod tests {
         // `app()` spelled out, so the case keeps the manager it needs to bind
         // a reaper before its own DELETE drops the runtime.
         let _scope = api_scope("router");
-        let state: Shared = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state: Shared = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         let app = super::router(Arc::clone(&state));
         // create
         let res = app

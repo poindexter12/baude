@@ -97,7 +97,7 @@ mod tests {
             _redirect: redirect,
             _root: root,
         };
-        let state = Arc::new(Mutex::new(Manager::new("sleep 30".into(), false)));
+        let state = Arc::new(Mutex::new(Manager::new("sh -c 'sleep 30'".into(), false)));
         (scope, super::router().with_state(state))
     }
 
