@@ -5204,8 +5204,7 @@ mod tests {
         let repo = fixture.subdir("repo");
         let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5400,8 +5399,7 @@ mod tests {
         let state_root = fixture.subdir("state");
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5439,8 +5437,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5556,8 +5553,7 @@ mod tests {
         let repo = fixture.subdir("repo");
         let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5657,8 +5653,7 @@ mod tests {
         let repo = fixture.subdir("repo");
         let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5724,8 +5719,7 @@ mod tests {
         let repo = fixture.subdir("repo");
         let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -5787,8 +5781,7 @@ mod tests {
         let repo = fixture.subdir("repo");
         let state_root = fixture.subdir("state");
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -6034,8 +6027,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -6100,8 +6092,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -6186,8 +6177,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -6345,8 +6335,7 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -6401,8 +6390,7 @@ mod tests {
         let state_root = fixture.subdir("state");
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
+        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("file"), b"one").unwrap();
         git(&repo, &["add", "file"]);
         git(&repo, &["commit", "-m", "initial"]);
@@ -7222,8 +7210,7 @@ mod tests {
         let origin = fixture.subdir("test-repo-origin.git");
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.name", "Baude Test"]);
-        git(&repo, &["config", "user.email", "baude@example.invalid"]);
+        baude_core::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
         std::fs::write(repo.join("file.txt"), b"test\n").expect("write file");
         git(&repo, &["add", "file.txt"]);
         git(&repo, &["commit", "-q", "-m", "test"]);

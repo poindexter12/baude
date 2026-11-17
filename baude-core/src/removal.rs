@@ -1899,8 +1899,7 @@ mod tests {
             };
             git_ok(&fixture.root, &["init", "-q", "-b", "main", "repo"]);
             let repo = fixture.repo();
-            git_ok(&repo, &["config", "user.name", "Baude Test"]);
-            git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+            crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
             fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write tracked file");
             git_ok(&repo, &["add", "tracked.txt"]);
             git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
@@ -4587,8 +4586,7 @@ mod tests {
     fn init_repo(root: &Path, name: &str) -> PathBuf {
         git_ok(root, &["init", "-q", "-b", "main", name]);
         let repo = root.join(name);
-        git_ok(&repo, &["config", "user.name", "Baude Test"]);
-        git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+        crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
         fs::write(repo.join("tracked.txt"), b"neighbour\n").expect("write tracked file");
         git_ok(&repo, &["add", "tracked.txt"]);
         git_ok(&repo, &["commit", "-q", "-m", "neighbour"]);

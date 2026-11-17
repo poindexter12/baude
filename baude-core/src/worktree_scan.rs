@@ -1961,8 +1961,7 @@ mod tests {
             let repo = self.root.join(name);
             std::fs::create_dir_all(&repo).expect("create fixture repo dir");
             git_ok(&repo, &["init", "-q", "."]);
-            git_ok(&repo, &["config", "user.name", "Baude Test"]);
-            git_ok(&repo, &["config", "user.email", "baude@example.invalid"]);
+            crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
             std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
             git_ok(&repo, &["add", "tracked.txt"]);
             git_ok(&repo, &["commit", "-q", "-m", "fixture"]);

@@ -97,6 +97,16 @@ step bash scripts/assert-no-test-leftovers.sh --self-test || exit 1
 # throwaway one, so both resolve to real binaries first, and cargo and rustup
 # keep their real homes.
 #
+# On macOS /usr/bin/git is usually the xcrun shim, which execs the real git and
+# roughly doubles the cost of every call: about 32 ms against 16 ms on a dev
+# host. The suite makes some 15,000 git calls, so when git resolves to the shim
+# the real binary's directory goes into the suite's PATH just ahead of
+# /usr/bin. Only commands that already resolved to /usr/bin change, and each of
+# those is an xcrun shim for the binary that now runs directly; anything earlier
+# on PATH, a version manager's python3 for one, still wins. A link to the real
+# git does not work: Apple's git finds its helpers and templates relative to
+# the path it was started from.
+#
 # The suite itself runs under the test leftover check, with TMPDIR pointed at a
 # directory inside the throwaway root. Every fixture root then lands there,
 # outside every git work tree, so a fixture never sits inside this checkout.
@@ -107,6 +117,12 @@ step bash scripts/assert-no-test-leftovers.sh --self-test || exit 1
 isolated_root="$(mktemp -d "${TMPDIR:-/tmp}/baude-gate.XXXXXX")" || exit 2
 trap 'rm -rf "$isolated_root"' EXIT
 cargo_bin="$(rustup which cargo 2>/dev/null || command -v cargo)" || exit 2
+suite_path="$(dirname "$cargo_bin"):$PATH"
+if [ "$(uname -s)" = Darwin ] && [ "$(command -v git)" = /usr/bin/git ] &&
+  real_git="$(xcrun -f git 2>/dev/null)" && [ -x "$real_git" ]; then
+  suite_path="$(printf '%s' "$suite_path" | awk -v RS=: -v ORS=: -v real="$(dirname "$real_git")" \
+    '$0 == "/usr/bin" && !done { print real; done = 1 } { print }' | sed 's/:$//')"
+fi
 isolated() {
   env \
     HOME="$isolated_root/home" \
@@ -116,7 +132,7 @@ isolated() {
     CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
     RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
     BAUDE_ASSERT_PYTHON="$(python3 -c 'import sys; print(sys.executable)')" \
-    PATH="$(dirname "$cargo_bin"):$PATH" \
+    PATH="$suite_path" \
     "$@"
 }
 mkdir -p "$isolated_root/home" || exit 2

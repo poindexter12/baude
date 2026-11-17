@@ -356,6 +356,28 @@ pub fn git_in(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// Give the repository freshly `git init`ed at `repo` a commit identity, as
+/// `git config user.name` and `git config user.email` would: the same `[user]`
+/// section appended to `.git/config`, without starting two git processes. The
+/// suite builds hundreds of fixture repositories and each git start costs tens
+/// of milliseconds on macOS. Panics unless `repo/.git/config` exists, so it is
+/// never pointed at a bare repository or a linked worktree.
+pub fn set_git_identity(repo: &Path, name: &str, email: &str) {
+    use std::io::Write as _;
+    let config = repo.join(".git").join("config");
+    assert!(
+        config.is_file(),
+        "set_git_identity needs a non-bare repository: {} is missing",
+        config.display()
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&config)
+        .unwrap_or_else(|error| panic!("open {}: {error}", config.display()));
+    write!(file, "[user]\n\tname = {name}\n\temail = {email}\n")
+        .unwrap_or_else(|error| panic!("write {}: {error}", config.display()));
+}
+
 /// The topology real users have: an upstream, a clone whose main checkout
 /// sits on a working branch, a managed default worktree on `main` and a
 /// managed branch worktree, the two managed worktrees allocated under the
@@ -392,8 +414,7 @@ pub fn cloned_topology(root: &Path) -> ClonedTopology {
     let upstream = root.join("upstream");
     std::fs::create_dir_all(&upstream).expect("create upstream");
     git_in(&upstream, &["init", "-q", "-b", "main"]);
-    git_in(&upstream, &["config", "user.email", "test@example.com"]);
-    git_in(&upstream, &["config", "user.name", "Test"]);
+    crate::testing::set_git_identity(&upstream, "Test", "test@example.com");
     std::fs::write(upstream.join("tracked"), b"one\n").expect("write tracked file");
     git_in(&upstream, &["add", "tracked"]);
     git_in(&upstream, &["commit", "-q", "-m", "initial"]);
@@ -875,6 +896,30 @@ impl Drop for RuntimeReaper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set_git_identity` leaves the repository where `git config` would: git
+    /// reads the identity back and commits under it.
+    #[test]
+    fn set_git_identity_is_read_back_by_git_and_signs_commits() {
+        let root = FixtureRoot::new("baude-testing-identity");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        set_git_identity(&repo, "Fixture Name", "fixture@example.invalid");
+
+        assert_eq!(git_in(&repo, &["config", "user.name"]), "Fixture Name");
+        assert_eq!(
+            git_in(&repo, &["config", "user.email"]),
+            "fixture@example.invalid"
+        );
+        std::fs::write(repo.join("tracked"), b"one\n").unwrap();
+        git_in(&repo, &["add", "tracked"]);
+        git_in(&repo, &["commit", "-q", "-m", "initial"]);
+        assert_eq!(
+            git_in(&repo, &["log", "-1", "--format=%an <%ae>"]),
+            "Fixture Name <fixture@example.invalid>"
+        );
+    }
 
     /// One `ps -eo pid=,pgid=,stat=` row per live process, zombies left out.
     fn live_rows() -> Vec<(i32, i32)> {
