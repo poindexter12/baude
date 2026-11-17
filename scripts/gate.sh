@@ -35,8 +35,16 @@ if [[ "${1:-}" == "--linux" ]]; then
   # its root-owned toolchain, so they are baked into a local image; docker's
   # layer cache makes every build after the first a no-op. It lacks node as
   # well, which the PWA suites need, so the binary is copied in from the node
-  # image. Its major must stay equal to node-version in ci.yml.
-  printf 'FROM rust:1-bookworm\nRUN rustup component add rustfmt clippy\nCOPY --from=node:26-bookworm /usr/local/bin/node /usr/local/bin/node\n' |
+  # image. Its major must stay equal to node-version in ci.yml. cargo-nextest
+  # comes from its release archive, checked against the published sha256, at
+  # the version ci.yml pins.
+  nextest_version=0.9.150
+  nextest_base="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/cargo-nextest-$nextest_version-\$(uname -m)-unknown-linux-gnu"
+  printf '%s\n' \
+    'FROM rust:1-bookworm' \
+    'RUN rustup component add rustfmt clippy' \
+    'COPY --from=node:26-bookworm /usr/local/bin/node /usr/local/bin/node' \
+    "RUN base=\"$nextest_base\" && curl -fsSL -o /tmp/nextest.tgz \"\$base.tar.gz\" && echo \"\$(curl -fsSL \"\$base.sha256\" | cut -d' ' -f1)  /tmp/nextest.tgz\" | sha256sum -c - && tar xzf /tmp/nextest.tgz -C /usr/local/cargo/bin && rm /tmp/nextest.tgz" |
     docker build -q -t baude-gate - >/dev/null || exit 2
   exec docker run --rm -u 1000:1000 \
     -v "$ROOT":/work -w /work \
@@ -96,7 +104,8 @@ step bash scripts/assert-no-test-leftovers.sh --self-test || exit 1
 # cargo and python3 may be version-manager shims that find their toolchains
 # through HOME. A shim that loses its HOME can install a whole toolchain into the
 # throwaway one, so both resolve to real binaries first, and cargo and rustup
-# keep their real homes.
+# keep their real homes. cargo-nextest runs the suite and may be a shim too, so
+# it resolves the same way and its directory joins the suite's PATH.
 #
 # On macOS /usr/bin/git is usually the xcrun shim, which execs the real git and
 # roughly doubles the cost of every call: about 32 ms against 16 ms on a dev
@@ -115,10 +124,19 @@ step bash scripts/assert-no-test-leftovers.sh --self-test || exit 1
 # directory; when it ends, the check sees any process still working there and
 # any fixture entry left behind. Either fails the step, and so does a failing
 # suite: the check exits 0 only when the suite and all three counts are zero.
+#
+# The doctests run under cargo test, which nextest cannot run. Every other test
+# runs under cargo-nextest, GATE_TEST_THREADS at a time, four by default, each in
+# its own process. scripts/test-shard.sh says why parallel runs replaced serial
+# ones; GATE_TEST_THREADS=1 restores the serial suite.
 isolated_root="$(mktemp -d "${TMPDIR:-/tmp}/baude-gate.XXXXXX")" || exit 2
 trap 'rm -rf "$isolated_root"' EXIT
 cargo_bin="$(rustup which cargo 2>/dev/null || command -v cargo)" || exit 2
-suite_path="$(dirname "$cargo_bin"):$PATH"
+nextest_bin="$(mise which cargo-nextest 2>/dev/null || command -v cargo-nextest)" || {
+  echo "gate: cargo-nextest is not installed; install it, see the Gate section of CLAUDE.md" >&2
+  exit 2
+}
+suite_path="$(dirname "$cargo_bin"):$(dirname "$nextest_bin"):$PATH"
 if [ "$(uname -s)" = Darwin ] && [ "$(command -v git)" = /usr/bin/git ] &&
   real_git="$(xcrun -f git 2>/dev/null)" && [ -x "$real_git" ]; then
   suite_path="$(printf '%s' "$suite_path" | awk -v RS=: -v ORS=: -v real="$(dirname "$real_git")" \
@@ -139,7 +157,9 @@ isolated() {
 mkdir -p "$isolated_root/home" || exit 2
 
 step isolated bash scripts/assert-real-roots-untouched.sh before || exit 1
-step isolated bash scripts/assert-no-test-leftovers.sh run "$isolated_root/tmp" -- cargo test -- --test-threads=1
+step isolated bash scripts/assert-no-test-leftovers.sh run "$isolated_root/tmp" -- \
+  bash -c 'cargo test -p vt100 -p baude-core --doc -- --test-threads=1 &&
+    cargo nextest run --workspace --no-fail-fast --test-threads "$1"' gate-suite "${GATE_TEST_THREADS:-4}"
 suite=$?
 step isolated bash scripts/assert-real-roots-untouched.sh after
 roots=$?

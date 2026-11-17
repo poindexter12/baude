@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one shard of the workspace test suite, serially, by exact test name.
+# Run one shard of the workspace test suite by exact test name.
 #
 #   scripts/test-shard.sh <index> <count>      run shard <index> of <count>
 #   scripts/test-shard.sh --list <index> <count>  print that shard's test names
@@ -17,10 +17,17 @@
 # Every runner computes the same deal from the same commit. The weights only
 # move tests between shards; no weight, stale or missing, can drop a test.
 #
-# The shard then runs `cargo test --lib --bins --tests -- --test-threads=1
-# --exact <names...>`. Each test binary runs the names it holds and filters out
-# the rest, so every test still runs serially, in its own binary, exactly as the
-# unsharded suite does. Serial execution stays for the reason ci.yml gives (#58).
+# The shard then runs `cargo nextest run --lib --bins --tests --no-fail-fast
+# --test-threads <TEST_SHARD_THREADS> -- --exact <names...>`. nextest runs every
+# test in its own process, so tests running side by side share no process state.
+# TEST_SHARD_THREADS defaults to 1. The suite ran serially from #58 until a
+# 2026-11-17 trial on CI runners, 27 whole-suite runs at 2 to 4 threads on
+# Ubuntu and 2 or 3 on macOS, all passing with nothing left behind; a flake that
+# appears later goes back to one thread here, never behind a retry.
+#
+# TEST_SHARD_LIBTEST_ARGS, when set, runs the shard with plain `cargo test
+# --test-threads=1` instead and passes those arguments to libtest, for the
+# test-weights workflow, whose JSON timing output only libtest gives.
 #
 # Doctests are not dealt: rustdoc does not match its own listed names under
 # --exact, so a doctest named in a shard would silently run nowhere. Shard 1
@@ -123,5 +130,8 @@ if [ "${#names[@]}" -eq 0 ]; then
 fi
 # TEST_SHARD_LIBTEST_ARGS adds libtest options, split on spaces, for the
 # weight-measuring workflow: it asks for JSON events with per-test times.
-read -r -a extra <<<"${TEST_SHARD_LIBTEST_ARGS:-}"
-exec cargo test "${targets[@]}" -- --test-threads=1 ${extra[@]+"${extra[@]}"} --exact "${names[@]}"
+if [ -n "${TEST_SHARD_LIBTEST_ARGS:-}" ]; then
+  read -r -a extra <<<"$TEST_SHARD_LIBTEST_ARGS"
+  exec cargo test "${targets[@]}" -- --test-threads=1 "${extra[@]}" --exact "${names[@]}"
+fi
+exec cargo nextest run "${targets[@]}" --no-fail-fast --test-threads "${TEST_SHARD_THREADS:-1}" -- --exact "${names[@]}"

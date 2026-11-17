@@ -9,6 +9,11 @@ exit codes. `scripts/gate.sh --linux` runs the same gate in `rust:1-bookworm` as
 for anything touching platform code (`cfg`, procfs, file timing), because macOS has hidden
 Linux-only defects before. Never judge a gate step by piping it to `tail` or `grep` and reading `$?`.
 
+The suite runs under cargo-nextest, four tests at a time (`GATE_TEST_THREADS` changes that; 1 is
+the old serial run), with doctests under `cargo test --doc`. Install the version CI pins:
+`mise use -g github:nextest-rs/nextest@cargo-nextest-0.9.150`. The Linux gate image installs it
+itself.
+
 ## Releases
 
 release-please owns versions, tags and the GitHub Release. Merging conventional commits to `main`
