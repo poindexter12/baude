@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.3](https://github.com/poindexter12/baude/compare/v2.8.2...v2.8.3) (2026-11-17)
+
+
+### Performance Improvements
+
+* run the test suite in parallel under cargo-nextest ([24ddf35](https://github.com/poindexter12/baude/commit/24ddf35add27624bfa395054a3d2517397130026))
+
 ## [2.8.2](https://github.com/poindexter12/baude/compare/v2.8.1...v2.8.2) (2026-11-17)
 
 
