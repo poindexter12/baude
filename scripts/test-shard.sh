@@ -4,13 +4,17 @@
 #   scripts/test-shard.sh <index> <count>      run shard <index> of <count>
 #   scripts/test-shard.sh --list <index> <count>  print that shard's test names
 #
-# Every shard asks `cargo test -- --list` for the full list of test names, sorts
-# it byte-wise, and takes every <count>-th name starting at <index>, counting
-# from 1. Each runner computes the same list from the same commit, so the shards
-# of one count are disjoint and their union is the whole suite: no test can be
-# skipped by a new file or module, because new tests land in the list and the
-# list is dealt round-robin. Round-robin over sorted names also spreads the slow
-# families of tests, which share a prefix, across the shards.
+# Every shard asks `cargo test -- --list` for the full list of test names and
+# deals all of them, so the shards of one count are disjoint and their union is
+# the whole suite: a new test lands in the list and is dealt like any other.
+#
+# The deal balances measured time. scripts/test-weights.tsv holds seconds per
+# test from one serial run; a test missing from it, such as a new one, gets
+# DEFAULT_WEIGHT. Tests go heaviest first, ties by name, each to the shard with
+# the least time so far, ties to the lowest index. Shard 1 starts with
+# SHARD1_PRELOAD because it also runs the doctests and the once-per-OS checks.
+# Every runner computes the same deal from the same commit. The weights only
+# move tests between shards; no weight, stale or missing, can drop a test.
 #
 # The shard then runs `cargo test --lib --bins --tests -- --test-threads=1
 # --exact <names...>`. Each test binary runs the names it holds and filters out
@@ -47,19 +51,31 @@ listing="$(cargo test -q --lib --bins --tests -- --list --format terse)" || {
   exit 1
 }
 
+weights="$(dirname "$0")/test-weights.tsv"
+[ -f "$weights" ] || weights=/dev/null
+DEFAULT_WEIGHT=0.05
+SHARD1_PRELOAD=60
+
+deal="$(
+  printf '%s\n' "$listing" | LC_ALL=C sort | awk -F'\t' -v w="$weights" -v d="$DEFAULT_WEIGHT" '
+    BEGIN { while ((getline line < w) > 0) { if (line ~ /^#/) continue; split(line, f, "\t"); wt[f[2]] = f[1] } }
+    /: test$/ { name = substr($0, 1, length($0) - 6); printf "%s\t%s\n", ((name in wt) ? wt[name] : d), name }
+  ' | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 | awk -F'\t' -v n="$count" -v pre="$SHARD1_PRELOAD" '
+    BEGIN { for (i = 1; i <= n; i++) load[i] = 0; load[1] = pre }
+    { best = 1; for (i = 2; i <= n; i++) if (load[i] < load[best]) best = i; load[best] += $1; print best "\t" $2 }
+  '
+)"
+
 names=()
 position=0
 while IFS= read -r line; do
-  case "$line" in
-    *': test') ;;
-    *) continue ;;
-  esac
+  [ -n "$line" ] || continue
   position=$((position + 1))
-  if [ $(((position - 1) % count + 1)) -eq "$index" ]; then
-    names+=("${line%: test}")
+  if [ "${line%%	*}" -eq "$index" ]; then
+    names+=("${line#*	}")
   fi
 done <<EOF
-$(printf '%s\n' "$listing" | LC_ALL=C sort)
+$deal
 EOF
 
 if [ "$position" -eq 0 ]; then

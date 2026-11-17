@@ -9,23 +9,44 @@ on:
 permissions:
   contents: read
 
+# Used by the per-OS required checks: $1 is the runner label, $2 the shard
+# count. Lists this run attempt's jobs and requires exactly $2 shard jobs for
+# that OS, every one concluded success.
+env:
+  SHARDS_PASSED: |
+    set -eu
+    os="$1"; want="$2"
+    gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+      --jq ".jobs[] | select(.name | startswith(\"check ($os, shard \")) | \"\\(.conclusion)\\t\\(.name)\"" > shards.txt
+    cat shards.txt
+    total=$(wc -l < shards.txt)
+    passed=$(grep -c '^success	' shards.txt || true)
+    echo "$os: $passed of $want shards passed, $total reported"
+    test "$total" -eq "$want" && test "$passed" -eq "$want"
+
 jobs:
-  # One job per Ubuntu run and one per macOS shard. macOS process start is
-  # several times slower than Linux and the suite spawns real git and PTYs
-  # thousands of times, so the serial macOS suite is split across three runners
-  # by scripts/test-shard.sh; every shard still runs its tests serially, and
-  # together they run every test. Ubuntu runs the whole suite in one job under
-  # its required name. The macOS required check is the check-macos job below.
+  # One job per shard. The suite spawns real git and PTYs thousands of times
+  # and runs serially (#58), so scripts/test-shard.sh splits it across runners,
+  # balanced by measured time: two on Ubuntu and three on macOS, where process
+  # start is several times slower. Every shard still runs its tests serially,
+  # and together the shards of one OS run every test. The required checks are
+  # the check-ubuntu and check-macos jobs below.
   check:
-    name: ${{ matrix.shards == 1 && format('check ({0})', matrix.os) || format('check ({0}, shard {1} of {2})', matrix.os, matrix.shard, matrix.shards) }}
+    name: check (${{ matrix.os }}, shard ${{ matrix.shard }} of ${{ matrix.shards }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, shard: 1, shards: 1 }
-          - { os: macos-15, shard: 1, shards: 3 }
-          - { os: macos-15, shard: 2, shards: 3 }
-          - { os: macos-15, shard: 3, shards: 3 }
+          - { os: ubuntu-22.04, shard: 1, shards: 4 }
+          - { os: ubuntu-22.04, shard: 2, shards: 4 }
+          - { os: ubuntu-22.04, shard: 3, shards: 4 }
+          - { os: ubuntu-22.04, shard: 4, shards: 4 }
+          - { os: macos-15, shard: 1, shards: 6 }
+          - { os: macos-15, shard: 2, shards: 6 }
+          - { os: macos-15, shard: 3, shards: 6 }
+          - { os: macos-15, shard: 4, shards: 6 }
+          - { os: macos-15, shard: 5, shards: 6 }
+          - { os: macos-15, shard: 6, shards: 6 }
     runs-on: ${{ matrix.os }}
     steps:
       # PR commit checks compare against origin/main, so checkout needs the
@@ -107,21 +128,35 @@ jobs:
         if: always() && steps.roots-before.outcome == 'success'
         run: bash scripts/assert-real-roots-untouched.sh after
 
-  # The required check for macOS: green only when every macOS shard is green.
-  # `needs` reports the check matrix as a whole, so an Ubuntu failure turns this
-  # red too; the failing job is the one to read.
+  # The required checks: one per OS, green only when that OS ran every shard it
+  # was dealt and each one succeeded. `needs` reports the matrix as a whole, so
+  # each job reads its own shards' conclusions from this run instead; a failing
+  # Ubuntu shard turns only check (ubuntu-22.04) red. A shard that did not run
+  # at all is missing from the count and fails the check too.
+  check-ubuntu:
+    name: check (ubuntu-22.04)
+    needs: check
+    if: always()
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+    steps:
+      - name: every Ubuntu shard passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash -c "$SHARDS_PASSED" -- 'ubuntu-22.04' 4
   check-macos:
     name: check (macos-15)
     needs: check
     if: always()
     runs-on: ubuntu-22.04
+    permissions:
+      actions: read
     steps:
-      - name: every check job passed
+      - name: every macOS shard passed
         env:
-          RESULT: ${{ needs.check.result }}
-        run: |
-          echo "check matrix result: $RESULT"
-          test "$RESULT" = success
+          GH_TOKEN: ${{ github.token }}
+        run: bash -c "$SHARDS_PASSED" -- 'macos-15' 6
 
   docker:
     runs-on: ubuntu-22.04
