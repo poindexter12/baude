@@ -39,10 +39,13 @@ jobs:
           fi
       - name: run the shard with per-test times
         run: |
+          # The leftover check keeps its own stdout for its verdict and sends the
+          # suite's output to stderr, so the shard writes its events to a file.
           bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- \
-            bash scripts/test-shard.sh ${{ matrix.shard }} 6 > events.jsonl
+            bash -c 'bash scripts/test-shard.sh "$1" 6 > "$2"' shard ${{ matrix.shard }} "$PWD/events.jsonl"
           jq -R -r 'fromjson? | select(.type == "test" and .event == "ok" and .exec_time != null) | "\(.exec_time)\t\(.name)"' events.jsonl > weights.part
           wc -l < weights.part
+          test -s weights.part
       - uses: actions/upload-artifact@v7
         with:
           name: weights-${{ matrix.shard }}
