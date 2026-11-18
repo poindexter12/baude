@@ -572,8 +572,15 @@ fn pushed_repo_with(
 }
 
 /// Run git in `dir`, returning git's stderr on a non-zero status.
+///
+/// Automatic maintenance and gc are off. After a commit or push git may start
+/// `git maintenance run --auto` in the background, which holds
+/// `.git/objects/maintenance.lock` while it runs; a template copied in that
+/// window carries the lock into every copy, and the background process outlives
+/// the build. A fixture of one commit has nothing for maintenance to do anyway.
 fn try_git(dir: &Path, args: &[&str]) -> Result<(), String> {
     let output = std::process::Command::new("git")
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(dir)
         .output()
