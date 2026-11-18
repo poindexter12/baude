@@ -1,19 +1,19 @@
 ---
 gsd_state_version: "1.0"
 milestone: v2.8
-milestone_name: Project Removal
 status: Awaiting next milestone
 stopped_at: Milestone v2.8 completed and archived; next is /gsd-new-milestone
-last_updated: "2026-11-16T16:32:28.467Z"
-last_activity: 2026-11-16
+last_updated: "2026-11-18T02:16:40.361Z"
+last_activity: 2026-11-17
 last_activity_desc: Milestone v2.8 completed and archived
-state_head: 912025f1d6645338e69dd3ed64a2c2737e3bee82
+state_head: 3d112618ddfd8035b09be2313dc4c0fa8b5688ce
 progress:
   total_phases: 6
   completed_phases: 6
   total_plans: 49
   completed_plans: 49
   percent: 100
+milestone_name: Project Removal
 current_phase: "22.1"
 current_phase_name: v2.8 Cleanup
 ---
@@ -32,7 +32,7 @@ See: .planning/PROJECT.md (updated 2026-11-16)
 Phase: Milestone v2.8 complete
 Plan: —
 Status: Awaiting next milestone
-Last activity: 2026-11-16 — Milestone v2.8 completed and archived
+Last activity: 2026-11-17 - Completed quick task 261117-mep: Cut test suite git spawns via template fixture repos
 
 ## Performance Metrics
 
@@ -345,6 +345,12 @@ Recent decisions affecting current work (full log in PROJECT.md):
 - Five baude-core/src/lifecycle.rs tests fail plan-01 containment (no TestRedirect held); measured pre-existing at 08-03's RED commit f6a3b1c. lifecycle.rs is in no phase-08 plan's files_modified — deferred to 08-06, which cannot go green until they hold a root and a literal identity. See 08 deferred-items.md.
 - ui::tests::ui_fixture_isolation_after_helper_return and ui_fixture_isolation_nested_restore are committed #[ignore]d: they build an App whose UsagePoller is uncontained until 08-08. Plan 08-08 task 1 must remove the attribute and run them.
 - 08-08 left the full workspace test suite unrun (plan forbids broad runs before 08-06 task 1 completes manager ownership). Real pass/fail numbers for the whole suite are owed by 08-06 task 2.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 261117-mep | Cut test suite git spawns via template fixture repos | 2026-11-17 | 3d11261 | [261117-mep-cut-test-suite-git-spawns-via-template-f](./quick/261117-mep-cut-test-suite-git-spawns-via-template-f/) |
 
 ### Roadmap Evolution
 

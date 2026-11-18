@@ -1977,11 +1977,7 @@ mod tests {
         /// candidate that is gitdir-bearing and git-disowned at once.
         fn git_init_root(&self) -> PathBuf {
             git_ok(&self.root, &["init", "-q", "."]);
-            git_ok(&self.root, &["config", "user.name", "Baude Test"]);
-            git_ok(
-                &self.root,
-                &["config", "user.email", "baude@example.invalid"],
-            );
+            crate::testing::set_git_identity(&self.root, "Baude Test", "baude@example.invalid");
             std::fs::write(self.root.join("tracked.txt"), b"fixture\n").expect("write root file");
             git_ok(&self.root, &["add", "tracked.txt"]);
             git_ok(&self.root, &["commit", "-q", "-m", "fixture"]);
@@ -3878,11 +3874,7 @@ mod tests {
 
         // Initialize a real git repository inside the checkout
         git_ok(&checkout_dir, &["init", "-q", "."]);
-        git_ok(&checkout_dir, &["config", "user.name", "Baude Test"]);
-        git_ok(
-            &checkout_dir,
-            &["config", "user.email", "baude@example.invalid"],
-        );
+        crate::testing::set_git_identity(&checkout_dir, "Baude Test", "baude@example.invalid");
         std::fs::write(checkout_dir.join("tracked.txt"), b"test\n").expect("write tracked file");
         git_ok(&checkout_dir, &["add", "tracked.txt"]);
         git_ok(&checkout_dir, &["commit", "-q", "-m", "test commit"]);

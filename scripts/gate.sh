@@ -109,13 +109,21 @@ step bash scripts/assert-no-test-leftovers.sh --self-test || exit 1
 #
 # On macOS /usr/bin/git is usually the xcrun shim, which execs the real git and
 # roughly doubles the cost of every call: about 32 ms against 16 ms on a dev
-# host. The suite makes some 15,000 git calls, so when git resolves to the shim
+# host. The suite makes some 10,400 git calls, so when git resolves to the shim
 # the real binary's directory goes into the suite's PATH just ahead of
 # /usr/bin. Only commands that already resolved to /usr/bin change, and each of
 # those is an xcrun shim for the binary that now runs directly; anything earlier
 # on PATH, a version manager's python3 for one, still wins. A link to the real
 # git does not work: Apple's git finds its helpers and templates relative to
 # the path it was started from.
+#
+# Most fixture repositories are one of a few shapes, each built hundreds of
+# times, and under nextest every test is its own process, so nothing built in
+# one test is reused by the next. BAUDE_GIT_TEMPLATE_DIR names a directory where
+# baude_core::testing builds each shape once per run and copies it into every
+# test that asks for it, at no git call. It is a sibling of the suite TMPDIR,
+# never inside it, so the leftover check below never sees a template as a
+# fixture entry, and the trap removes it with the rest of the throwaway root.
 #
 # The suite itself runs under the test leftover check, with TMPDIR pointed at a
 # directory inside the throwaway root. Every fixture root then lands there,
@@ -151,10 +159,11 @@ isolated() {
     CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
     RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
     BAUDE_ASSERT_PYTHON="$(python3 -c 'import sys; print(sys.executable)')" \
+    BAUDE_GIT_TEMPLATE_DIR="$isolated_root/git-templates" \
     PATH="$suite_path" \
     "$@"
 }
-mkdir -p "$isolated_root/home" || exit 2
+mkdir -p "$isolated_root/home" "$isolated_root/git-templates" || exit 2
 
 step isolated bash scripts/assert-real-roots-untouched.sh before || exit 1
 step isolated bash scripts/assert-no-test-leftovers.sh run "$isolated_root/tmp" -- \

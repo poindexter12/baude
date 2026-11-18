@@ -3265,18 +3265,13 @@ mod tests {
         // managed path this case composes, including the cleanup below.
         let fixture = LifecycleFixture::new("post-verification");
         let root = fixture.subdir("repo");
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success());
-        }
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        crate::testing::set_git_identity(&root, "Test", "test@example.com");
         std::fs::write(root.join("tracked"), b"one\n").unwrap();
         for args in [
             vec!["add", "tracked"],
@@ -3343,18 +3338,13 @@ mod tests {
         let fixture = LifecycleFixture::new("occupied-protected");
         let root = fixture.root();
         let repo = fixture.subdir("repo");
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .status()
-                .unwrap()
-                .success());
-        }
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        crate::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("tracked"), b"one\n").unwrap();
         for args in [
             vec!["add", "tracked"],
@@ -3461,18 +3451,13 @@ mod tests {
         let fixture = LifecycleFixture::new("occupied-recovery");
         let root = fixture.root();
         let repo = fixture.subdir("repo");
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .status()
-                .unwrap()
-                .success());
-        }
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        crate::testing::set_git_identity(&repo, "Test", "test@example.com");
         std::fs::write(repo.join("tracked"), b"one\n").unwrap();
         for args in [
             vec!["add", "tracked"],
@@ -3578,18 +3563,13 @@ mod tests {
     fn pending_activation_recovery_distinguishes_absent_and_exact_git_facts() {
         let fixture = LifecycleFixture::new("pending-recovery");
         let root = fixture.subdir("repo");
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success());
-        }
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        crate::testing::set_git_identity(&root, "Test", "test@example.com");
         std::fs::write(root.join("tracked"), b"one\n").unwrap();
         for args in [vec!["add", "tracked"], vec!["commit", "-m", "initial"]] {
             assert!(Command::new("git")
@@ -3649,18 +3629,13 @@ mod tests {
     fn blocked_activation_retry_round_trips_all_provenance() {
         let fixture = LifecycleFixture::new("activation-evidence");
         let root = fixture.subdir("repo");
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success());
-        }
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        crate::testing::set_git_identity(&root, "Test", "test@example.com");
         std::fs::write(root.join("tracked"), b"one\n").unwrap();
         for args in [vec!["add", "tracked"], vec!["commit", "-m", "initial"]] {
             assert!(Command::new("git")
@@ -4350,14 +4325,10 @@ mod tests {
                 managed.to_str().unwrap(),
             ],
         );
-        let reported = |path: &Path| {
-            git::discover_repository(path)
-                .unwrap()
-                .selected_worktree
-                .path
-        };
-        let main = git::discover_repository(&clone).unwrap().main_worktree;
-        (main, reported(&default), reported(&managed))
+        let snapshot = git::discover_repository(&clone).unwrap();
+        let default = crate::testing::inventory_path(&snapshot, &default);
+        let managed = crate::testing::inventory_path(&snapshot, &managed);
+        (snapshot.main_worktree, default, managed)
     }
 
     /// The persisted shape an older baude, or an earlier refusal, left: the

@@ -1021,14 +1021,21 @@ mod tests {
     /// as a repository, so the admitted row is a checkout.
     fn committed_repo(root: &Path) -> PathBuf {
         let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
-        std::fs::write(repo.join("file"), b"one").unwrap();
-        git(&repo, &["add", "file"]);
-        git(&repo, &["commit", "-m", "initial"]);
+        baude_core::testing::committed_repo(&repo, &FIXTURE_REPO);
         repo
     }
+
+    /// The one-commit repository [`committed_repo`] and
+    /// [`initialized_repo_in_workspace`] build: `file` committed on `main`.
+    const FIXTURE_REPO: baude_core::testing::CommittedRepo<'static> =
+        baude_core::testing::CommittedRepo {
+            branch: Some("main"),
+            file: "file",
+            contents: b"one",
+            name: "Test",
+            email: "test@example.com",
+            message: "initial",
+        };
 
     /// A fixture repository together with the redirect that contains it.
     ///
@@ -1084,12 +1091,7 @@ mod tests {
             None,
         );
         let repo = root.join(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
-        std::fs::write(repo.join("file"), b"one").unwrap();
-        git(&repo, &["add", "file"]);
-        git(&repo, &["commit", "-m", "initial"]);
+        baude_core::testing::committed_repo(&repo, &FIXTURE_REPO);
         FixtureRepo {
             repo,
             _identity: identity,
