@@ -454,20 +454,38 @@ pub fn cloned_topology(root: &Path) -> ClonedTopology {
             managed.to_str().expect("utf-8 managed path"),
         ],
     );
-    let reported = |path: &Path| {
-        crate::git::discover_repository(path)
-            .expect("discover worktree")
-            .selected_worktree
-            .path
-    };
     let snapshot = crate::git::discover_repository(&clone).expect("discover clone");
     ClonedTopology {
         upstream,
+        default_worktree: inventory_path(&snapshot, &default),
+        managed_worktree: inventory_path(&snapshot, &managed),
         clone: snapshot.main_worktree,
-        default_worktree: reported(&default),
-        managed_worktree: reported(&managed),
         common_dir: snapshot.common_dir,
     }
+}
+
+/// The path `snapshot`'s worktree inventory holds for the worktree at `path`,
+/// matched by canonical path. That is the path discovering the worktree
+/// itself reports, because [`crate::git::discover_repository`] takes its
+/// selected worktree from this same inventory, so a fixture that already has
+/// one snapshot of the repository needs no discovery per worktree. Panics
+/// when the inventory holds no such worktree.
+pub fn inventory_path(snapshot: &crate::git::RepositorySnapshot, path: &Path) -> PathBuf {
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize {}: {error}", path.display()));
+    snapshot
+        .worktrees
+        .iter()
+        .find(|record| record.path == canonical)
+        .map(|record| record.path.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not in the worktree inventory of {}",
+                path.display(),
+                snapshot.main_worktree.display()
+            )
+        })
 }
 
 // ---- live-runtime doubles (phase 18 plan 08, shared with the TUI since phase 20) ----

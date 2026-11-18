@@ -3814,23 +3814,18 @@ mod tests {
 
         fn repo(&self, relative: impl AsRef<Path>) -> PathBuf {
             let repo = self.root.join(relative);
-            git_ok(&self.root, &[OsStr::new("init"), repo.as_os_str()]);
+            // Starts on `topic`, so the one commit lands there and no other
+            // local branch ever exists.
             git_ok(
-                &repo,
+                &self.root,
                 &[
-                    OsStr::new("config"),
-                    OsStr::new("user.name"),
-                    OsStr::new("Baude Test"),
+                    OsStr::new("init"),
+                    OsStr::new("-b"),
+                    OsStr::new("topic"),
+                    repo.as_os_str(),
                 ],
             );
-            git_ok(
-                &repo,
-                &[
-                    OsStr::new("config"),
-                    OsStr::new("user.email"),
-                    OsStr::new("baude@example.invalid"),
-                ],
-            );
+            crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
             std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
             git_ok(&repo, &[OsStr::new("add"), OsStr::new("tracked.txt")]);
             git_ok(
@@ -3840,10 +3835,6 @@ mod tests {
                     OsStr::new("-m"),
                     OsStr::new("fixture"),
                 ],
-            );
-            git_ok(
-                &repo,
-                &[OsStr::new("branch"), OsStr::new("-M"), OsStr::new("topic")],
             );
             repo
         }

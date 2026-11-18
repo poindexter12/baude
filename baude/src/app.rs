@@ -17152,16 +17152,7 @@ mod tests {
             .current_dir(&repo_dir)
             .output()
             .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&repo_dir)
-            .output()
-            .expect("git config user.email");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&repo_dir)
-            .output()
-            .expect("git config user.name");
+        baude_core::testing::set_git_identity(&repo_dir, "Test", "test@example.com");
         std::fs::write(repo_dir.join("file.txt"), b"test\n").expect("write file");
         std::process::Command::new("git")
             .args(["add", "file.txt"])
