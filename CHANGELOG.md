@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.4](https://github.com/poindexter12/baude/compare/v2.8.3...v2.8.4) (2026-11-18)
+
+
+### Performance Improvements
+
+* build test fixture repositories once per run and copy them ([#141](https://github.com/poindexter12/baude/issues/141)) ([15eea0d](https://github.com/poindexter12/baude/commit/15eea0d709a62b5fc17c44c1d699ae8a40765d9b))
+
 ## [2.8.3](https://github.com/poindexter12/baude/compare/v2.8.2...v2.8.3) (2026-11-17)
 
 
