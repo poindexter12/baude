@@ -200,8 +200,17 @@ jobs:
       # TMPDIR at the end, or a fixture entry left behind. The TMPDIR comes from
       # mktemp under the runner's own TMPDIR: that keeps macOS on the /var
       # symlink the tests rely on and keeps both runners outside the checkout.
+      # BAUDE_GIT_TEMPLATE_DIR is a sibling made the same way, where
+      # baude_core::testing builds each common fixture repository once per run
+      # and copies it into every test that needs one; scripts/gate.sh says why.
+      # It sits beside the suite TMPDIR, never inside it, so the leftover check
+      # never counts a template as a fixture entry.
       - name: run the suite and assert it leaves no runtime or fixture entry behind
-        run: bash scripts/assert-no-test-leftovers.sh run "$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")" -- bash scripts/test-shard.sh ${{ matrix.shard }} ${{ matrix.shards }}
+        run: |
+          suite_tmp="$(mktemp -d "${TMPDIR:-/tmp}/suite-tmp.XXXXXX")"
+          BAUDE_GIT_TEMPLATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/git-templates.XXXXXX")"
+          export BAUDE_GIT_TEMPLATE_DIR
+          bash scripts/assert-no-test-leftovers.sh run "$suite_tmp" -- bash scripts/test-shard.sh ${{ matrix.shard }} ${{ matrix.shards }}
       # Runs even when the suite failed: a run that fails AND leaks is the case
       # most worth catching, and the two statuses are reported independently so
       # neither masks the other. Guarded on the snapshot having been taken, so
