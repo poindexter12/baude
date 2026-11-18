@@ -399,6 +399,17 @@ pub struct ClonedTopology {
     pub common_dir: PathBuf,
 }
 
+/// The upstream a cloned topology is cloned from: one `tracked` file
+/// committed on `main`.
+const UPSTREAM_SPEC: CommittedRepo<'static> = CommittedRepo {
+    branch: Some("main"),
+    file: "tracked",
+    contents: b"one\n",
+    name: "Test",
+    email: "test@example.com",
+    message: "initial",
+};
+
 /// Build a [`ClonedTopology`] under `root`.
 ///
 /// Requires an active [`TestRedirect`] on this thread and panics otherwise:
@@ -412,12 +423,7 @@ pub fn cloned_topology(root: &Path) -> ClonedTopology {
          managed worktrees would be created under the real managed root"
     );
     let upstream = root.join("upstream");
-    std::fs::create_dir_all(&upstream).expect("create upstream");
-    git_in(&upstream, &["init", "-q", "-b", "main"]);
-    crate::testing::set_git_identity(&upstream, "Test", "test@example.com");
-    std::fs::write(upstream.join("tracked"), b"one\n").expect("write tracked file");
-    git_in(&upstream, &["add", "tracked"]);
-    git_in(&upstream, &["commit", "-q", "-m", "initial"]);
+    committed_repo(&upstream, &UPSTREAM_SPEC);
     let clone = root.join("clone");
     git_in(
         root,
@@ -486,6 +492,312 @@ pub fn inventory_path(snapshot: &crate::git::RepositorySnapshot, path: &Path) ->
                 snapshot.main_worktree.display()
             )
         })
+}
+
+// ---- per-run fixture repository template ----
+
+/// The repository [`committed_repo`] builds: one file committed once by one
+/// identity, optionally on a named branch. [`pushed_repo`] builds the same
+/// repository and pushes it to a bare origin.
+#[derive(Clone, Copy, Debug, Hash)]
+pub struct CommittedRepo<'a> {
+    /// The branch `git init -b` starts on; `None` leaves git's own default.
+    pub branch: Option<&'a str>,
+    /// The single tracked file, relative to the repository root.
+    pub file: &'a str,
+    /// That file's contents.
+    pub contents: &'a [u8],
+    /// `user.name`, written by [`set_git_identity`].
+    pub name: &'a str,
+    /// `user.email`, written by [`set_git_identity`].
+    pub email: &'a str,
+    /// The commit message.
+    pub message: &'a str,
+}
+
+/// Build the repository `spec` describes at `dest`: `git init`, the identity,
+/// the file, `git add` and `git commit`.
+///
+/// When `BAUDE_GIT_TEMPLATE_DIR` names an absolute directory, the repository
+/// is built there once per spec and per run and then copied into `dest`,
+/// which costs no git process. The suite builds the same few repositories
+/// hundreds of times, and each git start costs tens of milliseconds on macOS.
+/// With the variable unset, or whenever the template cannot be used, the
+/// repository is built in place exactly as described above.
+pub fn committed_repo(dest: &Path, spec: &CommittedRepo<'_>) {
+    committed_repo_with(template_dir().as_deref(), dest, spec);
+}
+
+/// [`committed_repo`] at `repo`, plus a bare repository at `origin` on the
+/// same branch, `git remote add origin` with `origin` exactly as given, and
+/// `git push -u origin <branch>`: the shape `gh repo create` leaves behind.
+/// Templated the same way. Panics when `spec.branch` is `None`.
+pub fn pushed_repo(origin: &Path, repo: &Path, spec: &CommittedRepo<'_>) {
+    pushed_repo_with(template_dir().as_deref(), origin, repo, spec);
+}
+
+/// `BAUDE_GIT_TEMPLATE_DIR`, when it is set to an absolute path.
+fn template_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("BAUDE_GIT_TEMPLATE_DIR")?);
+    dir.is_absolute().then_some(dir)
+}
+
+/// Written last into a template, so a template without it is unfinished. A
+/// pushed template's marker holds the origin URL its repository was built
+/// with, which every copy rewrites.
+const TEMPLATE_READY: &str = "READY";
+
+fn committed_repo_with(templates: Option<&Path>, dest: &Path, spec: &CommittedRepo<'_>) {
+    if let Some(template) = templates.and_then(|dir| template_for(dir, "committed", spec)) {
+        if usable_destination(dest) && copy_template_tree(&template.join("repo"), dest) {
+            return;
+        }
+    }
+    build_committed(dest, spec).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn pushed_repo_with(
+    templates: Option<&Path>,
+    origin: &Path,
+    repo: &Path,
+    spec: &CommittedRepo<'_>,
+) {
+    assert!(spec.branch.is_some(), "pushed_repo needs a branch to push");
+    if let Some(template) = templates.and_then(|dir| template_for(dir, "pushed", spec)) {
+        if copy_pushed_template(&template, origin, repo) {
+            return;
+        }
+    }
+    build_pushed(origin, repo, spec).unwrap_or_else(|error| panic!("{error}"));
+}
+
+/// Run git in `dir`, returning git's stderr on a non-zero status.
+fn try_git(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|error| format!("run git {args:?} in {}: {error}", dir.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn build_committed(dest: &Path, spec: &CommittedRepo<'_>) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|error| format!("create {}: {error}", dest.display()))?;
+    let mut init = vec!["init", "-q"];
+    if let Some(branch) = spec.branch {
+        init.extend(["-b", branch]);
+    }
+    try_git(dest, &init)?;
+    set_git_identity(dest, spec.name, spec.email);
+    let file = dest.join(spec.file);
+    std::fs::write(&file, spec.contents)
+        .map_err(|error| format!("write {}: {error}", file.display()))?;
+    try_git(dest, &["add", spec.file])?;
+    try_git(dest, &["commit", "-q", "-m", spec.message])
+}
+
+fn build_pushed(origin: &Path, repo: &Path, spec: &CommittedRepo<'_>) -> Result<(), String> {
+    let branch = spec.branch.expect("pushed_repo needs a branch to push");
+    let url = origin
+        .to_str()
+        .ok_or_else(|| format!("origin path {} is not UTF-8", origin.display()))?;
+    std::fs::create_dir_all(origin)
+        .map_err(|error| format!("create {}: {error}", origin.display()))?;
+    try_git(origin, &["init", "--bare", "-q", "-b", branch])?;
+    build_committed(repo, spec)?;
+    try_git(repo, &["remote", "add", "origin", url])?;
+    try_git(repo, &["push", "-q", "-u", "origin", branch])
+}
+
+/// The finished template for `shape` and `spec` under `dir`, built first when
+/// there is none yet, or `None` when it cannot be built.
+///
+/// The key hashes the shape and every spec field with `DefaultHasher`, which
+/// is stable within one toolchain; the directory itself is fresh per run. A
+/// build goes into a private `.building-` directory, writes [`TEMPLATE_READY`]
+/// last and is renamed into place, so a reader never sees half a template. A
+/// builder that loses the rename to a concurrent one removes its own copy and
+/// uses the winner's.
+fn template_for(dir: &Path, shape: &str, spec: &CommittedRepo<'_>) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    shape.hash(&mut hasher);
+    spec.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+    let finished = dir.join(format!("{shape}-{key}"));
+    if finished.join(TEMPLATE_READY).is_file() {
+        return Some(finished);
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let building = dir.join(format!(
+        ".building-{key}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&building);
+    let built = if shape == "pushed" {
+        let origin = building.join("origin.git");
+        build_pushed(&origin, &building.join("repo"), spec).and_then(|()| {
+            origin
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "template origin path is not UTF-8".to_string())
+        })
+    } else {
+        build_committed(&building.join("repo"), spec).map(|()| String::new())
+    };
+    let ready = built.and_then(|recorded| {
+        std::fs::write(building.join(TEMPLATE_READY), recorded).map_err(|error| error.to_string())
+    });
+    if ready.is_err() {
+        let _ = std::fs::remove_dir_all(&building);
+        return None;
+    }
+    match std::fs::rename(&building, &finished) {
+        Ok(()) => Some(finished),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&building);
+            finished.join(TEMPLATE_READY).is_file().then_some(finished)
+        }
+    }
+}
+
+/// Whether a template may be copied to `dest`: `dest` is absent or an empty
+/// directory, so a failed copy can be removed without touching anything that
+/// was there before.
+fn usable_destination(dest: &Path) -> bool {
+    match std::fs::symlink_metadata(dest) {
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(meta) => {
+            meta.is_dir()
+                && std::fs::read_dir(dest).is_ok_and(|mut entries| entries.next().is_none())
+        }
+    }
+}
+
+/// Whether `dest`, or its nearest existing ancestor, is on the filesystem
+/// that holds `template`. `git init` probes the filesystem it runs on for
+/// `core.ignorecase`, `core.precomposeunicode` and `core.filemode`, so a copy
+/// onto another filesystem could carry settings wrong for it.
+fn same_filesystem(template: &Path, dest: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(template) = std::fs::metadata(template) else {
+        return false;
+    };
+    dest.ancestors()
+        .find_map(|ancestor| std::fs::metadata(ancestor).ok())
+        .is_some_and(|existing| existing.dev() == template.dev())
+}
+
+/// Copy the template tree `src` to `dest`, which [`usable_destination`]
+/// accepted. Any failure, including a symlink or any other entry that is not
+/// a directory or a regular file, removes what was copied and returns false.
+fn copy_template_tree(src: &Path, dest: &Path) -> bool {
+    if !same_filesystem(src, dest) {
+        return false;
+    }
+    if let Some(parent) = dest.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    if copy_entry(src, dest).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_dir_all(dest);
+    false
+}
+
+fn copy_entry(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        match std::fs::create_dir(dest) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dest.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_entry(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else if meta.is_file() {
+        // `fs::copy` keeps the permission bits, so hooks stay executable and
+        // loose objects stay read-only.
+        std::fs::copy(src, dest).map(|_| ())
+    } else {
+        Err(std::io::Error::other(format!(
+            "template entry {} is neither a directory nor a regular file",
+            src.display()
+        )))
+    }
+}
+
+/// Whether git would quote or escape `value` when writing it to a config
+/// file. Such an origin is left to the in-place build rather than rewritten.
+fn needs_config_quoting(value: &str) -> bool {
+    value.is_empty() || value.trim() != value || value.contains(['"', '\\', '\n', '\t', ';', '#'])
+}
+
+/// Copy a pushed template to `origin` and `repo`, then point the copy's
+/// `origin` remote at `origin` exactly as given.
+fn copy_pushed_template(template: &Path, origin: &Path, repo: &Path) -> bool {
+    let Some(given) = origin.to_str() else {
+        return false;
+    };
+    let Ok(recorded) = std::fs::read_to_string(template.join(TEMPLATE_READY)) else {
+        return false;
+    };
+    if needs_config_quoting(&recorded)
+        || needs_config_quoting(given)
+        || !usable_destination(origin)
+        || !usable_destination(repo)
+    {
+        return false;
+    }
+    if !copy_template_tree(&template.join("origin.git"), origin) {
+        return false;
+    }
+    if !copy_template_tree(&template.join("repo"), repo) {
+        let _ = std::fs::remove_dir_all(origin);
+        return false;
+    }
+    let config = repo.join(".git").join("config");
+    let text = std::fs::read_to_string(&config)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config.display()));
+    let stale = format!("url = {recorded}");
+    let mut changed = 0;
+    let rewritten: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim() == stale {
+                changed += 1;
+                format!("\turl = {given}\n")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        1,
+        "the copied {} must hold exactly one `{stale}` line",
+        config.display()
+    );
+    std::fs::write(&config, rewritten)
+        .unwrap_or_else(|error| panic!("write {}: {error}", config.display()));
+    true
 }
 
 // ---- live-runtime doubles (phase 18 plan 08, shared with the TUI since phase 20) ----
@@ -937,6 +1249,213 @@ mod tests {
             git_in(&repo, &["log", "-1", "--format=%an <%ae>"]),
             "Fixture Name <fixture@example.invalid>"
         );
+    }
+
+    const TEMPLATE_SPEC: CommittedRepo<'static> = CommittedRepo {
+        branch: Some("main"),
+        file: "tracked.txt",
+        contents: b"fixture\n",
+        name: "Template Test",
+        email: "template@example.invalid",
+        message: "fixture",
+    };
+
+    /// Every path under `root`, relative and sorted, directories included.
+    /// Loose object names are folded into one placeholder per fan-out slot:
+    /// a commit's id covers its timestamp, so two builds a second apart name
+    /// their commit objects differently while holding the same tree.
+    fn relative_tree(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let parts: Vec<&str> = relative.split('/').collect();
+                let loose = parts.len() >= 3
+                    && parts[parts.len() - 3].ends_with("objects")
+                    && parts[parts.len() - 2].len() == 2
+                    && parts[parts.len() - 2]
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit());
+                if loose {
+                    out.push(format!(
+                        "{}/<loose object>",
+                        parts[..parts.len() - 2].join("/")
+                    ));
+                } else {
+                    out.push(relative);
+                }
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.retain(|entry| !is_loose_fanout(entry));
+        out.sort();
+        out
+    }
+
+    /// A two-hex-digit directory under `objects`, which exists exactly when it
+    /// holds a loose object and so adds nothing the placeholder lacks.
+    fn is_loose_fanout(entry: &str) -> bool {
+        let parts: Vec<&str> = entry.split('/').collect();
+        parts.len() >= 2
+            && parts[parts.len() - 2].ends_with("objects")
+            && parts[parts.len() - 1].len() == 2
+            && parts[parts.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+    }
+
+    fn local_config(repo: &Path, origin: Option<&Path>) -> String {
+        let listed = git_in(repo, &["config", "--local", "--list"]);
+        match origin {
+            Some(origin) => listed.replace(origin.to_str().unwrap(), "<origin>"),
+            None => listed,
+        }
+    }
+
+    fn assert_same_repository(in_place: &Path, templated: &Path, origins: Option<(&Path, &Path)>) {
+        assert_eq!(relative_tree(in_place), relative_tree(templated));
+        for args in [
+            &["rev-parse", "HEAD^{tree}"][..],
+            &["symbolic-ref", "HEAD"][..],
+            &["for-each-ref", "--format=%(refname) %(upstream)"][..],
+        ] {
+            assert_eq!(
+                git_in(in_place, args),
+                git_in(templated, args),
+                "git {args:?}"
+            );
+        }
+        assert_eq!(
+            local_config(in_place, origins.map(|(own, _)| own)),
+            local_config(templated, origins.map(|(_, own)| own))
+        );
+        assert_eq!(git_in(templated, &["status", "--porcelain=v2"]), "");
+    }
+
+    /// A repository copied from the template is the repository the in-place
+    /// build makes: the same files, tree, HEAD, refs and local config, and git
+    /// reads the copy clean.
+    #[test]
+    fn templated_committed_repo_matches_an_in_place_one() {
+        let root = FixtureRoot::new("baude-testing-template-committed");
+        let templates = root.join("templates");
+        let in_place = root.join("in-place");
+        let templated = root.join("templated");
+        committed_repo_with(None, &in_place, &TEMPLATE_SPEC);
+        committed_repo_with(Some(&templates), &templated, &TEMPLATE_SPEC);
+
+        only_template(&templates, "committed");
+        assert_same_repository(&in_place, &templated, None);
+        assert_eq!(
+            git_in(&templated, &["log", "-1", "--format=%an <%ae> %s"]),
+            "Template Test <template@example.invalid> fixture"
+        );
+    }
+
+    /// The pushed shape copies too: the origin holds the same refs, the
+    /// repository tracks the same upstreams, its config differs only by its
+    /// own origin path, and that remote is the copied origin.
+    #[test]
+    fn templated_pushed_repo_matches_an_in_place_one() {
+        let root = FixtureRoot::new("baude-testing-template-pushed");
+        let templates = root.join("templates");
+        let (origin_a, repo_a) = (root.join("a-origin.git"), root.join("a-repo"));
+        let (origin_b, repo_b) = (root.join("b-origin.git"), root.join("b-repo"));
+        pushed_repo_with(None, &origin_a, &repo_a, &TEMPLATE_SPEC);
+        pushed_repo_with(Some(&templates), &origin_b, &repo_b, &TEMPLATE_SPEC);
+
+        only_template(&templates, "pushed");
+        assert_same_repository(&repo_a, &repo_b, Some((&origin_a, &origin_b)));
+        assert_eq!(relative_tree(&origin_a), relative_tree(&origin_b));
+        assert_eq!(
+            git_in(&origin_a, &["for-each-ref", "--format=%(refname)"]),
+            git_in(&origin_b, &["for-each-ref", "--format=%(refname)"])
+        );
+        assert_eq!(
+            git_in(&repo_b, &["remote", "get-url", "origin"]),
+            origin_b.to_str().unwrap()
+        );
+        let head = git_in(&repo_b, &["rev-parse", "HEAD"]);
+        assert_eq!(git_in(&origin_b, &["rev-parse", "refs/heads/main"]), head);
+        assert_eq!(
+            git_in(&repo_b, &["ls-remote", "origin", "refs/heads/main"]),
+            format!("{head}\trefs/heads/main")
+        );
+    }
+
+    /// The one finished template of `shape` under `templates`; panics unless
+    /// there is exactly one and no building directory is left beside it.
+    fn only_template(templates: &Path, shape: &str) -> PathBuf {
+        let names: Vec<String> = std::fs::read_dir(templates)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with(".building-")),
+            "{names:?}"
+        );
+        let finished: Vec<&String> = names
+            .iter()
+            .filter(|name| name.starts_with(&format!("{shape}-")))
+            .collect();
+        assert_eq!(finished.len(), 1, "{names:?}");
+        let template = templates.join(finished[0]);
+        assert!(template.join(TEMPLATE_READY).is_file());
+        template
+    }
+
+    /// A second build of the same spec copies the first template instead of
+    /// building another: a marker written into the template after the first
+    /// build shows up in the second copy, and no building directory is left.
+    #[test]
+    fn a_second_templated_build_reuses_the_template() {
+        let root = FixtureRoot::new("baude-testing-template-reuse");
+        let templates = root.join("templates");
+        committed_repo_with(Some(&templates), &root.join("first"), &TEMPLATE_SPEC);
+        let template = only_template(&templates, "committed");
+        std::fs::write(
+            template.join("repo").join(".git").join("description"),
+            b"copied from the template\n",
+        )
+        .unwrap();
+        committed_repo_with(Some(&templates), &root.join("second"), &TEMPLATE_SPEC);
+
+        assert_eq!(only_template(&templates, "committed"), template);
+        assert_eq!(
+            std::fs::read(root.join("second").join(".git").join("description")).unwrap(),
+            b"copied from the template\n"
+        );
+        assert_eq!(
+            git_in(&root.join("first"), &["rev-parse", "HEAD"]),
+            git_in(&root.join("second"), &["rev-parse", "HEAD"]),
+            "both copies come from one template commit"
+        );
+    }
+
+    /// Without a template directory the repository is built in place and no
+    /// template directory appears.
+    #[test]
+    fn without_a_template_directory_the_repo_is_built_in_place() {
+        let root = FixtureRoot::new("baude-testing-template-none");
+        let templates = root.join("templates");
+        let repo = root.join("repo");
+        committed_repo_with(None, &repo, &TEMPLATE_SPEC);
+
+        assert!(!templates.exists());
+        assert_eq!(git_in(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(git_in(&repo, &["status", "--porcelain=v2"]), "");
     }
 
     /// One `ps -eo pid=,pgid=,stat=` row per live process, zombies left out.

@@ -9031,22 +9031,21 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let origin = root.join("origin.git");
         let repo = root.join("repo");
-        std::fs::create_dir_all(&origin).unwrap();
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&origin, &["init", "--bare", "-b", "main"]);
-        git(&repo, &["init", "-b", "main"]);
-        baude_core::testing::set_git_identity(&repo, "Test", "test@example.com");
-        std::fs::write(repo.join("file"), b"one").unwrap();
-        git(&repo, &["add", "file"]);
-        git(&repo, &["commit", "-m", "initial"]);
-        git(
-            &repo,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
         // Stops at `push -u`, the shape `gh repo create` leaves behind. Writing
         // refs/remotes/origin/HEAD here would hide whether admission works for a repo
         // that never went through `git clone`.
-        git(&repo, &["push", "-u", "origin", "main"]);
+        baude_core::testing::pushed_repo(
+            &origin,
+            &repo,
+            &baude_core::testing::CommittedRepo {
+                branch: Some("main"),
+                file: "file",
+                contents: b"one",
+                name: "Test",
+                email: "test@example.com",
+                message: "initial",
+            },
+        );
         AdmissionRepo {
             root,
             repo,
@@ -10810,12 +10809,17 @@ mod tests {
         let standalone = root.join("notes");
         std::fs::create_dir_all(&standalone).unwrap();
         let second_repo = root.join("second");
-        std::fs::create_dir_all(&second_repo).unwrap();
-        git(&second_repo, &["init", "-b", "main"]);
-        baude_core::testing::set_git_identity(&second_repo, "Test", "test@example.com");
-        std::fs::write(second_repo.join("file"), b"two").unwrap();
-        git(&second_repo, &["add", "file"]);
-        git(&second_repo, &["commit", "-m", "initial"]);
+        baude_core::testing::committed_repo(
+            &second_repo,
+            &baude_core::testing::CommittedRepo {
+                branch: Some("main"),
+                file: "file",
+                contents: b"two",
+                name: "Test",
+                email: "test@example.com",
+                message: "initial",
+            },
+        );
         let second_common_dir = baude_core::git::discover_repository(&second_repo)
             .unwrap()
             .common_dir;

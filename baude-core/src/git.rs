@@ -3816,25 +3816,16 @@ mod tests {
             let repo = self.root.join(relative);
             // Starts on `topic`, so the one commit lands there and no other
             // local branch ever exists.
-            git_ok(
-                &self.root,
-                &[
-                    OsStr::new("init"),
-                    OsStr::new("-b"),
-                    OsStr::new("topic"),
-                    repo.as_os_str(),
-                ],
-            );
-            crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
-            std::fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write fixture file");
-            git_ok(&repo, &[OsStr::new("add"), OsStr::new("tracked.txt")]);
-            git_ok(
+            crate::testing::committed_repo(
                 &repo,
-                &[
-                    OsStr::new("commit"),
-                    OsStr::new("-m"),
-                    OsStr::new("fixture"),
-                ],
+                &crate::testing::CommittedRepo {
+                    branch: Some("topic"),
+                    file: "tracked.txt",
+                    contents: b"fixture\n",
+                    name: "Baude Test",
+                    email: "baude@example.invalid",
+                    message: "fixture",
+                },
             );
             repo
         }

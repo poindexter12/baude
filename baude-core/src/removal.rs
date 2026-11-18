@@ -1897,12 +1897,17 @@ mod tests {
                 root,
                 _root: fixture_root,
             };
-            git_ok(&fixture.root, &["init", "-q", "-b", "main", "repo"]);
-            let repo = fixture.repo();
-            crate::testing::set_git_identity(&repo, "Baude Test", "baude@example.invalid");
-            fs::write(repo.join("tracked.txt"), b"fixture\n").expect("write tracked file");
-            git_ok(&repo, &["add", "tracked.txt"]);
-            git_ok(&repo, &["commit", "-q", "-m", "fixture"]);
+            crate::testing::committed_repo(
+                &fixture.repo(),
+                &crate::testing::CommittedRepo {
+                    branch: Some("main"),
+                    file: "tracked.txt",
+                    contents: b"fixture\n",
+                    name: "Baude Test",
+                    email: "baude@example.invalid",
+                    message: "fixture",
+                },
+            );
             fs::create_dir_all(fixture.managed_root()).expect("create managed root");
             fs::create_dir_all(fixture.state_root()).expect("create state root");
             fixture
