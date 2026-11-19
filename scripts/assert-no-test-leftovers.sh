@@ -37,7 +37,8 @@
 # Environment: BAUDE_ASSERT_PYTHON names the interpreter, default python3, and
 # the body runs on Python 3.9. BAUDE_LEFTOVER_SAMPLE_SECS, default 2, and
 # BAUDE_LEFTOVER_PERSIST_SECS, default 5, set the sampling interval and the
-# persist window.
+# persist window. BAUDE_LEFTOVER_ORPHAN_MARK, for the self-test only, names a
+# file the sampler creates when it records its first orphan.
 set -eu
 
 # The self-test re-invokes this file, and argv[0] is "-" under the heredoc, so
@@ -260,6 +261,8 @@ class Sampler(threading.Thread):
         self.me = me
         self.interval = interval
         self.persist = persist
+        # Self-test only: a file created when the first orphan is recorded.
+        self.mark = os.environ.get("BAUDE_LEFTOVER_ORPHAN_MARK", "")
         self.first_seen = {}
         self.orphans = {}
         self.error = None
@@ -289,6 +292,8 @@ class Sampler(threading.Thread):
                     "orphan", pid, ppids, commands, cwd,
                     " seen_for={:.1f}s".format(now - first),
                 )
+                if self.mark:
+                    open(self.mark, "a").close()
 
     def stop(self):
         self.stopping.set()
@@ -540,11 +545,15 @@ def kill_recorded(scratch, names):
             pass
 
 
-def process_case(test, name, body, expect_rc, expect_line, pid_names=(), names_cwd=None):
+def process_case(test, name, body, expect_rc, expect_line, pid_names=(), names_cwd=None,
+                 orphan_mark=False):
     scratch = tempfile.mkdtemp(prefix="leftover-selftest.", dir=scratch_base())
     try:
+        env = dict(PROCESS_ENV)
+        if orphan_mark:
+            env["BAUDE_LEFTOVER_ORPHAN_MARK"] = os.path.join(scratch, "orphan.mark")
         rc, out, err = invoke(
-            ["run", scratch, "--", "sh", "-c", body], extra_env=PROCESS_ENV
+            ["run", scratch, "--", "sh", "-c", body], extra_env=env
         )
         ok = test.check(name, (rc, out), (expect_rc, expect_line + "\n"))
         if names_cwd is not None:
@@ -583,11 +592,15 @@ def process_cases(test):
     process_case(
         test, "an orphan seen across the persist window fails with orphans=1",
         # A sample period is the interval plus the lsof and ps time, which
-        # swings past a second on a busy macOS host. Wait long enough for the
-        # first sample, the persist window and one more sample at that pace.
-        DETACH.format(w="w", secs=15)
-        + '; sleep 9; kill "$(cat "$TMPDIR/w.pid")"; sleep 1',
-        1, summary(0, 1, 0, 0), pid_names=("w",),
+        # takes several seconds on a heavily loaded macOS host, so no fixed
+        # sleep fits every host. The command waits instead until the sampler
+        # marks the orphan recorded, up to 60 s; a sampler that never records
+        # it still fails the case with orphans=0.
+        DETACH.format(w="w", secs=90)
+        + '; i=0; while [ ! -e "$TMPDIR/orphan.mark" ] && [ "$i" -lt 600 ]; do'
+        + ' sleep 0.1; i=$((i + 1)); done'
+        + '; kill "$(cat "$TMPDIR/w.pid")"; sleep 1',
+        1, summary(0, 1, 0, 0), pid_names=("w",), orphan_mark=True,
     )
     process_case(
         test, "a descendant working in the dir past the window is not an orphan",
