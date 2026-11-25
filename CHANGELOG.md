@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.5](https://github.com/poindexter12/baude/compare/v2.8.4...v2.8.5) (2026-11-25)
+
+
+### Bug Fixes
+
+* let D remove worktrees with submodules and show removal errors whole ([#146](https://github.com/poindexter12/baude/issues/146)) ([aeb3cae](https://github.com/poindexter12/baude/commit/aeb3caebcea547e31d6c68290d39f486090c2761))
+
 ## [2.8.4](https://github.com/poindexter12/baude/compare/v2.8.3...v2.8.4) (2026-11-18)
 
 
