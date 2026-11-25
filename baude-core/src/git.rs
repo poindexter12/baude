@@ -2986,13 +2986,6 @@ pub enum ForcedRemovalError {
         path: PathBuf,
         observed_common_dir: PathBuf,
     },
-    /// The worktree's administrative directory holds absorbed submodule
-    /// gitdirs under `modules/`; a forced removal would delete them and any
-    /// unpushed submodule commits with them.
-    Submodules {
-        path: PathBuf,
-        modules: PathBuf,
-    },
     CommandStart(std::io::Error),
     Fallback {
         path: PathBuf,
@@ -3056,12 +3049,6 @@ impl fmt::Display for ForcedRemovalError {
                 "refusing forced removal of {}: directory holds another repository at {}",
                 path.display(),
                 observed_common_dir.display()
-            ),
-            Self::Submodules { path, modules } => write!(
-                f,
-                "refusing forced removal of {}: submodule gitdirs live under {}",
-                path.display(),
-                modules.display()
             ),
             Self::CommandStart(error) => write!(f, "start Git worktree command: {error}"),
             Self::Fallback {
@@ -3425,75 +3412,6 @@ fn foreign_repository_guard(
     }
 }
 
-/// The administrative directory `<common>/worktrees/<id>` whose `gitdir`
-/// file names `<canonical>/.git`. Filesystem inspection alone, so it is
-/// available when the worktree's own `.git` file or directory is gone. An
-/// unreadable `worktrees/` directory is `Uninspectable`; a missing one means
-/// no entry.
-fn admin_dir_for(
-    expected_common_dir: &Path,
-    canonical: &Path,
-) -> std::result::Result<Option<PathBuf>, ForcedRemovalError> {
-    let entries = match std::fs::read_dir(expected_common_dir.join("worktrees")) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ForcedRemovalError::Uninspectable {
-                path: canonical.to_path_buf(),
-                detail: format!("worktrees admin dir: {error}"),
-            });
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| ForcedRemovalError::Uninspectable {
-            path: canonical.to_path_buf(),
-            detail: format!("worktrees admin dir: {error}"),
-        })?;
-        let Ok(text) = std::fs::read_to_string(entry.path().join("gitdir")) else {
-            continue;
-        };
-        let named = PathBuf::from(text.trim_end_matches(['\r', '\n']));
-        let Some(worktree) = named.parent() else {
-            continue;
-        };
-        if canonicalize_through_missing(worktree).ok().as_deref() == Some(canonical) {
-            return Ok(Some(entry.path()));
-        }
-    }
-    Ok(None)
-}
-
-/// Refuse when the entry's `modules/` holds absorbed submodule gitdirs:
-/// `git worktree remove --force --force` deletes them with the entry, and so
-/// would the fallback, losing unpushed submodule commits with no typed
-/// refusal. Explicit removal waives a dirty tree, a lock and a held cwd,
-/// not another repository's history.
-fn submodule_guard(
-    expected_common_dir: &Path,
-    canonical: &Path,
-) -> std::result::Result<(), ForcedRemovalError> {
-    let Some(admin) = admin_dir_for(expected_common_dir, canonical)? else {
-        return Ok(());
-    };
-    let modules = admin.join("modules");
-    match std::fs::read_dir(&modules) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                return Err(ForcedRemovalError::Submodules {
-                    path: canonical.to_path_buf(),
-                    modules,
-                });
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ForcedRemovalError::Uninspectable {
-            path: canonical.to_path_buf(),
-            detail: format!("{}: {error}", modules.display()),
-        }),
-    }
-}
-
 /// Path of the removal marker written beside a managed worktree before the
 /// forced Git command runs: `<parent>/.<name>.baude-removal`.
 pub(crate) fn removal_marker_path(canonical: &Path) -> PathBuf {
@@ -3624,7 +3542,7 @@ enum ForcedStep {
 ///
 /// Callers must classify upstream (`removal::select_rows`) and never pass a
 /// Main, unmanaged or standalone path. Explicit user removal bypasses only the
-/// clean-tree and lock checks that `inspect_removal` / `topology_blockers`
+/// clean-tree, lock and submodule checks that `inspect_removal` / `topology_blockers`
 /// enforce for the verified path; common-dir identity, main-worktree exclusion
 /// and registration are re-proven here on the live tree. Every git command
 /// runs against `expected_common_dir`, never the main checkout, so a main
@@ -3669,7 +3587,6 @@ pub fn remove_managed_worktree_forced(
         }
         // Registered, directory gone: git drops a missing worktree per entry.
         (Some(_), false) => {
-            submodule_guard(&expected_common_dir, &canonical)?;
             let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
             if output.status.success() {
                 ForcedStep::GitRemoved
@@ -3679,7 +3596,6 @@ pub fn remove_managed_worktree_forced(
         }
         (Some(_), true) => {
             foreign_repository_guard(&canonical, &expected_common_dir)?;
-            submodule_guard(&expected_common_dir, &canonical)?;
             write_removal_marker(&canonical, &expected_common_dir)?;
             let output = remove_worktree_entry(&expected_common_dir, &canonical)?;
             if output.status.success() {
@@ -5963,18 +5879,12 @@ mod tests {
             assert_untouched(&repo, &wt, &before);
         }
 
-        /// A linked worktree with an absorbed submodule keeps the submodule's
-        /// gitdir under its own admin entry; git deletes it with `--force
-        /// --force`, so the removal must be refused before anything runs.
-        #[test]
-        fn worktree_with_submodule_gitdirs_is_refused_untouched() {
-            let fixture = GitFixture::new();
-            let _root = crate::testing::TestRedirect::new(&fixture.root);
-            let repo = fixture.repo("repo");
-            let sub = fixture.repo("sub");
-            let wt = managed_worktree(&fixture, &repo, "wt-a");
+        /// Add `sub` as an absorbed submodule of linked worktree `wt`, so its
+        /// gitdir lives under the worktree's own admin entry, and return that
+        /// `modules/` directory.
+        fn absorb_submodule(repo: &Path, sub: &Path, wt: &Path, name: &str) -> PathBuf {
             git_ok(
-                &wt,
+                wt,
                 &[
                     OsStr::new("-c"),
                     OsStr::new("protocol.file.allow=always"),
@@ -5986,7 +5896,7 @@ mod tests {
                 ],
             );
             git_ok(
-                &wt,
+                wt,
                 &[
                     OsStr::new("commit"),
                     OsStr::new("-q"),
@@ -5994,41 +5904,45 @@ mod tests {
                     OsStr::new("add submodule"),
                 ],
             );
-            let common = common_dir(&repo);
-            let modules = common.join("worktrees").join("wt-a").join("modules");
+            let modules = common_dir(repo)
+                .join("worktrees")
+                .join(name)
+                .join("modules");
             assert!(
-                modules.join("subdir").is_dir(),
+                modules.join("subdir").join("HEAD").is_file(),
                 "submodule gitdir is absorbed"
             );
+            modules
+        }
+
+        /// Explicit removal is a warned, unconditional delete: absorbed
+        /// submodule gitdirs go with the worktree, whether its directory is
+        /// still there or already vanished.
+        #[test]
+        fn worktree_with_submodule_gitdirs_is_removed_with_them() {
+            let fixture = GitFixture::new();
+            let _root = crate::testing::TestRedirect::new(&fixture.root);
+            let repo = fixture.repo("repo");
+            let sub = fixture.repo("sub");
+            let wt = managed_worktree(&fixture, &repo, "wt-a");
+            let gone = managed_worktree(&fixture, &repo, "wt-b");
+            let modules = absorb_submodule(&repo, &sub, &wt, "wt-a");
+            let gone_modules = absorb_submodule(&repo, &sub, &gone, "wt-b");
+            let common = common_dir(&repo);
             let before = branch_snapshot(&repo);
 
-            let error = remove_managed_worktree_forced(&common, &wt)
-                .expect_err("submodule gitdirs refuse the forced removal");
+            remove_managed_worktree_forced(&common, &wt)
+                .expect("a worktree with submodules is force-removed");
+            assert!(!wt.exists());
+            assert!(!modules.exists(), "submodule gitdirs go with the entry");
+            assert!(!inventory_lists(&repo, &wt));
 
-            match error {
-                ForcedRemovalError::Submodules {
-                    path,
-                    modules: found,
-                } => {
-                    assert_eq!(path, wt.canonicalize().unwrap());
-                    assert_eq!(found, modules);
-                }
-                other => panic!("expected Submodules, got {other:?}"),
-            }
-            assert!(modules.join("subdir").join("HEAD").is_file());
-            assert!(wt.join("subdir").is_dir());
-            assert!(
-                !removal_marker_path(&wt.canonicalize().unwrap()).exists(),
-                "refused before the marker is written"
-            );
-            assert_untouched(&repo, &wt, &before);
-
-            std::fs::remove_dir_all(&wt).unwrap();
-            let error = remove_managed_worktree_forced(&common, &wt)
-                .expect_err("a vanished directory still refuses while gitdirs remain");
-            assert!(matches!(error, ForcedRemovalError::Submodules { .. }));
-            assert!(modules.join("subdir").join("HEAD").is_file());
-            assert!(inventory_lists(&repo, &wt));
+            std::fs::remove_dir_all(&gone).unwrap();
+            remove_managed_worktree_forced(&common, &gone)
+                .expect("a vanished worktree with submodules is dropped");
+            assert!(!gone_modules.exists());
+            assert!(!inventory_lists(&repo, &gone));
+            assert_eq!(branch_snapshot(&repo), before);
         }
 
         #[test]

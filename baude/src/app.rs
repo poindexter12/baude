@@ -6281,7 +6281,7 @@ impl App {
                         report,
                         scroll,
                         origin,
-                        ..
+                        error: previous_error,
                     } = modal
                     else {
                         unreachable!();
@@ -6313,11 +6313,19 @@ impl App {
                                 Err(error) => {
                                     // D-09: rows and handles are intact; keep the
                                     // modal open with the typed error for retry.
+                                    let error = error.to_string();
+                                    // An identical failure redraws an identical
+                                    // modal, so say the retry ran.
+                                    if previous_error.as_deref() == Some(error.as_str()) {
+                                        self.set_message(
+                                            "retry failed again with the same error".into(),
+                                        );
+                                    }
                                     self.modal = Modal::ConfirmRemove {
                                         target,
                                         report,
                                         scroll,
-                                        error: Some(error.to_string()),
+                                        error: Some(error),
                                         origin: RemovalOrigin::Local,
                                     };
                                     self.dirty = true;
@@ -15779,6 +15787,22 @@ mod tests {
             "the injected failure models one atomic boundary"
         );
 
+        // A retry that fails the same way redraws the same modal, so the
+        // footer is what tells the user the Enter press ran.
+        assert!(
+            !last_message(&app).is_some_and(|m| m.contains("retry failed again")),
+            "a first failure is not a repeat"
+        );
+        app.atomic_failure_for_test = Some(AtomicFailure::Rename);
+        app.handle_modal_key(enter_key());
+        assert_eq!(
+            confirm_remove_error(&app, target),
+            error,
+            "the retry hit the same failure"
+        );
+        let notice = last_message(&app).expect("footer names the repeat");
+        assert!(notice.contains("retry failed again"), "{notice}");
+
         // The kill stage already ran, so the restored handle is dead when
         // the main loop ticks over it before the user retries; the retry
         // must still match that handle to the row's persisted runtime.
@@ -15802,7 +15826,7 @@ mod tests {
                 .any(|row| row.key == rows.standalone),
             "the row left the state file"
         );
-        assert_eq!(app.save_attempts_for_test.get(), saves_before + 2);
+        assert_eq!(app.save_attempts_for_test.get(), saves_before + 3);
         assert!(!app.runtime_standalones.contains_key(&rows.standalone));
         assert!(app.session(runtime_id).is_none());
         assert_eq!(app.sessions.len(), sessions_before - 1);

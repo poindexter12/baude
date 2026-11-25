@@ -209,6 +209,8 @@ pub enum DiskRemovalFailureKind {
     MainWorktree,
     NotRegistered,
     ForeignRepository,
+    /// No longer produced: removal deletes absorbed submodule gitdirs with
+    /// the worktree. Kept so a report from an older daemon still parses.
     Submodules,
     CommandStart,
     Fallback,
@@ -402,7 +404,6 @@ impl From<crate::git::ForcedRemovalError> for DiskRemovalFailure {
             E::MainWorktree { .. } => DiskRemovalFailureKind::MainWorktree,
             E::NotRegistered { .. } => DiskRemovalFailureKind::NotRegistered,
             E::ForeignRepository { .. } => DiskRemovalFailureKind::ForeignRepository,
-            E::Submodules { .. } => DiskRemovalFailureKind::Submodules,
             E::CommandStart(_) => DiskRemovalFailureKind::CommandStart,
             E::Fallback { .. } => DiskRemovalFailureKind::Fallback,
             E::Uninspectable { .. } => DiskRemovalFailureKind::Uninspectable,
