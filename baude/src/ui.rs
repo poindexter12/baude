@@ -303,6 +303,68 @@ fn truncate(s: &str, max: usize) -> String {
     format!("…{}", suffix.concat())
 }
 
+/// Break `text` into lines of at most `width` cells, at spaces where it can
+/// and mid-word where a word alone is too long, so the head of a message is
+/// never the part that gives way. Past `max_lines`, the last line keeps what
+/// fits and ends in `…`.
+fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    let mut overflow = false;
+    'words: for (index, word) in text.split(' ').enumerate() {
+        let word_width = cell_width(word);
+        let gap = usize::from(index > 0 && used > 0);
+        if used > 0 && used + gap + word_width > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        } else if gap == 1 {
+            line.push(' ');
+            used += 1;
+        }
+        for cluster in cell_clusters(word) {
+            let w = cell_width(&cluster);
+            if used + w > width {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            if lines.len() == max_lines {
+                overflow = true;
+                break 'words;
+            }
+            line.push_str(&cluster);
+            used += w;
+        }
+    }
+    if !overflow && !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        overflow = true;
+    }
+    if overflow {
+        if let Some(last) = lines.last_mut() {
+            let mut kept: Vec<String> = cell_clusters(last);
+            while !kept.is_empty() && cell_width(&kept.concat()) + 1 > width {
+                kept.pop();
+            }
+            *last = format!("{}…", kept.concat());
+        }
+    }
+    lines
+}
+
+/// Width inside the border of the `D` confirmation. The key handler measures
+/// the scroll window with it, so it must match what the renderer draws.
+pub(crate) const REMOVE_MODAL_INNER_WIDTH: usize = 74;
+
+/// The most lines a removal error may take in the `D` confirmation.
+const REMOVE_MODAL_ERROR_LINES: usize = 4;
+
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, compact_rows: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1811,8 +1873,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 .map(|text| removal_text_for_user(text, &removal_report_keys(report), &row_name));
             let error = shown_error.as_deref();
             let max_rows = remove_project_modal_max_rows(report, error, area.height);
-            let width: u16 = 76;
-            let inner_width = usize::from(width.saturating_sub(2));
+            let inner_width = REMOVE_MODAL_INNER_WIDTH;
+            let width = u16::try_from(inner_width + 2).unwrap_or(u16::MAX);
             let lines = match origin {
                 RemovalOrigin::Local => remove_project_confirmation_lines(
                     report,
@@ -2531,15 +2593,19 @@ pub(crate) fn remove_project_modal_max_rows(
     area_height: u16,
 ) -> usize {
     let inner_height = usize::from(remove_project_modal_max_height(area_height)).saturating_sub(2);
-    // Labels never wrap, so the count does not depend on their text.
+    // Labels are truncated to one line, so only the wrapped error depends
+    // on text, and it is measured at the width the renderer draws.
+    // Ten cells of padding cover the remote `unknown outcome: ` heading,
+    // which is that much longer than the shared `error: `.
+    let padded = error.map(|text| format!("{:10}{text}", ""));
     let unwindowed = remove_project_confirmation_lines(
         report,
         "",
         &|_| String::new(),
-        error,
+        padded.as_deref(),
         0,
         usize::MAX,
-        usize::MAX,
+        REMOVE_MODAL_INNER_WIDTH,
     );
     let rows = report.rows_removed.len();
     let fixed = unwindowed.len().saturating_sub(rows);
@@ -2603,32 +2669,27 @@ pub(crate) fn remote_removal_confirmation_lines(
     width: usize,
     unknown_outcome: bool,
 ) -> Vec<String> {
-    let mut lines = remove_project_confirmation_lines(
-        report, kind_label, row_name, error, scroll, max_rows, width,
-    );
     if !unknown_outcome {
-        return lines;
+        return remove_project_confirmation_lines(
+            report, kind_label, row_name, error, scroll, max_rows, width,
+        );
     }
-    // The shared builder ends with the error line, when it has one, and
-    // then the legend. Both are rebuilt from the untruncated text.
-    let error_index = lines.len().checked_sub(2);
-    if let Some(legend) = lines.last_mut() {
-        *legend = truncate("enter preview again · esc close", width);
+    // The shared builder ends with the error lines, when there are any, and
+    // then the legend. Build it without the error and put the outcome lines
+    // in their place. `remove_project_modal_max_rows` measures the error
+    // with padding for this longer heading, so the window still fits.
+    let mut lines = remove_project_confirmation_lines(
+        report, kind_label, row_name, None, scroll, max_rows, width,
+    );
+    lines.pop();
+    if let Some(text) = error {
+        lines.extend(wrap_text(
+            &format!("unknown outcome: {text}"),
+            width,
+            REMOVE_MODAL_ERROR_LINES,
+        ));
     }
-    if let (Some(text), Some(index)) = (error, error_index) {
-        if let Some(line) = lines.get_mut(index) {
-            // `truncate` keeps the end of a long text, so the heading is
-            // kept whole and only the message gives way: a narrow modal
-            // must still say the outcome is unknown.
-            const HEADING: &str = "unknown outcome: ";
-            let room = width.saturating_sub(cell_width(HEADING));
-            *line = if room == 0 {
-                truncate(HEADING.trim_end(), width)
-            } else {
-                format!("{HEADING}{}", truncate(text, room))
-            };
-        }
-    }
+    lines.push(truncate("enter preview again · esc close", width));
     lines
 }
 
@@ -2785,6 +2846,11 @@ pub(crate) fn remove_project_confirmation_lines(
     for path in &report.paths_deleted {
         lines.push(entry(&path.display().to_string()));
     }
+    if !report.paths_deleted.is_empty() {
+        lines.push(entry(
+            "everything in them is lost: uncommitted work, submodules",
+        ));
+    }
 
     heading(&mut lines, "paths kept", report.paths_kept.len());
     if report.paths_kept.is_empty() {
@@ -2840,7 +2906,11 @@ pub(crate) fn remove_project_confirmation_lines(
     }
 
     if let Some(text) = error {
-        lines.push(truncate(&format!("error: {text}"), width));
+        lines.extend(wrap_text(
+            &format!("error: {text}"),
+            width,
+            REMOVE_MODAL_ERROR_LINES,
+        ));
     }
 
     let legend = if error.is_some() {
@@ -3919,6 +3989,81 @@ mod tests {
             vec!["repo:child-4", "repo:child-5", "repo:child-6"],
             "scroll past the end clamps so the last child stays visible"
         );
+    }
+
+    #[test]
+    fn wrap_text_breaks_at_spaces_and_inside_long_words() {
+        assert_eq!(super::wrap_text("a bb ccc", 4, 5), vec!["a bb", "ccc"]);
+        assert_eq!(
+            super::wrap_text("x /abcdefghij", 5, 5),
+            vec!["x", "/abcd", "efghi", "j"]
+        );
+        assert_eq!(super::wrap_text("", 5, 5), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wrap_text_ellipsizes_the_last_allowed_line() {
+        let lines = super::wrap_text("aaaa bbbb cccc dddd", 4, 2);
+        assert_eq!(lines, vec!["aaaa", "bbb…"]);
+        assert!(lines.iter().all(|l| super::cell_width(l) <= 4));
+    }
+
+    /// A refusal names its reason after a long path; the modal wraps the
+    /// error so the reason is read, where truncation kept only the path's
+    /// tail.
+    #[test]
+    fn remove_project_lines_wrap_a_long_error_head_first() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report};
+
+        let child = RowKey::Checkout(remove_project::checkout(3));
+        let r = report(
+            RemovalTarget::Checkout(remove_project::checkout(3)),
+            vec![child],
+        );
+        let error = "could not remove /Users/someone/.local/share/baude/worktrees/ws/repository-19/primary-76: Postcondition: the directory is still there";
+        let lines =
+            remove_project_confirmation_lines(&r, "repository", &name, Some(error), 0, 10, 40);
+
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("error: could not remove"))
+            .unwrap_or_else(|| panic!("the error head is shown: {lines:?}"));
+        let shown: String = lines[start..lines.len() - 1].concat();
+        assert!(
+            shown.contains("Postcondition"),
+            "the reason is shown: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| super::cell_width(l) <= 40),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("enter retry · esc cancel")
+        );
+    }
+
+    #[test]
+    fn remove_project_lines_warn_that_deleted_paths_lose_their_contents() {
+        use baude_core::removal::{RemovalTarget, RowKey};
+        use remove_project::{name, report};
+
+        let child = RowKey::Checkout(remove_project::checkout(3));
+        let mut r = report(
+            RemovalTarget::Checkout(remove_project::checkout(3)),
+            vec![child],
+        );
+        let warns = |r: &baude_core::removal::RemovalReport| {
+            remove_project_confirmation_lines(r, "repository", &name, None, 0, 10, 100)
+                .iter()
+                .any(|l| l.contains("everything in them is lost"))
+        };
+        r.paths_deleted.clear();
+        assert!(!warns(&r), "nothing deleted, nothing to warn about");
+        r.paths_deleted
+            .push(std::path::PathBuf::from("/managed/wt"));
+        assert!(warns(&r));
     }
 
     #[test]
